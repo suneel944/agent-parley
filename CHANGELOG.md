@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/suneel944/agent-bridge/compare/v0.3.1...v0.3.2) (2026-09-05)
+
+
+### Automation
+
+* enforce contribution text policy and restore logo delivery ([#14](https://github.com/suneel944/agent-bridge/issues/14)) ([843c953](https://github.com/suneel944/agent-bridge/commit/843c953f0f67b206321ffa709ee7ed1519c4b2e6))
+
 ## [0.3.1](https://github.com/suneel944/agent-bridge/compare/v0.3.0...v0.3.1) (2026-09-05)
 
 ### Changed
