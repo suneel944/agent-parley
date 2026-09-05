@@ -6,6 +6,8 @@ import re
 import subprocess
 from typing import Any
 
+from scripts.check_policy import has_attribution
+
 
 def issue_numbers(body: str) -> set[int]:
     """Returns explicit local issue references from a pull-request body."""
@@ -30,6 +32,8 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
         Actionable failures; an empty list means all metadata rules pass.
     """
     errors = []
+    if has_attribution(pr.get("title", "") + "\n" + (pr.get("body") or "")):
+        errors.append("Remove prohibited attribution from the PR text.")
     if not pr.get("assignees"):
         errors.append("Assign at least one owner.")
     labels = {label["name"] for label in pr.get("labels", [])}
@@ -76,7 +80,7 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
-def api(path: str) -> Any:
+def api(path: str, *, paginate: bool = False) -> Any:
     """Reads authenticated GitHub metadata through the native CLI.
 
     Raises:
@@ -84,12 +88,15 @@ def api(path: str) -> Any:
         subprocess.TimeoutExpired: If the request exceeds thirty seconds.
     """
     result = subprocess.run(
-        ["gh", "api", path],
+        ["gh", "api", path]
+        + (["--paginate", "--jq", ".[] | @json"] if paginate else []),
         check=True,
         capture_output=True,
         text=True,
         timeout=30,
     )
+    if paginate:
+        return [json.loads(line) for line in result.stdout.splitlines()]
     return json.loads(result.stdout)
 
 
@@ -103,6 +110,23 @@ def main() -> None:
         for issue in sorted(issue_numbers(pr.get("body") or ""))
     ]
     errors = validate(pr, issues)
+    commits = api(
+        f"repos/{repository}/pulls/{number}/commits?per_page=100", paginate=True
+    )
+    if any(has_attribution(commit["commit"]["message"]) for commit in commits):
+        errors.append("Remove prohibited attribution from commit messages.")
+    for endpoint in (
+        f"issues/{number}/comments",
+        f"pulls/{number}/comments",
+        f"pulls/{number}/reviews",
+    ):
+        comments = api(f"repos/{repository}/{endpoint}", paginate=True)
+        if any(
+            has_attribution(comment.get("body") or "") for comment in comments
+        ):
+            errors.append("Remove prohibited attribution from PR comments.")
+    if any(has_attribution(issue.get("body") or "") for issue in issues):
+        errors.append("Remove prohibited attribution from linked issues.")
     if errors:
         raise SystemExit("\n".join(errors))
     print(f"PR #{number}: owner, labels, issue and milestone policy passed")

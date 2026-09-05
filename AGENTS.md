@@ -15,6 +15,10 @@ rules. Keep the 80-character formatting target and do not weaken checks.
 - Read the implementation before changing launch, identity, or process handling.
 - Reservations are advisory. Do not describe them as enforced filesystem locks.
 - Use RTK explicitly for development commands when available.
+- Do not add generator credits, assistant attribution, robot signatures, or
+  assistant coauthor trailers to code, commits, PRs, issues, or comments.
+  Use neutral contribution and release text. Enforce this through the policy
+  and PR hygiene gates; do not remove required license notices.
 - Run focused checks while editing. The final gate is `make check`, also used by CI.
 - Integration tests use real local MCP transport and temporary Git repositories.
   Distinguish those results from verification of live model behavior.

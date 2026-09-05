@@ -32,4 +32,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-        run: python3 scripts/check_pr_hygiene.py
+        run: python3 -m scripts.check_pr_hygiene

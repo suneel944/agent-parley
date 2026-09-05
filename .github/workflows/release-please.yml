@@ -27,6 +27,34 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         id: release
+      - name: Use neutral release status comments
+        if: steps.release.outputs.release_created == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        with:
+          script: |
+            const repo = context.repo;
+            const commit = await github.rest.repos.getCommit({
+              ...repo, ref: process.env.RELEASE_TAG});
+            const prs = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              {...repo, commit_sha: commit.data.sha});
+            for (const pr of prs.filter(p => p.merged_at)) {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {...repo, issue_number: pr.number});
+              for (const comment of comments) {
+                if (comment.user.login === 'github-actions[bot]' &&
+                    comment.body.startsWith('\u{1f916} Created releases:')) {
+                  await github.rest.issues.updateComment({
+                    ...repo, comment_id: comment.id,
+                    body: `Release ${process.env.RELEASE_TAG} is undergoing ` +
+                      'artifact verification before publication.',
+                  });
+                }
+              }
+            }
       - name: Assign release ownership and trigger required checks
         if: steps.release.outputs.prs_created == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
@@ -51,7 +79,7 @@ jobs:
                 i.title === issueTitle) ||
                 (await github.rest.issues.create({
                   ...repo, title: issueTitle,
-                  body: 'Track generated changelog, version alignment and ' +
+                  body: 'Track changelog, version alignment and ' +
                     'verified release artifacts.',
                   assignees: ['suneel944'], labels: ['release'],
                   milestone: milestone.number,

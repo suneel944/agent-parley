@@ -3,6 +3,8 @@
   "packages": {
     ".": {
       "release-type": "python",
+      "pull-request-header": "## Release summary",
+      "pull-request-footer": "## Verification\n\nRequired checks must pass before merge.",
       "include-component-in-tag": false,
       "draft": true,
       "force-tag-creation": true,

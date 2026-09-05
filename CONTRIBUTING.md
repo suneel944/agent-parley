@@ -82,6 +82,12 @@ local issue with `Refs #N` or a closing keyword. Match linked issue milestones
 when present. Release PRs always require a milestone. Bot-generated descriptions
 retain their native format, but ownership and issue rules still apply.
 
+Contribution text must omit generator credits, assistant attribution, robot
+signatures, and assistant coauthor trailers. This applies to tracked files,
+commit messages, PRs, issues, and comments, including closed items. Keep required
+license notices and factual product documentation intact. Repository policy and
+PR hygiene checks enforce the textual attribution boundary.
+
 Release Please prepares a version and changelog PR after merges to `main`.
 Package, plugin, marketplace and lockfile versions move together. The generated
 PR gets an owner, release issue and milestone, and explicitly dispatched checks
