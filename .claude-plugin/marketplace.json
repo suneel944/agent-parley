@@ -1,12 +1,15 @@
 {
   "name": "agent-bridge-local",
-  "owner": {"name": "Suneel Kaushik S", "email": "suneel944@gmail.com"},
+  "owner": {
+    "name": "Suneel Kaushik S",
+    "email": "suneel944@gmail.com"
+  },
   "plugins": [
     {
       "name": "agent-bridge",
       "source": "./plugins/agent-bridge",
       "description": "Shared issue ownership and handoffs for Claude Code and Codex.",
-      "version": "0.3.0"
+      "version": "0.3.1"
     }
   ]
 }
