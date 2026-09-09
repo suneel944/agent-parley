@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-bridge"
+name = "agent-parley"
 version = "0.3.2"
-description = "Run Claude Code and Codex in isolated worktrees with shared coordination."
+description = "Run several coding agents in isolated worktrees with shared coordination."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{name = "Suneel Kaushik S", email = "suneel944@gmail.com"}]

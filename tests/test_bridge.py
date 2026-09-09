@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 import zipfile
 from pathlib import Path
@@ -17,7 +18,16 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agent_bridge.checkpoints import checkpoint, mailbox
+from agent_bridge import dashboard, roster, store
+from agent_bridge.checkpoints import (
+    MAX_EVENT_LOG_AGE,
+    MAX_EVENT_LOG_BYTES,
+    branch_guard,
+    checkpoint,
+    event_summary,
+    mailbox,
+    prune,
+)
 from agent_bridge.cli import Bridge, BridgeError, git, lock, write_json
 from agent_bridge.process import start_ticks
 
@@ -34,8 +44,8 @@ async def client_session(url, auth):
                 yield session
 
 
-def test_isolation_identity_and_idempotent_setup(bridge, repo):
-    data = bridge.setup(repo)
+def test_isolation_identity_and_idempotent_setup(bridge, repo, paired):
+    data = paired
     claude, codex = (Path(data["lanes"][name]) for name in ("claude", "codex"))
     (claude / "shared.txt").write_text("Claude change\n")
     assert (codex / "shared.txt").read_text() == "original\n"
@@ -65,8 +75,8 @@ def test_missing_commit_and_existing_branch_preserved(bridge, repo, tmp_path):
     branch = f"bridge/{directory.name}/codex"
     git(repo, "branch", branch)
     with pytest.raises(BridgeError, match="Existing lane"):
-        bridge.setup(repo)
-    assert not (directory / "claude").exists()
+        bridge.add_participant(repo, "codex", "codex")
+    assert not (directory / "codex").exists()
     assert git(repo, "rev-parse", branch) == git(repo, "rev-parse", "HEAD")
 
 
@@ -107,13 +117,80 @@ def test_stale_pid_record_cannot_stop_an_unrelated_process(bridge):
     os.kill(pid, 0)
 
 
-def test_changed_lane_branch_is_rejected_without_resetting(bridge, repo):
-    data = bridge.setup(repo)
-    lane = Path(data["lanes"]["codex"])
+def test_changed_lane_branch_is_rejected_without_resetting(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
     git(lane, "switch", "-c", "personal-work")
-    with pytest.raises(BridgeError, match="changed branch"):
+    with pytest.raises(BridgeError, match="expected"):
         bridge.setup(repo)
     assert git(lane, "branch", "--show-current") == "personal-work"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git switch -c personal-work",
+        "rtk git checkout personal-work",
+        "git branch -m personal-work",
+        "git symbolic-ref HEAD refs/heads/personal-work",
+        "gh pr checkout 42",
+    ],
+)
+def test_native_hook_blocks_bridge_lane_branch_changes(
+    bridge, repo, paired, command
+):
+    data = paired
+    lane = Path(data["lanes"]["codex"])
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    }
+    result = checkpoint(bridge.home, lane.parent, "codex", payload)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert git(lane, "branch", "--show-current") == data["branches"]["codex"]
+
+
+def test_native_hook_blocks_drift_until_exact_restore(bridge, repo, paired):
+    data = paired
+    lane = Path(data["lanes"]["codex"])
+    expected = data["branches"]["codex"]
+    git(lane, "switch", "-c", "personal-work")
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+    }
+    denied, reason = branch_guard("PreToolUse", payload, lane, expected)
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert reason == "branch_drift"
+    blocked, reason = branch_guard("Stop", payload, lane, expected)
+    assert blocked["decision"] == "block"
+    assert reason == "branch_drift"
+    payload["tool_input"]["command"] = f"git switch {expected}"
+    assert branch_guard("PreToolUse", payload, lane, expected) == (
+        None,
+        "branch_restore",
+    )
+
+
+def test_native_hook_allows_branch_work_in_separate_worktree(
+    bridge, repo, paired
+):
+    data = paired
+    lane = Path(data["lanes"]["codex"])
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": f"git -C {repo} switch main"},
+    }
+    assert branch_guard(
+        "PreToolUse", payload, lane, data["branches"]["codex"]
+    ) == (None, "branch_ok")
 
 
 @pytest.mark.parametrize("agent", ["claude", "codex"])
@@ -171,8 +248,10 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
     assert "bypass" not in " ".join(result["argv"])
 
 
-def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
-    data = bridge.setup(repo)
+def test_mcp_two_clients_conflict_handoff_auth_and_restart(
+    bridge, repo, paired
+):
+    data = paired
     bridge.up()
     pid = bridge.server_process().pid
     bridge.up()
@@ -191,8 +270,8 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
 
     async def exercise():
         tokens = {}
-        for agent, name in [("claude", "GreenCastle"), ("codex", "BlueLake")]:
-            identity = await bridge.identity(agent, data)
+        for name in ("claude", "codex"):
+            identity = await bridge.identity(name, data)
             tokens[name] = identity["registration_token"]
 
         async def call(client, tool, arguments):
@@ -206,13 +285,20 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
             return result
 
         async with client_session(
-            bridge.url + "/mcp/", auth=tokens["GreenCastle"]
+            bridge.url + "/mcp/", auth=tokens["claude"]
         ) as claude:
             async with client_session(
-                bridge.url + "/mcp/", auth=tokens["BlueLake"]
+                bridge.url + "/mcp/", auth=tokens["codex"]
             ) as codex:
                 root = data["root"]
-                assert len((await claude.list_tools()).tools) == 6
+                assert len((await claude.list_tools()).tools) == 7
+                roster_view = await call(claude, "list_participants", {})
+                assert sorted(
+                    entry["name"]
+                    for entry in json.loads(roster_view.content[0].text)[
+                        "participants"
+                    ]
+                ) == ["claude", "codex"]
                 granted = await call(
                     claude,
                     "file_reservation_paths",
@@ -251,7 +337,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
                     {
                         "project_key": root,
                         "sender_name": "GreenCastle",
-                        "to": ["BlueLake"],
+                        "to": ["codex"],
                         "subject": "Login contract",
                         "body_md": "Response now includes session_id.",
                         "thread_id": "login-task",
@@ -299,9 +385,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
                 assert (
                     checkpoint(bridge.home, directory, "codex", payload) == {}
                 )
-                assert (
-                    mailbox(bridge.home, root, "BlueLake")["pending_ack"] == 1
-                )
+                assert mailbox(bridge.home, root, "codex")["pending_ack"] == 1
                 await call(
                     codex,
                     "acknowledge_message",
@@ -311,9 +395,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
                         "message_id": message["id"],
                     },
                 )
-                assert (
-                    mailbox(bridge.home, root, "BlueLake")["pending_ack"] == 0
-                )
+                assert mailbox(bridge.home, root, "codex")["pending_ack"] == 0
                 await call(
                     claude,
                     "release_file_reservations",
@@ -340,7 +422,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
                     {
                         "project_key": root,
                         "sender_name": "BlueLake",
-                        "to": ["GreenCastle"],
+                        "to": ["claude"],
                         "subject": "Handoff",
                         "body_md": (
                             f"Reviewed commit {data['base']}; "
@@ -410,9 +492,8 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(bridge, repo):
     assert (Path(data["lanes"]["claude"]) / "shared.txt").exists()
 
 
-def test_reports_require_remaining_work_or_verification(bridge, repo):
-    data = bridge.setup(repo)
-    lane = Path(data["lanes"]["claude"])
+def test_reports_require_remaining_work_or_verification(bridge, repo, paired):
+    lane = Path(paired["lanes"]["claude"])
     with pytest.raises(BridgeError, match="remaining"):
         bridge.report(lane, "partial", "Engine built", "", "")
     with pytest.raises(BridgeError, match="evidence"):
@@ -431,21 +512,33 @@ def test_reports_require_remaining_work_or_verification(bridge, repo):
     assert state["remaining"] == "CLI integration missing"
 
 
-def test_legacy_status_does_not_infer_completion(bridge, repo, capsys):
-    data = bridge.setup(repo)
-    directory = Path(data["lanes"]["claude"]).parent
+def test_liveness_follows_the_session_process_not_the_session_lock(
+    bridge, repo, paired, capsys
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    running = {
+        "session_pid": os.getpid(),
+        "session_ticks": start_ticks(os.getpid()),
+    }
+    write_json(directory / "claude-activity.json", running)
     with lock(directory / "claude.session.lock"):
         bridge.status()
     output = capsys.readouterr().out
     assert "running; checkpoints unavailable (relaunch)" in output
     assert "Reported outcome: unknown" in output
+    write_json(
+        directory / "claude-activity.json",
+        {**running, "session_ticks": "0", "activity": "working"},
+    )
+    with lock(directory / "claude.session.lock"):
+        bridge.status()
+    assert "claude (claude): stopped" in capsys.readouterr().out
 
 
 def test_hook_failure_pauses_tools_and_foreign_worktree_is_rejected(
-    bridge, repo
+    bridge, repo, paired
 ):
-    data = bridge.setup(repo)
-    lane = Path(data["lanes"]["claude"])
+    lane = Path(paired["lanes"]["claude"])
     write_json(lane.parent / "claude-identity.json", {"name": "GreenCastle"})
     payload = {
         "hook_event_name": "PreToolUse",
@@ -466,11 +559,139 @@ def test_hook_failure_pauses_tools_and_foreign_worktree_is_rejected(
     )
 
 
-def test_issue_claim_race_persistence_and_explicit_handoff(
-    bridge, repo, tmp_path
+def test_top_reports_every_participant_and_writes_no_state(
+    bridge, repo, paired, capsys
 ):
-    data = bridge.setup(repo)
-    lanes = {name: Path(path) for name, path in data["lanes"].items()}
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(
+        directory / "claude-activity.json",
+        {
+            "activity": "working",
+            "session_pid": os.getpid(),
+            "session_ticks": start_ticks(os.getpid()),
+            "last_prompt": "Wire the dashboard",
+        },
+    )
+    bridge.issue(Path(paired["lanes"]["codex"]), "claim", "77")
+    before = {
+        path.name: path.stat().st_mtime_ns for path in directory.iterdir()
+    }
+    dashboard.run(bridge.home, lambda: False, once=True)
+    output = capsys.readouterr().out
+    assert "agent-bridge top  server: not running" in output
+    assert "denials 0 (0%)" in output
+    assert "#77" in output
+    assert "Wire the dashboard" in output
+    assert "working" in output and "stopped" in output
+    assert {
+        path.name: path.stat().st_mtime_ns for path in directory.iterdir()
+    } == before
+
+
+def test_top_reports_only_the_selected_providers(bridge, repo, paired, capsys):
+    dashboard.run(bridge.home, lambda: False, once=True, providers=("codex",))
+    selected = capsys.readouterr().out
+    assert "codex/default" in selected
+    assert "claude/default" not in selected
+    assert "participants 1" in selected
+    assert "provider codex" in selected
+
+    dashboard.run(
+        bridge.home, lambda: False, once=True, providers=("claude", "codex")
+    )
+    both = capsys.readouterr().out
+    assert "claude/default" in both and "codex/default" in both
+    assert "participants 2" in both
+
+    dashboard.run(bridge.home, lambda: False, once=True, providers=("kimi",))
+    none = capsys.readouterr().out
+    assert "no participants for the selected provider" in none
+    assert "participants 0" in none
+
+    dashboard.run(bridge.home, lambda: False, once=True)
+    unfiltered = capsys.readouterr().out
+    assert "participants 2" in unfiltered
+    assert "provider " not in unfiltered
+
+
+def test_checkpoint_records_every_decision_in_a_rotating_event_log(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(
+        "agent_bridge.checkpoints.mailbox",
+        lambda *args: {"pending_ack": 0, "messages": []},
+    )
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    log = directory / "claude-events.jsonl"
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(lane),
+        "session_id": "test",
+        "tool_name": "Bash",
+        "tool_input": {"command": "pytest -q"},
+    }
+    checkpoint(bridge.home, directory, "claude", payload)
+    checkpoint(
+        bridge.home, directory, "claude", {**payload, "agent_id": "child"}
+    )
+    git(lane, "switch", "-c", "personal-work")
+    denied = checkpoint(bridge.home, directory, "claude", payload)
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    entries = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [entry["reason_class"] for entry in entries] == [
+        "coordination_pending",
+        "ignored_event",
+        "branch_drift",
+    ]
+    assert [entry["decision"] for entry in entries] == [
+        "allow",
+        "allow",
+        "deny",
+    ]
+    assert entries[0]["activity"] == "testing (command observed)"
+    assert entries[0]["tool_name"] == "Bash"
+    assert entries[0]["injected_bytes"] > 0
+    assert entries[1]["injected_bytes"] == 0
+    log.write_text("x" * MAX_EVENT_LOG_BYTES)
+    checkpoint(bridge.home, directory, "claude", payload)
+    assert (directory / "claude-events.1.jsonl").exists()
+    assert 0 < len(log.read_bytes()) < MAX_EVENT_LOG_BYTES
+    (directory / "claude-events.1.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": 1.0,
+                "decision": "deny",
+                "injected_bytes": 5,
+                "reason_class": "branch_drift",
+            }
+        )
+        + "\n"
+    )
+    log.write_text(
+        json.dumps(
+            {
+                "ts": 2.0,
+                "decision": "allow",
+                "injected_bytes": 7,
+                "reason_class": "coordination_pending",
+            }
+        )
+        + "\n"
+    )
+    summary = event_summary(directory, "claude")
+    assert summary["events"] == 2
+    assert summary["denials"] == 1
+    assert summary["injected_bytes"] == 12
+    assert summary["last_ts"] == 2.0
+    assert summary["last_reason"] == "coordination_pending"
+
+
+def test_issue_claim_race_persistence_and_explicit_handoff(
+    bridge, repo, paired, tmp_path
+):
+    lanes = {name: Path(path) for name, path in paired["lanes"].items()}
     commands = [
         subprocess.Popen(
             [
@@ -526,10 +747,11 @@ def test_issue_claim_race_persistence_and_explicit_handoff(
 
 
 def test_issue_decline_no_timeout_and_worktree_authority(
-    bridge, repo, monkeypatch
+    bridge, repo, paired, monkeypatch
 ):
-    data = bridge.setup(repo)
-    claude, codex = (Path(data["lanes"][name]) for name in ("claude", "codex"))
+    claude, codex = (
+        Path(paired["lanes"][name]) for name in ("claude", "codex")
+    )
     with pytest.raises(BridgeError, match="worktree"):
         bridge.issue(repo, "claim", "432")
     for number in (
@@ -554,9 +776,12 @@ def test_issue_decline_no_timeout_and_worktree_authority(
     assert declined["offer"] is None
 
 
-def test_issue_crash_releases_operation_lock_but_preserves_owner(bridge, repo):
-    data = bridge.setup(repo)
-    claude, codex = (Path(data["lanes"][name]) for name in ("claude", "codex"))
+def test_issue_crash_releases_operation_lock_but_preserves_owner(
+    bridge, repo, paired
+):
+    claude, codex = (
+        Path(paired["lanes"][name]) for name in ("claude", "codex")
+    )
     bridge.issue(claude, "claim", "432")
     crashed = subprocess.run(
         [
@@ -579,12 +804,13 @@ def test_issue_crash_releases_operation_lock_but_preserves_owner(bridge, repo):
 
 
 def test_issue_notifications_are_once_per_change_without_empty_reminders(
-    bridge, repo, monkeypatch
+    bridge, repo, paired, monkeypatch
 ):
-    data = bridge.setup(repo)
-    claude, codex = (Path(data["lanes"][name]) for name in ("claude", "codex"))
+    claude, codex = (
+        Path(paired["lanes"][name]) for name in ("claude", "codex")
+    )
     directory = claude.parent
-    write_json(directory / "codex-identity.json", {"name": "BlueLake"})
+    write_json(directory / "codex-identity.json", {"name": "codex"})
     monkeypatch.setattr(
         "agent_bridge.checkpoints.mailbox",
         lambda *args: {"pending_ack": 0, "messages": []},
@@ -630,19 +856,18 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     project = Path(__file__).resolve().parents[1]
     metadata = tomllib.loads((project / "pyproject.toml").read_text())
     version = metadata["project"]["version"]
-    wheel = project / "dist" / f"agent_bridge-{version}-py3-none-any.whl"
+    stem = metadata["project"]["name"].replace("-", "_")
+    wheel = project / "dist" / f"{stem}-{version}-py3-none-any.whl"
     assert wheel.exists(), "Run make build before the installed-package test."
     with zipfile.ZipFile(wheel) as archive:
         assert "agent_bridge/__main__.py" in archive.namelist()
         package_metadata = archive.read(
-            f"agent_bridge-{version}.dist-info/METADATA"
+            f"{stem}-{version}.dist-info/METADATA"
         ).decode()
         assert "Requires-Dist:" not in package_metadata
         assert not any(name.startswith("src/") for name in archive.namelist())
-    with tarfile.open(
-        project / "dist" / f"agent_bridge-{version}.tar.gz"
-    ) as archive:
-        root = f"agent_bridge-{version}"
+    with tarfile.open(project / "dist" / f"{stem}-{version}.tar.gz") as archive:
+        root = f"{stem}-{version}"
         for client in ("codex", "claude"):
             manifest_path = (
                 f"{root}/plugins/agent-bridge/.{client}-plugin/plugin.json"
@@ -737,6 +962,23 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             check=True,
             timeout=15,
         )
+    for participant in ("claude", "codex"):
+        subprocess.run(
+            [
+                str(executable),
+                "participant",
+                "add",
+                participant,
+                "--repo",
+                str(repo),
+            ],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
     result = subprocess.run(
         [str(executable), "setup", str(repo)],
         cwd=tmp_path,
@@ -758,7 +1000,9 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             timeout=30,
         )
         assert result.returncode == expected, result.stderr
-    installed_python = tmp_path / "tools" / "agent-bridge" / "bin" / "python"
+    installed_python = (
+        tmp_path / "tools" / metadata["project"]["name"] / "bin" / "python"
+    )
     location = subprocess.run(
         [
             str(installed_python),
@@ -781,3 +1025,500 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         check=True,
         timeout=30,
     )
+
+
+def test_many_accounts_of_one_provider_run_side_by_side(
+    bridge, repo, monkeypatch, tmp_path
+):
+    """Runs one provider under several accounts, each with its own lane."""
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'home': os.environ.get('CLAUDE_CONFIG_DIR', ''),\n"
+        "  'cwd': os.getcwd(),\n"
+        "  'token': os.environ.get('AGENT_BRIDGE_TOKEN', '')}, f)\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    store.initialize(bridge.home)
+    accounts = {f"claude-{index}": f"account-{index}" for index in (1, 2, 3)}
+    for profile in accounts.values():
+        roster.define_credential(
+            bridge.home, profile, str(tmp_path / profile), [], []
+        )
+    captured = {}
+    for name, profile in accounts.items():
+        capture = tmp_path / f"{name}.json"
+        monkeypatch.setenv("CAPTURE", str(capture))
+        assert (
+            bridge.launch(name, repo, "Work on issue 42", "claude", profile)
+            == 0
+        )
+        captured[name] = json.loads(capture.read_text())
+    data = bridge.setup(repo)
+    for name, profile in accounts.items():
+        assert captured[name]["cwd"] == data["lanes"][name]
+        assert captured[name]["home"] == str(tmp_path / profile)
+        assert data["participants"][name]["provider"] == "claude"
+    for field in ("cwd", "home", "token"):
+        values = [captured[name][field] for name in accounts]
+        assert len(set(values)) == len(accounts)
+    assert len({data["branches"][name] for name in accounts}) == len(accounts)
+    directory = Path(data["lanes"]["claude-1"]).parent
+    with lock(directory / "claude-1.session.lock"):
+        monkeypatch.setenv("CAPTURE", str(tmp_path / "second-run.json"))
+        assert bridge.launch("claude-2", repo, "Continue") == 0
+
+
+def test_provider_definitions_never_store_credential_values(
+    bridge, monkeypatch
+):
+    """Keeps secrets in the caller's environment instead of bridge state."""
+    with pytest.raises(BridgeError, match="does not store"):
+        roster.define_provider(
+            bridge.home,
+            "vendor",
+            "claude",
+            "claude",
+            "CLAUDE_CONFIG_DIR",
+            ["ANTHROPIC_AUTH_TOKEN=super-secret"],
+            [],
+        )
+    roster.define_provider(
+        bridge.home,
+        "vendor",
+        "claude",
+        "claude",
+        "CLAUDE_CONFIG_DIR",
+        ["ANTHROPIC_BASE_URL=https://vendor.example/anthropic"],
+        ["ANTHROPIC_AUTH_TOKEN"],
+    )
+    assert "super-secret" not in (bridge.home / "providers.json").read_text()
+    entry = roster.provider(bridge.home, "vendor")
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    with pytest.raises(BridgeError, match="Export these"):
+        roster.launch_environment(bridge.home, entry, None)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "exported-by-the-user")
+    assert roster.launch_environment(bridge.home, entry, None) == {
+        "ANTHROPIC_BASE_URL": "https://vendor.example/anthropic"
+    }
+    with pytest.raises(BridgeError, match="adapter must be"):
+        roster.define_provider(
+            bridge.home, "vendor", "vendor-cli", "vendor", "", [], []
+        )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escape",
+        "",
+        "Claude",
+        "project",
+        "a" * 40,
+        "issues.json",
+        "codex-activity.json",
+    ],
+)
+def test_invalid_participant_names_are_rejected(bridge, repo, name):
+    with pytest.raises(BridgeError, match="must match"):
+        bridge.add_participant(repo, name, "claude")
+
+
+def test_one_drifted_lane_does_not_block_other_participants(
+    bridge, repo, paired
+):
+    drifted = Path(paired["lanes"]["codex"])
+    git(drifted, "switch", "-c", "personal-work")
+    added = bridge.add_participant(repo, "kimi-1", "kimi")
+    assert "kimi-1" in added["participants"]
+    assert bridge.issue(Path(paired["lanes"]["claude"]), "claim", "51")
+    with pytest.raises(BridgeError, match="codex lane is on"):
+        bridge.add_participant(repo, "codex", "codex")
+    assert git(drifted, "branch", "--show-current") == "personal-work"
+
+
+def test_restore_returns_a_drifted_lane_without_discarding(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    git(lane, "switch", "-c", "personal-work")
+    (lane / "draft.txt").write_text("unsaved\n")
+    with pytest.raises(BridgeError, match="uncommitted changes"):
+        bridge.restore(repo, "codex")
+    assert (lane / "draft.txt").read_text() == "unsaved\n"
+    git(lane, "add", "draft.txt")
+    git(
+        lane,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Work in progress",
+    )
+    with pytest.raises(BridgeError, match="commits that"):
+        bridge.restore(repo, "codex")
+    assert git(lane, "log", "--oneline", "-1")
+    git(lane, "branch", "-f", branch, "personal-work")
+    assert "restored" in bridge.restore(repo, "codex")
+    assert (lane / "draft.txt").read_text() == "unsaved\n"
+    assert git(lane, "branch", "--show-current") == branch
+    assert bridge.restore(repo, "codex") == f"codex is already on {branch}."
+
+
+def test_retire_removes_a_lane_and_revokes_its_credential(bridge, repo, paired):
+    store.initialize(bridge.home)
+    token = asyncio.run(bridge.identity("codex", paired))["registration_token"]
+    assert store.authenticate(bridge.home, token)
+    lane = Path(paired["lanes"]["codex"])
+    (lane / "draft.txt").write_text("unsaved\n")
+    with pytest.raises(BridgeError, match="uncommitted changes"):
+        bridge.retire(repo, "codex")
+    assert lane.exists()
+    (lane / "draft.txt").unlink()
+    message = bridge.retire(repo, "codex")
+    assert "deleted" in message
+    assert not lane.exists()
+    assert store.authenticate(bridge.home, token) is None
+    remaining = bridge.setup(repo)
+    assert "codex" not in remaining["participants"]
+    assert "claude" in remaining["participants"]
+    assert not (lane.parent / "codex-identity.json").exists()
+    readded = bridge.add_participant(repo, "codex", "codex")
+    assert Path(readded["lanes"]["codex"]).exists()
+
+
+def test_retire_keeps_a_branch_that_still_holds_commits(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    (lane / "kept.txt").write_text("finished work\n")
+    git(lane, "add", "kept.txt")
+    git(
+        lane,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Finished work",
+    )
+    assert "kept" in bridge.retire(repo, "codex")
+    assert not lane.exists()
+    assert git(repo, "rev-parse", "--verify", branch)
+    assert "kept.txt" in git(repo, "show", "--name-only", branch)
+
+
+def test_roster_change_alone_never_denies_a_tool_call(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(
+        "agent_bridge.checkpoints.mailbox",
+        lambda *args: {"pending_ack": 0, "messages": []},
+    )
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "test",
+        "cwd": paired["lanes"]["claude"],
+        "tool_name": "Bash",
+    }
+    notice = checkpoint(bridge.home, directory, "claude", payload)
+    assert "claude, codex" in notice["hookSpecificOutput"]["additionalContext"]
+    assert "permissionDecision" not in notice["hookSpecificOutput"]
+    stop = {**payload, "hook_event_name": "Stop"}
+    bridge.add_participant(repo, "kimi-1", "kimi")
+    assert checkpoint(bridge.home, directory, "claude", stop) == {}
+    joined = checkpoint(bridge.home, directory, "claude", payload)
+    assert "kimi-1" in joined["hookSpecificOutput"]["additionalContext"]
+    assert "permissionDecision" not in joined["hookSpecificOutput"]
+
+
+def test_messages_fan_out_to_every_named_participant(bridge, repo, paired):
+    store.initialize(bridge.home)
+    data = bridge.add_participant(repo, "kimi-1", "kimi")
+    tokens = {
+        name: asyncio.run(bridge.identity(name, data))["registration_token"]
+        for name in data["participants"]
+    }
+    sender = store.authenticate(bridge.home, tokens["claude"])
+    message = {
+        "to": ["codex", "kimi-1"],
+        "subject": "Interface change",
+        "body_md": "Response now includes session_id.",
+        "idempotency_key": "interface-1",
+    }
+    store.call(bridge.home, sender, "send_message", message)
+    for name in ("codex", "kimi-1"):
+        actor = store.authenticate(bridge.home, tokens[name])
+        inbox = store.call(bridge.home, actor, "fetch_inbox", {})
+        assert inbox["messages"][0]["subject"] == "Interface change"
+    listed = store.call(bridge.home, sender, "list_participants", {})
+    assert listed["you"] == "claude"
+    assert len(listed["participants"]) == 3
+    with pytest.raises(BridgeError, match="not registered"):
+        store.call(
+            bridge.home,
+            sender,
+            "send_message",
+            {**message, "to": ["absent"], "idempotency_key": "interface-2"},
+        )
+    with pytest.raises(BridgeError, match="1..16"):
+        store.call(
+            bridge.home,
+            sender,
+            "send_message",
+            {
+                **message,
+                "to": ["codex"] * 17,
+                "idempotency_key": "interface-3",
+            },
+        )
+
+
+def test_issue_handoff_reaches_a_third_participant(bridge, repo, paired):
+    lanes = bridge.add_participant(repo, "kimi-1", "kimi")["lanes"]
+    bridge.issue(Path(lanes["claude"]), "claim", "77")
+    offer = bridge.issue(
+        Path(lanes["claude"]),
+        "offer",
+        "77",
+        to="kimi-1",
+        summary="Take the review; commit abc is pushed.",
+    )["offer"]
+    with pytest.raises(BridgeError, match="recipient"):
+        bridge.issue(Path(lanes["codex"]), "accept", "77", offer_id=offer["id"])
+    accepted = bridge.issue(
+        Path(lanes["kimi-1"]), "accept", "77", offer_id=offer["id"]
+    )
+    assert accepted["owner"] == "kimi-1"
+    with pytest.raises(BridgeError, match="another participant"):
+        bridge.issue(
+            Path(lanes["kimi-1"]), "offer", "77", to="absent", summary="Take it"
+        )
+
+
+def test_legacy_two_lane_manifest_keeps_lanes_and_identities(
+    bridge, repo, paired
+):
+    _, directory = bridge.project(repo)
+    write_json(
+        directory / "project.json",
+        {
+            "root": paired["root"],
+            "base": paired["base"],
+            "lanes": paired["lanes"],
+            "branches": paired["branches"],
+        },
+    )
+    migrated = bridge.setup(repo)
+    assert migrated["lanes"] == paired["lanes"]
+    assert migrated["participants"]["claude"]["display"] == "GreenCastle"
+    assert migrated["participants"]["codex"]["provider"] == "codex"
+    extended = bridge.add_participant(repo, "kimi-1", "kimi")
+    assert extended["participants"]["claude"]["display"] == "GreenCastle"
+    stored = json.loads((directory / "project.json").read_text())
+    assert stored["version"] == 2
+    assert sorted(stored["participants"]) == ["claude", "codex", "kimi-1"]
+
+
+def test_joining_participant_is_announced_once(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(
+        "agent_bridge.checkpoints.mailbox",
+        lambda *args: {"pending_ack": 0, "messages": []},
+    )
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "test",
+        "cwd": paired["lanes"]["claude"],
+    }
+    first = checkpoint(bridge.home, directory, "claude", payload)
+    assert "claude, codex" in first["hookSpecificOutput"]["additionalContext"]
+    assert checkpoint(bridge.home, directory, "claude", payload) == {}
+    bridge.add_participant(repo, "kimi-1", "kimi")
+    joined = checkpoint(bridge.home, directory, "claude", payload)
+    assert "kimi-1" in joined["hookSpecificOutput"]["additionalContext"]
+
+
+def identify(worktree):
+    """Gives a fixture repository the identity a merge commit needs."""
+    git(worktree, "config", "user.name", "Bridge Test")
+    git(worktree, "config", "user.email", "test@example.com")
+
+
+def commit(worktree, message):
+    """Records every pending change with a fixed identity."""
+    git(worktree, "add", "--all")
+    git(
+        worktree,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        message,
+    )
+
+
+def test_merge_integrates_a_lane_branch_and_leaves_the_lane_alone(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    directory = lane.parent
+    base = git(repo, "branch", "--show-current")
+    identify(repo)
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "Lane work")
+
+    (lane / "draft.txt").write_text("unsaved\n")
+    with pytest.raises(BridgeError, match="uncommitted changes that"):
+        bridge.merge(repo, "codex")
+    (lane / "draft.txt").unlink()
+
+    (repo / "pending.txt").write_text("base scratch\n")
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.merge(repo, "codex")
+    (repo / "pending.txt").unlink()
+
+    with lock(directory / "codex.session.lock"):
+        with pytest.raises(BridgeError, match="running session"):
+            bridge.merge(repo, "codex")
+
+    message = bridge.merge(repo, "codex")
+    assert f"Merged {branch} into {base}" in message
+    assert (repo / "feature.txt").read_text() == "lane work\n"
+    assert git(repo, "log", "-1", "--pretty=%s") == (
+        f"Merge bridge lane codex from {branch}"
+    )
+    assert len(git(repo, "log", "-1", "--pretty=%P").split()) == 2
+    assert lane.exists()
+    assert git(lane, "branch", "--show-current") == branch
+    assert bridge.merge(repo, "codex") == (
+        f"{base} already contains every commit on {branch}."
+    )
+
+
+def test_merge_leaves_a_conflict_resolvable_without_discarding(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    identify(repo)
+    (lane / "shared.txt").write_text("lane version\n")
+    commit(lane, "Lane edit")
+    (repo / "shared.txt").write_text("base version\n")
+    commit(repo, "Base edit")
+
+    with pytest.raises(BridgeError, match="stopped on conflicts") as failure:
+        bridge.merge(repo, "codex")
+    assert "shared.txt" in str(failure.value)
+    assert "merge --abort" in str(failure.value)
+    assert "shared.txt" in git(repo, "diff", "--name-only", "--diff-filter=U")
+
+    with pytest.raises(BridgeError, match="already merging"):
+        bridge.merge(repo, "codex")
+    git(repo, "merge", "--abort")
+    assert (repo / "shared.txt").read_text() == "base version\n"
+    assert (lane / "shared.txt").read_text() == "lane version\n"
+
+
+def test_event_history_is_bounded_by_age_and_reported_by_window(
+    bridge, repo, paired, tmp_path, capsys
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    log = directory / "claude-events.jsonl"
+    now = time.time()
+    expired = now - MAX_EVENT_LOG_AGE - 60
+    log.write_text(
+        "".join(
+            json.dumps(entry) + "\n"
+            for entry in (
+                {
+                    "ts": expired,
+                    "decision": "deny",
+                    "injected_bytes": 5,
+                    "reason_class": "branch_drift",
+                },
+                {
+                    "ts": now - 30,
+                    "decision": "allow",
+                    "injected_bytes": 7,
+                    "reason_class": "coordination_pending",
+                },
+            )
+        )
+    )
+    assert event_summary(directory, "claude")["events"] == 2
+    windowed = event_summary(directory, "claude", now - 60)
+    assert windowed["events"] == 1
+    assert windowed["denials"] == 0
+    assert windowed["injected_bytes"] == 7
+
+    dashboard.run(bridge.home, lambda: False, once=True, window=3600.0)
+    assert "last 60m" in capsys.readouterr().out
+    dashboard.run(bridge.home, lambda: False, once=True)
+    assert "all retained" in capsys.readouterr().out
+
+    destination = tmp_path / "events.jsonl"
+    report = bridge.export_events(repo, ("claude",), output=destination)
+    exported = [
+        json.loads(line) for line in destination.read_text().splitlines()
+    ]
+    assert [entry["participant"] for entry in exported] == ["claude"] * 2
+    assert [entry["ts"] for entry in exported] == [expired, now - 30]
+    assert "2 records" in report and str(destination) in report
+    assert bridge.export_events(repo, (), now - expired - 30, destination)
+    assert len(destination.read_text().splitlines()) == 1
+
+    with pytest.raises(BridgeError, match="Not a participant"):
+        bridge.export_events(repo, ("absent",))
+
+    assert prune(directory, "claude", now) == 1
+    assert event_summary(directory, "claude")["events"] == 1
+    assert json.loads(log.read_text().splitlines()[0])["ts"] == now - 30
+
+
+def test_session_end_discards_event_records_past_the_retention_age(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    log = directory / "claude-events.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "ts": time.time() - MAX_EVENT_LOG_AGE - 60,
+                "decision": "deny",
+                "injected_bytes": 5,
+                "reason_class": "branch_drift",
+            }
+        )
+        + "\n"
+    )
+    checkpoint(
+        bridge.home,
+        directory,
+        "claude",
+        {
+            "hook_event_name": "SessionEnd",
+            "cwd": str(lane),
+            "session_id": "test",
+        },
+    )
+    entries = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [entry["event"] for entry in entries] == ["SessionEnd"]

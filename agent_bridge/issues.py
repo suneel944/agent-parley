@@ -25,6 +25,7 @@ def change(
     action: str,
     issue: str,
     *,
+    participants: set[str],
     to: str | None = None,
     summary: str = "",
     offer_id: str | None = None,
@@ -36,7 +37,8 @@ def change(
         agent: Acting lane, resolved by the CLI from its worktree.
         action: Claim, release, offer, accept, decline, or cancel.
         issue: Positive repository issue number, optionally prefixed with #.
-        to: Recipient lane for an offer.
+        participants: Every participant registered for this project.
+        to: Recipient participant for an offer.
         summary: Peer-provided handoff context.
         offer_id: Exact current offer required for acceptance or decline.
 
@@ -91,12 +93,10 @@ def change(
                 if action == "offer":
                     recipient = to
                     summary = summary.strip()
-                    if (
-                        recipient not in ("claude", "codex")
-                        or recipient == agent
-                    ):
+                    if recipient not in participants or recipient == agent:
                         raise BridgeError(
-                            "Choose the other agent as recipient."
+                            "Choose another participant in this project; "
+                            "run agent-bridge participant list."
                         )
                     if not summary or len(summary) > 2000:
                         raise BridgeError(
@@ -137,8 +137,18 @@ def change(
         return record
 
 
-def describe(state: dict) -> str:
-    """Formats active ownership and pending offers without changing state."""
+def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
+    """Formats active ownership and pending offers without changing state.
+
+    Args:
+        state: Published issue ledger.
+        liveness: Optional session state per participant, reported beside the
+            owner. Liveness is information for an operator; silence, idleness,
+            and a stopped session never transfer ownership.
+
+    Returns:
+        One line for each owned issue, or a notice that none are claimed.
+    """
     lines = []
     for number, record in sorted(
         state["issues"].items(), key=lambda item: int(item[0])
@@ -146,6 +156,8 @@ def describe(state: dict) -> str:
         if not record["owner"]:
             continue
         line = f"#{number}: {record['owner']}"
+        if liveness and record["owner"] in liveness:
+            line += f" ({liveness[record['owner']]})"
         if offer := record["offer"]:
             age = max(0, int(time.time() - offer["created"]))
             line += (

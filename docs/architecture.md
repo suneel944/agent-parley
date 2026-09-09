@@ -10,11 +10,24 @@ native approvals, or merge work.
 | --- | --- |
 | `cli` | Git worktrees, native configuration, launch, status and reports |
 | `server` | Authenticated MCP transport and bounded tool contracts |
-| `store` | SQLite schema, migration, scoped mail and atomic leases |
-| `process` | Linux process identity and pidfd shutdown |
+| `store` | SQLite schema, migration, scoped mail, atomic leases and tool events |
+| `process` | Linux process identity, session liveness and pidfd shutdown |
 | `issues` | Claim and handoff state transitions |
+| `roster` | Providers, credential profiles and project participants |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `dashboard` | Read-only live operator view of every participant |
 | `state` | Private atomic JSON publication and operation locks |
+
+Enforcement and telemetry share one substrate, on purpose, in two places. Hook
+decisions are appended per participant beside the lane state, because a hook
+blocks its agent and must never wait on the coordination store's write lock.
+Served MCP calls are recorded in the store's `events` table inside the very
+transaction that carries the call's own effect, so an event exists exactly when
+the effect it describes was committed. A rejected call rolls that transaction
+back, and a read-only call holds no write lock, so both record afterwards in
+their own short transaction; a busy store loses the record rather than the
+call. Retention is bounded to the most recent 2000 events per project, and
+telemetry never decides an outcome.
 
 The service is a singleton **per private state directory**. An exclusive startup
 lock serializes launch and shutdown; the loopback port prevents a second listener.
@@ -40,17 +53,117 @@ requests, and avoids credential/body logging. It supports stateless JSON respons
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent
 official MCP SDK exercises initialization and calls in CI.
 
-Six tools cover sending, fetching, acknowledging, marking read, reserving files,
-and releasing reservations. Unknown arguments fail. Sends require an idempotency
+Seven tools cover sending, fetching, acknowledging, marking read, reserving
+files, releasing reservations, and listing participants. Unknown arguments fail. Sends require an idempotency
 key: identical retries return the original message ID; changed retries fail.
 Fetching never marks a message read or acknowledges it.
+
+No coordination tool returns a participant's whole starting context. The store
+holds projects, agents, messages, recipients, reservations and events, keyed by
+an authenticated project and lane. The issue ledger and the participant
+manifest are files in the project state directory, whose name derives from the
+repository's Git common directory, which the store never records. A served
+call carries no repository path, and the detached service must not run Git, so
+reaching that directory would need a new schema column, a launch-time map that
+goes stale as projects are added, or a scan of every project's manifest. None
+of those buys a capability. Checkpoints already deliver the roster, the issue
+ledger and message previews at session start and again on any prompt submit or
+pre-tool-use whose state changed; `list_participants` returns the roster on
+demand; and `agent-bridge issue list`, run from a participant's own worktree,
+re-reads the ledger from the one process that can resolve the directory. The
+store therefore stays free of repository paths, and refreshing context stays a
+checkpoint and CLI concern rather than a coordination tool.
+
+## Participants, providers and accounts
+
+A project holds a roster of participants. A participant is one lane: its own
+worktree, bridge branch, registration credential, activity file, event log and
+session lock. Its name addresses it in handoffs and message recipients, and it
+also becomes a directory and a branch component, so the validator accepts only
+lowercase letters, digits, hyphens and underscores. Dots are refused: a lane
+named after a peer's state file would otherwise shadow that file. Adding a
+participant creates only that lane and never touches existing lanes or branches.
+
+The activity file holds last state only; the event log,
+`<participant>-events.jsonl`, appends one record per observed hook event with an
+enumerated reason class and the decision it produced, so denials are retained
+rather than overwritten. Hooks block the agent, so the log stays a plain
+append-only file in the project state directory, outside the coordination store
+and its write lock, and it rotates to `<participant>-events.1.jsonl` at a fixed
+byte cap. A reader summarizes the rotated file and then the current one, oldest
+record first, so a report covers everything still retained rather than the
+current file alone. Retention is bounded twice: two files, because the rotation
+that creates a new one discards the older, and a maximum record age. Age
+retention rewrites the log, which costs a full read and write, so it runs only
+at a session boundary and never on the blocking path a hook takes before a tool
+call. A lane that never reaches a session boundary is still bounded by the byte
+cap. Each file is replaced atomically, and a failed rewrite leaves the log
+exactly as it was. A log failure never changes an enforcement outcome.
+
+Retained records are readable as a whole or over a window. A window filters on
+the recorded time, so it reports a period rather than a file, and a record
+carrying no time is never counted inside one. Export writes the retained
+records as JSON Lines, one record per line, each naming the participant that
+produced it, so enforcement history leaves the state directory in the shape it
+was stored in rather than a rendered summary.
+
+A lane's session state follows a recorded session process identity, matched by
+process ID and Linux creation ticks, never its session lock. The launcher holds
+that lock for the whole session, so probing it would make a concurrent launch
+fail while merely reporting. A session that ends without clearing its record
+reads as stopped, because its process is gone.
+
+A provider states which native CLI drives a participant and how that CLI reaches
+a model. Coordination needs MCP server configuration and lifecycle hooks, which
+the `claude` and `codex` CLIs supply, so every provider names one of those two
+adapters. Providers for other vendors reuse an adapter and change the endpoint
+through environment variables. The `deepseek`, `kimi` and `grok` presets carry no
+endpoint; `agent-bridge provider add` defines further providers locally.
+
+A credential profile selects one account by pointing the CLI's config-home
+variable at a separate directory, so the same provider can run twice under
+different logins. Profiles record directories, plain variable values and required
+variable names. Values whose names look like credentials are rejected, and
+required variables are read from the caller's environment at launch, so no
+credential value enters bridge state. Sign-in inside each config home remains the
+native CLI's own action.
+
+Branch verification is scoped to the lane an operation touches, so a lane left
+on the wrong branch blocks only its own participant. `status` reports every
+lane's actual branch. `participant restore` returns one lane to its branch and
+`participant retire` removes one lane; both refuse while that participant holds
+its session lock or its worktree is dirty, and neither resets, cleans, stashes,
+or force-switches. Retiring invalidates that participant's credential and keeps
+its branch whenever the branch holds commits the project base does not.
+
+`participant merge` integrates one lane's branch into the base checkout. It runs
+in the common repository root, never inside another lane, and always records a
+merge commit, so an integration is auditable rather than replayed as a fast
+forward. It refuses on a drifted lane, on a running session, on a dirty base
+checkout, on uncommitted lane changes the branch does not carry, and on a base
+checkout that is already merging or on a detached HEAD. A conflict is left in
+the working tree with the conflicting paths named and both `git merge --continue`
+and `git merge --abort` reported; Agent Bridge never resolves a conflict, and
+never resets, cleans, stashes or force-switches. Merging leaves the lane and its
+branch untouched, so retiring stays a separate decision.
+
+Manifests written by the earlier two-lane layout upgrade on first read. Migrated
+lanes keep their branches and registered identities, so existing mail, claims and
+reservations continue to resolve.
 
 ## Persistence and concurrency
 
 Mail uses SQLite WAL with indexed inbox and active-lease queries. Each write
 acquires an immediate transaction, validates and mutates, then commits once.
-Connections close after every operation. Lock acquisition times out after 300 ms.
-Conflicting reservation batches grant no paths. Directory overlaps are detected;
+Connections close after every operation. A writer waits up to one second for
+another transaction to commit.
+Conflicting reservation batches grant no paths. Each conflict names the blocking
+lane and that lane's declared reason, clipped to 80 characters, so a denied
+caller can judge the overlap without a further call. Conflicts are reported
+until the serialized result reaches its budget, and `has_more` states that
+further conflicts exist beyond the reported ones. Every lease records its
+creation time, so an operator can see lease age rather than expiry alone.
+Directory overlaps are detected;
 two globs conservatively conflict when either lease is exclusive. Use exact paths
 when disjoint globs would otherwise be rejected. Renewals replace the owner's
 previous lease atomically. Expired or released leases no longer block work.
@@ -59,6 +172,11 @@ Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer
 ID. Cancellation invalidates that ID. No timeout or process exit transfers
 ownership. Reported `ready` outcomes do not establish verified completion.
+Ownership listings report each owner's session state and the age of its last
+observed checkpoint. That report is for an operator; silence, an idle session
+and a stopped session all leave ownership where it is. `agent-bridge top`
+renders the same state continuously, adding branch drift, denial counts and
+served calls; it reads state and never writes it.
 
 Shutdown verifies the module, state path and process creation ticks, then pins
 the process with Linux pidfd before signaling. It does not kill arbitrary PIDs.
@@ -72,19 +190,31 @@ the process with Linux pidfd before signaling. It does not kill arbitrary PIDs.
 | New message body | 4,096 UTF-8 bytes |
 | Inbox page | Up to 5 messages; bodies omitted by default |
 | Body page | Up to 1,024 Unicode characters |
-| Serialized inbox result | At most 8,192 UTF-8 bytes |
+| Serialized inbox or conflict result | At most 8,192 UTF-8 bytes |
 | Hook preview batch | Up to 3 messages |
 | Injected notice | At most 1,536 UTF-8 bytes |
+| Message recipients | 1–16 per send |
+| Participants per project | At most 32 |
+| Roster listing | At most 32 participants |
 | Active reservations | At most 128 per lane |
 | Reservation lifetime | 30–3,600 seconds |
+| Reservation reason | 160 bytes stored; 80 characters reported on conflict |
+| Participant event log | Rotated at 262,144 bytes; one rotated file retained |
+| Participant event age | 1,209,600 seconds, applied at a session boundary |
+| Retained tool events | 2,000 per project |
 
 Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refetch
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.
 Stored legacy text is not discarded to satisfy response budgets.
 
-Hooks read local state without network requests or model calls. Session cursors
-prevent duplicate delivery; issue revisions suppress unchanged reminders. New
-sessions receive a bounded briefing of still-unreviewed mail. Stop retries do
+Hooks read local state without network requests or model calls. They reject
+branch-changing commands in assigned lanes, detect branch drift after any bypass,
+and block normal completion until the manifest-owned branch is restored. Session
+cursors prevent duplicate delivery; issue revisions suppress unchanged reminders.
+A changed roster is announced once so a joining participant stays addressable;
+that announcement never denies a tool call and never blocks completion, because
+no peer addressed it to anyone.
+New sessions receive a bounded briefing of still-unreviewed mail. Stop retries do
 not create continuation loops. Failed observations never request replay of an
 already completed action. Coordination errors before edits pause work.
 
@@ -99,6 +229,12 @@ read-only snapshot. IDs, acknowledgements and leases are retained; the original
 remains unchanged. Imported rows and the schema version commit together.
 Existing identities are rebound locally at launch. Stop old services and sessions
 before upgrading; no live workspace is automatically migrated or terminated.
+
+A store written by an earlier 0.3 release upgrades in place on first use: the
+event table is created and reservations gain a creation time, which existing
+leases date from the upgrade. No coordination row is rewritten, and the schema
+version publishes in the same transaction as the change it describes. A store
+written by a newer schema is refused rather than downgraded.
 
 CI covers temporary Git repositories, independent MCP clients, concurrent calls,
 authorization failures, persistence, resource budgets and isolated wheel installs.

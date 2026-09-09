@@ -1,6 +1,6 @@
 ---
 name: coordinate
-description: Inspect Agent Bridge status, claim repository issues, and manage explicit handoffs between Claude Code and Codex in paired worktrees. Use when working through Agent Bridge or when the user requests bridge coordination.
+description: Inspect Agent Bridge status, claim repository issues, and manage explicit handoffs between participants in separate worktrees. Use when working through Agent Bridge or when the user requests bridge coordination.
 ---
 
 # Agent Bridge coordination
@@ -8,22 +8,28 @@ description: Inspect Agent Bridge status, claim repository issues, and manage ex
 Use the installed `agent-bridge` executable. Honor `AGENT_BRIDGE_HOME` when set;
 all participants must use the same private state root.
 
-Start with `agent-bridge status` and `agent-bridge issue list` in the current
-repository. These show ownership separately from activity and reported outcomes.
+Start with `agent-bridge status`, `agent-bridge participant list`, and
+`agent-bridge issue list` in the current repository. These show ownership separately from activity and reported outcomes.
 If the executable is missing, installation from the Agent Bridge checkout is
 `make install`. Do not install software merely to answer a status question.
 
 ## Select the correct lane
 
 Issue mutations infer identity from the current worktree. Only act from this
-session's assigned lane, never impersonate the peer with `--repo` or by changing
+session's assigned lane, never impersonate a peer with `--repo` or by changing
 to its directory. If this session is not bridge-managed, explain that setup and
-native hooks require launching through the bridge in separate user terminals:
+native hooks require launching through the bridge in separate user terminals,
+one terminal per participant:
 
 ```sh
 agent-bridge run claude --repo /path/to/repository
 agent-bridge run codex --repo /path/to/repository
+agent-bridge run claude-2 --provider claude --credentials account-2 --repo /path/to/repository
 ```
+
+A project can hold any number of participants, including several of the same
+provider under different accounts. Use `list_participants` over MCP, or
+`agent-bridge participant list`, to see who is currently addressable.
 
 Do not launch nested interactive agents from a tool call or silently move an
 existing session. The plugin supplies this workflow; the launcher supplies
@@ -41,8 +47,8 @@ worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
   pass project/agent names as tool arguments. Send concise state changes with an
   idempotency key; reuse that key only when retrying the same send. Use checkpoint
   previews, fetch bodies only when needed, and avoid repeated empty inbox polling.
-- To hand off, stop editing the issue and run
-  `agent-bridge issue offer NUMBER --to PEER --summary "commit, checks, remaining"`.
+- To hand off, stop editing the issue and run `agent-bridge issue offer NUMBER
+  --to PARTICIPANT --summary "commit, checks, remaining"`.
   The owner stays paused while the offer is pending.
 - The named recipient reviews the handoff and runs
   `agent-bridge issue accept NUMBER --offer-id ID` before starting, or
