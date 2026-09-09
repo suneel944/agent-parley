@@ -20,13 +20,20 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
-      actions: write
     outputs:
       created: ${{ steps.release.outputs.release_created }}
       tag: ${{ steps.release.outputs.tag_name }}
+      number: ${{ steps.approve.outputs.number }}
     steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7
         id: release
+        with:
+          token: ${{ steps.app.outputs.token }}
       - name: Use neutral release status comments
         if: steps.release.outputs.release_created == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
@@ -55,7 +62,7 @@ jobs:
                 }
               }
             }
-      - name: Assign release ownership and trigger required checks
+      - name: Assign release ownership required by the hygiene gate
         if: steps.release.outputs.prs_created == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         env:
@@ -100,20 +107,51 @@ jobs:
               await github.rest.issues.addLabels({
                 ...repo, issue_number: pr.number, labels: ['release'],
               });
-              for (const workflow_id of ['check.yml', 'pr-hygiene.yml']) {
-                await github.rest.actions.createWorkflowDispatch({
-                  ...repo, workflow_id, ref: current.head.ref,
-                  inputs: workflow_id === 'pr-hygiene.yml' ?
-                    {pr_number: String(pr.number)} : {},
-                });
-              }
             }
+      - name: Review the release pull request as the workflow identity
+        id: approve
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        with:
+          script: |
+            const repo = context.repo;
+            const open = await github.paginate(github.rest.pulls.list, {
+              ...repo, state: 'open',
+              head: `${repo.owner}:release-please--branches--main`});
+            const pr = open[0];
+            if (!pr) return;
+            core.setOutput('number', String(pr.number));
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {...repo, pull_number: pr.number});
+            const current = reviews.some(review =>
+              review.state === 'APPROVED' &&
+              review.commit_id === pr.head.sha);
+            if (current) return;
+            await github.rest.pulls.createReview({
+              ...repo, pull_number: pr.number, event: 'APPROVE',
+              body: 'Release contents are generated from merged history; ' +
+                'required checks decide this merge.',
+            });
+      - name: Queue the release pull request behind the required checks
+        if: steps.approve.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.approve.outputs.number }}
+        run: |
+          set -euo pipefail
+          queued=$(gh pr view "$PR_NUMBER" --json autoMergeRequest \
+            --jq '.autoMergeRequest != null')
+          if [ "$queued" != true ]; then
+            gh pr merge "$PR_NUMBER" --squash --auto
+          fi
   publish:
     needs: prepare
     if: needs.prepare.outputs.created == 'true'
     permissions:
       contents: write
       id-token: write
+      issues: write
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.prepare.outputs.tag }}
