@@ -47,8 +47,9 @@ denial rate. The view is read-only and makes no model call; `q` leaves it.
 Use `--once`, or pipe it, for one plain snapshot instead of a live view, and
 `--interval` to change the redraw period. Session state follows the recorded
 session process, not the session lock, so watching a lane never blocks a
-launch. Denial counts cover the retained event log, which rotates at a byte
-cap; served-call counts cover the most recent 2000 events per project.
+launch. Denial counts cover the whole retained event log, the current file and
+the one rotated file together, so reaching the byte cap does not reset a total;
+served-call counts cover the most recent 2000 events per project.
 
 ## Participants, providers and accounts
 

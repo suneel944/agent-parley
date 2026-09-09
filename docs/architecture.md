@@ -74,7 +74,9 @@ enumerated reason class and the decision it produced, so denials are retained
 rather than overwritten. Hooks block the agent, so the log stays a plain
 append-only file in the project state directory, outside the coordination store
 and its write lock, and it rotates to `<participant>-events.1.jsonl` at a fixed
-byte cap. A log failure never changes an enforcement outcome.
+byte cap. A reader summarizes the rotated file and then the current one, oldest
+record first, so a rotation moves records without resetting a reported total. A
+log failure never changes an enforcement outcome.
 
 A lane's session state follows a recorded session process identity, matched by
 process ID and Linux creation ticks, never its session lock. The launcher holds

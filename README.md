@@ -14,6 +14,17 @@ The coordination engine is built in-house with Python's standard library. It
 has no runtime dependencies and makes no model calls. Your existing Claude and
 Codex logins and permission settings still apply.
 
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-top.svg" width="900" alt="agent-bridge top showing three lanes with issues, mail, leases, denials and served calls">
+</p>
+
+`agent-bridge top` is one screen for every lane: session state, branch drift,
+issues owned, handoffs pending, unread mail, held reservations, delivered
+context, and what enforcement denied.
+
+Every frame on this page is real command output from a demo project. Only the
+state and project paths are shortened.
+
 ## Get started
 
 Requires Linux with pidfd support, Git, [uv](https://docs.astral.sh/uv/), and signed-in
@@ -79,11 +90,34 @@ flowchart TD
     Hooks -.-> Codex
 ```
 
-Issue ownership changes only through explicit claims and accepted handoffs.
-Conflicting file reservations grant nothing. Hooks deliver short updates when
-state changes and keep each lane on its assigned bridge branch; unchanged
-checkpoints add no context. Each notice is capped at 1,536 UTF-8 bytes, and full
-message bodies are fetched only when needed.
+## What it enforces
+
+**Ownership changes only through explicit claims and accepted handoffs.** No
+timeout and no process exit moves an issue. `agent-bridge status` reports who
+owns what, which handoff is waiting on an offer ID, and any lane that has left
+its assigned branch.
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-status.svg" width="880" alt="agent-bridge status listing issue owners, a pending handoff, and a lane on the wrong branch">
+</p>
+
+**Native hooks decide before the tool runs.** They block branch changes inside
+an assigned lane, catch drift after any bypass, and deliver short updates when
+coordination state actually changes. Each notice is capped at 1,536 UTF-8
+bytes; an unchanged checkpoint adds no context at all.
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
+</p>
+
+**Seven scoped MCP tools carry the coordination.** Conflicting reservations
+grant nothing and name the blocking owner with that owner's declared reason.
+Sends need an idempotency key, so a retry returns the original message instead
+of a duplicate. Fetching an inbox never marks a message read.
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
+</p>
 
 Enforcement is recorded, not discarded. Every hook decision carries an
 enumerated reason and is appended to that participant's event log, and every
