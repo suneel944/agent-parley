@@ -130,6 +130,11 @@ def main() -> None:
     )
     if marketplace["plugins"][0]["version"] != metadata["version"]:
         errors.append("Claude marketplace version differs from package")
+    served = (root / "agent_bridge/server.py").read_text()
+    if f'"{metadata["name"]}"' not in served:
+        errors.append(
+            "server.py must report the distribution name from pyproject.toml"
+        )
     if errors:
         raise SystemExit("\n".join(errors))
     print(

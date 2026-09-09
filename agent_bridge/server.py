@@ -1,4 +1,4 @@
-"""Serves six bounded coordination tools over authenticated local MCP HTTP."""
+"""Serves seven bounded coordination tools over authenticated local MCP HTTP."""
 
 import argparse
 import hmac
@@ -32,7 +32,7 @@ def _tool(
             "additionalProperties": False,
         },
         "annotations": {
-            "readOnlyHint": name == "fetch_inbox",
+            "readOnlyHint": name in store.READ_ONLY,
             "destructiveHint": False,
             "openWorldHint": False,
         },
@@ -47,7 +47,11 @@ TOOLS = [
         "send_message",
         "Send a concise update. Reuse the key only on retries.",
         {
-            "to": {"type": "array", "items": TEXT, "maxItems": 2},
+            "to": {
+                "type": "array",
+                "items": TEXT,
+                "maxItems": store.MAX_RECIPIENTS,
+            },
             "subject": {**TEXT, "maxLength": 160},
             "body_md": {**TEXT, "description": "At most 4096 UTF-8 bytes."},
             "idempotency_key": {**TEXT, "maxLength": 80},
@@ -81,17 +85,28 @@ TOOLS = [
     ),
     _tool(
         "file_reservation_paths",
-        "Reserve paths atomically; conflicts grant nothing.",
+        "Reserve paths atomically; conflicts grant nothing and name the "
+        "blocking owner with that owner's reason.",
         {
             "paths": {"type": "array", "items": TEXT, "maxItems": 16},
             "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
             "exclusive": FLAG,
-            "reason": TEXT,
+            "reason": {
+                **TEXT,
+                "maxLength": 160,
+                "description": "Declared scope, shown to peers you block.",
+            },
         },
         ["paths"],
     ),
     _tool(
         "release_file_reservations", "Release your file reservations.", {}, []
+    ),
+    _tool(
+        "list_participants",
+        "List the participants you can address in this project.",
+        {},
+        [],
     ),
 ]
 
@@ -271,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "agent-bridge",
-                    "version": importlib.metadata.version("agent-bridge"),
+                    "version": importlib.metadata.version("agent-parley"),
                 },
             }
         elif method == "ping":

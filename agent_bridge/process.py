@@ -14,6 +14,23 @@ def start_ticks(pid: int) -> str:
     return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
 
 
+def alive(pid: int | None, ticks: str | None) -> bool:
+    """Reports whether a recorded process is still that same live process.
+
+    Args:
+        pid: Process ID recorded when the process started, if any.
+        ticks: Creation ticks recorded beside that process ID.
+
+    Returns:
+        Whether the process runs and was created at the recorded time. A
+        recycled process ID reports false, and so does a missing record.
+    """
+    try:
+        return pid is not None and start_ticks(pid) == ticks
+    except (OSError, IndexError, ValueError, TypeError):
+        return False
+
+
 @dataclass(frozen=True)
 class ServerProcess:
     """Holds a verified process ID and kernel creation identity."""

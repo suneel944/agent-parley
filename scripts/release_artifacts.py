@@ -67,8 +67,8 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     assets = []
     for filename in (
-        f"agent_bridge-{version}-py3-none-any.whl",
-        f"agent_bridge-{version}.tar.gz",
+        f"agent_parley-{version}-py3-none-any.whl",
+        f"agent_parley-{version}.tar.gz",
     ):
         destination = output / filename
         shutil.copyfile(root / "dist" / filename, destination)
