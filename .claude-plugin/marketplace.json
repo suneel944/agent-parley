@@ -10,7 +10,7 @@
       "name": "agent-parley",
       "source": "./plugins/agent-parley",
       "description": "Shared issue ownership and handoffs across coding agents.",
-      "version": "0.0.1"
+      "version": "0.1.0"
     }
   ]
 }
