@@ -52,7 +52,7 @@ jobs:
                 github.rest.issues.listComments,
                 {...repo, issue_number: pr.number});
               for (const comment of comments) {
-                if (comment.user.login === 'github-actions[bot]' &&
+                if (comment.user.type === 'Bot' &&
                     comment.body.startsWith('\u{1f916} Created releases:')) {
                   await github.rest.issues.updateComment({
                     ...repo, comment_id: comment.id,

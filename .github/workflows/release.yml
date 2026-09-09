@@ -1,8 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_call:
     inputs:
       tag:
@@ -57,10 +55,13 @@ jobs:
           cd dist/release
           sha256sum --check SHA256SUMS
           if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
-            test "$(jq -r .isDraft release.json)" = true
-            gh release upload "$RELEASE_TAG" --clobber \
-              ./*.whl ./*.tar.gz ./*.zip requirements.txt CHANGELOG.md \
-              RELEASE_NOTES.md SHA256SUMS
+            if [ "$(jq -r .isDraft release.json)" = true ]; then
+              gh release upload "$RELEASE_TAG" --clobber \
+                ./*.whl ./*.tar.gz ./*.zip requirements.txt CHANGELOG.md \
+                RELEASE_NOTES.md SHA256SUMS
+            else
+              echo "$RELEASE_TAG is already published; verifying its bytes."
+            fi
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --title "Agent Parley $RELEASE_TAG" \
