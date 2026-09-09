@@ -35,6 +35,13 @@
 ## See it
 
 <p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@88ab1e8f5301bca7e760dddf5e34dfa45ffef5f7/docs/assets/demo.gif" width="900" alt="A terminal session: launching a lane, listing issue ownership, the dashboard, narrowing it to one provider, and a hook refusing a branch switch">
+</p>
+
+Launch a lane, see who owns what, watch every lane at once, narrow to one
+provider, and watch a hook refuse a branch switch inside an assigned lane.
+
+<p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-top.svg" width="900" alt="agent-bridge top showing three lanes with issues, mail, leases, denials and served calls">
 </p>
 
