@@ -3,6 +3,7 @@
   "packages": {
     ".": {
       "release-type": "python",
+      "last-release-sha": "1221ae6acbe4a0398fb5f3e51db4fc670395b0e1",
       "pull-request-header": "## Release summary",
       "pull-request-footer": "## Verification\n\nRequired checks must pass before merge.",
       "include-component-in-tag": false,
