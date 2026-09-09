@@ -15,6 +15,7 @@ import pytest
 
 from agent_bridge import store
 from agent_bridge.checkpoints import MAX_CONTEXT_BYTES, checkpoint, mailbox
+from agent_bridge.issues import describe
 from agent_bridge.server import MAX_REQUEST_BYTES, TOOLS
 from agent_bridge.state import BridgeError
 
@@ -66,6 +67,18 @@ def test_concurrent_sends_are_idempotent_and_changed_retries_fail(
     assert "body_md" not in inbox["messages"][0]
 
 
+def test_ownership_listing_reports_liveness_and_keeps_the_owner():
+    state = {
+        "revision": 1,
+        "issues": {"7": {"owner": "claude-1", "offer": None, "history": []}},
+    }
+    assert describe(state) == "#7: claude-1"
+    assert describe(state, {"codex-1": "working"}) == "#7: claude-1"
+    assert describe(state, {"claude-1": "stopped; event 900s ago"}) == (
+        "#7: claude-1 (stopped; event 900s ago)"
+    )
+
+
 def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(
@@ -74,7 +87,11 @@ def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
                     bridge.home,
                     actor,
                     "file_reservation_paths",
-                    {"paths": ["./src/**"], "ttl_seconds": 30},
+                    {
+                        "paths": ["./src/**"],
+                        "ttl_seconds": 30,
+                        "reason": "refactor store",
+                    },
                 ),
                 actors,
             )
@@ -88,6 +105,7 @@ def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
         {"paths": ["safe.py", "src/api.py"]},
     )
     assert denied["conflicts"] and denied["granted"] == []
+    assert denied["conflicts"][0]["reason"] == "refactor store"
     with store.connect(bridge.home, write=True) as db:
         db.execute("UPDATE file_reservations SET expires_ts='2000-01-01'")
     assert store.call(
@@ -96,6 +114,12 @@ def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
     assert store.call(
         bridge.home, loser, "file_reservation_paths", {"paths": ["src/api.py"]}
     )["granted"]
+    other = next(actor for actor in actors if actor is not loser)
+    silent = store.call(
+        bridge.home, other, "file_reservation_paths", {"paths": ["src/api.py"]}
+    )
+    assert silent["granted"] == []
+    assert "reason" not in silent["conflicts"][0]
     with store.connect(bridge.home) as db:
         assert (
             db.execute(
@@ -206,9 +230,9 @@ def test_transport_scopes_identity_and_rejects_foreign_origins(bridge, actors):
 
 
 def test_context_is_bounded_incremental_and_never_auto_acknowledges(
-    bridge, repo
+    bridge, repo, paired
 ):
-    data = bridge.setup(repo)
+    data = paired
     bridge.up()
     for lane in ("claude", "codex"):
         asyncio.run(bridge.identity(lane, data))
@@ -221,6 +245,7 @@ def test_context_is_bounded_incremental_and_never_auto_acknowledges(
             actor,
             "send_message",
             message(
+                to=["codex"],
                 subject="新" * 50,
                 body_md="😀" * 1000,
                 ack_required=True,
@@ -242,11 +267,94 @@ def test_context_is_bounded_incremental_and_never_auto_acknowledges(
     assert len(set(seen)) == 3
     for _ in range(20):
         assert checkpoint(bridge.home, directory, "codex", payload) == {}
-    assert mailbox(bridge.home, data["root"], "BlueLake")["pending_ack"] == 9
+    assert mailbox(bridge.home, data["root"], "codex")["pending_ack"] == 9
     state = json.loads((directory / "codex-activity.json").read_text())
     assert state["injections"] == 3
     assert state["injected_bytes"] == sum(len(text.encode()) for text in seen)
     assert len(json.dumps(TOOLS).encode()) < 5000
+
+
+def test_tool_events_record_served_and_rejected_calls_within_a_bound(
+    bridge, actors, monkeypatch
+):
+    monkeypatch.setattr(store, "MAX_EVENT_ROWS", 4)
+    sent = store.call(bridge.home, actors[0], "send_message", message())
+    store.call(bridge.home, actors[1], "fetch_inbox", {})
+    with pytest.raises(BridgeError):
+        store.call(
+            bridge.home,
+            actors[1],
+            "acknowledge_message",
+            {"message_id": sent["id"] + 999},
+        )
+    with store.connect(bridge.home) as db:
+        rows = db.execute(
+            "SELECT tool,outcome,result_bytes,duration_ms FROM events "
+            "ORDER BY id"
+        ).fetchall()
+    assert [(row["tool"], row["outcome"]) for row in rows] == [
+        ("send_message", "ok"),
+        ("fetch_inbox", "ok"),
+        ("acknowledge_message", "error"),
+    ]
+    assert rows[1]["result_bytes"] > 0 and rows[2]["result_bytes"] == 0
+    assert all(row["duration_ms"] >= 0 for row in rows)
+    for index in range(6):
+        store.call(
+            bridge.home,
+            actors[0],
+            "send_message",
+            message(idempotency_key=f"bounded-{index}"),
+        )
+    with store.connect(bridge.home) as db:
+        assert db.execute("SELECT count(*) FROM events").fetchone()[0] == 4
+
+
+def test_schema_upgrade_adds_events_and_lease_age_without_rewrites(
+    bridge, actors
+):
+    store.call(bridge.home, actors[0], "send_message", message())
+    store.call(
+        bridge.home, actors[0], "file_reservation_paths", {"paths": ["src/a"]}
+    )
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("DROP TABLE events")
+        db.execute("ALTER TABLE file_reservations DROP COLUMN created_ts")
+        db.execute("PRAGMA user_version=1")
+    store.initialize(bridge.home)
+    with store.connect(bridge.home) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT count(*) FROM file_reservations "
+                "WHERE created_ts IS NULL"
+            ).fetchone()[0]
+            == 0
+        )
+    usage = store.usage(bridge.home, "/project")
+    assert usage["GreenCastle"]["leases"] == 1
+    assert usage["GreenCastle"]["lease_age"] >= 0
+
+
+def test_reservation_conflicts_stay_inside_the_response_budget(bridge, actors):
+    globs = [f"src/{'deep/' * 40}{index}/*.py" for index in range(16)]
+    held = store.call(
+        bridge.home,
+        actors[0],
+        "file_reservation_paths",
+        {"paths": globs, "reason": "wide refactor " * 10},
+    )
+    assert len(held["granted"]) == 16
+    denied = store.call(
+        bridge.home, actors[1], "file_reservation_paths", {"paths": globs}
+    )
+    assert denied["granted"] == [] and denied["has_more"]
+    assert (
+        len(json.dumps(denied, ensure_ascii=False).encode())
+        <= store.MAX_RESULT_BYTES
+    )
 
 
 def test_body_paging_preserves_unicode_and_read_is_not_ack(bridge, actors):

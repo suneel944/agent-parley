@@ -18,12 +18,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from agent_bridge import process, store
-from agent_bridge.checkpoints import EVENTS, mailbox
+from agent_bridge import dashboard, process, roster, store
+from agent_bridge.checkpoints import (
+    EVENTS,
+    lane_branch,
+    mailbox,
+    participant_liveness,
+)
 from agent_bridge.issues import change, describe, snapshot
 from agent_bridge.state import BridgeError, lock, write_json
-
-AGENTS = {"claude": "GreenCastle", "codex": "BlueLake"}
 
 
 def git(repo: Path, *args: str) -> str:
@@ -50,6 +53,38 @@ def git(repo: Path, *args: str) -> str:
     if result.returncode:
         raise BridgeError(result.stderr.strip() or "Git command failed.")
     return result.stdout.strip()
+
+
+def has_branch(repo: Path, branch: str) -> bool:
+    """Reports whether a branch still exists in a repository."""
+    return bool(
+        git(
+            repo,
+            "for-each-ref",
+            "--format=%(refname:short)",
+            f"refs/heads/{branch}",
+        )
+    )
+
+
+def drift(name: str, participant: dict, actual: str) -> str:
+    """Builds an actionable message for a lane that left its branch.
+
+    Args:
+        name: Participant that owns the lane.
+        participant: Manifest entry holding the lane and assigned branch.
+        actual: Branch the lane currently has.
+
+    Returns:
+        A message naming both branches and the repair commands.
+    """
+    return (
+        f"{name} lane is on {actual!r}, expected "
+        f"{participant['branch']!r}. Run "
+        f"`agent-bridge participant restore {name}` to return it, or "
+        f"`agent-bridge participant retire {name}` to drop the lane. "
+        "Both preserve committed and uncommitted work; neither discards."
+    )
 
 
 class Bridge:
@@ -214,107 +249,305 @@ class Bridge:
         return root, directory
 
     def setup(self, repo: Path) -> dict:
-        """Creates or verifies both persistent agent worktrees.
+        """Creates or verifies the project manifest for a repository.
 
         Args:
             repo: Main checkout or linked worktree of the target repository.
 
         Returns:
-            Manifest containing the common root, base, branches, and lanes.
+            Manifest containing the common root, base, and participants.
 
         Raises:
-            BridgeError: If the checkout or lanes cannot be used safely.
+            BridgeError: If the checkout or an existing lane is unusable.
         """
         root, directory = self.project(repo)
         with lock(directory / "setup.lock"):
-            manifest = directory / "project.json"
-            if manifest.exists():
-                data = json.loads(manifest.read_text())
-                for agent, lane in data["lanes"].items():
-                    if (
-                        git(Path(lane), "branch", "--show-current")
-                        != data["branches"][agent]
-                    ):
-                        raise BridgeError(
-                            f"{agent} worktree changed branch; "
-                            "restore its bridge branch."
-                        )
-                return data
-            base = git(root, "rev-parse", "--verify", "HEAD")
-            if git(root, "status", "--porcelain"):
+            return roster.expand(self._project(root, directory))
+
+    def _project(
+        self, root: Path, directory: Path, verify: set[str] | None = None
+    ) -> dict:
+        """Reads or creates the manifest while the setup lock is held.
+
+        Args:
+            root: Common repository root.
+            directory: Private state directory for the repository.
+            verify: Participants whose branch must match, or None for all.
+
+        Returns:
+            Manifest using the participant roster layout.
+
+        Raises:
+            BridgeError: If a checked lane left its assigned branch.
+        """
+        path = directory / "project.json"
+        if path.exists():
+            data = roster.normalize(json.loads(path.read_text()))
+            participants = data["participants"]
+            names = (
+                set(participants)
+                if verify is None
+                else verify & set(participants)
+            )
+            for name in sorted(names):
+                participant = participants[name]
+                actual = lane_branch(Path(participant["lane"]))
+                if actual != participant["branch"]:
+                    raise BridgeError(drift(name, participant, actual))
+            return data
+        if git(root, "status", "--porcelain"):
+            raise BridgeError(
+                "Commit or preserve your pending changes first; "
+                "worktrees start at HEAD."
+            )
+        data = {
+            "version": roster.MANIFEST_VERSION,
+            "root": str(root),
+            "base": git(root, "rev-parse", "--verify", "HEAD"),
+            "participants": {},
+        }
+        write_json(path, data)
+        return data
+
+    def add_participant(
+        self,
+        repo: Path,
+        name: str,
+        provider: str | None = None,
+        credential: str | None = None,
+    ) -> dict:
+        """Adds one lane for a participant without touching existing lanes.
+
+        Args:
+            repo: Main checkout or linked worktree of the target repository.
+            name: Participant name, unique within this project.
+            provider: Provider definition; defaults to the registered one, or
+                to a provider named exactly like the participant.
+            credential: Credential profile selecting one account; defaults to
+                the profile already registered for this participant.
+
+        Returns:
+            Manifest containing the common root, base, and participants.
+
+        Raises:
+            BridgeError: If the name, provider, lane, or branch is unusable.
+        """
+        roster.identifier(name, "Participant name")
+        root, directory = self.project(repo)
+        with lock(directory / "setup.lock"):
+            data = self._project(root, directory, verify={name})
+            participants = data["participants"]
+            existing = participants.get(name)
+            provider = provider or (existing or {}).get("provider") or name
+            if credential is None:
+                credential = (existing or {}).get("credential")
+            roster.provider(self.home, provider)
+            if credential is not None:
+                roster.credential(self.home, credential)
+            if existing:
+                if (
+                    existing["provider"] != provider
+                    or existing["credential"] != credential
+                ):
+                    raise BridgeError(
+                        f"Participant {name} already uses provider "
+                        f"{existing['provider']} with "
+                        f"{existing['credential'] or 'the default account'}."
+                    )
+                return roster.expand(data)
+            if len(participants) >= roster.MAX_PARTICIPANTS:
                 raise BridgeError(
-                    "Commit or preserve your pending changes first; "
-                    "worktrees start at HEAD."
+                    "This project already has "
+                    f"{roster.MAX_PARTICIPANTS} participants."
                 )
-            lanes = {agent: str(directory / agent) for agent in AGENTS}
-            branches = {
-                agent: f"bridge/{directory.name}/{agent}" for agent in AGENTS
-            }
-            existing = git(
+            if any(
+                participant["display"] == name
+                for participant in participants.values()
+            ):
+                raise BridgeError(f"Identity {name} is already registered.")
+            lane = directory / name
+            branch = f"bridge/{directory.name}/{name}"
+            refs = git(
                 root, "for-each-ref", "--format=%(refname:short)", "refs/heads"
             ).splitlines()
-            for agent in AGENTS:
-                if Path(lanes[agent]).exists() or branches[agent] in existing:
-                    raise BridgeError(
-                        f"Existing lane or branch for {agent}; "
-                        "preserve it before setup."
-                    )
-            created = []
+            if lane.exists() or branch in refs:
+                raise BridgeError(
+                    f"Existing lane or branch for {name}; "
+                    "preserve it before adding this participant."
+                )
+            git(root, "worktree", "add", "-b", branch, str(lane), data["base"])
+            participants[name] = {
+                "provider": provider,
+                "display": name,
+                "lane": str(lane),
+                "branch": branch,
+                "credential": credential,
+            }
             try:
-                for agent in AGENTS:
-                    git(
-                        root,
-                        "worktree",
-                        "add",
-                        "-b",
-                        branches[agent],
-                        lanes[agent],
-                        base,
-                    )
-                    created.append(agent)
-                data = {
-                    "root": str(root),
-                    "base": base,
-                    "lanes": lanes,
-                    "branches": branches,
-                }
-                write_json(manifest, data)
-            except Exception:
-                if created:
-                    print(
-                        f"Partial setup preserved in {directory}: "
-                        f"{', '.join(created)}",
-                        file=sys.stderr,
-                    )
+                write_json(directory / "project.json", data)
+            except OSError:
+                print(
+                    f"Lane preserved without registration: {lane}",
+                    file=sys.stderr,
+                )
                 raise
-            return data
+            return roster.expand(data)
+
+    def _lane(self, repo: Path, name: str) -> tuple[Path, dict, dict]:
+        """Resolves one participant's state directory and manifest entry."""
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        participant = data["participants"].get(name)
+        if participant is None:
+            raise BridgeError(
+                f"{name} is not a participant in this project; "
+                "run agent-bridge participant list."
+            )
+        return directory, data, participant
+
+    def restore(self, repo: Path, name: str) -> str:
+        """Returns a drifted lane to its branch without discarding work.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane must return to its bridge branch.
+
+        Returns:
+            An account of what changed.
+
+        Raises:
+            BridgeError: If the lane is busy, dirty, missing, or holds commits
+                the assigned branch does not.
+        """
+        directory, _, participant = self._lane(repo, name)
+        lane = Path(participant["lane"])
+        branch = participant["branch"]
+        with lock(
+            directory / f"{name}.session.lock",
+            f"{name} has a running session; stop that terminal first.",
+        ):
+            if not lane.exists():
+                raise BridgeError(
+                    f"{name} has no worktree at {lane}. Retire the "
+                    "participant, then add it again."
+                )
+            actual = lane_branch(lane)
+            if actual == branch:
+                return f"{name} is already on {branch}."
+            if not has_branch(lane, branch):
+                raise BridgeError(
+                    f"Branch {branch} no longer exists. Recover it from the "
+                    f"reflog, or retire {name} and add it again."
+                )
+            if git(lane, "status", "--porcelain"):
+                raise BridgeError(
+                    f"{name} has uncommitted changes on {actual}. Commit or "
+                    "preserve them first; restore never discards work."
+                )
+            unmerged = git(lane, "log", "--oneline", f"{branch}..HEAD")
+            if unmerged:
+                head = git(lane, "rev-parse", "HEAD")
+                raise BridgeError(
+                    f"{name} holds commits that {branch} does not:\n"
+                    f"{unmerged}\nKeep them first with `git -C "
+                    f"{shlex.quote(str(lane))} branch KEEP_NAME {head}`, then "
+                    "rerun; restore never discards work."
+                )
+            git(lane, "switch", branch)
+            return f"{name} restored to {branch} from {actual}."
+
+    def retire(self, repo: Path, name: str) -> str:
+        """Removes a participant's lane while preserving any work it holds.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane is retired.
+
+        Returns:
+            An account of what was removed and what was kept.
+
+        Raises:
+            BridgeError: If the lane is busy or holds uncommitted changes.
+        """
+        root, directory = self.project(repo)
+        with lock(directory / "setup.lock"):
+            data = self._project(root, directory, verify=set())
+            participant = data["participants"].get(name)
+            if participant is None:
+                raise BridgeError(
+                    f"{name} is not a participant in this project; "
+                    "run agent-bridge participant list."
+                )
+            lane = Path(participant["lane"])
+            branch = participant["branch"]
+            with lock(
+                directory / f"{name}.session.lock",
+                f"{name} has a running session; stop that terminal first.",
+            ):
+                if lane.exists():
+                    if git(lane, "status", "--porcelain"):
+                        raise BridgeError(
+                            f"{name} has uncommitted changes. Commit or "
+                            "preserve them first; retire never discards work."
+                        )
+                    git(root, "worktree", "remove", str(lane))
+                git(root, "worktree", "prune")
+                note = f"Branch {branch} was already gone."
+                if has_branch(root, branch):
+                    if git(
+                        root, "log", "--oneline", f"{data['base']}..{branch}"
+                    ):
+                        note = (
+                            f"Branch {branch} kept; it holds commits the "
+                            "project base does not."
+                        )
+                    else:
+                        git(root, "branch", "-d", branch)
+                        note = f"Branch {branch} deleted; it added no commits."
+                store.revoke(self.home, data["root"], participant["display"])
+                for suffix in ("identity.json", "activity.json", "mcp.json"):
+                    (directory / f"{name}-{suffix}").unlink(missing_ok=True)
+                del data["participants"][name]
+                write_json(directory / "project.json", data)
+                return f"Retired {name}. {note} Messages are preserved."
 
     async def identity(self, agent: str, data: dict) -> dict:
         """Registers a lane locally; registration is not an MCP tool.
 
         Args:
-            agent: Native CLI lane name.
+            agent: Participant name within the project.
             data: Project manifest from setup.
 
         Returns:
             Private registration data, including its credential.
         """
-        path = Path(data["lanes"][agent]).parent / f"{agent}-identity.json"
-        credentials = json.loads(path.read_text()) if path.exists() else {}
+        participant = data["participants"][agent]
+        path = Path(participant["lane"]).parent / f"{agent}-identity.json"
+        stored = json.loads(path.read_text()) if path.exists() else {}
         result = store.register(
             self.home,
             data["root"],
-            AGENTS[agent],
-            credentials.get("registration_token", ""),
+            participant["display"],
+            stored.get("registration_token", ""),
         )
         write_json(path, result)
         return result
 
     def protocol(self, agent: str, data: dict) -> str:
         """Builds coordination instructions without embedding tokens."""
-        peer = AGENTS["codex" if agent == "claude" else "claude"]
+        participant = data["participants"][agent]
+        peers = (
+            ", ".join(
+                f"{other['display']} ({other['provider']})"
+                for name, other in sorted(data["participants"].items())
+                if name != agent
+            )
+            or "none yet; more can join at any time"
+        )
         return f"""Agent Bridge protocol (also follow repository instructions):
-You are {AGENTS[agent]} using {agent}; your peer is {peer}.
+You are {participant["display"]} using {participant["provider"]}.
+Your peers right now: {peers}.
+Peers can join or leave; call list_participants for the current roster.
 Use the agent_bridge MCP server. Canonical project key: {data["root"]}
 Your editable worktree: {data["lanes"][agent]}
 The canonical project key is an identity, NOT a directory to edit.
@@ -329,7 +562,7 @@ Before working on a numbered issue, run `agent-bridge issue claim NUMBER` from
 your worktree. A conflict means choose another issue or request a handoff.
 Use `agent-bridge issue list` to inspect ownership notices or prepare a handoff.
 To hand off: stop work on that issue, then `agent-bridge issue offer NUMBER
---to claude|codex --summary "commit, checks, remaining work"`. Stay paused until
+--to PARTICIPANT --summary "commit, checks, remaining work"`. Stay paused until
 it is accepted, declined, or you cancel it. The recipient reviews the summary
 and runs `agent-bridge issue accept NUMBER --offer-id ID` before starting.
 Decline with `issue decline NUMBER --offer-id ID`.
@@ -347,7 +580,7 @@ the peer depends on. When finished, send a handoff containing the exact commit
 (if committed), changed files, verification commands/results, and limitations,
 then release your reservations. Avoid repeated empty inbox polling.
 
-Edit only your worktree. Do not reset, clean, switch, merge, or modify the peer
+Edit only your worktree. Do not reset, clean, switch, merge, or modify a peer
 worktree or the main checkout. Preserve existing work on your branch. Shared
 ports/databases need coordination; worktrees do not isolate those resources.
 Follow repository commit rules. Integration into the main branch remains a
@@ -376,7 +609,7 @@ review, not merged or independently verified. An idle turn is not completion.
                 str(self.home),
                 "--directory",
                 str(directory),
-                "--agent",
+                "--participant",
                 agent,
             ]
         )
@@ -414,20 +647,9 @@ review, not merged or independently verified. An idle turn is not completion.
         if not summary.strip():
             raise BridgeError("Reports require a nonempty --summary.")
         _, directory = self.project(repo)
-        data = json.loads((directory / "project.json").read_text())
+        data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = next(
-            (
-                name
-                for name, path in data["lanes"].items()
-                if Path(path) == lane
-            ),
-            None,
-        )
-        if agent is None:
-            raise BridgeError(
-                "Report from the agent's worktree, not the main checkout."
-            )
+        agent = roster.resolve(data, lane)
         if outcome in ("partial", "blocked") and not remaining.strip():
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
@@ -471,31 +693,37 @@ review, not merged or independently verified. An idle turn is not completion.
             BridgeError: If lane, ownership, or transition checks fail.
         """
         _, directory = self.project(repo)
-        data = json.loads((directory / "project.json").read_text())
+        data = roster.read(directory)
         if action == "list":
             return snapshot(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = next(
-            (
-                name
-                for name, path in data["lanes"].items()
-                if Path(path) == lane
-            ),
-            None,
-        )
-        if agent is None:
-            raise BridgeError(
-                "Change issue ownership from the agent's worktree."
-            )
+        agent = roster.resolve(data, lane)
         return change(
             directory,
             agent,
             action,
             number,
+            participants=set(data["participants"]),
             to=to,
             summary=summary,
             offer_id=offer_id,
         )
+
+    def liveness(self, repo: Path) -> dict[str, str]:
+        """Reports every participant's session state for one repository.
+
+        Args:
+            repo: Any checkout of the target repository.
+
+        Returns:
+            Mapping of participant name to session state and checkpoint age.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        return {
+            name: participant_liveness(directory, name)
+            for name in data["participants"]
+        }
 
     def status(self) -> None:
         """Prints activity, reported outcomes, and coordination state."""
@@ -505,30 +733,26 @@ review, not merged or independently verified. An idle turn is not completion.
         print(f"Server: {'ready' if healthy else 'not ready'}")
         print(f"State: {self.home}")
         for path in sorted((self.home / "projects").glob("*/project.json")):
-            data = json.loads(path.read_text())
+            data = roster.normalize(json.loads(path.read_text()))
             print(f"\nProject: {data['root']}")
             print(describe(snapshot(path.parent)))
-            for agent, name in AGENTS.items():
+            for agent, participant in sorted(data["participants"].items()):
+                name = participant["display"]
+                account = participant["credential"] or "default account"
                 state_path = path.parent / f"{agent}-activity.json"
                 state = (
                     json.loads(state_path.read_text())
                     if state_path.exists()
                     else {}
                 )
-                try:
-                    with lock(path.parent / f"{agent}.session.lock"):
-                        activity = "stopped"
-                except BridgeError:
-                    activity = state.get(
-                        "activity",
-                        "running; checkpoints unavailable (relaunch)",
-                    )
-                age = (
-                    f"; event {int(time.time() - state['updated'])}s ago"
-                    if state.get("updated")
-                    else ""
+                print(
+                    f"  {agent} ({name}): "
+                    f"{participant_liveness(path.parent, agent)}\n"
+                    f"    Provider: {participant['provider']}; {account}"
                 )
-                print(f"  {agent} ({name}): {activity}{age}")
+                branch = lane_branch(Path(participant["lane"]))
+                if branch != participant["branch"]:
+                    print(f"    {drift(agent, participant, branch)}")
                 print(
                     f"    Reported outcome: {state.get('outcome', 'unknown')}"
                 )
@@ -573,27 +797,43 @@ review, not merged or independently verified. An idle turn is not completion.
                 except (sqlite3.Error, BridgeError, OSError) as exc:
                     print(f"    Coordination unavailable: {exc}")
 
-    def launch(self, agent: str, repo: Path, task: str) -> int:
-        """Runs one native agent in its persistent lane.
+    def launch(
+        self,
+        agent: str,
+        repo: Path,
+        task: str,
+        provider: str | None = None,
+        credential: str | None = None,
+    ) -> int:
+        """Runs one participant's native CLI in its persistent lane.
 
         Args:
-            agent: Native executable name, claude or codex.
+            agent: Participant name within the project.
             repo: Target Git repository.
             task: User task passed as an argument without shell expansion.
+            provider: Provider definition driving this participant.
+            credential: Credential profile selecting one account.
 
         Returns:
             The native process exit code.
 
         Raises:
-            BridgeError: If setup fails or the lane already has a launcher.
+            BridgeError: If the provider, account, or lane cannot be used, or
+                the participant already has a launcher.
         """
-        executable = shutil.which(agent)
+        data = self.add_participant(repo, agent, provider, credential)
+        participant = data["participants"][agent]
+        entry = roster.provider(self.home, participant["provider"])
+        account = roster.launch_environment(
+            self.home, entry, participant["credential"]
+        )
+        executable = shutil.which(entry["command"])
         if executable is None:
             raise BridgeError(
-                f"Install and sign in to the native {agent} CLI first."
+                f"Install and sign in to the native {entry['command']} CLI "
+                "first."
             )
-        data = self.setup(repo)
-        lane = Path(data["lanes"][agent])
+        lane = Path(participant["lane"])
         with lock(lane.parent / f"{agent}.session.lock"):
             self.up()
             identity = asyncio.run(self.identity(agent, data))
@@ -601,11 +841,12 @@ review, not merged or independently verified. An idle turn is not completion.
             hooks = self.hooks(agent, lane.parent)
             env = {
                 **os.environ,
+                **account,
                 "AGENT_BRIDGE_TOKEN": identity["registration_token"],
                 "AGENT_BRIDGE_HOME": str(self.home),
             }
-            if agent == "claude":
-                config = lane.parent / "claude-mcp.json"
+            if entry["adapter"] == "claude":
+                config = lane.parent / f"{agent}-mcp.json"
                 write_json(
                     config,
                     {
@@ -652,7 +893,10 @@ review, not merged or independently verified. An idle turn is not completion.
                     command.extend(["-c", f"hooks.{event}={value}"])
                 command.append(prompt + "\nUser task:\n" + task)
             print(
-                f"{agent}: {lane}\nShared project: {data['root']}", flush=True
+                f"{agent} ({participant['provider']}, "
+                f"{participant['credential'] or 'default account'}): {lane}\n"
+                f"Shared project: {data['root']}",
+                flush=True,
             )
             activity_path = lane.parent / f"{agent}-activity.json"
             previous = (
@@ -666,6 +910,8 @@ review, not merged or independently verified. An idle turn is not completion.
                 updated=time.time(),
                 session_id="",
                 cursor=0,
+                session_pid=os.getpid(),
+                session_ticks=process.start_ticks(os.getpid()),
             )
             previous.pop("last_prompt", None)
             write_json(activity_path, previous)
@@ -675,6 +921,8 @@ review, not merged or independently verified. An idle turn is not completion.
                 with lock(lane.parent / f"{agent}-checkpoint.lock"):
                     state = json.loads(activity_path.read_text())
                     state.update(activity="stopped", updated=time.time())
+                    state.pop("session_pid", None)
+                    state.pop("session_ticks", None)
                     write_json(activity_path, state)
 
 
@@ -700,14 +948,39 @@ def main() -> int:
     commands.add_parser(
         "status", help="Show server health and registered workspaces."
     )
+    watch = commands.add_parser(
+        "top", help="Watch every participant's live coordination state."
+    )
+    watch.add_argument(
+        "--once",
+        action="store_true",
+        help="Print one plain snapshot instead of drawing a live view.",
+    )
+    watch.add_argument(
+        "--interval",
+        type=float,
+        default=1.0,
+        help="Seconds between redraws of the live view.",
+    )
     setup = commands.add_parser(
-        "setup", help="Create Claude and Codex worktrees from committed HEAD."
+        "setup",
+        help="Register a repository for coordination from committed HEAD.",
     )
     setup.add_argument("repo", type=Path)
     run = commands.add_parser(
-        "run", help="Launch a native agent in this terminal."
+        "run", help="Launch one participant's native CLI in this terminal."
     )
-    run.add_argument("agent", choices=AGENTS)
+    run.add_argument(
+        "participant",
+        help="Participant name; a new name creates its own worktree lane.",
+    )
+    run.add_argument(
+        "--provider",
+        help="Provider definition; defaults to the participant name.",
+    )
+    run.add_argument(
+        "--credentials", help="Credential profile selecting one account."
+    )
     run.add_argument("--repo", type=Path, default=Path.cwd())
     run.add_argument(
         "--task", default="Check shared coordination state and await my task."
@@ -740,10 +1013,47 @@ def main() -> int:
         if action != "list":
             command.add_argument("number")
         if action == "offer":
-            command.add_argument("--to", choices=AGENTS, required=True)
+            command.add_argument("--to", required=True)
             command.add_argument("--summary", required=True)
         if action in ("accept", "decline"):
             command.add_argument("--offer-id", required=True)
+    participant = commands.add_parser(
+        "participant", help="Inspect or add participants for a repository."
+    )
+    roles = participant.add_subparsers(dest="action", required=True)
+    listing = roles.add_parser("list")
+    listing.add_argument("--repo", type=Path, default=Path.cwd())
+    joining = roles.add_parser("add")
+    joining.add_argument("name")
+    joining.add_argument("--provider")
+    joining.add_argument("--credentials")
+    joining.add_argument("--repo", type=Path, default=Path.cwd())
+    for action in ("restore", "retire"):
+        command = roles.add_parser(action)
+        command.add_argument("name")
+        command.add_argument("--repo", type=Path, default=Path.cwd())
+    provider = commands.add_parser(
+        "provider", help="Inspect or define providers that drive a native CLI."
+    )
+    definitions = provider.add_subparsers(dest="action", required=True)
+    definitions.add_parser("list")
+    defining = definitions.add_parser("add")
+    defining.add_argument("name")
+    defining.add_argument("--adapter", choices=roster.ADAPTERS, required=True)
+    defining.add_argument("--executable", required=True)
+    defining.add_argument("--home-env", default="")
+    defining.add_argument("--env", action="append", default=[])
+    defining.add_argument("--require-env", action="append", default=[])
+    accounts = commands.add_parser(
+        "credentials", help="Inspect or define per-account profiles."
+    )
+    profiles = accounts.add_subparsers(dest="action", required=True)
+    profiles.add_parser("list")
+    profile = profiles.add_parser("add")
+    profile.add_argument("name")
+    profile.add_argument("--config-home", default="")
+    profile.add_argument("--env", action="append", default=[])
+    profile.add_argument("--require-env", action="append", default=[])
     args = parser.parse_args()
     try:
         bridge = Bridge(args.home)
@@ -755,10 +1065,23 @@ def main() -> int:
             print(
                 "Coordination server stopped. Worktrees and messages retained."
             )
+        elif args.command == "top":
+            dashboard.run(
+                bridge.home,
+                lambda: bool(bridge.server_process()),
+                args.once,
+                args.interval,
+            )
         elif args.command == "setup":
             print(json.dumps(bridge.setup(args.repo.resolve()), indent=2))
         elif args.command == "run":
-            return bridge.launch(args.agent, args.repo.resolve(), args.task)
+            return bridge.launch(
+                args.participant,
+                args.repo.resolve(),
+                args.task,
+                args.provider,
+                args.credentials,
+            )
         elif args.command == "report":
             bridge.report(
                 args.repo.resolve(),
@@ -778,10 +1101,44 @@ def main() -> int:
                 offer_id=getattr(args, "offer_id", None),
             )
             print(
-                describe(result)
+                describe(result, bridge.liveness(args.repo.resolve()))
                 if args.action == "list"
                 else json.dumps(result, indent=2)
             )
+        elif args.command == "participant":
+            repository = args.repo.resolve()
+            if args.action == "add":
+                bridge.add_participant(
+                    repository, args.name, args.provider, args.credentials
+                )
+            elif args.action == "restore":
+                print(bridge.restore(repository, args.name))
+            elif args.action == "retire":
+                print(bridge.retire(repository, args.name))
+            _, directory = bridge.project(repository)
+            print(roster.describe(roster.read(directory)))
+        elif args.command == "provider":
+            if args.action == "add":
+                roster.define_provider(
+                    bridge.home,
+                    args.name,
+                    args.adapter,
+                    args.executable,
+                    args.home_env,
+                    args.env,
+                    args.require_env,
+                )
+            print(json.dumps(roster.providers(bridge.home), indent=2))
+        elif args.command == "credentials":
+            if args.action == "add":
+                roster.define_credential(
+                    bridge.home,
+                    args.name,
+                    args.config_home,
+                    args.env,
+                    args.require_env,
+                )
+            print(json.dumps(roster.credentials(bridge.home), indent=2))
         else:
             bridge.status()
         return 0

@@ -31,6 +31,7 @@ before switching. Keep the extracted directory available for local plugin update
 Start a new session after installation. Use `/agent-bridge:coordinate` in Claude
 Code or select the plugin's `coordinate` skill in Codex.
 
-Launch working sessions through `agent-bridge run claude` and
-`agent-bridge run codex` in separate terminals. The plugin does not create hooks,
+Launch working sessions through `agent-bridge run PARTICIPANT` in separate
+terminals, one per participant; `agent-bridge run claude` and
+`agent-bridge run codex` are the defaults. The plugin does not create hooks,
 copy credentials, move an existing session into a worktree, or grant permissions.

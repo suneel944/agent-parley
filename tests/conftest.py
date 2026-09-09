@@ -23,6 +23,13 @@ def bridge(tmp_path):
 
 
 @pytest.fixture
+def paired(bridge, repo):
+    """Registers the two-participant roster most coordination tests assume."""
+    bridge.add_participant(repo, "claude", "claude")
+    return bridge.add_participant(repo, "codex", "codex")
+
+
+@pytest.fixture
 def repo(tmp_path):
     """Creates a committed repository whose path exercises spaces."""
     path = tmp_path / "project with spaces"

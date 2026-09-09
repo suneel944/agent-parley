@@ -41,11 +41,12 @@ def write_json(path: Path, value: dict) -> None:
 
 
 @contextlib.contextmanager
-def lock(path: Path) -> Iterator[None]:
+def lock(path: Path, busy: str = "") -> Iterator[None]:
     """Holds an exclusive nonblocking lock for the context lifetime.
 
     Args:
         path: Lock file in an existing private directory.
+        busy: Message replacing the generic contention text.
 
     Yields:
         None while the caller holds the operation lock.
@@ -58,7 +59,8 @@ def lock(path: Path) -> Iterator[None]:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise BridgeError(
-                f"Another bridge operation/session owns {path.name}; "
+                busy
+                or f"Another bridge operation/session owns {path.name}; "
                 "retry later."
             ) from None
         try:
