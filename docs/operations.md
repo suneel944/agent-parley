@@ -212,7 +212,10 @@ requirements file, the changelog, the release notes and the checksum manifest
 are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
 job requests a short-lived identity token through an `id-token: write`
 permission scoped to that job, and PyPI exchanges it for a one-time upload
-token, so the repository stores no PyPI API token and no publishing secret. The
+token, so the repository stores no PyPI API token and no publishing secret. That
+permission must also be granted by whichever job calls the release workflow,
+because a reusable workflow can never hold more than its caller granted; a
+caller that omits it fails the whole run before any step starts. The
 step deliberately runs last, because a version published to PyPI can never be
 re-uploaded or replaced, so it must not run before the GitHub release is
 confirmed good. Rerunning the workflow against an existing tag stays safe:
