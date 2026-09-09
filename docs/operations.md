@@ -57,9 +57,32 @@ rather than reading as empty. Session state follows the recorded
 session process, not the session lock, so watching a lane never blocks a
 launch. Denial counts cover the whole retained event log, the current file and
 the one rotated file together, so a count reports every record still kept rather
-than the current file alone. Only those two files are kept, so a long-running
-lane reports recent enforcement, not project history; served-call counts cover
-the most recent 2000 events per project.
+than the current file alone. Only those two files are kept, and records older
+than fourteen days are discarded at the next session start or session end, so a
+long-running lane reports recent enforcement, not project history; served-call
+counts cover the most recent 2000 events per project.
+
+`--since` narrows every event count to a window that ends at the current
+reading, so `agent-bridge top --since 6h` answers what happened in the last six
+hours rather than across the whole retained log. Accepted windows are a count
+followed by `s`, `m`, `h` or `d`. The header states the window, or `all
+retained` when none is given. A window can only narrow what retention already
+kept: it never recovers a record that rotation or the age bound discarded.
+
+```sh
+agent-bridge top --since 6h
+agent-bridge events export --since 7d --output enforcement.jsonl
+agent-bridge events export --participant claude-1 > claude-1-events.jsonl
+```
+
+`events export` writes the retained hook event records as JSON Lines, one
+record per line, each naming the participant that produced it. Records go to
+standard output unless `--output` names a file, and the count is reported on
+standard error in that case so a redirected export stays valid JSON Lines.
+`--participant` selects one lane and is repeatable; every participant is
+exported by default. `--since` takes the same windows as `top`. Export reads
+state and never writes it, and it is the supported way to keep enforcement
+history beyond what the state directory retains.
 
 ## Participants, providers and accounts
 
@@ -93,6 +116,7 @@ names look like credentials.
 ```sh
 agent-bridge status
 agent-bridge participant restore claude-1
+agent-bridge participant merge claude-1
 agent-bridge participant retire claude-1
 ```
 
@@ -105,6 +129,18 @@ that participant has a running session, refuses on an uncommitted change, and
 refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
+
+`participant merge` integrates one lane's branch into the base checkout. It
+always runs in the repository's main worktree, never inside another lane, and
+always records a merge commit, so the integration stays visible in history. It
+refuses while that participant has a running session, while the lane has left
+its assigned branch, while the base checkout is dirty, already merging, or on a
+detached HEAD, and while the lane holds uncommitted changes the branch does not
+carry. On a conflict it names the conflicting paths and leaves the merge in
+progress in the base checkout for you to finish with `git merge --continue` or
+undo with `git merge --abort`; it never resolves a conflict, and never resets,
+cleans, stashes, or force-switches. A successful merge leaves the lane and its
+branch exactly as they were, so retiring the participant stays a separate step.
 
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's
@@ -125,8 +161,10 @@ Set `AGENT_BRIDGE_PORT` before first initialization to override port 8876.
 
 Worktrees start at a captured commit and persist. Ignored environment files,
 dependencies and untracked configuration are not copied. Set up each worktree
-as needed. Review and integrate branches separately, then run the target repo's
-combined verification gate.
+as needed. Review each lane's branch, integrate it with `participant merge` or
+with Git directly, then run the target repository's combined verification gate.
+Merging is never automatic, and a reported `ready` outcome does not establish
+that a branch is fit to merge.
 
 ## Plugins
 
@@ -154,12 +192,41 @@ This is a skills-only plugin. Submission requires a verified publisher, listing
 and policy URLs, a skill bundle, and review cases. Neither catalog submission
 has been made. CI builds artifacts; it does not submit review forms.
 
+`docs/catalog-submission.md` records what each catalog asks for, the checks that
+can be run in this repository before submitting, and the steps that are bound to
+the owner's accounts and cannot be delegated.
+
 ## Releases
 
 Update package/plugin versions together and add a changelog entry. Run `make check`
 and `make release-artifacts`. After review and merge, an annotated `vVERSION` tag
 triggers release CI. It reruns the gate, creates a draft, uploads assets, downloads
 and verifies their checksums, then publishes. Failed verification leaves a draft.
+
+After the GitHub release is published and its uploaded bytes have been verified
+against the local checksums, the workflow publishes the distribution to PyPI. It
+stages a clean `dist/pypi` directory holding only the two files the index
+accepts, the `agent_bridge` wheel and the source tarball, copied by exact name
+from the verified `dist/release` bundle, so the plugin archive, the exported
+requirements file, the changelog, the release notes and the checksum manifest
+are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
+job requests a short-lived identity token through an `id-token: write`
+permission scoped to that job, and PyPI exchanges it for a one-time upload
+token, so the repository stores no PyPI API token and no publishing secret. The
+step deliberately runs last, because a version published to PyPI can never be
+re-uploaded or replaced, so it must not run before the GitHub release is
+confirmed good. Rerunning the workflow against an existing tag stays safe:
+files already on the index are skipped rather than treated as a failure.
+
+Publishing needs one manual step that only the repository owner can take, and
+it must be done before the first tag. PyPI has no `agent-bridge` project yet,
+and a trusted publisher cannot be added to a project that has no releases, so
+add a *pending* publisher instead: PyPI, account settings, Publishing, "Add a
+new pending publisher", GitHub, with PyPI project name `agent-bridge`, owner
+`suneel944`, repository `agent-bridge`, workflow `release.yml`, and the
+environment name left empty because the workflow declares no environment. The
+first successful run creates the project and converts the pending publisher
+into a normal one. Nothing is added to repository secrets.
 
 Download assets together and run `sha256sum --check SHA256SUMS`. The wheel needs
 no third-party runtime packages. Development tools and the independent MCP test

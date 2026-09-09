@@ -21,9 +21,11 @@ from pathlib import Path
 from agent_bridge import dashboard, process, roster, store
 from agent_bridge.checkpoints import (
     EVENTS,
+    current_branch,
     lane_branch,
     mailbox,
     participant_liveness,
+    read_events,
 )
 from agent_bridge.issues import change, describe, snapshot
 from agent_bridge.state import BridgeError, lock, write_json
@@ -55,6 +57,29 @@ def git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def duration(text: str) -> float:
+    """Converts a compact retention or reporting window into seconds.
+
+    Args:
+        text: A count followed by ``s``, ``m``, ``h`` or ``d``. A bare count
+            is read as seconds.
+
+    Returns:
+        The window in seconds.
+
+    Raises:
+        ValueError: If the text does not name a positive window.
+    """
+    scale = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(text[-1:], 0)
+    try:
+        seconds = float(text[:-1] if scale else text) * (scale or 1)
+    except ValueError:
+        seconds = 0.0
+    if seconds <= 0:
+        raise ValueError(f"{text!r} is not a window; use 45m, 6h or 7d.")
+    return seconds
+
+
 def has_branch(repo: Path, branch: str) -> bool:
     """Reports whether a branch still exists in a repository."""
     return bool(
@@ -84,6 +109,107 @@ def drift(name: str, participant: dict, actual: str) -> str:
         f"`agent-bridge participant restore {name}` to return it, or "
         f"`agent-bridge participant retire {name}` to drop the lane. "
         "Both preserve committed and uncommitted work; neither discards."
+    )
+
+
+def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
+    """Merges one lane's bridge branch into the base checkout.
+
+    The merge runs in the base checkout, never inside another lane, and
+    always records a merge commit so the integration stays auditable. It
+    reads the lane only to refuse merging a branch that does not yet carry
+    the lane's work. It never resets, cleans, stashes or force-switches, and
+    a conflict is left in the working tree for the operator to resolve.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        lane: Assigned bridge worktree belonging to the participant.
+        name: Participant that owns the lane.
+        branch: Bridge branch to merge into the base checkout.
+
+    Returns:
+        An account of what was merged.
+
+    Raises:
+        BridgeError: If either checkout cannot be merged from, or if the
+            merge stopped on conflicts that only the operator can resolve.
+        subprocess.TimeoutExpired: If the merge exceeds its timeout.
+    """
+    if not has_branch(root, branch):
+        raise BridgeError(
+            f"Branch {branch} no longer exists. Recover it from the reflog, "
+            f"or retire {name} and add it again."
+        )
+    base = current_branch(root)
+    if base == branch:
+        raise BridgeError(
+            f"The base checkout at {root} is on {branch} itself. Switch it "
+            "to the branch that should receive this work, then rerun."
+        )
+    if base == "<detached HEAD>":
+        raise BridgeError(
+            f"The base checkout at {root} is on a detached HEAD. Switch it "
+            "to the branch that should receive this work, then rerun."
+        )
+    git_dir = Path(
+        git(root, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+    quoted = shlex.quote(str(root))
+    if (git_dir / "MERGE_HEAD").exists():
+        raise BridgeError(
+            f"The base checkout at {root} is already merging. Finish it with "
+            f"`git -C {quoted} merge --continue`, or undo it with `git -C "
+            f"{quoted} merge --abort`, then rerun."
+        )
+    if git(root, "status", "--porcelain"):
+        raise BridgeError(
+            f"The base checkout at {root} has uncommitted changes. Commit or "
+            "preserve them first; merge never discards work."
+        )
+    if lane.exists() and git(lane, "status", "--porcelain"):
+        raise BridgeError(
+            f"{name} has uncommitted changes that {branch} does not carry. "
+            "Commit them in the lane first; merge only ever merges commits."
+        )
+    pending = git(root, "log", "--oneline", f"HEAD..{branch}")
+    if not pending:
+        return f"{base} already contains every commit on {branch}."
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "merge",
+            "--no-ff",
+            "-m",
+            f"Merge bridge lane {name} from {branch}",
+            branch,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if result.returncode:
+        if not (git_dir / "MERGE_HEAD").exists():
+            raise BridgeError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"Merging {branch} into {base} failed."
+            )
+        conflicted = git(root, "diff", "--name-only", "--diff-filter=U")
+        raise BridgeError(
+            f"Merging {branch} into {base} stopped on conflicts and the "
+            f"merge is now in progress in {root}:\n{conflicted}\n"
+            f"Resolve those paths and run `git -C {quoted} merge --continue`, "
+            f"or run `git -C {quoted} merge --abort` to leave {base} exactly "
+            "as it was. Agent Bridge never resolves a conflict for you."
+        )
+    merged = len(pending.splitlines())
+    return (
+        f"Merged {branch} into {base} as a merge commit, carrying {merged} "
+        f"commits from {name}. The lane and its branch are unchanged; retire "
+        f"{name} separately when the lane is no longer needed."
     )
 
 
@@ -511,6 +637,40 @@ class Bridge:
                 write_json(directory / "project.json", data)
                 return f"Retired {name}. {note} Messages are preserved."
 
+    def merge(self, repo: Path, name: str) -> str:
+        """Merges one participant's bridge branch into the base checkout.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose bridge branch is merged.
+
+        Returns:
+            An account of what was merged.
+
+        Raises:
+            BridgeError: If the lane drifted, if the participant holds a
+                running session, or if the merge cannot complete unattended.
+        """
+        root, directory = self.project(repo)
+        with lock(directory / "setup.lock"):
+            data = self._project(root, directory, verify={name})
+            participant = data["participants"].get(name)
+            if participant is None:
+                raise BridgeError(
+                    f"{name} is not a participant in this project; "
+                    "run agent-bridge participant list."
+                )
+            with lock(
+                directory / f"{name}.session.lock",
+                f"{name} has a running session; stop that terminal first.",
+            ):
+                return merge_branch(
+                    root,
+                    Path(participant["lane"]),
+                    name,
+                    participant["branch"],
+                )
+
     async def identity(self, agent: str, data: dict) -> dict:
         """Registers a lane locally; registration is not an MCP tool.
 
@@ -707,6 +867,67 @@ review, not merged or independently verified. An idle turn is not completion.
             to=to,
             summary=summary,
             offer_id=offer_id,
+        )
+
+    def export_events(
+        self,
+        repo: Path,
+        participants: tuple[str, ...] = (),
+        window: float = 0.0,
+        output: Path | None = None,
+    ) -> str:
+        """Writes retained hook event records as JSON Lines.
+
+        Each line carries the participant that produced the record, so an
+        export of several lanes stays attributable. Records are grouped by
+        participant and remain oldest first within one, which is the order
+        the log retains them in.
+
+        Args:
+            repo: Any checkout of the target repository.
+            participants: Participants to export; every participant when
+                empty.
+            window: Seconds of history to export; everything retained when
+                zero.
+            output: Destination file, or None to write to standard output.
+
+        Returns:
+            An account of what was exported.
+
+        Raises:
+            BridgeError: If a named participant is not in this project.
+            OSError: If the destination cannot be written.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        names = sorted(data["participants"])
+        unknown = sorted(set(participants) - set(names))
+        if unknown:
+            raise BridgeError(
+                f"Not a participant in this project: {', '.join(unknown)}; "
+                "run agent-bridge participant list."
+            )
+        selected = [
+            name for name in names if not participants or name in participants
+        ]
+        since = time.time() - window if window else 0.0
+        lines = [
+            json.dumps({"participant": name, **entry})
+            for name in selected
+            for entry in read_events(directory, name, since)
+        ]
+        text = "".join(f"{line}\n" for line in lines)
+        if output is None:
+            sys.stdout.write(text)
+        else:
+            output.write_text(text, encoding="utf-8")
+        covered = (
+            f"the last {int(window)}s" if window else "everything retained"
+        )
+        destination = "standard output" if output is None else str(output)
+        return (
+            f"Exported {len(lines)} records from {len(selected)} participants "
+            f"covering {covered} to {destination}."
         )
 
     def liveness(self, repo: Path) -> dict[str, str]:
@@ -971,6 +1192,46 @@ def main() -> int:
             "flag to report several."
         ),
     )
+    watch.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Count only enforcement history inside this window, such as 45m, "
+            "6h or 7d. The whole retained log is counted by default."
+        ),
+    )
+    events = commands.add_parser(
+        "events", help="Export retained enforcement history for a repository."
+    )
+    records = events.add_subparsers(dest="action", required=True)
+    export = records.add_parser("export")
+    export.add_argument("--repo", type=Path, default=Path.cwd())
+    export.add_argument(
+        "--participant",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Export only this participant. Repeat the flag to export several; "
+            "every participant is exported by default."
+        ),
+    )
+    export.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Export only records inside this window, such as 45m, 6h or 7d. "
+            "Everything still retained is exported by default."
+        ),
+    )
+    export.add_argument(
+        "--output",
+        type=Path,
+        help="Destination file; JSON Lines go to standard output otherwise.",
+    )
     setup = commands.add_parser(
         "setup",
         help="Register a repository for coordination from committed HEAD.",
@@ -1037,7 +1298,7 @@ def main() -> int:
     joining.add_argument("--provider")
     joining.add_argument("--credentials")
     joining.add_argument("--repo", type=Path, default=Path.cwd())
-    for action in ("restore", "retire"):
+    for action in ("restore", "retire", "merge"):
         command = roles.add_parser(action)
         command.add_argument("name")
         command.add_argument("--repo", type=Path, default=Path.cwd())
@@ -1081,6 +1342,18 @@ def main() -> int:
                 args.once,
                 args.interval,
                 tuple(args.provider or ()),
+                args.since,
+            )
+        elif args.command == "events":
+            message = bridge.export_events(
+                args.repo.resolve(),
+                tuple(args.participant or ()),
+                args.since,
+                args.output,
+            )
+            print(
+                message,
+                file=sys.stdout if args.output else sys.stderr,
             )
         elif args.command == "setup":
             print(json.dumps(bridge.setup(args.repo.resolve()), indent=2))
@@ -1125,6 +1398,8 @@ def main() -> int:
                 print(bridge.restore(repository, args.name))
             elif args.action == "retire":
                 print(bridge.retire(repository, args.name))
+            elif args.action == "merge":
+                print(bridge.merge(repository, args.name))
             _, directory = bridge.project(repository)
             print(roster.describe(roster.read(directory)))
         elif args.command == "provider":

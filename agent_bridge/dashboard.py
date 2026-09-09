@@ -113,7 +113,7 @@ def _row(
     """
     participant = data["participants"][agent]
     state = activity(directory, agent)
-    events = event_summary(directory, agent)
+    events = event_summary(directory, agent, context["since"])
     stats = context["usage"].get(participant["display"], {})
     issues = context["issues"]["issues"]
     owned = sorted(
@@ -171,6 +171,7 @@ def collect(
     running: bool,
     branches: dict,
     providers: tuple[str, ...] = (),
+    window: float = 0.0,
 ) -> dict:
     """Reads one snapshot of every registered project without changing state.
 
@@ -181,12 +182,16 @@ def collect(
         providers: Provider names to report; every provider when empty. A
             project keeps its heading once it holds a selected participant, so
             an operator can tell an emptied selection from an empty project.
+        window: Seconds of enforcement history each event count covers; the
+            whole retained log when zero. The window ends at the time of this
+            reading, so a live view reports a period that moves with it.
 
     Returns:
         Server health, per-project participant rows, and totals over the
         reported rows, so a header never counts a participant the table
         does not show.
     """
+    since = time.time() - window if window else 0.0
     projects = []
     totals = {"participants": 0, "events": 0, "denials": 0, "context": 0}
     for path in sorted((home / "projects").glob("*/project.json")):
@@ -202,6 +207,7 @@ def collect(
             "usage": usage,
             "issues": snapshot(path.parent),
             "branches": branches,
+            "since": since,
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -221,6 +227,7 @@ def collect(
         "projects": projects,
         "totals": totals,
         "providers": list(providers),
+        "window": window,
     }
 
 
@@ -252,6 +259,11 @@ def render(view: dict) -> list[str]:
             f"  provider {','.join(view['providers'])}"
             if view.get("providers")
             else ""
+        )
+        + (
+            f"  last {_age(view['window'])}"
+            if view.get("window")
+            else "  all retained"
         ),
     ]
     header = "  ".join(name.ljust(width) for name, width in COLUMNS)
@@ -310,6 +322,7 @@ def _loop(
     running: Callable[[], bool],
     interval: float,
     providers: tuple[str, ...],
+    window: float,
 ) -> None:
     """Redraws the snapshot until the operator quits; never writes state."""
     branches: dict = {}
@@ -317,7 +330,7 @@ def _loop(
         curses.curs_set(0)
     screen.timeout(max(100, int(interval * 1000)))
     while True:
-        lines = render(collect(home, running(), branches, providers))
+        lines = render(collect(home, running(), branches, providers, window))
         height, width = screen.getmaxyx()
         screen.erase()
         for index, line in enumerate(lines[: height - 1]):
@@ -342,6 +355,7 @@ def run(
     once: bool = False,
     interval: float = 1.0,
     providers: tuple[str, ...] = (),
+    window: float = 0.0,
 ) -> None:
     """Shows the dashboard, printing a plain snapshot when it cannot draw.
 
@@ -351,9 +365,11 @@ def run(
         once: Print one snapshot instead of drawing a live view.
         interval: Seconds between redraws of the live view.
         providers: Provider names to report; every provider when empty.
+        window: Seconds of enforcement history each event count covers; the
+            whole retained log when zero.
     """
     if once or not sys.stdout.isatty():
-        for line in render(collect(home, running(), {}, providers)):
+        for line in render(collect(home, running(), {}, providers, window)):
             print(line)
         return
-    curses.wrapper(_loop, home, running, interval, providers)
+    curses.wrapper(_loop, home, running, interval, providers, window)

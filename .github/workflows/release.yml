@@ -28,6 +28,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
@@ -75,3 +76,18 @@ jobs:
           cmp dist/release/SHA256SUMS "$verification_dir/SHA256SUMS"
           (cd "$verification_dir" && sha256sum --check SHA256SUMS)
           gh release edit "$RELEASE_TAG" --draft=false --latest
+      - name: Stage the wheel and sdist for PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          rm -rf dist/pypi
+          mkdir -p dist/pypi
+          cp "dist/release/agent_bridge-${version}-py3-none-any.whl" \
+            "dist/release/agent_bridge-${version}.tar.gz" dist/pypi/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: dist/pypi
+          skip-existing: true
+          print-hash: true

@@ -58,6 +58,22 @@ files, releasing reservations, and listing participants. Unknown arguments fail.
 key: identical retries return the original message ID; changed retries fail.
 Fetching never marks a message read or acknowledges it.
 
+No coordination tool returns a participant's whole starting context. The store
+holds projects, agents, messages, recipients, reservations and events, keyed by
+an authenticated project and lane. The issue ledger and the participant
+manifest are files in the project state directory, whose name derives from the
+repository's Git common directory, which the store never records. A served
+call carries no repository path, and the detached service must not run Git, so
+reaching that directory would need a new schema column, a launch-time map that
+goes stale as projects are added, or a scan of every project's manifest. None
+of those buys a capability. Checkpoints already deliver the roster, the issue
+ledger and message previews at session start and again on any prompt submit or
+pre-tool-use whose state changed; `list_participants` returns the roster on
+demand; and `agent-bridge issue list`, run from a participant's own worktree,
+re-reads the ledger from the one process that can resolve the directory. The
+store therefore stays free of repository paths, and refreshing context stays a
+checkpoint and CLI concern rather than a coordination tool.
+
 ## Participants, providers and accounts
 
 A project holds a roster of participants. A participant is one lane: its own
@@ -76,9 +92,20 @@ append-only file in the project state directory, outside the coordination store
 and its write lock, and it rotates to `<participant>-events.1.jsonl` at a fixed
 byte cap. A reader summarizes the rotated file and then the current one, oldest
 record first, so a report covers everything still retained rather than the
-current file alone. Retention is still two files: the rotation that creates a
-new one discards the older, and a report falls by that much. A log failure never
-changes an enforcement outcome.
+current file alone. Retention is bounded twice: two files, because the rotation
+that creates a new one discards the older, and a maximum record age. Age
+retention rewrites the log, which costs a full read and write, so it runs only
+at a session boundary and never on the blocking path a hook takes before a tool
+call. A lane that never reaches a session boundary is still bounded by the byte
+cap. Each file is replaced atomically, and a failed rewrite leaves the log
+exactly as it was. A log failure never changes an enforcement outcome.
+
+Retained records are readable as a whole or over a window. A window filters on
+the recorded time, so it reports a period rather than a file, and a record
+carrying no time is never counted inside one. Export writes the retained
+records as JSON Lines, one record per line, each naming the participant that
+produced it, so enforcement history leaves the state directory in the shape it
+was stored in rather than a rendered summary.
 
 A lane's session state follows a recorded session process identity, matched by
 process ID and Linux creation ticks, never its session lock. The launcher holds
@@ -108,6 +135,17 @@ lane's actual branch. `participant restore` returns one lane to its branch and
 its session lock or its worktree is dirty, and neither resets, cleans, stashes,
 or force-switches. Retiring invalidates that participant's credential and keeps
 its branch whenever the branch holds commits the project base does not.
+
+`participant merge` integrates one lane's branch into the base checkout. It runs
+in the common repository root, never inside another lane, and always records a
+merge commit, so an integration is auditable rather than replayed as a fast
+forward. It refuses on a drifted lane, on a running session, on a dirty base
+checkout, on uncommitted lane changes the branch does not carry, and on a base
+checkout that is already merging or on a detached HEAD. A conflict is left in
+the working tree with the conflicting paths named and both `git merge --continue`
+and `git merge --abort` reported; Agent Bridge never resolves a conflict, and
+never resets, cleans, stashes or force-switches. Merging leaves the lane and its
+branch untouched, so retiring stays a separate decision.
 
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
@@ -162,6 +200,7 @@ the process with Linux pidfd before signaling. It does not kill arbitrary PIDs.
 | Reservation lifetime | 30–3,600 seconds |
 | Reservation reason | 160 bytes stored; 80 characters reported on conflict |
 | Participant event log | Rotated at 262,144 bytes; one rotated file retained |
+| Participant event age | 1,209,600 seconds, applied at a session boundary |
 | Retained tool events | 2,000 per project |
 
 Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refetch

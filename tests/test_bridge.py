@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 import zipfile
 from pathlib import Path
@@ -19,11 +20,13 @@ from mcp.client.streamable_http import streamable_http_client
 
 from agent_bridge import dashboard, roster, store
 from agent_bridge.checkpoints import (
+    MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
     branch_guard,
     checkpoint,
     event_summary,
     mailbox,
+    prune,
 )
 from agent_bridge.cli import Bridge, BridgeError, git, lock, write_json
 from agent_bridge.process import start_ticks
@@ -1347,3 +1350,174 @@ def test_joining_participant_is_announced_once(
     bridge.add_participant(repo, "kimi-1", "kimi")
     joined = checkpoint(bridge.home, directory, "claude", payload)
     assert "kimi-1" in joined["hookSpecificOutput"]["additionalContext"]
+
+
+def identify(worktree):
+    """Gives a fixture repository the identity a merge commit needs."""
+    git(worktree, "config", "user.name", "Bridge Test")
+    git(worktree, "config", "user.email", "test@example.com")
+
+
+def commit(worktree, message):
+    """Records every pending change with a fixed identity."""
+    git(worktree, "add", "--all")
+    git(
+        worktree,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        message,
+    )
+
+
+def test_merge_integrates_a_lane_branch_and_leaves_the_lane_alone(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    directory = lane.parent
+    base = git(repo, "branch", "--show-current")
+    identify(repo)
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "Lane work")
+
+    (lane / "draft.txt").write_text("unsaved\n")
+    with pytest.raises(BridgeError, match="uncommitted changes that"):
+        bridge.merge(repo, "codex")
+    (lane / "draft.txt").unlink()
+
+    (repo / "pending.txt").write_text("base scratch\n")
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.merge(repo, "codex")
+    (repo / "pending.txt").unlink()
+
+    with lock(directory / "codex.session.lock"):
+        with pytest.raises(BridgeError, match="running session"):
+            bridge.merge(repo, "codex")
+
+    message = bridge.merge(repo, "codex")
+    assert f"Merged {branch} into {base}" in message
+    assert (repo / "feature.txt").read_text() == "lane work\n"
+    assert git(repo, "log", "-1", "--pretty=%s") == (
+        f"Merge bridge lane codex from {branch}"
+    )
+    assert len(git(repo, "log", "-1", "--pretty=%P").split()) == 2
+    assert lane.exists()
+    assert git(lane, "branch", "--show-current") == branch
+    assert bridge.merge(repo, "codex") == (
+        f"{base} already contains every commit on {branch}."
+    )
+
+
+def test_merge_leaves_a_conflict_resolvable_without_discarding(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    identify(repo)
+    (lane / "shared.txt").write_text("lane version\n")
+    commit(lane, "Lane edit")
+    (repo / "shared.txt").write_text("base version\n")
+    commit(repo, "Base edit")
+
+    with pytest.raises(BridgeError, match="stopped on conflicts") as failure:
+        bridge.merge(repo, "codex")
+    assert "shared.txt" in str(failure.value)
+    assert "merge --abort" in str(failure.value)
+    assert "shared.txt" in git(repo, "diff", "--name-only", "--diff-filter=U")
+
+    with pytest.raises(BridgeError, match="already merging"):
+        bridge.merge(repo, "codex")
+    git(repo, "merge", "--abort")
+    assert (repo / "shared.txt").read_text() == "base version\n"
+    assert (lane / "shared.txt").read_text() == "lane version\n"
+
+
+def test_event_history_is_bounded_by_age_and_reported_by_window(
+    bridge, repo, paired, tmp_path, capsys
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    log = directory / "claude-events.jsonl"
+    now = time.time()
+    expired = now - MAX_EVENT_LOG_AGE - 60
+    log.write_text(
+        "".join(
+            json.dumps(entry) + "\n"
+            for entry in (
+                {
+                    "ts": expired,
+                    "decision": "deny",
+                    "injected_bytes": 5,
+                    "reason_class": "branch_drift",
+                },
+                {
+                    "ts": now - 30,
+                    "decision": "allow",
+                    "injected_bytes": 7,
+                    "reason_class": "coordination_pending",
+                },
+            )
+        )
+    )
+    assert event_summary(directory, "claude")["events"] == 2
+    windowed = event_summary(directory, "claude", now - 60)
+    assert windowed["events"] == 1
+    assert windowed["denials"] == 0
+    assert windowed["injected_bytes"] == 7
+
+    dashboard.run(bridge.home, lambda: False, once=True, window=3600.0)
+    assert "last 60m" in capsys.readouterr().out
+    dashboard.run(bridge.home, lambda: False, once=True)
+    assert "all retained" in capsys.readouterr().out
+
+    destination = tmp_path / "events.jsonl"
+    report = bridge.export_events(repo, ("claude",), output=destination)
+    exported = [
+        json.loads(line) for line in destination.read_text().splitlines()
+    ]
+    assert [entry["participant"] for entry in exported] == ["claude"] * 2
+    assert [entry["ts"] for entry in exported] == [expired, now - 30]
+    assert "2 records" in report and str(destination) in report
+    assert bridge.export_events(repo, (), now - expired - 30, destination)
+    assert len(destination.read_text().splitlines()) == 1
+
+    with pytest.raises(BridgeError, match="Not a participant"):
+        bridge.export_events(repo, ("absent",))
+
+    assert prune(directory, "claude", now) == 1
+    assert event_summary(directory, "claude")["events"] == 1
+    assert json.loads(log.read_text().splitlines()[0])["ts"] == now - 30
+
+
+def test_session_end_discards_event_records_past_the_retention_age(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    log = directory / "claude-events.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "ts": time.time() - MAX_EVENT_LOG_AGE - 60,
+                "decision": "deny",
+                "injected_bytes": 5,
+                "reason_class": "branch_drift",
+            }
+        )
+        + "\n"
+    )
+    checkpoint(
+        bridge.home,
+        directory,
+        "claude",
+        {
+            "hook_event_name": "SessionEnd",
+            "cwd": str(lane),
+            "session_id": "test",
+        },
+    )
+    entries = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [entry["event"] for entry in entries] == ["SessionEnd"]

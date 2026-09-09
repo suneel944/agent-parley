@@ -114,6 +114,16 @@ agent-bridge status   # ownership, activity and reported results
 agent-bridge top      # every lane live, including what enforcement denied
 ```
 
+When a lane's work is ready, integrate it from the base checkout:
+
+```sh
+agent-bridge participant merge claude-2
+```
+
+It always records a merge commit, refuses on a running session, a dirty tree or
+a drifted lane, and leaves a conflict in place for you to resolve. It never
+resets, cleans, stashes or force-switches.
+
 ## What it enforces
 
 **Ownership changes only through explicit claims and accepted handoffs.** No
@@ -147,6 +157,17 @@ Enforcement is recorded, not discarded. Every hook decision carries an
 enumerated reason and lands in that participant's event log; every served call
 is recorded inside the transaction that carried its effect. That is why `top`
 can show what was denied, to whom, and how often.
+
+That history is bounded, and it can leave the state directory. A lane keeps two
+event files and discards records older than fourteen days, so `top` reports
+recent enforcement rather than the whole project. `--since` narrows any count
+to a window, and `events export` writes the retained records as JSON Lines you
+can keep for as long as you need:
+
+```sh
+agent-bridge top --since 6h
+agent-bridge events export --since 7d --output enforcement.jsonl
+```
 
 ## Watch one provider
 

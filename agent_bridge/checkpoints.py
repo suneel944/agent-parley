@@ -19,6 +19,7 @@ from agent_bridge.store import DATABASE
 
 MAX_CONTEXT_BYTES = 1536
 MAX_EVENT_LOG_BYTES = 262144
+MAX_EVENT_LOG_AGE = 1209600
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
         "-C",
@@ -141,6 +142,90 @@ def record(
             path.replace(directory / f"{agent}-events.1.jsonl")
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry) + "\n")
+
+
+def read_events(directory: Path, agent: str, since: float = 0.0) -> list[dict]:
+    """Reads the retained hook event records for one participant.
+
+    Records are returned oldest first, the rotated file before the current
+    one, so a reader covers everything still retained rather than the current
+    file alone. An unreadable file and a malformed line are skipped, because a
+    damaged log must never fail a report.
+
+    Args:
+        directory: Private state directory for the common repository.
+        agent: Participant that owns the lane.
+        since: Unix time floor; a record older than it, or carrying no time,
+            is omitted. Zero returns everything retained.
+
+    Returns:
+        Retained records, oldest first.
+    """
+    entries = []
+    for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
+        try:
+            text = (directory / name).read_text(errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if float(entry.get("ts", 0) or 0) < since:
+                continue
+            entries.append(entry)
+    return entries
+
+
+def prune(directory: Path, agent: str, now: float = 0.0) -> int:
+    """Discards event records older than the retention age.
+
+    Age retention runs beside the byte cap rather than replacing it, and
+    never on a hook's blocking path: rewriting a log costs a full read and
+    write, so it runs only at a session boundary. Each file is replaced
+    atomically, and a failure leaves the log exactly as it was, because
+    telemetry must never change an enforcement outcome.
+
+    Args:
+        directory: Private state directory for the common repository.
+        agent: Participant that owns the lane.
+        now: Unix time the retention window ends at; the current time when it
+            is zero.
+
+    Returns:
+        Number of records discarded.
+    """
+    floor = (now or time.time()) - MAX_EVENT_LOG_AGE
+    discarded = 0
+    for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
+        path = directory / name
+        with contextlib.suppress(OSError):
+            if not path.exists():
+                continue
+            kept = []
+            dropped = 0
+            for line in path.read_text(errors="ignore").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    dropped += 1
+                    continue
+                if float(entry.get("ts", 0) or 0) < floor:
+                    dropped += 1
+                    continue
+                kept.append(line)
+            if not dropped:
+                continue
+            temporary = path.with_name(f"{path.name}.tmp")
+            temporary.write_text(
+                "".join(f"{line}\n" for line in kept), encoding="utf-8"
+            )
+            temporary.replace(path)
+            discarded += dropped
+    return discarded
 
 
 def shell_segments(command: str) -> list[list[str]]:
@@ -377,7 +462,7 @@ def participant_liveness(directory: Path, agent: str) -> str:
     return f"{reported if running else 'stopped'}{age}"
 
 
-def event_summary(directory: Path, agent: str) -> dict:
+def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
     """Summarizes the retained hook event log for one participant.
 
     Counts cover the rotated file and then the current one, oldest record
@@ -387,36 +472,25 @@ def event_summary(directory: Path, agent: str) -> dict:
     Args:
         directory: Private state directory for the common repository.
         agent: Participant that owns the lane.
+        since: Unix time floor; only records at or after it are counted.
+            Zero counts everything retained.
 
     Returns:
         Observed event count, denials, injected bytes, and the time and
         reason class of the most recent record.
     """
-    events = denials = injected = 0
-    last_ts = 0.0
-    last_reason = ""
-    for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
-        try:
-            text = (directory / name).read_text(errors="ignore")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue
-            events += 1
-            if entry.get("decision") in ("deny", "block"):
-                denials += 1
-            injected += int(entry.get("injected_bytes", 0) or 0)
-            last_ts = float(entry.get("ts", 0) or 0)
-            last_reason = str(entry.get("reason_class", ""))
+    entries = read_events(directory, agent, since)
+    last = entries[-1] if entries else {}
     return {
-        "events": events,
-        "denials": denials,
-        "injected_bytes": injected,
-        "last_ts": last_ts,
-        "last_reason": last_reason,
+        "events": len(entries),
+        "denials": sum(
+            1 for entry in entries if entry.get("decision") in ("deny", "block")
+        ),
+        "injected_bytes": sum(
+            int(entry.get("injected_bytes", 0) or 0) for entry in entries
+        ),
+        "last_ts": float(last.get("ts", 0) or 0),
+        "last_reason": str(last.get("reason_class", "")),
     }
 
 
@@ -744,6 +818,8 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
             output,
             str(state.get("activity", "")),
         )
+        if event in ("SessionStart", "SessionEnd"):
+            prune(directory, agent)
         return output
 
 
