@@ -1,5 +1,6 @@
 {
   "name": "agent-parley-local",
+  "description": "Coordination plugins for running several coding agents side by side in separate Git worktrees.",
   "owner": {
     "name": "Suneel Kaushik S",
     "email": "suneel944@gmail.com"

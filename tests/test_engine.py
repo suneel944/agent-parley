@@ -79,6 +79,24 @@ def test_ownership_listing_reports_liveness_and_keeps_the_owner():
     )
 
 
+def test_ownership_listing_names_the_holder_of_each_blocking_issue():
+    state = {
+        "revision": 4,
+        "issues": {
+            "7": {
+                "owner": "claude-1",
+                "offer": None,
+                "blocked_by": ["4", "9"],
+                "history": [],
+            },
+            "4": {"owner": "codex-1", "offer": None, "history": []},
+        },
+    }
+    assert describe(state) == (
+        "#4: codex-1\n#7: claude-1; waits on #4 (codex-1), #9 (unclaimed)"
+    )
+
+
 def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(

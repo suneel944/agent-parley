@@ -11,12 +11,15 @@ import zipfile
 from pathlib import Path
 
 
-def release_notes(changelog: str, version: str) -> str:
+def release_notes(changelog: str, version: str, overview: str = "") -> str:
     """Extracts a version section from manual or Release Please changelogs.
 
     Args:
         changelog: Complete Markdown changelog.
         version: Exact package version to extract.
+        overview: Standing product description placed before the section, so
+            that every release states what the project is without a per-release
+            edit.
 
     Returns:
         Version heading and its release notes, excluding adjacent versions.
@@ -37,6 +40,8 @@ def release_notes(changelog: str, version: str) -> str:
     )[0].strip()
     if not section:
         raise ValueError("Release notes must not be empty.")
+    if overview.strip():
+        section = f"{overview.strip()}\n\n{section}"
     return f"## Agent Parley {version}\n\n{section}\n"
 
 
@@ -62,7 +67,8 @@ def main() -> None:
         if manifest["version"] != version:
             raise ValueError(f"{client} plugin version differs from package.")
     changelog = (root / "CHANGELOG.md").read_text()
-    notes = release_notes(changelog, version)
+    overview = (root / "docs" / "release-overview.md").read_text()
+    notes = release_notes(changelog, version, overview)
     output = root / "dist" / "release"
     output.mkdir(parents=True, exist_ok=True)
     assets = []
