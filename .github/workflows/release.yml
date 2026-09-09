@@ -83,8 +83,8 @@ jobs:
           version="${RELEASE_TAG#v}"
           rm -rf dist/pypi
           mkdir -p dist/pypi
-          cp "dist/release/agent_bridge-${version}-py3-none-any.whl" \
-            "dist/release/agent_bridge-${version}.tar.gz" dist/pypi/
+          cp "dist/release/agent_parley-${version}-py3-none-any.whl" \
+            "dist/release/agent_parley-${version}.tar.gz" dist/pypi/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:

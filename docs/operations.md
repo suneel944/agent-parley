@@ -6,6 +6,15 @@ Installing needs no clone. `uv tool install git+https://github.com/suneel944/age
 tracks the default branch; a release wheel URL pins an exact version, and the
 wheel needs no third-party runtime packages either way.
 
+The distribution is published as `agent-parley`, because PyPI holds an
+unrelated `agentbridge` project and treats that name and `agent-bridge` as the
+same once separators are stripped. The command remains `agent-bridge` and the
+import package remains `agent_bridge`; only the install name differs.
+
+```sh
+uv tool install agent-parley
+```
+
 From a checkout, `make install` installs a package snapshot in uv's user
 executable directory. If needed, run `uv tool update-shell` and open a new
 terminal. `make install-dev` installs an editable checkout.
@@ -222,11 +231,16 @@ Publishing needs one manual step that only the repository owner can take, and
 it must be done before the first tag. PyPI has no `agent-bridge` project yet,
 and a trusted publisher cannot be added to a project that has no releases, so
 add a *pending* publisher instead: PyPI, account settings, Publishing, "Add a
-new pending publisher", GitHub, with PyPI project name `agent-bridge`, owner
+new pending publisher", GitHub, with PyPI project name `agent-parley`, owner
 `suneel944`, repository `agent-bridge`, workflow `release.yml`, and the
 environment name left empty because the workflow declares no environment. The
 first successful run creates the project and converts the pending publisher
 into a normal one. Nothing is added to repository secrets.
+
+A pending publisher does not reserve the name until it is first used, so
+register it before tagging. `agent-bridge` itself is unavailable: PyPI strips
+separators when comparing names, and an unrelated `agentbridge` project already
+holds that form.
 
 Download assets together and run `sha256sum --check SHA256SUMS`. The wheel needs
 no third-party runtime packages. Development tools and the independent MCP test

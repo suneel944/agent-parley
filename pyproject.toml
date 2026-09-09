@@ -3,7 +3,7 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-bridge"
+name = "agent-parley"
 version = "0.3.2"
 description = "Run several coding agents in isolated worktrees with shared coordination."
 readme = "README.md"

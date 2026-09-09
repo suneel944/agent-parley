@@ -286,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "agent-bridge",
-                    "version": importlib.metadata.version("agent-bridge"),
+                    "version": importlib.metadata.version("agent-parley"),
                 },
             }
         elif method == "ping":

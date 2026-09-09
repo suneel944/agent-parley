@@ -856,19 +856,18 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     project = Path(__file__).resolve().parents[1]
     metadata = tomllib.loads((project / "pyproject.toml").read_text())
     version = metadata["project"]["version"]
-    wheel = project / "dist" / f"agent_bridge-{version}-py3-none-any.whl"
+    stem = metadata["project"]["name"].replace("-", "_")
+    wheel = project / "dist" / f"{stem}-{version}-py3-none-any.whl"
     assert wheel.exists(), "Run make build before the installed-package test."
     with zipfile.ZipFile(wheel) as archive:
         assert "agent_bridge/__main__.py" in archive.namelist()
         package_metadata = archive.read(
-            f"agent_bridge-{version}.dist-info/METADATA"
+            f"{stem}-{version}.dist-info/METADATA"
         ).decode()
         assert "Requires-Dist:" not in package_metadata
         assert not any(name.startswith("src/") for name in archive.namelist())
-    with tarfile.open(
-        project / "dist" / f"agent_bridge-{version}.tar.gz"
-    ) as archive:
-        root = f"agent_bridge-{version}"
+    with tarfile.open(project / "dist" / f"{stem}-{version}.tar.gz") as archive:
+        root = f"{stem}-{version}"
         for client in ("codex", "claude"):
             manifest_path = (
                 f"{root}/plugins/agent-bridge/.{client}-plugin/plugin.json"
@@ -1001,7 +1000,9 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             timeout=30,
         )
         assert result.returncode == expected, result.stderr
-    installed_python = tmp_path / "tools" / "agent-bridge" / "bin" / "python"
+    installed_python = (
+        tmp_path / "tools" / metadata["project"]["name"] / "bin" / "python"
+    )
     location = subprocess.run(
         [
             str(installed_python),

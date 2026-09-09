@@ -59,6 +59,7 @@ The wheel needs no third-party runtime packages.
 
 ```sh
 uv tool install git+https://github.com/suneel944/agent-bridge
+# once released: uv tool install agent-parley
 ```
 
 Then add the plugin to whichever CLI you drive. One marketplace serves both.

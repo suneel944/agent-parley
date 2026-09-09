@@ -6,7 +6,7 @@ only, and the launcher supplies MCP configuration and lifecycle hooks per
 session. Given the wheel and locked requirements from the same release:
 
 ```sh
-uv tool install ./agent_bridge-VERSION-py3-none-any.whl \
+uv tool install ./agent_parley-VERSION-py3-none-any.whl \
   --with-requirements ./requirements.txt
 ```
 
