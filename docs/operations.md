@@ -234,9 +234,16 @@ would never be cut. Nothing here bypasses a check. `check`, `secrets` and
 `pr-hygiene` stay required, `enforce_admins` stays on, and auto-merge only
 merges once all three pass. A red check leaves the pull request open.
 
-Merging that pull request creates the `vVERSION` tag and triggers release CI.
-It reruns the gate, creates a draft, uploads assets, downloads and verifies
-their checksums, then publishes. Failed verification leaves a draft.
+Merging that pull request creates the `vVERSION` tag, and the same run calls the
+release workflow. It reruns the gate, creates a draft, uploads assets, downloads
+and verifies their checksums, then publishes. Failed verification leaves a
+draft.
+
+The release workflow answers only to that call and to `workflow_dispatch`. It
+deliberately has no tag trigger: a tag push would start a second publisher for
+the same tag, and whichever run arrived second would find the release already
+published and fail. Publishing an existing tag is idempotent, so a rerun
+verifies the uploaded bytes again instead of failing.
 
 Release notes are assembled from two sources so that no release needs hand
 editing: `docs/release-overview.md` is a standing description of what the
