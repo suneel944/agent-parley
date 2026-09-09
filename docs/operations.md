@@ -2,9 +2,11 @@
 
 ## Install and upgrade
 
-Installing needs no clone. `uv tool install git+https://github.com/suneel944/agent-parley`
-tracks the default branch; a release wheel URL pins an exact version, and the
-wheel needs no third-party runtime packages either way.
+Installing needs no clone. `uv tool install agent-parley` takes the published
+distribution from PyPI. `uv tool install git+https://github.com/suneel944/agent-parley`
+tracks the default branch instead, and a release wheel URL pins an exact
+version. The wheel needs no third-party runtime packages in any of the three
+cases.
 
 The distribution, the command and the import package are all named after the
 project: `agent-parley`, `agent-parley` and `agent_parley`.
@@ -34,6 +36,8 @@ agent-parley issue list
 agent-parley issue claim 42
 agent-parley issue offer 42 --to codex --summary "commit, checks, remaining work"
 agent-parley issue accept 42 --offer-id CURRENT_OFFER_ID
+agent-parley issue block 42 --on 17
+agent-parley issue unblock 42 --on 17
 agent-parley report --state ready --summary "Result" --evidence "Checks and results"
 ```
 
@@ -42,6 +46,17 @@ agent-parley report --state ready --summary "Result" --evidence "Checks and resu
 `issue list` prints each owner's session state and the age of its last
 checkpoint, so a stalled lane is visible. Reclaiming that work still needs the
 owner to release it, or an explicit offer and accept.
+
+`issue block NUMBER --on OTHER` records that one issue waits on another. Only
+the current owner of NUMBER can add or drop a dependency, and an issue records
+at most ten. `issue list` then names the participant holding each blocking
+issue, or reports it unclaimed. Every ledger change bumps the revision, so the
+next checkpoint delivers the updated dependency line to each running lane
+without polling. Dependencies survive release and reclaim.
+
+A dependency is information, not a gate. Nothing prevents work on a waiting
+issue, no transition clears a dependency, and finishing the blocking issue does
+not drop the edge; the owner runs `issue unblock` when the wait is over.
 
 `agent-parley top` watches every participant live: session state, event age,
 branch with a `!` when a lane left its assigned branch, issues owned and
@@ -198,10 +213,55 @@ the owner's accounts and cannot be delegated.
 
 ## Releases
 
-Update package/plugin versions together and add a changelog entry. Run `make check`
-and `make release-artifacts`. After review and merge, an annotated `vVERSION` tag
-triggers release CI. It reruns the gate, creates a draft, uploads assets, downloads
-and verifies their checksums, then publishes. Failed verification leaves a draft.
+Releases run without a manual step. Every push to `main` runs
+`Prepare release`, which mints a token for the release GitHub App, runs Release
+Please as that App, and keeps one open release pull request holding the next
+version across `pyproject.toml`, both plugin manifests, the Claude marketplace
+manifest, `uv.lock` and `CHANGELOG.md`. Because the App opens and pushes that
+branch, `Check` and `PR hygiene` start on it like any other pull request; a
+pull request opened with the workflow token would leave them waiting for
+manual approval instead. The same job assigns the pull request, labels it
+`release`, creates the `vVERSION` milestone and the tracking issue, and links
+them, because the hygiene gate requires all four.
+
+The workflow then reviews that pull request as `github-actions[bot]` and turns
+on auto-merge. The review and the branch push come from two different
+identities on purpose: the ruleset requires the most recent push to be approved
+by someone other than the pusher. Auto-merge is enabled with the App token so
+that the merge commit comes from the App and starts the next `Prepare release`
+run; a merge attributed to the workflow token would start nothing and the tag
+would never be cut. Nothing here bypasses a check. `check`, `secrets` and
+`pr-hygiene` stay required, `enforce_admins` stays on, and auto-merge only
+merges once all three pass. A red check leaves the pull request open.
+
+Merging that pull request creates the `vVERSION` tag and triggers release CI.
+It reruns the gate, creates a draft, uploads assets, downloads and verifies
+their checksums, then publishes. Failed verification leaves a draft.
+
+Release notes are assembled from two sources so that no release needs hand
+editing: `docs/release-overview.md` is a standing description of what the
+project is and how to verify a download, and Release Please generates the
+version section of `CHANGELOG.md` from merged commit subjects. Maintenance,
+automation, build, refactor and test commits are hidden from that section, so
+the notes carry features, fixes, performance, documentation and reverts.
+Rewrite `docs/release-overview.md` when the product description changes, not
+when a version does.
+
+After publication the release workflow comments the verification result on the
+tracking issue, closes it, and closes the milestone once nothing else is open
+in it. Merged release branches are deleted by the repository setting.
+
+One-time owner setup, without which `Prepare release` fails at its first step:
+register a GitHub App under the owner account with repository permissions
+Contents: read and write, Pull requests: read and write, and Issues: read and
+write; install it on `suneel944/agent-parley`; set the repository variable
+`RELEASE_BOT_APP_ID` to the App ID; and set the repository secret
+`RELEASE_BOT_PRIVATE_KEY` to a generated private key in full PEM form. The App
+is not a review bypass: it opens the pull request and merges it after the
+required checks pass, and it never merges a red one.
+
+To cut a release by hand in an emergency, `Release` still accepts a
+`workflow_dispatch` with an existing tag, and reruns the same verification.
 
 After the GitHub release is published and its uploaded bytes have been verified
 against the local checksums, the workflow publishes the distribution to PyPI. It

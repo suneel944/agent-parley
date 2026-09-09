@@ -281,8 +281,9 @@ class Bridge:
                 )
                 if legacy_running:
                     raise BridgeError(
-                        "Legacy service is running. Stop it using v0.2.0 "
-                        "before upgrading; existing sessions are preserved."
+                        "A service from an older installation is running. "
+                        "Stop it with the command that started it before "
+                        "upgrading; existing sessions are preserved."
                     )
             running = self.server_process()
             if running:
@@ -729,6 +730,10 @@ Decline with `issue decline NUMBER --offer-id ID`.
 The owner can `issue cancel NUMBER`.
 No timeout transfers ownership. Release finished responsibility with
 `agent-parley issue release NUMBER`; release does not mean merged or complete.
+Record a dependency with `agent-parley issue block NUMBER --on OTHER`, and drop
+it with `issue unblock NUMBER --on OTHER`. `issue list` then names who holds
+each blocking issue. A recorded dependency is information, not a gate: nothing
+stops work on a waiting issue and no transition clears the dependency for you.
 Reserve repo-relative file paths before editing. Reservations are advisory:
 if conflicts are returned, stop overlapping work, release the conflicting grant,
 and agree on ownership with the peer. Do not treat a granted lease as permission
@@ -835,16 +840,19 @@ review, not merged or independently verified. An idle turn is not completion.
         to: str | None = None,
         summary: str = "",
         offer_id: str | None = None,
+        on: str | None = None,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
-            action: List, claim, release, offer, accept, decline, or cancel.
+            action: List, claim, release, offer, accept, decline, cancel,
+                block, or unblock.
             number: Repository issue number for a mutation.
             to: Handoff recipient.
             summary: Handoff context supplied by the owner.
             offer_id: Exact current offer ID for acceptance or decline.
+            on: Issue this one waits on, for a block or unblock.
 
         Returns:
             The whole ledger for list, or the resulting issue record.
@@ -867,6 +875,7 @@ review, not merged or independently verified. An idle turn is not completion.
             to=to,
             summary=summary,
             offer_id=offer_id,
+            on=on,
         )
 
     def export_events(
@@ -1277,6 +1286,8 @@ def main() -> int:
         "accept",
         "decline",
         "cancel",
+        "block",
+        "unblock",
     ):
         command = actions.add_parser(action)
         command.add_argument("--repo", type=Path, default=Path.cwd())
@@ -1287,6 +1298,8 @@ def main() -> int:
             command.add_argument("--summary", required=True)
         if action in ("accept", "decline"):
             command.add_argument("--offer-id", required=True)
+        if action in ("block", "unblock"):
+            command.add_argument("--on", required=True)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -1382,6 +1395,7 @@ def main() -> int:
                 to=getattr(args, "to", None),
                 summary=getattr(args, "summary", ""),
                 offer_id=getattr(args, "offer_id", None),
+                on=getattr(args, "on", None),
             )
             print(
                 describe(result, bridge.liveness(args.repo.resolve()))

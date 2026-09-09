@@ -66,7 +66,11 @@ repository's Git common directory, which the store never records. A served
 call carries no repository path, and the detached service must not run Git, so
 reaching that directory would need a new schema column, a launch-time map that
 goes stale as projects are added, or a scan of every project's manifest. None
-of those buys a capability. Checkpoints already deliver the roster, the issue
+of those buys a capability. Dependency edges live in the same ledger file for
+the same reason: `issues.json` already records ownership, offers and history
+per issue, and the checkpoint that reports a revision change reports the edges
+with it, so dependency notification costs no new substrate and no new tool.
+Checkpoints already deliver the roster, the issue
 ledger and message previews at session start and again on any prompt submit or
 pre-tool-use whose state changed; `list_participants` returns the roster on
 demand; and `agent-parley issue list`, run from a participant's own worktree,

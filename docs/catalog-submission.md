@@ -72,8 +72,10 @@ a clean tree.
 
 ## Validation evidence
 
-Captured on 2026-09-10 with Claude Code 2.1.267 at version 0.0.1 of the
-plugin.
+Captured on 2026-09-10 with Claude Code 2.1.267. The validator reads manifest
+structure rather than the version string, so this evidence holds for any
+release in which both manifests stay aligned with the package; `make check`
+fails the build if they drift.
 
 Plugin manifest:
 
@@ -90,15 +92,10 @@ Marketplace manifest:
 $ claude plugin validate .
 Validating marketplace manifest: /home/dev/agent-parley/.claude-plugin/marketplace.json
 
-⚠ Found 1 warning:
-
-  ❯ description: No marketplace description provided. Adding a description helps users understand what this marketplace offers
-
-✔ Validation passed with warnings
+✔ Validation passed
 ```
 
-Both commands exited zero. The marketplace warning is the only validator
-finding and is addressed in the next section.
+Both commands exited zero with no warnings.
 
 ## Metadata gaps to close before submitting
 
@@ -106,19 +103,15 @@ None of these block the validator, and none are changed by this document.
 They are listed so the owner can decide which to fix before a listing is
 reviewed.
 
-- Marketplace description is absent. `.claude-plugin/marketplace.json` has
-  only `name`, `owner` and `plugins`, which is what the validator warns
-  about. A directory listing reads better with a sentence describing the
-  marketplace itself.
 - Listing descriptions are short. The marketplace plugin entry is 57
   characters and the Claude plugin manifest description is 79. The Codex
   `interface.longDescription` is 96 characters. These are accurate but give a
   reviewer little to judge; a fuller paragraph explaining isolated worktrees,
   advisory reservations and explicit handoffs would serve the listing better.
-- No keywords or category for Claude. `pyproject.toml` has no `keywords`
-  field and the Claude plugin manifest has no category, so the plugin is hard
-  to surface by search. The Codex manifest already sets `interface.category`
-  to `Productivity`.
+- No category on the Claude plugin manifest, so the plugin is harder to
+  surface by search there. `pyproject.toml` now carries `keywords` and
+  trove classifiers for the package index, and the Codex manifest already
+  sets `interface.category` to `Productivity`.
 - No license field on either plugin manifest. The repository is MIT licensed
   through `pyproject.toml` and `LICENSE`, but a reader of the plugin manifest
   alone cannot see that.

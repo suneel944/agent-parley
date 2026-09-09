@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/agent-parley.png" width="560" alt="Agent Parley — separate work, shared context">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/agent-parley.png" width="560" alt="Agent Parley — separate work, shared context">
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@ Launch a lane, see who owns what, watch every lane at once, narrow to one
 provider, and watch a hook refuse a branch switch inside an assigned lane.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
 </p>
 
 One screen for every lane: session state, branch drift, issues owned, handoffs
@@ -54,8 +54,9 @@ Linux with pidfd support, Git, and [uv](https://docs.astral.sh/uv/). No clone.
 The wheel needs no third-party runtime packages.
 
 ```sh
-uv tool install git+https://github.com/suneel944/agent-parley
-# once released: uv tool install agent-parley
+uv tool install agent-parley
+# to track the default branch instead:
+# uv tool install git+https://github.com/suneel944/agent-parley
 ```
 
 Then add the plugin to whichever CLI you drive. One marketplace serves both.
@@ -126,10 +127,17 @@ resets, cleans, stashes or force-switches.
 **Ownership changes only through explicit claims and accepted handoffs.** No
 timeout and no process exit moves an issue. `agent-parley status` reports who
 owns what, which handoff is waiting on an offer ID, and any lane that left its
-assigned branch.
+assigned branch. An owner can record that one issue waits on another with
+`agent-parley issue block 42 --on 17`; the listing then names who holds the
+blocking issue, and every lane sees the change at its next checkpoint. A
+recorded dependency informs, it does not gate.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">
+</p>
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-issues.svg" width="880" alt="agent-parley issue list showing an issue that waits on another, the participant holding it, and a pending handoff with its offer ID">
 </p>
 
 **Native hooks decide before the tool runs.** They block branch changes inside
@@ -138,7 +146,7 @@ when coordination state actually changes. Each notice is capped at 1,536 UTF-8
 bytes; an unchanged checkpoint adds no context at all.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
 **Seven scoped MCP tools carry the coordination.** Conflicting reservations
@@ -147,7 +155,7 @@ Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Fetching an inbox never marks a message read.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
 </p>
 
 Enforcement is recorded, not discarded. Every hook decision carries an
