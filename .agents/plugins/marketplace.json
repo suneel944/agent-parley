@@ -1,14 +1,14 @@
 {
-  "name": "agent-bridge-local",
+  "name": "agent-parley-local",
   "interface": {
-    "displayName": "Agent Bridge Local"
+    "displayName": "Agent Parley Local"
   },
   "plugins": [
     {
-      "name": "agent-bridge",
+      "name": "agent-parley",
       "source": {
         "source": "local",
-        "path": "./plugins/agent-bridge"
+        "path": "./plugins/agent-parley"
       },
       "policy": {
         "installation": "AVAILABLE",

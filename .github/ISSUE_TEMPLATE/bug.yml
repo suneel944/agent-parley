@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem with Agent Bridge.
+description: Report a reproducible problem with Agent Parley.
 title: "bug: "
 body:
   - type: markdown

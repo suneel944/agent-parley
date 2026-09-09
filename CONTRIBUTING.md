@@ -120,7 +120,7 @@ and permission boundaries. Distinguish real MCP transport tests from native mode
 behavior; the latter requires an explicit two-terminal trial.
 
 Update the README and architecture diagrams when responsibilities or flows change.
-Keep runtime code in the top-level `agent_bridge/` package. `make build` must
+Keep runtime code in the top-level `agent_parley/` package. `make build` must
 produce an installable wheel and a source archive containing both native plugin
 manifests and the shared skill. The installed-package test uses a temporary tool
 environment outside the checkout to catch accidental source-tree imports.

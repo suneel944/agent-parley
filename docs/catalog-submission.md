@@ -1,7 +1,7 @@
 # Catalog submission
 
 This document prepares the public plugin directory submissions for the
-Agent Bridge plugin bundle. It records what each catalog asks for, what is
+Agent Parley plugin bundle. It records what each catalog asks for, what is
 mechanically verifiable inside this repository and how to verify it, the
 validator evidence captured for the current version, and the steps that only
 the repository owner can carry out.
@@ -31,7 +31,7 @@ The repository must carry a license and a way to report problems.
 
 Codex submissions follow
 [OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission).
-Agent Bridge is a skills-only plugin, so the submission consists of the skill
+Agent Parley is a skills-only plugin, so the submission consists of the skill
 bundle rather than a hosted service. That guide requires a verified publisher,
 a listing URL, a policy URL, the skill bundle itself, and review cases that a
 reviewer can execute against the bundle.
@@ -46,7 +46,7 @@ Each item below is verifiable from a clean checkout. Run the command and
 confirm the stated expectation before opening either form.
 
 - Plugin manifest is valid and complete.
-  `claude plugin validate plugins/agent-bridge`
+  `claude plugin validate plugins/agent-parley`
 - Marketplace manifest is valid.
   `claude plugin validate .`
 - Package, plugin and marketplace versions move together, no prohibited
@@ -54,7 +54,7 @@ confirm the stated expectation before opening either form.
   `uv run --locked python scripts/check_policy.py`
 - The `coordinate` skill carries YAML frontmatter with `name` and
   `description`.
-  `head -5 plugins/agent-bridge/skills/coordinate/SKILL.md`
+  `head -5 plugins/agent-parley/skills/coordinate/SKILL.md`
 - The repository states its license.
   `head -1 LICENSE`
 - The repository states a private vulnerability reporting route.
@@ -72,14 +72,14 @@ a clean tree.
 
 ## Validation evidence
 
-Captured on 2026-09-09 with Claude Code 2.1.266 at version 0.3.2 of the
+Captured on 2026-09-10 with Claude Code 2.1.267 at version 0.0.1 of the
 plugin.
 
 Plugin manifest:
 
 ```text
-$ claude plugin validate plugins/agent-bridge
-Validating plugin manifest: /home/suneel/Code/Personal/agent-bridge/plugins/agent-bridge/.claude-plugin/plugin.json
+$ claude plugin validate plugins/agent-parley
+Validating plugin manifest: /home/dev/agent-parley/plugins/agent-parley/.claude-plugin/plugin.json
 
 ✔ Validation passed
 ```
@@ -88,7 +88,7 @@ Marketplace manifest:
 
 ```text
 $ claude plugin validate .
-Validating marketplace manifest: /home/suneel/Code/Personal/agent-bridge/.claude-plugin/marketplace.json
+Validating marketplace manifest: /home/dev/agent-parley/.claude-plugin/marketplace.json
 
 ⚠ Found 1 warning:
 
@@ -158,20 +158,20 @@ checklist and the evidence above.
 ## Review cases
 
 Each case is grounded in what
-`plugins/agent-bridge/skills/coordinate/SKILL.md` instructs. They are written
-so a catalog reviewer can run them against a checkout with the Agent Bridge
+`plugins/agent-parley/skills/coordinate/SKILL.md` instructs. They are written
+so a catalog reviewer can run them against a checkout with the Agent Parley
 executable installed.
 
-### 1. Status inspection from a session that is not bridge-managed
+### 1. Status inspection from a session that is not launcher-managed
 
 - **Setup.** Install the executable, install the plugin, then start an
   ordinary Claude Code or Codex session in a repository checkout without
-  launching it through `agent-bridge run`.
-- **Action.** Invoke the `coordinate` skill and ask for the current bridge
-  status.
-- **Expected result.** The session runs `agent-bridge status`,
-  `agent-bridge participant list` and `agent-bridge issue list`, then explains
-  that setup and native hooks require launching through the bridge in separate
+  launching it through `agent-parley run`.
+- **Action.** Invoke the `coordinate` skill and ask for the current
+  coordination status.
+- **Expected result.** The session runs `agent-parley status`,
+  `agent-parley participant list` and `agent-parley issue list`, then explains
+  that setup and native hooks require launching through Agent Parley in separate
   user terminals, one terminal per participant. It does not launch a nested
   interactive agent from a tool call and does not silently move the existing
   session into a worktree.
@@ -179,12 +179,12 @@ executable installed.
 ### 2. Claim before working on a numbered issue
 
 - **Setup.** Launch two participants in separate terminals, for example
-  `agent-bridge run claude --repo /path/to/repository` and
-  `agent-bridge run codex --repo /path/to/repository`. Pick an issue number
+  `agent-parley run claude --repo /path/to/repository` and
+  `agent-parley run codex --repo /path/to/repository`. Pick an issue number
   that no participant owns.
 - **Action.** From one lane, ask the skill to start work on that issue.
-- **Expected result.** The session runs `agent-bridge issue claim NUMBER`
-  before editing anything. `agent-bridge issue list` in the other terminal
+- **Expected result.** The session runs `agent-parley issue claim NUMBER`
+  before editing anything. `agent-parley issue list` in the other terminal
   then shows that participant as the owner. Ownership is reported separately
   from activity and from reported outcomes.
 
@@ -205,10 +205,10 @@ executable installed.
 - **Action.** Ask the owner's session to hand the issue to the second
   participant, then ask the recipient's session to take it up.
 - **Expected result.** The owner stops editing and runs
-  `agent-bridge issue offer NUMBER --to PARTICIPANT --summary "commit, checks,
+  `agent-parley issue offer NUMBER --to PARTICIPANT --summary "commit, checks,
   remaining"`, and stays paused while the offer is pending. The recipient
-  reads the current offer identifier from `agent-bridge issue list` and runs
-  `agent-bridge issue accept NUMBER --offer-id ID`. An identifier from a
+  reads the current offer identifier from `agent-parley issue list` and runs
+  `agent-parley issue accept NUMBER --offer-id ID`. An identifier from a
   cancelled or replaced offer is rejected rather than accepted. The handoff
   transfers neither file reservations nor message acknowledgement.
 
@@ -218,7 +218,7 @@ executable installed.
 - **Action.** Ask the session to record a partial outcome, then a ready
   outcome.
 - **Expected result.** The partial report is sent as
-  `agent-bridge report --state partial --summary "result" --remaining "..."`
+  `agent-parley report --state partial --summary "result" --remaining "..."`
   and is refused without `--remaining`; the ready report requires
   `--evidence`. The session presents the report as an agent claim rather than
   as independent verification, and does not infer merge or push authority from

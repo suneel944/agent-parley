@@ -17,7 +17,7 @@ def test_extracts_only_requested_version(heading):
     text = f"# Changelog\n\n{heading}\n\n### Fixes\n\n- Fixed.\n\n"
     text += "## [0.3.0] - 2026-09-04\n\nOlder.\n"
     assert release_notes(text, "0.3.1") == (
-        "## Agent Bridge 0.3.1\n\n### Fixes\n\n- Fixed.\n"
+        "## Agent Parley 0.3.1\n\n### Fixes\n\n- Fixed.\n"
     )
 
 

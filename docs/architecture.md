@@ -1,6 +1,6 @@
 # Architecture and contracts
 
-Agent Bridge runs on one Linux host under one OS user. It coordinates participating
+Agent Parley runs on one Linux host under one OS user. It coordinates participating
 agents; it does not execute model requests, enforce filesystem permissions, replace
 native approvals, or merge work.
 
@@ -69,7 +69,7 @@ goes stale as projects are added, or a scan of every project's manifest. None
 of those buys a capability. Checkpoints already deliver the roster, the issue
 ledger and message previews at session start and again on any prompt submit or
 pre-tool-use whose state changed; `list_participants` returns the roster on
-demand; and `agent-bridge issue list`, run from a participant's own worktree,
+demand; and `agent-parley issue list`, run from a participant's own worktree,
 re-reads the ledger from the one process that can resolve the directory. The
 store therefore stays free of repository paths, and refreshing context stays a
 checkpoint and CLI concern rather than a coordination tool.
@@ -118,7 +118,7 @@ a model. Coordination needs MCP server configuration and lifecycle hooks, which
 the `claude` and `codex` CLIs supply, so every provider names one of those two
 adapters. Providers for other vendors reuse an adapter and change the endpoint
 through environment variables. The `deepseek`, `kimi` and `grok` presets carry no
-endpoint; `agent-bridge provider add` defines further providers locally.
+endpoint; `agent-parley provider add` defines further providers locally.
 
 A credential profile selects one account by pointing the CLI's config-home
 variable at a separate directory, so the same provider can run twice under
@@ -143,7 +143,7 @@ forward. It refuses on a drifted lane, on a running session, on a dirty base
 checkout, on uncommitted lane changes the branch does not carry, and on a base
 checkout that is already merging or on a detached HEAD. A conflict is left in
 the working tree with the conflicting paths named and both `git merge --continue`
-and `git merge --abort` reported; Agent Bridge never resolves a conflict, and
+and `git merge --abort` reported; Agent Parley never resolves a conflict, and
 never resets, cleans, stashes or force-switches. Merging leaves the lane and its
 branch untouched, so retiring stays a separate decision.
 
@@ -174,7 +174,7 @@ ID. Cancellation invalidates that ID. No timeout or process exit transfers
 ownership. Reported `ready` outcomes do not establish verified completion.
 Ownership listings report each owner's session state and the age of its last
 observed checkpoint. That report is for an operator; silence, an idle session
-and a stopped session all leave ownership where it is. `agent-bridge top`
+and a stopped session all leave ownership where it is. `agent-parley top`
 renders the same state continuously, adding branch drift, denial counts and
 served calls; it reads state and never writes it.
 

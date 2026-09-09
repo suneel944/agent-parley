@@ -11,8 +11,8 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
-        "plugins/agent-bridge/.claude-plugin/plugin.json",
-        "plugins/agent-bridge/.codex-plugin/plugin.json",
+        "plugins/agent-parley/.claude-plugin/plugin.json",
+        "plugins/agent-parley/.codex-plugin/plugin.json",
         {
           "type": "json",
           "path": ".claude-plugin/marketplace.json",
@@ -21,7 +21,7 @@
         {
           "type": "toml",
           "path": "uv.lock",
-          "jsonpath": "$.package[?(@.name.value=='agent-bridge')].version"
+          "jsonpath": "$.package[?(@.name.value=='agent-parley')].version"
         }
       ],
       "changelog-sections": [

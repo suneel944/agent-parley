@@ -1,4 +1,4 @@
-# agent-bridge
+# agent-parley
 
 Shared operating guidance remains authoritative at `~/.claude/CLAUDE.md`.
 

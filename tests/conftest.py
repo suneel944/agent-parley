@@ -4,8 +4,8 @@ import socket
 
 import pytest
 
-from agent_bridge.cli import Bridge, git
-from agent_bridge.state import write_json
+from agent_parley.cli import Bridge, git
+from agent_parley.state import write_json
 
 
 @pytest.fixture

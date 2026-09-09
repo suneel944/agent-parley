@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-from agent_bridge.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, lock, write_json
 
 ADAPTERS = ("claude", "codex")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
@@ -126,7 +126,7 @@ def overrides(pairs: list[str]) -> dict[str, str]:
             raise BridgeError("Environment overrides use NAME=VALUE.")
         if SECRET_NAME.search(name):
             raise BridgeError(
-                f"{name} names a credential. Agent Bridge does not store "
+                f"{name} names a credential. Agent Parley does not store "
                 "credential values; export it and list it with --require-env."
             )
         result[name] = value
@@ -175,8 +175,8 @@ def provider(home: Path, name: str) -> dict:
     entry = providers(home).get(name)
     if entry is None:
         raise BridgeError(
-            f"Unknown provider {name!r}. Run `agent-bridge provider list` or "
-            "define it with `agent-bridge provider add`."
+            f"Unknown provider {name!r}. Run `agent-parley provider list` or "
+            "define it with `agent-parley provider add`."
         )
     return entry
 
@@ -194,7 +194,7 @@ def define_provider(
 
     Args:
         home: Private bridge state root.
-        name: Provider name used by `agent-bridge run --provider`.
+        name: Provider name used by `agent-parley run --provider`.
         adapter: Native CLI contract, claude or codex.
         command: Executable resolved on PATH at launch.
         home_env: Variable that points the CLI at a per-account config home.
@@ -210,7 +210,7 @@ def define_provider(
     identifier(name, "Provider name")
     if adapter not in ADAPTERS:
         raise BridgeError(
-            "Agent Bridge drives native CLIs that support MCP servers and "
+            "Agent Parley drives native CLIs that support MCP servers and "
             f"lifecycle hooks; adapter must be one of: {', '.join(ADAPTERS)}."
         )
     if not command.strip() or "\x00" in command or len(command) > 240:
@@ -253,7 +253,7 @@ def credential(home: Path, name: str) -> dict:
     if entry is None:
         raise BridgeError(
             f"Unknown credential profile {name!r}. Define it with "
-            "`agent-bridge credentials add`."
+            "`agent-parley credentials add`."
         )
     return entry
 
@@ -268,7 +268,7 @@ def define_credential(
 
     Args:
         home: Private bridge state root.
-        name: Profile name used by `agent-bridge run --credentials`.
+        name: Profile name used by `agent-parley run --credentials`.
         config_home: Directory the native CLI uses for this account.
         env: Non-credential NAME=VALUE overrides for this account.
         require: Variables the launcher requires from the caller's shell.
@@ -409,8 +409,8 @@ def read(directory: Path) -> dict:
     path = directory / "project.json"
     if not path.exists():
         raise BridgeError(
-            "This repository has no bridge project yet; run agent-bridge run "
-            "or agent-bridge setup first."
+            "This repository has no bridge project yet; run agent-parley run "
+            "or agent-parley setup first."
         )
     return normalize(json.loads(path.read_text()))
 

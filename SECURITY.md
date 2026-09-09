@@ -1,7 +1,7 @@
 # Security policy
 
 Report vulnerabilities privately through
-[GitHub security advisories](https://github.com/suneel944/agent-bridge/security/advisories/new).
+[GitHub security advisories](https://github.com/suneel944/agent-parley/security/advisories/new).
 If private reporting is unavailable, email suneel944@gmail.com. Do not disclose
 credentials, private messages or exploit details in a public issue.
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@cc7ed01606973ffc9b524366da149763bfd119d5/docs/assets/agent-bridge.png" width="560" alt="Agent Bridge — separate work, shared context">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/agent-parley.png" width="560" alt="Agent Parley — separate work, shared context">
 </p>
 
 <p align="center">
@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/suneel944/agent-bridge/releases"><img src="https://img.shields.io/github/v/release/suneel944/agent-bridge?style=flat&color=blue" alt="Release"></a>
+  <a href="https://github.com/suneel944/agent-parley/releases"><img src="https://img.shields.io/github/v/release/suneel944/agent-parley?style=flat&color=blue" alt="Release"></a>
   <a href="#install"><img src="https://img.shields.io/badge/runtime_dependencies-0-brightgreen?style=flat" alt="Zero runtime dependencies"></a>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=flat" alt="Python 3.12+"></a>
   <a href="#providers-and-accounts"><img src="https://img.shields.io/badge/native_CLIs-claude_%2B_codex-orange?style=flat" alt="claude and codex"></a>
@@ -34,15 +34,11 @@
 
 ## See it
 
-<p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@88ab1e8f5301bca7e760dddf5e34dfa45ffef5f7/docs/assets/demo.gif" width="900" alt="A terminal session: launching a lane, listing issue ownership, the dashboard, narrowing it to one provider, and a hook refusing a branch switch">
-</p>
-
 Launch a lane, see who owns what, watch every lane at once, narrow to one
 provider, and watch a hook refuse a branch switch inside an assigned lane.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-top.svg" width="900" alt="agent-bridge top showing three lanes with issues, mail, leases, denials and served calls">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
 </p>
 
 One screen for every lane: session state, branch drift, issues owned, handoffs
@@ -58,31 +54,31 @@ Linux with pidfd support, Git, and [uv](https://docs.astral.sh/uv/). No clone.
 The wheel needs no third-party runtime packages.
 
 ```sh
-uv tool install git+https://github.com/suneel944/agent-bridge
+uv tool install git+https://github.com/suneel944/agent-parley
 # once released: uv tool install agent-parley
 ```
 
 Then add the plugin to whichever CLI you drive. One marketplace serves both.
 
 ```sh
-claude plugin marketplace add suneel944/agent-bridge
-claude plugin install agent-bridge@agent-bridge-local
+claude plugin marketplace add suneel944/agent-parley
+claude plugin install agent-parley@agent-parley-local
 ```
 
 ```sh
-codex plugin marketplace add suneel944/agent-bridge
-codex plugin add agent-bridge@agent-bridge-local
+codex plugin marketplace add suneel944/agent-parley
+codex plugin add agent-parley@agent-parley-local
 ```
 
-The plugin carries the shared `coordinate` skill, so an agent can read bridge
-state, claim an issue and hand work off in its own words. It is deliberately
+The plugin carries the shared `coordinate` skill, so an agent can read
+coordination state, claim an issue and hand work off in its own words. It is deliberately
 skill-only: the launcher supplies MCP configuration and lifecycle hooks per
 session, and it is also what creates the worktrees and runs the coordination
 service. The plugin alone gives an agent the skill and nothing to coordinate
 through.
 
 For a pinned, checksummed install, take a wheel from
-[Releases](https://github.com/suneel944/agent-bridge/releases) instead.
+[Releases](https://github.com/suneel944/agent-parley/releases) instead.
 
 ## Run it
 
@@ -90,10 +86,10 @@ From a committed, clean checkout, one terminal per agent:
 
 ```sh
 # Terminal 1
-agent-bridge run claude
+agent-parley run claude
 
 # Terminal 2
-agent-bridge run codex
+agent-parley run codex
 ```
 
 That is the whole setup. The first run registers the repository, creates that
@@ -104,21 +100,21 @@ A new name creates its own lane, so a second account of the same provider, or
 another provider, is one more terminal:
 
 ```sh
-agent-bridge credentials add account-2 --config-home ~/.claude-account-2
-agent-bridge run claude-2 --provider claude --credentials account-2
+agent-parley credentials add account-2 --config-home ~/.claude-account-2
+agent-parley run claude-2 --provider claude --credentials account-2
 ```
 
 Then watch the work:
 
 ```sh
-agent-bridge status   # ownership, activity and reported results
-agent-bridge top      # every lane live, including what enforcement denied
+agent-parley status   # ownership, activity and reported results
+agent-parley top      # every lane live, including what enforcement denied
 ```
 
 When a lane's work is ready, integrate it from the base checkout:
 
 ```sh
-agent-bridge participant merge claude-2
+agent-parley participant merge claude-2
 ```
 
 It always records a merge commit, refuses on a running session, a dirty tree or
@@ -128,12 +124,12 @@ resets, cleans, stashes or force-switches.
 ## What it enforces
 
 **Ownership changes only through explicit claims and accepted handoffs.** No
-timeout and no process exit moves an issue. `agent-bridge status` reports who
+timeout and no process exit moves an issue. `agent-parley status` reports who
 owns what, which handoff is waiting on an offer ID, and any lane that left its
 assigned branch.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-status.svg" width="880" alt="agent-bridge status listing issue owners, a pending handoff, and a lane on the wrong branch">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">
 </p>
 
 **Native hooks decide before the tool runs.** They block branch changes inside
@@ -142,7 +138,7 @@ when coordination state actually changes. Each notice is capped at 1,536 UTF-8
 bytes; an unchanged checkpoint adds no context at all.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
 **Seven scoped MCP tools carry the coordination.** Conflicting reservations
@@ -151,7 +147,7 @@ Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Fetching an inbox never marks a message read.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-bridge@2b65dde1e76eaf97de57997d76546452586c27ca/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
 </p>
 
 Enforcement is recorded, not discarded. Every hook decision carries an
@@ -166,8 +162,8 @@ to a window, and `events export` writes the retained records as JSON Lines you
 can keep for as long as you need:
 
 ```sh
-agent-bridge top --since 6h
-agent-bridge events export --since 7d --output enforcement.jsonl
+agent-parley top --since 6h
+agent-parley events export --since 7d --output enforcement.jsonl
 ```
 
 ## Watch one provider
@@ -177,8 +173,8 @@ narrows the view to the participants driven by one provider, and the header
 counts only the rows it shows:
 
 ```sh
-agent-bridge top --provider codex
-agent-bridge top --provider claude --provider codex
+agent-parley top --provider codex
+agent-parley top --provider claude --provider codex
 ```
 
 ## Providers and accounts
@@ -192,13 +188,13 @@ installations cover all of them:
 | `claude` | `claude` | Claude Code |
 | `codex` | `codex` | Codex |
 | `deepseek`, `kimi`, `grok` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
-| your own, via `agent-bridge provider add` | the adapter you name | that adapter's plugin |
+| your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
 `claude` and `codex` work out of the box. The `deepseek`, `kimi` and `grok`
 presets carry no endpoint, so their base URL and key must be exported in the
 launching shell; the launcher refuses to start when a required variable is unset
-rather than falling back to another account. Bridge state records variable names
-and config directories, never credential values.
+rather than falling back to another account. Coordination state records variable
+names and config directories, never credential values.
 
 Credential profiles point a provider's config-home variable at a separate
 directory, so one provider can run under several logins. Up to 32 participants
@@ -208,9 +204,9 @@ per project.
 
 ```mermaid
 flowchart TD
-    Repo[Your repository] --> Bridge[Agent Bridge launcher]
-    Bridge --> Claude[Participant · own worktree]
-    Bridge --> Codex[Participant · own worktree]
+    Repo[Your repository] --> Launcher[Agent Parley launcher]
+    Launcher --> Claude[Participant · own worktree]
+    Launcher --> Codex[Participant · own worktree]
     Claude <-->|Seven scoped MCP tools| Server[Local coordination service]
     Codex <-->|Seven scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]

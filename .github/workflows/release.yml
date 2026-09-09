@@ -62,7 +62,7 @@ jobs:
               RELEASE_NOTES.md SHA256SUMS
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
-              --title "Agent Bridge $RELEASE_TAG" \
+              --title "Agent Parley $RELEASE_TAG" \
               --notes-file RELEASE_NOTES.md \
               ./*.whl ./*.tar.gz ./*.zip requirements.txt CHANGELOG.md \
               RELEASE_NOTES.md SHA256SUMS
