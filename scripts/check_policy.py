@@ -86,7 +86,7 @@ def main() -> None:
             errors.append("Commit message contains prohibited attribution.")
     if metadata["dependencies"]:
         errors.append("Runtime dependencies must remain empty.")
-    for directory in ("agent_bridge", "scripts"):
+    for directory in ("agent_parley", "scripts"):
         for path in sorted((root / directory).glob("*.py")):
             text = path.read_text()
             tree = ast.parse(text)
@@ -110,7 +110,7 @@ def main() -> None:
                 elif isinstance(node, ast.ImportFrom):
                     names = [node.module or ""]
                 for name in names:
-                    allowed = sys.stdlib_module_names | {"agent_bridge"}
+                    allowed = sys.stdlib_module_names | {"agent_parley"}
                     if directory == "scripts":
                         allowed |= {"scripts"}
                     if name.split(".")[0] not in allowed:
@@ -122,7 +122,7 @@ def main() -> None:
                         "use a docstring, not an inline comment"
                     )
     for client in ("codex", "claude"):
-        path = root / "plugins/agent-bridge" / f".{client}-plugin/plugin.json"
+        path = root / "plugins/agent-parley" / f".{client}-plugin/plugin.json"
         if json.loads(path.read_text())["version"] != metadata["version"]:
             errors.append(f"{client} plugin version differs from package")
     marketplace = json.loads(
@@ -130,7 +130,7 @@ def main() -> None:
     )
     if marketplace["plugins"][0]["version"] != metadata["version"]:
         errors.append("Claude marketplace version differs from package")
-    served = (root / "agent_bridge/server.py").read_text()
+    served = (root / "agent_parley/server.py").read_text()
     if f'"{metadata["name"]}"' not in served:
         errors.append(
             "server.py must report the distribution name from pyproject.toml"

@@ -8,16 +8,16 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_bridge import roster, store
-from agent_bridge.checkpoints import (
+from agent_parley import roster, store
+from agent_parley.checkpoints import (
     activity,
     event_summary,
     lane_branch,
     mailbox,
     participant_liveness,
 )
-from agent_bridge.issues import snapshot
-from agent_bridge.state import BridgeError
+from agent_parley.issues import snapshot
+from agent_parley.state import BridgeError
 
 BRANCH_TTL = 5.0
 MAX_PROMPT = 120
@@ -247,7 +247,7 @@ def render(view: dict) -> list[str]:
         else "0%"
     )
     lines = [
-        f"agent-bridge top  server: "
+        f"agent-parley top  server: "
         f"{'running' if view['running'] else 'not running'}  "
         f"state: {view['home']}",
         f"projects {len(view['projects'])}  "
