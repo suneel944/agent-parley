@@ -27,16 +27,43 @@ state and project paths are shortened.
 
 ## Get started
 
-Requires Linux with pidfd support, Git, [uv](https://docs.astral.sh/uv/), and signed-in
-`claude` and `codex` commands. Python 3.12+ is installed by uv if needed.
+Requires Linux with pidfd support, Git, [uv](https://docs.astral.sh/uv/), and at least
+one signed-in native CLI. Python 3.12+ is installed by uv if needed.
+
+**1. Install the launcher.** No clone; the wheel needs no third-party runtime
+packages.
 
 ```sh
-git clone https://github.com/suneel944/agent-bridge.git
-cd agent-bridge
-make install
+uv tool install git+https://github.com/suneel944/agent-bridge
 ```
 
-Then, from any directory, open one terminal per participant:
+For a pinned, checksummed install, take the wheel from a
+[release](https://github.com/suneel944/agent-bridge/releases) instead:
+
+```sh
+uv tool install https://github.com/suneel944/agent-bridge/releases/download/v0.3.2/agent_bridge-0.3.2-py3-none-any.whl
+```
+
+**2. Add the plugin to each CLI you drive.** One marketplace serves both.
+
+```sh
+claude plugin marketplace add suneel944/agent-bridge
+claude plugin install agent-bridge@agent-bridge-local
+```
+
+```sh
+codex plugin marketplace add suneel944/agent-bridge
+codex plugin add agent-bridge@agent-bridge-local
+```
+
+The plugin carries the shared `coordinate` skill, so an agent can inspect bridge
+state, claim an issue, and hand work off in its own words. It is deliberately
+skill-only: MCP configuration and lifecycle hooks are supplied per session by
+the launcher that starts it, which is also what creates the worktrees and runs
+the coordination service. Installing the plugin without the launcher gives an
+agent the skill and nothing to coordinate through.
+
+**3. Open one terminal per participant.**
 
 ```sh
 # Terminal 1
@@ -60,11 +87,22 @@ agent-bridge run kimi-1 --provider kimi --task "Issue 46"
 Define one profile per subscription you own. Any number of accounts of the same
 provider can work in one project, up to 32 participants in total.
 
-Providers describe which native CLI to launch and which account it uses.
-`claude` and `codex` work out of the box; `deepseek`, `kimi`, and `grok` reuse
-those CLIs and need their base URL and key exported in your shell. Define your
-own with `agent-bridge provider add`. Bridge state records variable names and
-config directories, never credential values.
+Providers describe which native CLI to launch and which account it uses. Every
+provider drives one of two adapters, which is why two plugin installations cover
+all of them:
+
+| Provider | Native CLI it drives | Plugin that carries `coordinate` |
+| --- | --- | --- |
+| `claude` | `claude` | Claude Code |
+| `codex` | `codex` | Codex |
+| `deepseek`, `kimi`, `grok` | `claude` or `codex`, with the vendor endpoint | that adapter's plugin |
+| your own, via `agent-bridge provider add` | the adapter you name | that adapter's plugin |
+
+`claude` and `codex` work out of the box. The `deepseek`, `kimi`, and `grok`
+presets carry no endpoint, so their base URL and key must be exported in the
+launching shell; the launcher refuses to start when a required variable is
+unset rather than falling back to another account. Bridge state records variable
+names and config directories, never credential values.
 
 Start from a committed, clean checkout. The launcher creates each participant's
 worktree; the agents claim issues from their assigned lanes. Run

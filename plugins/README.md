@@ -1,12 +1,22 @@
 # Agent Bridge plugins
 
 This bundle contains Claude Code and Codex manifests and the shared `coordinate`
-skill. Install the Agent Bridge executable first. Given the wheel and locked
-requirements from the same release:
+skill. Install the Agent Bridge executable first; the plugin carries the skill
+only, and the launcher supplies MCP configuration and lifecycle hooks per
+session. Given the wheel and locked requirements from the same release:
 
 ```sh
-uv tool install ./agent_bridge-0.3.0-py3-none-any.whl \
+uv tool install ./agent_bridge-VERSION-py3-none-any.whl \
   --with-requirements ./requirements.txt
+```
+
+Without a downloaded bundle, install the executable straight from the
+repository and add the marketplace by name instead:
+
+```sh
+uv tool install git+https://github.com/suneel944/agent-bridge
+claude plugin marketplace add suneel944/agent-bridge
+codex plugin marketplace add suneel944/agent-bridge
 ```
 
 Extract the plugin archive and run these commands from its extracted root.

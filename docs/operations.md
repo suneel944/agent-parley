@@ -2,11 +2,16 @@
 
 ## Install and upgrade
 
-`make install` installs a package snapshot in uv's user executable directory.
-If needed, run `uv tool update-shell` and open a new terminal. `make install-dev`
-installs an editable checkout. `sudo env "PATH=$PATH" make install-system`
-installs into `/usr/local/bin`, with its environment under `/opt/agent-bridge`.
-Each user's runtime state remains private.
+Installing needs no clone. `uv tool install git+https://github.com/suneel944/agent-bridge`
+tracks the default branch; a release wheel URL pins an exact version, and the
+wheel needs no third-party runtime packages either way.
+
+From a checkout, `make install` installs a package snapshot in uv's user
+executable directory. If needed, run `uv tool update-shell` and open a new
+terminal. `make install-dev` installs an editable checkout.
+`sudo env "PATH=$PATH" make install-system` installs into `/usr/local/bin`, with
+its environment under `/opt/agent-bridge`. Each user's runtime state remains
+private.
 
 Before upgrading from 0.2, finish both sessions and run `agent-bridge down` using
 the old installation. Preserve the entire state directory: it contains worktrees,
