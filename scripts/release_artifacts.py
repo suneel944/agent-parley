@@ -11,8 +11,17 @@ import zipfile
 from pathlib import Path
 
 
-def release_notes(changelog: str, version: str, overview: str = "") -> str:
-    """Extracts a version section from manual or Release Please changelogs.
+def release_notes(
+    changelog: str,
+    version: str,
+    overview: str = "",
+    repository: str = "",
+) -> str:
+    """Builds GitHub release notes for one version of the changelog.
+
+    The result follows the conventional release-note shape: a "What's Changed"
+    heading, a short standing description of the project, the generated
+    subsections for this version, and a full changelog link.
 
     Args:
         changelog: Complete Markdown changelog.
@@ -20,9 +29,10 @@ def release_notes(changelog: str, version: str, overview: str = "") -> str:
         overview: Standing product description placed before the section, so
             that every release states what the project is without a per-release
             edit.
+        repository: Repository URL used for the full changelog link.
 
     Returns:
-        Version heading and its release notes, excluding adjacent versions.
+        Release notes for this version, excluding adjacent versions.
 
     Raises:
         ValueError: If there is no matching nonempty version section.
@@ -40,9 +50,14 @@ def release_notes(changelog: str, version: str, overview: str = "") -> str:
     )[0].strip()
     if not section:
         raise ValueError("Release notes must not be empty.")
+    parts = ["## What's Changed"]
     if overview.strip():
-        section = f"{overview.strip()}\n\n{section}"
-    return f"## Agent Parley {version}\n\n{section}\n"
+        parts.append(overview.strip())
+    parts.append(section)
+    if repository.strip():
+        link = f"{repository.strip().rstrip('/')}/commits/v{version}"
+        parts.append(f"**Full Changelog**: {link}")
+    return "\n\n".join(parts) + "\n"
 
 
 def main() -> None:
@@ -53,9 +68,9 @@ def main() -> None:
         OSError: If an expected package or bundle input is unavailable.
     """
     root = Path(__file__).resolve().parents[1]
-    version = tomllib.loads((root / "pyproject.toml").read_text())["project"][
-        "version"
-    ]
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    version = project["version"]
+    repository = project.get("urls", {}).get("Repository", "")
     tag = f"v{version}"
     if os.environ.get("RELEASE_TAG", tag) != tag:
         raise ValueError("Release tag must match the package version.")
@@ -68,9 +83,10 @@ def main() -> None:
             raise ValueError(f"{client} plugin version differs from package.")
     changelog = (root / "CHANGELOG.md").read_text()
     overview = (root / "docs" / "release-overview.md").read_text()
-    notes = release_notes(changelog, version, overview)
+    notes = release_notes(changelog, version, overview, repository)
     output = root / "dist" / "release"
-    output.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir(parents=True)
     assets = []
     for filename in (
         f"agent_parley-{version}-py3-none-any.whl",
