@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@ASSETSHA/docs/assets/agent-parley.png" width="560" alt="Agent Parley — separate work, shared context">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/agent-parley.png" width="560" alt="Agent Parley — separate work, shared context">
 </p>
 
 <p align="center">
@@ -34,15 +34,11 @@
 
 ## See it
 
-<p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@ASSETSHA/docs/assets/demo.gif" width="900" alt="A terminal session: launching a lane, listing issue ownership, the dashboard, narrowing it to one provider, and a hook refusing a branch switch">
-</p>
-
 Launch a lane, see who owns what, watch every lane at once, narrow to one
 provider, and watch a hook refuse a branch switch inside an assigned lane.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@ASSETSHA/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
 </p>
 
 One screen for every lane: session state, branch drift, issues owned, handoffs
@@ -133,7 +129,7 @@ owns what, which handoff is waiting on an offer ID, and any lane that left its
 assigned branch.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@ASSETSHA/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">
 </p>
 
 **Native hooks decide before the tool runs.** They block branch changes inside
@@ -142,7 +138,7 @@ when coordination state actually changes. Each notice is capped at 1,536 UTF-8
 bytes; an unchanged checkpoint adds no context at all.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@ASSETSHA/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
 **Seven scoped MCP tools carry the coordination.** Conflicting reservations
@@ -151,7 +147,7 @@ Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Fetching an inbox never marks a message read.
 
 <p align="center">
-  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@ASSETSHA/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@2133540d21b5165a8d42197116d81e2693388571/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
 </p>
 
 Enforcement is recorded, not discarded. Every hook decision carries an
