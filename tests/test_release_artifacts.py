@@ -17,7 +17,7 @@ def test_extracts_only_requested_version(heading):
     text = f"# Changelog\n\n{heading}\n\n### Fixes\n\n- Fixed.\n\n"
     text += "## [0.3.0] - 2026-09-04\n\nOlder.\n"
     assert release_notes(text, "0.3.1") == (
-        "## Agent Parley 0.3.1\n\n### Fixes\n\n- Fixed.\n"
+        "## What's Changed\n\n### Fixes\n\n- Fixed.\n"
     )
 
 
@@ -33,9 +33,14 @@ def test_rejects_missing_or_empty_release_notes(text):
         release_notes(text, "0.3.1")
 
 
-def test_standing_overview_precedes_the_generated_section():
+def test_overview_and_full_changelog_wrap_the_generated_section():
     text = "# Changelog\n\n## [0.3.1] - 2026-09-05\n\n### Fixes\n\n- Fixed.\n"
-    assert release_notes(text, "0.3.1", "\nWhat this is.\n\n") == (
-        "## Agent Parley 0.3.1\n\nWhat this is.\n\n### Fixes\n\n- Fixed.\n"
+    assert release_notes(
+        text, "0.3.1", "\nWhat this is.\n\n", "https://example.com/repo/"
+    ) == (
+        "## What's Changed\n\nWhat this is.\n\n### Fixes\n\n- Fixed.\n\n"
+        "**Full Changelog**: https://example.com/repo/commits/v0.3.1\n"
     )
-    assert release_notes(text, "0.3.1", "   \n") == release_notes(text, "0.3.1")
+    assert release_notes(text, "0.3.1", "   \n", "  ") == release_notes(
+        text, "0.3.1"
+    )
