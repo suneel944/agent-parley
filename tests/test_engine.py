@@ -13,11 +13,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agent_bridge import store
-from agent_bridge.checkpoints import MAX_CONTEXT_BYTES, checkpoint, mailbox
-from agent_bridge.issues import describe
-from agent_bridge.server import MAX_REQUEST_BYTES, TOOLS
-from agent_bridge.state import BridgeError
+from agent_parley import store
+from agent_parley.checkpoints import MAX_CONTEXT_BYTES, checkpoint, mailbox
+from agent_parley.issues import describe
+from agent_parley.server import MAX_REQUEST_BYTES, TOOLS
+from agent_parley.state import BridgeError
 
 
 @pytest.fixture

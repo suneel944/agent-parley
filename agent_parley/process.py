@@ -6,7 +6,7 @@ import signal
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_bridge.state import BridgeError
+from agent_parley.state import BridgeError
 
 
 def start_ticks(pid: int) -> str:
@@ -66,7 +66,7 @@ def identify(record: dict, home: Path) -> ServerProcess | None:
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\x00")
         expected = [
             b"-m",
-            b"agent_bridge.server",
+            b"agent_parley.server",
             b"--home",
             str(home).encode(),
         ]

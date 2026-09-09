@@ -6,13 +6,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from agent_bridge import store
-from agent_bridge.server import TOOLS
+from agent_parley import store
+from agent_parley.server import TOOLS
 
 
 def main() -> None:
     """Benchmarks committed sends and metadata reads against temporary state."""
-    with tempfile.TemporaryDirectory(prefix="agent-bridge-benchmark-") as path:
+    with tempfile.TemporaryDirectory(prefix="agent-parley-benchmark-") as path:
         home = Path(path)
         store.initialize(home)
         first = store.register(home, "/benchmark", "GreenCastle")

@@ -18,8 +18,8 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agent_bridge import dashboard, roster, store
-from agent_bridge.checkpoints import (
+from agent_parley import dashboard, roster, store
+from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
     branch_guard,
@@ -28,8 +28,8 @@ from agent_bridge.checkpoints import (
     mailbox,
     prune,
 )
-from agent_bridge.cli import Bridge, BridgeError, git, lock, write_json
-from agent_bridge.process import start_ticks
+from agent_parley.cli import Bridge, BridgeError, git, lock, write_json
+from agent_parley.process import start_ticks
 
 
 @contextlib.asynccontextmanager
@@ -72,7 +72,7 @@ def test_missing_commit_and_existing_branch_preserved(bridge, repo, tmp_path):
     with pytest.raises(BridgeError):
         bridge.setup(empty)
     _, directory = bridge.project(repo)
-    branch = f"bridge/{directory.name}/codex"
+    branch = f"parley/{directory.name}/codex"
     git(repo, "branch", branch)
     with pytest.raises(BridgeError, match="Existing lane"):
         bridge.add_participant(repo, "codex", "codex")
@@ -206,7 +206,7 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
         "import json, os, sys\n"
         "with open(os.environ['CAPTURE'], 'w') as f:\n"
         " json.dump({'argv': sys.argv[1:], 'cwd': os.getcwd(), "
-        "'has_token': bool(os.environ.get('AGENT_BRIDGE_TOKEN'))}, f)\n"
+        "'has_token': bool(os.environ.get('AGENT_PARLEY_TOKEN'))}, f)\n"
     )
     executable.chmod(0o755)
     capture = tmp_path / "capture.json"
@@ -229,7 +229,7 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
     if agent == "claude":
         config = json.loads(Path(result["argv"][1]).read_text())
         assert (
-            config["mcpServers"]["agent_bridge"]["url"] == bridge.url + "/mcp/"
+            config["mcpServers"]["agent_parley"]["url"] == bridge.url + "/mcp/"
         )
         settings = json.loads(
             result["argv"][result["argv"].index("--settings") + 1]
@@ -238,7 +238,7 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
         assert "Stop" in settings["hooks"]
     else:
         assert (
-            'mcp_servers.agent_bridge.bearer_token_env_var="AGENT_BRIDGE_TOKEN"'
+            'mcp_servers.agent_parley.bearer_token_env_var="AGENT_PARLEY_TOKEN"'
             in result["argv"]
         )
         overrides = [arg for arg in result["argv"] if arg.startswith("hooks.")]
@@ -578,7 +578,7 @@ def test_top_reports_every_participant_and_writes_no_state(
     }
     dashboard.run(bridge.home, lambda: False, once=True)
     output = capsys.readouterr().out
-    assert "agent-bridge top  server: not running" in output
+    assert "agent-parley top  server: not running" in output
     assert "denials 0 (0%)" in output
     assert "#77" in output
     assert "Wire the dashboard" in output
@@ -618,7 +618,7 @@ def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     bridge, repo, paired, monkeypatch
 ):
     monkeypatch.setattr(
-        "agent_bridge.checkpoints.mailbox",
+        "agent_parley.checkpoints.mailbox",
         lambda *args: {"pending_ack": 0, "messages": []},
     )
     lane = Path(paired["lanes"]["claude"])
@@ -697,7 +697,7 @@ def test_issue_claim_race_persistence_and_explicit_handoff(
             [
                 sys.executable,
                 "-m",
-                "agent_bridge.cli",
+                "agent_parley.cli",
                 "--home",
                 str(bridge.home),
                 "issue",
@@ -768,7 +768,7 @@ def test_issue_decline_no_timeout_and_worktree_authority(
         claude, "offer", "432", to="codex", summary="Waiting for review"
     )["offer"]
     monkeypatch.setattr(
-        "agent_bridge.issues.time.time", lambda: offer["created"] + 86400
+        "agent_parley.issues.time.time", lambda: offer["created"] + 86400
     )
     assert bridge.issue(repo, "list")["issues"]["432"]["owner"] == "claude"
     declined = bridge.issue(codex, "decline", "432", offer_id=offer["id"])
@@ -788,7 +788,7 @@ def test_issue_crash_releases_operation_lock_but_preserves_owner(
             sys.executable,
             "-c",
             "import os, sys\nfrom pathlib import Path\n"
-            "from agent_bridge.state import lock\n"
+            "from agent_parley.state import lock\n"
             "with lock(Path(sys.argv[1])): os._exit(7)",
             str(claude.parent / "issues.lock"),
         ],
@@ -812,7 +812,7 @@ def test_issue_notifications_are_once_per_change_without_empty_reminders(
     directory = claude.parent
     write_json(directory / "codex-identity.json", {"name": "codex"})
     monkeypatch.setattr(
-        "agent_bridge.checkpoints.mailbox",
+        "agent_parley.checkpoints.mailbox",
         lambda *args: {"pending_ack": 0, "messages": []},
     )
     bridge.issue(claude, "claim", "432")
@@ -860,7 +860,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     wheel = project / "dist" / f"{stem}-{version}-py3-none-any.whl"
     assert wheel.exists(), "Run make build before the installed-package test."
     with zipfile.ZipFile(wheel) as archive:
-        assert "agent_bridge/__main__.py" in archive.namelist()
+        assert "agent_parley/__main__.py" in archive.namelist()
         package_metadata = archive.read(
             f"{stem}-{version}.dist-info/METADATA"
         ).decode()
@@ -870,14 +870,14 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         root = f"{stem}-{version}"
         for client in ("codex", "claude"):
             manifest_path = (
-                f"{root}/plugins/agent-bridge/.{client}-plugin/plugin.json"
+                f"{root}/plugins/agent-parley/.{client}-plugin/plugin.json"
             )
             with archive.extractfile(manifest_path) as stream:
                 manifest = json.load(stream)
-            assert manifest["name"] == "agent-bridge"
+            assert manifest["name"] == "agent-parley"
             assert manifest["version"] == version
         assert archive.getmember(
-            f"{root}/plugins/agent-bridge/skills/coordinate/SKILL.md"
+            f"{root}/plugins/agent-parley/skills/coordinate/SKILL.md"
         ).isfile()
         assert archive.getmember(
             f"{root}/.agents/plugins/marketplace.json"
@@ -907,11 +907,11 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         **os.environ,
         "UV_TOOL_DIR": str(tmp_path / "tools"),
         "UV_TOOL_BIN_DIR": str(tmp_path / "bin"),
-        "AGENT_BRIDGE_HOME": str(tmp_path / "installed-state"),
+        "AGENT_PARLEY_HOME": str(tmp_path / "installed-state"),
     }
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        environment["AGENT_BRIDGE_PORT"] = str(sock.getsockname()[1])
+        environment["AGENT_PARLEY_PORT"] = str(sock.getsockname()[1])
     environment.pop("PYTHONPATH", None)
     subprocess.run(
         [
@@ -931,7 +931,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         check=True,
         timeout=120,
     )
-    executable = tmp_path / "bin" / "agent-bridge"
+    executable = tmp_path / "bin" / "agent-parley"
     try:
         subprocess.run(
             [str(executable), "up"],
@@ -1008,7 +1008,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             str(installed_python),
             "-I",
             "-c",
-            "import agent_bridge; print(agent_bridge.__file__)",
+            "import agent_parley; print(agent_parley.__file__)",
         ],
         cwd=tmp_path,
         capture_output=True,
@@ -1018,7 +1018,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     )
     assert Path(location.stdout.strip()).is_relative_to(tmp_path / "tools")
     subprocess.run(
-        [str(installed_python), "-I", "-m", "agent_bridge", "--help"],
+        [str(installed_python), "-I", "-m", "agent_parley", "--help"],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -1040,7 +1040,7 @@ def test_many_accounts_of_one_provider_run_side_by_side(
         "with open(os.environ['CAPTURE'], 'w') as f:\n"
         " json.dump({'home': os.environ.get('CLAUDE_CONFIG_DIR', ''),\n"
         "  'cwd': os.getcwd(),\n"
-        "  'token': os.environ.get('AGENT_BRIDGE_TOKEN', '')}, f)\n"
+        "  'token': os.environ.get('AGENT_PARLEY_TOKEN', '')}, f)\n"
     )
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
@@ -1221,7 +1221,7 @@ def test_roster_change_alone_never_denies_a_tool_call(
     bridge, repo, paired, monkeypatch
 ):
     monkeypatch.setattr(
-        "agent_bridge.checkpoints.mailbox",
+        "agent_parley.checkpoints.mailbox",
         lambda *args: {"pending_ack": 0, "messages": []},
     )
     directory = Path(paired["lanes"]["claude"]).parent
@@ -1335,7 +1335,7 @@ def test_joining_participant_is_announced_once(
     bridge, repo, paired, monkeypatch
 ):
     monkeypatch.setattr(
-        "agent_bridge.checkpoints.mailbox",
+        "agent_parley.checkpoints.mailbox",
         lambda *args: {"pending_ack": 0, "messages": []},
     )
     directory = Path(paired["lanes"]["claude"]).parent

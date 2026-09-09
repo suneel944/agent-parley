@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_bridge.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, lock, write_json
 
 
 def snapshot(directory: Path) -> dict:
@@ -96,7 +96,7 @@ def change(
                     if recipient not in participants or recipient == agent:
                         raise BridgeError(
                             "Choose another participant in this project; "
-                            "run agent-bridge participant list."
+                            "run agent-parley participant list."
                         )
                     if not summary or len(summary) > 2000:
                         raise BridgeError(

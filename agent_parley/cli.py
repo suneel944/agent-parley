@@ -18,8 +18,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from agent_bridge import dashboard, process, roster, store
-from agent_bridge.checkpoints import (
+from agent_parley import dashboard, process, roster, store
+from agent_parley.checkpoints import (
     EVENTS,
     current_branch,
     lane_branch,
@@ -27,8 +27,8 @@ from agent_bridge.checkpoints import (
     participant_liveness,
     read_events,
 )
-from agent_bridge.issues import change, describe, snapshot
-from agent_bridge.state import BridgeError, lock, write_json
+from agent_parley.issues import change, describe, snapshot
+from agent_parley.state import BridgeError, lock, write_json
 
 
 def git(repo: Path, *args: str) -> str:
@@ -106,8 +106,8 @@ def drift(name: str, participant: dict, actual: str) -> str:
     return (
         f"{name} lane is on {actual!r}, expected "
         f"{participant['branch']!r}. Run "
-        f"`agent-bridge participant restore {name}` to return it, or "
-        f"`agent-bridge participant retire {name}` to drop the lane. "
+        f"`agent-parley participant restore {name}` to return it, or "
+        f"`agent-parley participant retire {name}` to drop the lane. "
         "Both preserve committed and uncommitted work; neither discards."
     )
 
@@ -203,7 +203,7 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
             f"merge is now in progress in {root}:\n{conflicted}\n"
             f"Resolve those paths and run `git -C {quoted} merge --continue`, "
             f"or run `git -C {quoted} merge --abort` to leave {base} exactly "
-            "as it was. Agent Bridge never resolves a conflict for you."
+            "as it was. Agent Parley never resolves a conflict for you."
         )
     merged = len(pending.splitlines())
     return (
@@ -233,10 +233,10 @@ class Bridge:
         with lock(self.home / "config.lock"):
             path = self.home / "config.json"
             if not path.exists():
-                port = int(os.environ.get("AGENT_BRIDGE_PORT", "8876"))
+                port = int(os.environ.get("AGENT_PARLEY_PORT", "8876"))
                 if not 1024 <= port <= 65535:
                     raise BridgeError(
-                        "AGENT_BRIDGE_PORT must be between 1024 and 65535."
+                        "AGENT_PARLEY_PORT must be between 1024 and 65535."
                     )
                 write_json(
                     path, {"port": port, "token": secrets.token_urlsafe(32)}
@@ -306,7 +306,7 @@ class Bridge:
                     [
                         sys.executable,
                         "-m",
-                        "agent_bridge.server",
+                        "agent_parley.server",
                         "--home",
                         str(self.home),
                     ],
@@ -492,7 +492,7 @@ class Bridge:
             ):
                 raise BridgeError(f"Identity {name} is already registered.")
             lane = directory / name
-            branch = f"bridge/{directory.name}/{name}"
+            branch = f"parley/{directory.name}/{name}"
             refs = git(
                 root, "for-each-ref", "--format=%(refname:short)", "refs/heads"
             ).splitlines()
@@ -527,7 +527,7 @@ class Bridge:
         if participant is None:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-bridge participant list."
+                "run agent-parley participant list."
             )
         return directory, data, participant
 
@@ -602,7 +602,7 @@ class Bridge:
             if participant is None:
                 raise BridgeError(
                     f"{name} is not a participant in this project; "
-                    "run agent-bridge participant list."
+                    "run agent-parley participant list."
                 )
             lane = Path(participant["lane"])
             branch = participant["branch"]
@@ -658,7 +658,7 @@ class Bridge:
             if participant is None:
                 raise BridgeError(
                     f"{name} is not a participant in this project; "
-                    "run agent-bridge participant list."
+                    "run agent-parley participant list."
                 )
             with lock(
                 directory / f"{name}.session.lock",
@@ -704,11 +704,11 @@ class Bridge:
             )
             or "none yet; more can join at any time"
         )
-        return f"""Agent Bridge protocol (also follow repository instructions):
+        return f"""Agent Parley protocol (also follow repository instructions):
 You are {participant["display"]} using {participant["provider"]}.
 Your peers right now: {peers}.
 Peers can join or leave; call list_participants for the current roster.
-Use the agent_bridge MCP server. Canonical project key: {data["root"]}
+Use the agent_parley MCP server. Canonical project key: {data["root"]}
 Your editable worktree: {data["lanes"][agent]}
 The canonical project key is an identity, NOT a directory to edit.
 Your connection supplies project and identity automatically. Never read or pass
@@ -718,17 +718,17 @@ stable idempotency_key for each send; reuse it if retrying that same message.
 Do not assume the peer is online. Checkpoints deliver bounded previews; fetch
 bodies only when needed. Page via after_id and next_after_id; when a body has
 next_body_offset, refetch that message with body_offset before advancing.
-Before working on a numbered issue, run `agent-bridge issue claim NUMBER` from
+Before working on a numbered issue, run `agent-parley issue claim NUMBER` from
 your worktree. A conflict means choose another issue or request a handoff.
-Use `agent-bridge issue list` to inspect ownership notices or prepare a handoff.
-To hand off: stop work on that issue, then `agent-bridge issue offer NUMBER
+Use `agent-parley issue list` to inspect ownership notices or prepare a handoff.
+To hand off: stop work on that issue, then `agent-parley issue offer NUMBER
 --to PARTICIPANT --summary "commit, checks, remaining work"`. Stay paused until
 it is accepted, declined, or you cancel it. The recipient reviews the summary
-and runs `agent-bridge issue accept NUMBER --offer-id ID` before starting.
+and runs `agent-parley issue accept NUMBER --offer-id ID` before starting.
 Decline with `issue decline NUMBER --offer-id ID`.
 The owner can `issue cancel NUMBER`.
 No timeout transfers ownership. Release finished responsibility with
-`agent-bridge issue release NUMBER`; release does not mean merged or complete.
+`agent-parley issue release NUMBER`; release does not mean merged or complete.
 Reserve repo-relative file paths before editing. Reservations are advisory:
 if conflicts are returned, stop overlapping work, release the conflicting grant,
 and agree on ownership with the peer. Do not treat a granted lease as permission
@@ -751,7 +751,7 @@ Native checkpoints deliver peer messages and track activity automatically.
 Delivery does not acknowledge a message. After reviewing, explicitly call
 acknowledge_message. Use mark_message_read after reviewing ordinary messages
 to keep restart briefings current.
-Before a handoff, run `agent-bridge --home {shlex.quote(str(self.home))} report`
+Before a handoff, run `agent-parley --home {shlex.quote(str(self.home))} report`
 with `--state partial --summary "..." --remaining "..."`
 or `--state ready --summary "..." --evidence "commands and results"`.
 Use --state blocked with --remaining to explain a blocker. Ready means ready for
@@ -764,7 +764,7 @@ review, not merged or independently verified. An idle turn is not completion.
             [
                 sys.executable,
                 "-m",
-                "agent_bridge.checkpoints",
+                "agent_parley.checkpoints",
                 "--home",
                 str(self.home),
                 "--directory",
@@ -905,7 +905,7 @@ review, not merged or independently verified. An idle turn is not completion.
         if unknown:
             raise BridgeError(
                 f"Not a participant in this project: {', '.join(unknown)}; "
-                "run agent-bridge participant list."
+                "run agent-parley participant list."
             )
         selected = [
             name for name in names if not participants or name in participants
@@ -1063,8 +1063,8 @@ review, not merged or independently verified. An idle turn is not completion.
             env = {
                 **os.environ,
                 **account,
-                "AGENT_BRIDGE_TOKEN": identity["registration_token"],
-                "AGENT_BRIDGE_HOME": str(self.home),
+                "AGENT_PARLEY_TOKEN": identity["registration_token"],
+                "AGENT_PARLEY_HOME": str(self.home),
             }
             if entry["adapter"] == "claude":
                 config = lane.parent / f"{agent}-mcp.json"
@@ -1072,12 +1072,12 @@ review, not merged or independently verified. An idle turn is not completion.
                     config,
                     {
                         "mcpServers": {
-                            "agent_bridge": {
+                            "agent_parley": {
                                 "type": "http",
                                 "url": self.url + "/mcp/",
                                 "headers": {
                                     "Authorization": (
-                                        "Bearer ${AGENT_BRIDGE_TOKEN}"
+                                        "Bearer ${AGENT_PARLEY_TOKEN}"
                                     )
                                 },
                             }
@@ -1099,10 +1099,10 @@ review, not merged or independently verified. An idle turn is not completion.
                 command = [
                     executable,
                     "-c",
-                    "mcp_servers.agent_bridge.url="
+                    "mcp_servers.agent_parley.url="
                     + json.dumps(self.url + "/mcp/"),
                     "-c",
-                    'mcp_servers.agent_bridge.bearer_token_env_var="AGENT_BRIDGE_TOKEN"',
+                    'mcp_servers.agent_parley.bearer_token_env_var="AGENT_PARLEY_TOKEN"',
                 ]
                 for event, groups in hooks.items():
                     hook = groups[0]["hooks"][0]
@@ -1154,9 +1154,9 @@ def main() -> int:
         "--home",
         type=Path,
         default=Path(
-            os.environ.get("AGENT_BRIDGE_HOME", "~/.local/state/agent-bridge")
+            os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
         ),
-        help="Private state directory (or AGENT_BRIDGE_HOME).",
+        help="Private state directory (or AGENT_PARLEY_HOME).",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser(
@@ -1433,7 +1433,7 @@ def main() -> int:
         ValueError,
         subprocess.TimeoutExpired,
     ) as exc:
-        print(f"agent-bridge: {exc}", file=sys.stderr)
+        print(f"agent-parley: {exc}", file=sys.stderr)
         return 1
 
 

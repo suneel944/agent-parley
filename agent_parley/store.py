@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
-from agent_bridge.state import BridgeError, lock
+from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
 SCHEMA_VERSION = 2

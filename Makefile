@@ -15,8 +15,8 @@ install-dev:
 
 install-system:
 	@test "$$(id -u)" -eq 0 || { echo 'Run sudo env "PATH=$$PATH" make install-system'; exit 1; }
-	UV_TOOL_DIR=/opt/agent-bridge/tools UV_TOOL_BIN_DIR=/usr/local/bin \
-	UV_PYTHON_INSTALL_DIR=/opt/agent-bridge/python $(MAKE) install
+	UV_TOOL_DIR=/opt/agent-parley/tools UV_TOOL_BIN_DIR=/usr/local/bin \
+	UV_PYTHON_INSTALL_DIR=/opt/agent-parley/python $(MAKE) install
 
 build:
 	uv build --no-sources

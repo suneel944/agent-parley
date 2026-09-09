@@ -1,0 +1,11 @@
+{
+  "name": "agent-parley",
+  "version": "0.0.1",
+  "description": "Coordinate issue ownership and handoffs across coding agents with Agent Parley.",
+  "author": {
+    "name": "Suneel Kaushik S",
+    "email": "suneel944@gmail.com"
+  },
+  "homepage": "https://github.com/suneel944/agent-parley",
+  "repository": "https://github.com/suneel944/agent-parley"
+}

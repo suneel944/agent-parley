@@ -37,7 +37,7 @@ def release_notes(changelog: str, version: str) -> str:
     )[0].strip()
     if not section:
         raise ValueError("Release notes must not be empty.")
-    return f"## Agent Bridge {version}\n\n{section}\n"
+    return f"## Agent Parley {version}\n\n{section}\n"
 
 
 def main() -> None:
@@ -54,7 +54,7 @@ def main() -> None:
     tag = f"v{version}"
     if os.environ.get("RELEASE_TAG", tag) != tag:
         raise ValueError("Release tag must match the package version.")
-    plugin = root / "plugins" / "agent-bridge"
+    plugin = root / "plugins" / "agent-parley"
     for client in ("claude", "codex"):
         manifest = json.loads(
             (plugin / f".{client}-plugin" / "plugin.json").read_text()
@@ -73,7 +73,7 @@ def main() -> None:
         destination = output / filename
         shutil.copyfile(root / "dist" / filename, destination)
         assets.append(destination)
-    bundle = output / f"agent-bridge-plugins-{version}.zip"
+    bundle = output / f"agent-parley-plugins-{version}.zip"
     inputs = [
         root / ".agents" / "plugins" / "marketplace.json",
         root / ".claude-plugin" / "marketplace.json",

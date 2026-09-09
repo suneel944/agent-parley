@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-parley"
-version = "0.3.2"
+version = "0.0.1"
 description = "Run several coding agents in isolated worktrees with shared coordination."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,17 +14,17 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.scripts]
-agent-bridge = "agent_bridge.cli:main"
+agent-parley = "agent_parley.cli:main"
 
 [project.urls]
-Repository = "https://github.com/suneel944/agent-bridge"
-Issues = "https://github.com/suneel944/agent-bridge/issues"
+Repository = "https://github.com/suneel944/agent-parley"
+Issues = "https://github.com/suneel944/agent-parley/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["agent_bridge"]
+packages = ["agent_parley"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/agent_bridge", "/plugins", "/tests", "/scripts", "/docs", "/README.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md", "/CODE_OF_CONDUCT.md", "/Makefile", "/pyproject.toml", "/uv.lock", "/.claude-plugin", "/.agents"]
+include = ["/agent_parley", "/plugins", "/tests", "/scripts", "/docs", "/README.md", "/CONTRIBUTING.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md", "/CODE_OF_CONDUCT.md", "/Makefile", "/pyproject.toml", "/uv.lock", "/.claude-plugin", "/.agents"]
 
 [dependency-groups]
 dev = [
@@ -55,7 +55,7 @@ convention = "google"
 testpaths = ["tests"]
 
 [tool.mypy]
-files = ["agent_bridge", "scripts"]
+files = ["agent_parley", "scripts"]
 check_untyped_defs = true
 disallow_untyped_defs = true
 warn_unused_ignores = true

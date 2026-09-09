@@ -11,8 +11,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent_bridge import store
-from agent_bridge.state import BridgeError
+from agent_parley import store
+from agent_parley.state import BridgeError
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 MAX_REQUEST_BYTES = 16384
@@ -216,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
         """Reports authenticated health without opening SSE streams."""
         if self._authorize() is not None:
             if self.path == "/health/readiness":
-                self._reply(200, {"status": "ready", "engine": "agent-bridge"})
+                self._reply(200, {"status": "ready", "engine": "agent-parley"})
             else:
                 self._reply(405)
 
@@ -285,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
                 else VERSIONS[-1],
                 "capabilities": {"tools": {}},
                 "serverInfo": {
-                    "name": "agent-bridge",
+                    "name": "agent-parley",
                     "version": importlib.metadata.version("agent-parley"),
                 },
             }
