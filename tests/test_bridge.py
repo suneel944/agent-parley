@@ -22,6 +22,7 @@ from agent_bridge.checkpoints import (
     MAX_EVENT_LOG_BYTES,
     branch_guard,
     checkpoint,
+    event_summary,
     mailbox,
 )
 from agent_bridge.cli import Bridge, BridgeError, git, lock, write_json
@@ -628,6 +629,34 @@ def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     checkpoint(bridge.home, directory, "claude", payload)
     assert (directory / "claude-events.1.jsonl").exists()
     assert 0 < len(log.read_bytes()) < MAX_EVENT_LOG_BYTES
+    (directory / "claude-events.1.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": 1.0,
+                "decision": "deny",
+                "injected_bytes": 5,
+                "reason_class": "branch_drift",
+            }
+        )
+        + "\n"
+    )
+    log.write_text(
+        json.dumps(
+            {
+                "ts": 2.0,
+                "decision": "allow",
+                "injected_bytes": 7,
+                "reason_class": "coordination_pending",
+            }
+        )
+        + "\n"
+    )
+    summary = event_summary(directory, "claude")
+    assert summary["events"] == 2
+    assert summary["denials"] == 1
+    assert summary["injected_bytes"] == 12
+    assert summary["last_ts"] == 2.0
+    assert summary["last_reason"] == "coordination_pending"
 
 
 def test_issue_claim_race_persistence_and_explicit_handoff(

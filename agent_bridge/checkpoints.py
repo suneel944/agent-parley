@@ -380,8 +380,9 @@ def participant_liveness(directory: Path, agent: str) -> str:
 def event_summary(directory: Path, agent: str) -> dict:
     """Summarizes the retained hook event log for one participant.
 
-    Counts cover the current log only; the log rotates at a byte cap, so an
-    older record is retained in the rotated file and is not counted here.
+    Counts cover the rotated file and then the current one, oldest record
+    first, so reaching the byte cap does not reset a running total. Only one
+    rotation is retained, so a record older than that is not counted.
 
     Args:
         directory: Private state directory for the common repository.
@@ -394,21 +395,22 @@ def event_summary(directory: Path, agent: str) -> dict:
     events = denials = injected = 0
     last_ts = 0.0
     last_reason = ""
-    try:
-        text = (directory / f"{agent}-events.jsonl").read_text(errors="ignore")
-    except OSError:
-        text = ""
-    for line in text.splitlines():
+    for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
         try:
-            entry = json.loads(line)
-        except ValueError:
+            text = (directory / name).read_text(errors="ignore")
+        except OSError:
             continue
-        events += 1
-        if entry.get("decision") in ("deny", "block"):
-            denials += 1
-        injected += int(entry.get("injected_bytes", 0) or 0)
-        last_ts = float(entry.get("ts", 0) or 0)
-        last_reason = str(entry.get("reason_class", ""))
+        for line in text.splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            events += 1
+            if entry.get("decision") in ("deny", "block"):
+                denials += 1
+            injected += int(entry.get("injected_bytes", 0) or 0)
+            last_ts = float(entry.get("ts", 0) or 0)
+            last_reason = str(entry.get("reason_class", ""))
     return {
         "events": events,
         "denials": denials,
