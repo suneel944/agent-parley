@@ -56,6 +56,22 @@ def _size(count: int) -> str:
     return f"{count / 1024 / 1024:.1f}MB"
 
 
+def _fit(value: str, width: int) -> str:
+    """Pads a cell, marking any value the column could not show in full.
+
+    Args:
+        value: Cell text.
+        width: Column width.
+
+    Returns:
+        Text padded to the column width, ending in an ellipsis when clipped,
+        so a truncated branch or issue list never reads as complete.
+    """
+    if len(value) > width:
+        return value[: width - 1] + "…"
+    return value.ljust(width)
+
+
 def _branch(lane: Path, cache: dict) -> str:
     """Reads a lane branch at most once per branch refresh interval.
 
@@ -227,7 +243,7 @@ def render(view: dict) -> list[str]:
         for row in project["rows"]:
             lines.append(
                 "  ".join(
-                    value.ljust(width)[:width]
+                    _fit(value, width)
                     for value, (_, width) in zip(
                         (
                             row["participant"],
