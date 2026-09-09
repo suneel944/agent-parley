@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="150" viewBox="0 0 940 150" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13">
+<rect width="940" height="150" rx="10" fill="#0d1117"/>
+<rect width="940" height="30.0" rx="10" fill="#161b22"/>
+<rect y="20.0" width="940" height="10" fill="#161b22"/>
+<circle cx="18" cy="15" r="5.5" fill="#ff5f57"/><circle cx="36" cy="15" r="5.5" fill="#febc2e"/><circle cx="54" cy="15" r="5.5" fill="#28c840"/>
+<text x="470" y="19" text-anchor="middle" fill="#8b949e" font-size="12">agent-parley issue list</text>
+<text x="18.0" y="61.5" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue list</tspan></text>
+<text x="18.0" y="79.5" xml:space="preserve" fill="#c9d1d9">#17: codex (stopped)</text>
+<text x="18.0" y="97.5" xml:space="preserve" fill="#c9d1d9">#42: claude (stopped); waits on #17 (codex); handoff to codex pending 0s; offer 4560c1ded1424c549843694d42e43d39</text>
+<text x="18.0" y="115.5" xml:space="preserve" fill="#8b949e">  Peer-provided summary: "rounding fixed in payments.py; refund path still open"</text>
+</svg>

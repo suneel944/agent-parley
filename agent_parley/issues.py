@@ -8,6 +8,29 @@ from pathlib import Path
 
 from agent_parley.state import BridgeError, lock, write_json
 
+MAX_BLOCKERS = 10
+
+
+def parse_issue(value: str, label: str = "Issue") -> str:
+    """Returns a repository issue number without its optional prefix.
+
+    Args:
+        value: Candidate issue number, optionally prefixed with #.
+        label: Field name reported when validation fails.
+
+    Returns:
+        The bare digits of a valid issue number.
+
+    Raises:
+        BridgeError: If the value is not a positive number of up to 18 digits.
+    """
+    if not re.fullmatch(r"#?[1-9][0-9]{0,17}", value or ""):
+        raise BridgeError(
+            f"{label} must be a positive number of up to 18 digits, "
+            "e.g. 432 or #432."
+        )
+    return value.lstrip("#")
+
 
 def snapshot(directory: Path) -> dict:
     """Returns the published issue ledger, or an empty ledger."""
@@ -29,18 +52,21 @@ def change(
     to: str | None = None,
     summary: str = "",
     offer_id: str | None = None,
+    on: str | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
     Args:
         directory: Private state directory for the common repository.
         agent: Acting lane, resolved by the CLI from its worktree.
-        action: Claim, release, offer, accept, decline, or cancel.
+        action: Claim, release, offer, accept, decline, cancel, block, or
+            unblock.
         issue: Positive repository issue number, optionally prefixed with #.
         participants: Every participant registered for this project.
         to: Recipient participant for an offer.
         summary: Peer-provided handoff context.
         offer_id: Exact current offer required for acceptance or decline.
+        on: Issue this one waits on, for a block or unblock.
 
     Returns:
         The persisted issue record, including transition history.
@@ -48,12 +74,12 @@ def change(
     Raises:
         BridgeError: If validation, ownership, offer, or lock checks fail.
     """
-    if not re.fullmatch(r"#?[1-9][0-9]{0,17}", issue):
-        raise BridgeError(
-            "Issue must be a positive number of up to 18 digits, "
-            "e.g. 432 or #432."
-        )
-    issue = issue.lstrip("#")
+    issue = parse_issue(issue)
+    blocker = ""
+    if action in ("block", "unblock"):
+        blocker = parse_issue(on or "", "Blocker")
+        if blocker == issue:
+            raise BridgeError("An issue cannot wait on itself.")
     with lock(directory / "issues.lock"):
         state = snapshot(directory)
         record = state["issues"].get(issue)
@@ -67,6 +93,7 @@ def change(
             record = {
                 "owner": agent,
                 "offer": None,
+                "blocked_by": (record or {}).get("blocked_by", []),
                 "history": (record or {}).get("history", []),
             }
         else:
@@ -119,6 +146,25 @@ def change(
                     record["offer"] = None
                 elif action == "release":
                     record.update(owner=None, offer=None)
+                elif action == "block":
+                    waiting = record.get("blocked_by", [])
+                    if blocker in waiting:
+                        return record
+                    if len(waiting) >= MAX_BLOCKERS:
+                        raise BridgeError(
+                            f"Issue #{issue} already waits on {MAX_BLOCKERS} "
+                            "issues; drop one with issue unblock."
+                        )
+                    record["blocked_by"] = sorted([*waiting, blocker], key=int)
+                elif action == "unblock":
+                    waiting = record.get("blocked_by", [])
+                    if blocker not in waiting:
+                        raise BridgeError(
+                            f"Issue #{issue} does not wait on #{blocker}."
+                        )
+                    record["blocked_by"] = [
+                        number for number in waiting if number != blocker
+                    ]
                 else:
                     raise BridgeError("Unknown issue action.")
         record["history"].append(
@@ -147,7 +193,8 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             and a stopped session never transfer ownership.
 
     Returns:
-        One line for each owned issue, or a notice that none are claimed.
+        One line for each owned issue, naming any issue it waits on and who
+        holds that issue, or a notice that none are claimed.
     """
     lines = []
     for number, record in sorted(
@@ -158,6 +205,13 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         line = f"#{number}: {record['owner']}"
         if liveness and record["owner"] in liveness:
             line += f" ({liveness[record['owner']]})"
+        if waiting := record.get("blocked_by"):
+            line += "; waits on " + ", ".join(
+                f"#{blocker} ({holder['owner']})"
+                if (holder := state["issues"].get(blocker, {})).get("owner")
+                else f"#{blocker} (unclaimed)"
+                for blocker in waiting
+            )
         if offer := record["offer"]:
             age = max(0, int(time.time() - offer["created"]))
             line += (

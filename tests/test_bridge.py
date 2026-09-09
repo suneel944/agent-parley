@@ -29,6 +29,7 @@ from agent_parley.checkpoints import (
     prune,
 )
 from agent_parley.cli import Bridge, BridgeError, git, lock, write_json
+from agent_parley.issues import MAX_BLOCKERS, describe
 from agent_parley.process import start_ticks
 
 
@@ -801,6 +802,45 @@ def test_issue_crash_releases_operation_lock_but_preserves_owner(
         Bridge(bridge.home).issue(codex, "claim", "432")
     bridge.issue(claude, "release", "432")
     assert bridge.issue(codex, "claim", "432")["owner"] == "codex"
+
+
+def test_issue_dependencies_are_owner_only_and_survive_a_release(
+    bridge, repo, paired
+):
+    claude, codex = (
+        Path(paired["lanes"][name]) for name in ("claude", "codex")
+    )
+    bridge.issue(claude, "claim", "432")
+    bridge.issue(codex, "claim", "77")
+    with pytest.raises(BridgeError, match="Only claude"):
+        bridge.issue(codex, "block", "432", on="77")
+    with pytest.raises(BridgeError, match="wait on itself"):
+        bridge.issue(claude, "block", "432", on="432")
+    with pytest.raises(BridgeError, match="Blocker must be"):
+        bridge.issue(claude, "block", "432", on="0")
+    blocked = bridge.issue(claude, "block", "432", on="#77")
+    assert blocked["blocked_by"] == ["77"]
+    revision = bridge.issue(repo, "list")["revision"]
+    assert bridge.issue(claude, "block", "432", on="77")["blocked_by"] == ["77"]
+    assert bridge.issue(repo, "list")["revision"] == revision
+    for extra in range(100, 99 + MAX_BLOCKERS):
+        bridge.issue(claude, "block", "432", on=str(extra))
+    with pytest.raises(BridgeError, match="drop one with issue unblock"):
+        bridge.issue(claude, "block", "432", on="999")
+    bridge.issue(claude, "release", "432")
+    assert bridge.issue(claude, "claim", "432")["blocked_by"] == [
+        "77",
+        *(str(extra) for extra in range(100, 99 + MAX_BLOCKERS)),
+    ]
+    assert "#432: claude; waits on #77 (codex)" in describe(
+        bridge.issue(repo, "list")
+    )
+    with pytest.raises(BridgeError, match="does not wait on #555"):
+        bridge.issue(claude, "unblock", "432", on="555")
+    assert (
+        "77"
+        not in bridge.issue(claude, "unblock", "432", on="77")["blocked_by"]
+    )
 
 
 def test_issue_notifications_are_once_per_change_without_empty_reminders(
