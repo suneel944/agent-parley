@@ -962,6 +962,15 @@ def main() -> int:
         default=1.0,
         help="Seconds between redraws of the live view.",
     )
+    watch.add_argument(
+        "--provider",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Report only participants driven by this provider. Repeat the "
+            "flag to report several."
+        ),
+    )
     setup = commands.add_parser(
         "setup",
         help="Register a repository for coordination from committed HEAD.",
@@ -1071,6 +1080,7 @@ def main() -> int:
                 lambda: bool(bridge.server_process()),
                 args.once,
                 args.interval,
+                tuple(args.provider or ()),
             )
         elif args.command == "setup":
             print(json.dumps(bridge.setup(args.repo.resolve()), indent=2))

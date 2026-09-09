@@ -138,6 +138,7 @@ def _row(
     branch = _branch(Path(participant["lane"]), context["branches"])
     return {
         "participant": agent,
+        "provider_name": participant["provider"],
         "provider": (
             f"{participant['provider']}/"
             f"{participant['credential'] or 'default'}"
@@ -165,16 +166,26 @@ def _row(
     }
 
 
-def collect(home: Path, running: bool, branches: dict) -> dict:
+def collect(
+    home: Path,
+    running: bool,
+    branches: dict,
+    providers: tuple[str, ...] = (),
+) -> dict:
     """Reads one snapshot of every registered project without changing state.
 
     Args:
         home: Private bridge state root.
         running: Whether the recorded coordination server process is alive.
         branches: Caller-owned branch cache, refreshed on its own interval.
+        providers: Provider names to report; every provider when empty. A
+            project keeps its heading once it holds a selected participant, so
+            an operator can tell an emptied selection from an empty project.
 
     Returns:
-        Server health, per-project participant rows, and project totals.
+        Server health, per-project participant rows, and totals over the
+        reported rows, so a header never counts a participant the table
+        does not show.
     """
     projects = []
     totals = {"participants": 0, "events": 0, "denials": 0, "context": 0}
@@ -196,6 +207,8 @@ def collect(home: Path, running: bool, branches: dict) -> dict:
             _row(home, path.parent, data, agent, context)
             for agent in sorted(data["participants"])
         ]
+        if providers:
+            rows = [row for row in rows if row["provider_name"] in providers]
         for row in rows:
             totals["participants"] += 1
             totals["events"] += row["hook_events"]
@@ -207,6 +220,7 @@ def collect(home: Path, running: bool, branches: dict) -> dict:
         "home": str(home),
         "projects": projects,
         "totals": totals,
+        "providers": list(providers),
     }
 
 
@@ -233,13 +247,22 @@ def render(view: dict) -> list[str]:
         f"participants {totals['participants']}  "
         f"hook events {totals['events']}  "
         f"denials {totals['denials']} ({rate})  "
-        f"context {_size(totals['context'])}",
+        f"context {_size(totals['context'])}"
+        + (
+            f"  provider {','.join(view['providers'])}"
+            if view.get("providers")
+            else ""
+        ),
     ]
     header = "  ".join(name.ljust(width) for name, width in COLUMNS)
     for project in view["projects"]:
         lines.extend(["", f"project {project['root']}", header.rstrip()])
         if not project["rows"]:
-            lines.append("  no participants")
+            lines.append(
+                "  no participants for the selected provider"
+                if view.get("providers")
+                else "  no participants"
+            )
         for row in project["rows"]:
             lines.append(
                 "  ".join(
@@ -286,6 +309,7 @@ def _loop(
     home: Path,
     running: Callable[[], bool],
     interval: float,
+    providers: tuple[str, ...],
 ) -> None:
     """Redraws the snapshot until the operator quits; never writes state."""
     branches: dict = {}
@@ -293,7 +317,7 @@ def _loop(
         curses.curs_set(0)
     screen.timeout(max(100, int(interval * 1000)))
     while True:
-        lines = render(collect(home, running(), branches))
+        lines = render(collect(home, running(), branches, providers))
         height, width = screen.getmaxyx()
         screen.erase()
         for index, line in enumerate(lines[: height - 1]):
@@ -317,6 +341,7 @@ def run(
     running: Callable[[], bool],
     once: bool = False,
     interval: float = 1.0,
+    providers: tuple[str, ...] = (),
 ) -> None:
     """Shows the dashboard, printing a plain snapshot when it cannot draw.
 
@@ -325,9 +350,10 @@ def run(
         running: Reports whether the recorded server process is alive.
         once: Print one snapshot instead of drawing a live view.
         interval: Seconds between redraws of the live view.
+        providers: Provider names to report; every provider when empty.
     """
     if once or not sys.stdout.isatty():
-        for line in render(collect(home, running(), {})):
+        for line in render(collect(home, running(), {}, providers)):
             print(line)
         return
-    curses.wrapper(_loop, home, running, interval)
+    curses.wrapper(_loop, home, running, interval, providers)

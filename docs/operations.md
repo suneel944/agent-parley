@@ -50,7 +50,10 @@ the oldest, delivered context, denials against retained hook events, and served
 MCP calls with rejections. The header carries server health and the project's
 denial rate. The view is read-only and makes no model call; `q` leaves it.
 Use `--once`, or pipe it, for one plain snapshot instead of a live view, and
-`--interval` to change the redraw period. Session state follows the recorded
+`--interval` to change the redraw period. `--provider NAME` reports only the
+participants driven by that provider and is repeatable; the header then counts
+only the reported rows, and a project holding no selected participant says so
+rather than reading as empty. Session state follows the recorded
 session process, not the session lock, so watching a lane never blocks a
 launch. Denial counts cover the whole retained event log, the current file and
 the one rotated file together, so a count reports every record still kept rather

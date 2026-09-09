@@ -585,6 +585,32 @@ def test_top_reports_every_participant_and_writes_no_state(
     } == before
 
 
+def test_top_reports_only_the_selected_providers(bridge, repo, paired, capsys):
+    dashboard.run(bridge.home, lambda: False, once=True, providers=("codex",))
+    selected = capsys.readouterr().out
+    assert "codex/default" in selected
+    assert "claude/default" not in selected
+    assert "participants 1" in selected
+    assert "provider codex" in selected
+
+    dashboard.run(
+        bridge.home, lambda: False, once=True, providers=("claude", "codex")
+    )
+    both = capsys.readouterr().out
+    assert "claude/default" in both and "codex/default" in both
+    assert "participants 2" in both
+
+    dashboard.run(bridge.home, lambda: False, once=True, providers=("kimi",))
+    none = capsys.readouterr().out
+    assert "no participants for the selected provider" in none
+    assert "participants 0" in none
+
+    dashboard.run(bridge.home, lambda: False, once=True)
+    unfiltered = capsys.readouterr().out
+    assert "participants 2" in unfiltered
+    assert "provider " not in unfiltered
+
+
 def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     bridge, repo, paired, monkeypatch
 ):
