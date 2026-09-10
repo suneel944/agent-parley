@@ -114,6 +114,40 @@ def git_repo(tmp_path):
     return tmp_path
 
 
+def product_commit(repo, subject, path="agent_parley/module.py", body=""):
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a") as stream:
+        stream.write(f"{subject}\n")
+    release.command("git", "add", "-A", cwd=repo)
+    release.command(
+        "git",
+        "commit",
+        "-m",
+        f"{subject}\n\n{body}" if body else subject,
+        cwd=repo,
+    )
+
+
+@pytest.fixture
+def local(monkeypatch):
+    monkeypatch.delenv("GH_REPO", raising=False)
+    monkeypatch.setattr(release, "pypi_files", lambda version: [])
+    return monkeypatch
+
+
+@pytest.fixture
+def counted_repo(git_repo):
+    (git_repo / ".release-please-manifest.json").write_text('{".": "0.1.1"}')
+    (git_repo / "release-please-config.json").write_text(
+        '{"packages": {".": {}}}'
+    )
+    release.command("git", "add", ".", cwd=git_repo)
+    release.command("git", "commit", "-m", "chore: configure", cwd=git_repo)
+    release.command("git", "tag", TAG, cwd=git_repo)
+    return git_repo
+
+
 @pytest.mark.parametrize("annotated", [False, True])
 def test_real_tag_on_main_resolves_to_exact_commit(git_repo, annotated):
     args = ("-a", "-m", "Release") if annotated else ()
@@ -322,18 +356,188 @@ def test_retired_version_cannot_be_prepared_or_published(migrated_repo):
         release.validate_tag(migrated_repo, "v0.1.2")
 
 
-def test_patch_bumping_onto_a_retired_version_is_rejected(migrated_repo):
-    path = migrated_repo / "release-please-config.json"
-    config = json.loads(path.read_text())
-    assert release.proposed_feature_version(migrated_repo) == "0.2.0"
+def test_patch_bumping_onto_a_retired_version_is_skipped(migrated_repo, local):
+    product_commit(migrated_repo, "fix(urgent): repair the package")
+    assert release.advance_version("0.1.1", "patch", ["0.1.2"]) == "0.1.3"
+    assert release.release_candidate(migrated_repo)[0] == "0.1.3"
     assert release.migration_config_errors(migrated_repo) == []
-    config["packages"]["."]["bump-patch-for-minor-pre-major"] = True
-    path.write_text(json.dumps(config))
-    assert release.proposed_feature_version(migrated_repo) == "0.1.2"
-    assert release.migration_config_errors(migrated_repo) == [
-        "Accumulated features would propose a retired version; "
-        "change the bump policy so preparation skips it."
+    path = migrated_repo / ".github/release-history.json"
+    history = json.loads(path.read_text())
+    history["retired"] = [
+        f"0.1.{number}" for number in range(2, release.RETIREMENT_LIMIT + 3)
     ]
+    path.write_text(json.dumps(history))
+    assert release.migration_config_errors(migrated_repo) == [
+        "Every candidate version of one release kind is retired; "
+        "preparation would have no version left to propose."
+    ]
+    with pytest.raises(ValueError, match="No patch version is available"):
+        release.release_candidate(migrated_repo)
+
+
+def test_infrastructure_commits_cannot_raise_a_version(counted_repo, local):
+    product_commit(counted_repo, "ci: retune", ".github/workflows/check.yml")
+    product_commit(counted_repo, "docs: explain", "docs/releases.md")
+    product_commit(counted_repo, "feat: write a plan", "docs/plan.md")
+    product_commit(counted_repo, "feat: rework tooling", "scripts/tool.py")
+    product_commit(counted_repo, "chore: touch the package")
+    assert release.release_candidate(counted_repo) == ("", 0, 0)
+
+
+def test_package_and_plugin_commits_each_count_one_unit(counted_repo, local):
+    product_commit(counted_repo, "feat: add a command", "agent_parley/cli.py")
+    assert release.release_candidate(counted_repo) == ("", 1, 1)
+    product_commit(
+        counted_repo,
+        "fix: repair the skill",
+        "plugins/agent-parley/skills/coordinate/SKILL.md",
+    )
+    assert release.release_candidate(counted_repo) == ("", 2, 1)
+
+
+def test_one_issue_across_three_pull_requests_counts_once(counted_repo, local):
+    for number in range(3):
+        product_commit(counted_repo, f"feat: part {number}", body="Refs #7")
+    assert release.release_candidate(counted_repo) == ("", 1, 1)
+    product_commit(counted_repo, "fix: repair part one", body="Fixes #7")
+    product_commit(counted_repo, "perf: speed up parts", body="closes #8")
+    assert release.release_candidate(counted_repo) == ("", 2, 1)
+
+
+def test_a_qualifying_commit_without_an_issue_still_counts(counted_repo, local):
+    product_commit(counted_repo, "feat: unreferenced work")
+    product_commit(counted_repo, "feat: further unreferenced work")
+    assert release.release_candidate(counted_repo) == ("", 2, 2)
+
+
+def test_ten_product_issues_propose_the_next_minor(counted_repo, local):
+    for number in range(release.MINOR_THRESHOLD - 1):
+        product_commit(
+            counted_repo, f"fix: repair {number}", body=f"Refs #{number}"
+        )
+    assert release.release_candidate(counted_repo) == ("", 9, 0)
+    product_commit(counted_repo, "feat: the tenth unit", body="Resolves #99")
+    assert release.release_candidate(counted_repo) == ("0.2.0", 10, 1)
+
+
+def test_fifty_product_features_propose_the_next_major(counted_repo, local):
+    for number in range(release.MAJOR_THRESHOLD - 1):
+        product_commit(
+            counted_repo, f"feat: feature {number}", body=f"Refs #{number}"
+        )
+    assert release.release_candidate(counted_repo) == ("0.2.0", 49, 49)
+    product_commit(counted_repo, "feat: the fiftieth", body="Refs #999")
+    assert release.release_candidate(counted_repo) == ("1.0.0", 50, 50)
+
+
+def test_only_an_urgent_fix_proposes_a_patch(counted_repo, local):
+    product_commit(counted_repo, "fix: a quiet repair", body="Refs #3")
+    assert release.release_candidate(counted_repo) == ("", 1, 0)
+    product_commit(counted_repo, "fix(urgent): stop the bleeding")
+    assert release.release_candidate(counted_repo) == ("0.1.2", 2, 0)
+
+
+def test_an_existing_tag_alone_makes_a_version_unavailable(counted_repo, local):
+    product_commit(counted_repo, "fix(urgent): stop the bleeding")
+    release.command("git", "tag", "v0.1.2", cwd=counted_repo)
+    assert release.release_candidate(counted_repo)[0] == "0.1.3"
+
+
+def test_a_draft_release_alone_makes_a_version_unavailable(counted_repo, local):
+    product_commit(counted_repo, "fix(urgent): stop the bleeding")
+    local.setenv("GH_REPO", "owner/repo")
+    local.setattr(
+        release,
+        "github_release",
+        lambda tag: {"draft": True} if tag == "v0.1.2" else None,
+    )
+    assert release.release_candidate(counted_repo)[0] == "0.1.3"
+
+
+def test_a_published_package_version_is_unavailable(counted_repo, local):
+    product_commit(counted_repo, "fix(urgent): stop the bleeding")
+    local.setattr(
+        release,
+        "pypi_files",
+        lambda version: [{"filename": "wheel"}] if version == "0.1.2" else [],
+    )
+    assert release.release_candidate(counted_repo)[0] == "0.1.3"
+
+
+@pytest.mark.parametrize("failure", ["github", "package index"])
+def test_a_failing_availability_check_stops_the_proposal(
+    counted_repo, local, failure
+):
+    product_commit(counted_repo, "fix(urgent): stop the bleeding")
+    if failure == "github":
+        local.setenv("GH_REPO", "owner/repo")
+
+        def broken(tag):
+            raise RuntimeError("Cannot inspect GitHub release")
+
+        local.setattr(release, "github_release", broken)
+        expected = RuntimeError
+    else:
+
+        def broken(version):
+            raise urllib.error.URLError("Network is unreachable")
+
+        local.setattr(release, "pypi_files", broken)
+        expected = urllib.error.URLError
+    with pytest.raises(expected):
+        release.release_candidate(counted_repo)
+
+
+def test_a_local_checkout_proposes_without_a_github_repository(
+    counted_repo, local
+):
+    def refuse(tag):
+        raise AssertionError("GitHub must not be consulted without GH_REPO")
+
+    local.setattr(release, "github_release", refuse)
+    product_commit(counted_repo, "fix(urgent): stop the bleeding")
+    assert release.release_candidate(counted_repo)[0] == "0.1.2"
+
+
+@pytest.mark.parametrize("delivered", [2, release.MINOR_THRESHOLD])
+def test_candidate_phase_reports_measured_eligibility(
+    counted_repo, local, capsys, delivered
+):
+    for number in range(delivered):
+        product_commit(
+            counted_repo, f"feat: work {number}", body=f"Refs #{number}"
+        )
+    output = counted_repo / ".git/candidate-output"
+    local.setenv("GITHUB_OUTPUT", str(output))
+    local.chdir(counted_repo)
+    local.setattr(sys, "argv", ["release_publish", "candidate"])
+    release.main()
+    printed = capsys.readouterr().out.strip()
+    emitted = dict(
+        line.split("=", 1) for line in output.read_text().splitlines()
+    )
+    if delivered == 2:
+        assert emitted == {
+            "eligible": "false",
+            "version": "",
+            "issues": "2",
+            "features": "2",
+        }
+        assert printed == (
+            "2 product issues and 2 product features since v0.1.1; "
+            "10 issues or 50 features or one fix(urgent) commit are required."
+        )
+    else:
+        assert emitted == {
+            "eligible": "true",
+            "version": "0.2.0",
+            "issues": "10",
+            "features": "10",
+        }
+        assert printed == (
+            "10 product issues and 10 product features since v0.1.1; "
+            "proposing 0.2.0."
+        )
 
 
 @pytest.mark.parametrize(

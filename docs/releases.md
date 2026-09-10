@@ -101,18 +101,38 @@ users pinned exactly to a yanked version can still install it.
 
 ## A future intentional release
 
-1. Confirm there are actual package changes to distribute. Enable Prepare
-   release when a new proposal is wanted, then dispatch it from `main`.
+1. Confirm there is enough delivered product work to distribute. Eligibility is
+   measured, not judged. The candidate step counts commits between the approved
+   release and `main`, and a commit counts only when both of these hold: its
+   title uses a releasing conventional type, `feat`, `fix` or `perf`, with or
+   without a scope or `!`; and it touches at least one path under
+   `agent_parley/` or `plugins/agent-parley/`. Workflow, script, test and
+   documentation commits are therefore structurally incapable of counting, even
+   with a releasing title, because they change nothing the package distributes.
+   Each counted commit contributes the distinct issues its message names
+   through `Refs`, `Fixes`, `Closes` or `Resolves`, so one issue delivered by
+   three pull requests counts once; a counted commit that names no issue counts
+   as one unit of its own. Fifty product features propose the next major
+   version, ten product issues propose the next minor version, and a single
+   commit titled `fix(urgent):` proposes the next patch version. That scope is
+   the only mechanical marker for a patch release; nothing else reaches that
+   rung. Below all three thresholds nothing is proposed and the step reports
+   the counts it measured. Counting is local and repeatable: it reads Git
+   history and nothing else. Enable Prepare release when a new proposal is
+   wanted, then dispatch it from `main`.
 2. Review the changelog and version changes and merge the PR through required
    checks. A generated PR is a proposal, not release authorization. Previously
-   consumed versions cannot be reused, including a deleted or yanked 0.1.2.
-   Feature work accumulates onto one proposal rather than releasing each
-   change, and the bump policy raises the minor component while the major
-   component is zero, so preparation from 0.1.1 proposes 0.2.0 and steps over
-   the retired number without a manual correction. The policy gate recomputes
-   that proposal and fails when the configured policy would land on a retired
-   version. Remove the migration's root `last-release-sha` in this version PR;
-   the policy gate rejects a stale migration boundary.
+   consumed versions cannot be reused, including a deleted or yanked 0.1.2. A
+   proposal that lands on an unavailable version advances to the next free
+   version of the same kind instead of failing, so an urgent patch from 0.1.1
+   proposes 0.1.3 without a manual correction. A version is unavailable when it
+   is retired in `.github/release-history.json`, when the tag already exists
+   locally or on `origin`, when a GitHub release exists for that tag including
+   a draft, or when the package index already has it. Only a definite absence
+   makes a version available; a check that fails to answer stops the run rather
+   than proposing a number that may already be taken. Remove the migration's
+   root `last-release-sha` in this version PR; the policy gate rejects a stale
+   migration boundary.
 3. Create the corresponding version tag at the reviewed commit on `main`.
    Enable Release and dispatch it from `main` with that existing tag.
 4. Check the workflow result and verify the published version. A release is
