@@ -1,7 +1,7 @@
 {
   "name": "agent-parley",
   "version": "0.1.0",
-  "description": "Coordinate issue ownership and handoffs across coding agents with Agent Parley.",
+  "description": "Run several coding agents side by side on one repository with shared issue ownership, advisory file reservations, and explicit handoffs.",
   "author": {
     "name": "Suneel Kaushik S",
     "email": "suneel944@gmail.com"
@@ -9,8 +9,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Agent Parley",
-    "shortDescription": "Use Agent Parley in Codex.",
-    "longDescription": "Inspect coordination status, claim issues, and explicitly hand off work across separate Git worktrees.",
+    "shortDescription": "Coordinate several coding agents on one repository.",
+    "longDescription": "Agent Parley lets several coding agents work on one repository at the same time without overwriting each other. Each participant runs in its own Git worktree. Before editing, a participant claims a numbered issue, and the claim is visible to every other participant. File reservations are announced over MCP and are advisory: peers see a conflict and stop, but nothing on disk is locked. Work moves between participants through an explicit offer and accept, carrying a summary of the commit, the checks that ran, and what remains. Outcomes are reported as agent claims with evidence, never as independent verification. The skill reads coordination state through the agent-parley command line tool, which must be installed separately.",
     "developerName": "Suneel Kaushik S",
     "category": "Productivity",
     "capabilities": [],

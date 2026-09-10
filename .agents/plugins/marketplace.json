@@ -1,7 +1,7 @@
 {
-  "name": "agent-parley-local",
+  "name": "agent-parley",
   "interface": {
-    "displayName": "Agent Parley Local"
+    "displayName": "Agent Parley"
   },
   "plugins": [
     {

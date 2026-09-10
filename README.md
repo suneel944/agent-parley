@@ -63,12 +63,12 @@ Then add the plugin to whichever CLI you drive. One marketplace serves both.
 
 ```sh
 claude plugin marketplace add suneel944/agent-parley
-claude plugin install agent-parley@agent-parley-local
+claude plugin install agent-parley@agent-parley
 ```
 
 ```sh
 codex plugin marketplace add suneel944/agent-parley
-codex plugin add agent-parley@agent-parley-local
+codex plugin add agent-parley@agent-parley
 ```
 
 The plugin carries the shared `coordinate` skill, so an agent can read
