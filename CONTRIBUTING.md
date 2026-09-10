@@ -77,7 +77,11 @@ direct pushes. Revisit the review exception when additional maintainers join.
 
 Use Conventional Commit PR titles, such as `fix: preserve pending messages` or
 `ci: validate release metadata`; squash merges retain that title for automated
-changelogs. Assign an owner, add a change-type label, and reference an existing
+changelogs. The title decides whether a release is cut: `feat`, `fix` and
+`perf` publish a new version, and everything else does not. Reserve them for
+changes a user of the distributed package would notice, and title workflow,
+tooling and documentation work `ci`, `build`, `chore`, `test`, `refactor` or
+`docs` so the index is not given a version with no change in it. Assign an owner, add a change-type label, and reference an existing
 local issue with `Refs #N` or a closing keyword. Match linked issue milestones
 when present. Release PRs always require a milestone. Bot-generated descriptions
 retain their native format, but ownership and issue rules still apply.

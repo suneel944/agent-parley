@@ -29,7 +29,7 @@
         {"type": "feat", "section": "Features"},
         {"type": "fix", "section": "Bug fixes"},
         {"type": "perf", "section": "Performance"},
-        {"type": "docs", "section": "Documentation"},
+        {"type": "docs", "section": "Documentation", "hidden": true},
         {"type": "revert", "section": "Reverts"},
         {"type": "chore", "section": "Maintenance", "hidden": true},
         {"type": "ci", "section": "Automation", "hidden": true},
