@@ -177,6 +177,24 @@ undo with `git merge --abort`; it never resolves a conflict, and never resets,
 cleans, stashes, or force-switches. A successful merge leaves the lane and its
 branch exactly as they were, so retiring the participant stays a separate step.
 
+`participant merge --preview` answers what that merge would do without doing it:
+
+```sh
+agent-parley participant merge claude-1 --preview
+```
+
+`--preview` reports what that merge would bring in and what would refuse it,
+and changes nothing: no merge commit, no branch movement, no working-tree or
+index change, and no coordination state. It lists the commits the base does not
+have, the files they change relative to the merge base, and every refusal
+gathered into one report rather than raised one at a time. It never takes the
+participant's session lock, so it is safe to run while that lane is still
+working; a running session is read from the recorded session process and named
+as a blocker. Because it attempts no merge, a preview that names no blocker
+says only that nothing refuses the merge right now, not that the merge would
+apply without conflicts. A preview prints no roster listing, unlike the actions
+that change one.
+
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's
 coordination credential, and drops its manifest entry. The branch is deleted

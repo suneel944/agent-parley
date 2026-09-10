@@ -1702,6 +1702,129 @@ def test_merge_leaves_a_conflict_resolvable_without_discarding(
     assert (lane / "shared.txt").read_text() == "lane version\n"
 
 
+def test_preview_reports_pending_work_and_leaves_the_base_untouched(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    base = git(repo, "branch", "--show-current")
+    identify(repo)
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "Lane work")
+    head = git(repo, "rev-parse", "HEAD")
+    status = git(repo, "status", "--porcelain")
+    git_dir = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+
+    report = bridge.preview_merge(repo, "codex")
+    assert f"Merging {branch} into {base} would bring in 1 commits:" in report
+    assert "Lane work" in report
+    assert "feature.txt" in report
+    assert f"Nothing refuses this merge; it would land on {base}." in report
+    assert "cannot predict conflicts" in report
+    assert "would be refused" not in report
+
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "status", "--porcelain") == status
+    assert not (git_dir / "MERGE_HEAD").exists()
+    assert not (repo / "feature.txt").exists()
+    assert git(lane, "branch", "--show-current") == branch
+
+
+def test_preview_reports_a_branch_the_base_already_contains(
+    bridge, repo, paired
+):
+    branch = paired["branches"]["codex"]
+    base = git(repo, "branch", "--show-current")
+    report = bridge.preview_merge(repo, "codex")
+    assert report.endswith(f"{base} already contains every commit on {branch}.")
+    assert "would bring in" not in report
+
+
+def test_preview_gathers_every_blocking_condition_in_one_report(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    base = git(repo, "branch", "--show-current")
+    identify(repo)
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "Lane work")
+
+    (repo / "pending.txt").write_text("base scratch\n")
+    (lane / "draft.txt").write_text("unsaved\n")
+    report = bridge.preview_merge(repo, "codex")
+    assert f"The base checkout at {repo} has uncommitted changes." in report
+    assert (
+        f"codex has uncommitted changes that {branch} does not carry." in report
+    )
+    assert "Lane work" in report
+    (repo / "pending.txt").unlink()
+    (lane / "draft.txt").unlink()
+
+    git(repo, "checkout", "--detach")
+    assert "is on a detached HEAD" in bridge.preview_merge(repo, "codex")
+    git(repo, "switch", base)
+
+    git(repo, "switch", "--ignore-other-worktrees", branch)
+    assert f"is on {branch} itself" in bridge.preview_merge(repo, "codex")
+    git(repo, "switch", base)
+
+
+def test_preview_reports_a_merge_in_progress_a_drift_and_a_missing_branch(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    identify(repo)
+    (lane / "shared.txt").write_text("lane version\n")
+    commit(lane, "Lane edit")
+    (repo / "shared.txt").write_text("base version\n")
+    commit(repo, "Base edit")
+
+    with pytest.raises(BridgeError, match="stopped on conflicts"):
+        bridge.merge(repo, "codex")
+    report = bridge.preview_merge(repo, "codex")
+    assert f"The base checkout at {repo} is already merging." in report
+    assert f"The base checkout at {repo} has uncommitted changes." in report
+    git(repo, "merge", "--abort")
+
+    git(lane, "switch", "--detach")
+    assert "codex lane is on '<detached HEAD>'" in bridge.preview_merge(
+        repo, "codex"
+    )
+    git(repo, "branch", "-D", branch)
+    report = bridge.preview_merge(repo, "codex")
+    assert f"Branch {branch} no longer exists." in report
+    assert "Nothing further can be previewed while the branch" in report
+    assert "would bring in" not in report
+
+
+def test_preview_names_a_running_session_without_taking_its_lock(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    identify(repo)
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "Lane work")
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "session_pid": os.getpid(),
+            "session_ticks": start_ticks(os.getpid()),
+        },
+    )
+    with lock(directory / "codex.session.lock"):
+        report = bridge.preview_merge(repo, "codex")
+        with pytest.raises(BridgeError, match="running session"):
+            bridge.merge(repo, "codex")
+    assert "codex has a running session; stop that terminal first." in report
+    assert "Lane work" in report
+
+
 def test_event_history_is_bounded_by_age_and_reported_by_window(
     bridge, repo, paired, tmp_path, capsys
 ):
