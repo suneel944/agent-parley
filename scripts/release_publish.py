@@ -14,6 +14,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+MINOR_THRESHOLD = 10
+MAJOR_THRESHOLD = 50
+RETIREMENT_LIMIT = 100
+PACKAGE_PATHS = ("agent_parley", "plugins/agent-parley")
+RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?!?:")
+ISSUE_REFERENCE = re.compile(
+    r"\b(?:refs|fixes|closes|resolves)\s+#(\d+)\b", re.IGNORECASE
+)
+
 
 def command(*args: str, cwd: Path | None = None) -> str:
     """Runs a bounded command and preserves its failure diagnostics."""
@@ -168,37 +177,219 @@ def release_baseline(root: Path, tag: str, source: str) -> str:
     return baseline
 
 
-def proposed_feature_version(root: Path) -> str:
-    """Returns the version accumulated features would propose next.
-
-    Preparation stacks feature work onto one version rather than releasing
-    each change. Knowing that version before preparation runs is what lets
-    configuration refuse a number the package index can never accept again.
+def next_version(approved: str, kind: str) -> str:
+    """Raises one component of a version and resets the lower ones.
 
     Args:
-        root: Checkout containing release configuration and version manifest.
+        approved: Version to advance, as MAJOR.MINOR.PATCH.
+        kind: Release kind, one of major, minor or patch.
 
     Returns:
-        The next version implied by the approved version and bump policy.
+        The immediately following version of the requested kind.
+    """
+    major, minor, patch = (int(part) for part in approved.split("."))
+    if kind == "major":
+        return f"{major + 1}.0.0"
+    if kind == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def advance_version(approved: str, kind: str, retired: list[str]) -> str:
+    """Projects the next version from configuration alone, skipping retirement.
+
+    This is the offline projection used by configuration checks. It answers
+    what preparation would reach using only the retirement list, without
+    consulting Git, GitHub or the package index.
+
+    Args:
+        approved: Approved release version.
+        kind: Release kind, one of major, minor or patch.
+        retired: Versions that may never be reused.
+
+    Returns:
+        The first version of that kind outside the retirement list, or the
+        last candidate examined when the bounded search finds none.
+    """
+    candidate = approved
+    for _ in range(RETIREMENT_LIMIT):
+        candidate = next_version(candidate, kind)
+        if candidate not in retired:
+            break
+    return candidate
+
+
+def version_available(root: Path, version: str, retired: list[str]) -> bool:
+    """Reports whether a version can still be created everywhere it must exist.
+
+    A retirement list is maintained by hand and cannot be the only evidence.
+    An existing tag, an existing GitHub release including a draft, or an
+    existing package index version all make a release run fail, so each is
+    consulted directly. Only a definite absence makes a version available:
+    a failing check raises rather than reporting availability, because a
+    proposal built on an unanswered question is the failure it should have
+    prevented. Remote checks are skipped only when their environment is
+    genuinely absent, never because they errored.
+
+    Args:
+        root: Checkout used for tag lookups.
+        version: Candidate version without its leading v.
+        retired: Versions that may never be reused.
+
+    Returns:
+        Whether the version is free of retirement, tags, releases and files.
 
     Raises:
-        ValueError: If the approved version is not MAJOR.MINOR.PATCH.
+        RuntimeError: If the GitHub release API cannot be inspected.
+        urllib.error.URLError: If the package index cannot be inspected.
+        subprocess.CalledProcessError: If Git cannot list local or remote tags.
     """
-    config = json.loads((root / "release-please-config.json").read_text())
+    if version in retired:
+        return False
+    tag = f"v{version}"
+    if command("git", "tag", "--list", tag, cwd=root):
+        return False
+    if "origin" in command("git", "remote", cwd=root).split():
+        if command(
+            "git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}", cwd=root
+        ):
+            return False
+    if os.environ.get("GH_REPO") and github_release(tag) is not None:
+        return False
+    return not pypi_files(version)
+
+
+def available_version(
+    root: Path, approved: str, kind: str, retired: list[str]
+) -> str:
+    """Looks ahead for the first version of a kind that nothing else claims.
+
+    Args:
+        root: Checkout used for tag lookups.
+        approved: Approved release version.
+        kind: Release kind, one of major, minor or patch.
+        retired: Versions that may never be reused.
+
+    Returns:
+        The first available version of the requested kind.
+
+    Raises:
+        ValueError: If the bounded search finds no available version.
+    """
+    candidate = approved
+    for _ in range(RETIREMENT_LIMIT):
+        candidate = next_version(candidate, kind)
+        if version_available(root, candidate, retired):
+            return candidate
+    raise ValueError(f"No {kind} version is available after {approved}.")
+
+
+def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
+    """Measures delivered product work between the approved release and HEAD.
+
+    A commit contributes only when a releasing conventional type introduces
+    it and it touches the distributed package or the plugins. Workflow,
+    script, test and documentation commits are therefore structurally
+    incapable of raising a version. Issue references collapse repeated pull
+    requests for one issue into a single unit, and a qualifying commit that
+    names no issue counts as one unit of its own so delivered work is never
+    under-reported. Measurement is local: one Git history read, no network.
+    Records and fields are separated with control bytes that can appear in
+    neither a commit message nor a path, so a crafted message cannot forge
+    a commit boundary.
+
+    Args:
+        root: Checkout containing the release baseline and HEAD.
+        baseline: Approved release commit on the current branch's ancestry.
+
+    Returns:
+        Distinct units from every releasing type, the units introduced by
+        feature commits, and whether an urgent fix requests a patch release.
+
+    Raises:
+        subprocess.CalledProcessError: If Git cannot read the commit range.
+    """
+    log = command(
+        "git",
+        "log",
+        "--no-merges",
+        "--name-only",
+        "--format=%x00%H%x01%B%x01",
+        f"{baseline}..HEAD",
+        cwd=root,
+    )
+    issues: set[str] = set()
+    features: set[str] = set()
+    urgent = False
+    for record in log.split("\x00")[1:]:
+        commit, message, names = record.split("\x01")
+        subject = RELEASING_SUBJECT.match(message)
+        if not subject or not any(
+            name == path or name.startswith(f"{path}/")
+            for name in names.splitlines()
+            for path in PACKAGE_PATHS
+        ):
+            continue
+        units = {
+            f"#{number}" for number in ISSUE_REFERENCE.findall(message)
+        } or {commit}
+        issues |= units
+        if subject[1] == "feat":
+            features |= units
+        urgent = urgent or (subject[1] == "fix" and subject[2] == "urgent")
+    return issues, features, urgent
+
+
+def release_candidate(root: Path) -> tuple[str, int, int]:
+    """Returns the version the measured product changes propose, with counts.
+
+    Eligibility is measured rather than judged so preparation can run
+    unattended. Fifty product features propose the next major version, ten
+    product issues propose the next minor version, and a single commit
+    titled fix(urgent) is the only mechanical marker that proposes a patch
+    version. Nothing else raises a version. The proposal then looks ahead
+    for a version that is genuinely free.
+
+    Args:
+        root: Checkout containing the version manifest and release history.
+
+    Returns:
+        The proposed version, empty when nothing is proposed, with the
+        distinct issue count and the distinct feature count.
+
+    Raises:
+        ValueError: If the approved version is not MAJOR.MINOR.PATCH, or no
+            version of the proposed kind is available.
+        subprocess.CalledProcessError: If Git cannot resolve the baseline.
+    """
     approved = json.loads((root / ".release-please-manifest.json").read_text())[
         "."
     ]
     if not re.fullmatch(r"\d+\.\d+\.\d+", approved):
         raise ValueError("Approved version must be MAJOR.MINOR.PATCH.")
-    major, minor, patch = (int(part) for part in approved.split("."))
-    package = config["packages"]["."]
-    if major == 0 and package.get("bump-patch-for-minor-pre-major"):
-        return f"{major}.{minor}.{patch + 1}"
-    return f"{major}.{minor + 1}.0"
+    tag = f"v{approved}"
+    baseline = release_baseline(root, tag, validate_tag(root, tag))
+    issues, features, urgent = product_units(root, baseline)
+    if len(features) >= MAJOR_THRESHOLD:
+        kind = "major"
+    elif len(issues) >= MINOR_THRESHOLD:
+        kind = "minor"
+    elif urgent:
+        kind = "patch"
+    else:
+        return "", len(issues), len(features)
+    _, retired = release_history(root)
+    proposal = available_version(root, approved, kind, retired)
+    return proposal, len(issues), len(features)
 
 
 def migration_config_errors(root: Path) -> list[str]:
     """Rejects missing, stale or misplaced release-history scan boundaries.
+
+    Preparation now advances past a retired number instead of failing on it,
+    so this check guards the remaining configuration mistake: a retirement
+    list so long that some release kind has no unretired number left within
+    the bounded search. Every check here is offline and reads only files.
 
     Args:
         root: Checkout containing release configuration and version manifest.
@@ -216,10 +407,13 @@ def migration_config_errors(root: Path) -> list[str]:
     errors = []
     if version in retired:
         errors.append("Retired release versions cannot be reused.")
-    if proposed_feature_version(root) in retired:
+    if any(
+        advance_version(version, kind, retired) in retired
+        for kind in ("major", "minor", "patch")
+    ):
         errors.append(
-            "Accumulated features would propose a retired version; "
-            "change the bump policy so preparation skips it."
+            "Every candidate version of one release kind is retired; "
+            "preparation would have no version left to propose."
         )
     if config.get("last-release-sha") != expected:
         errors.append(
@@ -317,8 +511,7 @@ def has_package_changes(root: Path) -> bool:
         "--name-only",
         source,
         "--",
-        "agent_parley",
-        "plugins/agent-parley",
+        *PACKAGE_PATHS,
         cwd=root,
     )
     previous = tomllib.loads(
@@ -427,10 +620,30 @@ def main() -> None:
         errors = migration_config_errors(root)
         if errors:
             raise ValueError("\n".join(errors))
-        eligible = has_package_changes(root)
+        approved = json.loads(
+            (root / ".release-please-manifest.json").read_text()
+        )["."]
+        version, issues, features = release_candidate(root)
+        changed = has_package_changes(root)
+        eligible = bool(version) and changed
         emit("eligible", str(eligible).lower())
-        if not eligible:
-            print("No package changes since the approved release.")
+        emit("version", version)
+        emit("issues", str(issues))
+        emit("features", str(features))
+        measured = (
+            f"{issues} product issues and {features} product features "
+            f"since v{approved}"
+        )
+        if not version:
+            print(
+                f"{measured}; {MINOR_THRESHOLD} issues or "
+                f"{MAJOR_THRESHOLD} features or one fix(urgent) commit "
+                "are required."
+            )
+        elif not changed:
+            print(f"{measured}; no package changes since the approved release.")
+        else:
+            print(f"{measured}; proposing {version}.")
         return
     tag = os.environ["RELEASE_TAG"]
     source = validate_tag(root, tag)
