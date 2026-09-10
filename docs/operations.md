@@ -187,9 +187,9 @@ Install the CLI first, then add the repository marketplace:
 
 ```sh
 claude plugin marketplace add suneel944/agent-parley
-claude plugin install agent-parley@agent-parley-local
+claude plugin install agent-parley@agent-parley
 codex plugin marketplace add suneel944/agent-parley
-codex plugin add agent-parley@agent-parley-local
+codex plugin add agent-parley@agent-parley
 ```
 
 Both plugins provide `coordinate`; the launcher supplies MCP and native hooks.

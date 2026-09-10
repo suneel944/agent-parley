@@ -16,25 +16,47 @@ this listing would describe.
 
 ### Claude plugin directory
 
-Community submissions go through the
-[community submission form](https://platform.claude.com/plugins/submit). The
-official catalog is curated separately; the plugin documentation at
-[Claude's guide](https://code.claude.com/docs/en/plugins) is the authoritative
-description of manifest fields and directory expectations.
+Submissions go through the
+[Console form](https://platform.claude.com/plugins/submit) or the
+[claude.ai form](https://claude.ai/admin-settings/directory/submissions/plugins/new).
+The directory surfaces in Claude Code as the `claude-plugins-official`
+marketplace. [Anthropic's submission guide](https://claude.com/docs/plugins/submit)
+is authoritative for the process, and
+[Claude's plugin guide](https://code.claude.com/docs/en/plugins) for manifest
+fields.
 
-In practice a submission needs a publicly reachable marketplace source, a
-plugin manifest that passes `claude plugin validate`, and identifying metadata
-on that manifest: name, version, description, author, homepage and repository.
-The repository must carry a license and a way to report problems.
+The form itself takes a GitHub link. The repository must be public, because
+closed-source plugins are not accepted, and the manifest must pass
+`claude plugin validate`. Identifying metadata belongs on the manifest: name,
+display name, version, description, author, homepage, repository, license and
+keywords. The repository must carry a license and a way to report problems.
+
+Submitting is account-bound and role-gated. The Console form requires a
+Developer, Admin or Owner role on a Console organization, which is the route
+for an individual author. The claude.ai form requires a Team or Enterprise
+organization with directory management access.
+
+Once a listing is published, pushes to the repository are mirrored
+automatically and rescreened. Updates do not need a new submission.
 
 ### Codex plugin submission
 
 Codex submissions follow
-[OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission).
+[OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission)
+and, for a plugin that already targets Claude Code,
+[OpenAI's porting guide](https://developers.openai.com/plugins/guides/submit-claude-plugin).
 Agent Parley is a skills-only plugin, so the submission consists of the skill
-bundle rather than a hosted service. That guide requires a verified publisher,
-a listing URL, a policy URL, the skill bundle itself, and review cases that a
-reviewer can execute against the bundle.
+bundle rather than a hosted service. That path requires a verified publisher,
+Apps Management write access, a listing URL, a policy URL, the skill bundle
+itself, and review cases that a reviewer can execute against the bundle.
+
+The upload is an archive, not a repository link, and the portal generates
+`.codex-plugin/plugin.json` from `.claude-plugin/plugin.json`. The archive
+keeps each skill directory with its `SKILL.md` and any scripts or assets it
+references, and drops `.claude-plugin/marketplace.json`, `.agents/`, any MCP
+configuration and any Claude-only settings. Skill text must be
+provider-neutral: no instruction that depends on a Claude-specific feature,
+and no assumption about which model reads it.
 
 Both forms change over time. Re-read them at submission time and treat the
 lists above as a preparation aid, not as a transcription of the current form
@@ -95,32 +117,37 @@ Validating marketplace manifest: /home/dev/agent-parley/.claude-plugin/marketpla
 ✔ Validation passed
 ```
 
-Both commands exited zero with no warnings.
+Both commands exited zero with no warnings, and both still pass under
+`--strict`, which turns unrecognized manifest fields into errors.
 
-## Metadata gaps to close before submitting
+## Listing metadata
 
-None of these block the validator, and none are changed by this document.
-They are listed so the owner can decide which to fix before a listing is
-reviewed.
+The manifests now carry the metadata a reviewer reads. Both plugin manifests
+and the Claude marketplace entry describe isolated worktrees, advisory
+reservations and explicit handoffs in a full paragraph. The Claude manifest
+declares `displayName`, `license` and `keywords`; the marketplace entry adds
+`category`, `author`, `homepage` and `repository`. The Codex manifest keeps
+its listing copy in `interface`, and that copy names no specific model. The
+marketplace is named `agent-parley`, so the documented install command is
+`agent-parley@agent-parley`.
 
-- Listing descriptions are short. The marketplace plugin entry is 57
-  characters and the Claude plugin manifest description is 79. The Codex
-  `interface.longDescription` is 96 characters. These are accurate but give a
-  reviewer little to judge; a fuller paragraph explaining isolated worktrees,
-  advisory reservations and explicit handoffs would serve the listing better.
-- No category on the Claude plugin manifest, so the plugin is harder to
-  surface by search there. `pyproject.toml` now carries `keywords` and
-  trove classifiers for the package index, and the Codex manifest already
-  sets `interface.category` to `Productivity`.
-- No license field on either plugin manifest. The repository is MIT licensed
-  through `pyproject.toml` and `LICENSE`, but a reader of the plugin manifest
-  alone cannot see that.
-- No policy URL. The Codex submission expects one. The repository currently
-  offers `SECURITY.md` and `CODE_OF_CONDUCT.md`; the owner must decide which
-  URL is presented as the policy link, or publish a page that covers data
-  handling for the coordination runtime.
-- No listing imagery. `docs/assets/` holds the README banner; a directory
-  listing may ask for an icon or screenshots sized to its own requirements.
+Both catalogs ask for public URLs that match the publisher identity. Use:
+
+- Website and homepage: `https://github.com/suneel944/agent-parley#readme`
+- Support: `https://github.com/suneel944/agent-parley/issues`
+- Privacy policy:
+  `https://github.com/suneel944/agent-parley/blob/main/docs/privacy.md`
+- Terms: `https://github.com/suneel944/agent-parley/blob/main/docs/terms.md`
+
+`docs/privacy.md` states that nothing leaves the machine. That claim rests on
+the coordination server binding `127.0.0.1` only, on the client disabling
+proxy handling for its loopback requests, and on the package declaring no
+runtime dependencies. If any of those three change, the policy must change
+with them in the same commit.
+
+One gap remains, and it does not block the validator. There is no listing
+imagery. `docs/assets/` holds the README banner; a directory listing asks for
+an icon and may ask for screenshots sized to its own requirements.
 
 The skill frontmatter itself is in good shape: `name` is `coordinate` and the
 `description` is 211 characters covering both what the skill does and when to
@@ -134,9 +161,12 @@ accounts and to a legal identity that an agent does not hold.
 - **Publisher verification.** The Codex submission requires a verified
   publisher. Verification proves control of an identity or a domain and cannot
   be delegated.
-- **Signing in and submitting.** Both forms are account-bound. Submitting
-  requires the owner's authenticated session, and the submission becomes a
-  statement made by that account.
+- **Signing in and submitting.** Both forms are account-bound and role-gated.
+  The Claude directory needs a Developer, Admin or Owner role on a Console
+  organization, or a Team or Enterprise organization on claude.ai with
+  directory management access; Codex needs Apps Management write access.
+  Submitting requires the owner's authenticated session, and the submission
+  becomes a statement made by that account.
 - **Accepting catalog terms.** Each catalog attaches distribution terms to the
   listing. Only the owner can agree to them.
 - **Publishing the policy and listing URLs.** The owner chooses which pages
