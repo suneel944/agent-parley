@@ -54,10 +54,24 @@ requests, and avoids credential/body logging. It supports stateless JSON respons
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent
 official MCP SDK exercises initialization and calls in CI.
 
-Seven tools cover sending, fetching, acknowledging, marking read, reserving
-files, releasing reservations, and listing participants. Unknown arguments fail. Sends require an idempotency
+Nine tools cover sending, fetching, acknowledging, marking read, reserving
+files, releasing reservations, listing participants, reading one thread, and
+searching mail. Unknown arguments fail. Sends require an idempotency
 key: identical retries return the original message ID; changed retries fail.
 Fetching never marks a message read or acknowledges it.
+
+Every delivered message belongs to exactly one thread. A send naming
+`reply_to` joins the thread of the message it answers, and that message must
+be one the sender itself sent or received. A send naming neither `reply_to`
+nor `thread_id` opens its own thread, whose identifier is derived from the
+sender and the idempotency key rather than allocated, so an interrupted send
+that retries resolves the same thread instead of opening a second one. A
+thread link is a resolution rule, not a stored parent pointer: threads are
+read in send order, so no reply tree is recorded. An inbox page names each
+message's thread, so a recipient can read or answer into it without a further
+call. Reading a thread and
+searching mail are scoped to what the caller already sees, so neither widens
+a lane's view of the project, and both are read-only and take no write lock.
 
 No coordination tool returns a participant's whole starting context. The store
 holds projects, agents, messages, recipients, reservations and events, keyed by
@@ -315,6 +329,10 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | Concurrent workers / socket timeout | 16 / 3 seconds |
 | New message body | 4,096 UTF-8 bytes |
 | Inbox page | Up to 5 messages; bodies omitted by default |
+| Thread page | Up to 10 messages; 240-character body previews |
+| Search hits | Up to 5 messages; 240-character body previews |
+| Search query | 160 UTF-8 bytes |
+| Thread identifier | 80 UTF-8 bytes |
 | Body page | Up to 1,024 Unicode characters |
 | Serialized inbox or conflict result | At most 8,192 UTF-8 bytes |
 | Hook preview batch | Up to 3 messages |
@@ -361,6 +379,23 @@ event table is created and reservations gain a creation time, which existing
 leases date from the upgrade. No coordination row is rewritten, and the schema
 version publishes in the same transaction as the change it describes. A store
 written by a newer schema is refused rather than downgraded.
+
+A store written before threads and search upgrades in place the same way.
+Every stored message that carries no thread is given its own identifier,
+derived from its message ID, and threads are indexed. Message text is read
+rather than rewritten, and the backfill, the index and the schema version
+commit together, so an interrupted upgrade retries from the version it
+started at. The full-text index is an FTS5 virtual table over stored subjects
+and bodies, kept current by insert and delete triggers and built once from
+the messages already stored. Where SQLite was built without FTS5 the virtual
+table is refused, the upgrade continues, and the store opens normally;
+searching then matches the query as a literal case-insensitive substring of a
+subject or body instead of as a phrase of indexed terms. That is narrower and
+slower, and every search result names which of the two answered it, so a
+degraded store is visible rather than silent. A store upgraded on a build
+without FTS5 keeps matching substrings on a build that has FTS5, because its
+schema version is already current; deleting and re-importing the store is the
+only way to gain the index afterwards.
 
 CI covers temporary Git repositories, independent MCP clients, concurrent calls,
 authorization failures, persistence, resource budgets and isolated wheel installs.

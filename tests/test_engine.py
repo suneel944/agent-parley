@@ -341,7 +341,10 @@ def test_schema_upgrade_adds_events_and_lease_age_without_rewrites(
         db.execute("PRAGMA user_version=1")
     store.initialize(bridge.home)
     with store.connect(bridge.home) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            db.execute("PRAGMA user_version").fetchone()[0]
+            == store.SCHEMA_VERSION
+        )
         assert db.execute("SELECT count(*) FROM events").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
         assert (
@@ -354,6 +357,235 @@ def test_schema_upgrade_adds_events_and_lease_age_without_rewrites(
     usage = store.usage(bridge.home, "/project")
     assert usage["GreenCastle"]["leases"] == 1
     assert usage["GreenCastle"]["lease_age"] >= 0
+
+
+def test_replies_join_a_thread_and_other_sends_open_their_own(bridge, actors):
+    opened = store.call(bridge.home, actors[0], "send_message", message())
+    assert opened["thread_id"]
+    answer = message(
+        to=["GreenCastle"],
+        subject="Re: Contract",
+        body_md="Agreed",
+        idempotency_key="contract-answer",
+        reply_to=opened["id"],
+    )
+    inbox = store.call(bridge.home, actors[1], "fetch_inbox", {})
+    assert inbox["messages"][0]["thread_id"] == opened["thread_id"]
+    answered = store.call(bridge.home, actors[1], "send_message", answer)
+    assert answered["thread_id"] == opened["thread_id"]
+    retried = store.call(bridge.home, actors[1], "send_message", answer)
+    assert retried["duplicate"]
+    assert retried["thread_id"] == opened["thread_id"]
+    separate = store.call(
+        bridge.home,
+        actors[0],
+        "send_message",
+        message(idempotency_key="contract-2"),
+    )
+    assert separate["thread_id"] != opened["thread_id"]
+    with pytest.raises(BridgeError, match="reply_to"):
+        store.call(
+            bridge.home,
+            actors[0],
+            "send_message",
+            message(idempotency_key="stray", reply_to=opened["id"] + 999),
+        )
+    with pytest.raises(BridgeError, match="not both"):
+        store.call(
+            bridge.home,
+            actors[0],
+            "send_message",
+            message(
+                idempotency_key="ambiguous",
+                reply_to=opened["id"],
+                thread_id="chosen",
+            ),
+        )
+
+
+def test_thread_reads_in_send_order_for_the_calling_participant(bridge, actors):
+    first = store.call(bridge.home, actors[0], "send_message", message())
+    thread = first["thread_id"]
+    for index in range(2):
+        store.call(
+            bridge.home,
+            actors[1],
+            "send_message",
+            message(
+                to=["GreenCastle"],
+                body_md=f"Answer {index}",
+                idempotency_key=f"answer-{index}",
+                reply_to=first["id"],
+            ),
+        )
+    page = store.call(
+        bridge.home, actors[0], "read_thread", {"thread_id": thread}
+    )
+    assert [row["sender"] for row in page["messages"]] == [
+        "GreenCastle",
+        "BlueLake",
+        "BlueLake",
+    ]
+    identifiers = [row["id"] for row in page["messages"]]
+    assert identifiers == sorted(identifiers) and not page["has_more"]
+    assert (
+        store.read_thread(bridge.home, "/project", "GreenCastle", thread)[
+            "messages"
+        ]
+        == page["messages"]
+    )
+    walked = store.call(
+        bridge.home,
+        actors[0],
+        "read_thread",
+        {"thread_id": thread, "limit": 1},
+    )
+    assert walked["has_more"] and walked["next_after_id"] == first["id"]
+    rest = store.call(
+        bridge.home,
+        actors[0],
+        "read_thread",
+        {"thread_id": thread, "after_id": walked["next_after_id"]},
+    )
+    assert [row["id"] for row in rest["messages"]] == identifiers[1:]
+    absent = store.call(
+        bridge.home, actors[0], "read_thread", {"thread_id": "absent"}
+    )
+    assert absent["messages"] == [] and not absent["has_more"]
+
+
+def test_search_reports_own_mail_hits_and_ignores_other_projects(
+    bridge, actors
+):
+    sent = store.call(
+        bridge.home,
+        actors[0],
+        "send_message",
+        message(body_md="Reservation conflict on src/engine.py"),
+    )
+    with store.connect(bridge.home) as db:
+        indexed = bool(
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='message_search'"
+            ).fetchone()
+        )
+    hit = store.call(
+        bridge.home, actors[1], "search_messages", {"query": "reservation"}
+    )
+    assert hit["index"] == ("fts5" if indexed else "substring")
+    assert [row["id"] for row in hit["messages"]] == [sent["id"]]
+    assert hit["messages"][0]["thread_id"] == sent["thread_id"]
+    miss = store.call(
+        bridge.home, actors[1], "search_messages", {"query": "unrelated"}
+    )
+    assert miss["messages"] == [] and not miss["has_more"]
+    outsider = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, "/other", "GreenCastle")[
+            "registration_token"
+        ],
+    )
+    assert (
+        store.call(
+            bridge.home, outsider, "search_messages", {"query": "reservation"}
+        )["messages"]
+        == []
+    )
+    assert [
+        row["id"]
+        for row in store.search_messages(
+            bridge.home, "/project", "BlueLake", "conflict"
+        )["messages"]
+    ] == [sent["id"]]
+
+
+def test_upgrade_backfills_threads_and_indexes_stored_messages(bridge, actors):
+    for index in range(2):
+        store.call(
+            bridge.home,
+            actors[0],
+            "send_message",
+            message(
+                body_md=f"Reservation conflict {index}",
+                idempotency_key=f"stored-{index}",
+            ),
+        )
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("UPDATE messages SET thread_id=''")
+        db.execute("DROP TABLE IF EXISTS message_search")
+        db.execute("DROP TRIGGER IF EXISTS message_indexed")
+        db.execute("DROP TRIGGER IF EXISTS message_unindexed")
+        db.execute("DROP INDEX IF EXISTS threads")
+        db.execute("PRAGMA user_version=2")
+    store.initialize(bridge.home)
+    with store.connect(bridge.home) as db:
+        assert (
+            db.execute("PRAGMA user_version").fetchone()[0]
+            == store.SCHEMA_VERSION
+        )
+        threads = [
+            row[0] for row in db.execute("SELECT thread_id FROM messages")
+        ]
+    assert len(threads) == 2 and len(set(threads)) == 2 and all(threads)
+    found = store.call(
+        bridge.home, actors[1], "search_messages", {"query": "reservation"}
+    )
+    assert len(found["messages"]) == 2
+    page = store.call(
+        bridge.home, actors[1], "read_thread", {"thread_id": threads[0]}
+    )
+    assert len(page["messages"]) == 1
+
+
+def test_search_degrades_to_substring_where_sqlite_lacks_fts5(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "without-fts5"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(
+        store, "SEARCH_SCHEMA", store.SEARCH_SCHEMA.replace("fts5", "fts5x")
+    )
+    store.initialize(home)
+    identities = [
+        store.authenticate(
+            home,
+            store.register(home, "/project", name)["registration_token"],
+        )
+        for name in ("GreenCastle", "BlueLake")
+    ]
+    sent = store.call(
+        home,
+        identities[0],
+        "send_message",
+        message(body_md="Lease overlap in src/engine.py"),
+    )
+    with store.connect(home) as db:
+        assert not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='message_search'"
+        ).fetchone()
+    found = store.call(
+        home, identities[1], "search_messages", {"query": "overlap"}
+    )
+    assert found["index"] == "substring"
+    assert [row["id"] for row in found["messages"]] == [sent["id"]]
+    assert (
+        store.call(
+            home, identities[1], "search_messages", {"query": "unrelated"}
+        )["messages"]
+        == []
+    )
+    assert (
+        store.call(
+            home,
+            identities[1],
+            "search_messages",
+            {"query": "100% _absent_"},
+        )["messages"]
+        == []
+    )
+    assert store.call(
+        home, identities[1], "read_thread", {"thread_id": sent["thread_id"]}
+    )["messages"]
 
 
 def test_reservation_conflicts_stay_inside_the_response_budget(bridge, actors):

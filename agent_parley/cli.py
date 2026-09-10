@@ -1512,6 +1512,49 @@ review, not merged or independently verified. An idle turn is not completion.
             forge.unassign(repo, parse_issue(number))
         return record
 
+    def mail(
+        self,
+        repo: Path,
+        action: str,
+        *,
+        thread: str = "",
+        query: str = "",
+        after: int = 0,
+        limit: int = store.MAX_SEARCH_HITS,
+    ) -> dict:
+        """Reads a mail thread or searches mail as the lane this runs in.
+
+        The worktree selects the reader, exactly as it does for reports and
+        issue transitions, so an operator reads a participant's own mail
+        rather than the whole project's.
+
+        Args:
+            repo: Assigned agent worktree.
+            action: Thread or search.
+            thread: Thread identifier for a thread read.
+            query: Text to search subjects and bodies for.
+            after: Last thread message already read.
+            limit: Maximum search hits reported.
+
+        Returns:
+            One thread page, or the matching messages.
+
+        Raises:
+            BridgeError: If the lane or its registered identity is unknown.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        name = data["participants"][agent]["display"]
+        if action == "thread":
+            return store.read_thread(
+                self.home, data["root"], name, thread, after
+            )
+        return store.search_messages(
+            self.home, data["root"], name, query, limit
+        )
+
     def export_events(
         self,
         repo: Path,
@@ -1934,6 +1977,18 @@ def main() -> int:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    mail = commands.add_parser(
+        "mail", help="Read one mail thread or search your own mail."
+    )
+    letters = mail.add_subparsers(dest="action", required=True)
+    reading = letters.add_parser("thread")
+    reading.add_argument("thread_id")
+    reading.add_argument("--repo", type=Path, default=Path.cwd())
+    reading.add_argument("--after-id", type=int, default=0)
+    finding = letters.add_parser("search")
+    finding.add_argument("query")
+    finding.add_argument("--repo", type=Path, default=Path.cwd())
+    finding.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -2054,6 +2109,20 @@ def main() -> int:
                 describe(result, bridge.liveness(args.repo.resolve()))
                 if args.action == "list"
                 else json.dumps(result, indent=2)
+            )
+        elif args.command == "mail":
+            print(
+                json.dumps(
+                    bridge.mail(
+                        args.repo.resolve(),
+                        args.action,
+                        thread=getattr(args, "thread_id", ""),
+                        query=getattr(args, "query", ""),
+                        after=getattr(args, "after_id", 0),
+                        limit=getattr(args, "limit", store.MAX_SEARCH_HITS),
+                    ),
+                    indent=2,
+                )
             )
         elif args.command == "participant":
             repository = args.repo.resolve()

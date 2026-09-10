@@ -1,4 +1,4 @@
-"""Serves seven bounded coordination tools over authenticated local MCP HTTP."""
+"""Serves nine bounded coordination tools over authenticated local MCP HTTP."""
 
 import argparse
 import hmac
@@ -55,7 +55,11 @@ TOOLS = [
             "subject": {**TEXT, "maxLength": 160},
             "body_md": {**TEXT, "description": "At most 4096 UTF-8 bytes."},
             "idempotency_key": {**TEXT, "maxLength": 80},
-            "thread_id": TEXT,
+            "thread_id": {**TEXT, "maxLength": 80},
+            "reply_to": {
+                **INTEGER,
+                "description": "Message answered; joins its thread.",
+            },
             "ack_required": FLAG,
         },
         ["to", "subject", "body_md", "idempotency_key"],
@@ -107,6 +111,33 @@ TOOLS = [
         "List the participants you can address in this project.",
         {},
         [],
+    ),
+    _tool(
+        "read_thread",
+        "Read your mail in one thread, oldest first.",
+        {
+            "thread_id": {**TEXT, "maxLength": 80},
+            "after_id": INTEGER,
+            "limit": {
+                **INTEGER,
+                "minimum": 1,
+                "maximum": store.MAX_THREAD_PAGE,
+            },
+        },
+        ["thread_id"],
+    ),
+    _tool(
+        "search_messages",
+        "Search your mail by text, newest match first.",
+        {
+            "query": {**TEXT, "maxLength": store.MAX_QUERY_BYTES},
+            "limit": {
+                **INTEGER,
+                "minimum": 1,
+                "maximum": store.MAX_SEARCH_HITS,
+            },
+        },
+        ["query"],
     ),
 ]
 

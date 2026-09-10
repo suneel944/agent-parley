@@ -31,6 +31,7 @@ from agent_parley.checkpoints import (
 from agent_parley.cli import Bridge, BridgeError, git, lock, write_json
 from agent_parley.issues import MAX_BLOCKERS, describe
 from agent_parley.process import start_ticks
+from agent_parley.server import TOOLS
 from scripts.check_pr_hygiene import issue_numbers, validate
 
 
@@ -400,7 +401,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(
                 bridge.url + "/mcp/", auth=tokens["codex"]
             ) as codex:
                 root = data["root"]
-                assert len((await claude.list_tools()).tools) == 7
+                assert len((await claude.list_tools()).tools) == len(TOOLS)
                 roster_view = await call(claude, "list_participants", {})
                 assert sorted(
                     entry["name"]
@@ -2219,3 +2220,40 @@ def test_session_end_discards_event_records_past_the_retention_age(
     )
     entries = [json.loads(line) for line in log.read_text().splitlines()]
     assert [entry["event"] for entry in entries] == ["SessionEnd"]
+
+
+def test_mail_commands_read_the_lane_participants_own_thread_and_search(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    identities = {
+        name: paired["participants"][name]["display"]
+        for name in ("claude", "codex")
+    }
+    sender = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, paired["root"], identities["claude"])[
+            "registration_token"
+        ],
+    )
+    store.register(bridge.home, paired["root"], identities["codex"])
+    sent = store.call(
+        bridge.home,
+        sender,
+        "send_message",
+        {
+            "to": [identities["codex"]],
+            "subject": "Lease overlap",
+            "body_md": "Reservation conflict on src/engine.py",
+            "idempotency_key": "overlap-1",
+        },
+    )
+    lane = Path(paired["lanes"]["codex"])
+    page = bridge.mail(lane, "thread", thread=sent["thread_id"])
+    assert [row["id"] for row in page["messages"]] == [sent["id"]]
+    assert page["messages"][0]["sender"] == identities["claude"]
+    found = bridge.mail(lane, "search", query="reservation")
+    assert [row["id"] for row in found["messages"]] == [sent["id"]]
+    assert bridge.mail(lane, "search", query="unrelated")["messages"] == []
+    with pytest.raises(BridgeError, match="assigned agent worktree"):
+        bridge.mail(repo, "thread", thread=sent["thread_id"])

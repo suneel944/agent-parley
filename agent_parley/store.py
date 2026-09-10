@@ -13,13 +13,22 @@ from pathlib import Path, PurePosixPath
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
 MAX_RECIPIENTS = 16
 MAX_ROSTER = 32
 MAX_EVENT_ROWS = 2000
-READ_ONLY = ("fetch_inbox", "list_participants")
+MAX_THREAD_PAGE = 10
+MAX_SEARCH_HITS = 5
+MAX_QUERY_BYTES = 160
+PREVIEW_CHARACTERS = 240
+READ_ONLY = (
+    "fetch_inbox",
+    "list_participants",
+    "read_thread",
+    "search_messages",
+)
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
  id INTEGER PRIMARY KEY, human_key TEXT NOT NULL UNIQUE);
@@ -34,6 +43,7 @@ CREATE TABLE IF NOT EXISTS messages (
  subject TEXT NOT NULL, body_md TEXT NOT NULL, ack_required INTEGER DEFAULT 0,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
  UNIQUE(sender_id,dedup_key));
+CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), read_ts TEXT, ack_ts TEXT,
@@ -58,6 +68,18 @@ CREATE TABLE IF NOT EXISTS events (
  result_bytes INTEGER NOT NULL,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS history ON events(project_id,id);
+"""
+SEARCH_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
+ subject, body_md, content='messages', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS message_indexed AFTER INSERT ON messages BEGIN
+ INSERT INTO message_search(rowid,subject,body_md)
+ VALUES (new.id,new.subject,new.body_md);
+END;
+CREATE TRIGGER IF NOT EXISTS message_unindexed AFTER DELETE ON messages BEGIN
+ INSERT INTO message_search(message_search,rowid,subject,body_md)
+ VALUES ('delete',old.id,old.subject,old.body_md);
+END;
 """
 
 
@@ -91,6 +113,12 @@ def initialize(home: Path) -> None:
     schema-1 store adds the tool event log and reservation creation time in
     place; no coordination row is rewritten, and leases that predate the
     upgrade date from it.
+
+    Upgrading a schema-2 store gives every stored message that carries no
+    thread its own thread identifier, indexes threads, and builds the
+    full-text index over stored subjects and bodies. Message text is read
+    rather than rewritten. Where SQLite was built without FTS5 the index is
+    skipped and the store still opens; searching then matches substrings.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -107,6 +135,7 @@ def initialize(home: Path) -> None:
             db.executescript(SCHEMA)
             if version == 1:
                 _add_reservation_created(db)
+            _add_message_search(db)
         with connect(home, write=True) as db:
             legacy = home / "mail.sqlite3"
             if version == 0 and legacy.exists():
@@ -116,6 +145,8 @@ def initialize(home: Path) -> None:
                     "UPDATE file_reservations SET created_ts=CURRENT_TIMESTAMP"
                     " WHERE created_ts IS NULL"
                 )
+            _open_threads(db)
+            _rebuild_search(db)
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -126,6 +157,42 @@ def _add_reservation_created(db: sqlite3.Connection) -> None:
     }
     if "created_ts" not in columns:
         db.execute("ALTER TABLE file_reservations ADD COLUMN created_ts TEXT")
+
+
+def _add_message_search(db: sqlite3.Connection) -> None:
+    """Creates the full-text index where the SQLite build provides FTS5.
+
+    A build without the FTS5 module rejects the virtual table, which leaves
+    the store usable and search degraded rather than the store unopenable.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.executescript(SEARCH_SCHEMA)
+
+
+def _searchable(db: sqlite3.Connection) -> bool:
+    """Reports whether this store carries a full-text index."""
+    return bool(
+        db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='message_search'"
+        ).fetchone()
+    )
+
+
+def _open_threads(db: sqlite3.Connection) -> None:
+    """Gives every stored message without a thread one of its own."""
+    db.execute(
+        "UPDATE messages SET thread_id='t'||id "
+        "WHERE thread_id IS NULL OR thread_id=''"
+    )
+
+
+def _rebuild_search(db: sqlite3.Connection) -> None:
+    """Indexes every stored message when this store carries an index."""
+    if _searchable(db):
+        db.execute(
+            "INSERT INTO message_search(message_search) VALUES ('rebuild')"
+        )
 
 
 def _import_legacy(db: sqlite3.Connection, legacy: Path) -> None:
@@ -241,13 +308,67 @@ def _flag(value: object, name: str) -> bool:
     return value
 
 
+def _opened_thread(actor: dict, key: str) -> str:
+    """Derives the identifier of the thread a message opens.
+
+    The identifier is derived from the sender and its idempotency key rather
+    than allocated, so an interrupted send that retries resolves the same
+    thread instead of opening a second one.
+
+    Args:
+        actor: Authenticated project and lane.
+        key: Idempotency key naming this send.
+
+    Returns:
+        Opaque thread identifier within this project.
+    """
+    seed = f"{actor['project_id']}\x00{actor['id']}\x00{key}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+
+def _answered_thread(db: sqlite3.Connection, actor: dict, value: object) -> str:
+    """Resolves the thread carried by the message a send answers.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        value: Identifier of the message being answered.
+
+    Returns:
+        Thread identifier of the answered message.
+
+    Raises:
+        BridgeError: If the message is outside this sender's own mail.
+    """
+    answered = _number(value, "reply_to", 1, 2**63 - 1)
+    row = db.execute(
+        "SELECT m.thread_id FROM messages m LEFT JOIN message_recipients r "
+        "ON r.message_id=m.id AND r.agent_id=? WHERE m.id=? AND m.project_id=? "
+        "AND (m.sender_id=? OR r.agent_id IS NOT NULL)",
+        (actor["id"], answered, actor["project_id"], actor["id"]),
+    ).fetchone()
+    if not row:
+        raise BridgeError("reply_to must name a message you sent or received.")
+    return row[0]
+
+
 def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
-    """Atomically delivers an idempotent message to authorized recipients."""
+    """Atomically delivers an idempotent message to authorized recipients.
+
+    A send naming ``reply_to`` joins the thread of the message it answers. A
+    send naming neither ``reply_to`` nor ``thread_id`` opens its own thread,
+    so every delivered message belongs to exactly one thread.
+    """
     subject = _text(args.get("subject"), "subject", 160)
     body = _text(args.get("body_md"), "body_md", MAX_BODY_BYTES)
     thread = _text(args.get("thread_id", ""), "thread_id", 80, empty=True)
     key = _text(args.get("idempotency_key"), "idempotency_key", 80)
     ack = _flag(args.get("ack_required", False), "ack_required")
+    if "reply_to" in args:
+        if thread:
+            raise BridgeError("Answer with reply_to or thread_id, not both.")
+        thread = _answered_thread(db, actor, args["reply_to"])
+    thread = thread or _opened_thread(actor, key)
     recipients = args.get("to")
     if (
         not isinstance(recipients, list)
@@ -285,7 +406,11 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
             existing["ack_required"],
         ) != (subject, body, thread, ack) or previous != set(ids):
             raise BridgeError("Idempotency key already names another message.")
-        return {"id": existing["id"], "duplicate": True}
+        return {
+            "id": existing["id"],
+            "thread_id": existing["thread_id"],
+            "duplicate": True,
+        }
     cursor = db.execute(
         "INSERT INTO messages(project_id,sender_id,subject,body_md,"
         "thread_id,ack_required,dedup_key) VALUES (?,?,?,?,?,?,?)",
@@ -296,7 +421,7 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         "INSERT INTO message_recipients(message_id,agent_id) VALUES (?,?)",
         [(message_id, recipient) for recipient in set(ids)],
     )
-    return {"id": message_id}
+    return {"id": message_id, "thread_id": thread}
 
 
 def _roster(db: sqlite3.Connection, actor: dict) -> dict:
@@ -310,12 +435,17 @@ def _roster(db: sqlite3.Connection, actor: dict) -> dict:
 
 
 def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
-    """Pages metadata and legacy bodies within a bounded response budget."""
+    """Pages metadata and legacy bodies within a bounded response budget.
+
+    Each message reports the thread it belongs to, so a recipient can read
+    that thread or answer into it without a further lookup.
+    """
     after = _number(args.get("after_id", 0), "after_id", 0, 2**63 - 1)
     limit = _number(args.get("limit", 5), "limit", 1, 5)
     bodies = _flag(args.get("include_bodies", False), "include_bodies")
     rows = db.execute(
-        "SELECT m.id,a.name AS sender,m.subject,m.body_md,m.ack_required "
+        "SELECT m.id,a.name AS sender,m.thread_id,m.subject,m.body_md,"
+        "m.ack_required "
         "FROM messages m JOIN agents a ON a.id=m.sender_id "
         "JOIN message_recipients r ON r.message_id=m.id "
         "WHERE r.agent_id=? AND m.id>? ORDER BY m.id LIMIT ?",
@@ -339,6 +469,161 @@ def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         result["messages"].append(item)
         result["next_after_id"] = row["id"]
     result["has_more"] = len(rows) > len(result["messages"])
+    return result
+
+
+MAIL_COLUMNS = (
+    "SELECT m.id,a.name AS sender,m.thread_id,"
+    "substr(m.subject,1,160) AS subject,"
+    "substr(m.body_md,1,?) AS body_md,m.created_ts,m.ack_required "
+)
+MAIL_SCOPE = (
+    "JOIN agents a ON a.id=m.sender_id LEFT JOIN message_recipients r "
+    "ON r.message_id=m.id AND r.agent_id=? WHERE m.project_id=? "
+    "AND (m.sender_id=? OR r.agent_id IS NOT NULL) "
+)
+
+
+def _bounded(result: dict, rows: list[sqlite3.Row]) -> list[dict]:
+    """Returns the leading rows whose serialized result stays in budget.
+
+    Args:
+        result: Response fields that accompany the reported messages.
+        rows: Candidate rows, already ordered and count-limited.
+
+    Returns:
+        Reported messages, which may be fewer than the candidates.
+    """
+    reported: list[dict] = []
+    for row in rows:
+        candidate = {**result, "messages": [*reported, dict(row)]}
+        if len(json.dumps(candidate, ensure_ascii=False).encode()) > 7500:
+            break
+        reported.append(dict(row))
+    return reported
+
+
+def _thread(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
+    """Reads one thread's messages in send order within a bounded budget.
+
+    Only mail this participant sent or received is reported, so reading a
+    thread never widens what a lane can already see.
+    """
+    thread = _text(args.get("thread_id"), "thread_id", 80)
+    after = _number(args.get("after_id", 0), "after_id", 0, 2**63 - 1)
+    limit = _number(
+        args.get("limit", MAX_THREAD_PAGE), "limit", 1, MAX_THREAD_PAGE
+    )
+    rows = db.execute(
+        MAIL_COLUMNS
+        + "FROM messages m "
+        + MAIL_SCOPE
+        + "AND m.thread_id=? AND m.id>? ORDER BY m.id LIMIT ?",
+        (
+            PREVIEW_CHARACTERS,
+            actor["id"],
+            actor["project_id"],
+            actor["id"],
+            thread,
+            after,
+            limit + 1,
+        ),
+    ).fetchall()
+    result: dict = {"thread_id": thread, "next_after_id": after}
+    messages = _bounded(result, rows[:limit])
+    if messages:
+        result["next_after_id"] = messages[-1]["id"]
+    result["messages"] = messages
+    result["has_more"] = len(rows) > len(messages)
+    return result
+
+
+def _phrase(query: str) -> str:
+    """Quotes a query as one FTS5 phrase so its operators stay literal."""
+    return '"' + query.replace('"', '""') + '"'
+
+
+def _wildcards(query: str) -> str:
+    """Escapes LIKE wildcards so a query matches literal text only."""
+    for character in ("\\", "%", "_"):
+        query = query.replace(character, "\\" + character)
+    return query
+
+
+def _indexed_matches(
+    db: sqlite3.Connection, actor: dict, query: str, limit: int
+) -> list[sqlite3.Row]:
+    """Matches the query as one phrase against the full-text index.
+
+    The index is named rather than aliased because FTS5 resolves a MATCH
+    constraint against the table name alone.
+    """
+    return db.execute(
+        MAIL_COLUMNS
+        + "FROM message_search JOIN messages m ON m.id=message_search.rowid "
+        + MAIL_SCOPE
+        + "AND message_search MATCH ? ORDER BY m.id DESC LIMIT ?",
+        (
+            PREVIEW_CHARACTERS,
+            actor["id"],
+            actor["project_id"],
+            actor["id"],
+            _phrase(query),
+            limit + 1,
+        ),
+    ).fetchall()
+
+
+def _substring_matches(
+    db: sqlite3.Connection, actor: dict, query: str, limit: int
+) -> list[sqlite3.Row]:
+    """Matches the query as a literal substring of a subject or body."""
+    pattern = f"%{_wildcards(query)}%"
+    return db.execute(
+        MAIL_COLUMNS
+        + "FROM messages m "
+        + MAIL_SCOPE
+        + "AND (m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\') "
+        "ORDER BY m.id DESC LIMIT ?",
+        (
+            PREVIEW_CHARACTERS,
+            actor["id"],
+            actor["project_id"],
+            actor["id"],
+            pattern,
+            pattern,
+            limit + 1,
+        ),
+    ).fetchall()
+
+
+def _search(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
+    """Searches this participant's own mail, newest match first.
+
+    A store whose SQLite build provides FTS5 matches the query as a phrase
+    of indexed terms. Where that index is absent the same query is matched
+    as a literal substring of a subject or body, which is slower and narrower
+    but keeps searching available. The reported ``index`` names which of the
+    two answered the call.
+    """
+    query = _text(args.get("query"), "query", MAX_QUERY_BYTES)
+    limit = _number(
+        args.get("limit", MAX_SEARCH_HITS), "limit", 1, MAX_SEARCH_HITS
+    )
+    rows = None
+    if _searchable(db):
+        with contextlib.suppress(sqlite3.OperationalError):
+            rows = _indexed_matches(db, actor, query, limit)
+    indexed = rows is not None
+    if rows is None:
+        rows = _substring_matches(db, actor, query, limit)
+    result: dict = {
+        "query": query,
+        "index": "fts5" if indexed else "substring",
+    }
+    messages = _bounded(result, rows[:limit])
+    result["messages"] = messages
+    result["has_more"] = len(rows) > len(messages)
     return result
 
 
@@ -578,6 +863,10 @@ def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
         return _inbox(db, actor, args)
     if tool == "list_participants":
         return _roster(db, actor)
+    if tool == "read_thread":
+        return _thread(db, actor, args)
+    if tool == "search_messages":
+        return _search(db, actor, args)
     if tool == "file_reservation_paths":
         return _reserve(db, actor, args)
     if tool == "release_file_reservations":
@@ -600,6 +889,75 @@ def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
             raise BridgeError("Message is not in your inbox.")
         return {"id": message, "acknowledged": ack}
     raise BridgeError("Unknown coordination tool.")
+
+
+def _identify(db: sqlite3.Connection, root: str, name: str) -> dict:
+    """Resolves a registered participant to its own store identity."""
+    row = db.execute(
+        "SELECT a.id,a.project_id,a.name FROM agents a "
+        "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? AND a.name=?",
+        (root, name),
+    ).fetchone()
+    if not row:
+        raise BridgeError("This participant has no registered mail yet.")
+    return dict(row)
+
+
+def read_thread(
+    home: Path, root: str, name: str, thread: str, after: int = 0
+) -> dict:
+    """Reads one thread's mail as a registered participant.
+
+    Operator reads are not served MCP calls, so they hold no write lock and
+    record no tool event.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own mail is read.
+        thread: Thread identifier to read.
+        after: Last message identifier already read.
+
+    Returns:
+        One page of the thread in send order, with paging state.
+
+    Raises:
+        BridgeError: If no store exists or the participant is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home) as db:
+        actor = _identify(db, root, name)
+        return _thread(db, actor, {"thread_id": thread, "after_id": after})
+
+
+def search_messages(
+    home: Path,
+    root: str,
+    name: str,
+    query: str,
+    limit: int = MAX_SEARCH_HITS,
+) -> dict:
+    """Searches a registered participant's own mail for text.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own mail is searched.
+        query: Text to match against subjects and bodies.
+        limit: Maximum hits reported.
+
+    Returns:
+        Matching messages newest first, naming the index that answered.
+
+    Raises:
+        BridgeError: If no store exists or the participant is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home) as db:
+        actor = _identify(db, root, name)
+        return _search(db, actor, {"query": query, "limit": limit})
 
 
 def usage(home: Path, root: str) -> dict[str, dict]:
