@@ -31,6 +31,7 @@ from agent_parley.checkpoints import (
 from agent_parley.cli import Bridge, BridgeError, git, lock, write_json
 from agent_parley.issues import MAX_BLOCKERS, describe
 from agent_parley.process import start_ticks
+from scripts.check_pr_hygiene import issue_numbers, validate
 
 
 @contextlib.asynccontextmanager
@@ -1888,6 +1889,109 @@ def test_merge_runs_the_repository_verification_command_first(
 
     assert "no verification command" in bridge.verification(repo, "")
     assert roster.read(Path(paired["lanes"]["codex"]).parent)["verify"] == []
+
+
+GH_STUB = """#!/bin/sh
+if [ "$2" = "list" ]; then
+  cat "$GH_OPEN"
+  exit 0
+fi
+: > "$GH_CREATE"
+for argument in "$@"; do
+  printf '%s\\0' "$argument" >> "$GH_CREATE"
+done
+echo "https://github.com/example/agent-parley/pull/7"
+"""
+
+
+def stub_github_cli(tmp_path, monkeypatch):
+    """Puts a recording GitHub CLI first on PATH so no request leaves."""
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    executable = binaries / "gh"
+    executable.write_text(GH_STUB)
+    executable.chmod(0o755)
+    listed = tmp_path / "open-pull-requests.json"
+    listed.write_text("[]")
+    created = tmp_path / "created-arguments"
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("GH_OPEN", str(listed))
+    monkeypatch.setenv("GH_CREATE", str(created))
+    return listed, created
+
+
+def created_options(created):
+    """Reads the flags the stubbed GitHub CLI was asked to create with."""
+    arguments = created.read_text().split("\0")[:-1]
+    return dict(zip(arguments[2::2], arguments[3::2], strict=True))
+
+
+def test_pull_request_refuses_before_the_repository_has_a_project(bridge, repo):
+    with pytest.raises(BridgeError, match="no bridge project"):
+        bridge.pull_request(repo, "codex")
+
+
+def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    base = git(repo, "branch", "--show-current")
+    identify(repo)
+    remote = tmp_path / "origin.git"
+    git(repo, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    listed, created = stub_github_cli(tmp_path, monkeypatch)
+
+    with pytest.raises(BridgeError, match="not a participant"):
+        bridge.pull_request(repo, "absent")
+    with pytest.raises(BridgeError, match="recorded no report"):
+        bridge.pull_request(repo, "codex")
+
+    bridge.report(lane, "ready", "Lane result", "", "make check: 181 passed")
+    with pytest.raises(BridgeError, match="nothing to open"):
+        bridge.pull_request(repo, "codex")
+    assert git(repo, "branch", "--remotes") == ""
+
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "feat: add the lane feature")
+    with pytest.raises(BridgeError, match="claims no issue"):
+        bridge.pull_request(repo, "codex")
+    bridge.issue(lane, "claim", "42")
+
+    message = bridge.pull_request(repo, "codex")
+    assert "https://github.com/example/agent-parley/pull/7" in message
+    assert git(remote, "log", "-1", "--pretty=%s", branch) == (
+        "feat: add the lane feature"
+    )
+    options = created_options(created)
+    assert options["--base"] == base
+    assert options["--head"] == branch
+    assert options["--title"] == "feat: add the lane feature"
+    assert "Lane result" in options["--body"]
+    assert "make check: 181 passed" in options["--body"]
+    assert issue_numbers(options["--body"]) == {42}
+    assert (
+        validate(
+            {
+                "title": options["--title"],
+                "assignees": [{"login": "owner"}],
+                "labels": [{"name": "enhancement"}],
+                "user": {"type": "User"},
+                "body": options["--body"],
+            },
+            [{"number": 42}],
+        )
+        == []
+    )
+
+    created.unlink()
+    listed.write_text(
+        json.dumps([{"url": "https://github.com/example/agent-parley/pull/7"}])
+    )
+    repeated = bridge.pull_request(repo, "codex")
+    assert "already open" in repeated
+    assert not created.exists()
 
 
 def test_event_history_is_bounded_by_age_and_reported_by_window(

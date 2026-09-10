@@ -152,6 +152,7 @@ names look like credentials.
 agent-parley status
 agent-parley participant restore claude-1
 agent-parley participant merge claude-1
+agent-parley participant pr claude-1
 agent-parley participant retire claude-1
 ```
 
@@ -194,6 +195,25 @@ as a blocker. Because it attempts no merge, a preview that names no blocker
 says only that nothing refuses the merge right now, not that the merge would
 apply without conflicts. A preview prints no roster listing, unlike the actions
 that change one.
+
+`participant pr` pushes one lane's bridge branch to `origin` and opens a pull
+request for it. The body is the lane's own recorded report: its summary, its
+verification evidence and its remaining work, under the three headings the
+repository's pull-request template asks for, followed by an explicit `Refs #N`
+for every issue the lane still claims. The title is the first commit the lane
+added, so it already follows the target repository's commit rules, and the base
+is the branch the main checkout has out. Authentication is the native `gh` CLI's
+own: Agent Parley stores no token and adds no flag that bypasses a repository
+rule. It refuses when the repository has no project, when the participant is
+unknown, when no report is on file, when the lane claims no issue, when the
+branch adds no commits to the project base, and when the main checkout is on a
+detached HEAD or on the lane's own branch. A pull request already open for that
+branch is reported rather than duplicated, and its branch is still updated by
+the push. Pushing to `origin` happens only here; `status` never reaches a
+remote. Assignee, change-type label and milestone stay the operator's to set,
+because they are repository policy rather than lane state. A reported `ready`
+outcome is the participant's own account, so an opened pull request still needs
+review and the target repository's own gate.
 
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's
