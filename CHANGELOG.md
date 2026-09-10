@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/suneel944/agent-parley/compare/v0.1.0...v0.1.1) (2026-09-10)
+
+
+### Documentation
+
+* add a square listing icon for the plugin directories ([#34](https://github.com/suneel944/agent-parley/issues/34)) ([84ed038](https://github.com/suneel944/agent-parley/commit/84ed0382f1cfbd928d60c924e5cd5719779a6637))
+
 ## [0.1.0] - 2026-09-10
 
 ### Features
