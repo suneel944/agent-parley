@@ -93,7 +93,15 @@ TOOLS = [
         "blocking owner with that owner's reason.",
         {
             "paths": {"type": "array", "items": TEXT, "maxItems": 16},
-            "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
+            "ttl_seconds": {
+                **INTEGER,
+                "minimum": 30,
+                "maximum": 3600,
+                "description": (
+                    "Optional. Past it the lease reports stale and still "
+                    "holds; omit it and the lease never reports stale."
+                ),
+            },
             "exclusive": FLAG,
             "reason": {
                 **TEXT,
