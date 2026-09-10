@@ -43,6 +43,12 @@ agent-parley report --state ready --summary "Result" --evidence "Checks and resu
 
 `issue offer --to` names another participant in the same project.
 
+`issue list` also shows the forge title beside the owner, as
+`#42: claude — Some issue title`, when `gh` is installed and authenticated and
+the repository's `origin` remote points at GitHub. Without any of those the
+title is simply absent and nothing else changes: the claim still succeeds and
+every listing, dependency and handoff behaves the same.
+
 `issue list` prints each owner's session state and the age of its last
 checkpoint, so a stalled lane is visible. Reclaiming that work still needs the
 owner to release it, or an explicit offer and accept.

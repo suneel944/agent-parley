@@ -53,6 +53,7 @@ def change(
     summary: str = "",
     offer_id: str | None = None,
     on: str | None = None,
+    title: str | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -67,6 +68,9 @@ def change(
         summary: Peer-provided handoff context.
         offer_id: Exact current offer required for acceptance or decline.
         on: Issue this one waits on, for a block or unblock.
+        title: Optional forge-supplied issue title recorded on a claim. It is
+            display context only, never ownership authority, and an absent
+            title leaves any previously recorded one in place.
 
     Returns:
         The persisted issue record, including transition history.
@@ -90,12 +94,16 @@ def change(
                 raise BridgeError(
                     f"Issue #{issue} is owned by {record['owner']}."
                 )
+            previous = record or {}
             record = {
                 "owner": agent,
                 "offer": None,
-                "blocked_by": (record or {}).get("blocked_by", []),
-                "history": (record or {}).get("history", []),
+                "blocked_by": previous.get("blocked_by", []),
+                "history": previous.get("history", []),
             }
+            resolved = title if title else previous.get("title")
+            if resolved:
+                record["title"] = resolved
         else:
             if not record or not record["owner"]:
                 raise BridgeError(f"Issue #{issue} has no owner.")
@@ -193,8 +201,9 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             and a stopped session never transfer ownership.
 
     Returns:
-        One line for each owned issue, naming any issue it waits on and who
-        holds that issue, or a notice that none are claimed.
+        One line for each owned issue, carrying any recorded forge title as
+        display context, naming any issue it waits on and who holds that
+        issue, or a notice that none are claimed.
     """
     lines = []
     for number, record in sorted(
@@ -205,6 +214,8 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         line = f"#{number}: {record['owner']}"
         if liveness and record["owner"] in liveness:
             line += f" ({liveness[record['owner']]})"
+        if title := record.get("title"):
+            line += f" — {title}"
         if waiting := record.get("blocked_by"):
             line += "; waits on " + ", ".join(
                 f"#{blocker} ({holder['owner']})"

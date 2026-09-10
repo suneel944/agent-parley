@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from agent_parley import dashboard, process, roster, store
+from agent_parley import dashboard, forge, process, roster, store
 from agent_parley.checkpoints import (
     EVENTS,
     current_branch,
@@ -27,7 +27,7 @@ from agent_parley.checkpoints import (
     participant_liveness,
     read_events,
 )
-from agent_parley.issues import change, describe, snapshot
+from agent_parley.issues import change, describe, parse_issue, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
 
@@ -899,6 +899,10 @@ review, not merged or independently verified. An idle turn is not completion.
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
+        A claim additionally attempts a read-only forge lookup for the issue
+        title. That lookup is optional context: an unavailable forge resolves
+        to no title and never blocks or fails the claim.
+
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
             action: List, claim, release, offer, accept, decline, cancel,
@@ -921,6 +925,11 @@ review, not merged or independently verified. An idle turn is not completion.
             return snapshot(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
+        title = (
+            forge.issue_title(repo, parse_issue(number))
+            if action == "claim"
+            else None
+        )
         return change(
             directory,
             agent,
@@ -931,6 +940,7 @@ review, not merged or independently verified. An idle turn is not completion.
             summary=summary,
             offer_id=offer_id,
             on=on,
+            title=title,
         )
 
     def export_events(

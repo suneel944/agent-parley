@@ -14,6 +14,7 @@ native approvals, or merge work.
 | `process` | Linux process identity, session liveness and pidfd shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
+| `forge` | Optional read-only issue title lookups against the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view of every participant |
 | `state` | Private atomic JSON publication and operation locks |
@@ -191,6 +192,15 @@ observed checkpoint. That report is for an operator; silence, an idle session
 and a stopped session all leave ownership where it is. `agent-parley top`
 renders the same state continuously, adding branch drift, denial counts and
 served calls; it reads state and never writes it.
+
+A claim additionally attempts one read-only forge lookup for the issue title,
+using the repository's own `origin` remote and the operator's already
+authenticated `gh` client. The lookup is best effort: no GitHub remote, no
+`gh`, no network, a refused request or unusable output all resolve to no title,
+and the claim proceeds unchanged. A recorded title is peer-supplied display
+context, clipped to 200 characters; it is never authority for ownership, and
+every transition, dependency and handoff rule behaves identically with or
+without it.
 
 Shutdown verifies the module, state path and process creation ticks, then pins
 the process with Linux pidfd before signaling. It does not kill arbitrary PIDs.

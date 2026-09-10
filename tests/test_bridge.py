@@ -18,7 +18,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agent_parley import dashboard, roster, store
+from agent_parley import dashboard, forge, roster, store
 from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
@@ -855,6 +855,117 @@ def test_issue_dependencies_are_owner_only_and_survive_a_release(
     assert (
         "77"
         not in bridge.issue(claude, "unblock", "432", on="77")["blocked_by"]
+    )
+
+
+def test_forge_slug_reads_github_remotes_and_ignores_everything_else(repo):
+    assert forge.slug(repo) is None
+    git(repo, "remote", "add", "origin", "https://github.com/owner/name.git")
+    assert forge.slug(repo) == "owner/name"
+    git(repo, "remote", "set-url", "origin", "git@github.com:owner/name.git")
+    assert forge.slug(repo) == "owner/name"
+    git(repo, "remote", "set-url", "origin", "https://github.com/owner/name")
+    assert forge.slug(repo) == "owner/name"
+    git(repo, "remote", "set-url", "origin", "git@example.com:owner/name.git")
+    assert forge.slug(repo) is None
+
+
+def test_forge_title_is_skipped_without_the_gh_client(repo, monkeypatch):
+    git(repo, "remote", "add", "origin", "https://github.com/owner/name.git")
+    assert forge.slug(repo) == "owner/name"
+    monkeypatch.setattr(forge.shutil, "which", lambda command: None)
+    executed = []
+    real_run = subprocess.run
+
+    def record(command, **kwargs):
+        executed.append(command[0])
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(forge.subprocess, "run", record)
+    assert forge.issue_title(repo, "42") is None
+    assert executed == ["git"]
+
+
+def test_forge_title_absorbs_failed_and_unusable_gh_output(repo, monkeypatch):
+    monkeypatch.setattr(forge, "slug", lambda directory: "owner/name")
+    monkeypatch.setattr(forge.shutil, "which", lambda command: "/usr/bin/gh")
+    replies = [
+        subprocess.CompletedProcess([], 1, "", "gh: could not authenticate"),
+        subprocess.CompletedProcess([], 0, "not json at all", ""),
+        subprocess.CompletedProcess([], 0, '{"body": "no title key"}', ""),
+        subprocess.CompletedProcess([], 0, '{"title": null}', ""),
+    ]
+    monkeypatch.setattr(
+        forge.subprocess, "run", lambda *args, **kwargs: replies.pop(0)
+    )
+    resolved = [forge.issue_title(repo, "42") for _ in range(len(replies))]
+    assert resolved == [None, None, None, None]
+
+
+def test_forge_title_is_clipped_to_the_display_limit(repo, monkeypatch):
+    monkeypatch.setattr(forge, "slug", lambda directory: "owner/name")
+    monkeypatch.setattr(forge.shutil, "which", lambda command: "/usr/bin/gh")
+    payload = json.dumps({"title": "t" * 500})
+    reply = subprocess.CompletedProcess([], 0, payload, "")
+    monkeypatch.setattr(forge.subprocess, "run", lambda *args, **kwargs: reply)
+    assert forge.issue_title(repo, "42") == "t" * 200
+
+
+def test_issue_claim_records_and_renders_the_forge_title(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title",
+        lambda directory, number: f"Title for issue {number}",
+    )
+    assert bridge.issue(claude, "claim", "#432")["title"] == (
+        "Title for issue 432"
+    )
+    assert (
+        describe(bridge.issue(repo, "list"))
+        == "#432: claude — Title for issue 432"
+    )
+
+
+def test_issue_claim_survives_an_unavailable_forge(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    assert "title" not in bridge.issue(claude, "claim", "432")
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: ""
+    )
+    assert "title" not in bridge.issue(claude, "claim", "433")
+    assert describe(bridge.issue(repo, "list")) == (
+        "#432: claude\n#433: claude"
+    )
+
+
+def test_recorded_issue_title_survives_later_transitions(
+    bridge, repo, paired, monkeypatch
+):
+    claude, codex = (
+        Path(paired["lanes"][name]) for name in ("claude", "codex")
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title",
+        lambda directory, number: "Resolved from the forge",
+    )
+    bridge.issue(claude, "claim", "432")
+    blocked = bridge.issue(claude, "block", "432", on="77")
+    assert blocked["title"] == "Resolved from the forge"
+    bridge.issue(claude, "release", "432")
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    reclaimed = bridge.issue(codex, "claim", "432")
+    assert reclaimed["title"] == "Resolved from the forge"
+    assert "#432: codex — Resolved from the forge; waits on #77" in describe(
+        bridge.issue(repo, "list")
     )
 
 
