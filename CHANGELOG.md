@@ -1,12 +1,5 @@
 # Changelog
 
-## [0.1.2](https://github.com/suneel944/agent-parley/compare/v0.1.1...v0.1.2) (2026-09-10)
-
-
-### Bug fixes
-
-* make the plugin bundle reproducible and the release re-runnable ([#40](https://github.com/suneel944/agent-parley/issues/40)) ([436c2b5](https://github.com/suneel944/agent-parley/commit/436c2b58b2d3dbd35607641dce0d2f185a835c4b))
-
 ## [0.1.1](https://github.com/suneel944/agent-parley/compare/v0.1.0...v0.1.1) (2026-09-10)
 
 
