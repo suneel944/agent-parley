@@ -1825,6 +1825,71 @@ def test_preview_names_a_running_session_without_taking_its_lock(
     assert "Lane work" in report
 
 
+def verification_script(directory, name, body):
+    """Publishes an executable stand-in for a repository verification gate."""
+    path = directory / name
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return path
+
+
+def test_merge_runs_the_repository_verification_command_first(
+    bridge, repo, paired, tmp_path
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    root, _ = bridge.project(repo)
+    base = git(repo, "branch", "--show-current")
+    identify(repo)
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "Lane work")
+
+    assert "no verification command" in bridge.verification(repo)
+    assert f"Merged {branch} into {base}" in bridge.merge(repo, "codex")
+    assert (repo / "feature.txt").read_text() == "lane work\n"
+
+    (lane / "second.txt").write_text("more lane work\n")
+    commit(lane, "More lane work")
+
+    red_marker = tmp_path / "red.txt"
+    red = verification_script(
+        tmp_path,
+        "red.sh",
+        f"pwd -P > {shlex.quote(str(red_marker))}\n"
+        "echo checked line one\n"
+        "echo checked line two >&2\n"
+        "exit 3\n",
+    )
+    bridge.verification(repo, shlex.quote(str(red)))
+    with pytest.raises(BridgeError, match="Verification failed") as failure:
+        bridge.merge(repo, "codex")
+    assert "exited 3" in str(failure.value)
+    assert "checked line one" in str(failure.value)
+    assert "checked line two" in str(failure.value)
+    assert Path(red_marker.read_text().strip()).resolve() == root.resolve()
+    assert not (repo / "second.txt").exists()
+
+    bridge.verification(repo, shlex.quote(str(tmp_path / "absent.sh")))
+    with pytest.raises(BridgeError, match="could not run"):
+        bridge.merge(repo, "codex")
+    assert not (repo / "second.txt").exists()
+
+    with pytest.raises(BridgeError, match="argument list"):
+        bridge.verification(repo, "make 'check")
+
+    green_marker = tmp_path / "green.txt"
+    green = verification_script(
+        tmp_path, "green.sh", f"pwd -P > {shlex.quote(str(green_marker))}\n"
+    )
+    assert "runs `" in bridge.verification(repo, shlex.quote(str(green)))
+    assert f"Merged {branch} into {base}" in bridge.merge(repo, "codex")
+    assert Path(green_marker.read_text().strip()).resolve() == root.resolve()
+    assert (repo / "second.txt").read_text() == "more lane work\n"
+
+    assert "no verification command" in bridge.verification(repo, "")
+    assert roster.read(Path(paired["lanes"]["codex"]).parent)["verify"] == []
+
+
 def test_event_history_is_bounded_by_age_and_reported_by_window(
     bridge, repo, paired, tmp_path, capsys
 ):

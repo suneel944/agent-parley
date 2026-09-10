@@ -32,6 +32,9 @@ from agent_parley.checkpoints import (
 from agent_parley.issues import change, describe, parse_issue, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
+VERIFY_TIMEOUT = 1800
+VERIFY_TAIL_LINES = 20
+
 
 def git(repo: Path, *args: str) -> str:
     """Runs Git in a repository and returns stripped stdout.
@@ -407,6 +410,52 @@ def report_comment(agent: str, summary: str, evidence: str) -> str:
     )
 
 
+def verify_base(root: Path, command: list[str]) -> None:
+    """Runs a repository's verification command in the base checkout.
+
+    Executing a configured command is a different trust decision from reading
+    Git state, so the gate is a separate step that runs before the merge and
+    never rewrites, resets or stages anything itself. It reports the checkout
+    as it stands before the merge, which is not a claim about the merged
+    result. The command is run as an argument list without a shell, and no
+    flag skips it: a repository that configures a gate always pays it.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        command: Argument tokens recorded in the project manifest.
+
+    Raises:
+        BridgeError: If the command cannot run, or if it exits non-zero.
+        subprocess.TimeoutExpired: If verification exceeds its timeout.
+    """
+    quoted = shlex.join(command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=VERIFY_TIMEOUT,
+            check=False,
+        )
+    except OSError as exc:
+        raise BridgeError(
+            f"The verification command for the base checkout at {root} could "
+            f"not run: {exc}. Correct it with `agent-parley verify set`, then "
+            "rerun; merge never skips verification."
+        ) from None
+    if not result.returncode:
+        return
+    tail = "\n".join(
+        (result.stdout + result.stderr).splitlines()[-VERIFY_TAIL_LINES:]
+    )
+    raise BridgeError(
+        f"Verification failed in the base checkout at {root}: `{quoted}` "
+        f"exited {result.returncode}. Fix it and rerun; merge never skips "
+        f"verification and nothing was merged.\n{tail}"
+    )
+
+
 class Bridge:
     """Coordinates native agent worktrees using one private local state root.
 
@@ -636,6 +685,7 @@ class Bridge:
             "version": roster.MANIFEST_VERSION,
             "root": str(root),
             "base": git(root, "rev-parse", "--verify", "HEAD"),
+            "verify": [],
             "participants": {},
         }
         write_json(path, data)
@@ -843,6 +893,43 @@ class Bridge:
                 write_json(directory / "project.json", data)
                 return f"Retired {name}. {note} Messages are preserved."
 
+    def verification(self, repo: Path, command: str | None = None) -> str:
+        """Reports or records the command every merge must pass first.
+
+        The gate belongs to the repository, not to a participant, so it lives
+        beside the roster in that repository's project manifest rather than in
+        a new configuration file or inside the target source tree.
+
+        Args:
+            repo: Any checkout of the target repository.
+            command: Command line to require before every merge, an empty
+                string to remove the gate, or None to report the current
+                setting without changing it.
+
+        Returns:
+            An account of the configured gate.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or the command
+                is not a usable argument list.
+        """
+        root, directory = self.project(repo)
+        with lock(directory / "setup.lock"):
+            data = self._project(root, directory, verify=set())
+            if command is not None:
+                data["verify"] = roster.verify_command(command)
+                write_json(directory / "project.json", data)
+            configured = data["verify"]
+        if not configured:
+            return (
+                f"{root} has no verification command; `participant merge` "
+                "runs no gate."
+            )
+        return (
+            f"{root} runs `{shlex.join(configured)}` in the base checkout "
+            "before every `participant merge`."
+        )
+
     def merge(self, repo: Path, name: str) -> str:
         """Merges one participant's bridge branch into the base checkout.
 
@@ -855,7 +942,9 @@ class Bridge:
 
         Raises:
             BridgeError: If the lane drifted, if the participant holds a
-                running session, or if the merge cannot complete unattended.
+                running session, if the repository's verification command
+                fails, or if the merge cannot complete unattended.
+            subprocess.TimeoutExpired: If verification exceeds its timeout.
         """
         root, directory = self.project(repo)
         with lock(directory / "setup.lock"):
@@ -867,6 +956,8 @@ class Bridge:
                     "run agent-parley participant list."
                 )
             with lock(directory / f"{name}.session.lock", session_busy(name)):
+                if data["verify"]:
+                    verify_base(root, data["verify"])
                 return merge_branch(
                     root,
                     Path(participant["lane"]),
@@ -1594,6 +1685,23 @@ def main() -> int:
         command.add_argument("--repo", type=Path, default=Path.cwd())
         if action == "merge":
             command.add_argument("--preview", action="store_true")
+    gate = commands.add_parser(
+        "verify",
+        help="Show or set the command a repository requires before a merge.",
+    )
+    gates = gate.add_subparsers(dest="action", required=True)
+    showing = gates.add_parser("show")
+    showing.add_argument("--repo", type=Path, default=Path.cwd())
+    setting = gates.add_parser("set")
+    setting.add_argument(
+        "command_line",
+        metavar="COMMAND",
+        help=(
+            "Command run in the base checkout before every merge; pass an "
+            "empty string to remove the gate. No flag skips it."
+        ),
+    )
+    setting.add_argument("--repo", type=Path, default=Path.cwd())
     provider = commands.add_parser(
         "provider", help="Inspect or define providers that drive a native CLI."
     )
@@ -1701,6 +1809,13 @@ def main() -> int:
             if not preview:
                 _, directory = bridge.project(repository)
                 print(roster.describe(roster.read(directory)))
+        elif args.command == "verify":
+            print(
+                bridge.verification(
+                    args.repo.resolve(),
+                    getattr(args, "command_line", None),
+                )
+            )
         elif args.command == "provider":
             if args.action == "add":
                 roster.define_provider(
