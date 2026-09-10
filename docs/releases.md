@@ -106,8 +106,12 @@ users pinned exactly to a yanked version can still install it.
 2. Review the changelog and version changes and merge the PR through required
    checks. A generated PR is a proposal, not release authorization. Previously
    consumed versions cannot be reused, including a deleted or yanked 0.1.2.
-   Select an unused version explicitly if the proposal suggests the retired
-   number. Remove the migration's root `last-release-sha` in this version PR;
+   Feature work accumulates onto one proposal rather than releasing each
+   change, and the bump policy raises the minor component while the major
+   component is zero, so preparation from 0.1.1 proposes 0.2.0 and steps over
+   the retired number without a manual correction. The policy gate recomputes
+   that proposal and fails when the configured policy would land on a retired
+   version. Remove the migration's root `last-release-sha` in this version PR;
    the policy gate rejects a stale migration boundary.
 3. Create the corresponding version tag at the reviewed commit on `main`.
    Enable Release and dispatch it from `main` with that existing tag.

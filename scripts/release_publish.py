@@ -168,6 +168,35 @@ def release_baseline(root: Path, tag: str, source: str) -> str:
     return baseline
 
 
+def proposed_feature_version(root: Path) -> str:
+    """Returns the version accumulated features would propose next.
+
+    Preparation stacks feature work onto one version rather than releasing
+    each change. Knowing that version before preparation runs is what lets
+    configuration refuse a number the package index can never accept again.
+
+    Args:
+        root: Checkout containing release configuration and version manifest.
+
+    Returns:
+        The next version implied by the approved version and bump policy.
+
+    Raises:
+        ValueError: If the approved version is not MAJOR.MINOR.PATCH.
+    """
+    config = json.loads((root / "release-please-config.json").read_text())
+    approved = json.loads((root / ".release-please-manifest.json").read_text())[
+        "."
+    ]
+    if not re.fullmatch(r"\d+\.\d+\.\d+", approved):
+        raise ValueError("Approved version must be MAJOR.MINOR.PATCH.")
+    major, minor, patch = (int(part) for part in approved.split("."))
+    package = config["packages"]["."]
+    if major == 0 and package.get("bump-patch-for-minor-pre-major"):
+        return f"{major}.{minor}.{patch + 1}"
+    return f"{major}.{minor + 1}.0"
+
+
 def migration_config_errors(root: Path) -> list[str]:
     """Rejects missing, stale or misplaced release-history scan boundaries.
 
@@ -187,6 +216,11 @@ def migration_config_errors(root: Path) -> list[str]:
     errors = []
     if version in retired:
         errors.append("Retired release versions cannot be reused.")
+    if proposed_feature_version(root) in retired:
+        errors.append(
+            "Accumulated features would propose a retired version; "
+            "change the bump policy so preparation skips it."
+        )
     if config.get("last-release-sha") != expected:
         errors.append(
             "Release scan boundary must match the approved migration; "

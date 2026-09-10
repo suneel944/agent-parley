@@ -322,6 +322,20 @@ def test_retired_version_cannot_be_prepared_or_published(migrated_repo):
         release.validate_tag(migrated_repo, "v0.1.2")
 
 
+def test_patch_bumping_onto_a_retired_version_is_rejected(migrated_repo):
+    path = migrated_repo / "release-please-config.json"
+    config = json.loads(path.read_text())
+    assert release.proposed_feature_version(migrated_repo) == "0.2.0"
+    assert release.migration_config_errors(migrated_repo) == []
+    config["packages"]["."]["bump-patch-for-minor-pre-major"] = True
+    path.write_text(json.dumps(config))
+    assert release.proposed_feature_version(migrated_repo) == "0.1.2"
+    assert release.migration_config_errors(migrated_repo) == [
+        "Accumulated features would propose a retired version; "
+        "change the bump policy so preparation skips it."
+    ]
+
+
 @pytest.mark.parametrize(
     ("path", "eligible"),
     [

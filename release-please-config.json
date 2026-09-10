@@ -8,7 +8,7 @@
       "pull-request-footer": "## Verification\n\nRequired checks must pass before merge.",
       "include-component-in-tag": false,
       "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
       "extra-files": [
         "plugins/agent-parley/.claude-plugin/plugin.json",
         "plugins/agent-parley/.codex-plugin/plugin.json",
