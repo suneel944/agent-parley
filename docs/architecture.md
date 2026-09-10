@@ -144,11 +144,24 @@ fail while merely reporting. A session that ends without clearing its record
 reads as stopped, because its process is gone.
 
 A provider states which native CLI drives a participant and how that CLI reaches
-a model. Coordination needs MCP server configuration and lifecycle hooks, which
-the `claude` and `codex` CLIs supply, so every provider names one of those two
-adapters. Providers for other vendors reuse an adapter and change the endpoint
-through environment variables. The `deepseek`, `kimi` and `grok` presets carry no
-endpoint; `agent-parley provider add` defines further providers locally.
+a model. Coordination needs an MCP server, a system prompt and lifecycle hooks,
+and the launcher supplies all three as command-line arguments of the session it
+starts, so nothing is written into a configuration file the operator also owns
+and no state survives the session. Exactly two argument contracts implement
+that, `claude` and `codex`, so every provider names one of those two adapters
+and its executable must accept that contract in full.
+
+Providers for other vendors reuse an adapter and change the endpoint through
+environment variables, so a preset names the vendor whose models answer rather
+than that vendor's own agent CLI: `gemini` starts `codex` against a Gemini
+endpoint. The `deepseek`, `kimi`, `grok` and `gemini` presets carry no endpoint;
+`agent-parley provider add` defines further providers locally.
+
+Other agent CLIs, including Gemini CLI, Copilot CLI, OpenCode and Amp, support
+MCP and mostly support hooks, but configure both through their own files rather
+than through these arguments, so none of them is a preset and none is drivable
+by naming it as a provider executable. A third contract would be a launch-path
+change; `docs/operations.md` records each one's configuration surface.
 
 A credential profile selects one account by pointing the CLI's config-home
 variable at a separate directory, so the same provider can run twice under

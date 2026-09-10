@@ -70,6 +70,13 @@ PRESETS: dict[str, dict] = {
         "env": {},
         "require_env": ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
     },
+    "gemini": {
+        "adapter": "codex",
+        "command": "codex",
+        "home_env": "CODEX_HOME",
+        "env": {},
+        "require_env": ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+    },
 }
 
 
@@ -258,8 +265,9 @@ def define_provider(
     identifier(name, "Provider name")
     if adapter not in ADAPTERS:
         raise BridgeError(
-            "Agent Parley drives native CLIs that support MCP servers and "
-            f"lifecycle hooks; adapter must be one of: {', '.join(ADAPTERS)}."
+            "Agent Parley supplies MCP configuration and lifecycle hooks as "
+            "native command-line arguments, which only these invocation "
+            f"contracts accept; adapter must be one of: {', '.join(ADAPTERS)}."
         )
     if not command.strip() or "\x00" in command or len(command) > 240:
         raise BridgeError("Provider command must be an executable name.")

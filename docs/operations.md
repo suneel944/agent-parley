@@ -177,9 +177,14 @@ instead of refusing to start. It names the stash entry and prints the
 of a repository shares one stash stack. Only that first registration touches the
 base checkout; `merge`, `restore` and `retire` still refuse on a dirty tree. The participant name is what peers
 address; the provider decides which native CLI starts and which endpoint it uses.
-The `deepseek`, `kimi` and `grok` presets need their vendor base URL and key
-exported in the launching shell; the launcher refuses to start when a required
-variable is unset, rather than falling back to another account.
+The `deepseek`, `kimi`, `grok` and `gemini` presets need their vendor base URL
+and key exported in the launching shell; the launcher refuses to start when a
+required variable is unset, rather than falling back to another account.
+
+A preset is named after the vendor whose models answer, not after that vendor's
+own agent CLI. `gemini` starts the `codex` CLI against a Gemini endpoint and
+requires `OPENAI_BASE_URL` and `OPENAI_API_KEY`; it does not start the Gemini
+CLI. The same holds for `deepseek`, `kimi` and `grok`.
 
 Credential profiles point a provider's config-home variable at a separate
 directory so one provider can run under several accounts. Define one profile per
@@ -188,6 +193,45 @@ accounts need no relationship to each other. Sign in to each directory with the
 native CLI once. Agent Parley stores directory paths and
 variable names; it never stores tokens or keys, and rejects `--env` values whose
 names look like credentials.
+
+## Other agent CLIs
+
+Agent Parley hands the native CLI its MCP server, the coordination prompt and its
+lifecycle hooks as command-line arguments at launch, never by writing into a
+shared configuration file. Two argument contracts implement that, and
+`--adapter` names the one to use:
+
+| Adapter | MCP server | Coordination prompt | Hooks |
+| --- | --- | --- | --- |
+| `claude` | `--mcp-config FILE` | `--append-system-prompt TEXT` | `--settings '{"hooks":…}'` |
+| `codex` | `-c mcp_servers.agent_parley.url=…` | appended to the prompt argument | `-c hooks.EVENT=…` |
+
+A provider's `--executable` therefore has to accept every argument of the
+contract its adapter names. Gemini CLI, Copilot CLI, OpenCode and Amp all speak
+MCP, and three of the four run external commands on lifecycle events, but each
+reads that configuration from its own files rather than from these arguments.
+None is shipped as a preset. `agent-parley provider add` will store a definition
+naming one of them, because the command is only resolved on `PATH` at launch,
+but the resulting session fails inside the native CLI on the first unrecognized
+argument. There is no flag that makes it work and none should be added.
+
+| Agent CLI | MCP configuration | Lifecycle hooks | Per-account config home |
+| --- | --- | --- | --- |
+| Gemini CLI | `mcpServers` in `~/.gemini/settings.json`, or `gemini mcp add` | `hooks` in the same file | none published |
+| Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `$COPILOT_HOME/hooks/*.json` | `COPILOT_HOME` |
+| OpenCode | `mcp` in `opencode.json`, or `opencode mcp add` | JavaScript plugins only | `OPENCODE_CONFIG_DIR` |
+| Amp | `--mcp-config`, or `amp.mcpServers` in its settings file | `amp.hooks` in its settings file | `--settings-file`, `AMP_SETTINGS_FILE` |
+
+Amp is the closest fit and still not a fit: it accepts `--mcp-config`, but it has
+no `--append-system-prompt`, and its settings arrive through `--settings-file`
+rather than `--settings`, so two thirds of the `claude` contract is rejected.
+Gemini CLI additionally publishes no variable that relocates `~/.gemini`, so a
+credential profile cannot give it a second account; `launch_environment` refuses
+a profile whose provider has no `home_env` rather than sharing one login.
+
+Supporting any of these means a third adapter in the launch path, with its own
+plugin for the `coordinate` skill. That is a launch-path change and is tracked
+separately.
 
 ## Recovery and teardown
 

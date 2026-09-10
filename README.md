@@ -254,18 +254,35 @@ installations cover all of them:
 | --- | --- | --- |
 | `claude` | `claude` | Claude Code |
 | `codex` | `codex` | Codex |
-| `deepseek`, `kimi`, `grok` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
+| `deepseek`, `kimi`, `grok`, `gemini` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
-`claude` and `codex` work out of the box. The `deepseek`, `kimi` and `grok`
-presets carry no endpoint, so their base URL and key must be exported in the
-launching shell; the launcher refuses to start when a required variable is unset
-rather than falling back to another account. Coordination state records variable
-names and config directories, never credential values.
+`claude` and `codex` work out of the box. The `deepseek`, `kimi`, `grok` and
+`gemini` presets carry no endpoint, so their base URL and key must be exported in
+the launching shell; the launcher refuses to start when a required variable is
+unset rather than falling back to another account. Coordination state records
+variable names and config directories, never credential values.
+
+A preset names the vendor whose models answer, not a vendor's own agent CLI:
+`gemini` reaches Gemini models through the `codex` CLI, exactly as `grok` and
+`kimi` do for theirs.
 
 Credential profiles point a provider's config-home variable at a separate
 directory, so one provider can run under several logins. Up to 32 participants
 per project.
+
+### Other agent CLIs
+
+The launcher passes MCP configuration, the coordination prompt and lifecycle
+hooks as native command-line arguments, so a provider's executable has to accept
+the `claude` or `codex` argument contract. Gemini CLI, Copilot CLI, OpenCode and
+Amp all support MCP servers, and three of the four support hooks, but each reads
+that configuration from its own files instead of the arguments Agent Parley
+passes. None of them is shipped as a preset, and defining one with
+`agent-parley provider add` stores a provider that cannot launch. Driving them
+would need a third adapter in the launch path, which is out of scope here.
+[Operations](docs/operations.md#other-agent-clis) records what each one supports
+and where its MCP and hook configuration lives.
 
 ## How it fits together
 

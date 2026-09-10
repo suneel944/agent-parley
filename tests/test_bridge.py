@@ -1670,6 +1670,124 @@ def test_provider_definitions_never_store_credential_values(
         )
 
 
+def test_every_shipped_preset_rides_one_of_the_two_native_contracts():
+    """Keeps presets on a CLI that accepts the argument contract we emit."""
+    for name, entry in roster.PRESETS.items():
+        assert entry["adapter"] in roster.ADAPTERS, name
+        assert entry["command"] in ("claude", "codex"), name
+
+
+def test_gemini_preset_runs_the_codex_contract_against_a_vendor_endpoint(
+    bridge, repo, monkeypatch, tmp_path
+):
+    """Drives Gemini models through the codex CLI, never the Gemini CLI."""
+    entry = roster.provider(bridge.home, "gemini")
+    assert entry["adapter"] == "codex"
+    assert entry["command"] == "codex"
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(BridgeError, match="Export these"):
+        roster.launch_environment(bridge.home, entry, None)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "codex"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'argv': sys.argv[1:],\n"
+        "  'base_url': os.environ.get('OPENAI_BASE_URL', '')}, f)\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://vendor.example/openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "exported-by-the-user")
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    assert bridge.launch("gemini", repo, "Work on issue 74", "gemini") == 0
+    result = json.loads(capture.read_text())
+    assert result["base_url"] == "https://vendor.example/openai"
+    assert (
+        'mcp_servers.agent_parley.bearer_token_env_var="AGENT_PARLEY_TOKEN"'
+        in result["argv"]
+    )
+    overrides = [arg for arg in result["argv"] if arg.startswith("hooks.")]
+    assert "PreToolUse" in tomllib.loads("\n".join(overrides))["hooks"]
+    assert entry["env"] == {}
+    assert "exported-by-the-user" not in json.dumps(result)
+
+
+AGENT_CLIENTS = [
+    ("gemini-cli", "gemini", ""),
+    ("copilot-cli", "copilot", "COPILOT_HOME"),
+    ("opencode", "opencode", "OPENCODE_CONFIG_DIR"),
+    ("amp", "amp", "AMP_SETTINGS_FILE"),
+]
+
+
+@pytest.mark.parametrize("name,executable,home_env", AGENT_CLIENTS)
+def test_agent_client_recipes_select_accounts_by_their_own_config_home(
+    bridge, tmp_path, name, executable, home_env
+):
+    """Records the config-home variable each client documents, if any."""
+    entry = roster.define_provider(
+        bridge.home, name, "claude", executable, home_env, [], []
+    )
+    assert entry["command"] == executable
+    assert roster.provider(bridge.home, name)["home_env"] == home_env
+    roster.define_credential(
+        bridge.home, f"{name}-account", str(tmp_path / name), [], []
+    )
+    if not home_env:
+        with pytest.raises(BridgeError, match="no home_env"):
+            roster.launch_environment(bridge.home, entry, f"{name}-account")
+        return
+    assert roster.launch_environment(bridge.home, entry, f"{name}-account") == {
+        home_env: str(tmp_path / name)
+    }
+
+
+@pytest.mark.parametrize("name,executable,home_env", AGENT_CLIENTS)
+def test_agent_client_recipes_still_receive_the_claude_argument_contract(
+    bridge, repo, monkeypatch, tmp_path, name, executable, home_env
+):
+    """Shows why these clients are recipes rather than shipped presets."""
+    roster.define_provider(
+        bridge.home, name, "claude", executable, home_env, [], []
+    )
+    binary = tmp_path / "bin"
+    binary.mkdir(exist_ok=True)
+    script = binary / executable
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'argv': sys.argv[1:]}, f)\n"
+    )
+    script.chmod(0o755)
+    capture = tmp_path / f"{name}.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    assert bridge.launch(name, repo, "Work on issue 74", name) == 0
+    argv = json.loads(capture.read_text())["argv"]
+    assert "--mcp-config" in argv
+    assert "--append-system-prompt" in argv
+    assert "--settings" in argv
+    assert "bypass" not in " ".join(argv)
+
+
 @pytest.mark.parametrize(
     "name",
     [
