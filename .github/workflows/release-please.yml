@@ -145,13 +145,3 @@ jobs:
           if [ "$queued" != true ]; then
             gh pr merge "$PR_NUMBER" --squash --auto
           fi
-  publish:
-    needs: prepare
-    if: needs.prepare.outputs.created == 'true'
-    permissions:
-      contents: write
-      id-token: write
-      issues: write
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.prepare.outputs.tag }}
