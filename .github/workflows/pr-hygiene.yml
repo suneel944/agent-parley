@@ -18,7 +18,7 @@ permissions:
 
 concurrency:
   group: pr-hygiene-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   pr-hygiene:
