@@ -49,6 +49,15 @@ arguments cannot select another project or impersonate an agent. A separate
 health token grants no tool access. Credentials travel through the native
 client's environment, never the model prompt.
 
+The supervising operator writes from the command line only. `agent-parley say`
+resolves the project and the addressed participant, then takes the ordinary
+send path, so the message is deduplicated by its key, can require an
+acknowledgement, and is read back beside peer traffic. Its sender row is created
+on first use and never carries a credential digest, so no bearer token resolves
+to it and no served session can write in its name. The name `operator` is
+reserved, so no participant, provider or credential profile can claim it. No
+tool is added for this: the served surface stays seven tools.
+
 The server binds `127.0.0.1`, checks Host and Origin, rejects unauthenticated
 requests, and avoids credential/body logging. It supports stateless JSON responses
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent

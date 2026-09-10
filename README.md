@@ -112,6 +112,18 @@ agent-parley status   # ownership, activity and reported results
 agent-parley top      # every lane live, including what enforcement denied
 ```
 
+Steer one lane without taking over its terminal:
+
+```sh
+agent-parley say claude-2 "Rebase onto main before you open the pull request."
+```
+
+The message lands in that lane's inbox beside peer traffic, so the agent reads
+it at its next checkpoint. It comes from `operator`, a command-line identity: no
+participant can be named `operator`, and no MCP tool sends as it, so an agent
+cannot write in its name. Repeating the same message delivers nothing further,
+and `--ack` asks the lane to acknowledge it.
+
 When a lane's work is ready, integrate it from the base checkout:
 
 ```sh
