@@ -3,7 +3,69 @@
 The approved version is **0.1.1**. There is no package release associated with
 the workflow repair. Preparation and publication are separate manual actions;
 neither a merge nor a tag push triggers them. Keep both workflows disabled until
-the repair is merged and the unwanted 0.1.2 publication is addressed.
+the repair and history migration are on main and their real refs are verified.
+
+## Audited release history
+
+The read-only audit on 2026-09-10 downloaded the GitHub bundles and PyPI package
+files, verified both GitHub checksum manifests, and compared the package bytes.
+
+| Version | Disposition | Evidence |
+| --- | --- | --- |
+| 0.1.0 | Preserve as archival; do not retry publication | Wheels match across services. Source archives differ in five files; PyPI's copies match the original tag. |
+| 0.1.1 | Approved baseline and supported retry | Both package hashes match across GitHub and PyPI. Neither file is yanked. |
+| 0.1.2 | Retired incident record; never reuse | Absent from PyPI at audit time. GitHub retains a draft, assets and the original tag. |
+| Earlier version labels | Withdrawn preparation history | No corresponding release remains in the current GitHub or PyPI inventories. Reworded commits retain their original source trees. |
+
+The initial source archive differs in `CHANGELOG.md`, `docs/operations.md`,
+`docs/release-overview.md`, `scripts/release_artifacts.py`, and
+`tests/test_release_artifacts.py`. The archive file lists are identical; package
+runtime contents are unchanged. This is a provenance defect in the GitHub
+archive, not a reason to overwrite either service's published files. The
+original tag and PyPI archive remain the source provenance for that release.
+
+| File | SHA-256 |
+| --- | --- |
+| Initial wheel, both services | `0a904c5a87983ba664724757fa8c8d3822bcb4a1744522010700008893843879` |
+| Initial source archive, PyPI | `b75164c598a94ba70410e1b67af8655b717b1b14d3a402884afbb9608bc607bb` |
+| Initial source archive, GitHub | `5e82c8f562c22f54ede4519b2928aa1bf78ec6057742d06796b4e837b23fe4c7` |
+| Approved wheel, both services | `d6807a9cf203d402853e6e14c2bd5f97c7d0815b79ba241861bd39ec95a5b7a6` |
+| Approved source archive, both services | `5b9a5e15bd4fd3c6765cdfd6d9d12f13932d47c5ab6e33670b217526ff02111a` |
+
+## Migration to curated commit messages
+
+Published tags keep their original commit IDs. Rewording their ancestors changes
+the corresponding release commits in the curated branch even though all their
+file trees remain identical.
+
+| Tag | Original commit | Equivalent curated commit |
+| --- | --- | --- |
+| v0.1.0 | `1221ae6acbe4a0398fb5f3e51db4fc670395b0e1` | `d8aea19fa65ac5d70a60705bc44f9728bc113619` |
+| v0.1.1 | `5a45a2d076531936a653e31873fd176d29b232e2` | `2c406150c9f559d5e975d88b645effbb449cf46d` |
+
+Only the approved release has an operational mapping in
+`.github/release-history.json`. Validation requires its exact original commit,
+an identical full Git tree at the mapped commit, and mapped ancestry of the
+workflow's main revision. Unmapped tags still require ordinary ancestry.
+Publication continues to check out the original tag commit and reuse its
+verified assets. The initial archival release is not enabled for retries.
+The same history file records the retired version. Both the policy gate and
+publication validation reject reusing it, even if a proposal changes every
+version marker to that number.
+
+The root `last-release-sha` in `release-please-config.json` limits Release
+Please's commit scan to the mapped approved release. A bootstrap setting would
+not work: Release Please still finds the original GitHub release, so it does
+not enter bootstrap mode. The policy gate and preparation command require the
+boundary to equal the approved version's recorded mapping. The next intentional
+version PR must remove this root field; checks reject leaving it pinned to the
+old release. Keep the historical mapping as provenance. New tags follow normal
+ancestry and do not require additional mappings.
+
+Replacing protected main remains a separate repository-policy operation.
+A squash merge can install the code but cannot remove the old commit history.
+Do not move published tags, merge the old lineage into the curated branch, or
+disable ancestry and artifact checks to make a cosmetic rewrite pass.
 
 ## Incident and recovery
 
@@ -17,8 +79,10 @@ again. Reverting metadata alone could not stop the automation.
 The attempted `last-release-sha` workaround was inside `packages["."]`, although
 Release Please supports that option only at the configuration root. A permanent
 root override would also pin history scanning to an old boundary. The repair
-removes it and the workflow's approval/merge code. Preparation is now manual and
-uses `skip-github-release`, so it cannot create release tags or GitHub releases.
+removed it and the workflow's approval/merge code. The later history migration
+uses a root-only boundary with an explicit mapping and a stale-boundary gate,
+as described above. Preparation is now manual and uses `skip-github-release`,
+so it cannot create release tags or GitHub releases.
 A separate guard compares the approved tag with main's package code, plugin
 files and `[project]` metadata before invoking Release Please. Workflow changes,
 release scripts and development tooling alone cannot open another release PR,
@@ -29,9 +93,10 @@ GitHub and PyPI were checked during recovery. Both retained valid 0.1.1 package
 files with matching SHA-256 hashes. PyPI also contained an unwanted 0.1.2, and
 GitHub showed 0.1.2 as latest. Recovery returned that release to a draft, preserving
 its assets and tag, and restored 0.1.1 as GitHub's latest release. Restoring main
-to 0.1.1 does not remove PyPI's records. Keep 0.1.1's files and tag intact and
-yank 0.1.2 through the PyPI project's release management page. Yanking is
-recoverable; deleting a PyPI file permanently consumes its filename. Existing
+to 0.1.1 does not remove PyPI's records. Keep 0.1.1's files and tag intact. The
+unwanted version was absent from PyPI at the later audit. Do not recreate
+it: deleting a PyPI file permanently consumes its filename. If an unwanted
+publication happens again, prefer recoverable yanking over deletion. Existing
 users pinned exactly to a yanked version can still install it.
 
 ## A future intentional release
@@ -41,6 +106,9 @@ users pinned exactly to a yanked version can still install it.
 2. Review the changelog and version changes and merge the PR through required
    checks. A generated PR is a proposal, not release authorization. Previously
    consumed versions cannot be reused, including a deleted or yanked 0.1.2.
+   Select an unused version explicitly if the proposal suggests the retired
+   number. Remove the migration's root `last-release-sha` in this version PR;
+   the policy gate rejects a stale migration boundary.
 3. Create the corresponding version tag at the reviewed commit on `main`.
    Enable Release and dispatch it from `main` with that existing tag.
 4. Check the workflow result and verify the published version. A release is
@@ -72,9 +140,16 @@ require a later retry. No error creates a new version automatically.
 ## Verification limits
 
 `make check` includes real temporary Git repositories for tag resolution and
-history checks, plus simulated GitHub/PyPI failures for retry and ordering
-checks. These are not live publication tests. Read-only checks against the
+history and migration checks, plus simulated GitHub/PyPI failures for retry
+and ordering checks. These are not live publication tests. Read-only checks
+against the
 existing 0.1.1 files verify its current hashes without uploading packages.
 GitHub App permissions and PyPI trusted-publisher configuration must also allow
 the respective workflows. A successful local gate cannot prove those external
 permissions. Never publish a throwaway version just to test the workflow.
+
+The migration audit also ran Release Please 17.6.0, the version locked by the
+pinned action, against the published curated branch using read-only GitHub
+requests and the proposed scan boundary. It stopped at the mapped release and
+built zero release proposals. This exercises history discovery without opening
+a PR, tagging a commit, dispatching workflows, or uploading packages.

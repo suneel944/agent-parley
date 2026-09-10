@@ -10,6 +10,8 @@ import tokenize
 import tomllib
 from pathlib import Path
 
+from scripts import release_publish
+
 
 def has_attribution(text: str) -> bool:
     """Detects assistant credits and generator signatures in contribution text.
@@ -134,6 +136,7 @@ def main() -> None:
     if manifest.exists():
         if json.loads(manifest.read_text())["."] != metadata["version"]:
             errors.append("Release manifest version differs from package")
+        errors.extend(release_publish.migration_config_errors(root))
     elif (root / ".git").exists():
         errors.append("Release manifest is missing")
     lock = tomllib.loads((root / "uv.lock").read_text())

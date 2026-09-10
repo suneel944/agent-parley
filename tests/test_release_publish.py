@@ -154,6 +154,174 @@ def test_unapproved_version_cannot_be_republished(git_repo):
         release.validate_tag(git_repo, "v0.1.2")
 
 
+@pytest.fixture
+def migrated_repo(git_repo):
+    release.command("git", "tag", TAG, cwd=git_repo)
+    original = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    release.command(
+        "git", "commit", "--amend", "-m", "Reworded version", cwd=git_repo
+    )
+    rewritten = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    (git_repo / ".github").mkdir()
+    (git_repo / ".github/release-history.json").write_text(
+        json.dumps(
+            {
+                "migrations": {
+                    TAG: {"original": original, "rewritten": rewritten}
+                },
+                "retired": ["0.1.2"],
+            }
+        )
+    )
+    (git_repo / ".release-please-manifest.json").write_text(
+        json.dumps({".": VERSION})
+    )
+    (git_repo / "release-please-config.json").write_text(
+        json.dumps({"packages": {".": {}}, "last-release-sha": rewritten})
+    )
+    release.command("git", "add", ".", cwd=git_repo)
+    release.command("git", "commit", "-m", "Map release", cwd=git_repo)
+    return git_repo
+
+
+def test_migration_preserves_tag_source_and_ignores_tooling(migrated_repo):
+    original = release.command(
+        "git", "rev-parse", f"refs/tags/{TAG}", cwd=migrated_repo
+    )
+    assert release.validate_tag(migrated_repo, TAG) == original
+    assert not release.has_package_changes(migrated_repo)
+    assert release.migration_config_errors(migrated_repo) == []
+    package = migrated_repo / "agent_parley"
+    package.mkdir()
+    (package / "cli.py").write_text('"""A new package change."""\n')
+    release.command("git", "add", ".", cwd=migrated_repo)
+    release.command("git", "commit", "-m", "Package change", cwd=migrated_repo)
+    assert release.has_package_changes(migrated_repo)
+
+
+@pytest.mark.parametrize("damage", ["moved_tag", "different_tree", "missing"])
+def test_migration_cannot_authorize_changed_provenance(migrated_repo, damage):
+    path = migrated_repo / ".github/release-history.json"
+    history = json.loads(path.read_text())
+    mapping = history["migrations"]
+    if damage == "moved_tag":
+        release.command(
+            "git",
+            "tag",
+            "-f",
+            TAG,
+            mapping[TAG]["rewritten"],
+            cwd=migrated_repo,
+        )
+        expected = ValueError
+    elif damage == "different_tree":
+        mapping[TAG]["rewritten"] = release.command(
+            "git", "rev-parse", "HEAD", cwd=migrated_repo
+        )
+        path.write_text(json.dumps(history))
+        expected = ValueError
+    else:
+        path.unlink()
+        expected = subprocess.CalledProcessError
+    with pytest.raises(expected):
+        release.validate_tag(migrated_repo, TAG)
+
+
+def test_equivalent_migration_commit_must_be_on_current_history(migrated_repo):
+    path = migrated_repo / ".github/release-history.json"
+    history = json.loads(path.read_text())
+    mapping = history["migrations"]
+    release.command(
+        "git",
+        "checkout",
+        "-b",
+        "other",
+        mapping[TAG]["original"],
+        cwd=migrated_repo,
+    )
+    release.command(
+        "git",
+        "commit",
+        "--amend",
+        "-m",
+        "Unrelated rewrite",
+        cwd=migrated_repo,
+    )
+    mapping[TAG]["rewritten"] = release.command(
+        "git", "rev-parse", "HEAD", cwd=migrated_repo
+    )
+    release.command("git", "checkout", "main", cwd=migrated_repo)
+    path.write_text(json.dumps(history))
+    with pytest.raises(subprocess.CalledProcessError):
+        release.validate_tag(migrated_repo, TAG)
+
+
+@pytest.mark.parametrize(
+    "entry", [None, {}, {"original": "HEAD", "rewritten": "HEAD"}]
+)
+def test_migration_requires_exact_commit_ids(migrated_repo, entry):
+    (migrated_repo / ".github/release-history.json").write_text(
+        json.dumps({"migrations": {TAG: entry}, "retired": []})
+    )
+    with pytest.raises(ValueError, match="exact commit IDs"):
+        release.validate_tag(migrated_repo, TAG)
+
+
+@pytest.mark.parametrize("damage", ["absent", "wrong", "package", "stale"])
+def test_release_scan_boundary_cannot_drift(migrated_repo, damage):
+    path = migrated_repo / "release-please-config.json"
+    config = json.loads(path.read_text())
+    if damage == "absent":
+        config.pop("last-release-sha")
+    elif damage == "wrong":
+        config["last-release-sha"] = "0" * 40
+    elif damage == "package":
+        config["packages"]["."]["last-release-sha"] = config["last-release-sha"]
+    else:
+        (migrated_repo / ".release-please-manifest.json").write_text(
+            '{".": "0.1.3"}'
+        )
+    path.write_text(json.dumps(config))
+    assert release.migration_config_errors(migrated_repo)
+    if damage == "stale":
+        config.pop("last-release-sha")
+        path.write_text(json.dumps(config))
+        assert release.migration_config_errors(migrated_repo) == []
+
+
+def test_next_release_uses_normal_ancestry_after_migration(migrated_repo):
+    path = migrated_repo / "pyproject.toml"
+    path.write_text('[project]\nname = "agent-parley"\nversion = "0.1.3"\n')
+    release.command("git", "add", ".", cwd=migrated_repo)
+    release.command("git", "commit", "-m", "Next release", cwd=migrated_repo)
+    release.command("git", "tag", "v0.1.3", cwd=migrated_repo)
+    assert release.validate_tag(migrated_repo, "v0.1.3") == release.command(
+        "git", "rev-parse", "HEAD", cwd=migrated_repo
+    )
+    with pytest.raises(ValueError, match="versions"):
+        release.validate_tag(migrated_repo, TAG)
+
+
+def test_retired_version_cannot_be_prepared_or_published(migrated_repo):
+    (migrated_repo / "pyproject.toml").write_text(
+        '[project]\nname = "agent-parley"\nversion = "0.1.2"\n'
+    )
+    (migrated_repo / ".release-please-manifest.json").write_text(
+        '{".": "0.1.2"}'
+    )
+    (migrated_repo / "release-please-config.json").write_text(
+        '{"packages": {".": {}}}'
+    )
+    release.command("git", "add", ".", cwd=migrated_repo)
+    release.command("git", "commit", "-m", "Retired version", cwd=migrated_repo)
+    release.command("git", "tag", "v0.1.2", cwd=migrated_repo)
+    assert release.migration_config_errors(migrated_repo) == [
+        "Retired release versions cannot be reused."
+    ]
+    with pytest.raises(ValueError, match="Retired"):
+        release.validate_tag(migrated_repo, "v0.1.2")
+
+
 @pytest.mark.parametrize(
     ("path", "eligible"),
     [
@@ -398,5 +566,5 @@ def test_workflow_cannot_recurse_or_publish_from_an_automatic_event():
     assert "id-token" not in publication["jobs"]["build"]["permissions"]
     assert publication["jobs"]["publish"]["needs"] == "build"
     config = json.loads((root / "release-please-config.json").read_text())
-    assert "last-release-sha" not in config
+    assert release.migration_config_errors(root) == []
     assert "last-release-sha" not in config["packages"]["."]

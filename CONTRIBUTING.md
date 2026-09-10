@@ -102,9 +102,13 @@ merges through the protected-branch gate. Package, plugin, marketplace, release
 manifest and lockfile versions must agree.
 
 Publication is a separate manual Release dispatch for an existing version tag.
-The tag must resolve to a commit in main history, and both its package version
-and the approved version on main must match. Creating or pushing a tag does not
-publish anything. Release runs the tagged source's `make check` and the history
+The tag must resolve to a commit in main history or an explicitly recorded
+history migration whose rewritten commit is on main with an identical tree.
+The original tag commit stays immutable; both its package version and the
+approved version on main must match. The migration's temporary Release Please
+scan boundary must be removed in the next intentional version PR, as enforced
+by the policy gate. Creating or pushing a tag does not publish anything.
+Release runs the tagged source's `make check` and the history
 secret scan. Its build job has no PyPI identity permission. A separate publishing
 job downloads the verified GitHub assets and uploads only missing PyPI files.
 Existing PyPI filenames must have matching SHA-256 hashes and must not be yanked.

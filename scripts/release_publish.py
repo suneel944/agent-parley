@@ -85,8 +85,122 @@ def verify_assets(directory: Path, version: str) -> str:
     return digest(manifest)
 
 
+def release_history(root: Path) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Loads reviewed tag mappings and versions that cannot be reused.
+
+    Args:
+        root: Checkout containing release configuration.
+
+    Returns:
+        Commit mappings indexed by release tag, and retired versions.
+
+    Raises:
+        ValueError: If the migration file contains invalid entries.
+    """
+    path = root / ".github/release-history.json"
+    if not path.exists():
+        return {}, []
+    history = json.loads(path.read_text())
+    if not isinstance(history, dict) or set(history) != {
+        "migrations",
+        "retired",
+    }:
+        raise ValueError("Release history requires migrations and retirement.")
+    mappings, retired = history["migrations"], history["retired"]
+    if (
+        not isinstance(mappings, dict)
+        or not isinstance(retired, list)
+        or any(
+            not isinstance(version, str)
+            or not re.fullmatch(r"\d+\.\d+\.\d+", version)
+            for version in retired
+        )
+    ):
+        raise ValueError("Release history contains invalid versions.")
+    for tag, entry in mappings.items():
+        if (
+            not re.fullmatch(r"v\d+\.\d+\.\d+", tag)
+            or not isinstance(entry, dict)
+            or set(entry) != {"original", "rewritten"}
+            or any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", value)
+                for value in entry.values()
+            )
+        ):
+            raise ValueError("Release history requires exact commit IDs.")
+    return mappings, retired
+
+
+def release_baseline(root: Path, tag: str, source: str) -> str:
+    """Requires source ancestry or an exact, tree-equivalent migration.
+
+    Args:
+        root: Checkout of the proposed main revision.
+        tag: Validated release tag.
+        source: Resolved original tag commit.
+
+    Returns:
+        The equivalent release commit on the current branch's ancestry.
+
+    Raises:
+        ValueError: If a mapped tag moved or its rewritten tree differs.
+        subprocess.CalledProcessError: If a commit is absent or outside HEAD.
+    """
+    migrations, retired = release_history(root)
+    if tag[1:] in retired:
+        raise ValueError("Retired release versions cannot be reused.")
+    migration = migrations.get(tag)
+    baseline = source
+    if migration:
+        if source != migration["original"]:
+            raise ValueError("Migrated tag changed its original commit.")
+        baseline = migration["rewritten"]
+        original_tree = command(
+            "git", "rev-parse", f"{source}^{{tree}}", cwd=root
+        )
+        rewritten_tree = command(
+            "git", "rev-parse", f"{baseline}^{{tree}}", cwd=root
+        )
+        if original_tree != rewritten_tree:
+            raise ValueError("Migrated release trees must match exactly.")
+    command("git", "merge-base", "--is-ancestor", baseline, "HEAD", cwd=root)
+    return baseline
+
+
+def migration_config_errors(root: Path) -> list[str]:
+    """Rejects missing, stale or misplaced release-history scan boundaries.
+
+    Args:
+        root: Checkout containing release configuration and version manifest.
+
+    Returns:
+        Configuration errors that block policy checks and preparation.
+    """
+    config = json.loads((root / "release-please-config.json").read_text())
+    version = json.loads((root / ".release-please-manifest.json").read_text())[
+        "."
+    ]
+    migrations, retired = release_history(root)
+    migration = migrations.get(f"v{version}")
+    expected = migration["rewritten"] if migration else None
+    errors = []
+    if version in retired:
+        errors.append("Retired release versions cannot be reused.")
+    if config.get("last-release-sha") != expected:
+        errors.append(
+            "Release scan boundary must match the approved migration; "
+            "remove it when preparing the next version."
+        )
+    if any(
+        "last-release-sha" in package for package in config["packages"].values()
+    ):
+        errors.append("Release scan boundaries belong at configuration root.")
+    return errors
+
+
 def validate_tag(root: Path, tag: str) -> str:
-    """Requires a real tag on main history matching approved package metadata.
+    """Requires a real tag with approved metadata and verified provenance.
 
     A version rollback is not permission to republish different bytes. Existing
     release assets remain authoritative, and a retired tag cannot be dispatched
@@ -101,7 +215,7 @@ def validate_tag(root: Path, tag: str) -> str:
 
     Raises:
         ValueError: If the tag or versions disagree.
-        subprocess.CalledProcessError: If the tag is absent or outside main.
+        subprocess.CalledProcessError: If tag provenance is absent from main.
     """
     version_pattern = r"(?:0|[1-9][0-9]*)"
     if not re.fullmatch(
@@ -111,7 +225,7 @@ def validate_tag(root: Path, tag: str) -> str:
     source = command(
         "git", "rev-parse", f"refs/tags/{tag}^{{commit}}", cwd=root
     )
-    command("git", "merge-base", "--is-ancestor", source, "HEAD", cwd=root)
+    release_baseline(root, tag, source)
     approved = tomllib.loads((root / "pyproject.toml").read_text())["project"]
     tagged = tomllib.loads(
         command("git", "show", f"{source}:pyproject.toml", cwd=root)
@@ -276,6 +390,9 @@ def main() -> None:
     root = Path.cwd()
     phase = sys.argv[1]
     if phase == "candidate":
+        errors = migration_config_errors(root)
+        if errors:
+            raise ValueError("\n".join(errors))
         eligible = has_package_changes(root)
         emit("eligible", str(eligible).lower())
         if not eligible:
