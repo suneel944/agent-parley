@@ -76,12 +76,12 @@ merging a PR. It does not exempt the account from any required check or permit
 direct pushes. Revisit the review exception when additional maintainers join.
 
 Use Conventional Commit PR titles, such as `fix: preserve pending messages` or
-`ci: validate release metadata`; squash merges retain that title for automated
-changelogs. The title decides whether a release is cut: `feat`, `fix` and
-`perf` publish a new version, and everything else does not. Reserve them for
-changes a user of the distributed package would notice, and title workflow,
+`ci: validate release metadata`; squash merges retain that title for changelogs.
+`feat`, `fix` and `perf` contribute to a future release proposal. Reserve them
+for changes a user of the distributed package would notice. Title workflow,
 tooling and documentation work `ci`, `build`, `chore`, `test`, `refactor` or
-`docs` so the index is not given a version with no change in it. Assign an owner, add a change-type label, and reference an existing
+`docs`. Merging a PR never starts version preparation or publication.
+Assign an owner, add a change-type label, and reference an existing
 local issue with `Refs #N` or a closing keyword. Match linked issue milestones
 when present. Release PRs always require a milestone. Bot-generated descriptions
 retain their native format, but ownership and issue rules still apply.
@@ -92,16 +92,30 @@ commit messages, PRs, issues, and comments, including closed items. Keep require
 license notices and factual product documentation intact. Repository policy and
 PR hygiene checks enforce the textual attribution boundary.
 
-Release Please prepares a version and changelog PR after merges to `main`.
-Package, plugin, marketplace and lockfile versions move together. The generated
-PR gets an owner, release issue and milestone, and explicitly dispatched checks
-because GitHub's workflow token does not trigger workflows on its own PR writes.
-Review and merge it through the normal protected-branch gate. Publication creates
-a draft, runs `make check` and the history secret scan, attaches release bundles,
-downloads and verifies their checksums, then publishes. Failed publication keeps
-the release draft; rerun Release with its existing tag to retry. Published assets
-are never overwritten. The release workflow can also publish a manually pushed
-version tag, provided its commit belongs to `main` history.
+Releases require explicit maintainer actions. `0.1.1` remains the approved
+version; workflow repairs do not authorize a new version. Both release workflows
+accept only manual dispatches from `main`. The Prepare release workflow creates
+or updates a Release Please PR, using the release app identity so normal PR checks
+run. It assigns ownership, a release issue and a milestone. It cannot approve,
+merge, tag, or publish. A maintainer reviews the proposed package changes and
+merges through the protected-branch gate. Package, plugin, marketplace, release
+manifest and lockfile versions must agree.
+
+Publication is a separate manual Release dispatch for an existing version tag.
+The tag must resolve to a commit in main history, and both its package version
+and the approved version on main must match. Creating or pushing a tag does not
+publish anything. Release runs the tagged source's `make check` and the history
+secret scan. Its build job has no PyPI identity permission. A separate publishing
+job downloads the verified GitHub assets and uploads only missing PyPI files.
+Existing PyPI filenames must have matching SHA-256 hashes and must not be yanked.
+Only after both PyPI files match does the GitHub release become public/latest.
+
+Retries use the existing GitHub assets, without rebuilding or overwriting them.
+During an interrupted initial upload, the workflow can rebuild and add missing
+assets only if every uploaded file still matches; the checksum manifest is
+uploaded last. Partial PyPI uploads resume at missing files. Failures leave a new
+release as a draft. Never delete and reuse a published version or move its tag.
+See [release operations](docs/releases.md) for recovery and verification limits.
 
 Contributions are accepted under the repository's MIT license. Submit only work
 you have the right to contribute. Follow CODE_OF_CONDUCT.md and report security
