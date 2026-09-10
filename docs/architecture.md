@@ -132,6 +132,16 @@ required variables are read from the caller's environment at launch, so no
 credential value enters bridge state. Sign-in inside each config home remains the
 native CLI's own action.
 
+Registering a project reads committed HEAD, so pending base-checkout work would
+never reach a lane. Rather than refusing, `setup`, `participant add` and `run`
+stash that work with `git stash push --include-untracked` when they create the
+project manifest, then report the entry on standard error. One stash stack is
+shared by every worktree of a repository, so the entry carries a unique message
+and is restored by name with `git stash apply <entry>` rather than by position.
+Nothing is reset, cleaned or force-switched, and a checkout Git cannot fully
+stash still refuses. Later registrations read the existing manifest and never
+touch the checkout.
+
 Branch verification is scoped to the lane an operation touches, so a lane left
 on the wrong branch blocks only its own participant. `status` reports every
 lane's actual branch. `participant restore` returns one lane to its branch and

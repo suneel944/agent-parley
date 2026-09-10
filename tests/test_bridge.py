@@ -59,10 +59,25 @@ def test_isolation_identity_and_idempotent_setup(bridge, repo, paired):
     )
 
 
-def test_dirty_source_is_not_silently_omitted(bridge, repo):
+def test_dirty_source_is_preserved_as_a_stash_entry(bridge, repo, capsys):
     (repo / "shared.txt").write_text("uncommitted work\n")
-    with pytest.raises(BridgeError, match="pending changes"):
-        bridge.setup(repo)
+    (repo / "untracked.txt").write_text("untracked work\n")
+    data = bridge.setup(repo)
+    assert data["base"] == git(repo, "rev-parse", "--verify", "HEAD")
+    assert not git(repo, "status", "--porcelain")
+    assert (repo / "shared.txt").read_text() == "original\n"
+    assert not (repo / "untracked.txt").exists()
+    entry = git(repo, "rev-parse", "--short", "refs/stash")
+    assert f"stash apply {entry}" in capsys.readouterr().err
+    git(repo, "stash", "apply", entry)
+    assert (repo / "shared.txt").read_text() == "uncommitted work\n"
+    assert (repo / "untracked.txt").read_text() == "untracked work\n"
+
+
+def test_merge_still_refuses_a_dirty_base_checkout(bridge, repo, paired):
+    (repo / "shared.txt").write_text("uncommitted work\n")
+    with pytest.raises(BridgeError, match="uncommitted changes"):
+        bridge.merge(repo, "claude")
     assert (repo / "shared.txt").read_text() == "uncommitted work\n"
 
 
