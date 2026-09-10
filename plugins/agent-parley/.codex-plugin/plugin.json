@@ -1,6 +1,6 @@
 {
   "name": "agent-parley",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Run several coding agents side by side on one repository with shared issue ownership, advisory file reservations, and explicit handoffs.",
   "author": {
     "name": "Suneel Kaushik S",
