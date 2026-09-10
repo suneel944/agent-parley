@@ -50,7 +50,7 @@ state and project paths are shortened.
 
 ## Install
 
-Linux with pidfd support, Git, and [uv](https://docs.astral.sh/uv/). No clone.
+Linux or macOS, Git, and [uv](https://docs.astral.sh/uv/). No clone.
 The wheel needs no third-party runtime packages.
 
 ```sh
