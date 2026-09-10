@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
+import datetime
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -746,6 +748,176 @@ def test_top_marks_a_lease_past_its_time_to_live_as_stale(
     assert "1!1" in stale
     assert "past a declared time to live" in stale
     assert "still held" in stale
+
+
+def usage_record(identifier, tokens):
+    """Builds one assistant transcript record reporting its own usage."""
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "id": identifier,
+                "usage": {
+                    "input_tokens": tokens,
+                    "cache_creation_input_tokens": tokens * 2,
+                    "cache_read_input_tokens": tokens * 3,
+                    "output_tokens": tokens * 4,
+                },
+            },
+        }
+    )
+
+
+def total_record(total):
+    """Builds one Codex rollout record reporting a running session total."""
+    return json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": total}},
+            },
+        }
+    )
+
+
+def claude_transcript(config, lane, lines):
+    """Writes a Claude transcript where that client would keep one."""
+    directory = (
+        Path(config) / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(lane))
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "session.jsonl"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def codex_rollout(config, lane, lines):
+    """Writes a Codex rollout where that client would keep one today."""
+    day = datetime.date.today()
+    directory = (
+        Path(config) / "sessions" / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "rollout-session.jsonl"
+    meta = json.dumps({"type": "session_meta", "payload": {"cwd": str(lane)}})
+    path.write_text("\n".join([meta, *lines]) + "\n")
+    return path
+
+
+def rows_of(view):
+    """Indexes one project's rendered rows by participant."""
+    return {row["participant"]: row for row in view["projects"][0]["rows"]}
+
+
+def test_top_reports_tokens_each_native_client_recorded(
+    bridge, repo, paired, tmp_path, capsys
+):
+    claude_transcript(
+        tmp_path / "claude_config_dir",
+        paired["lanes"]["claude"],
+        [
+            usage_record("msg_a", 10),
+            usage_record("msg_b", 5),
+            usage_record("msg_a", 10),
+        ],
+    )
+    codex_rollout(
+        tmp_path / "codex_home",
+        paired["lanes"]["codex"],
+        [total_record(1200), total_record(2500)],
+    )
+    rows = rows_of(dashboard.collect(bridge.home, False, {}))
+    assert rows["claude"]["tokens"] == 150
+    assert rows["codex"]["tokens"] == 2500
+
+    dashboard.run(bridge.home, lambda: False, once=True)
+    output = capsys.readouterr().out
+    lines = output.splitlines()
+    assert any(
+        line.startswith("PARTICIPANT") and line.endswith("TOKENS")
+        for line in lines
+    )
+    assert (
+        next(line for line in lines if line.startswith("claude ")).split()[-1]
+        == "150"
+    )
+    assert (
+        next(line for line in lines if line.startswith("codex ")).split()[-1]
+        == "2.5k"
+    )
+    assert "not billed spend" in output
+
+
+def test_top_leaves_tokens_blank_without_readable_session_records(
+    bridge, repo, paired, capsys
+):
+    rows = rows_of(dashboard.collect(bridge.home, False, {}))
+    assert rows["claude"]["tokens"] is None
+    assert rows["codex"]["tokens"] is None
+
+    dashboard.run(bridge.home, lambda: False, once=True)
+    lines = capsys.readouterr().out.splitlines()
+    assert any(
+        line.startswith("PARTICIPANT") and line.endswith("TOKENS")
+        for line in lines
+    )
+    assert (
+        next(line for line in lines if line.startswith("claude ")).split()[-1]
+        == "0"
+    )
+
+
+def test_token_reading_survives_a_malformed_session_record(
+    bridge, repo, paired, tmp_path
+):
+    claude_transcript(
+        tmp_path / "claude_config_dir",
+        paired["lanes"]["claude"],
+        [
+            "{ not json at all",
+            json.dumps({"message": {"usage": "unexpected"}}),
+            json.dumps([1, 2, 3]),
+            json.dumps({"message": {"id": "msg_a", "usage": {"input": None}}}),
+            usage_record("msg_b", 10),
+        ],
+    )
+    rows = rows_of(dashboard.collect(bridge.home, False, {}))
+    assert rows["claude"]["tokens"] == 100
+
+
+def test_token_reading_follows_a_relocated_credential_home(
+    bridge, repo, tmp_path
+):
+    relocated = tmp_path / "account-1-home"
+    roster.define_credential(bridge.home, "account-1", str(relocated), [], [])
+    data = bridge.add_participant(repo, "claude-1", "claude", "account-1")
+    lane = data["lanes"]["claude-1"]
+    claude_transcript(relocated, lane, [usage_record("msg_a", 10)])
+    claude_transcript(
+        tmp_path / "claude_config_dir", lane, [usage_record("msg_b", 50)]
+    )
+    rows = rows_of(dashboard.collect(bridge.home, False, {}))
+    assert rows["claude-1"]["tokens"] == 100
+
+
+def test_repeated_token_readings_fold_only_appended_records(
+    bridge, repo, paired, tmp_path
+):
+    lane = paired["lanes"]["claude"]
+    path = claude_transcript(
+        tmp_path / "claude_config_dir", lane, [usage_record("msg_a", 10)]
+    )
+    cache: dict = {}
+    rows = rows_of(dashboard.collect(bridge.home, False, {}, readings=cache))
+    assert rows["claude"]["tokens"] == 100
+    consumed = cache[str(lane)]["offset"]
+    with path.open("r+b") as handle:
+        handle.write(b"x" * (consumed - 1))
+    with path.open("ab") as handle:
+        handle.write((usage_record("msg_b", 5) + "\n").encode())
+    rows = rows_of(dashboard.collect(bridge.home, False, {}, readings=cache))
+    assert rows["claude"]["tokens"] == 150
 
 
 def test_checkpoint_records_every_decision_in_a_rotating_event_log(

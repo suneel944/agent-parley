@@ -92,8 +92,9 @@ not drop the edge; the owner runs `issue unblock` when the wait is over.
 `agent-parley top` watches every participant live: session state, event age,
 branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
-the oldest, delivered context, denials against retained hook events, and served
-MCP calls with rejections. The header carries server health and the project's
+the oldest, delivered context, denials against retained hook events, served
+MCP calls with rejections, and the tokens that lane's own native client
+recorded. The header carries server health and the project's
 denial rate. The view is read-only and makes no model call; `q` leaves it.
 
 A reservation may declare `ttl_seconds`, and one taken without it never
@@ -116,6 +117,23 @@ than the current file alone. Only those two files are kept, and records older
 than fourteen days are discarded at the next session start or session end, so a
 long-running lane reports recent enforcement, not project history; served-call
 counts cover the most recent 2000 events per project.
+
+`TOKENS` is what that lane's own native client recorded for its session, read
+from the session records the client already keeps on disk: no vendor request,
+no API key, no price. Treat it as a relative signal between refreshes of the
+same lane. It is **not** billed spend, and it is not comparable between
+vendors, which count differently. It is also unrelated to `CONTEXT`, which
+measures only the bytes coordination itself injects. The records are looked up
+under the config home that lane launched with, so a credential profile that
+relocates the config home is followed. The cell is blank whenever nothing
+could be read — records absent, unreadable, malformed, or in a shape a client
+version changed — and a blank cell means "not read", never "spent nothing".
+Claude is read from that client's transcript for the lane's working directory.
+Codex is read from the rollout whose own record names that lane, searched only
+in the last two days of rollouts, so a Codex session older than that reports
+nothing. Reading is incremental: each refresh folds only the records appended
+since the previous one, up to 1 MiB per lane, so watching a long session never
+re-reads its history.
 
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six

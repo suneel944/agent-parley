@@ -347,6 +347,40 @@ def define_credential(
     )
 
 
+def config_home(home: Path, entry: dict, profile: str | None) -> str:
+    """Returns the config home a launch selects for one provider account.
+
+    A read-only reader of a native client's own files needs the same directory
+    the launcher points that client at, so both resolve it here rather than
+    assuming a fixed path in the operator's home directory.
+
+    Args:
+        home: Private bridge state root.
+        entry: Provider definition.
+        profile: Credential profile name, or None for the CLI default account.
+
+    Returns:
+        The directory the provider's config-home variable is set to, or an
+        empty string when the launch leaves that variable to the caller.
+
+    Raises:
+        BridgeError: If the profile is undefined, or names a home this
+            provider cannot apply.
+    """
+    if profile is None:
+        return ""
+    account = credential(home, profile)
+    if not account.get("home"):
+        return ""
+    variable = entry.get("home_env", "")
+    if not variable:
+        raise BridgeError(
+            f"Provider {entry['command']!r} has no home_env, so a "
+            "credential home cannot select a separate account."
+        )
+    return str(account["home"])
+
+
 def launch_environment(
     home: Path, entry: dict, profile: str | None
 ) -> dict[str, str]:
@@ -378,14 +412,9 @@ def launch_environment(
             if not os.environ.get(name)
         ]
         result.update(account.get("env", {}))
-        if account.get("home"):
-            variable = entry.get("home_env", "")
-            if not variable:
-                raise BridgeError(
-                    f"Provider {entry['command']!r} has no home_env, so a "
-                    "credential home cannot select a separate account."
-                )
-            result[variable] = account["home"]
+        selected = config_home(home, entry, profile)
+        if selected:
+            result[entry["home_env"]] = selected
     if missing:
         raise BridgeError(
             "Export these before launching: " + ", ".join(sorted(set(missing)))

@@ -17,6 +17,7 @@ native approvals, or merge work.
 | `forge` | Optional best-effort issue lookups and mirrors on the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view of every participant |
+| `records` | Best-effort reading of native CLI session records on disk |
 | `state` | Private atomic JSON publication and operation locks |
 
 Enforcement and telemetry share one substrate, on purpose, in two places. Hook
@@ -367,6 +368,7 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | Participant event log | Rotated at 262,144 bytes; one rotated file retained |
 | Participant event age | 1,209,600 seconds, applied at a session boundary |
 | Retained tool events | 2,000 per project |
+| Session record read per lane per refresh | 1,048,576 bytes |
 
 Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refetch
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.
@@ -384,7 +386,33 @@ not create continuation loops. Failed observations never request replay of an
 already completed action. Coordination errors before edits pause work.
 
 Status reports notice counts and injected UTF-8 bytes, not tokenizer counts or
-API billing. Deterministic tests enforce context budgets. `make benchmark`
+API billing. That measure covers what coordination itself delivers into a
+lane's context and nothing else; it is not, and must not be read as, what a
+lane spends.
+
+`top` reports a lane's token count separately, from the session records the
+native client already writes under its own config home: the Claude transcript
+for the lane's working directory, and the Codex rollout whose recorded working
+directory is that lane. The config home is resolved through the same
+`roster.config_home` the launcher uses, so a credential profile that relocates
+it is followed rather than guessed at. Nothing is requested from a vendor, no
+key is read, and no price is applied. The number is one client's own count for
+one session: not billed spend, and not comparable between vendors, whose
+counting differs. Every step is best effort — an absent, unreadable, malformed
+or unexpectedly shaped record reports nothing and renders a blank cell, because
+an operator view must not fail on a private file format that can change.
+
+Reading is bounded so a live refresh stays responsive. Each lane resolves one
+record file, the most recently modified; the Codex lookup only inspects the two
+most recent day directories and at most sixteen candidates within them, so an
+older session reports nothing rather than costing a scan. A reading remembers
+the file, its inode and the byte offset it stopped at, folds only complete
+lines appended since, and consumes at most 1 MiB per refresh, so a session's
+history is never re-read each second and a record that grew by more than the
+budget catches up over later refreshes. A replaced or truncated file starts a
+new reading. Claude records are summed per message and deduplicated by message
+identifier; Codex records already carry a running session total, so the latest
+one wins. Deterministic tests enforce context budgets. `make benchmark`
 measures latency separately; results depend on hardware and workload.
 
 ## Migration and verification limits
