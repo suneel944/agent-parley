@@ -1,15 +1,10 @@
 name: Release
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to verify and publish
+        description: Existing tag matching the approved version on main
         required: true
         type: string
 
@@ -17,110 +12,71 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-publication
   cancel-in-progress: false
 
 jobs:
-  publish:
+  build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
-      id-token: write
-      issues: write
+    outputs:
+      checksum: ${{ steps.prepare.outputs.checksum }}
+      source: ${{ steps.validate.outputs.source }}
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Require a release tag on main history
-        run: |
-          set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          git fetch origin main
-          git merge-base --is-ancestor HEAD origin/main
+      - name: Validate the exact tag and approved version
+        id: validate
+        run: python3 -m scripts.release_publish validate
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.validate.outputs.source }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
       - uses: ./.github/actions/secret-scan
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
       - run: make check
-      - run: make release-artifacts
-      - name: Create draft release with verified artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist/release
-          sha256sum --check SHA256SUMS
-          if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
-            if [ "$(jq -r .isDraft release.json)" = true ]; then
-              gh release upload "$RELEASE_TAG" --clobber \
-                ./*.whl ./*.tar.gz ./*.zip requirements.txt CHANGELOG.md \
-                RELEASE_NOTES.md SHA256SUMS
-            else
-              echo "$RELEASE_TAG is already published; verifying its bytes."
-            fi
-          else
-            gh release create "$RELEASE_TAG" --verify-tag --draft \
-              --title "Agent Parley $RELEASE_TAG" \
-              --notes-file RELEASE_NOTES.md \
-              ./*.whl ./*.tar.gz ./*.zip requirements.txt CHANGELOG.md \
-              RELEASE_NOTES.md SHA256SUMS
-          fi
-      - name: Verify uploaded bytes and publish
-        shell: bash
-        run: |
-          set -euo pipefail
-          verification_dir=$(mktemp -d)
-          gh release download "$RELEASE_TAG" --dir "$verification_dir"
-          cmp dist/release/SHA256SUMS "$verification_dir/SHA256SUMS"
-          (cd "$verification_dir" && sha256sum --check SHA256SUMS)
-          gh release edit "$RELEASE_TAG" --draft=false --latest
-      - name: Stage the wheel and sdist for PyPI
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${RELEASE_TAG#v}"
-          rm -rf dist/pypi
-          mkdir -p dist/pypi
-          cp "dist/release/agent_parley-${version}-py3-none-any.whl" \
-            "dist/release/agent_parley-${version}.tar.gz" dist/pypi/
+        working-directory: release-source
+      - name: Prepare or reuse verified release assets
+        id: prepare
+        run: python3 -m scripts.release_publish prepare
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_CHECKSUM: ${{ needs.build.outputs.checksum }}
+      RELEASE_SOURCE: ${{ needs.build.outputs.source }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify assets and stage only missing PyPI files
+        id: stage
+        run: python3 -m scripts.release_publish stage
       - name: Publish to PyPI
+        if: steps.stage.outputs.pending == 'true'
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           packages-dir: dist/pypi
-          skip-existing: true
           print-hash: true
-      - name: Close the tracking issue and milestone for this release
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-        with:
-          script: |
-            const repo = context.repo;
-            const tag = process.env.RELEASE_TAG;
-            const issues = await github.paginate(
-              github.rest.issues.listForRepo,
-              {...repo, state: 'open', labels: 'release'});
-            for (const issue of issues.filter(i => !i.pull_request &&
-                i.title === `Release ${tag}`)) {
-              await github.rest.issues.createComment({
-                ...repo, issue_number: issue.number,
-                body: `Published ${tag}. Release assets were downloaded ` +
-                  'again after upload and checked against SHA256SUMS.',
-              });
-              await github.rest.issues.update({
-                ...repo, issue_number: issue.number,
-                state: 'closed', state_reason: 'completed'});
-            }
-            const milestones = await github.paginate(
-              github.rest.issues.listMilestones, {...repo, state: 'open'});
-            for (const milestone of milestones.filter(m => m.title === tag)) {
-              if (milestone.open_issues === 0) {
-                await github.rest.issues.updateMilestone({
-                  ...repo, milestone_number: milestone.number,
-                  state: 'closed'});
-              }
-            }
+      - name: Verify PyPI hashes before publishing the GitHub release
+        run: python3 -m scripts.release_publish finish

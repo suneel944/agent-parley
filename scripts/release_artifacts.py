@@ -60,6 +60,29 @@ def release_notes(
     return "\n\n".join(parts) + "\n"
 
 
+def add_entry(archive: zipfile.ZipFile, path: Path, name: str) -> None:
+    """Stores one file with fixed metadata so the bundle is reproducible.
+
+    Checkout timestamps and file modes vary between machines and between
+    continuous integration runs, and a zip entry records both, so an
+    otherwise identical bundle hashes differently each time it is built.
+    Fixing them lets a rebuild of a released tag be compared byte for byte
+    against the published asset.
+
+    Args:
+        archive: Open bundle receiving the entry.
+        path: File to store.
+        name: Path recorded inside the bundle.
+
+    Raises:
+        OSError: If the file cannot be read.
+    """
+    entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    entry.compress_type = zipfile.ZIP_DEFLATED
+    entry.external_attr = 0o644 << 16
+    archive.writestr(entry, path.read_bytes())
+
+
 def main() -> None:
     """Collects release assets and hashes after checking version agreement.
 
@@ -103,8 +126,8 @@ def main() -> None:
     ]
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in inputs:
-            archive.write(path, path.relative_to(root))
-        archive.write(root / "plugins" / "README.md", "README.md")
+            add_entry(archive, path, str(path.relative_to(root)))
+        add_entry(archive, root / "plugins" / "README.md", "README.md")
     assets.append(bundle)
     requirements = output / "requirements.txt"
     subprocess.run(

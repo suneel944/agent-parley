@@ -130,6 +130,18 @@ def main() -> None:
     )
     if marketplace["plugins"][0]["version"] != metadata["version"]:
         errors.append("Claude marketplace version differs from package")
+    manifest = root / ".release-please-manifest.json"
+    if manifest.exists():
+        if json.loads(manifest.read_text())["."] != metadata["version"]:
+            errors.append("Release manifest version differs from package")
+    elif (root / ".git").exists():
+        errors.append("Release manifest is missing")
+    lock = tomllib.loads((root / "uv.lock").read_text())
+    locked = [
+        p["version"] for p in lock["package"] if p["name"] == metadata["name"]
+    ]
+    if locked != [metadata["version"]]:
+        errors.append("Locked project version differs from package")
     served = (root / "agent_parley/server.py").read_text()
     if f'"{metadata["name"]}"' not in served:
         errors.append(
