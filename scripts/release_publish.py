@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 MINOR_THRESHOLD = 10
-MAJOR_THRESHOLD = 50
+MAJOR_THRESHOLD = 100
 RETIREMENT_LIMIT = 100
 PACKAGE_PATHS = ("agent_parley", "plugins/agent-parley")
 MANIFEST_PATH = ".release-manifest.json"
@@ -352,7 +352,7 @@ def release_candidate(root: Path) -> tuple[str, int, int]:
     """Returns the version the measured product changes propose, with counts.
 
     Eligibility is measured rather than judged so preparation can run
-    unattended. Fifty product features propose the next major version, ten
+    unattended. A hundred product features propose the next major version, ten
     product issues propose the next minor version, and a single commit
     titled fix(urgent) is the only mechanical marker that proposes a patch
     version. Nothing else raises a version. The proposal then looks ahead

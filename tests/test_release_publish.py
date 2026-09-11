@@ -385,14 +385,19 @@ def test_ten_product_issues_propose_the_next_minor(counted_repo, local):
     assert release.release_candidate(counted_repo) == ("0.2.0", 10, 1)
 
 
-def test_fifty_product_features_propose_the_next_major(counted_repo, local):
-    for number in range(release.MAJOR_THRESHOLD - 1):
+def test_the_feature_threshold_proposes_the_next_major(counted_repo, local):
+    below = release.MAJOR_THRESHOLD - 1
+    for number in range(below):
         product_commit(
             counted_repo, f"feat: feature {number}", body=f"Refs #{number}"
         )
-    assert release.release_candidate(counted_repo) == ("0.2.0", 49, 49)
-    product_commit(counted_repo, "feat: the fiftieth", body="Refs #999")
-    assert release.release_candidate(counted_repo) == ("1.0.0", 50, 50)
+    assert release.release_candidate(counted_repo) == ("0.2.0", below, below)
+    product_commit(counted_repo, "feat: the last one", body="Refs #999")
+    assert release.release_candidate(counted_repo) == (
+        "1.0.0",
+        release.MAJOR_THRESHOLD,
+        release.MAJOR_THRESHOLD,
+    )
 
 
 def test_only_an_urgent_fix_proposes_a_patch(counted_repo, local):
@@ -490,7 +495,9 @@ def test_candidate_phase_reports_measured_eligibility(
         }
         assert printed == (
             "2 product issues and 2 product features since v0.1.1; "
-            "10 issues or 50 features or one fix(urgent) commit are required."
+            f"{release.MINOR_THRESHOLD} issues or "
+            f"{release.MAJOR_THRESHOLD} features or one fix(urgent) commit "
+            "are required."
         )
     else:
         assert emitted == {

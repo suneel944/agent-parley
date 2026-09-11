@@ -126,7 +126,7 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    Each counted commit contributes the distinct issues its message names
    through `Refs`, `Fixes`, `Closes` or `Resolves`, so one issue delivered by
    three pull requests counts once; a counted commit that names no issue counts
-   as one unit of its own. Fifty product features propose the next major
+   as one unit of its own. A hundred product features propose the next major
    version, ten product issues propose the next minor version, and a single
    commit titled `fix(urgent):` proposes the next patch version. That scope is
    the only mechanical marker for a patch release; nothing else reaches that
