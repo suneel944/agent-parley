@@ -122,6 +122,17 @@ It always records a merge commit, refuses on a running session, a dirty tree or
 a drifted lane, and leaves a conflict in place for you to resolve. It never
 resets, cleans, stashes or force-switches.
 
+To see what that would bring in, and everything that would refuse it right now,
+ask for a preview first:
+
+```sh
+agent-parley participant merge claude-2 --preview
+```
+
+The preview only reads. It changes nothing, and it never takes the lane's
+session lock, so it is safe while that agent is still working. It attempts no
+merge, so it cannot predict conflicts.
+
 ## What it enforces
 
 **Ownership changes only through explicit claims and accepted handoffs.** No

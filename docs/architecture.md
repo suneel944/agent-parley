@@ -162,6 +162,17 @@ and `git merge --abort` reported; Agent Parley never resolves a conflict, and
 never resets, cleans, stashes or force-switches. Merging leaves the lane and its
 branch untouched, so retiring stays a separate decision.
 
+`participant merge --preview` answers the same question without acting. It
+reports the commits `HEAD..branch`, the files they change relative to the merge
+base, and every refusal above at once instead of one at a time, so a single
+report names everything to fix. Merge and preview share one generator of
+refusal conditions, so their wording cannot drift; the merge raises the first
+condition it meets, the preview collects them all. The preview writes nothing
+and takes no session lock, because previewing a lane while its agent works is
+the ordinary case and that lock belongs to the session; a running session is
+read from the recorded session process, as liveness reporting reads it. It
+performs no trial merge, so it reports refusals, never conflicts.
+
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
 reservations continue to resolve.

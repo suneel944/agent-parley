@@ -16,11 +16,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 from agent_parley import dashboard, forge, process, roster, store
 from agent_parley.checkpoints import (
     EVENTS,
+    activity,
     current_branch,
     lane_branch,
     mailbox,
@@ -156,6 +158,157 @@ def drift(name: str, participant: dict, actual: str) -> str:
     )
 
 
+def session_busy(name: str) -> str:
+    """Builds the refusal used while a participant still holds a session.
+
+    Args:
+        name: Participant that owns the lane.
+
+    Returns:
+        The message reported when that participant is still working.
+    """
+    return f"{name} has a running session; stop that terminal first."
+
+
+def merge_blockers(
+    root: Path, lane: Path, name: str, branch: str, session: str = ""
+) -> Iterator[str]:
+    """Yields the conditions that refuse a lane merge, in the order met.
+
+    Yielding lazily lets a merge stop at its first refusal while a preview
+    collects every one of them, so both report a condition in the same
+    words. The branch is examined first because nothing else can be
+    inspected once it is gone, and iteration stops there. Every check reads;
+    none writes.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        lane: Assigned bridge worktree belonging to the participant.
+        name: Participant that owns the lane.
+        branch: Bridge branch to merge into the base checkout.
+        session: Session state when the participant still holds a running
+            session, or an empty string when no session blocks the merge.
+
+    Yields:
+        One refusal message for each condition that is currently unmet.
+
+    Raises:
+        BridgeError: If Git cannot read either checkout.
+        subprocess.TimeoutExpired: If a read exceeds the command timeout.
+    """
+    if not has_branch(root, branch):
+        yield (
+            f"Branch {branch} no longer exists. Recover it from the reflog, "
+            f"or retire {name} and add it again."
+        )
+        return
+    base = current_branch(root)
+    if base == branch:
+        yield (
+            f"The base checkout at {root} is on {branch} itself. Switch it "
+            "to the branch that should receive this work, then rerun."
+        )
+    if base == "<detached HEAD>":
+        yield (
+            f"The base checkout at {root} is on a detached HEAD. Switch it "
+            "to the branch that should receive this work, then rerun."
+        )
+    git_dir = Path(
+        git(root, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+    quoted = shlex.quote(str(root))
+    if (git_dir / "MERGE_HEAD").exists():
+        yield (
+            f"The base checkout at {root} is already merging. Finish it with "
+            f"`git -C {quoted} merge --continue`, or undo it with `git -C "
+            f"{quoted} merge --abort`, then rerun."
+        )
+    if git(root, "status", "--porcelain"):
+        yield (
+            f"The base checkout at {root} has uncommitted changes. Commit or "
+            "preserve them first; merge never discards work."
+        )
+    if lane.exists() and git(lane, "status", "--porcelain"):
+        yield (
+            f"{name} has uncommitted changes that {branch} does not carry. "
+            "Commit them in the lane first; merge only ever merges commits."
+        )
+    if session:
+        yield session_busy(name)
+
+
+def merge_preview(
+    root: Path, lane: Path, name: str, branch: str, session: str
+) -> str:
+    """Reports what a lane merge would bring in and what would refuse it.
+
+    The preview only reads: it records no merge commit, moves no branch,
+    leaves the index and working tree of both checkouts alone, and never
+    takes the participant's session lock, so previewing a lane while its
+    agent still works cannot make that session fail. It attempts no trial
+    merge either, so a preview that names no refusal says the merge is not
+    currently refused, never that it would apply without conflicts.
+
+    The file summary keeps the leading space Git indents every one of its
+    rows with, which reading stripped command output would otherwise take
+    from the first row alone and misalign the columns.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        lane: Assigned bridge worktree belonging to the participant.
+        name: Participant that owns the lane.
+        branch: Bridge branch the merge would integrate.
+        session: Session state when the participant holds a running session,
+            or an empty string when no session blocks the merge.
+
+    Returns:
+        An account of the commits the merge would carry, the files they
+        change, and every condition that would refuse the merge right now.
+
+    Raises:
+        BridgeError: If Git cannot read the base checkout.
+        subprocess.TimeoutExpired: If a read exceeds the command timeout.
+    """
+    header = f"Preview only: nothing merged, and {root} is unchanged."
+    refused = "The merge would be refused right now:"
+    if not has_branch(root, branch):
+        missing = next(merge_blockers(root, lane, name, branch, session), "")
+        return (
+            f"{header}\n{refused}\n- {missing}\n"
+            "Nothing further can be previewed while the branch is gone."
+        )
+    base = current_branch(root)
+    pending = git(root, "log", "--oneline", f"HEAD..{branch}")
+    report = [header]
+    if pending:
+        report += [
+            f"Merging {branch} into {base} would bring in "
+            f"{len(pending.splitlines())} commits:",
+            pending,
+            "Those commits change these files, relative to the merge base:",
+            " " + git(root, "diff", "--stat", f"HEAD...{branch}"),
+        ]
+    else:
+        report.append(f"{base} already contains every commit on {branch}.")
+    blockers = []
+    actual = lane_branch(lane)
+    if actual != branch:
+        blockers.append(drift(name, {"branch": branch}, actual))
+    blockers += merge_blockers(root, lane, name, branch, session)
+    if blockers:
+        report.append(refused)
+        report += [f"- {blocker}" for blocker in blockers]
+        report.append(
+            f"Clear those, then run `agent-parley participant merge {name}`."
+        )
+    elif pending:
+        report.append(
+            f"Nothing refuses this merge; it would land on {base}. The "
+            "preview merges nothing, so it cannot predict conflicts."
+        )
+    return "\n".join(report)
+
+
 def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     """Merges one lane's bridge branch into the base checkout.
 
@@ -179,42 +332,14 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
             merge stopped on conflicts that only the operator can resolve.
         subprocess.TimeoutExpired: If the merge exceeds its timeout.
     """
-    if not has_branch(root, branch):
-        raise BridgeError(
-            f"Branch {branch} no longer exists. Recover it from the reflog, "
-            f"or retire {name} and add it again."
-        )
+    blocker = next(merge_blockers(root, lane, name, branch), "")
+    if blocker:
+        raise BridgeError(blocker)
     base = current_branch(root)
-    if base == branch:
-        raise BridgeError(
-            f"The base checkout at {root} is on {branch} itself. Switch it "
-            "to the branch that should receive this work, then rerun."
-        )
-    if base == "<detached HEAD>":
-        raise BridgeError(
-            f"The base checkout at {root} is on a detached HEAD. Switch it "
-            "to the branch that should receive this work, then rerun."
-        )
     git_dir = Path(
         git(root, "rev-parse", "--path-format=absolute", "--git-dir")
     )
     quoted = shlex.quote(str(root))
-    if (git_dir / "MERGE_HEAD").exists():
-        raise BridgeError(
-            f"The base checkout at {root} is already merging. Finish it with "
-            f"`git -C {quoted} merge --continue`, or undo it with `git -C "
-            f"{quoted} merge --abort`, then rerun."
-        )
-    if git(root, "status", "--porcelain"):
-        raise BridgeError(
-            f"The base checkout at {root} has uncommitted changes. Commit or "
-            "preserve them first; merge never discards work."
-        )
-    if lane.exists() and git(lane, "status", "--porcelain"):
-        raise BridgeError(
-            f"{name} has uncommitted changes that {branch} does not carry. "
-            "Commit them in the lane first; merge only ever merges commits."
-        )
     pending = git(root, "log", "--oneline", f"HEAD..{branch}")
     if not pending:
         return f"{base} already contains every commit on {branch}."
@@ -741,16 +866,57 @@ class Bridge:
                     f"{name} is not a participant in this project; "
                     "run agent-parley participant list."
                 )
-            with lock(
-                directory / f"{name}.session.lock",
-                f"{name} has a running session; stop that terminal first.",
-            ):
+            with lock(directory / f"{name}.session.lock", session_busy(name)):
                 return merge_branch(
                     root,
                     Path(participant["lane"]),
                     name,
                     participant["branch"],
                 )
+
+    def preview_merge(self, repo: Path, name: str) -> str:
+        """Reports what merging a participant's lane would do, changing nothing.
+
+        The preview deliberately never takes the participant's session lock,
+        because previewing a lane while its agent still works is the ordinary
+        case and taking that lock would make a concurrent launch fail. A
+        running session is read from the recorded session process instead, the
+        same way liveness reporting reads it. Only the shared setup lock is
+        held, and only to read the project manifest.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose bridge branch the preview examines.
+
+        Returns:
+            An account of the commits the merge would carry, the files they
+            change, and every condition that would refuse the merge right now.
+
+        Raises:
+            BridgeError: If the repository has no project, if the participant
+                is unknown, or if a checkout cannot be read.
+        """
+        root, directory = self.project(repo)
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            participant = data["participants"].get(name)
+            if participant is None:
+                raise BridgeError(
+                    f"{name} is not a participant in this project; "
+                    "run agent-parley participant list."
+                )
+            state = activity(directory, name)
+            running = process.alive(
+                state.get("session_pid"), state.get("session_ticks")
+            )
+            session = participant_liveness(directory, name) if running else ""
+        return merge_preview(
+            root,
+            Path(participant["lane"]),
+            name,
+            participant["branch"],
+            session,
+        )
 
     async def identity(self, agent: str, data: dict) -> dict:
         """Registers a lane locally; registration is not an MCP tool.
@@ -1426,6 +1592,8 @@ def main() -> int:
         command = roles.add_parser(action)
         command.add_argument("name")
         command.add_argument("--repo", type=Path, default=Path.cwd())
+        if action == "merge":
+            command.add_argument("--preview", action="store_true")
     provider = commands.add_parser(
         "provider", help="Inspect or define providers that drive a native CLI."
     )
@@ -1515,6 +1683,7 @@ def main() -> int:
             )
         elif args.command == "participant":
             repository = args.repo.resolve()
+            preview = getattr(args, "preview", False)
             if args.action == "add":
                 bridge.add_participant(
                     repository, args.name, args.provider, args.credentials
@@ -1524,9 +1693,14 @@ def main() -> int:
             elif args.action == "retire":
                 print(bridge.retire(repository, args.name))
             elif args.action == "merge":
-                print(bridge.merge(repository, args.name))
-            _, directory = bridge.project(repository)
-            print(roster.describe(roster.read(directory)))
+                print(
+                    bridge.preview_merge(repository, args.name)
+                    if preview
+                    else bridge.merge(repository, args.name)
+                )
+            if not preview:
+                _, directory = bridge.project(repository)
+                print(roster.describe(roster.read(directory)))
         elif args.command == "provider":
             if args.action == "add":
                 roster.define_provider(
