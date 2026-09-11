@@ -323,6 +323,23 @@ def test_release_scan_boundary_cannot_drift(migrated_repo, damage):
         assert release.migration_config_errors(migrated_repo) == []
 
 
+def test_scan_boundary_retires_with_the_version_it_pinned(migrated_repo):
+    path = migrated_repo / "release-please-config.json"
+    approved = json.loads(
+        (migrated_repo / ".release-please-manifest.json").read_text()
+    )["."]
+    assert release.align_scan_boundary(migrated_repo, approved) is False
+    assert release.migration_config_errors(migrated_repo) == []
+    (migrated_repo / ".release-please-manifest.json").write_text(
+        '{".": "0.2.0"}\n'
+    )
+    assert release.migration_config_errors(migrated_repo)
+    assert release.align_scan_boundary(migrated_repo, "0.2.0") is True
+    assert "last-release-sha" not in json.loads(path.read_text())
+    assert release.migration_config_errors(migrated_repo) == []
+    assert release.align_scan_boundary(migrated_repo, "0.2.0") is False
+
+
 def test_next_release_uses_normal_ancestry_after_migration(migrated_repo):
     path = migrated_repo / "pyproject.toml"
     path.write_text('[project]\nname = "agent-parley"\nversion = "0.1.3"\n')
