@@ -154,6 +154,7 @@ def _row(
         "unread": mail.get("unread", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
         "leases": stats.get("leases", 0),
+        "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
         "injected_bytes": events["injected_bytes"],
         "hook_events": events["events"],
@@ -291,6 +292,11 @@ def render(view: dict) -> list[str]:
                             f"{row['unread']}/{row['pending_ack']}",
                             f"{row['leases']}"
                             + (
+                                f"!{row['stale_leases']}"
+                                if row["stale_leases"]
+                                else ""
+                            )
+                            + (
                                 f" {_age(row['lease_age'])}"
                                 if row["leases"]
                                 else ""
@@ -309,9 +315,11 @@ def render(view: dict) -> list[str]:
                 lines.append(f"    last: {row['prompt']}")
     lines.append("")
     lines.append(
-        "Columns: MAIL unread/pending acknowledgement; DENIALS denied or "
-        "blocked of retained hook events; CALLS served MCP calls, !rejected. "
-        "A branch marked ! left its assigned bridge branch."
+        "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
+        "!past a declared time to live, with the age of the oldest; DENIALS "
+        "denied or blocked of retained hook events; CALLS served MCP calls, "
+        "!rejected. A branch marked ! left its assigned bridge branch. A "
+        "stale lease is still held; releasing it is its owner's to do."
     )
     return lines
 

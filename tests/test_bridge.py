@@ -724,6 +724,30 @@ def test_top_reports_only_the_selected_providers(bridge, repo, paired, capsys):
     assert "provider " not in unfiltered
 
 
+def test_top_marks_a_lease_past_its_time_to_live_as_stale(
+    bridge, repo, paired, capsys
+):
+    store.initialize(bridge.home)
+    token = asyncio.run(bridge.identity("codex", paired))["registration_token"]
+    actor = store.authenticate(bridge.home, token)
+    store.call(
+        bridge.home,
+        actor,
+        "file_reservation_paths",
+        {"paths": ["src/a"], "ttl_seconds": 3600},
+    )
+    dashboard.run(bridge.home, lambda: False, once=True)
+    live = capsys.readouterr().out
+    assert "1!1" not in live
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("UPDATE file_reservations SET expires_ts='2000-01-01'")
+    dashboard.run(bridge.home, lambda: False, once=True)
+    stale = capsys.readouterr().out
+    assert "1!1" in stale
+    assert "past a declared time to live" in stale
+    assert "still held" in stale
+
+
 def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     bridge, repo, paired, monkeypatch
 ):

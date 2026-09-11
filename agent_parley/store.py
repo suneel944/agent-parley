@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
 MAX_RECIPIENTS = 16
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS file_reservations (
  agent_id INTEGER NOT NULL REFERENCES agents(id), path_pattern TEXT NOT NULL,
  exclusive INTEGER NOT NULL, reason TEXT DEFAULT '',
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- expires_ts TEXT NOT NULL, released_ts TEXT);
+ expires_ts TEXT, released_ts TEXT);
 CREATE INDEX IF NOT EXISTS leases ON file_reservations(project_id,expires_ts)
  WHERE released_ts IS NULL;
 CREATE TABLE IF NOT EXISTS events (
@@ -119,6 +119,11 @@ def initialize(home: Path) -> None:
     full-text index over stored subjects and bodies. Message text is read
     rather than rewritten. Where SQLite was built without FTS5 the index is
     skipped and the store still opens; searching then matches substrings.
+
+    Upgrading a schema-3 store makes a lease's time to live optional, and
+    every existing lease keeps the deadline it was taken with. No coordination
+    value is rewritten, and each step is skipped once its result is already
+    present, so an interrupted upgrade safely retries.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -135,6 +140,7 @@ def initialize(home: Path) -> None:
             db.executescript(SCHEMA)
             if version == 1:
                 _add_reservation_created(db)
+            _rebuild_reservations(db)
             _add_message_search(db)
         with connect(home, write=True) as db:
             legacy = home / "mail.sqlite3"
@@ -193,6 +199,44 @@ def _rebuild_search(db: sqlite3.Connection) -> None:
         db.execute(
             "INSERT INTO message_search(message_search) VALUES ('rebuild')"
         )
+
+
+def _rebuild_reservations(db: sqlite3.Connection) -> None:
+    """Makes a lease's time to live optional in an older store.
+
+    A store written before the opt-in required every lease to carry a
+    deadline. SQLite cannot relax that requirement in place, so the table is
+    copied once into its current shape. Every lease keeps the deadline it was
+    taken with, and a lease that gained its creation column in the schema-1
+    upgrade is dated from this copy. The copy is skipped once the column
+    already accepts a lease without a deadline.
+    """
+    required = [
+        row[3]
+        for row in db.execute("PRAGMA table_info(file_reservations)")
+        if row[1] == "expires_ts"
+    ]
+    if not required or not required[0]:
+        return
+    db.executescript(
+        "CREATE TABLE rebuilt_reservations ("
+        " id INTEGER PRIMARY KEY,"
+        " project_id INTEGER NOT NULL REFERENCES projects(id),"
+        " agent_id INTEGER NOT NULL REFERENCES agents(id),"
+        " path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL,"
+        " reason TEXT DEFAULT '',"
+        " created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        " expires_ts TEXT, released_ts TEXT);"
+        "INSERT INTO rebuilt_reservations (id,project_id,agent_id,"
+        "path_pattern,exclusive,reason,created_ts,expires_ts,released_ts) "
+        "SELECT id,project_id,agent_id,path_pattern,exclusive,reason,"
+        "coalesce(created_ts,CURRENT_TIMESTAMP),expires_ts,released_ts "
+        "FROM file_reservations;"
+        "DROP TABLE file_reservations;"
+        "ALTER TABLE rebuilt_reservations RENAME TO file_reservations;"
+        "CREATE INDEX IF NOT EXISTS leases ON "
+        "file_reservations(project_id,expires_ts) WHERE released_ts IS NULL;"
+    )
 
 
 def _import_legacy(db: sqlite3.Connection, legacy: Path) -> None:
@@ -635,11 +679,20 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     a further round trip. The reason is omitted when the owner declared none.
     Conflicts are reported until the response budget is reached; ``has_more``
     states that further conflicts exist beyond the reported ones.
+
+    ``ttl_seconds`` is optional. Without it the lease carries no deadline and
+    never reports as stale. With it, a lease whose deadline has passed carries
+    ``stale`` in the conflict it raises, so a reader can tell a working owner
+    from one that died holding the path. Staleness is a report: the lease is
+    not revoked, not reassigned, and blocks exactly the paths it already
+    blocked until its owner releases it.
     """
     paths = args.get("paths")
     if not isinstance(paths, list) or not 1 <= len(paths) <= 16:
         raise BridgeError("paths must contain 1..16 repository-relative paths.")
-    ttl = _number(args.get("ttl_seconds", 900), "ttl_seconds", 30, 3600)
+    ttl = args.get("ttl_seconds")
+    if ttl is not None:
+        ttl = _number(ttl, "ttl_seconds", 30, 3600)
     exclusive = _flag(args.get("exclusive", True), "exclusive")
     reason = _text(args.get("reason", ""), "reason", 160, empty=True)
     for pattern in paths:
@@ -655,10 +708,11 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     paths = [str(PurePosixPath(pattern)) for pattern in paths]
     leases = db.execute(
         "SELECT f.id,f.path_pattern,f.exclusive,a.name,"
-        "substr(f.reason,1,80) AS reason FROM file_reservations f "
+        "substr(f.reason,1,80) AS reason,"
+        "(f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP) "
+        "AS stale FROM file_reservations f "
         "JOIN agents a ON a.id=f.agent_id WHERE f.project_id=? "
-        "AND f.agent_id!=? AND f.released_ts IS NULL "
-        "AND f.expires_ts>CURRENT_TIMESTAMP",
+        "AND f.agent_id!=? AND f.released_ts IS NULL",
         (actor["project_id"], actor["id"]),
     ).fetchall()
     conflicts = []
@@ -679,6 +733,8 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
                 conflict = {"path": pattern, "owner": lease["name"]}
                 if lease["reason"]:
                     conflict["reason"] = lease["reason"]
+                if lease["stale"]:
+                    conflict["stale"] = True
                 conflicts.append(conflict)
     if conflicts:
         reported: list[dict] = []
@@ -697,7 +753,7 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         }
     owned = db.execute(
         "SELECT path_pattern FROM file_reservations WHERE agent_id=? "
-        "AND released_ts IS NULL AND expires_ts>CURRENT_TIMESTAMP",
+        "AND released_ts IS NULL",
         (actor["id"],),
     ).fetchall()
     if len({row[0] for row in owned} | set(paths)) > 128:
@@ -719,7 +775,7 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
                 pattern,
                 exclusive,
                 reason,
-                f"+{ttl} seconds",
+                None if ttl is None else f"+{ttl} seconds",
             ),
         )
         granted.append({"id": cursor.lastrowid, "path": pattern})
@@ -961,7 +1017,7 @@ def search_messages(
 
 
 def usage(home: Path, root: str) -> dict[str, dict]:
-    """Reports retained tool events and live leases for one project.
+    """Reports retained tool events and held leases for one project.
 
     Args:
         home: Private bridge state root.
@@ -969,8 +1025,11 @@ def usage(home: Path, root: str) -> dict[str, dict]:
 
     Returns:
         Mapping of registered identity to served calls, rejected calls,
-        returned bytes, held leases, and the age of its oldest live lease.
-        Counts cover retained events only; older events are retired.
+        returned bytes, held leases, how many of those leases are past a
+        declared time to live, and the age of its oldest held lease. A stale
+        lease is still held and still counted; nothing releases it on its
+        owner's behalf. Counts cover retained events only; older events are
+        retired.
     """
     if not (home / DATABASE).exists():
         return {}
@@ -985,18 +1044,26 @@ def usage(home: Path, root: str) -> dict[str, dict]:
             "WHERE p.human_key=? GROUP BY a.id",
             (root,),
         ):
-            report[row["name"]] = {**dict(row), "leases": 0, "lease_age": 0}
+            report[row["name"]] = {
+                **dict(row),
+                "leases": 0,
+                "stale_leases": 0,
+                "lease_age": 0,
+            }
         for row in db.execute(
             "SELECT a.name AS name,count(*) AS leases,"
+            "coalesce(sum(f.expires_ts IS NOT NULL "
+            "AND f.expires_ts<=CURRENT_TIMESTAMP),0) AS stale_leases,"
             "cast(strftime('%s','now')-strftime('%s',min(f.created_ts)) "
             "AS INTEGER) AS lease_age FROM file_reservations f "
             "JOIN agents a ON a.id=f.agent_id "
             "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
-            "AND f.released_ts IS NULL AND f.expires_ts>CURRENT_TIMESTAMP "
-            "GROUP BY a.id",
+            "AND f.released_ts IS NULL GROUP BY a.id",
             (root,),
         ):
             report.setdefault(row["name"], {}).update(
-                leases=row["leases"], lease_age=max(0, row["lease_age"] or 0)
+                leases=row["leases"],
+                stale_leases=row["stale_leases"],
+                lease_age=max(0, row["lease_age"] or 0),
             )
     return report

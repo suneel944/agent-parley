@@ -97,7 +97,7 @@ def test_ownership_listing_names_the_holder_of_each_blocking_issue():
     )
 
 
-def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
+def test_reservations_serialize_conflicts_and_renew(bridge, actors):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(
             pool.map(
@@ -124,15 +124,15 @@ def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
     )
     assert denied["conflicts"] and denied["granted"] == []
     assert denied["conflicts"][0]["reason"] == "refactor store"
-    with store.connect(bridge.home, write=True) as db:
-        db.execute("UPDATE file_reservations SET expires_ts='2000-01-01'")
-    assert store.call(
-        bridge.home, loser, "file_reservation_paths", {"paths": ["src/api.py"]}
-    )["granted"]
-    assert store.call(
-        bridge.home, loser, "file_reservation_paths", {"paths": ["src/api.py"]}
-    )["granted"]
+    assert "stale" not in denied["conflicts"][0]
     other = next(actor for actor in actors if actor is not loser)
+    store.call(bridge.home, other, "release_file_reservations", {})
+    assert store.call(
+        bridge.home, loser, "file_reservation_paths", {"paths": ["src/api.py"]}
+    )["granted"]
+    assert store.call(
+        bridge.home, loser, "file_reservation_paths", {"paths": ["src/api.py"]}
+    )["granted"]
     silent = store.call(
         bridge.home, other, "file_reservation_paths", {"paths": ["src/api.py"]}
     )
@@ -141,11 +141,163 @@ def test_reservations_serialize_conflicts_renew_and_expire(bridge, actors):
     with store.connect(bridge.home) as db:
         assert (
             db.execute(
-                "SELECT count(*) FROM file_reservations WHERE "
-                "expires_ts>CURRENT_TIMESTAMP AND released_ts IS NULL"
+                "SELECT count(*) FROM file_reservations "
+                "WHERE released_ts IS NULL"
             ).fetchone()[0]
             == 1
         )
+
+
+def test_a_reservation_without_a_time_to_live_never_reports_stale(
+    bridge, actors
+):
+    store.call(
+        bridge.home, actors[0], "file_reservation_paths", {"paths": ["src/a"]}
+    )
+    with store.connect(bridge.home) as db:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM file_reservations "
+                "WHERE expires_ts IS NULL AND released_ts IS NULL"
+            ).fetchone()[0]
+            == 1
+        )
+    usage = store.usage(bridge.home, "/project")
+    assert usage["GreenCastle"]["leases"] == 1
+    assert usage["GreenCastle"]["stale_leases"] == 0
+    denied = store.call(
+        bridge.home, actors[1], "file_reservation_paths", {"paths": ["src/a"]}
+    )
+    assert denied["granted"] == []
+    assert "stale" not in denied["conflicts"][0]
+    mail = mailbox(bridge.home, "/project", "GreenCastle")
+    assert mail["reservations"] == 1
+    assert mail["stale_reservations"] == 0
+
+
+def test_a_lease_past_its_time_to_live_reports_stale_and_still_blocks(
+    bridge, actors
+):
+    store.call(
+        bridge.home,
+        actors[0],
+        "file_reservation_paths",
+        {"paths": ["src/a"], "ttl_seconds": 3600, "reason": "refactor store"},
+    )
+    live = store.call(
+        bridge.home, actors[1], "file_reservation_paths", {"paths": ["src/a"]}
+    )
+    assert live["granted"] == []
+    assert "stale" not in live["conflicts"][0]
+    before = store.usage(bridge.home, "/project")
+    assert before["GreenCastle"]["stale_leases"] == 0
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET expires_ts='2000-01-01' "
+            "WHERE agent_id=?",
+            (actors[0]["id"],),
+        )
+    expired = store.call(
+        bridge.home, actors[1], "file_reservation_paths", {"paths": ["src/a"]}
+    )
+    assert expired["granted"] == []
+    assert expired["conflicts"][0]["owner"] == "GreenCastle"
+    assert expired["conflicts"][0]["reason"] == "refactor store"
+    assert expired["conflicts"][0]["stale"] is True
+    usage = store.usage(bridge.home, "/project")
+    assert usage["GreenCastle"]["leases"] == 1
+    assert usage["GreenCastle"]["stale_leases"] == 1
+    mail = mailbox(bridge.home, "/project", "GreenCastle")
+    assert mail["reservations"] == 1
+    assert mail["stale_reservations"] == 1
+
+
+def test_the_conflict_listing_separates_live_holders_from_stale_ones(
+    bridge, actors
+):
+    third = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, "/project", "RedRiver")[
+            "registration_token"
+        ],
+    )
+    store.call(
+        bridge.home,
+        actors[0],
+        "file_reservation_paths",
+        {"paths": ["src/live.py"], "ttl_seconds": 3600},
+    )
+    store.call(
+        bridge.home,
+        third,
+        "file_reservation_paths",
+        {"paths": ["src/dead.py"], "ttl_seconds": 30},
+    )
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET expires_ts='2000-01-01' "
+            "WHERE agent_id=?",
+            (third["id"],),
+        )
+    denied = store.call(
+        bridge.home,
+        actors[1],
+        "file_reservation_paths",
+        {"paths": ["src/live.py", "src/dead.py"]},
+    )
+    assert denied["granted"] == []
+    assert {
+        conflict["owner"]: conflict.get("stale", False)
+        for conflict in denied["conflicts"]
+    } == {"GreenCastle": False, "RedRiver": True}
+
+
+def test_schema_upgrade_makes_a_lease_time_to_live_optional(bridge, actors):
+    store.call(
+        bridge.home,
+        actors[0],
+        "file_reservation_paths",
+        {"paths": ["src/a"], "ttl_seconds": 3600},
+    )
+    with store.connect(bridge.home, write=True) as db:
+        deadline = db.execute(
+            "SELECT expires_ts FROM file_reservations"
+        ).fetchone()[0]
+        db.execute("ALTER TABLE file_reservations RENAME TO retired_leases")
+        db.execute(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY,"
+            " project_id INTEGER NOT NULL REFERENCES projects(id),"
+            " agent_id INTEGER NOT NULL REFERENCES agents(id),"
+            " path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL,"
+            " reason TEXT DEFAULT '',"
+            " created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+            " expires_ts TEXT NOT NULL, released_ts TEXT)"
+        )
+        db.execute(
+            "INSERT INTO file_reservations SELECT id,project_id,agent_id,"
+            "path_pattern,exclusive,reason,created_ts,expires_ts,released_ts "
+            "FROM retired_leases"
+        )
+        db.execute("DROP TABLE retired_leases")
+        db.execute("PRAGMA user_version=2")
+    store.initialize(bridge.home)
+    store.call(
+        bridge.home, actors[1], "file_reservation_paths", {"paths": ["docs/b"]}
+    )
+    with store.connect(bridge.home) as db:
+        assert (
+            db.execute("PRAGMA user_version").fetchone()[0]
+            == store.SCHEMA_VERSION
+        )
+        assert [
+            row[0]
+            for row in db.execute(
+                "SELECT expires_ts FROM file_reservations ORDER BY id"
+            )
+        ] == [deadline, None]
+    usage = store.usage(bridge.home, "/project")
+    assert usage["GreenCastle"]["leases"] == 1
+    assert usage["BlueLake"]["leases"] == 1
 
 
 @pytest.mark.parametrize(

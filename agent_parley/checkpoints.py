@@ -567,7 +567,9 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         after: Last locally delivered message ID.
 
     Returns:
-        Message previews, pending counts, reservations, and coordination age.
+        Message previews, pending counts, held reservations with how many are
+        past a declared time to live, and coordination age. A stale
+        reservation is still held; nothing releases it on its owner's behalf.
 
     Raises:
         BridgeError: If the agent is not registered.
@@ -608,15 +610,17 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             (agent["id"],),
         ).fetchone()[0]
         leases = db.execute(
-            "SELECT count(*) FROM file_reservations WHERE agent_id=? "
-            "AND released_ts IS NULL AND expires_ts>datetime('now')",
+            "SELECT count(*) AS held,coalesce(sum(expires_ts IS NOT NULL "
+            "AND expires_ts<=datetime('now')),0) AS stale "
+            "FROM file_reservations WHERE agent_id=? AND released_ts IS NULL",
             (agent["id"],),
-        ).fetchone()[0]
+        ).fetchone()
         return {
             "messages": [dict(row) for row in messages],
             "pending_ack": pending,
             "unread": unread,
-            "reservations": leases,
+            "reservations": leases["held"],
+            "stale_reservations": leases["stale"],
             "reported_task": agent["task_description"],
             "last_coordination": agent["last_active_ts"],
         }

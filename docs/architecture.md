@@ -238,7 +238,7 @@ reservations continue to resolve.
 
 ## Persistence and concurrency
 
-Mail uses SQLite WAL with indexed inbox and active-lease queries. Each write
+Mail uses SQLite WAL with indexed inbox and held-lease queries. Each write
 acquires an immediate transaction, validates and mutates, then commits once.
 Connections close after every operation. A writer waits up to one second for
 another transaction to commit.
@@ -251,7 +251,19 @@ creation time, so an operator can see lease age rather than expiry alone.
 Directory overlaps are detected;
 two globs conservatively conflict when either lease is exclusive. Use exact paths
 when disjoint globs would otherwise be rejected. Renewals replace the owner's
-previous lease atomically. Expired or released leases no longer block work.
+previous lease atomically. Released leases no longer block work.
+
+`ttl_seconds` is optional. A lease taken without one carries no deadline and
+never reports as stale. A lease taken with one reports as stale once its
+deadline passes: the conflict it raises carries `stale`, `agent-parley top`
+marks the count with `!`, and `agent-parley status` names the stale share.
+Staleness is a report and nothing more. The lease is not revoked or
+reassigned, it still counts against the per-lane reservation cap, and it keeps
+blocking exactly the paths it already blocked until its owner releases it.
+That distinction lets a reader separate a lane still working on a path from a
+lane that died holding it, without any process deciding on that lane's behalf.
+No time-to-live applies to issue ownership, which changes hands only through
+release, or an explicit offer and acceptance.
 
 Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer
@@ -341,7 +353,7 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | Participants per project | At most 32 |
 | Roster listing | At most 32 participants |
 | Active reservations | At most 128 per lane |
-| Reservation lifetime | 30–3,600 seconds |
+| Reservation time to live | Optional; 30–3,600 seconds when declared |
 | Reservation reason | 160 bytes stored; 80 characters reported on conflict |
 | Participant event log | Rotated at 262,144 bytes; one rotated file retained |
 | Participant event age | 1,209,600 seconds, applied at a session boundary |
@@ -376,7 +388,11 @@ before upgrading; no live workspace is automatically migrated or terminated.
 
 A store written by an earlier 0.3 release upgrades in place on first use: the
 event table is created and reservations gain a creation time, which existing
-leases date from the upgrade. No coordination row is rewritten, and the schema
+leases date from the upgrade. A store that still requires a deadline on every
+lease is copied once into a shape where the deadline is optional; every lease
+keeps the deadline it was taken with, so a long-abandoned lease reports as
+stale rather than being released for its owner. No coordination value is
+rewritten, each step is skipped once its result is present, and the schema
 version publishes in the same transaction as the change it describes. A store
 written by a newer schema is refused rather than downgraded.
 

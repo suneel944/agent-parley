@@ -79,6 +79,15 @@ handoffs pending, unread and unacknowledged mail, held leases with the age of
 the oldest, delivered context, denials against retained hook events, and served
 MCP calls with rejections. The header carries server health and the project's
 denial rate. The view is read-only and makes no model call; `q` leaves it.
+
+A reservation may declare `ttl_seconds`, and one taken without it never
+reports as stale. Once a declared time to live passes, the LEASES count in
+`top` gains `!` and the stale count, `status` reports the stale share of a
+lane's reservations, and a conflict names that holder as stale. The lease is
+still held: nothing revokes it, reassigns it, or narrows what it blocks, and
+only its owner releases it. Reading `!` as "an agent died holding this" is the
+point; acting on it is the operator's decision, exactly as with a stalled
+issue owner.
 Use `--once`, or pipe it, for one plain snapshot instead of a live view, and
 `--interval` to change the redraw period. `--provider NAME` reports only the
 participants driven by that provider and is repeatable; the header then counts

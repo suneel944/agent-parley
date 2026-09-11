@@ -1680,10 +1680,12 @@ review, not merged or independently verified. An idle turn is not completion.
                     mail = mailbox(
                         self.home, data["root"], name, state.get("cursor", 0)
                     )
+                    stale = mail.get("stale_reservations", 0)
                     print(
                         f"    Unread: {mail['unread']}; "
                         f"pending acknowledgements: {mail['pending_ack']}; "
                         f"active reservations: {mail['reservations']}"
+                        + (f" ({stale} stale)" if stale else "")
                     )
                     print(
                         "    Last coordination: "
