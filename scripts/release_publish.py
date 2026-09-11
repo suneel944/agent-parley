@@ -383,6 +383,39 @@ def release_candidate(root: Path) -> tuple[str, int, int]:
     return proposal, len(issues), len(features)
 
 
+def align_scan_boundary(root: Path, version: str) -> bool:
+    """Aligns the release scan boundary with the version being prepared.
+
+    A history migration pins Release Please to the rewritten commit of the
+    approved release so preparation never walks into rewritten history. That
+    pin is specific to one version: the moment a proposal advances past it,
+    the configuration the policy gate accepts is the one that carries the
+    boundary recorded for the proposed version, and no boundary at all when
+    that version was never migrated. Writing it here keeps a proposal from
+    arriving with a boundary the gate refuses.
+
+    Args:
+        root: Checkout holding the configuration to align.
+        version: Version the proposal prepares.
+
+    Returns:
+        Whether the configuration on disk changed.
+    """
+    path = root / "release-please-config.json"
+    config = json.loads(path.read_text())
+    migrations, _ = release_history(root)
+    migration = migrations.get(f"v{version}")
+    expected = migration["rewritten"] if migration else None
+    if config.get("last-release-sha") == expected:
+        return False
+    if expected is None:
+        config.pop("last-release-sha")
+    else:
+        config["last-release-sha"] = expected
+    path.write_text(json.dumps(config, indent=2) + "\n")
+    return True
+
+
 def migration_config_errors(root: Path) -> list[str]:
     """Rejects missing, stale or misplaced release-history scan boundaries.
 
@@ -644,6 +677,17 @@ def main() -> None:
             print(f"{measured}; no package changes since the approved release.")
         else:
             print(f"{measured}; proposing {version}.")
+        return
+    if phase == "boundary":
+        version = json.loads(
+            (root / ".release-please-manifest.json").read_text()
+        )["."]
+        changed = align_scan_boundary(root, version)
+        print(
+            f"Scan boundary aligned with {version}."
+            if changed
+            else f"Scan boundary already matches {version}."
+        )
         return
     tag = os.environ["RELEASE_TAG"]
     source = validate_tag(root, tag)
