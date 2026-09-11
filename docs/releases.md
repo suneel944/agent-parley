@@ -17,7 +17,7 @@ says nothing about the current approved release.
 | --- | --- | --- |
 | 0.1.0 | Preserve as archival; do not retry publication | Wheels match across services. Source archives differ in five files; PyPI's copies match the original tag. |
 | 0.1.1 | Approved baseline and supported retry | Both package hashes match across GitHub and PyPI. Neither file is yanked. |
-| 0.1.2 | Retired incident record; never reuse | Absent from PyPI at audit time. Its GitHub draft and assets were deleted on 2026-09-11; the original tag remains. |
+| 0.1.2 | Retired incident record; never reuse | Absent from PyPI at audit time. Its GitHub draft, assets and tag were all deleted on 2026-09-11. The retirement list is what refuses the number. |
 | Earlier version labels | Withdrawn preparation history | No corresponding release remains in the current GitHub or PyPI inventories. Reworded commits retain their original source trees. |
 
 The initial source archive differs in `CHANGELOG.md`, `docs/operations.md`,
@@ -100,11 +100,13 @@ an explicitly authored version PR when there is a real distribution change.
 GitHub and PyPI were checked during recovery. Both retained valid 0.1.1 package
 files with matching SHA-256 hashes. PyPI also contained an unwanted 0.1.2, and
 GitHub showed 0.1.2 as latest. Recovery returned that release to a draft, preserving
-its assets and tag, and restored 0.1.1 as GitHub's latest release. That draft and
-its assets were deleted on 2026-09-11, once 0.2.0 was published, so the releases
-page carries only versions that were meant to exist; the tag remains, and the
-version stays retired in `.github/release-history.json`, which is what refuses to
-reuse the number. Restoring main
+its assets and tag, and restored 0.1.1 as GitHub's latest release. That draft,
+its assets and its tag were all deleted on 2026-09-11, once 0.2.0 was published,
+so no trace of a version that was never meant to ship remains on the releases
+page or in the tag list. Retirement does not depend on any of them: the version
+stays listed in `.github/release-history.json`, and that list is what the policy
+gate and preparation read to refuse the number, so the guarantee survives the
+deletion of every artifact it described. Restoring main
 to 0.1.1 does not remove PyPI's records. Keep 0.1.1's files and tag intact. The
 unwanted version was absent from PyPI at the later audit. Do not recreate
 it: deleting a PyPI file permanently consumes its filename. If an unwanted
