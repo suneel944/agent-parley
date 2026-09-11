@@ -132,7 +132,10 @@ def preserve_pending(root: Path) -> str | None:
     never reach a lane. The changes are stashed rather than discarded. The
     stash stack is shared by every worktree of the repository, so the entry
     carries a unique message and the returned account restores it by name
-    rather than by position.
+    rather than by position. The name is the full object name: Git reads a
+    bare decimal argument to ``git stash apply`` as a reflog position, so an
+    abbreviation made only of digits would restore some other entry or fail
+    outright.
 
     Args:
         root: Common repository root, which is always the base checkout.
@@ -160,7 +163,7 @@ def preserve_pending(root: Path) -> str | None:
             f"The checkout at {root} still holds changes that Git cannot "
             "stash. Commit or preserve them first; worktrees start at HEAD."
         )
-    entry = git(root, "rev-parse", "--short", "refs/stash")
+    entry = git(root, "rev-parse", "refs/stash")
     return (
         f"Preserved your pending changes as stash entry {entry}; worktrees "
         f"start at HEAD. Restore them with `git -C "
