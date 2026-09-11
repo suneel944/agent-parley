@@ -206,7 +206,13 @@ branch the common repository root has checked out. Authentication is the native
 enters bridge state. The generated body carries the three headings of
 `.github/PULL_REQUEST_TEMPLATE.md` and an explicit reference to every claimed
 issue, which is what the repository's pull-request hygiene gate requires of a
-body. It refuses on an unknown participant, a missing report, an unclaimed lane,
+body. The assignee is the operator's own forge account, and the change-type
+labels and milestone are mirrored from the claimed issues, so classification
+comes from the issue rather than from the lane and the hygiene gate passes at
+creation. That metadata resolves before the push, so a refusal leaves no remote
+branch behind. It refuses on an unknown participant, a missing report, an
+unclassified claimed issue, claimed issues whose milestones disagree, an
+unclaimed lane,
 a branch that adds no commits to the project base, and a base checkout on a
 detached HEAD or on the lane's own branch. An open pull request for the branch
 is reported instead of replaced by a second one.

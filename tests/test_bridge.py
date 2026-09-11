@@ -1892,6 +1892,10 @@ def test_merge_runs_the_repository_verification_command_first(
 
 
 GH_STUB = """#!/bin/sh
+if [ "$1" = "issue" ]; then
+  cat "$GH_ISSUE"
+  exit 0
+fi
 if [ "$2" = "list" ]; then
   cat "$GH_OPEN"
   exit 0
@@ -1914,10 +1918,20 @@ def stub_github_cli(tmp_path, monkeypatch):
     listed = tmp_path / "open-pull-requests.json"
     listed.write_text("[]")
     created = tmp_path / "created-arguments"
+    issue = tmp_path / "issue-metadata.json"
+    issue.write_text(
+        json.dumps(
+            {
+                "labels": [{"name": "enhancement"}, {"name": "good first"}],
+                "milestone": {"title": "0.2.0"},
+            }
+        )
+    )
     monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("GH_OPEN", str(listed))
     monkeypatch.setenv("GH_CREATE", str(created))
-    return listed, created
+    monkeypatch.setenv("GH_ISSUE", str(issue))
+    return listed, created, issue
 
 
 def created_options(created):
@@ -1941,7 +1955,7 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
     remote = tmp_path / "origin.git"
     git(repo, "init", "--bare", str(remote))
     git(repo, "remote", "add", "origin", str(remote))
-    listed, created = stub_github_cli(tmp_path, monkeypatch)
+    listed, created, issue = stub_github_cli(tmp_path, monkeypatch)
 
     with pytest.raises(BridgeError, match="not a participant"):
         bridge.pull_request(repo, "absent")
@@ -1971,16 +1985,20 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
     assert "Lane result" in options["--body"]
     assert "make check: 181 passed" in options["--body"]
     assert issue_numbers(options["--body"]) == {42}
+    assert options["--assignee"] == "@me"
+    assert options["--label"] == "enhancement"
+    assert options["--milestone"] == "0.2.0"
     assert (
         validate(
             {
                 "title": options["--title"],
                 "assignees": [{"login": "owner"}],
-                "labels": [{"name": "enhancement"}],
+                "labels": [{"name": options["--label"]}],
+                "milestone": {"number": 9, "title": options["--milestone"]},
                 "user": {"type": "User"},
                 "body": options["--body"],
             },
-            [{"number": 42}],
+            [{"number": 42, "milestone": {"number": 9}}],
         )
         == []
     )
@@ -1992,6 +2010,35 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
     repeated = bridge.pull_request(repo, "codex")
     assert "already open" in repeated
     assert not created.exists()
+
+
+def test_pull_request_takes_its_classification_from_the_claimed_issue(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    identify(repo)
+    remote = tmp_path / "origin.git"
+    git(repo, "init", "--bare", str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    _, created, issue = stub_github_cli(tmp_path, monkeypatch)
+    bridge.report(lane, "ready", "Lane result", "", "make check: 181 passed")
+    (lane / "feature.txt").write_text("lane work\n")
+    commit(lane, "feat: add the lane feature")
+    bridge.issue(lane, "claim", "42")
+
+    issue.write_text(json.dumps({"labels": [], "milestone": None}))
+    with pytest.raises(BridgeError, match="change-type label"):
+        bridge.pull_request(repo, "codex")
+    assert git(repo, "branch", "--remotes") == ""
+    assert not created.exists()
+
+    issue.write_text(
+        json.dumps(
+            {"labels": [{"name": "ci"}], "milestone": {"title": "0.2.0"}}
+        )
+    )
+    bridge.pull_request(repo, "codex")
+    assert created_options(created)["--label"] == "ci"
 
 
 def test_event_history_is_bounded_by_age_and_reported_by_window(

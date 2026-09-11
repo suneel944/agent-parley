@@ -156,9 +156,11 @@ agent-parley participant pr claude-2
 
 That pushes the lane's branch and opens one pull request whose body is the
 lane's own recorded report, under the headings your pull-request template asks
-for, referencing the issue the lane claimed. It uses your own `gh` sign-in,
-refuses when there is no report, no claimed issue or nothing to push, and
-reports an already-open pull request rather than opening a second one.
+for, referencing the issue the lane claimed. It opens assigned to you and
+labelled from that issue, so it arrives owned and classified rather than needing
+repair. It uses your own `gh` sign-in, refuses when there is no report, no
+claimed issue, no change type on that issue or nothing to push, and reports an
+already-open pull request rather than opening a second one.
 
 ## What it enforces
 

@@ -210,10 +210,17 @@ branch adds no commits to the project base, and when the main checkout is on a
 detached HEAD or on the lane's own branch. A pull request already open for that
 branch is reported rather than duplicated, and its branch is still updated by
 the push. Pushing to `origin` happens only here; `status` never reaches a
-remote. Assignee, change-type label and milestone stay the operator's to set,
-because they are repository policy rather than lane state. A reported `ready`
-outcome is the participant's own account, so an opened pull request still needs
-review and the target repository's own gate.
+remote.
+
+The pull request opens owned and classified. Your own GitHub account becomes
+its assignee, and its change-type labels and milestone are read from the issues
+the lane claims rather than chosen by the lane, so a participant never
+classifies its own work. That metadata is resolved before the branch is pushed:
+an issue carrying no change-type label refuses the whole command, naming the
+issue and the labels the repository accepts, and claimed issues carrying
+different milestones refuse it as well. A reported `ready` outcome is the
+participant's own account, so an opened pull request still needs review and the
+target repository's own gate.
 
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's

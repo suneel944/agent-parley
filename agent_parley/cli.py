@@ -34,6 +34,18 @@ from agent_parley.state import BridgeError, lock, write_json
 
 VERIFY_TIMEOUT = 1800
 VERIFY_TAIL_LINES = 20
+CHANGE_TYPE = frozenset(
+    {
+        "bug",
+        "enhancement",
+        "documentation",
+        "dependencies",
+        "ci",
+        "security",
+        "performance",
+        "release",
+    }
+)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -493,6 +505,60 @@ def gh(cwd: Path, *args: str) -> str:
     if result.returncode:
         raise BridgeError(result.stderr.strip() or "GitHub CLI call failed.")
     return result.stdout.strip()
+
+
+def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
+    """Reads the ownership metadata the claimed issues already carry.
+
+    The repository requires every pull request to declare a change type and
+    to match the milestone of the issue it references. Both facts already
+    exist on the issue, so they are mirrored rather than invented: a lane
+    does not get to classify its own work, and an unclassified issue is
+    reported instead of being given a guessed label.
+
+    Args:
+        cwd: Checkout the GitHub CLI runs in, which selects the repository.
+        issues: Repository issue numbers the lane claims.
+
+    Returns:
+        The change-type labels the issues carry, and the single milestone
+        title they agree on, or an empty string when none carries one.
+
+    Raises:
+        BridgeError: If no claimed issue carries a change-type label, if the
+            claimed issues carry conflicting milestones, or if the GitHub CLI
+            cannot read an issue.
+        subprocess.TimeoutExpired: If gh exceeds the command timeout.
+    """
+    labels: set[str] = set()
+    milestones: set[str] = set()
+    for number in issues:
+        record = json.loads(
+            gh(cwd, "issue", "view", number, "--json", "labels,milestone")
+        )
+        labels |= {
+            label["name"] for label in record.get("labels") or []
+        } & CHANGE_TYPE
+        if milestone := record.get("milestone"):
+            milestones.add(milestone["title"])
+    if not labels:
+        raise BridgeError(
+            "No claimed issue carries a change-type label, and the pull "
+            "request takes its classification from the issue rather than "
+            "choosing one. Label "
+            + ", ".join(f"#{number}" for number in issues)
+            + " with one of: "
+            + ", ".join(sorted(CHANGE_TYPE))
+            + "."
+        )
+    if len(milestones) > 1:
+        raise BridgeError(
+            "The claimed issues carry different milestones ("
+            + ", ".join(sorted(milestones))
+            + "), so one pull request cannot match them all. Split the work "
+            "or align the issues first."
+        )
+    return sorted(labels), milestones.pop() if milestones else ""
 
 
 def pull_request_body(state: dict, issues: list[str]) -> str:
@@ -1099,6 +1165,14 @@ class Bridge:
         target repository's own commit rules. An open pull request for the
         branch is reported rather than replaced by a second one.
 
+        The pull request also opens owned and classified. The operator's own
+        GitHub account becomes its assignee, and its change-type labels and
+        milestone are mirrored from the issues the lane claims, so a lane
+        never classifies its own work and the repository's own metadata rules
+        are met at creation rather than repaired afterwards. Metadata is
+        resolved before the branch is pushed, so a refusal leaves no remote
+        branch behind.
+
         Args:
             repo: Any checkout of the target repository.
             name: Participant whose bridge branch becomes a pull request.
@@ -1108,8 +1182,8 @@ class Bridge:
 
         Raises:
             BridgeError: If the project, participant, report, branch, claimed
-                issue, base checkout, push, or GitHub CLI cannot support a
-                pull request.
+                issue, issue classification, base checkout, push, or GitHub
+                CLI cannot support a pull request.
             subprocess.TimeoutExpired: If Git or gh exceeds its timeout.
         """
         directory, data, participant = self._lane(repo, name)
@@ -1147,6 +1221,7 @@ class Bridge:
                 "issue reference. Run `agent-parley issue claim NUMBER` in "
                 "the lane first."
             )
+        labels, milestone = hygiene_metadata(root, claimed)
         base = current_branch(root)
         if base in ("<detached HEAD>", branch):
             raise BridgeError(
@@ -1181,8 +1256,7 @@ class Bridge:
             "--format=%s",
             f"{data['base']}..{branch}",
         ).splitlines()[0]
-        created = gh(
-            root,
+        arguments = [
             "pr",
             "create",
             "--base",
@@ -1193,7 +1267,14 @@ class Bridge:
             title,
             "--body",
             pull_request_body(state, claimed),
-        )
+            "--assignee",
+            "@me",
+        ]
+        for label in labels:
+            arguments.extend(["--label", label])
+        if milestone:
+            arguments.extend(["--milestone", milestone])
+        created = gh(root, *arguments)
         opened = created.splitlines()[-1] if created else "a pull request"
         return f"Pushed {branch} and opened {opened}"
 
