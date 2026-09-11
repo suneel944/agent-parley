@@ -1,6 +1,6 @@
 # Architecture and contracts
 
-Agent Parley runs on one Linux host under one OS user. It coordinates participating
+Agent Parley runs on one Linux or macOS host under one OS user. It coordinates participating
 agents; it does not execute model requests, enforce filesystem permissions, replace
 native approvals, or merge work.
 
@@ -11,7 +11,7 @@ native approvals, or merge work.
 | `cli` | Git worktrees, native configuration, launch, status and reports |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases and tool events |
-| `process` | Linux process identity, session liveness and pidfd shutdown |
+| `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
 | `forge` | Optional best-effort issue lookups and mirrors on the host forge |
@@ -113,7 +113,8 @@ produced it, so enforcement history leaves the state directory in the shape it
 was stored in rather than a rendered summary.
 
 A lane's session state follows a recorded session process identity, matched by
-process ID and Linux creation ticks, never its session lock. The launcher holds
+process ID and the creation time the kernel recorded for it, never its session
+lock. The launcher holds
 that lock for the whole session, so probing it would make a concurrent launch
 fail while merely reporting. A session that ends without clearing its record
 reads as stopped, because its process is gone.
@@ -273,8 +274,38 @@ without moving the forge assignee, and change-type labels are never written at
 all: classification is the repository's own decision and a lane does not make
 it.
 
-Shutdown verifies the module, state path and process creation ticks, then pins
-the process with Linux pidfd before signaling. It does not kill arbitrary PIDs.
+Shutdown verifies the module, state path and process creation time before
+signaling. It does not kill arbitrary PIDs.
+
+## Platform primitives
+
+The `process` module selects one bundle of operating-system primitives at
+import and every caller goes through that bundle, so no call site tests the
+platform. Each bundle supplies a creation-identity reader, an existence check,
+a command-line match and a terminate step.
+
+On Linux the bundle reads `/proc/<pid>/stat` for creation ticks and
+`/proc/<pid>/cmdline` for the argument vector, and shutdown pins the process
+with pidfd before rechecking identity and signaling, so nothing can occupy the
+process ID between the check and the signal.
+
+On macOS there is no `/proc` and no pidfd. Creation identity is `ps -o lstart=`,
+which prints the absolute weekday, date, time and year the kernel recorded when
+the process was forked. That field is preferred over `ps -o start=`, which
+abbreviates the same instant to a time of day and, once a process is more than
+a day old, to a weekday alone; two processes created on different days can then
+print the same value, and a reused process ID would compare equal to the session
+it replaced. Both fields render a timestamp stored with the process, so a later
+system-clock change does not rewrite the recorded value. The command line comes
+from `ps -o args=`, compared against the end of the printed line rather than
+split into words, which keeps a state directory whose path contains a space
+exact. Liveness uses `os.kill(pid, 0)`: a lookup error means the process is
+gone, and a permission error means it exists under another user and therefore
+counts as running. Shutdown re-reads the creation time immediately before
+`os.kill(pid, SIGTERM)` and then polls, reaping first so an unreaped child does
+not read as alive. The identity guarantee is the same on both platforms; only
+Linux can additionally close the window between the identity check and the
+signal, so macOS shutdown carries that narrow residual race and Linux does not.
 
 ## Context and resource budgets
 

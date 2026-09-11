@@ -9,7 +9,7 @@ body:
     id: version
     attributes:
       label: Version and environment
-      description: Bridge version, Linux distribution, Python and native CLI versions.
+      description: Bridge version, operating system, Python and native CLI versions.
     validations:
       required: true
   - type: textarea

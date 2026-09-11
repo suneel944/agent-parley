@@ -662,11 +662,8 @@ class Bridge:
             legacy_record = self.home / "server.json"
             if legacy_record.exists():
                 record = json.loads(legacy_record.read_text())
-                legacy_running = (
-                    "start_ticks" not in record
-                    and Path(f"/proc/{record['pid']}").exists()
-                )
-                if legacy_running:
+                legacy = "start_ticks" not in record
+                if legacy and process.running(record["pid"]):
                     raise BridgeError(
                         "A service from an older installation is running. "
                         "Stop it with the command that started it before "
