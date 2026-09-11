@@ -1,8 +1,9 @@
 # Architecture and contracts
 
 Agent Parley runs on one Linux or macOS host under one OS user. It coordinates participating
-agents; it does not execute model requests, enforce filesystem permissions, replace
-native approvals, or merge work.
+agents; it does not execute model requests, enforce filesystem permissions or
+replace native approvals. It integrates a lane's branch only when an operator
+runs `participant merge`, and never on an agent's behalf.
 
 ## Responsibilities
 
@@ -57,7 +58,7 @@ acknowledgement, and is read back beside peer traffic. Its sender row is created
 on first use and never carries a credential digest, so no bearer token resolves
 to it and no served session can write in its name. The name `operator` is
 reserved, so no participant, provider or credential profile can claim it. No
-tool is added for this: the served surface stays seven tools.
+tool is added for this: the served surface stays the nine tools below.
 
 The server binds `127.0.0.1`, checks Host and Origin, rejects unauthenticated
 requests, and avoids credential/body logging. It supports stateless JSON responses

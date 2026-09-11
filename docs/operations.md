@@ -40,6 +40,8 @@ agent-parley issue block 42 --on 17
 agent-parley issue unblock 42 --on 17
 agent-parley report --state ready --summary "Result" --evidence "Checks and results"
 agent-parley say codex "Rebase onto main before you open the pull request."
+agent-parley mail thread THREAD_ID
+agent-parley mail search "reservation conflict"
 ```
 
 `issue offer --to` names another participant in the same project.
@@ -73,6 +75,16 @@ never launched and so has no registered identity.
 `operator` is reserved. It cannot be claimed as a participant, provider or
 credential profile name, it never holds a coordination credential, and no MCP
 tool sends as it, so a served agent cannot write in the operator's name.
+
+`mail thread ID` prints one thread in send order and `mail search QUERY` reports
+the messages matching it. Both read as the lane whose worktree they run in, the
+same way reports and issue transitions do, so they answer for one participant's
+own mail rather than for the project, and neither marks anything read. A thread
+page carries up to ten messages and a search up to five, each with a
+240-character body preview; `--after-id` continues a thread page and `--limit`
+narrows a search. Where SQLite was built without the full-text index a search
+matches the query as a literal case-insensitive substring rather than as
+indexed terms, and every result names which of the two answered it.
 
 `issue list` prints each owner's session state and the age of its last
 checkpoint, so a stalled lane is visible. Reclaiming that work still needs the
@@ -294,6 +306,28 @@ says only that nothing refuses the merge right now, not that the merge would
 apply without conflicts. A preview prints no roster listing, unlike the actions
 that change one.
 
+A repository can require one verification command to pass before any merge:
+
+```sh
+agent-parley verify show
+agent-parley verify set 'make check'
+agent-parley verify set ''
+```
+
+`verify set` records that command in the repository's project manifest, beside
+the roster and outside the target source tree, and `verify show` reports what is
+required. A repository with nothing configured runs no gate and merges exactly
+as before. With a command configured, `participant merge` runs it in the base
+checkout before merging and refuses on a non-zero exit, reporting the exit
+status and the last twenty lines of the command's combined output; a command
+that cannot run is a refusal, not a skip. The command is stored as argument
+tokens and run without a shell, so redirection, expansion and chaining cannot
+ride into a gate, and no flag skips it. Removing it is an explicit
+`verify set ''`. `--preview` never runs it, because executing a configured
+command is a different decision from reading Git state. The gate reports the
+base checkout as it stands before the merge, which is not a claim about the
+merged result.
+
 `participant pr` pushes one lane's bridge branch to `origin` and opens a pull
 request for it. The body is the lane's own recorded report: its summary, its
 verification evidence and its remaining work, under the three headings the
@@ -425,14 +459,15 @@ After publication the release workflow comments the verification result on the
 tracking issue, closes it, and closes the milestone once nothing else is open
 in it. Merged release branches are deleted by the repository setting.
 
-One-time owner setup, without which `Prepare release` fails at its first step:
+One-time owner setup, without which `Prepare release` fails as soon as a push
+warrants a version:
 register a GitHub App under the owner account with repository permissions
 Contents: read and write, Pull requests: read and write, and Issues: read and
 write; install it on `suneel944/agent-parley`; set the repository variable
 `RELEASE_BOT_APP_ID` to the App ID; and set the repository secret
 `RELEASE_BOT_PRIVATE_KEY` to a generated private key in full PEM form. The App
-is not a review bypass: it opens the pull request and merges it after the
-required checks pass, and it never merges a red one.
+is not a review bypass: it opens and updates the release pull request so the
+required checks start on it, and it cannot approve, merge, tag or publish.
 
 To cut a release by hand in an emergency, `Release` still accepts a
 `workflow_dispatch` with an existing tag, and reruns the same verification.
@@ -447,7 +482,7 @@ are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
 job requests a short-lived identity token through an `id-token: write`
 permission scoped to that job, and PyPI exchanges it for a one-time upload
 token, so the repository stores no PyPI API token and no publishing secret. The
-workflow must run as its own top-level workflow, triggered by the release tag
+workflow must run as its own top-level workflow, started by its own dispatch
 rather than called from `Prepare release`. The upload carries a signed
 attestation whose build configuration names the workflow that started the run,
 and PyPI checks that name against the trusted publisher: called from another
@@ -458,18 +493,19 @@ re-uploaded or replaced, so it must not run before the GitHub release is
 confirmed good. Rerunning the workflow against an existing tag stays safe:
 files already on the index are skipped rather than treated as a failure.
 
-Publishing needs one manual step that only the repository owner can take, and
-it must be done before the first tag. PyPI has no `agent-parley` project yet,
-and a trusted publisher cannot be added to a project that has no releases, so
-add a *pending* publisher instead: PyPI, account settings, Publishing, "Add a
-new pending publisher", GitHub, with PyPI project name `agent-parley`, owner
-`suneel944`, repository `agent-parley`, workflow `release.yml`, and the
-environment name left empty because the workflow declares no environment. The
-first successful run creates the project and converts the pending publisher
-into a normal one. Nothing is added to repository secrets.
+Publishing needed one manual step that only the repository owner could take,
+and it is done. The `agent-parley` project exists on PyPI and its trusted
+publisher is this repository's `release.yml`, with the environment name left
+empty because the workflow declares no environment. It had to be registered as
+a *pending* publisher, because a trusted publisher cannot be added to a project
+that has no releases, and the first successful run created the project and
+converted it into a normal one. Nothing was added to repository secrets.
 
-A pending publisher does not reserve the name until it is first used, so
-register it before tagging. The earlier candidate `agent-bridge` is permanently
+Registering another one repeats the same path: PyPI, account settings,
+Publishing, "Add a new pending publisher", GitHub, with the PyPI project name,
+owner `suneel944`, repository `agent-parley` and workflow `release.yml`. A
+pending publisher does not reserve the name until it is first used, so register
+it before tagging. The earlier candidate `agent-bridge` is permanently
 unavailable: PyPI strips separators when comparing names, and an unrelated
 `agentbridge` project already holds that form.
 
