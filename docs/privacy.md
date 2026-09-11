@@ -6,17 +6,27 @@ policy describes what the software stores, where it stores it, and what it
 transmits. It applies to the published package, to the Claude plugin and to
 the Codex plugin, which share one coordination runtime.
 
-Last updated 2026-09-10.
+Last updated 2026-09-11.
 
 ## What the software transmits
 
-Nothing leaves your machine.
+Coordination itself never leaves your machine.
 
 The coordination server binds the loopback interface only, at
 `127.0.0.1` on a port you control. The command line tool and the plugin skill
 reach that server over `http://127.0.0.1:PORT` with proxy handling disabled,
 so requests are not forwarded to an external host. The runtime declares no
 third-party dependencies and uses only the Python standard library.
+
+A few commands deliberately reach the Git host you already use, through the
+native `gh` and `git` clients under your own sign-in. `participant pr` pushes
+that lane's branch to `origin` and opens a pull request carrying the lane's
+recorded report. Claiming an issue looks up its title and assigns it to your
+account, releasing it unassigns it, and a lane's first ready report posts its
+summary and evidence as a comment on the issues it claims. Agent Parley stores
+no forge token and adds no flag that bypasses a repository rule, and when no
+`gh` client, no GitHub remote or no network is available nothing is sent and
+the local record is unchanged.
 
 There is no analytics, no crash reporting, no license check and no account.
 The publisher receives no data from your use of the software.
@@ -45,6 +55,12 @@ The directory holds the coordination record you create by using the tool:
 Content is whatever you or your agents write into a summary, a message or a
 report. Do not put secrets in those fields; they are stored as plain text in
 files you own.
+
+`agent-parley top` additionally reads the session records your native clients
+already write under their own configuration directories, so it can report what
+each lane's client counted for its session. Those files are read locally and in
+place. Nothing from them is copied into coordination state, and no vendor is
+asked for anything.
 
 ## Retention and deletion
 

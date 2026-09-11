@@ -1,14 +1,17 @@
 # Release operations
 
-The approved version is **0.1.1**. There is no package release associated with
-the workflow repair. Preparation and publication are separate manual actions;
-neither a merge nor a tag push triggers them. Keep both workflows disabled until
-the repair and history migration are on main and their real refs are verified.
+The approved version is **0.2.0**, published on 2026-09-11. Preparation and
+publication remain separate. Every push to `main` measures release eligibility
+and opens or updates a proposal when the delivered product work warrants one;
+merging that proposal and publishing an existing tag stay manual actions, and
+neither a merge nor a tag push publishes anything. Both workflows are active.
 
 ## Audited release history
 
 The read-only audit on 2026-09-10 downloaded the GitHub bundles and PyPI package
 files, verified both GitHub checksum manifests, and compared the package bytes.
+It predates 0.2.0, so the table below records the versions that existed then and
+says nothing about the current approved release.
 
 | Version | Disposition | Evidence |
 | --- | --- | --- |
@@ -53,14 +56,19 @@ The same history file records the retired version. Both the policy gate and
 publication validation reject reusing it, even if a proposal changes every
 version marker to that number.
 
-The root `last-release-sha` in `release-please-config.json` limits Release
+A root `last-release-sha` in `release-please-config.json` limits Release
 Please's commit scan to the mapped approved release. A bootstrap setting would
 not work: Release Please still finds the original GitHub release, so it does
-not enter bootstrap mode. The policy gate and preparation command require the
-boundary to equal the approved version's recorded mapping. The next intentional
-version PR must remove this root field; checks reject leaving it pinned to the
-old release. Keep the historical mapping as provenance. New tags follow normal
-ancestry and do not require additional mappings.
+not enter bootstrap mode. The policy gate and the preparation command require
+that boundary to equal the mapping recorded for the version in the manifest, and
+to be absent when that version was never migrated. Retiring it is automated:
+the `Retire the migration scan boundary on the proposal` step of `Prepare
+release` runs `python3 -m scripts.release_publish boundary` against the open
+proposal and commits the boundary that proposed version requires, so a proposal
+never arrives carrying a stale one. The 0.2.0 proposal was the first to advance
+past the migrated release, and the field is now absent from the configuration.
+Keep the historical mapping as provenance. New tags follow normal ancestry and
+do not require additional mappings.
 
 Replacing protected main remains a separate repository-policy operation.
 A squash merge can install the code but cannot remove the old commit history.
@@ -133,11 +141,12 @@ users pinned exactly to a yanked version can still install it.
    locally or on `origin`, when a GitHub release exists for that tag including
    a draft, or when the package index already has it. Only a definite absence
    makes a version available; a check that fails to answer stops the run rather
-   than proposing a number that may already be taken. Remove the migration's
-   root `last-release-sha` in this version PR; the policy gate rejects a stale
-   migration boundary.
+   than proposing a number that may already be taken. The migration's root
+   `last-release-sha` is retired without asking: preparation rewrites it on the
+   proposal to the boundary that version requires, or removes it when that
+   version was never migrated, so the policy gate never meets a stale one.
 3. Create the corresponding version tag at the reviewed commit on `main`.
-   Enable Release and dispatch it from `main` with that existing tag.
+   Dispatch Release from `main` with that existing tag.
 4. Check the workflow result and verify the published version. A release is
    complete only after the wheel and source archive on PyPI match the verified
    GitHub artifacts.

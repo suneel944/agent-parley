@@ -42,8 +42,17 @@ provider, and watch a hook refuse a branch switch inside an assigned lane.
 </p>
 
 One screen for every lane: session state, branch drift, issues owned, handoffs
-pending, unread mail, held reservations, delivered context, and what enforcement
-denied. Read-only, no model call, `q` quits.
+pending, unread mail, held reservations, delivered context, what enforcement
+denied, and what that lane's own client recorded for its session. Read-only, no
+model call, `q` quits.
+
+A reservation that declared a time to live is counted with `!` once that
+deadline passes, so a lane that died holding a path reads differently from one
+still working on it; nothing is revoked, and releasing it stays its owner's
+decision. `TOKENS` is the session total that lane's own native client already
+wrote to disk. No vendor is asked, no key is read and no price is applied, so
+it is a relative signal between refreshes rather than billed spend, and the
+cell is blank when nothing could be read.
 
 Every frame on this page is real command output from a demo project. Only the
 state and project paths are shortened.
@@ -247,14 +256,16 @@ agent-parley top --provider claude --provider codex
 ## Providers and accounts
 
 A provider states which native CLI drives a participant and how that CLI reaches
-a model. Every provider drives one of two adapters, which is why two plugin
-installations cover all of them:
+a model. Every provider names one of three adapters, and the adapter decides how
+that CLI is handed its MCP server, its coordination prompt and its hooks. Two of
+the three take a published plugin, which is why two plugin installations cover
+every model-endpoint preset:
 
 | Provider | Native CLI it drives | Plugin that carries `coordinate` |
 | --- | --- | --- |
 | `claude` | `claude` | Claude Code |
 | `codex` | `codex` | Codex |
-| `copilot` | `copilot` | GitHub Copilot CLI |
+| `copilot` | `copilot` | none; the launcher writes that lane's files |
 | `deepseek`, `kimi`, `grok`, `gemini` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
@@ -313,10 +324,12 @@ permission settings still apply.
 ## What it does not do
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent
-Bridge does not merge branches, approve commands, or wake idle agents. Reported
-`ready` is ready for review, not verified completion. Token usage still depends
-on the native agents; the bridge reports injected bytes rather than claiming a
-token-saving percentage.
+Parley integrates a lane only when you run `participant merge`, and it never
+approves a command or wakes an idle agent. Reported `ready` is ready for review,
+not verified completion. Token usage still depends on the native agents:
+`CONTEXT` reports the bytes coordination itself injects and `TOKENS` repeats
+what a lane's own client counted, and neither is billed spend or a claim about
+a token-saving percentage.
 
 ## Contributing
 
