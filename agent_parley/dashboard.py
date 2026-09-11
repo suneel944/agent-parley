@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import roster, store
+from agent_parley import records, roster, store
 from agent_parley.checkpoints import (
     activity,
     event_summary,
@@ -33,6 +33,7 @@ COLUMNS = (
     ("CONTEXT", 9),
     ("DENIALS", 9),
     ("CALLS", 9),
+    ("TOKENS", 9),
 )
 
 
@@ -54,6 +55,26 @@ def _size(count: int) -> str:
     if count < 1024 * 1024:
         return f"{count / 1024:.1f}kB"
     return f"{count / 1024 / 1024:.1f}MB"
+
+
+def _tokens(count: int | None) -> str:
+    """Formats a reported token count, or nothing when none was readable.
+
+    Args:
+        count: Tokens the lane's own native client recorded for its session,
+            or None when those records could not be read.
+
+    Returns:
+        A compact count, or an empty cell, which states that nothing was read
+        rather than that the lane spent nothing.
+    """
+    if count is None:
+        return ""
+    if count < 1000:
+        return str(count)
+    if count < 1000000:
+        return f"{count / 1000:.1f}k"
+    return f"{count / 1000000:.1f}M"
 
 
 def _fit(value: str, width: int) -> str:
@@ -161,6 +182,9 @@ def _row(
         "denials": events["denials"],
         "calls": stats.get("calls", 0),
         "errors": stats.get("errors", 0),
+        "tokens": records.reported_tokens(
+            home, participant, context["records"]
+        ),
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
         ).replace("\n", " ")[:MAX_PROMPT],
@@ -173,6 +197,7 @@ def collect(
     branches: dict,
     providers: tuple[str, ...] = (),
     window: float = 0.0,
+    readings: dict | None = None,
 ) -> dict:
     """Reads one snapshot of every registered project without changing state.
 
@@ -186,6 +211,9 @@ def collect(
         window: Seconds of enforcement history each event count covers; the
             whole retained log when zero. The window ends at the time of this
             reading, so a live view reports a period that moves with it.
+        readings: Caller-owned cache of each lane's last session-record
+            reading, so a live view folds only newly appended records instead
+            of re-reading a whole transcript on every refresh.
 
     Returns:
         Server health, per-project participant rows, and totals over the
@@ -193,6 +221,7 @@ def collect(
         does not show.
     """
     since = time.time() - window if window else 0.0
+    cache = {} if readings is None else readings
     projects = []
     totals = {"participants": 0, "events": 0, "denials": 0, "context": 0}
     for path in sorted((home / "projects").glob("*/project.json")):
@@ -208,6 +237,7 @@ def collect(
             "usage": usage,
             "issues": snapshot(path.parent),
             "branches": branches,
+            "records": cache,
             "since": since,
         }
         rows = [
@@ -305,6 +335,7 @@ def render(view: dict) -> list[str]:
                             f"{row['denials']}/{row['hook_events']}",
                             f"{row['calls']}"
                             + (f"!{row['errors']}" if row["errors"] else ""),
+                            _tokens(row["tokens"]),
                         ),
                         COLUMNS,
                         strict=True,
@@ -318,8 +349,11 @@ def render(view: dict) -> list[str]:
         "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
         "!past a declared time to live, with the age of the oldest; DENIALS "
         "denied or blocked of retained hook events; CALLS served MCP calls, "
-        "!rejected. A branch marked ! left its assigned bridge branch. A "
-        "stale lease is still held; releasing it is its owner's to do."
+        "!rejected; TOKENS what that lane's own native client recorded for "
+        "its session, not billed spend and not comparable between vendors, "
+        "blank when its records were not readable. A branch marked ! left "
+        "its assigned bridge branch. A stale lease is still held; releasing "
+        "it is its owner's to do."
     )
     return lines
 
@@ -334,11 +368,14 @@ def _loop(
 ) -> None:
     """Redraws the snapshot until the operator quits; never writes state."""
     branches: dict = {}
+    readings: dict = {}
     with contextlib.suppress(curses.error):
         curses.curs_set(0)
     screen.timeout(max(100, int(interval * 1000)))
     while True:
-        lines = render(collect(home, running(), branches, providers, window))
+        lines = render(
+            collect(home, running(), branches, providers, window, readings)
+        )
         height, width = screen.getmaxyx()
         screen.erase()
         for index, line in enumerate(lines[: height - 1]):

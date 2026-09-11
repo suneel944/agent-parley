@@ -8,6 +8,13 @@ from agent_parley.cli import Bridge, git
 from agent_parley.state import write_json
 
 
+@pytest.fixture(autouse=True)
+def native_config_homes(tmp_path, monkeypatch):
+    """Keeps native session-record reads inside each test's own directory."""
+    for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        monkeypatch.setenv(variable, str(tmp_path / variable.lower()))
+
+
 @pytest.fixture
 def bridge(tmp_path):
     """Allocates private coordination state and tears down its own service."""
