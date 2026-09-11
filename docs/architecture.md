@@ -195,6 +195,28 @@ The gate reports the base checkout as it stands before the merge, which is not
 a claim about the merged result, so combined post-merge verification remains a
 separate reviewed action.
 
+`participant pr` pushes one lane's branch to `origin` and opens a pull request
+carrying that lane's recorded report. It is the only command that writes to the
+repository's remote; the forge mirrors above touch issues, never Git, and
+reading status stays local. It reads the report from lane activity, the claimed
+issues from the issue
+ledger, the title from the first commit the lane added, and the base from the
+branch the common repository root has checked out. Authentication is the native
+`gh` CLI's own, so repository permissions and rules apply unchanged and no token
+enters bridge state. The generated body carries the three headings of
+`.github/PULL_REQUEST_TEMPLATE.md` and an explicit reference to every claimed
+issue, which is what the repository's pull-request hygiene gate requires of a
+body. The assignee is the operator's own forge account, and the change-type
+labels and milestone are mirrored from the claimed issues, so classification
+comes from the issue rather than from the lane and the hygiene gate passes at
+creation. That metadata resolves before the push, so a refusal leaves no remote
+branch behind. It refuses on an unknown participant, a missing report, an
+unclassified claimed issue, claimed issues whose milestones disagree, an
+unclaimed lane,
+a branch that adds no commits to the project base, and a base checkout on a
+detached HEAD or on the lane's own branch. An open pull request for the branch
+is reported instead of replaced by a second one.
+
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
 reservations continue to resolve.

@@ -34,6 +34,18 @@ from agent_parley.state import BridgeError, lock, write_json
 
 VERIFY_TIMEOUT = 1800
 VERIFY_TAIL_LINES = 20
+CHANGE_TYPE = frozenset(
+    {
+        "bug",
+        "enhancement",
+        "documentation",
+        "dependencies",
+        "ci",
+        "security",
+        "performance",
+        "release",
+    }
+)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -453,6 +465,138 @@ def verify_base(root: Path, command: list[str]) -> None:
         f"Verification failed in the base checkout at {root}: `{quoted}` "
         f"exited {result.returncode}. Fix it and rerun; merge never skips "
         f"verification and nothing was merged.\n{tail}"
+    )
+
+
+def gh(cwd: Path, *args: str) -> str:
+    """Runs the operator's GitHub CLI and returns stripped stdout.
+
+    Authentication, host selection and repository permissions stay with the
+    native `gh` installation. Agent Parley passes no token, reads no
+    credential, and adds no flag that would bypass a repository rule. The
+    working directory selects the repository, exactly as it does when the
+    operator runs `gh` by hand.
+
+    Args:
+        cwd: Checkout the command runs in, which selects the repository.
+        *args: Individual gh arguments, never shell-expanded.
+
+    Returns:
+        Command output with surrounding whitespace removed.
+
+    Raises:
+        BridgeError: If gh is not installed or exits unsuccessfully.
+        subprocess.TimeoutExpired: If gh exceeds the command timeout.
+    """
+    executable = shutil.which("gh")
+    if executable is None:
+        raise BridgeError(
+            "Install and sign in to the native gh CLI first; Agent Parley "
+            "uses your own GitHub authentication and never stores a token."
+        )
+    result = subprocess.run(
+        [executable, *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode:
+        raise BridgeError(result.stderr.strip() or "GitHub CLI call failed.")
+    return result.stdout.strip()
+
+
+def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
+    """Reads the ownership metadata the claimed issues already carry.
+
+    The repository requires every pull request to declare a change type and
+    to match the milestone of the issue it references. Both facts already
+    exist on the issue, so they are mirrored rather than invented: a lane
+    does not get to classify its own work, and an unclassified issue is
+    reported instead of being given a guessed label.
+
+    Args:
+        cwd: Checkout the GitHub CLI runs in, which selects the repository.
+        issues: Repository issue numbers the lane claims.
+
+    Returns:
+        The change-type labels the issues carry, and the single milestone
+        title they agree on, or an empty string when none carries one.
+
+    Raises:
+        BridgeError: If no claimed issue carries a change-type label, if the
+            claimed issues carry conflicting milestones, or if the GitHub CLI
+            cannot read an issue.
+        subprocess.TimeoutExpired: If gh exceeds the command timeout.
+    """
+    labels: set[str] = set()
+    milestones: set[str] = set()
+    for number in issues:
+        record = json.loads(
+            gh(cwd, "issue", "view", number, "--json", "labels,milestone")
+        )
+        labels |= {
+            label["name"] for label in record.get("labels") or []
+        } & CHANGE_TYPE
+        if milestone := record.get("milestone"):
+            milestones.add(milestone["title"])
+    if not labels:
+        raise BridgeError(
+            "No claimed issue carries a change-type label, and the pull "
+            "request takes its classification from the issue rather than "
+            "choosing one. Label "
+            + ", ".join(f"#{number}" for number in issues)
+            + " with one of: "
+            + ", ".join(sorted(CHANGE_TYPE))
+            + "."
+        )
+    if len(milestones) > 1:
+        raise BridgeError(
+            "The claimed issues carry different milestones ("
+            + ", ".join(sorted(milestones))
+            + "), so one pull request cannot match them all. Split the work "
+            "or align the issues first."
+        )
+    return sorted(labels), milestones.pop() if milestones else ""
+
+
+def pull_request_body(state: dict, issues: list[str]) -> str:
+    """Shapes one lane's recorded report into the repository template.
+
+    The body reproduces what the participant reported and invents nothing
+    of its own, so a reviewer reads the lane's own account. It carries the
+    three headings of `.github/PULL_REQUEST_TEMPLATE.md` and an explicit
+    reference to every issue the lane still claims, which is what the
+    repository hygiene gate requires of a pull request.
+
+    Args:
+        state: Recorded lane activity holding the reported outcome.
+        issues: Repository issue numbers the lane claims.
+
+    Returns:
+        Markdown for the pull-request body.
+    """
+    references = " ".join(f"Refs #{number}" for number in issues)
+    evidence = (
+        state.get("evidence", "").strip()
+        or "The lane recorded no verification evidence."
+    )
+    remaining = (
+        state.get("remaining", "").strip()
+        or "The lane recorded no remaining work."
+    )
+    return (
+        "## Problem and result\n\n"
+        f"{state['summary'].strip()}\n\n"
+        f"Reported state: {state.get('outcome', 'unknown')}. A reported "
+        "state is the participant's own account of its lane; it is neither "
+        "review nor independent verification.\n\n"
+        f"{references}\n\n"
+        "## Verification\n\n"
+        f"{evidence}\n\n"
+        "## Compatibility and risks\n\n"
+        f"{remaining}\n"
     )
 
 
@@ -1008,6 +1152,131 @@ class Bridge:
             participant["branch"],
             session,
         )
+
+    def pull_request(self, repo: Path, name: str) -> str:
+        """Pushes one lane's branch and opens its pull request.
+
+        The pull request carries the lane's recorded report, so the summary,
+        the verification evidence and the issues the lane claimed reach
+        review as the participant reported them. Pushing is the only network
+        side effect in the coordination runtime and it happens here alone:
+        recording a report or reading status never reaches a remote. The
+        title is the first commit the lane added, which already follows the
+        target repository's own commit rules. An open pull request for the
+        branch is reported rather than replaced by a second one.
+
+        The pull request also opens owned and classified. The operator's own
+        GitHub account becomes its assignee, and its change-type labels and
+        milestone are mirrored from the issues the lane claims, so a lane
+        never classifies its own work and the repository's own metadata rules
+        are met at creation rather than repaired afterwards. Metadata is
+        resolved before the branch is pushed, so a refusal leaves no remote
+        branch behind.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose bridge branch becomes a pull request.
+
+        Returns:
+            An account naming the pushed branch and the pull request.
+
+        Raises:
+            BridgeError: If the project, participant, report, branch, claimed
+                issue, issue classification, base checkout, push, or GitHub
+                CLI cannot support a pull request.
+            subprocess.TimeoutExpired: If Git or gh exceeds its timeout.
+        """
+        directory, data, participant = self._lane(repo, name)
+        root = Path(data["root"])
+        branch = participant["branch"]
+        path = directory / f"{name}-activity.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if not state.get("summary", "").strip():
+            raise BridgeError(
+                f"{name} has recorded no report, and a pull request carries "
+                "that report. Run `agent-parley report --state ready "
+                '--summary "..." --evidence "..."` in the lane first.'
+            )
+        if not has_branch(root, branch):
+            raise BridgeError(
+                f"Branch {branch} no longer exists. Recover it from the "
+                f"reflog, or retire {name} and add it again."
+            )
+        if not git(root, "log", "--oneline", f"{data['base']}..{branch}"):
+            raise BridgeError(
+                f"{branch} adds no commits to the project base, so {name} "
+                "has nothing to open a pull request for."
+            )
+        claimed = sorted(
+            (
+                number
+                for number, record in snapshot(directory)["issues"].items()
+                if record["owner"] == name
+            ),
+            key=int,
+        )
+        if not claimed:
+            raise BridgeError(
+                f"{name} claims no issue, so the pull request would carry no "
+                "issue reference. Run `agent-parley issue claim NUMBER` in "
+                "the lane first."
+            )
+        labels, milestone = hygiene_metadata(root, claimed)
+        base = current_branch(root)
+        if base in ("<detached HEAD>", branch):
+            raise BridgeError(
+                f"The base checkout at {root} is on {base}, which cannot "
+                "receive this pull request. Switch it to the branch the "
+                "pull request should target, then rerun."
+            )
+        git(root, "push", "--set-upstream", "origin", branch)
+        listed = json.loads(
+            gh(
+                root,
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "url",
+            )
+            or "[]"
+        )
+        if listed:
+            return (
+                f"Pushed {branch}. A pull request is already open for it: "
+                f"{listed[0]['url']}"
+            )
+        title = git(
+            root,
+            "log",
+            "--reverse",
+            "--format=%s",
+            f"{data['base']}..{branch}",
+        ).splitlines()[0]
+        arguments = [
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body",
+            pull_request_body(state, claimed),
+            "--assignee",
+            "@me",
+        ]
+        for label in labels:
+            arguments.extend(["--label", label])
+        if milestone:
+            arguments.extend(["--milestone", milestone])
+        created = gh(root, *arguments)
+        opened = created.splitlines()[-1] if created else "a pull request"
+        return f"Pushed {branch} and opened {opened}"
 
     async def identity(self, agent: str, data: dict) -> dict:
         """Registers a lane locally; registration is not an MCP tool.
@@ -1679,7 +1948,7 @@ def main() -> int:
     joining.add_argument("--provider")
     joining.add_argument("--credentials")
     joining.add_argument("--repo", type=Path, default=Path.cwd())
-    for action in ("restore", "retire", "merge"):
+    for action in ("restore", "retire", "merge", "pr"):
         command = roles.add_parser(action)
         command.add_argument("name")
         command.add_argument("--repo", type=Path, default=Path.cwd())
@@ -1806,6 +2075,8 @@ def main() -> int:
                     if preview
                     else bridge.merge(repository, args.name)
                 )
+            elif args.action == "pr":
+                print(bridge.pull_request(repository, args.name))
             if not preview:
                 _, directory = bridge.project(repository)
                 print(roster.describe(roster.read(directory)))
