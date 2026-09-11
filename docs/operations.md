@@ -39,6 +39,7 @@ agent-parley issue accept 42 --offer-id CURRENT_OFFER_ID
 agent-parley issue block 42 --on 17
 agent-parley issue unblock 42 --on 17
 agent-parley report --state ready --summary "Result" --evidence "Checks and results"
+agent-parley say codex "Rebase onto main before you open the pull request."
 ```
 
 `issue offer --to` names another participant in the same project.
@@ -57,6 +58,21 @@ a forge that is missing, offline or unwilling changes nothing about ownership.
 Because every lane runs under your one account, a handoff between participants
 changes the ledger owner without changing the assignee, and change-type labels
 are left to you.
+
+`say NAME "text"` writes one message into that participant's inbox as
+`operator`, so a supervisor steering several lanes can redirect one without
+typing into its terminal. The message uses the same send path as peer mail: the
+lane sees it at its next checkpoint, alongside agent traffic. Without `--key`
+the idempotency key follows the message itself, so repeating an identical
+message delivers nothing further, while changed text is a new message. `--ack`
+requires the lane to acknowledge it, and `--subject` replaces the default
+subject line. The command refuses, naming the reason, when the repository has
+no project, when the name is not in the roster, and when that participant has
+never launched and so has no registered identity.
+
+`operator` is reserved. It cannot be claimed as a participant, provider or
+credential profile name, it never holds a coordination credential, and no MCP
+tool sends as it, so a served agent cannot write in the operator's name.
 
 `issue list` prints each owner's session state and the age of its last
 checkpoint, so a stalled lane is visible. Reclaiming that work still needs the

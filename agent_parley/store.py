@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
+from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
@@ -28,6 +29,10 @@ READ_ONLY = (
     "list_participants",
     "read_thread",
     "search_messages",
+)
+NO_PROJECT = (
+    "This repository has no coordination project yet; launch a participant "
+    "once with agent-parley run so the project registers."
 )
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -267,7 +272,27 @@ def _import_legacy(db: sqlite3.Connection, legacy: Path) -> None:
 
 
 def register(home: Path, root: str, name: str, token: str = "") -> dict:
-    """Registers a locally authorized lane; never exposed as an MCP tool."""
+    """Registers a locally authorized lane; never exposed as an MCP tool.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Identity the lane presents to its peers.
+        token: Credential retained from an earlier registration, or empty to
+            mint one.
+
+    Returns:
+        The registered identity and its bearer credential.
+
+    Raises:
+        BridgeError: If the name is the reserved operator identity, which
+            writes from the command line and never holds a credential.
+    """
+    if name == OPERATOR:
+        raise BridgeError(
+            f"{OPERATOR!r} is the command-line operator identity; it cannot "
+            "be registered or hold a coordination credential."
+        )
     token = token or secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
     with connect(home, write=True) as db:
@@ -1014,6 +1039,80 @@ def search_messages(
     with connect(home) as db:
         actor = _identify(db, root, name)
         return _search(db, actor, {"query": query, "limit": limit})
+
+
+def speak(
+    home: Path,
+    root: str,
+    name: str,
+    subject: str,
+    body: str,
+    key: str,
+    *,
+    ack: bool = False,
+) -> dict:
+    """Delivers one supervising operator's message to a registered lane.
+
+    The message takes the ordinary send path, so it is deduplicated by its
+    key, can require acknowledgement, and is read back beside peer traffic.
+    The operator row carries no credential digest, so it never resolves a
+    bearer token and no served session can write in its name.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity of the participant being addressed.
+        subject: Subject line shown in that participant's inbox.
+        body: Message body the participant reads.
+        key: Idempotency key; an identical resend returns the original.
+        ack: Whether the participant must acknowledge the message.
+
+    Returns:
+        The delivered message identifier, carrying ``duplicate`` when this key
+        already named exactly this message.
+
+    Raises:
+        BridgeError: If the project or the addressed participant is not
+            registered, or the message fails validation.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        project = db.execute(
+            "SELECT id FROM projects WHERE human_key=?", (root,)
+        ).fetchone()
+        if not project:
+            raise BridgeError(NO_PROJECT)
+        registered = db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND name=?",
+            (project[0], name),
+        ).fetchone()
+        if not registered:
+            raise BridgeError(
+                f"{name} has not registered with the coordination store; "
+                "launch that participant once with agent-parley run."
+            )
+        db.execute(
+            "INSERT INTO agents(project_id,name) VALUES (?,?) "
+            "ON CONFLICT(project_id,name) DO NOTHING",
+            (project[0], OPERATOR),
+        )
+        actor = db.execute(
+            "SELECT id,project_id,name FROM agents "
+            "WHERE project_id=? AND name=?",
+            (project[0], OPERATOR),
+        ).fetchone()
+        return _send(
+            db,
+            dict(actor),
+            {
+                "to": [name],
+                "subject": subject,
+                "body_md": body,
+                "idempotency_key": key,
+                "ack_required": ack,
+            },
+        )
 
 
 def usage(home: Path, root: str) -> dict[str, dict]:

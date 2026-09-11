@@ -28,7 +28,7 @@ from agent_parley.checkpoints import (
     mailbox,
     prune,
 )
-from agent_parley.cli import Bridge, BridgeError, git, lock, write_json
+from agent_parley.cli import Bridge, BridgeError, git, lock, main, write_json
 from agent_parley.issues import MAX_BLOCKERS, describe
 from agent_parley.process import start_ticks
 from agent_parley.server import TOOLS
@@ -2281,3 +2281,79 @@ def test_mail_commands_read_the_lane_participants_own_thread_and_search(
     assert bridge.mail(lane, "search", query="unrelated")["messages"] == []
     with pytest.raises(BridgeError, match="assigned agent worktree"):
         bridge.mail(repo, "thread", thread=sent["thread_id"])
+
+
+def operator_lane(bridge, repo, name="claude"):
+    """Adds one lane and registers the coordination identity it addresses."""
+    data = bridge.add_participant(repo, name, "claude")
+    store.initialize(bridge.home)
+    identity = store.register(bridge.home, data["root"], name)
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    return data, actor
+
+
+def test_operator_message_is_delivered_deduplicated_and_acknowledgeable(
+    bridge, repo, monkeypatch
+):
+    data, actor = operator_lane(bridge, repo)
+    first = bridge.say(repo, "claude", "Switch to issue 44 next.")
+    assert "duplicate" not in first
+    inbox = mailbox(bridge.home, data["root"], "claude")
+    assert inbox["unread"] == 1
+    assert inbox["messages"][0]["sender"] == roster.OPERATOR
+    assert inbox["messages"][0]["subject"] == "Operator message"
+    assert inbox["messages"][0]["body_md"] == "Switch to issue 44 next."
+    resent = bridge.say(repo, "claude", "Switch to issue 44 next.")
+    assert resent["id"] == first["id"]
+    assert resent["duplicate"] is True
+    assert mailbox(bridge.home, data["root"], "claude")["unread"] == 1
+    pending = bridge.say(repo, "claude", "Pause and confirm.", ack=True)
+    assert mailbox(bridge.home, data["root"], "claude")["pending_ack"] == 1
+    store.call(
+        bridge.home,
+        actor,
+        "acknowledge_message",
+        {"message_id": pending["id"]},
+    )
+    assert mailbox(bridge.home, data["root"], "claude")["pending_ack"] == 0
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "say",
+            "claude",
+            "Ship the fix today.",
+            "--repo",
+            str(repo),
+            "--subject",
+            "Priority",
+        ],
+    )
+    assert main() == 0
+    assert mailbox(bridge.home, data["root"], "claude")["unread"] == 2
+
+
+def test_operator_refuses_unknown_targets_and_cannot_be_impersonated(
+    bridge, repo
+):
+    with pytest.raises(BridgeError, match="no bridge project"):
+        bridge.say(repo, "claude", "Nothing to steer yet.")
+    data, actor = operator_lane(bridge, repo)
+    with pytest.raises(BridgeError, match="not a participant"):
+        bridge.say(repo, "ghost", "Who are you?")
+    bridge.add_participant(repo, "codex", "codex")
+    with pytest.raises(BridgeError, match="has not registered"):
+        bridge.say(repo, "codex", "Start when you are launched.")
+    with pytest.raises(BridgeError, match="no coordination project"):
+        store.speak(bridge.home, "/absent", "claude", "Subject", "Body", "k1")
+    with pytest.raises(BridgeError, match="Unknown coordination tool"):
+        store.call(bridge.home, actor, "say", {})
+    with pytest.raises(BridgeError, match="operator"):
+        roster.identifier(roster.OPERATOR, "Participant name")
+    with pytest.raises(BridgeError, match="operator"):
+        bridge.add_participant(repo, roster.OPERATOR)
+    with pytest.raises(BridgeError, match="operator"):
+        store.register(bridge.home, data["root"], roster.OPERATOR)

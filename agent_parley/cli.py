@@ -97,6 +97,22 @@ def duration(text: str) -> float:
     return seconds
 
 
+def operator_key(name: str, subject: str, body: str) -> str:
+    """Derives a stable idempotency key from an operator message itself.
+
+    Args:
+        name: Participant the message addresses.
+        subject: Subject line of the message.
+        body: Message body.
+
+    Returns:
+        A key that repeats only for an identical message, so retyping the same
+        steer redelivers nothing while a changed one is a new message.
+    """
+    digest = hashlib.sha256("\x00".join((name, subject, body)).encode())
+    return f"operator-{digest.hexdigest()[:48]}"
+
+
 def has_branch(repo: Path, branch: str) -> bool:
     """Reports whether a branch still exists in a repository."""
     return bool(
@@ -1445,6 +1461,59 @@ review, not merged or independently verified. An idle turn is not completion.
                 if record["owner"] == agent:
                     forge.comment(repo, issue, body)
 
+    def say(
+        self,
+        repo: Path,
+        name: str,
+        text: str,
+        subject: str = "",
+        key: str = "",
+        ack: bool = False,
+    ) -> dict:
+        """Writes one operator message into a participant's lane inbox.
+
+        The operator supervises several lanes and steers one without typing
+        into its terminal. It writes from this command line only: no
+        coordination tool sends as the operator, and the operator identity
+        holds no credential, so no served session can write in its name.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose inbox receives the message.
+            text: Message body the participant reads.
+            subject: Subject line; a plain default is used when empty.
+            key: Idempotency key; derived from the message when empty.
+            ack: Whether the participant must acknowledge the message.
+
+        Returns:
+            The delivered message identifier, carrying ``duplicate`` when this
+            key already named exactly this message.
+
+        Raises:
+            BridgeError: If the repository has no project, the participant is
+                not in its roster or not registered, or the message fails
+                validation.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        participant = data["participants"].get(name)
+        if participant is None:
+            raise BridgeError(
+                f"{name} is not a participant in this project; "
+                "run agent-parley participant list."
+            )
+        subject = subject or "Operator message"
+        identity = participant["display"]
+        return store.speak(
+            self.home,
+            data["root"],
+            identity,
+            subject,
+            text,
+            key or operator_key(identity, subject, text),
+            ack=ack,
+        )
+
     def issue(
         self,
         repo: Path,
@@ -1953,6 +2022,32 @@ def main() -> int:
     report.add_argument("--summary", required=True)
     report.add_argument("--remaining", default="")
     report.add_argument("--evidence", default="")
+    steer = commands.add_parser(
+        "say", help="Send one lane a coordination message as the operator."
+    )
+    steer.add_argument(
+        "participant", help="Participant whose inbox receives the message."
+    )
+    steer.add_argument("text", help="Message body the participant reads.")
+    steer.add_argument("--repo", type=Path, default=Path.cwd())
+    steer.add_argument(
+        "--subject",
+        default="",
+        help="Subject line shown in the lane's inbox.",
+    )
+    steer.add_argument(
+        "--key",
+        default="",
+        help=(
+            "Idempotency key. Without one the key follows the message text, "
+            "so repeating the same message delivers nothing further."
+        ),
+    )
+    steer.add_argument(
+        "--ack",
+        action="store_true",
+        help="Require the participant to acknowledge the message.",
+    )
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -2097,6 +2192,24 @@ def main() -> int:
                 args.evidence,
             )
             print(f"Recorded outcome: {args.state}")
+        elif args.command == "say":
+            delivered = bridge.say(
+                args.repo.resolve(),
+                args.participant,
+                args.text,
+                args.subject,
+                args.key,
+                args.ack,
+            )
+            state = (
+                "already delivered"
+                if delivered.get("duplicate")
+                else "delivered"
+            )
+            print(
+                f"Operator message {delivered['id']} {state} to "
+                f"{args.participant}."
+            )
         elif args.command == "issue":
             result = bridge.issue(
                 args.repo.resolve(),

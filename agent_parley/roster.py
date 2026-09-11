@@ -14,8 +14,18 @@ ADAPTERS = ("claude", "codex")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
 VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL")
+OPERATOR = "operator"
 RESERVED = frozenset(
-    {"bridge", "config", "issues", "project", "server", "setup", "store"}
+    {
+        "bridge",
+        "config",
+        "issues",
+        OPERATOR,
+        "project",
+        "server",
+        "setup",
+        "store",
+    }
 )
 LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
@@ -74,7 +84,8 @@ def identifier(value: str, kind: str) -> str:
         The accepted name.
 
     Raises:
-        BridgeError: If the name is malformed or reserved for bridge state.
+        BridgeError: If the name is malformed, reserved for bridge state, or
+            reserved for the command-line operator identity.
     """
     if (
         not isinstance(value, str)
