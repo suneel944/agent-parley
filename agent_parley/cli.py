@@ -92,6 +92,50 @@ def has_branch(repo: Path, branch: str) -> bool:
     )
 
 
+def preserve_pending(root: Path) -> str | None:
+    """Stashes pending base-checkout work so lanes can start from HEAD.
+
+    Registration reads committed HEAD, so pending changes would otherwise
+    never reach a lane. The changes are stashed rather than discarded. The
+    stash stack is shared by every worktree of the repository, so the entry
+    carries a unique message and the returned account restores it by name
+    rather than by position.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+
+    Returns:
+        An account of the preserved entry, or None if nothing was pending.
+
+    Raises:
+        BridgeError: If Git leaves changes in the checkout after stashing.
+        subprocess.TimeoutExpired: If Git exceeds the command timeout.
+    """
+    if not git(root, "status", "--porcelain"):
+        return None
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    git(
+        root,
+        "stash",
+        "push",
+        "--include-untracked",
+        "--message",
+        f"agent-parley pending work {stamp}",
+    )
+    if git(root, "status", "--porcelain"):
+        raise BridgeError(
+            f"The checkout at {root} still holds changes that Git cannot "
+            "stash. Commit or preserve them first; worktrees start at HEAD."
+        )
+    entry = git(root, "rev-parse", "--short", "refs/stash")
+    return (
+        f"Preserved your pending changes as stash entry {entry}; worktrees "
+        f"start at HEAD. Restore them with `git -C "
+        f"{shlex.quote(str(root))} stash apply {entry}`, which names this "
+        "entry rather than whichever one is on top of the shared stack."
+    )
+
+
 def drift(name: str, participant: dict, actual: str) -> str:
     """Builds an actionable message for a lane that left its branch.
 
@@ -389,10 +433,14 @@ class Bridge:
         """
         root, directory = self.project(repo)
         with lock(directory / "setup.lock"):
-            return roster.expand(self._project(root, directory))
+            return roster.expand(self._project(root, directory, preserve=True))
 
     def _project(
-        self, root: Path, directory: Path, verify: set[str] | None = None
+        self,
+        root: Path,
+        directory: Path,
+        verify: set[str] | None = None,
+        preserve: bool = False,
     ) -> dict:
         """Reads or creates the manifest while the setup lock is held.
 
@@ -400,12 +448,15 @@ class Bridge:
             root: Common repository root.
             directory: Private state directory for the repository.
             verify: Participants whose branch must match, or None for all.
+            preserve: Whether pending base-checkout work is stashed instead
+                of refused when this manifest is created.
 
         Returns:
             Manifest using the participant roster layout.
 
         Raises:
-            BridgeError: If a checked lane left its assigned branch.
+            BridgeError: If a checked lane left its assigned branch, or if
+                pending work blocks a manifest that must not stash it.
         """
         path = directory / "project.json"
         if path.exists():
@@ -422,7 +473,11 @@ class Bridge:
                 if actual != participant["branch"]:
                     raise BridgeError(drift(name, participant, actual))
             return data
-        if git(root, "status", "--porcelain"):
+        if preserve:
+            preserved = preserve_pending(root)
+            if preserved:
+                print(preserved, file=sys.stderr, flush=True)
+        elif git(root, "status", "--porcelain"):
             raise BridgeError(
                 "Commit or preserve your pending changes first; "
                 "worktrees start at HEAD."
@@ -462,7 +517,7 @@ class Bridge:
         roster.identifier(name, "Participant name")
         root, directory = self.project(repo)
         with lock(directory / "setup.lock"):
-            data = self._project(root, directory, verify={name})
+            data = self._project(root, directory, verify={name}, preserve=True)
             participants = data["participants"]
             existing = participants.get(name)
             provider = provider or (existing or {}).get("provider") or name

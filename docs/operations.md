@@ -112,7 +112,12 @@ agent-parley provider add vendor --adapter claude --executable claude \
 ```
 
 `run` creates a participant's lane on first use, so `participant add` is only
-needed to prepare a roster in advance. The participant name is what peers
+needed to prepare a roster in advance. Worktrees start at committed HEAD, so the
+first registration of a repository stashes any pending work in the base checkout
+instead of refusing to start. It names the stash entry and prints the
+`git stash apply` that brings that specific entry back, because every worktree
+of a repository shares one stash stack. Only that first registration touches the
+base checkout; `merge`, `restore` and `retire` still refuse on a dirty tree. The participant name is what peers
 address; the provider decides which native CLI starts and which endpoint it uses.
 The `deepseek`, `kimi` and `grok` presets need their vendor base URL and key
 exported in the launching shell; the launcher refuses to start when a required
