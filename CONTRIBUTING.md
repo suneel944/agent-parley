@@ -92,13 +92,18 @@ commit messages, PRs, issues, and comments, including closed items. Keep require
 license notices and factual product documentation intact. Repository policy and
 PR hygiene checks enforce the textual attribution boundary.
 
-Releases require explicit maintainer actions. `0.1.1` remains the approved
-version; workflow repairs do not authorize a new version. Both release workflows
-accept only manual dispatches from `main`. The Prepare release workflow creates
-or updates a Release Please PR, using the release app identity so normal PR checks
-run. It assigns ownership, a release issue and a milestone. It cannot approve,
-merge, tag, or publish. A maintainer reviews the proposed package changes and
-merges through the protected-branch gate. Package, plugin, marketplace, release
+Releasing requires explicit maintainer actions; proposing does not. Every push
+to `main` runs Prepare release, which measures release eligibility from
+delivered product work and stops there unless a version is warranted. Workflow
+repairs do not authorize a new version, and neither does a proposal. A merged
+release proposal does not re-enter the workflow. Release remains a manual
+dispatch.
+
+When eligibility is met, the Prepare release workflow creates or updates a
+Release Please PR, using the release app identity so normal PR checks run. It
+assigns ownership, a release issue and a milestone. It cannot approve, merge,
+tag, or publish. A maintainer reviews the proposed package changes and merges
+through the protected-branch gate. Package, plugin, marketplace, release
 manifest and lockfile versions must agree.
 
 Publication is a separate manual Release dispatch for an existing version tag.
