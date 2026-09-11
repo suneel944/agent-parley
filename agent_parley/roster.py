@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_parley.state import BridgeError, lock, write_json
 
-ADAPTERS = ("claude", "codex")
+ADAPTERS = ("claude", "codex", "copilot")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
 VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL")
@@ -64,6 +64,20 @@ PRESETS: dict[str, dict] = {
         "require_env": ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
     },
     "grok": {
+        "adapter": "codex",
+        "command": "codex",
+        "home_env": "CODEX_HOME",
+        "env": {},
+        "require_env": ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+    },
+    "copilot": {
+        "adapter": "copilot",
+        "command": "copilot",
+        "home_env": "COPILOT_HOME",
+        "env": {},
+        "require_env": [],
+    },
+    "gemini": {
         "adapter": "codex",
         "command": "codex",
         "home_env": "CODEX_HOME",
@@ -258,8 +272,9 @@ def define_provider(
     identifier(name, "Provider name")
     if adapter not in ADAPTERS:
         raise BridgeError(
-            "Agent Parley drives native CLIs that support MCP servers and "
-            f"lifecycle hooks; adapter must be one of: {', '.join(ADAPTERS)}."
+            "Agent Parley supplies MCP configuration and lifecycle hooks as "
+            "native command-line arguments, which only these invocation "
+            f"contracts accept; adapter must be one of: {', '.join(ADAPTERS)}."
         )
     if not command.strip() or "\x00" in command or len(command) > 240:
         raise BridgeError("Provider command must be an executable name.")

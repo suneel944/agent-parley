@@ -30,7 +30,15 @@ from agent_parley.checkpoints import (
     mailbox,
     prune,
 )
-from agent_parley.cli import Bridge, BridgeError, git, lock, main, write_json
+from agent_parley.cli import (
+    COPILOT_EVENTS,
+    Bridge,
+    BridgeError,
+    git,
+    lock,
+    main,
+    write_json,
+)
 from agent_parley.issues import MAX_BLOCKERS, describe
 from agent_parley.process import start_ticks
 from agent_parley.server import TOOLS
@@ -1632,6 +1640,56 @@ def test_many_accounts_of_one_provider_run_side_by_side(
         assert bridge.launch("claude-2", repo, "Continue") == 0
 
 
+def test_a_copilot_lane_configures_only_its_own_client_home(
+    bridge, repo, monkeypatch, tmp_path
+):
+    """Exercises the file-configured adapter without a model call."""
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "copilot"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'argv': sys.argv[1:],\n"
+        "  'home': os.environ.get('COPILOT_HOME', '')}, f)\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("CAPTURE", str(tmp_path / "capture.json"))
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    store.initialize(bridge.home)
+
+    with pytest.raises(BridgeError, match="credential profile"):
+        bridge.launch("solo", repo, "Work on issue 42", "copilot")
+
+    account = tmp_path / "copilot-account"
+    roster.define_credential(bridge.home, "work", str(account), [], [])
+    assert (
+        bridge.launch("helper", repo, "Work on issue 42", "copilot", "work")
+        == 0
+    )
+    captured = json.loads((tmp_path / "capture.json").read_text())
+    assert captured["home"] == str(account)
+    assert captured["argv"][0] == "-p"
+    assert "Work on issue 42" in captured["argv"][1]
+    assert not [flag for flag in captured["argv"] if flag.startswith("--al")]
+
+    servers = json.loads((account / "mcp-config.json").read_text())
+    entry = servers["mcpServers"]["agent_parley"]
+    assert entry["url"] == bridge.url + "/mcp/"
+    assert entry["headers"]["Authorization"] == "Bearer ${AGENT_PARLEY_TOKEN}"
+    assert bridge.config["token"] not in json.dumps(servers)
+
+    settings = json.loads((account / "settings.json").read_text())
+    assert settings["version"] == 1
+    assert set(settings["hooks"]) == set(COPILOT_EVENTS.values())
+    hook = settings["hooks"]["sessionStart"][0]
+    assert hook["type"] == "command"
+    assert hook["timeoutSec"] == 3
+    assert "agent_parley.checkpoints" in hook["bash"]
+
+
 def test_provider_definitions_never_store_credential_values(
     bridge, monkeypatch
 ):
@@ -1668,6 +1726,124 @@ def test_provider_definitions_never_store_credential_values(
         roster.define_provider(
             bridge.home, "vendor", "vendor-cli", "vendor", "", [], []
         )
+
+
+def test_every_shipped_preset_rides_one_of_the_native_contracts():
+    """Keeps presets on a CLI that accepts the configuration we emit."""
+    for name, entry in roster.PRESETS.items():
+        assert entry["adapter"] in roster.ADAPTERS, name
+        assert entry["command"] in ("claude", "codex", "copilot"), name
+
+
+def test_gemini_preset_runs_the_codex_contract_against_a_vendor_endpoint(
+    bridge, repo, monkeypatch, tmp_path
+):
+    """Drives Gemini models through the codex CLI, never the Gemini CLI."""
+    entry = roster.provider(bridge.home, "gemini")
+    assert entry["adapter"] == "codex"
+    assert entry["command"] == "codex"
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(BridgeError, match="Export these"):
+        roster.launch_environment(bridge.home, entry, None)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "codex"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'argv': sys.argv[1:],\n"
+        "  'base_url': os.environ.get('OPENAI_BASE_URL', '')}, f)\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://vendor.example/openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "exported-by-the-user")
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    assert bridge.launch("gemini", repo, "Work on issue 74", "gemini") == 0
+    result = json.loads(capture.read_text())
+    assert result["base_url"] == "https://vendor.example/openai"
+    assert (
+        'mcp_servers.agent_parley.bearer_token_env_var="AGENT_PARLEY_TOKEN"'
+        in result["argv"]
+    )
+    overrides = [arg for arg in result["argv"] if arg.startswith("hooks.")]
+    assert "PreToolUse" in tomllib.loads("\n".join(overrides))["hooks"]
+    assert entry["env"] == {}
+    assert "exported-by-the-user" not in json.dumps(result)
+
+
+AGENT_CLIENTS = [
+    ("gemini-cli", "gemini", ""),
+    ("copilot-cli", "copilot", "COPILOT_HOME"),
+    ("opencode", "opencode", "OPENCODE_CONFIG_DIR"),
+    ("amp", "amp", "AMP_SETTINGS_FILE"),
+]
+
+
+@pytest.mark.parametrize("name,executable,home_env", AGENT_CLIENTS)
+def test_agent_client_recipes_select_accounts_by_their_own_config_home(
+    bridge, tmp_path, name, executable, home_env
+):
+    """Records the config-home variable each client documents, if any."""
+    entry = roster.define_provider(
+        bridge.home, name, "claude", executable, home_env, [], []
+    )
+    assert entry["command"] == executable
+    assert roster.provider(bridge.home, name)["home_env"] == home_env
+    roster.define_credential(
+        bridge.home, f"{name}-account", str(tmp_path / name), [], []
+    )
+    if not home_env:
+        with pytest.raises(BridgeError, match="no home_env"):
+            roster.launch_environment(bridge.home, entry, f"{name}-account")
+        return
+    assert roster.launch_environment(bridge.home, entry, f"{name}-account") == {
+        home_env: str(tmp_path / name)
+    }
+
+
+@pytest.mark.parametrize("name,executable,home_env", AGENT_CLIENTS)
+def test_agent_client_recipes_still_receive_the_claude_argument_contract(
+    bridge, repo, monkeypatch, tmp_path, name, executable, home_env
+):
+    """Shows why these clients are recipes rather than shipped presets."""
+    roster.define_provider(
+        bridge.home, name, "claude", executable, home_env, [], []
+    )
+    binary = tmp_path / "bin"
+    binary.mkdir(exist_ok=True)
+    script = binary / executable
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'argv': sys.argv[1:]}, f)\n"
+    )
+    script.chmod(0o755)
+    capture = tmp_path / f"{name}.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    assert bridge.launch(name, repo, "Work on issue 74", name) == 0
+    argv = json.loads(capture.read_text())["argv"]
+    assert "--mcp-config" in argv
+    assert "--append-system-prompt" in argv
+    assert "--settings" in argv
+    assert "bypass" not in " ".join(argv)
 
 
 @pytest.mark.parametrize(

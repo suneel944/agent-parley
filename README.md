@@ -254,18 +254,39 @@ installations cover all of them:
 | --- | --- | --- |
 | `claude` | `claude` | Claude Code |
 | `codex` | `codex` | Codex |
-| `deepseek`, `kimi`, `grok` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
+| `copilot` | `copilot` | GitHub Copilot CLI |
+| `deepseek`, `kimi`, `grok`, `gemini` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
-`claude` and `codex` work out of the box. The `deepseek`, `kimi` and `grok`
-presets carry no endpoint, so their base URL and key must be exported in the
-launching shell; the launcher refuses to start when a required variable is unset
-rather than falling back to another account. Coordination state records variable
-names and config directories, never credential values.
+`claude` and `codex` work out of the box. The `deepseek`, `kimi`, `grok` and
+`gemini` presets carry no endpoint, so their base URL and key must be exported in
+the launching shell; the launcher refuses to start when a required variable is
+unset rather than falling back to another account. Coordination state records
+variable names and config directories, never credential values.
+
+A preset names the vendor whose models answer, not a vendor's own agent CLI:
+`gemini` reaches Gemini models through the `codex` CLI, exactly as `grok` and
+`kimi` do for theirs.
 
 Credential profiles point a provider's config-home variable at a separate
 directory, so one provider can run under several logins. Up to 32 participants
 per project.
+
+### Other agent CLIs
+
+Three adapters cover three ways of accepting configuration. `claude` and
+`codex` take MCP servers, the coordination prompt and lifecycle hooks as
+command-line arguments. `copilot` reads them from files instead, so Agent
+Parley writes `mcp-config.json` and `settings.json` into that lane's own
+Copilot configuration directory; a `copilot` lane therefore requires a
+credential profile, and the launcher refuses without one rather than writing
+hooks into the configuration directory your own sessions use.
+
+Gemini CLI, OpenCode and Amp are not covered. Gemini CLI publishes no variable
+that relocates `~/.gemini`, so it cannot be given a lane of its own; OpenCode
+runs plugins rather than hook commands; Amp accepts no system-prompt argument.
+[Operations](docs/operations.md#other-agent-clis) records what each one
+supports and where its MCP and hook configuration lives.
 
 ## How it fits together
 
