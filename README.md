@@ -189,10 +189,17 @@ bytes; an unchanged checkpoint adds no context at all.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
-**Seven scoped MCP tools carry the coordination.** Conflicting reservations
+**Nine scoped MCP tools carry the coordination.** Conflicting reservations
 grant nothing and name the blocking owner with that owner's declared reason.
 Sends need an idempotency key, so a retry returns the original message instead
-of a duplicate. Fetching an inbox never marks a message read.
+of a duplicate. Fetching an inbox never marks a message read. A send can answer
+another message, which puts both in one thread, and a participant can read a
+thread in order or search its own mail:
+
+```sh
+agent-parley mail thread t12
+agent-parley mail search "reservation conflict"
+```
 
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
@@ -255,8 +262,8 @@ flowchart TD
     Repo[Your repository] --> Launcher[Agent Parley launcher]
     Launcher --> Claude[Participant · own worktree]
     Launcher --> Codex[Participant · own worktree]
-    Claude <-->|Seven scoped MCP tools| Server[Local coordination service]
-    Codex <-->|Seven scoped MCP tools| Server
+    Claude <-->|Nine scoped MCP tools| Server[Local coordination service]
+    Codex <-->|Nine scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]
     Claude --> Claims[Atomic issue claims and handoffs]
     Codex --> Claims
