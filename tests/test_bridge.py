@@ -911,6 +911,106 @@ def test_forge_title_is_clipped_to_the_display_limit(repo, monkeypatch):
     assert forge.issue_title(repo, "42") == "t" * 200
 
 
+def test_forge_mirrors_use_the_operator_account_and_absorb_refusal(
+    repo, monkeypatch
+):
+    monkeypatch.setattr(forge, "slug", lambda directory: "owner/name")
+    monkeypatch.setattr(forge.shutil, "which", lambda command: "/usr/bin/gh")
+    issued = []
+    accepted = subprocess.CompletedProcess([], 0, "", "")
+
+    def record(command, **kwargs):
+        issued.append(command)
+        return accepted
+
+    monkeypatch.setattr(forge.subprocess, "run", record)
+    assert forge.assign(repo, "42") is True
+    assert forge.unassign(repo, "42") is True
+    assert forge.comment(repo, "42", "Lane account") is True
+    assert issued[0][:6] == [
+        "gh",
+        "issue",
+        "edit",
+        "42",
+        "--repo",
+        "owner/name",
+    ]
+    assert issued[0][6:] == ["--add-assignee", "@me"]
+    assert issued[1][6:] == ["--remove-assignee", "@me"]
+    assert issued[2][1:4] == ["issue", "comment", "42"]
+    assert issued[2][6:] == ["--body", "Lane account"]
+    assert not any("--force" in command for command in issued)
+
+    refused = subprocess.CompletedProcess([], 1, "", "gh: no write access")
+    monkeypatch.setattr(forge.subprocess, "run", lambda *a, **k: refused)
+    assert forge.assign(repo, "42") is False
+    assert forge.unassign(repo, "42") is False
+    assert forge.comment(repo, "42", "Lane account") is False
+    monkeypatch.setattr(forge.shutil, "which", lambda command: None)
+    assert forge.assign(repo, "42") is False
+
+
+def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    mirrored = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign",
+        lambda directory, number: mirrored.append(("assign", number)),
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.unassign",
+        lambda directory, number: mirrored.append(("unassign", number)),
+    )
+    bridge.issue(claude, "claim", "#432")
+    bridge.issue(claude, "block", "432", on="77")
+    bridge.issue(claude, "release", "432")
+    assert mirrored == [("assign", "432"), ("unassign", "432")]
+
+    def refuse(directory, number):
+        raise AssertionError("a mirror must never decide the ledger")
+
+    monkeypatch.setattr("agent_parley.cli.forge.assign", refuse)
+    with pytest.raises(AssertionError):
+        bridge.issue(claude, "claim", "432")
+    assert bridge.issue(repo, "list")["issues"]["432"]["owner"] == "claude"
+
+
+def test_a_ready_report_comments_once_on_every_claimed_issue(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    posted = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign", lambda directory, number: True
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.comment",
+        lambda directory, number, body: posted.append((number, body)),
+    )
+    bridge.issue(claude, "claim", "432")
+    bridge.issue(claude, "claim", "433")
+
+    bridge.report(claude, "partial", "Halfway", "More to do", "")
+    assert posted == []
+
+    bridge.report(claude, "ready", "Lane result", "", "make check passed")
+    assert [number for number, _ in posted] == ["432", "433"]
+    assert "Lane `claude` reports ready for review." in posted[0][1]
+    assert "make check passed" in posted[0][1]
+    assert "neither review nor independent verification" in posted[0][1]
+
+    bridge.report(claude, "ready", "Lane result", "", "make check passed")
+    assert len(posted) == 2
+
+
 def test_issue_claim_records_and_renders_the_forge_title(
     bridge, repo, paired, monkeypatch
 ):
