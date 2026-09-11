@@ -45,7 +45,7 @@ jobs:
           token: ${{ steps.app.outputs.token }}
           skip-github-release: true
       - name: Assign release ownership required by the hygiene gate
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.release.outputs.prs != ''
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         env:
           RELEASE_PRS: ${{ steps.release.outputs.prs }}
@@ -56,16 +56,22 @@ jobs:
               const version = pr.title.match(/\b\d+\.\d+\.\d+\b/)[0];
               const title = `v${version}`;
               const milestones = await github.paginate(
-                github.rest.issues.listMilestones, {...repo, state: 'open'});
-              const milestone = milestones.find(m => m.title === title) ||
-                (await github.rest.issues.createMilestone(
+                github.rest.issues.listMilestones, {...repo, state: 'all'});
+              const existing = milestones.find(m => m.title === title);
+              const milestone = existing
+                ? (existing.state === 'closed'
+                  ? (await github.rest.issues.updateMilestone({...repo,
+                    milestone_number: existing.number, state: 'open'})).data
+                  : existing)
+                : (await github.rest.issues.createMilestone(
                   {...repo, title})).data;
               const issues = await github.paginate(
                 github.rest.issues.listForRepo,
-                {...repo, state: 'open', labels: 'release'});
+                {...repo, state: 'all', labels: 'release'});
+              const tracked = issues.find(i => !i.pull_request &&
+                i.title === `Release ${title}`);
               const issueTitle = `Release ${title}`;
-              const issue = issues.find(i => !i.pull_request &&
-                i.title === issueTitle) ||
+              const issue = tracked ||
                 (await github.rest.issues.create({
                   ...repo, title: issueTitle,
                   body: 'Track changelog, version alignment and ' +
