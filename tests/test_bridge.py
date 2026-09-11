@@ -71,7 +71,8 @@ def test_dirty_source_is_preserved_as_a_stash_entry(bridge, repo, capsys):
     assert not git(repo, "status", "--porcelain")
     assert (repo / "shared.txt").read_text() == "original\n"
     assert not (repo / "untracked.txt").exists()
-    entry = git(repo, "rev-parse", "--short", "refs/stash")
+    entry = git(repo, "rev-parse", "refs/stash")
+    assert len(entry) == 40
     assert f"stash apply {entry}" in capsys.readouterr().err
     git(repo, "stash", "apply", entry)
     assert (repo / "shared.txt").read_text() == "uncommitted work\n"
