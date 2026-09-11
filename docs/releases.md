@@ -56,19 +56,14 @@ The same history file records the retired version. Both the policy gate and
 publication validation reject reusing it, even if a proposal changes every
 version marker to that number.
 
-A root `last-release-sha` in `release-please-config.json` limits Release
-Please's commit scan to the mapped approved release. A bootstrap setting would
-not work: Release Please still finds the original GitHub release, so it does
-not enter bootstrap mode. The policy gate and the preparation command require
-that boundary to equal the mapping recorded for the version in the manifest, and
-to be absent when that version was never migrated. Retiring it is automated:
-the `Retire the migration scan boundary on the proposal` step of `Prepare
-release` runs `python3 -m scripts.release_publish boundary` against the open
-proposal and commits the boundary that proposed version requires, so a proposal
-never arrives carrying a stale one. The 0.2.0 proposal was the first to advance
-past the migrated release, and the field is now absent from the configuration.
-Keep the historical mapping as provenance. New tags follow normal ancestry and
-do not require additional mappings.
+The migration needed a scan boundary only while Release Please walked history
+looking for the previous release. Versioning no longer uses Release Please, and
+`release-please-config.json` is gone with it. Measurement now starts from the
+baseline `release_baseline` resolves through the recorded mapping, so rewritten
+history is handled by the mapping itself rather than by a configuration field
+that had to be retired on every proposal. Keep the historical mapping as
+provenance. New tags follow normal ancestry and do not require additional
+mappings.
 
 Replacing protected main remains a separate repository-policy operation.
 A squash merge can install the code but cannot remove the old commit history.
@@ -87,15 +82,17 @@ again. Reverting metadata alone could not stop the automation.
 The attempted `last-release-sha` workaround was inside `packages["."]`, although
 Release Please supports that option only at the configuration root. A permanent
 root override would also pin history scanning to an old boundary. The repair
-removed it and the workflow's approval/merge code. The later history migration
-uses a root-only boundary with an explicit mapping and a stale-boundary gate,
-as described above. Preparation is now manual and uses `skip-github-release`,
-so it cannot create release tags or GitHub releases.
-A separate guard compares the approved tag with main's package code, plugin
-files and `[project]` metadata before invoking Release Please. Workflow changes,
-release scripts and development tooling alone cannot open another release PR,
-even if an older commit used a `fix:` title. Other packaging-only releases need
-an explicitly authored version PR when there is a real distribution change.
+removed it and the workflow's approval/merge code.
+
+What prevents the replay today is the measurement, not a human step. A `fix:`
+title on build tooling contributes nothing, because a commit counts only when
+it also touches `agent_parley/` or `plugins/agent-parley/`, and a version is
+proposed only when the measured work crosses a threshold and the package
+differs from the approved release. Commit `436c2b5` measures zero under every
+one of those conditions. Removing the proposal pull request therefore removed a
+review step that was never what stopped the incident; the guard that did is
+`python3 -m scripts.release_publish candidate`, which anyone can run locally
+and which every push to `main` runs before anything else happens.
 
 GitHub and PyPI were checked during recovery. Both retained valid 0.1.1 package
 files with matching SHA-256 hashes. PyPI also contained an unwanted 0.1.2, and
@@ -113,10 +110,13 @@ it: deleting a PyPI file permanently consumes its filename. If an unwanted
 publication happens again, prefer recoverable yanking over deletion. Existing
 users pinned exactly to a yanked version can still install it.
 
-## A future intentional release
+## How a release happens
 
-1. Confirm there is enough delivered product work to distribute. Eligibility is
-   measured, not judged. The candidate step counts commits between the approved
+Nothing on this list is a human action. It describes what the repository does
+on its own after an eligible push to `main`, and what to inspect afterwards.
+
+1. Eligibility is measured, not judged. The candidate step counts commits
+   between the approved
    release and `main`, and a commit counts only when both of these hold: its
    title uses a releasing conventional type, `feat`, `fix` or `perf`, with or
    without a scope or `!`; and it touches at least one path under
@@ -126,36 +126,48 @@ users pinned exactly to a yanked version can still install it.
    Each counted commit contributes the distinct issues its message names
    through `Refs`, `Fixes`, `Closes` or `Resolves`, so one issue delivered by
    three pull requests counts once; a counted commit that names no issue counts
-   as one unit of its own. Fifty product features propose the next major
+   as one unit of its own. A hundred product features propose the next major
    version, ten product issues propose the next minor version, and a single
    commit titled `fix(urgent):` proposes the next patch version. That scope is
    the only mechanical marker for a patch release; nothing else reaches that
    rung. Below all three thresholds nothing is proposed and the step reports
    the counts it measured. Counting is local and repeatable: it reads Git
    history and nothing else, so `python3 -m scripts.release_publish candidate`
-   answers the same question before any merge. Every push to `main` runs this
-   step, so a warranted version proposes itself; dispatching Prepare release
-   from `main` runs the same measurement on demand and reaches the same
-   conclusion.
-2. Review the changelog and version changes and merge the PR through required
-   checks. A generated PR is a proposal, not release authorization. Previously
-   consumed versions cannot be reused, including a deleted or yanked 0.1.2. A
-   proposal that lands on an unavailable version advances to the next free
-   version of the same kind instead of failing, so an urgent patch from 0.1.1
-   proposes 0.1.3 without a manual correction. A version is unavailable when it
-   is retired in `.github/release-history.json`, when the tag already exists
-   locally or on `origin`, when a GitHub release exists for that tag including
-   a draft, or when the package index already has it. Only a definite absence
-   makes a version available; a check that fails to answer stops the run rather
-   than proposing a number that may already be taken. The migration's root
-   `last-release-sha` is retired without asking: preparation rewrites it on the
-   proposal to the boundary that version requires, or removes it when that
-   version was never migrated, so the policy gate never meets a stale one.
-3. Create the corresponding version tag at the reviewed commit on `main`.
-   Dispatch Release from `main` with that existing tag.
-4. Check the workflow result and verify the published version. A release is
+   answers the same question before any merge. Every push to `main` runs it,
+   and a push below all three thresholds ends there.
+2. The chosen number must be free. Previously consumed versions cannot be
+   reused, including a deleted or yanked 0.1.2. A release that lands on an
+   unavailable version advances to the next free version of the same kind
+   instead of failing, so an urgent patch from 0.1.1 reaches 0.1.3 without a
+   manual correction. A version is unavailable when it is retired in
+   `.github/release-history.json`, when the tag already exists locally or on
+   `origin`, when a GitHub release exists for that tag including a draft, or
+   when the package index already has it. Only a definite absence makes a
+   version available; a check that fails to answer stops the run rather than
+   choosing a number that may already be taken.
+3. `python3 -m scripts.release_publish bump` raises every version marker the
+   policy gate compares and prepends a changelog entry built from the same
+   commits the measurement counted, so the published notes and the decision to
+   release describe the same work. The policy gate then runs against the
+   raised markers, so a marker the bump forgets fails the run instead of
+   reaching a release.
+4. The release application commits `chore(main): release X.Y.Z` to `main`,
+   creates the annotated tag `vX.Y.Z` and pushes both. That commit subject is
+   the loop guard: `Auto version` skips it, so a release cannot trigger another
+   release. If `main` advanced between the measurement and the push, the push
+   is rejected and the run fails rather than tagging a tree nothing measured.
+   The next eligible push measures again and succeeds.
+5. The same step dispatches `Release` with the pushed tag. Publication stays a
+   separate top-level workflow so the index's trusted-publisher configuration
+   continues to match the workflow that claims it, and so a retry is one
+   dispatch rather than a repeat of the versioning path.
+6. Check the workflow result and verify the published version. A release is
    complete only after the wheel and source archive on PyPI match the verified
    GitHub artifacts.
+
+Dispatching `Auto version` by hand runs the same measurement on demand and
+reaches the same conclusion. Dispatching `Release` by hand with an existing tag
+is the retry and republication route; it never creates a version.
 
 ## Retry contract
 
@@ -190,8 +202,10 @@ GitHub App permissions and PyPI trusted-publisher configuration must also allow
 the respective workflows. A successful local gate cannot prove those external
 permissions. Never publish a throwaway version just to test the workflow.
 
-The migration audit also ran Release Please 17.6.0, the version locked by the
-pinned action, against the published curated branch using read-only GitHub
-requests and the proposed scan boundary. It stopped at the mapped release and
-built zero release proposals. This exercises history discovery without opening
-a PR, tagging a commit, dispatching workflows, or uploading packages.
+The migration audit of 2026-09-10 ran Release Please 17.6.0 against the
+published curated branch using read-only GitHub requests and the proposed scan
+boundary. It stopped at the mapped release and built zero release proposals.
+That audit is historical: versioning no longer runs Release Please, and the
+equivalent check today is `python3 -m scripts.release_publish candidate`, which
+reads Git history alone and reaches the same conclusion without opening a pull
+request, tagging a commit, dispatching workflows, or uploading packages.
