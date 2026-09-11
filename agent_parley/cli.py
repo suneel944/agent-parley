@@ -1874,8 +1874,9 @@ review, not merged or independently verified. An idle turn is not completion.
                         "of its own. Without that, this lane's hooks would "
                         "run in every session started from your own "
                         "configuration directory. Define a profile with "
-                        "`agent-parley credential add NAME --home DIR`, sign "
-                        "in to it once, and launch with --credentials NAME."
+                        "`agent-parley credentials add NAME --config-home "
+                        "DIR`, sign in to it once, and launch with "
+                        "--credentials NAME."
                     )
                 write_json(
                     Path(config_home) / "mcp-config.json",

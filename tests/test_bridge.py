@@ -1660,11 +1660,20 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     monkeypatch.setattr(bridge, "up", lambda: None)
     store.initialize(bridge.home)
 
-    with pytest.raises(BridgeError, match="credential profile"):
+    with pytest.raises(BridgeError, match="credential profile") as refusal:
         bridge.launch("solo", repo, "Work on issue 42", "copilot")
 
     account = tmp_path / "copilot-account"
-    roster.define_credential(bridge.home, "work", str(account), [], [])
+    suggested = shlex.split(str(refusal.value).split("`")[1])
+    placeholders = {"NAME": "work", "DIR": str(account)}
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [suggested[0], "--home", str(bridge.home)]
+        + [placeholders.get(token, token) for token in suggested[1:]],
+    )
+    assert main() == 0
+    assert "work" in roster.credentials(bridge.home)
     assert (
         bridge.launch("helper", repo, "Work on issue 42", "copilot", "work")
         == 0
