@@ -92,27 +92,30 @@ commit messages, PRs, issues, and comments, including closed items. Keep require
 license notices and factual product documentation intact. Repository policy and
 PR hygiene checks enforce the textual attribution boundary.
 
-Releasing requires explicit maintainer actions; proposing does not. Every push
-to `main` runs Prepare release, which measures release eligibility from
-delivered product work and stops there unless a version is warranted. Workflow
-repairs do not authorize a new version, and neither does a proposal. A merged
-release proposal does not re-enter the workflow. Release remains a manual
-dispatch.
+Releasing is automatic, and the measurement is what authorizes it. Every push
+to `main` runs Auto version, which measures release eligibility from delivered
+product work and stops there unless a version is warranted. Workflow repairs,
+release scripts, tests and documentation are structurally incapable of raising
+a version, because a commit counts only when a releasing conventional type
+introduces it and it also touches `agent_parley/` or `plugins/agent-parley/`.
 
-When eligibility is met, the Prepare release workflow creates or updates a
-Release Please PR, using the release app identity so normal PR checks run. It
-assigns ownership, a release issue and a milestone. It cannot approve, merge,
-tag, or publish. A maintainer reviews the proposed package changes and merges
-through the protected-branch gate. Package, plugin, marketplace, release
-manifest and lockfile versions must agree.
+When eligibility is met, the release application raises every version marker,
+records a changelog entry built from the counted commits, runs the policy gate
+against the raised markers, commits `chore(main): release X.Y.Z` to `main`,
+pushes the annotated tag, and dispatches Release for it. Package, plugin,
+marketplace, release manifest and lockfile versions must agree; the policy gate
+runs before the commit, so a marker the bump misses fails the run. The release
+commit subject is the loop guard, so a release cannot trigger another release.
+No pull request is involved, and nothing approves or merges on your behalf.
+Independent approval continues to apply to every human pull request.
 
-Publication is a separate manual Release dispatch for an existing version tag.
+Publication is a separate Release workflow for an existing version tag, which
+Auto version dispatches and a maintainer can dispatch again to retry.
 The tag must resolve to a commit in main history or an explicitly recorded
 history migration whose rewritten commit is on main with an identical tree.
 The original tag commit stays immutable; both its package version and the
-approved version on main must match. The migration's temporary Release Please
-scan boundary must be removed in the next intentional version PR, as enforced
-by the policy gate. Creating or pushing a tag does not publish anything.
+approved version on main must match. Creating or pushing a tag does not publish
+anything; only a Release dispatch does.
 Release runs the tagged source's `make check` and the history
 secret scan. Its build job has no PyPI identity permission. A separate publishing
 job downloads the verified GitHub assets and uploads only missing PyPI files.

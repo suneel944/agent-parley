@@ -1,5 +1,6 @@
 """Publishes explicit releases using one immutable set of verified assets."""
 
+import datetime
 import hashlib
 import json
 import os
@@ -18,6 +19,13 @@ MINOR_THRESHOLD = 10
 MAJOR_THRESHOLD = 50
 RETIREMENT_LIMIT = 100
 PACKAGE_PATHS = ("agent_parley", "plugins/agent-parley")
+MANIFEST_PATH = ".release-manifest.json"
+REPOSITORY_URL = "https://github.com/suneel944/agent-parley"
+CHANGELOG_SECTIONS = (
+    ("feat", "Features"),
+    ("fix", "Bug fixes"),
+    ("perf", "Performance"),
+)
 RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?!?:")
 ISSUE_REFERENCE = re.compile(
     r"\b(?:refs|fixes|closes|resolves)\s+#(\d+)\b", re.IGNORECASE
@@ -362,9 +370,7 @@ def release_candidate(root: Path) -> tuple[str, int, int]:
             version of the proposed kind is available.
         subprocess.CalledProcessError: If Git cannot resolve the baseline.
     """
-    approved = json.loads((root / ".release-please-manifest.json").read_text())[
-        "."
-    ]
+    approved = json.loads((root / MANIFEST_PATH).read_text())["."]
     if not re.fullmatch(r"\d+\.\d+\.\d+", approved):
         raise ValueError("Approved version must be MAJOR.MINOR.PATCH.")
     tag = f"v{approved}"
@@ -383,60 +389,22 @@ def release_candidate(root: Path) -> tuple[str, int, int]:
     return proposal, len(issues), len(features)
 
 
-def align_scan_boundary(root: Path, version: str) -> bool:
-    """Aligns the release scan boundary with the version being prepared.
+def release_history_errors(root: Path) -> list[str]:
+    """Rejects a retirement list that leaves a release kind unreachable.
 
-    A history migration pins Release Please to the rewritten commit of the
-    approved release so preparation never walks into rewritten history. That
-    pin is specific to one version: the moment a proposal advances past it,
-    the configuration the policy gate accepts is the one that carries the
-    boundary recorded for the proposed version, and no boundary at all when
-    that version was never migrated. Writing it here keeps a proposal from
-    arriving with a boundary the gate refuses.
+    Preparation advances past a retired number instead of failing on it, so
+    the remaining configuration mistake is a retirement list so long that
+    some release kind has no unretired number left within the bounded
+    search. Every check here is offline and reads only files.
 
     Args:
-        root: Checkout holding the configuration to align.
-        version: Version the proposal prepares.
-
-    Returns:
-        Whether the configuration on disk changed.
-    """
-    path = root / "release-please-config.json"
-    config = json.loads(path.read_text())
-    migrations, _ = release_history(root)
-    migration = migrations.get(f"v{version}")
-    expected = migration["rewritten"] if migration else None
-    if config.get("last-release-sha") == expected:
-        return False
-    if expected is None:
-        config.pop("last-release-sha")
-    else:
-        config["last-release-sha"] = expected
-    path.write_text(json.dumps(config, indent=2) + "\n")
-    return True
-
-
-def migration_config_errors(root: Path) -> list[str]:
-    """Rejects missing, stale or misplaced release-history scan boundaries.
-
-    Preparation now advances past a retired number instead of failing on it,
-    so this check guards the remaining configuration mistake: a retirement
-    list so long that some release kind has no unretired number left within
-    the bounded search. Every check here is offline and reads only files.
-
-    Args:
-        root: Checkout containing release configuration and version manifest.
+        root: Checkout containing release history and the version manifest.
 
     Returns:
         Configuration errors that block policy checks and preparation.
     """
-    config = json.loads((root / "release-please-config.json").read_text())
-    version = json.loads((root / ".release-please-manifest.json").read_text())[
-        "."
-    ]
-    migrations, retired = release_history(root)
-    migration = migrations.get(f"v{version}")
-    expected = migration["rewritten"] if migration else None
+    version = json.loads((root / MANIFEST_PATH).read_text())["."]
+    _, retired = release_history(root)
     errors = []
     if version in retired:
         errors.append("Retired release versions cannot be reused.")
@@ -448,16 +416,116 @@ def migration_config_errors(root: Path) -> list[str]:
             "Every candidate version of one release kind is retired; "
             "preparation would have no version left to propose."
         )
-    if config.get("last-release-sha") != expected:
-        errors.append(
-            "Release scan boundary must match the approved migration; "
-            "remove it when preparing the next version."
-        )
-    if any(
-        "last-release-sha" in package for package in config["packages"].values()
-    ):
-        errors.append("Release scan boundaries belong at configuration root.")
     return errors
+
+
+def changelog_entry(
+    root: Path, baseline: str, approved: str, version: str
+) -> str:
+    """Renders the changelog section describing what a release delivers.
+
+    Only the commits the eligibility measurement counts appear here, so the
+    published notes and the decision to release describe the same work.
+
+    Args:
+        root: Checkout holding the release history.
+        baseline: Approved release commit on the current branch's ancestry.
+        approved: Version the release advances from.
+        version: Version being prepared.
+
+    Returns:
+        A Markdown section ending with a trailing blank line.
+
+    Raises:
+        subprocess.CalledProcessError: If Git cannot read the commit range.
+    """
+    log = command(
+        "git",
+        "log",
+        "--no-merges",
+        "--name-only",
+        "--format=%x00%H%x01%B%x01",
+        f"{baseline}..HEAD",
+        cwd=root,
+    )
+    sections: dict[str, set[str]] = {}
+    for record in log.split("\x00")[1:]:
+        _, message, names = record.split("\x01")
+        subject = RELEASING_SUBJECT.match(message)
+        if not subject or not any(
+            name == path or name.startswith(f"{path}/")
+            for name in names.splitlines()
+            for path in PACKAGE_PATHS
+        ):
+            continue
+        headline = message.splitlines()[0][subject.end() :].strip()
+        links = " ".join(
+            f"([#{number}]({REPOSITORY_URL}/issues/{number}))"
+            for number in sorted(set(ISSUE_REFERENCE.findall(message)), key=int)
+        )
+        entry = f"* {headline} {links}".rstrip()
+        sections.setdefault(subject[1], set()).add(entry)
+    compare = f"{REPOSITORY_URL}/compare/v{approved}...v{version}"
+    date = datetime.date.today().isoformat()
+    lines = [f"## [{version}]({compare}) ({date})", ""]
+    for kind, title in CHANGELOG_SECTIONS:
+        if kind in sections:
+            lines += ["", f"### {title}", "", *sorted(sections[kind])]
+    return "\n".join(lines) + "\n\n"
+
+
+def bump(root: Path, baseline: str, approved: str, version: str) -> None:
+    """Writes one version to every marker and records the changelog entry.
+
+    The markers are exactly those the policy gate compares, so a marker this
+    function forgets fails the gate rather than reaching a release.
+
+    Args:
+        root: Checkout to update in place.
+        baseline: Approved release commit on the current branch's ancestry.
+        approved: Version the release advances from.
+        version: Version being prepared.
+
+    Raises:
+        ValueError: If a marker does not carry the approved version.
+    """
+    project = root / "pyproject.toml"
+    text, count = re.subn(
+        r'(?m)^version = "[^"]+"$',
+        f'version = "{version}"',
+        project.read_text(),
+        count=1,
+    )
+    if count != 1:
+        raise ValueError("pyproject.toml has no project version to raise.")
+    project.write_text(text)
+    lock = root / "uv.lock"
+    text, count = re.subn(
+        r'(?m)^(name = "agent-parley"\nversion = )"[^"]+"$',
+        rf'\g<1>"{version}"',
+        lock.read_text(),
+        count=1,
+    )
+    if count != 1:
+        raise ValueError("uv.lock has no agent-parley version to raise.")
+    lock.write_text(text)
+    for client in ("claude", "codex"):
+        path = root / "plugins/agent-parley" / f".{client}-plugin/plugin.json"
+        plugin = json.loads(path.read_text())
+        plugin["version"] = version
+        path.write_text(json.dumps(plugin, indent=2) + "\n")
+    path = root / ".claude-plugin/marketplace.json"
+    marketplace = json.loads(path.read_text())
+    marketplace["plugins"][0]["version"] = version
+    path.write_text(json.dumps(marketplace, indent=2) + "\n")
+    (root / MANIFEST_PATH).write_text(
+        json.dumps({".": version}, indent=2) + "\n"
+    )
+    changelog = root / "CHANGELOG.md"
+    heading = "# Changelog\n\n"
+    body = changelog.read_text().removeprefix(heading)
+    entry = changelog_entry(root, baseline, approved, version)
+    changelog.write_text(f"{heading}{entry}{body}")
 
 
 def validate_tag(root: Path, tag: str) -> str:
@@ -534,9 +602,7 @@ def has_package_changes(root: Path) -> bool:
         ValueError: If release metadata does not identify the approved tag.
         subprocess.CalledProcessError: If Git cannot compare the source trees.
     """
-    version = json.loads((root / ".release-please-manifest.json").read_text())[
-        "."
-    ]
+    version = json.loads((root / MANIFEST_PATH).read_text())["."]
     source = validate_tag(root, f"v{version}")
     changed = command(
         "git",
@@ -650,12 +716,10 @@ def main() -> None:
     root = Path.cwd()
     phase = sys.argv[1]
     if phase == "candidate":
-        errors = migration_config_errors(root)
+        errors = release_history_errors(root)
         if errors:
             raise ValueError("\n".join(errors))
-        approved = json.loads(
-            (root / ".release-please-manifest.json").read_text()
-        )["."]
+        approved = json.loads((root / MANIFEST_PATH).read_text())["."]
         version, issues, features = release_candidate(root)
         changed = has_package_changes(root)
         eligible = bool(version) and changed
@@ -678,16 +742,18 @@ def main() -> None:
         else:
             print(f"{measured}; proposing {version}.")
         return
-    if phase == "boundary":
-        version = json.loads(
-            (root / ".release-please-manifest.json").read_text()
-        )["."]
-        changed = align_scan_boundary(root, version)
-        print(
-            f"Scan boundary aligned with {version}."
-            if changed
-            else f"Scan boundary already matches {version}."
+    if phase == "bump":
+        version = os.environ["RELEASE_VERSION"]
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            raise ValueError("Release version must be MAJOR.MINOR.PATCH.")
+        approved = json.loads((root / MANIFEST_PATH).read_text())["."]
+        if version == approved:
+            raise ValueError("Release version must differ from the approved.")
+        baseline = release_baseline(
+            root, f"v{approved}", validate_tag(root, f"v{approved}")
         )
+        bump(root, baseline, approved, version)
+        print(f"Raised every version marker from {approved} to {version}.")
         return
     tag = os.environ["RELEASE_TAG"]
     source = validate_tag(root, tag)

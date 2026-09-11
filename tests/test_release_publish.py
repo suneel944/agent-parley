@@ -138,10 +138,7 @@ def local(monkeypatch):
 
 @pytest.fixture
 def counted_repo(git_repo):
-    (git_repo / ".release-please-manifest.json").write_text('{".": "0.1.1"}')
-    (git_repo / "release-please-config.json").write_text(
-        '{"packages": {".": {}}}'
-    )
+    (git_repo / release.MANIFEST_PATH).write_text('{".": "0.1.1"}')
     release.command("git", "add", ".", cwd=git_repo)
     release.command("git", "commit", "-m", "chore: configure", cwd=git_repo)
     release.command("git", "tag", TAG, cwd=git_repo)
@@ -207,12 +204,7 @@ def migrated_repo(git_repo):
             }
         )
     )
-    (git_repo / ".release-please-manifest.json").write_text(
-        json.dumps({".": VERSION})
-    )
-    (git_repo / "release-please-config.json").write_text(
-        json.dumps({"packages": {".": {}}, "last-release-sha": rewritten})
-    )
+    (git_repo / release.MANIFEST_PATH).write_text(json.dumps({".": VERSION}))
     release.command("git", "add", ".", cwd=git_repo)
     release.command("git", "commit", "-m", "Map release", cwd=git_repo)
     return git_repo
@@ -224,7 +216,7 @@ def test_migration_preserves_tag_source_and_ignores_tooling(migrated_repo):
     )
     assert release.validate_tag(migrated_repo, TAG) == original
     assert not release.has_package_changes(migrated_repo)
-    assert release.migration_config_errors(migrated_repo) == []
+    assert release.release_history_errors(migrated_repo) == []
     package = migrated_repo / "agent_parley"
     package.mkdir()
     (package / "cli.py").write_text('"""A new package change."""\n')
@@ -301,45 +293,6 @@ def test_migration_requires_exact_commit_ids(migrated_repo, entry):
         release.validate_tag(migrated_repo, TAG)
 
 
-@pytest.mark.parametrize("damage", ["absent", "wrong", "package", "stale"])
-def test_release_scan_boundary_cannot_drift(migrated_repo, damage):
-    path = migrated_repo / "release-please-config.json"
-    config = json.loads(path.read_text())
-    if damage == "absent":
-        config.pop("last-release-sha")
-    elif damage == "wrong":
-        config["last-release-sha"] = "0" * 40
-    elif damage == "package":
-        config["packages"]["."]["last-release-sha"] = config["last-release-sha"]
-    else:
-        (migrated_repo / ".release-please-manifest.json").write_text(
-            '{".": "0.1.3"}'
-        )
-    path.write_text(json.dumps(config))
-    assert release.migration_config_errors(migrated_repo)
-    if damage == "stale":
-        config.pop("last-release-sha")
-        path.write_text(json.dumps(config))
-        assert release.migration_config_errors(migrated_repo) == []
-
-
-def test_scan_boundary_retires_with_the_version_it_pinned(migrated_repo):
-    path = migrated_repo / "release-please-config.json"
-    approved = json.loads(
-        (migrated_repo / ".release-please-manifest.json").read_text()
-    )["."]
-    assert release.align_scan_boundary(migrated_repo, approved) is False
-    assert release.migration_config_errors(migrated_repo) == []
-    (migrated_repo / ".release-please-manifest.json").write_text(
-        '{".": "0.2.0"}\n'
-    )
-    assert release.migration_config_errors(migrated_repo)
-    assert release.align_scan_boundary(migrated_repo, "0.2.0") is True
-    assert "last-release-sha" not in json.loads(path.read_text())
-    assert release.migration_config_errors(migrated_repo) == []
-    assert release.align_scan_boundary(migrated_repo, "0.2.0") is False
-
-
 def test_next_release_uses_normal_ancestry_after_migration(migrated_repo):
     path = migrated_repo / "pyproject.toml"
     path.write_text('[project]\nname = "agent-parley"\nversion = "0.1.3"\n')
@@ -357,16 +310,11 @@ def test_retired_version_cannot_be_prepared_or_published(migrated_repo):
     (migrated_repo / "pyproject.toml").write_text(
         '[project]\nname = "agent-parley"\nversion = "0.1.2"\n'
     )
-    (migrated_repo / ".release-please-manifest.json").write_text(
-        '{".": "0.1.2"}'
-    )
-    (migrated_repo / "release-please-config.json").write_text(
-        '{"packages": {".": {}}}'
-    )
+    (migrated_repo / release.MANIFEST_PATH).write_text('{".": "0.1.2"}')
     release.command("git", "add", ".", cwd=migrated_repo)
     release.command("git", "commit", "-m", "Retired version", cwd=migrated_repo)
     release.command("git", "tag", "v0.1.2", cwd=migrated_repo)
-    assert release.migration_config_errors(migrated_repo) == [
+    assert release.release_history_errors(migrated_repo) == [
         "Retired release versions cannot be reused."
     ]
     with pytest.raises(ValueError, match="Retired"):
@@ -377,14 +325,14 @@ def test_patch_bumping_onto_a_retired_version_is_skipped(migrated_repo, local):
     product_commit(migrated_repo, "fix(urgent): repair the package")
     assert release.advance_version("0.1.1", "patch", ["0.1.2"]) == "0.1.3"
     assert release.release_candidate(migrated_repo)[0] == "0.1.3"
-    assert release.migration_config_errors(migrated_repo) == []
+    assert release.release_history_errors(migrated_repo) == []
     path = migrated_repo / ".github/release-history.json"
     history = json.loads(path.read_text())
     history["retired"] = [
         f"0.1.{number}" for number in range(2, release.RETIREMENT_LIMIT + 3)
     ]
     path.write_text(json.dumps(history))
-    assert release.migration_config_errors(migrated_repo) == [
+    assert release.release_history_errors(migrated_repo) == [
         "Every candidate version of one release kind is retired; "
         "preparation would have no version left to propose."
     ]
@@ -570,7 +518,7 @@ def test_candidate_phase_reports_measured_eligibility(
 def test_package_guard_ignores_old_fix_titles_for_tooling(
     git_repo, path, eligible
 ):
-    (git_repo / ".release-please-manifest.json").write_text('{".": "0.1.1"}')
+    (git_repo / release.MANIFEST_PATH).write_text('{".": "0.1.1"}')
     release.command("git", "tag", TAG, cwd=git_repo)
     changed = git_repo / path
     changed.parent.mkdir(parents=True, exist_ok=True)
@@ -584,7 +532,7 @@ def test_package_guard_ignores_old_fix_titles_for_tooling(
 def test_project_metadata_is_distinct_from_development_dependencies(
     git_repo, development_only
 ):
-    (git_repo / ".release-please-manifest.json").write_text('{".": "0.1.1"}')
+    (git_repo / release.MANIFEST_PATH).write_text('{".": "0.1.1"}')
     release.command("git", "tag", TAG, cwd=git_repo)
     path = git_repo / "pyproject.toml"
     addition = (
@@ -777,36 +725,102 @@ def test_github_publication_requires_verified_pypi_completion(
         assert calls == []
 
 
-def test_workflow_cannot_recurse_or_publish_from_an_automatic_event():
+def test_version_workflow_cannot_recurse_or_publish_by_itself():
     root = Path(__file__).resolve().parents[1]
-    for filename in ("release.yml", "release-please.yml"):
-        text = (root / ".github" / "workflows" / filename).read_text()
+    workflows = root / ".github/workflows"
+    assert not (workflows / "release-please.yml").exists()
+    for filename in ("release.yml", "release-version.yml"):
+        text = (workflows / filename).read_text()
         assert "gh pr merge" not in text
         assert "createReview" not in text
         assert "skip-existing" not in text
-    publisher = yaml.safe_load(
-        (root / ".github/workflows/release.yml").read_text()
-    )
-    assert set(publisher[True]) == {"workflow_dispatch"}
-    preparation = yaml.safe_load(
-        (root / ".github/workflows/release-please.yml").read_text()
-    )
-    assert set(preparation[True]) == {"push", "workflow_dispatch"}
-    assert preparation[True]["push"] == {"branches": ["main"]}
-    condition = preparation["jobs"]["prepare"]["if"]
+        assert "--clobber" not in text
+    versioning = yaml.safe_load((workflows / "release-version.yml").read_text())
+    assert set(versioning[True]) == {"push", "workflow_dispatch"}
+    assert versioning[True]["push"] == {"branches": ["main"]}
+    condition = versioning["jobs"]["version"]["if"]
     assert "refs/heads/main" in condition
     assert "chore(main): release" in condition
-    action = next(
-        step
-        for step in preparation["jobs"]["prepare"]["steps"]
-        if step.get("id") == "release"
+    steps = versioning["jobs"]["version"]["steps"]
+    assert steps[1]["id"] == "candidate"
+    assert all(
+        step.get("if") == "steps.candidate.outputs.eligible == 'true'"
+        for step in steps[2:]
     )
-    assert action["with"]["skip-github-release"] is True
-    publication = yaml.safe_load(
-        (root / ".github/workflows/release.yml").read_text()
-    )
+    assert not any("pypi" in str(step.get("uses", "")) for step in steps)
+    publication = yaml.safe_load((workflows / "release.yml").read_text())
+    assert set(publication[True]) == {"workflow_dispatch"}
     assert "id-token" not in publication["jobs"]["build"]["permissions"]
     assert publication["jobs"]["publish"]["needs"] == "build"
-    config = json.loads((root / "release-please-config.json").read_text())
-    assert release.migration_config_errors(root) == []
-    assert "last-release-sha" not in config["packages"]["."]
+    assert release.release_history_errors(root) == []
+
+
+@pytest.fixture
+def versioned_repo(git_repo):
+    (git_repo / release.MANIFEST_PATH).write_text('{".": "0.1.1"}\n')
+    (git_repo / "uv.lock").write_text(
+        '[[package]]\nname = "agent-parley"\nversion = "0.1.1"\n'
+    )
+    (git_repo / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [0.1.1] (earlier)\n"
+    )
+    directory = git_repo / ".claude-plugin"
+    directory.mkdir()
+    (directory / "marketplace.json").write_text(
+        json.dumps({"plugins": [{"version": "0.1.1"}]}) + "\n"
+    )
+    for client in ("claude", "codex"):
+        directory = git_repo / "plugins/agent-parley" / f".{client}-plugin"
+        directory.mkdir(parents=True)
+        (directory / "plugin.json").write_text(
+            json.dumps({"version": "0.1.1"}) + "\n"
+        )
+    release.command("git", "add", "-A", cwd=git_repo)
+    release.command("git", "commit", "-m", "chore: markers", cwd=git_repo)
+    release.command("git", "tag", TAG, cwd=git_repo)
+    return git_repo
+
+
+def test_bump_raises_every_marker_and_lists_only_counted_work(versioned_repo):
+    product_commit(versioned_repo, "feat: add a lane", body="Refs #12")
+    product_commit(versioned_repo, "fix: repair a lane", body="Closes #13")
+    product_commit(
+        versioned_repo, "fix: repair tooling", path="scripts/tool.py"
+    )
+    release.bump(versioned_repo, TAG, VERSION, "0.2.0")
+    assert (
+        '\nversion = "0.2.0"\n'
+        in (versioned_repo / "pyproject.toml").read_text()
+    )
+    assert (
+        'name = "agent-parley"\nversion = "0.2.0"'
+        in (versioned_repo / "uv.lock").read_text()
+    )
+    assert json.loads((versioned_repo / release.MANIFEST_PATH).read_text()) == {
+        ".": "0.2.0"
+    }
+    assert (
+        json.loads(
+            (versioned_repo / ".claude-plugin/marketplace.json").read_text()
+        )["plugins"][0]["version"]
+        == "0.2.0"
+    )
+    for client in ("claude", "codex"):
+        path = (
+            versioned_repo
+            / "plugins/agent-parley"
+            / f".{client}-plugin/plugin.json"
+        )
+        assert json.loads(path.read_text())["version"] == "0.2.0"
+    changelog = (versioned_repo / "CHANGELOG.md").read_text()
+    assert changelog.startswith("# Changelog\n\n## [0.2.0](")
+    assert "* add a lane ([#12]" in changelog
+    assert "* repair a lane ([#13]" in changelog
+    assert "repair tooling" not in changelog
+    assert "## [0.1.1] (earlier)" in changelog
+
+
+def test_bump_refuses_a_marker_it_cannot_raise(versioned_repo):
+    (versioned_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    with pytest.raises(ValueError, match="no project version"):
+        release.bump(versioned_repo, TAG, VERSION, "0.2.0")

@@ -410,48 +410,57 @@ the owner's accounts and cannot be delegated.
 
 ## Releases
 
-A release proposes itself; it does not publish itself. Every push to `main`
-runs `Prepare release`, whose first step measures release eligibility from
-delivered product work and reports the counts it measured. A push that warrants
-no version stops there, and so does a push whose changes never reach the
-package. The push that merges a release proposal is skipped by its commit
-subject, so an accepted proposal does not re-enter the workflow.
+A release measures itself, then ships itself. Every push to `main` runs
+`Auto version`, whose first step measures release eligibility from delivered
+product work and reports the counts it measured. A push that warrants no
+version stops there, and so does a push whose changes never reach the package.
+The release commit is skipped by its `chore(main): release` subject, so a
+release cannot trigger another release.
 
-An eligible push mints a token for the release GitHub App, runs Release
-Please as that App, and keeps one open release pull request holding the next
+An eligible push mints a token for the release GitHub App, raises the next
 version across `pyproject.toml`, both plugin manifests, the Claude marketplace
-manifest, `uv.lock` and `CHANGELOG.md`. Because the App opens and pushes that
-branch, `Check` and `PR hygiene` start on it like any other pull request; a
-pull request opened with the workflow token would leave them waiting for
-manual approval instead. The same job assigns the pull request, labels it
-`release`, creates the `vVERSION` milestone and the tracking issue, and links
-them, because the hygiene gate requires all four.
+manifest, `uv.lock` and `.release-manifest.json`, and prepends a `CHANGELOG.md`
+entry built from the same commits the measurement counted. It then runs the
+policy gate against the raised markers, so a marker the bump misses fails the
+run rather than reaching a release. The App commits that to `main`, pushes the
+annotated `vVERSION` tag, and dispatches `Release` for it.
 
-The workflow stops at the proposal. It does not review, approve, merge, tag or
-publish, and it holds no path to any of those: a maintainer reads the proposed
-version and changelog and merges through the protected-branch gate like any
-other pull request. That separation is deliberate. An earlier design had the
-workflow approve its own release pull request as a second identity and enable
-auto-merge, and a withdrawn version reached PyPI seconds after the resulting
-tag push, before the run could be cancelled. A published version cannot be
-replaced or reused. `check`, `secrets` and `pr-hygiene` stay required and
-`enforce_admins` stays on, so a red check leaves the pull request open.
+There is no release pull request. An earlier design kept one, and it did not
+prevent the incident it appeared to guard: a build-tooling commit with a `fix:`
+title produced a proposal, the workflow approved it as a second identity,
+auto-merge fired, and a withdrawn version reached PyPI seconds after the
+resulting tag push. What stops that today is the measurement. A commit counts
+only when a releasing conventional type introduces it and it touches
+`agent_parley/` or `plugins/agent-parley/`, and a version is raised only when
+the counted work crosses a threshold and the package differs from the approved
+release. Tooling commits measure zero, so the proposal that started the
+incident cannot exist. `check`, `secrets` and `pr-hygiene` stay required for
+human pull requests, and independent approval still applies to them; the App
+bypasses review only for the release commit it authors, and cannot approve or
+merge anything.
 
-Publication is a separate `Release` dispatch naming an existing tag. It reruns
-the gate, creates a draft, uploads assets, downloads and verifies their
-checksums, then publishes. Failed verification leaves a draft.
+If `main` advances between the measurement and the push, the push is rejected
+and the run fails rather than tagging a tree nothing measured. The next
+eligible push measures again and succeeds, so the failure costs a run, not a
+release.
+
+Publication is a separate `Release` run naming an existing tag. It reruns the
+gate, creates a draft, uploads assets, downloads and verifies their checksums,
+then publishes. Failed verification leaves a draft.
 
 The release workflow answers only to `workflow_dispatch`. It deliberately has
-no tag trigger: a tag push would publish without anyone deciding to, which is
-exactly how a withdrawn version reached the index. Publishing an existing tag
+no tag trigger: publication must name a tag explicitly, so a tag pushed by any
+other route publishes nothing. `Auto version` dispatches it by name after
+pushing the tag it measured. Publishing an existing tag
 is idempotent, so a rerun verifies the uploaded bytes again instead of failing.
 
 Release notes are assembled from two sources so that no release needs hand
 editing: `docs/release-overview.md` is a standing description of what the
-project is and how to verify a download, and Release Please generates the
-version section of `CHANGELOG.md` from merged commit subjects. Maintenance,
-automation, build, refactor and test commits are hidden from that section, so
-the notes carry features, fixes, performance, documentation and reverts.
+project is and how to verify a download, and the bump step generates the
+version section of `CHANGELOG.md` from the commits the eligibility measurement
+counted. Maintenance, automation, build, refactor, documentation and test
+commits never count, so the notes carry features, fixes and performance, and
+the published notes and the decision to release describe the same work.
 Rewrite `docs/release-overview.md` when the product description changes, not
 when a version does.
 
@@ -461,19 +470,17 @@ before that title existed were renamed to match. Do not retitle a release by
 hand: a page where one entry names the product and another shows a bare tag
 reads as two different projects.
 
-After publication the release workflow comments the verification result on the
-tracking issue, closes it, and closes the milestone once nothing else is open
-in it. Merged release branches are deleted by the repository setting.
-
-One-time owner setup, without which `Prepare release` fails as soon as a push
+One-time owner setup, without which `Auto version` fails as soon as a push
 warrants a version:
 register a GitHub App under the owner account with repository permissions
-Contents: read and write, Pull requests: read and write, and Issues: read and
-write; install it on `suneel944/agent-parley`; set the repository variable
-`RELEASE_BOT_APP_ID` to the App ID; and set the repository secret
-`RELEASE_BOT_PRIVATE_KEY` to a generated private key in full PEM form. The App
-is not a review bypass: it opens and updates the release pull request so the
-required checks start on it, and it cannot approve, merge, tag or publish.
+Contents: read and write and Actions: read and write; install it on
+`suneel944/agent-parley`; set the repository variable `RELEASE_BOT_APP_ID` to
+the App ID; set the repository secret `RELEASE_BOT_PRIVATE_KEY` to a generated
+private key in full PEM form; and add the App to the bypass actors of the
+`main` branch ruleset so it can push the release commit and tag. Contents
+covers the commit and the tag, Actions covers the `Release` dispatch. The App
+holds no Pull requests or Issues permission, so it cannot open, approve or
+merge anything.
 
 To cut a release by hand in an emergency, `Release` still accepts a
 `workflow_dispatch` with an existing tag, and reruns the same verification.
@@ -489,7 +496,9 @@ job requests a short-lived identity token through an `id-token: write`
 permission scoped to that job, and PyPI exchanges it for a one-time upload
 token, so the repository stores no PyPI API token and no publishing secret. The
 workflow must run as its own top-level workflow, started by its own dispatch
-rather than called from `Prepare release`. The upload carries a signed
+rather than called from `Auto version`. This is why `Auto version` finishes by
+dispatching `Release` instead of calling it as a reusable workflow, even though
+calling it would be shorter. The upload carries a signed
 attestation whose build configuration names the workflow that started the run,
 and PyPI checks that name against the trusted publisher: called from another
 workflow, the attestation names the caller, the check fails, and the upload is

@@ -132,11 +132,11 @@ def main() -> None:
     )
     if marketplace["plugins"][0]["version"] != metadata["version"]:
         errors.append("Claude marketplace version differs from package")
-    manifest = root / ".release-please-manifest.json"
+    manifest = root / release_publish.MANIFEST_PATH
     if manifest.exists():
         if json.loads(manifest.read_text())["."] != metadata["version"]:
             errors.append("Release manifest version differs from package")
-        errors.extend(release_publish.migration_config_errors(root))
+        errors.extend(release_publish.release_history_errors(root))
     elif (root / ".git").exists():
         errors.append("Release manifest is missing")
     lock = tomllib.loads((root / "uv.lock").read_text())
