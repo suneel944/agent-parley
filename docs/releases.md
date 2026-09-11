@@ -118,8 +118,11 @@ users pinned exactly to a yanked version can still install it.
    the only mechanical marker for a patch release; nothing else reaches that
    rung. Below all three thresholds nothing is proposed and the step reports
    the counts it measured. Counting is local and repeatable: it reads Git
-   history and nothing else. Enable Prepare release when a new proposal is
-   wanted, then dispatch it from `main`.
+   history and nothing else, so `python3 -m scripts.release_publish candidate`
+   answers the same question before any merge. Every push to `main` runs this
+   step, so a warranted version proposes itself; dispatching Prepare release
+   from `main` runs the same measurement on demand and reaches the same
+   conclusion.
 2. Review the changelog and version changes and merge the PR through required
    checks. A generated PR is a proposal, not release authorization. Previously
    consumed versions cannot be reused, including a deleted or yanked 0.1.2. A

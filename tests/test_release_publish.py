@@ -764,14 +764,21 @@ def test_workflow_cannot_recurse_or_publish_from_an_automatic_event():
     root = Path(__file__).resolve().parents[1]
     for filename in ("release.yml", "release-please.yml"):
         text = (root / ".github" / "workflows" / filename).read_text()
-        workflow = yaml.safe_load(text)
-        assert set(workflow[True]) == {"workflow_dispatch"}
         assert "gh pr merge" not in text
         assert "createReview" not in text
         assert "skip-existing" not in text
+    publisher = yaml.safe_load(
+        (root / ".github/workflows/release.yml").read_text()
+    )
+    assert set(publisher[True]) == {"workflow_dispatch"}
     preparation = yaml.safe_load(
         (root / ".github/workflows/release-please.yml").read_text()
     )
+    assert set(preparation[True]) == {"push", "workflow_dispatch"}
+    assert preparation[True]["push"] == {"branches": ["main"]}
+    condition = preparation["jobs"]["prepare"]["if"]
+    assert "refs/heads/main" in condition
+    assert "chore(main): release" in condition
     action = next(
         step
         for step in preparation["jobs"]["prepare"]["steps"]

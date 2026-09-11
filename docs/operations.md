@@ -376,8 +376,14 @@ the owner's accounts and cannot be delegated.
 
 ## Releases
 
-Releases run without a manual step. Every push to `main` runs
-`Prepare release`, which mints a token for the release GitHub App, runs Release
+A release proposes itself; it does not publish itself. Every push to `main`
+runs `Prepare release`, whose first step measures release eligibility from
+delivered product work and reports the counts it measured. A push that warrants
+no version stops there, and so does a push whose changes never reach the
+package. The push that merges a release proposal is skipped by its commit
+subject, so an accepted proposal does not re-enter the workflow.
+
+An eligible push mints a token for the release GitHub App, runs Release
 Please as that App, and keeps one open release pull request holding the next
 version across `pyproject.toml`, both plugin manifests, the Claude marketplace
 manifest, `uv.lock` and `CHANGELOG.md`. Because the App opens and pushes that
@@ -387,26 +393,24 @@ manual approval instead. The same job assigns the pull request, labels it
 `release`, creates the `vVERSION` milestone and the tracking issue, and links
 them, because the hygiene gate requires all four.
 
-The workflow then reviews that pull request as `github-actions[bot]` and turns
-on auto-merge. The review and the branch push come from two different
-identities on purpose: the ruleset requires the most recent push to be approved
-by someone other than the pusher. Auto-merge is enabled with the App token so
-that the merge commit comes from the App and starts the next `Prepare release`
-run; a merge attributed to the workflow token would start nothing and the tag
-would never be cut. Nothing here bypasses a check. `check`, `secrets` and
-`pr-hygiene` stay required, `enforce_admins` stays on, and auto-merge only
-merges once all three pass. A red check leaves the pull request open.
+The workflow stops at the proposal. It does not review, approve, merge, tag or
+publish, and it holds no path to any of those: a maintainer reads the proposed
+version and changelog and merges through the protected-branch gate like any
+other pull request. That separation is deliberate. An earlier design had the
+workflow approve its own release pull request as a second identity and enable
+auto-merge, and a withdrawn version reached PyPI seconds after the resulting
+tag push, before the run could be cancelled. A published version cannot be
+replaced or reused. `check`, `secrets` and `pr-hygiene` stay required and
+`enforce_admins` stays on, so a red check leaves the pull request open.
 
-Merging that pull request creates the `vVERSION` tag, and the same run calls the
-release workflow. It reruns the gate, creates a draft, uploads assets, downloads
-and verifies their checksums, then publishes. Failed verification leaves a
-draft.
+Publication is a separate `Release` dispatch naming an existing tag. It reruns
+the gate, creates a draft, uploads assets, downloads and verifies their
+checksums, then publishes. Failed verification leaves a draft.
 
-The release workflow answers only to that call and to `workflow_dispatch`. It
-deliberately has no tag trigger: a tag push would start a second publisher for
-the same tag, and whichever run arrived second would find the release already
-published and fail. Publishing an existing tag is idempotent, so a rerun
-verifies the uploaded bytes again instead of failing.
+The release workflow answers only to `workflow_dispatch`. It deliberately has
+no tag trigger: a tag push would publish without anyone deciding to, which is
+exactly how a withdrawn version reached the index. Publishing an existing tag
+is idempotent, so a rerun verifies the uploaded bytes again instead of failing.
 
 Release notes are assembled from two sources so that no release needs hand
 editing: `docs/release-overview.md` is a standing description of what the
