@@ -133,6 +133,21 @@ The preview only reads. It changes nothing, and it never takes the lane's
 session lock, so it is safe while that agent is still working. It attempts no
 merge, so it cannot predict conflicts.
 
+A repository can also require its own command to pass before any merge. The
+command is recorded in coordination state, not in the repository:
+
+```sh
+agent-parley verify set 'make check'   # require it from now on
+agent-parley verify show               # report what is required
+agent-parley verify set ''             # remove the requirement
+```
+
+With one configured, `participant merge` runs it in the base checkout first and
+refuses the merge on a non-zero exit, reporting the exit status and the tail of
+the output. It runs as an argument list, never through a shell, and no flag
+skips it. It reports the base checkout as it stands before the merge, which is
+not a claim about the merged result.
+
 ## What it enforces
 
 **Ownership changes only through explicit claims and accepted handoffs.** No

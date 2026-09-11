@@ -171,7 +171,29 @@ condition it meets, the preview collects them all. The preview writes nothing
 and takes no session lock, because previewing a lane while its agent works is
 the ordinary case and that lock belongs to the session; a running session is
 read from the recorded session process, as liveness reporting reads it. It
-performs no trial merge, so it reports refusals, never conflicts.
+performs no trial merge, so it reports refusals, never conflicts. The preview
+reads Git state only and never runs the verification command below, because
+executing a configured command is not a read.
+
+A repository can require one verification command to pass before any merge.
+Executing a configured command is a different trust decision from reading Git
+state, so the gate is a separate step at the merge entry point rather than one
+more Git refusal, and `agent-parley verify` is the only thing that records it.
+It lives in that repository's project manifest, beside the roster and the
+project base, because the manifest is already the per-repository configuration
+and it already sits outside the target source tree; no new file and no
+in-repository file is introduced. A repository with no command configured runs
+no gate and merges exactly as before. The command is stored as argument tokens
+and run without a shell, so redirection, expansion and chaining cannot ride
+into a gate, and it runs in the common repository root while the merge already
+holds the project setup lock and that participant's session lock, so the lane
+cannot start and the roster cannot change underneath it. A non-zero exit
+refuses the merge, reporting the exit status and the last twenty lines of the
+command's combined output; a command that cannot run is a refusal, not a skip.
+No flag bypasses the gate, and removing it is an explicit `verify set ''`.
+The gate reports the base checkout as it stands before the merge, which is not
+a claim about the merged result, so combined post-merge verification remains a
+separate reviewed action.
 
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 
 from agent_parley.state import BridgeError, lock, write_json
@@ -18,6 +19,7 @@ RESERVED = frozenset(
 )
 LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
+MAX_VERIFY_ARGUMENTS = 64
 MANIFEST_VERSION = 2
 PROVIDERS = "providers.json"
 CREDENTIALS = "credentials.json"
@@ -131,6 +133,41 @@ def overrides(pairs: list[str]) -> dict[str, str]:
             )
         result[name] = value
     return result
+
+
+def verify_command(command: str) -> list[str]:
+    """Parses a repository's pre-merge verification command into arguments.
+
+    The command is stored and run as argument tokens, never through a shell,
+    so redirection, expansion and chaining cannot ride into a merge gate. An
+    empty command removes the gate rather than configuring an empty one, which
+    keeps "no gate" a single represented state.
+
+    Args:
+        command: Command line an operator configured for this repository.
+
+    Returns:
+        Argument tokens, or an empty list when no gate is configured.
+
+    Raises:
+        BridgeError: If the command cannot be read as an argument list.
+    """
+    if not command.strip():
+        return []
+    try:
+        parsed = shlex.split(command)
+    except ValueError as exc:
+        raise BridgeError(
+            f"Verification command is not a usable argument list: {exc}."
+        ) from None
+    if not parsed or len(parsed) > MAX_VERIFY_ARGUMENTS:
+        raise BridgeError(
+            "Verification command must name an executable followed by at "
+            f"most {MAX_VERIFY_ARGUMENTS - 1} arguments."
+        )
+    if any("\x00" in token for token in parsed):
+        raise BridgeError("Verification command must not contain NUL bytes.")
+    return parsed
 
 
 def _registry(home: Path, filename: str, presets: dict) -> dict:
@@ -375,6 +412,7 @@ def normalize(manifest: dict) -> dict:
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
         "base": manifest["base"],
+        "verify": list(manifest.get("verify") or []),
         "participants": participants,
     }
 
