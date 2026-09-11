@@ -45,14 +45,16 @@ jobs:
           token: ${{ steps.app.outputs.token }}
           skip-github-release: true
       - name: Assign release ownership required by the hygiene gate
-        if: steps.release.outputs.prs != ''
+        if: steps.candidate.outputs.eligible == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
-        env:
-          RELEASE_PRS: ${{ steps.release.outputs.prs }}
         with:
           script: |
             const repo = context.repo;
-            for (const pr of JSON.parse(process.env.RELEASE_PRS)) {
+            const open = await github.paginate(
+              github.rest.pulls.list, {...repo, state: 'open'});
+            const pending = open.filter(candidate =>
+              candidate.labels.some(l => l.name === 'autorelease: pending'));
+            for (const pr of pending) {
               const version = pr.title.match(/\b\d+\.\d+\.\d+\b/)[0];
               const title = `v${version}`;
               const milestones = await github.paginate(
