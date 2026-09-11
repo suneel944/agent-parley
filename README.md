@@ -254,6 +254,7 @@ installations cover all of them:
 | --- | --- | --- |
 | `claude` | `claude` | Claude Code |
 | `codex` | `codex` | Codex |
+| `copilot` | `copilot` | GitHub Copilot CLI |
 | `deepseek`, `kimi`, `grok`, `gemini` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
@@ -273,16 +274,19 @@ per project.
 
 ### Other agent CLIs
 
-The launcher passes MCP configuration, the coordination prompt and lifecycle
-hooks as native command-line arguments, so a provider's executable has to accept
-the `claude` or `codex` argument contract. Gemini CLI, Copilot CLI, OpenCode and
-Amp all support MCP servers, and three of the four support hooks, but each reads
-that configuration from its own files instead of the arguments Agent Parley
-passes. None of them is shipped as a preset, and defining one with
-`agent-parley provider add` stores a provider that cannot launch. Driving them
-would need a third adapter in the launch path, which is out of scope here.
-[Operations](docs/operations.md#other-agent-clis) records what each one supports
-and where its MCP and hook configuration lives.
+Three adapters cover three ways of accepting configuration. `claude` and
+`codex` take MCP servers, the coordination prompt and lifecycle hooks as
+command-line arguments. `copilot` reads them from files instead, so Agent
+Parley writes `mcp-config.json` and `settings.json` into that lane's own
+Copilot configuration directory; a `copilot` lane therefore requires a
+credential profile, and the launcher refuses without one rather than writing
+hooks into the configuration directory your own sessions use.
+
+Gemini CLI, OpenCode and Amp are not covered. Gemini CLI publishes no variable
+that relocates `~/.gemini`, so it cannot be given a lane of its own; OpenCode
+runs plugins rather than hook commands; Amp accepts no system-prompt argument.
+[Operations](docs/operations.md#other-agent-clis) records what each one
+supports and where its MCP and hook configuration lives.
 
 ## How it fits together
 

@@ -196,42 +196,53 @@ names look like credentials.
 
 ## Other agent CLIs
 
-Agent Parley hands the native CLI its MCP server, the coordination prompt and its
-lifecycle hooks as command-line arguments at launch, never by writing into a
-shared configuration file. Two argument contracts implement that, and
-`--adapter` names the one to use:
+Agent Parley hands the native CLI its MCP server, the coordination prompt and
+its lifecycle hooks at launch. Three contracts implement that, and `--adapter`
+names the one to use:
 
 | Adapter | MCP server | Coordination prompt | Hooks |
 | --- | --- | --- | --- |
 | `claude` | `--mcp-config FILE` | `--append-system-prompt TEXT` | `--settings '{"hooks":…}'` |
 | `codex` | `-c mcp_servers.agent_parley.url=…` | appended to the prompt argument | `-c hooks.EVENT=…` |
+| `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-p` argument | `hooks` in `settings.json` there |
 
 A provider's `--executable` therefore has to accept every argument of the
-contract its adapter names. Gemini CLI, Copilot CLI, OpenCode and Amp all speak
-MCP, and three of the four run external commands on lifecycle events, but each
-reads that configuration from its own files rather than from these arguments.
-None is shipped as a preset. `agent-parley provider add` will store a definition
-naming one of them, because the command is only resolved on `PATH` at launch,
-but the resulting session fails inside the native CLI on the first unrecognized
-argument. There is no flag that makes it work and none should be added.
+contract its adapter names. The `copilot` adapter is the file-configured one:
+Copilot CLI reads MCP servers and hooks from its configuration directory rather
+than from arguments, so Agent Parley writes both files into the directory
+`COPILOT_HOME` selects. That directory also holds the client's own
+authentication, and user-level hooks there apply to every session started from
+it, so a `copilot` participant requires a credential profile and the launcher
+refuses one without a profile instead of writing lane hooks into the directory
+your own Copilot sessions use. Sign in to that directory once, as with any
+other profile.
+
+The launch path was exercised against a stub executable that records its
+arguments and environment, not against a live Copilot session, so argument and
+file handling are verified while live model behavior is not.
+
+Gemini CLI, OpenCode and Amp remain uncovered, each for a different reason
+recorded below. `agent-parley provider add` will store a definition naming one
+of them, because the command is only resolved on `PATH` at launch, but the
+resulting session fails inside the native CLI. There is no flag that makes it
+work and none should be added.
 
 | Agent CLI | MCP configuration | Lifecycle hooks | Per-account config home |
 | --- | --- | --- | --- |
 | Gemini CLI | `mcpServers` in `~/.gemini/settings.json`, or `gemini mcp add` | `hooks` in the same file | none published |
-| Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `$COPILOT_HOME/hooks/*.json` | `COPILOT_HOME` |
+| Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `hooks` in `$COPILOT_HOME/settings.json` | `COPILOT_HOME` |
 | OpenCode | `mcp` in `opencode.json`, or `opencode mcp add` | JavaScript plugins only | `OPENCODE_CONFIG_DIR` |
 | Amp | `--mcp-config`, or `amp.mcpServers` in its settings file | `amp.hooks` in its settings file | `--settings-file`, `AMP_SETTINGS_FILE` |
 
-Amp is the closest fit and still not a fit: it accepts `--mcp-config`, but it has
-no `--append-system-prompt`, and its settings arrive through `--settings-file`
-rather than `--settings`, so two thirds of the `claude` contract is rejected.
-Gemini CLI additionally publishes no variable that relocates `~/.gemini`, so a
-credential profile cannot give it a second account; `launch_environment` refuses
-a profile whose provider has no `home_env` rather than sharing one login.
-
-Supporting any of these means a third adapter in the launch path, with its own
-plugin for the `coordinate` skill. That is a launch-path change and is tracked
-separately.
+Copilot CLI is covered by the `copilot` adapter above. The other three are not.
+Amp accepts `--mcp-config`, but it has no `--append-system-prompt`, and its
+settings arrive through `--settings-file` rather than `--settings`, so two
+thirds of the `claude` contract is rejected. OpenCode extends sessions through
+JavaScript plugins rather than hook commands, so lane checkpoints and the
+enforcement record would have no way to run. Gemini CLI publishes no variable
+that relocates `~/.gemini`, so a credential profile cannot give it an account
+of its own; `launch_environment` refuses a profile whose provider has no
+`home_env` rather than sharing one login.
 
 ## Recovery and teardown
 

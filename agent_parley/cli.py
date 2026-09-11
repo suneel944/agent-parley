@@ -46,6 +46,15 @@ CHANGE_TYPE = frozenset(
         "release",
     }
 )
+COPILOT_EVENTS = {
+    "SessionStart": "sessionStart",
+    "UserPromptSubmit": "userPromptSubmitted",
+    "PreToolUse": "preToolUse",
+    "PostToolUse": "postToolUse",
+    "PermissionRequest": "permissionRequest",
+    "Stop": "agentStop",
+    "SessionEnd": "sessionEnd",
+}
 
 
 def git(repo: Path, *args: str) -> str:
@@ -1854,6 +1863,58 @@ review, not merged or independently verified. An idle turn is not completion.
                     json.dumps({"hooks": hooks}),
                     "--",
                     task,
+                ]
+            elif entry["adapter"] == "copilot":
+                config_home = account.get(entry.get("home_env", ""))
+                if not config_home:
+                    raise BridgeError(
+                        f"{entry['command']!r} reads its MCP servers and its "
+                        "hooks from files in its configuration directory, so "
+                        "a lane needs a credential profile that gives it one "
+                        "of its own. Without that, this lane's hooks would "
+                        "run in every session started from your own "
+                        "configuration directory. Define a profile with "
+                        "`agent-parley credential add NAME --home DIR`, sign "
+                        "in to it once, and launch with --credentials NAME."
+                    )
+                write_json(
+                    Path(config_home) / "mcp-config.json",
+                    {
+                        "mcpServers": {
+                            "agent_parley": {
+                                "type": "http",
+                                "url": self.url + "/mcp/",
+                                "headers": {
+                                    "Authorization": (
+                                        "Bearer ${AGENT_PARLEY_TOKEN}"
+                                    )
+                                },
+                                "tools": ["*"],
+                            }
+                        }
+                    },
+                )
+                write_json(
+                    Path(config_home) / "settings.json",
+                    {
+                        "version": 1,
+                        "hooks": {
+                            COPILOT_EVENTS[event]: [
+                                {
+                                    "type": "command",
+                                    "bash": groups[0]["hooks"][0]["command"],
+                                    "timeoutSec": 3,
+                                }
+                            ]
+                            for event, groups in hooks.items()
+                            if event in COPILOT_EVENTS
+                        },
+                    },
+                )
+                command = [
+                    executable,
+                    "-p",
+                    prompt + "\nUser task:\n" + task,
                 ]
             else:
                 command = [
