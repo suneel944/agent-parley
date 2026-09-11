@@ -14,6 +14,7 @@ native approvals, or merge work.
 | `process` | Linux process identity, session liveness and pidfd shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
+| `forge` | Optional best-effort issue lookups and mirrors on the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view of every participant |
 | `state` | Private atomic JSON publication and operation locks |
@@ -191,6 +192,31 @@ observed checkpoint. That report is for an operator; silence, an idle session
 and a stopped session all leave ownership where it is. `agent-parley top`
 renders the same state continuously, adding branch drift, denial counts and
 served calls; it reads state and never writes it.
+
+A claim additionally attempts one read-only forge lookup for the issue title,
+using the repository's own `origin` remote and the operator's already
+authenticated `gh` client. The lookup is best effort: no GitHub remote, no
+`gh`, no network, a refused request or unusable output all resolve to no title,
+and the claim proceeds unchanged. A recorded title is peer-supplied display
+context, clipped to 200 characters; it is never authority for ownership, and
+every transition, dependency and handoff rule behaves identically with or
+without it.
+
+The ledger is then mirrored back. A completed claim adds the operator's own
+forge account as the issue's assignee and a release removes it, so an issue
+being worked is visible to a reader who never opens Agent Parley. A lane that
+newly reports the ready state posts its recorded summary and evidence as one
+comment on every issue it claims, once per arrival at that state rather than on
+every repeated report. Every mirror runs after the local write, through the
+operator's own `gh` client, with no flag that bypasses a repository rule, and
+reports failure instead of raising: an unreachable, unauthenticated or
+unwilling forge leaves the transition and the report exactly as recorded.
+
+The forge sees one assignee, the operator's account, because every lane runs
+under it. A handoff between participants therefore moves the ledger owner
+without moving the forge assignee, and change-type labels are never written at
+all: classification is the repository's own decision and a lane does not make
+it.
 
 Shutdown verifies the module, state path and process creation ticks, then pins
 the process with Linux pidfd before signaling. It does not kill arbitrary PIDs.

@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from agent_parley import dashboard, process, roster, store
+from agent_parley import dashboard, forge, process, roster, store
 from agent_parley.checkpoints import (
     EVENTS,
     current_branch,
@@ -27,7 +27,7 @@ from agent_parley.checkpoints import (
     participant_liveness,
     read_events,
 )
-from agent_parley.issues import change, describe, snapshot
+from agent_parley.issues import change, describe, parse_issue, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
 
@@ -254,6 +254,31 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         f"Merged {branch} into {base} as a merge commit, carrying {merged} "
         f"commits from {name}. The lane and its branch are unchanged; retire "
         f"{name} separately when the lane is no longer needed."
+    )
+
+
+def report_comment(agent: str, summary: str, evidence: str) -> str:
+    """Shapes one lane's ready report for the issue it claims.
+
+    The comment reproduces the lane's own summary and evidence and adds no
+    assessment of its own, so a reader on the forge sees what the participant
+    reported and what that report is worth.
+
+    Args:
+        agent: Participant that reported the state.
+        summary: The lane's account of its result.
+        evidence: The verification evidence the lane recorded.
+
+    Returns:
+        Markdown for the issue comment.
+    """
+    return (
+        f"Lane `{agent}` reports ready for review.\n\n"
+        f"{summary.strip()}\n\n"
+        "Verification recorded by the lane:\n\n"
+        f"{evidence.strip()}\n\n"
+        "A reported state is the participant's own account of its lane. It is "
+        "neither review nor independent verification."
     )
 
 
@@ -854,6 +879,11 @@ review, not merged or independently verified. An idle turn is not completion.
     ) -> None:
         """Records an explicitly reported outcome independently of activity.
 
+        A lane that newly reaches the ready state also posts its account to
+        every issue it claims, so a reviewer reading the forge sees the same
+        summary and evidence the lane recorded. The comment is best effort and
+        is posted once per arrival at the state, not on every repeated report.
+
         Args:
             repo: Assigned agent worktree.
             outcome: Partial, blocked, or ready-for-review state.
@@ -877,6 +907,7 @@ review, not merged or independently verified. An idle turn is not completion.
         with lock(directory / f"{agent}-checkpoint.lock"):
             path = directory / f"{agent}-activity.json"
             state = json.loads(path.read_text()) if path.exists() else {}
+            arrived = outcome == "ready" and state.get("outcome") != "ready"
             state.update(
                 outcome=outcome,
                 summary=summary,
@@ -885,6 +916,11 @@ review, not merged or independently verified. An idle turn is not completion.
                 reported_at=time.time(),
             )
             write_json(path, state)
+        if arrived:
+            body = report_comment(agent, summary, evidence)
+            for issue, record in snapshot(directory)["issues"].items():
+                if record["owner"] == agent:
+                    forge.comment(repo, issue, body)
 
     def issue(
         self,
@@ -898,6 +934,15 @@ review, not merged or independently verified. An idle turn is not completion.
         on: str | None = None,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
+
+        A claim additionally attempts a read-only forge lookup for the issue
+        title. That lookup is optional context: an unavailable forge resolves
+        to no title and never blocks or fails the claim.
+
+        A completed claim or release is then mirrored onto the host forge as
+        an assignment, so the issue reads as worked outside Agent Parley. The
+        ledger is written first and the mirror never reverses it: a forge that
+        is missing, offline or unwilling leaves the transition in force.
 
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
@@ -921,7 +966,12 @@ review, not merged or independently verified. An idle turn is not completion.
             return snapshot(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
-        return change(
+        title = (
+            forge.issue_title(repo, parse_issue(number))
+            if action == "claim"
+            else None
+        )
+        record = change(
             directory,
             agent,
             action,
@@ -931,7 +981,13 @@ review, not merged or independently verified. An idle turn is not completion.
             summary=summary,
             offer_id=offer_id,
             on=on,
+            title=title,
         )
+        if action == "claim":
+            forge.assign(repo, parse_issue(number))
+        elif action == "release":
+            forge.unassign(repo, parse_issue(number))
+        return record
 
     def export_events(
         self,
