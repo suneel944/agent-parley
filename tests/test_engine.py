@@ -846,7 +846,7 @@ def test_locked_store_fails_within_a_bounded_deadline(bridge, actors):
         started = time.monotonic()
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             store.call(bridge.home, actors[0], "send_message", message())
-        assert time.monotonic() - started < 2
+        assert time.monotonic() - started < store.BUSY_TIMEOUT + 1
 
 
 def test_writer_waits_for_a_short_lived_competing_transaction(
@@ -870,6 +870,6 @@ def test_writer_waits_for_a_short_lived_competing_transaction(
             pending = pool.submit(
                 store.call, bridge.home, actors[0], "send_message", message()
             )
-            assert attempted.wait(timeout=2)
-            time.sleep(0.45)
-        assert pending.result(timeout=2)["id"] > 0
+            assert attempted.wait(timeout=store.BUSY_TIMEOUT)
+            time.sleep(1.2)
+        assert pending.result(timeout=store.BUSY_TIMEOUT)["id"] > 0
