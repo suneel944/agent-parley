@@ -455,6 +455,12 @@ the notes carry features, fixes, performance, documentation and reverts.
 Rewrite `docs/release-overview.md` when the product description changes, not
 when a version does.
 
+Every GitHub release is titled `Agent Parley vVERSION`, minted by publication
+rather than typed, so the releases page reads as one series. Releases published
+before that title existed were renamed to match. Do not retitle a release by
+hand: a page where one entry names the product and another shows a bare tag
+reads as two different projects.
+
 After publication the release workflow comments the verification result on the
 tracking issue, closes it, and closes the milestone once nothing else is open
 in it. Merged release branches are deleted by the repository setting.
