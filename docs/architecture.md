@@ -271,7 +271,7 @@ reservations continue to resolve.
 
 Mail uses SQLite WAL with indexed inbox and held-lease queries. Each write
 acquires an immediate transaction, validates and mutates, then commits once.
-Connections close after every operation. A writer waits up to one second for
+Connections close after every operation. A writer waits up to five seconds for
 another transaction to commit.
 Conflicting reservation batches grant no paths. Each conflict names the blocking
 lane and that lane's declared reason, clipped to 80 characters, so a denied
@@ -370,6 +370,7 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | --- | --- |
 | HTTP request | 16,384 bytes |
 | Concurrent workers / socket timeout | 16 / 3 seconds |
+| Writer wait for a busy store | 5 seconds |
 | New message body | 4,096 UTF-8 bytes |
 | Inbox page | Up to 5 messages; bodies omitted by default |
 | Thread page | Up to 10 messages; 240-character body previews |
@@ -390,6 +391,13 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | Participant event age | 1,209,600 seconds, applied at a session boundary |
 | Retained tool events | 2,000 per project |
 | Session record read per lane per refresh | 1,048,576 bytes |
+
+A writer that finds the store busy waits for the holding transaction rather
+than failing. The sixteen concurrent workers serialize their writes in about a
+tenth of a second on an idle machine, so the five second budget carries some
+fifty times that queue and absorbs the scheduling delay of a loaded shared
+machine. Below that margin ordinary contention reached a participant as a
+refused coordination call rather than a turn in the queue.
 
 Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refetch
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.

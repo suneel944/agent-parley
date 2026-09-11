@@ -15,6 +15,7 @@ from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
 SCHEMA_VERSION = 4
+BUSY_TIMEOUT = 5.0
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
 MAX_RECIPIENTS = 16
@@ -92,11 +93,17 @@ END;
 def connect(home: Path, *, write: bool = False) -> Iterator[sqlite3.Connection]:
     """Opens a bounded transaction and always closes its connection.
 
-    Writers allow one second for another transaction to commit. The former
-    300 ms ceiling rejected ordinary contention on loaded CI workers. SQLite
-    acquires uncontended locks immediately; this budget adds no fixed delay.
+    A writer waits `BUSY_TIMEOUT` seconds for the holding transaction to
+    commit before it reports the store as locked. The sixteen concurrent
+    workers of the service serialize their writes in about a tenth of a
+    second on an idle machine, so the budget carries some fifty times that
+    queue. Loaded shared machines stretch the same queue past the former one
+    second ceiling, which turned ordinary contention into a refused
+    coordination call. SQLite acquires uncontended locks immediately, so the
+    budget adds no fixed delay; it bounds only a wait that is already
+    happening.
     """
-    db = sqlite3.connect(home / DATABASE, timeout=1.0)
+    db = sqlite3.connect(home / DATABASE, timeout=BUSY_TIMEOUT)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     try:
@@ -132,7 +139,9 @@ def initialize(home: Path) -> None:
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
-        with contextlib.closing(sqlite3.connect(path, timeout=1)) as db:
+        with contextlib.closing(
+            sqlite3.connect(path, timeout=BUSY_TIMEOUT)
+        ) as db:
             path.chmod(0o600)
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == SCHEMA_VERSION:
