@@ -559,13 +559,19 @@ def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     after = _number(args.get("after_id", 0), "after_id", 0, 2**63 - 1)
     limit = _number(args.get("limit", 5), "limit", 1, 5)
     bodies = _flag(args.get("include_bodies", False), "include_bodies")
+    unread = _flag(args.get("unread", False), "unread")
+    unacknowledged = _flag(args.get("unacknowledged", False), "unacknowledged")
+    offset = _number(args.get("body_offset", 0), "body_offset", 0, 10**9)
     rows = db.execute(
         "SELECT m.id,a.name AS sender,m.thread_id,m.subject,m.body_md,"
-        "m.ack_required "
+        "m.ack_required,r.read_ts,r.ack_ts "
         "FROM messages m JOIN agents a ON a.id=m.sender_id "
         "JOIN message_recipients r ON r.message_id=m.id "
-        "WHERE r.agent_id=? AND m.id>? ORDER BY m.id LIMIT ?",
-        (actor["id"], after, limit + 1),
+        "WHERE r.agent_id=? AND m.id>? "
+        "AND (?=0 OR r.read_ts IS NULL) "
+        "AND (?=0 OR (m.ack_required=1 AND r.ack_ts IS NULL)) "
+        "ORDER BY m.id LIMIT ?",
+        (actor["id"], after, unread, unacknowledged, limit + 1),
     ).fetchall()
     result: dict = {"messages": [], "next_after_id": after, "has_more": False}
     for row in rows[:limit]:
@@ -573,14 +579,20 @@ def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         if not bodies:
             item.pop("body_md")
         item["subject"] = item["subject"][:160]
-        offset = _number(args.get("body_offset", 0), "body_offset", 0, 10**9)
         if bodies:
             full = item["body_md"]
             item["body_md"] = full[offset : offset + 1024]
             if offset + 1024 < len(full):
                 item["next_body_offset"] = offset + 1024
-        candidate = {**result, "messages": [*result["messages"], item]}
-        if len(json.dumps(candidate, ensure_ascii=False).encode()) > 7500:
+        candidate = {
+            **result,
+            "messages": [*result["messages"], item],
+            "next_after_id": row["id"],
+        }
+        if (
+            len(json.dumps(candidate, ensure_ascii=False).encode())
+            > MAX_RESULT_BYTES
+        ):
             break
         result["messages"].append(item)
         result["next_after_id"] = row["id"]
@@ -612,8 +624,17 @@ def _bounded(result: dict, rows: list[sqlite3.Row]) -> list[dict]:
     """
     reported: list[dict] = []
     for row in rows:
-        candidate = {**result, "messages": [*reported, dict(row)]}
-        if len(json.dumps(candidate, ensure_ascii=False).encode()) > 7500:
+        candidate = {
+            **result,
+            "messages": [*reported, dict(row)],
+            "has_more": False,
+        }
+        if "next_after_id" in result:
+            candidate["next_after_id"] = row["id"]
+        if (
+            len(json.dumps(candidate, ensure_ascii=False).encode())
+            > MAX_RESULT_BYTES
+        ):
             break
         reported.append(dict(row))
     return reported

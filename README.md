@@ -164,8 +164,8 @@ agent-parley verify set ''             # remove the requirement
 ```
 
 With one configured, `participant merge` runs it in the base checkout first and
-refuses the merge on a non-zero exit, reporting the exit status and the tail of
-the output. It runs as an argument list, never through a shell, and no flag
+streams the command's output, refusing the merge on a non-zero exit and
+reporting the exit status. It runs as an argument list, never through a shell, and no flag
 skips it. It reports the base checkout as it stands before the merge, which is
 not a claim about the merged result.
 
@@ -301,6 +301,78 @@ that relocates `~/.gemini`, so it cannot be given a lane of its own; OpenCode
 runs plugins rather than hook commands; Amp accepts no system-prompt argument.
 [Operations](docs/operations.md#other-agent-clis) records what each one
 supports and where its MCP and hook configuration lives.
+
+## Command reference
+
+Use `agent-parley COMMAND --help` for arguments. `--home DIR` selects private
+state globally; repository commands accept `--repo PATH` unless noted below.
+Issue mutations, reports and lane mail resolve identity from the current lane.
+
+| Command | Purpose |
+| --- | --- |
+| `up` | Start the local coordination server. |
+| `down` | Stop the server while retaining state and worktrees. |
+| `status` | Show server health, ownership, activity and reported outcomes. |
+| `setup PATH` | Register a repository from committed HEAD. |
+| `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
+| `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider` and `--since` filter it. |
+| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`. |
+| `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
+| `issue list` | Show claims, dependencies and handoff offers. |
+| `issue claim NUMBER` | Claim an available issue from this lane. |
+| `issue release NUMBER` | Release ownership without closing the GitHub issue. |
+| `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly. |
+| `issue accept NUMBER --offer-id ID` | Accept the current offer addressed to this lane. |
+| `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |
+| `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
+| `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
+| `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
+| `participant list` | List the project's lanes and their identities. |
+| `participant add NAME` | Create a lane with an optional provider and credential profile. |
+| `participant restore NAME` | Restore the assigned branch while preserving work. |
+| `participant retire NAME` | Retire an idle lane while preserving recoverable work. |
+| `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
+| `participant pr NAME` | Push the lane branch and open or locate its pull request. |
+| `provider list` | List built-in presets and local overrides. |
+| `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
+| `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |
+| `credentials list` | List native account profiles. |
+| `credentials add NAME` | Define a config home and environment requirements. |
+| `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
+| `verify show` | Show the project's configured pre-merge command. |
+| `verify set COMMAND` | Set that command; an empty string removes it. |
+| `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
+| `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
+| `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
+
+Removing a definition leaves participant references intact. Redefine that name
+before relaunching a lane that uses it. A removed provider override immediately
+reveals its built-in preset, if any.
+
+The live dashboard drops columns by priority on narrow terminals and marks
+hidden participants when space runs out. `running; no hooks` means the session
+needs relaunching to obtain checkpoint reporting. `top --once` prints full detail.
+
+### MCP tools
+
+Authentication supplies the lane identity; tool arguments cannot select another
+participant or project. Reservations are advisory, not filesystem locks.
+
+| Tool | Purpose |
+| --- | --- |
+| `send_message` | Send to peers using an idempotency key; optionally join a thread or require acknowledgement. |
+| `fetch_inbox` | Page inbox metadata and optional bodies; filter with `unread` or `unacknowledged`. |
+| `mark_message_read` | Explicitly mark a received message read. |
+| `acknowledge_message` | Explicitly acknowledge a reviewed message. |
+| `file_reservation_paths` | Reserve advisory path patterns and report conflicts. |
+| `release_file_reservations` | Release reservations owned by this lane. |
+| `list_participants` | Discover addressable identities, tasks and last coordination times. |
+| `read_thread` | Page messages this lane sent or received in one thread. |
+| `search_messages` | Search only messages this lane sent or received. |
+
+Inbox rows include `read_ts` and `ack_ts`. Fetching changes neither. Both filters
+can be combined; `unacknowledged` selects messages that requested an acknowledgement
+and have not received it. The result budget is 8,192 UTF-8 bytes.
 
 ## How it fits together
 

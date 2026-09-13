@@ -53,6 +53,22 @@ arguments cannot select another project or impersonate an agent. A separate
 health token grants no tool access. Credentials travel through the native
 client's environment, never the model prompt.
 
+`AGENT_PARLEY_TOKEN` is inherited by every child of the native client, including
+shell tools, Git hooks and test runners. Those processes can authenticate as
+that lane; this is not an isolation boundary against code executed by the agent.
+Run untrusted programs with `env -u AGENT_PARLEY_TOKEN COMMAND` and keep native
+approvals enabled. That removes inheritance for that process, but does not
+isolate a process running as the same OS user from private identity files.
+Separate OS users or containers are needed for mutually untrusted workloads.
+The token is scoped to one lane and project; it grants no operator identity.
+
+Inbox reads return `read_ts` and `ack_ts` without changing either. `unread`
+selects receipts without a read timestamp; `unacknowledged` selects messages
+that require acknowledgement and lack its timestamp. Combined filters select
+their intersection and preserve `after_id` paging. All body offsets are
+validated even when no row is returned. Inbox, thread, search and reservation
+responses use the same `MAX_RESULT_BYTES` budget.
+
 The supervising operator writes from the command line only. `agent-parley say`
 resolves the project and the addressed participant, then takes the ordinary
 send path, so the message is deduplicated by its key, can require an
@@ -152,6 +168,12 @@ that lock for the whole session, so probing it would make a concurrent launch
 fail while merely reporting. A session that ends without clearing its record
 reads as stopped, because its process is gone.
 
+Linux shutdown pins the process with pidfd before checking its creation time
+and signaling it. When a Python build omits `os.pidfd_open` or
+`signal.pidfd_send_signal`, stdlib `ctypes` calls the host libc's matching API.
+A host lacking that API fails closed; it never falls back to signaling an
+unpinned numeric PID.
+
 A provider states which native CLI drives a participant and how that CLI reaches
 a model. Coordination needs an MCP server, a system prompt and lifecycle hooks,
 and three contracts implement that, so every provider names one of the three
@@ -160,7 +182,8 @@ adapters and its executable must accept that contract in full. `claude` and
 starts, so nothing is written into a configuration file the operator also owns
 and no state survives the session. `copilot` is file-configured: Copilot CLI
 reads MCP servers and hooks from its configuration directory, so the launcher
-writes `mcp-config.json` and a `settings.json` hooks block into the directory
+writes the `agent_parley` MCP entry and appends its hooks while preserving other
+servers, hooks and settings in `mcp-config.json` and `settings.json` in the directory
 `COPILOT_HOME` names. That directory also holds the client's own credentials
 and its user-level hooks apply to every session started from it, so a `copilot`
 participant requires a credential profile and the launcher refuses without one

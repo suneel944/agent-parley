@@ -221,6 +221,35 @@ def providers(home: Path) -> dict:
     return _registry(home, PROVIDERS, PRESETS)
 
 
+def remove(home: Path, kind: str, name: str) -> None:
+    """Removes a local definition while preserving native account files.
+
+    Removing a provider override reveals its built-in preset again. Existing
+    participants retain their profile names and need a replacement definition
+    before their next launch. Native credentials are never deleted.
+
+    Args:
+        home: Private bridge state root.
+        kind: Either provider or credentials.
+        name: Local definition to remove.
+
+    Raises:
+        BridgeError: If the kind or local definition does not exist.
+    """
+    filenames = {"provider": PROVIDERS, "credentials": CREDENTIALS}
+    if kind not in filenames:
+        raise BridgeError(f"Unknown registry: {kind}.")
+    identifier(name, "Definition name")
+    with lock(home / "registry.lock"):
+        path = home / filenames[kind]
+        stored = json.loads(path.read_text()) if path.exists() else {}
+        entries = stored.get("entries", {})
+        if name not in entries:
+            raise BridgeError(f"No local {kind} definition named {name!r}.")
+        del entries[name]
+        write_json(path, stored)
+
+
 def provider(home: Path, name: str) -> dict:
     """Returns one provider definition.
 
@@ -348,17 +377,19 @@ def define_credential(
         directory = Path(config_home).expanduser()
         if not directory.is_absolute():
             raise BridgeError("Credential home must be an absolute path.")
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         resolved = str(directory)
+    entry = {
+        "home": resolved,
+        "env": overrides(env),
+        "require_env": variables(require),
+    }
+    if resolved:
+        Path(resolved).mkdir(parents=True, exist_ok=True, mode=0o700)
     return _define(
         home,
         CREDENTIALS,
         name,
-        {
-            "home": resolved,
-            "env": overrides(env),
-            "require_env": variables(require),
-        },
+        entry,
     )
 
 

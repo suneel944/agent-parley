@@ -157,6 +157,7 @@ def _row(
     except (BridgeError, OSError, sqlite3.Error):
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
+    liveness = participant_liveness(directory, agent)
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -164,7 +165,11 @@ def _row(
             f"{participant['provider']}/"
             f"{participant['credential'] or 'default'}"
         ),
-        "state": participant_liveness(directory, agent).split(";")[0],
+        "state": (
+            "running; no hooks"
+            if "checkpoints unavailable" in liveness
+            else liveness
+        ),
         "event_age": (
             _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
         ),
@@ -262,15 +267,36 @@ def collect(
     }
 
 
-def render(view: dict) -> list[str]:
+def render(
+    view: dict, width: int | None = None, height: int | None = None
+) -> list[str]:
     """Formats a snapshot as plain lines that survive being piped to a file.
 
     Args:
         view: Snapshot produced by ``collect``.
+        width: Available terminal columns, or unlimited for plain output.
+        height: Available lines, or unlimited for plain output.
 
     Returns:
         Header, one line per participant, and an indented prompt line.
     """
+    columns = list(enumerate(COLUMNS))
+    omitted = []
+    if width is not None:
+        for index in (1, 3, 4, 8, 10, 11, 7, 5, 9):
+            if sum(cell[1][1] + 2 for cell in columns) - 2 <= width:
+                break
+            omitted.append(COLUMNS[index][0])
+            columns = [cell for cell in columns if cell[0] != index]
+        if sum(cell[1][1] + 2 for cell in columns) - 2 > width:
+            cell_width = max(
+                1, (width - 2 * (len(columns) - 1)) // len(columns)
+            )
+            columns = [
+                (index, (name, cell_width)) for index, (name, _) in columns
+            ]
+    selected_columns = dict(columns)
+    row_positions = []
     totals = view["totals"]
     rate = (
         f"{100 * totals['denials'] / totals['events']:.0f}%"
@@ -297,7 +323,9 @@ def render(view: dict) -> list[str]:
             else "  all retained"
         ),
     ]
-    header = "  ".join(name.ljust(width) for name, width in COLUMNS)
+    if omitted:
+        lines.append("Hidden columns: " + ", ".join(omitted))
+    header = "  ".join(name.ljust(size) for _, (name, size) in columns)
     for project in view["projects"]:
         lines.extend(["", f"project {project['root']}", header.rstrip()])
         if not project["rows"]:
@@ -307,10 +335,11 @@ def render(view: dict) -> list[str]:
                 else "  no participants"
             )
         for row in project["rows"]:
+            row_positions.append(len(lines))
             lines.append(
                 "  ".join(
-                    _fit(value, width)
-                    for value, (_, width) in zip(
+                    _fit(value, selected_columns[index][1])
+                    for index, value in enumerate(
                         (
                             row["participant"],
                             row["provider"],
@@ -337,9 +366,8 @@ def render(view: dict) -> list[str]:
                             + (f"!{row['errors']}" if row["errors"] else ""),
                             _tokens(row["tokens"]),
                         ),
-                        COLUMNS,
-                        strict=True,
                     )
+                    if index in selected_columns
                 ).rstrip()
             )
             if row["prompt"]:
@@ -355,6 +383,16 @@ def render(view: dict) -> list[str]:
         "its assigned bridge branch. A stale lease is still held; releasing "
         "it is its owner's to do."
     )
+    if width is not None:
+        lines = [_fit(line, max(1, width)).rstrip() for line in lines]
+    if height is not None and len(lines) > max(0, height):
+        available = max(0, height - 1)
+        hidden = sum(position >= available for position in row_positions)
+        footer = f"{hidden} participants hidden; more details: top --once"
+        lines = lines[:available] + [footer]
+        if width is not None:
+            lines[-1] = _fit(lines[-1], max(1, width)).rstrip()
+        lines = lines[: max(0, height)]
     return lines
 
 
@@ -373,10 +411,12 @@ def _loop(
         curses.curs_set(0)
     screen.timeout(max(100, int(interval * 1000)))
     while True:
-        lines = render(
-            collect(home, running(), branches, providers, window, readings)
-        )
         height, width = screen.getmaxyx()
+        lines = render(
+            collect(home, running(), branches, providers, window, readings),
+            max(1, width - 1),
+            max(0, height - 1),
+        )
         screen.erase()
         for index, line in enumerate(lines[: height - 1]):
             with contextlib.suppress(curses.error):

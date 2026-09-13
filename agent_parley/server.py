@@ -72,6 +72,8 @@ TOOLS = [
             "limit": {**INTEGER, "minimum": 1, "maximum": 5},
             "include_bodies": FLAG,
             "body_offset": INTEGER,
+            "unread": FLAG,
+            "unacknowledged": FLAG,
         },
         [],
     ),
