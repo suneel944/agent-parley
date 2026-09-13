@@ -80,6 +80,20 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
+def validate_repository(repository: dict[str, Any]) -> list[str]:
+    """Requires squash defaults that retain the validated PR title and body.
+
+    Explicit merge API message overrides must also preserve issue references;
+    repository defaults cannot constrain an override supplied at merge time.
+    """
+    if (
+        repository.get("squash_merge_commit_title") != "PR_TITLE"
+        or repository.get("squash_merge_commit_message") != "PR_BODY"
+    ):
+        return ["Set squash merge defaults to the PR title and PR body."]
+    return []
+
+
 def api(path: str, *, paginate: bool = False) -> Any:
     """Reads authenticated GitHub metadata through the native CLI.
 
@@ -109,7 +123,8 @@ def main() -> None:
         api(f"repos/{repository}/issues/{issue}")
         for issue in sorted(issue_numbers(pr.get("body") or ""))
     ]
-    errors = validate(pr, issues)
+    errors = validate_repository(api(f"repos/{repository}"))
+    errors += validate(pr, issues)
     commits = api(
         f"repos/{repository}/pulls/{number}/commits?per_page=100", paginate=True
     )

@@ -1,6 +1,12 @@
 """Exercises ownership and issue validation at the GitHub metadata boundary."""
 
-from scripts.check_pr_hygiene import issue_numbers, validate
+import pytest
+
+from scripts.check_pr_hygiene import (
+    issue_numbers,
+    validate,
+    validate_repository,
+)
 
 
 def metadata():
@@ -50,3 +56,23 @@ def test_human_pr_requires_template_sections():
     pr = metadata()
     pr["body"] = "Refs #7"
     assert len(validate(pr, [{"number": 7}])) == 3
+
+
+@pytest.mark.parametrize(
+    ("title", "message", "valid"),
+    [
+        ("PR_TITLE", "PR_BODY", True),
+        ("COMMIT_OR_PR_TITLE", "PR_BODY", False),
+        ("PR_TITLE", "COMMIT_MESSAGES", False),
+        ("PR_TITLE", "BLANK", False),
+        (None, None, False),
+    ],
+)
+def test_squash_defaults_preserve_validated_pr_metadata(title, message, valid):
+    errors = validate_repository(
+        {
+            "squash_merge_commit_title": title,
+            "squash_merge_commit_message": message,
+        }
+    )
+    assert bool(errors) is not valid

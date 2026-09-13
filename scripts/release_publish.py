@@ -103,26 +103,29 @@ def verify_assets(directory: Path, version: str) -> str:
     return digest(manifest)
 
 
-def release_history(root: Path) -> tuple[dict[str, dict[str, str]], list[str]]:
-    """Loads reviewed tag mappings and versions that cannot be reused.
+def release_history(
+    root: Path,
+) -> tuple[dict[str, dict[str, str]], list[str], dict[str, list[int]]]:
+    """Loads reviewed provenance, retired versions and recovered references.
 
     Args:
         root: Checkout containing release configuration.
 
     Returns:
-        Commit mappings indexed by release tag, and retired versions.
+        Tag mappings, retired versions and issue references by exact commit.
 
     Raises:
         ValueError: If the migration file contains invalid entries.
     """
     path = root / ".github/release-history.json"
     if not path.exists():
-        return {}, []
+        return {}, [], {}
     history = json.loads(path.read_text())
-    if not isinstance(history, dict) or set(history) != {
-        "migrations",
-        "retired",
-    }:
+    if (
+        not isinstance(history, dict)
+        or not {"migrations", "retired"} <= set(history)
+        or set(history) - {"migrations", "retired", "issue_references"}
+    ):
         raise ValueError("Release history requires migrations and retirement.")
     mappings, retired = history["migrations"], history["retired"]
     if (
@@ -147,7 +150,22 @@ def release_history(root: Path) -> tuple[dict[str, dict[str, str]], list[str]]:
             )
         ):
             raise ValueError("Release history requires exact commit IDs.")
-    return mappings, retired
+    references = history.get("issue_references", {})
+    if not isinstance(references, dict):
+        raise ValueError("Recovered issue references must be a mapping.")
+    for commit, numbers in references.items():
+        if (
+            not re.fullmatch(r"[0-9a-f]{40}", commit)
+            or not isinstance(numbers, list)
+            or not numbers
+            or any(type(number) is not int or number <= 0 for number in numbers)
+            or len(set(numbers)) != len(numbers)
+        ):
+            raise ValueError(
+                "Recovered references require exact commit IDs and unique "
+                "positive issue numbers."
+            )
+    return mappings, retired, references
 
 
 def release_baseline(root: Path, tag: str, source: str) -> str:
@@ -165,7 +183,7 @@ def release_baseline(root: Path, tag: str, source: str) -> str:
         ValueError: If a mapped tag moved or its rewritten tree differs.
         subprocess.CalledProcessError: If a commit is absent or outside HEAD.
     """
-    migrations, retired = release_history(root)
+    migrations, retired, _ = release_history(root)
     if tag[1:] in retired:
         raise ValueError("Retired release versions cannot be reused.")
     migration = migrations.get(tag)
@@ -301,8 +319,10 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
     script, test and documentation commits are therefore structurally
     incapable of raising a version. Issue references collapse repeated pull
     requests for one issue into a single unit, and a qualifying commit that
-    names no issue counts as one unit of its own so delivered work is never
-    under-reported. Measurement is local: one Git history read, no network.
+    names no issue counts as one unit of its own. Reviewed history metadata
+    can recover references lost during squash merging, but only for an exact
+    qualifying commit in this range. Recovered references replace the fallback
+    commit unit and share normal deduplication. Measurement remains local.
     Records and fields are separated with control bytes that can appear in
     neither a commit message nor a path, so a crafted message cannot forge
     a commit boundary.
@@ -327,6 +347,7 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
         f"{baseline}..HEAD",
         cwd=root,
     )
+    _, _, references = release_history(root)
     issues: set[str] = set()
     features: set[str] = set()
     urgent = False
@@ -339,9 +360,10 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
             for path in PACKAGE_PATHS
         ):
             continue
-        units = {
-            f"#{number}" for number in ISSUE_REFERENCE.findall(message)
-        } or {commit}
+        units = (
+            {f"#{number}" for number in ISSUE_REFERENCE.findall(message)}
+            | {f"#{number}" for number in references.get(commit, [])}
+        ) or {commit}
         issues |= units
         if subject[1] == "feat":
             features |= units
@@ -385,7 +407,7 @@ def release_candidate(root: Path) -> tuple[str, int, int]:
         kind = "patch"
     else:
         return "", len(issues), len(features)
-    _, retired = release_history(root)
+    _, retired, _ = release_history(root)
     proposal = available_version(root, approved, kind, retired)
     return proposal, len(issues), len(features)
 
@@ -405,7 +427,7 @@ def release_history_errors(root: Path) -> list[str]:
         Configuration errors that block policy checks and preparation.
     """
     version = json.loads((root / MANIFEST_PATH).read_text())["."]
-    _, retired = release_history(root)
+    _, retired, _ = release_history(root)
     errors = []
     if version in retired:
         errors.append("Retired release versions cannot be reused.")
@@ -449,9 +471,10 @@ def changelog_entry(
         f"{baseline}..HEAD",
         cwd=root,
     )
+    _, _, references = release_history(root)
     sections: dict[str, set[str]] = {}
     for record in log.split("\x00")[1:]:
-        _, message, names = record.split("\x01")
+        commit, message, names = record.split("\x01")
         subject = RELEASING_SUBJECT.match(message)
         if not subject or not any(
             name == path or name.startswith(f"{path}/")
@@ -460,9 +483,12 @@ def changelog_entry(
         ):
             continue
         headline = message.splitlines()[0][subject.end() :].strip()
+        numbers = set(ISSUE_REFERENCE.findall(message)) | {
+            str(number) for number in references.get(commit, [])
+        }
         links = " ".join(
             f"([#{number}]({REPOSITORY_URL}/issues/{number}))"
-            for number in sorted(set(ISSUE_REFERENCE.findall(message)), key=int)
+            for number in sorted(numbers, key=int)
         )
         entry = f"* {headline} {links}".rstrip()
         sections.setdefault(subject[1], set()).add(entry)

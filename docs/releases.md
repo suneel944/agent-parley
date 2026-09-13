@@ -14,6 +14,28 @@ matched the GitHub packages. See the
 
 ## Audited release history
 
+### Recovering issue references lost during squash merging
+
+The repository uses the PR title and body as its squash commit defaults, and
+PR hygiene checks those settings. Explicit merge API message overrides must
+also preserve the issue references from the PR body.
+
+PR [#161](https://github.com/suneel944/agent-parley/pull/161) closed seven issues,
+but its squash commit `4edd3fc6ed0f77bf516008b7d2f16f4fef578415` omitted their
+references. Together with the three references retained by PR #139, the release
+counter saw four units instead of ten. The `issue_references` entry in
+`.github/release-history.json` records those seven references against the exact
+commit, preserving the existing Git history and release tags.
+
+Recovery metadata is reviewed alongside its source PR evidence. It contributes
+only when the named commit is in the unreleased range, has a releasing
+Conventional Commit title and changes the package or plugin. Its issue numbers
+share normal deduplication and replace the anonymous commit fallback. Changelog
+generation uses the same recovered references. Entries outside the current
+release range contribute nothing; keep them as an audit record.
+
+### Published artifact audit
+
 The read-only audit on 2026-09-10 downloaded the GitHub bundles and PyPI package
 files, verified both GitHub checksum manifests, and compared the package bytes.
 It predates 0.2.0, so the table below records the versions that existed then and
