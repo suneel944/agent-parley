@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import datetime
+import io
 import json
 import os
 import re
@@ -9,9 +10,11 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import tomllib
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -20,7 +23,7 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agent_parley import dashboard, forge, process, roster, store
+from agent_parley import checkpoints, dashboard, forge, process, roster, store
 from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
@@ -114,6 +117,60 @@ def test_lock_rejects_second_session(bridge):
     with lock(path), pytest.raises(BridgeError, match="owns"):
         with lock(path):
             pass
+
+
+def test_short_operation_lock_waits_and_times_out(bridge):
+    path = bridge.home / "operation.lock"
+    acquired = threading.Event()
+
+    def contender():
+        with lock(path, timeout=1):
+            acquired.set()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with lock(path):
+            pending = pool.submit(contender)
+            assert not acquired.wait(0.05)
+        pending.result(timeout=2)
+    assert acquired.is_set()
+    with lock(path):
+        started = time.monotonic()
+        with pytest.raises(BridgeError, match="owns"):
+            with lock(path, timeout=0.05):
+                pytest.fail("Contended lock was acquired")
+        assert 0.04 <= time.monotonic() - started < 0.5
+
+
+def test_issue_claim_waits_for_a_busy_ledger(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with lock(lane.parent / "issues.lock"):
+            pending = pool.submit(bridge.issue, lane, "claim", "101")
+            time.sleep(0.05)
+            assert not pending.done()
+        assert pending.result(timeout=2)["owner"] == "codex"
+
+
+def test_checkpoint_waits_for_a_short_activity_update(
+    bridge, repo, paired, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    monkeypatch.setattr(
+        checkpoints, "mailbox", lambda *args: {"pending_ack": 0, "messages": []}
+    )
+    write_json(lane.parent / "codex-identity.json", {"name": "codex"})
+    payload = {"hook_event_name": "PreToolUse", "cwd": str(lane)}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with lock(lane.parent / "codex-checkpoint.lock"):
+            pending = pool.submit(
+                checkpoint, bridge.home, lane.parent, "codex", payload
+            )
+            time.sleep(0.05)
+            assert not pending.done()
+        output = pending.result(timeout=2)
+    assert checkpoints.decision_of(output) == "allow"
+    assert checkpoints.activity(lane.parent, "codex")["event"] == "PreToolUse"
+    assert len(checkpoints.read_events(lane.parent, "codex")) == 1
 
 
 def test_public_state_directory_rejected(tmp_path):
@@ -291,11 +348,99 @@ def test_native_hook_blocks_drift_until_exact_restore(bridge, repo, paired):
     blocked, reason = branch_guard("Stop", payload, lane, expected)
     assert blocked["decision"] == "block"
     assert reason == "branch_drift"
+    assert branch_guard(
+        "Stop", {**payload, "stop_hook_active": True}, lane, expected
+    ) == ({}, "branch_drift")
     payload["tool_input"]["command"] = f"git switch {expected}"
     assert branch_guard("PreToolUse", payload, lane, expected) == (
         None,
         "branch_restore",
     )
+
+
+@pytest.mark.parametrize("create_first", [False, True])
+def test_renamed_lane_can_restore_without_losing_work(
+    bridge, repo, paired, create_first
+):
+    lane = Path(paired["lanes"]["codex"])
+    expected = paired["branches"]["codex"]
+    git(lane, "branch", "-m", "renamed")
+    (lane / "pending.txt").write_text("keep me")
+    head = git(lane, "rev-parse", "HEAD")
+    payload = {"cwd": str(lane), "tool_input": {"command": "git status"}}
+    denied, _ = branch_guard("PreToolUse", payload, lane, expected)
+    assert f"git branch -m renamed {expected}" in str(denied)
+    for command in (
+        f"git branch -M renamed {expected}",
+        f"git branch -m unrelated {expected}",
+        f"git branch -m renamed {expected}; git reset --hard",
+        f"git -C {repo} branch -m renamed {expected}",
+    ):
+        payload["tool_input"]["command"] = command
+        assert branch_guard("PreToolUse", payload, lane, expected)[1] == (
+            "branch_drift"
+        )
+    args = (
+        ["branch", expected]
+        if create_first
+        else ["branch", "-m", "renamed", expected]
+    )
+    payload["tool_input"]["command"] = shlex.join(["git", *args])
+    assert branch_guard("PreToolUse", payload, lane, expected) == (
+        None,
+        "branch_restore",
+    )
+    git(lane, *args)
+    if create_first:
+        payload["tool_input"]["command"] = f"git switch {expected}"
+        assert branch_guard("PreToolUse", payload, lane, expected)[1] == (
+            "branch_restore"
+        )
+        git(lane, "switch", expected)
+    assert git(lane, "branch", "--show-current") == expected
+    assert git(lane, "rev-parse", "HEAD") == head
+    assert (lane / "pending.txt").read_text() == "keep me"
+
+
+@pytest.mark.parametrize("event", checkpoints.EVENTS)
+def test_git_timeout_is_recorded_and_obeys_hook_exit_contract(
+    bridge, repo, paired, monkeypatch, capsys, event
+):
+    lane = Path(paired["lanes"]["codex"])
+    payload = {"hook_event_name": event, "cwd": str(lane)}
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("git", 3)
+
+    monkeypatch.setattr(checkpoints.subprocess, "run", timeout)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "checkpoint",
+            "--home",
+            str(bridge.home),
+            "--directory",
+            str(lane.parent),
+            "--participant",
+            "codex",
+        ],
+    )
+    blocking = event in ("PreToolUse", "SessionStart", "UserPromptSubmit")
+    assert checkpoints.main() == (2 if blocking else 0)
+    output = capsys.readouterr()
+    assert output.err == (
+        "Agent Parley checkpoint failed: "
+        "Git branch inspection timed out after 3s.\n"
+    )
+    assert output.out == ("" if blocking else "{}\n")
+    state = checkpoints.activity(lane.parent, "codex")
+    assert state["event"] == event
+    assert "timed out" in state["checkpoint_error"]
+    entry = checkpoints.read_events(lane.parent, "codex")[-1]
+    assert entry["reason_class"] == "checkpoint_failed"
+    assert entry["decision"] == ("deny" if blocking else "allow")
 
 
 def test_native_hook_allows_branch_work_in_separate_worktree(
@@ -1926,6 +2071,22 @@ def test_retire_removes_a_lane_and_revokes_its_credential(bridge, repo, paired):
         bridge.retire(repo, "codex")
     assert lane.exists()
     (lane / "draft.txt").unlink()
+    artifacts = [
+        lane.parent / f"codex-{suffix}"
+        for suffix in (
+            "activity.json",
+            "mcp.json",
+            "events.jsonl",
+            "events.1.jsonl",
+            "events.jsonl.tmp",
+            "events.1.jsonl.tmp",
+            "checkpoint.lock",
+        )
+    ] + [lane.parent / "codex.session.lock"]
+    for artifact in artifacts:
+        artifact.write_text("old lane state")
+    peer_log = lane.parent / "codex-peer-events.jsonl"
+    peer_log.write_text("peer state")
     message = bridge.retire(repo, "codex")
     assert "deleted" in message
     assert not lane.exists()
@@ -1934,8 +2095,11 @@ def test_retire_removes_a_lane_and_revokes_its_credential(bridge, repo, paired):
     assert "codex" not in remaining["participants"]
     assert "claude" in remaining["participants"]
     assert not (lane.parent / "codex-identity.json").exists()
+    assert all(not path.exists() for path in artifacts)
+    assert peer_log.read_text() == "peer state"
     readded = bridge.add_participant(repo, "codex", "codex")
     assert Path(readded["lanes"]["codex"]).exists()
+    assert event_summary(lane.parent, "codex")["events"] == 0
 
 
 def test_retire_keeps_a_branch_that_still_holds_commits(bridge, repo, paired):
@@ -1953,10 +2117,49 @@ def test_retire_keeps_a_branch_that_still_holds_commits(bridge, repo, paired):
         "-m",
         "Finished work",
     )
-    assert "kept" in bridge.retire(repo, "codex")
+    message = bridge.retire(repo, "codex")
+    assert "kept" in message
+    assert f"git branch -m {branch} KEEP_NAME" in message
     assert not lane.exists()
     assert git(repo, "rev-parse", "--verify", branch)
     assert "kept.txt" in git(repo, "show", "--name-only", branch)
+    with pytest.raises(BridgeError, match="git branch -m"):
+        bridge.add_participant(repo, "codex", "codex")
+    git(repo, "branch", "-m", branch, "kept-codex")
+    readded = bridge.add_participant(repo, "codex", "codex")
+    assert Path(readded["lanes"]["codex"]).exists()
+    assert "kept.txt" in git(repo, "show", "--name-only", "kept-codex")
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+@pytest.mark.parametrize("operation", ["show", "set", "retire", "merge"])
+def test_unregistered_commands_leave_repository_and_state_untouched(
+    bridge, repo, dirty, operation
+):
+    if dirty:
+        (repo / "shared.txt").write_text("pending work")
+    before = set(bridge.home.rglob("*"))
+    status = git(repo, "status", "--porcelain")
+    with pytest.raises(BridgeError, match="agent-parley setup"):
+        if operation == "show":
+            bridge.verification(repo)
+        elif operation == "set":
+            bridge.verification(repo, "make check")
+        elif operation == "retire":
+            bridge.retire(repo, "codex")
+        else:
+            bridge.merge(repo, "codex")
+    assert set(bridge.home.rglob("*")) == before
+    assert git(repo, "status", "--porcelain") == status
+
+
+def test_verify_show_never_writes_or_takes_setup_lock(bridge, repo, paired):
+    directory = Path(paired["lanes"]["codex"]).parent
+    manifest = directory / "project.json"
+    before = manifest.read_bytes(), manifest.stat().st_mtime_ns
+    with lock(directory / "setup.lock"):
+        assert "no verification command" in bridge.verification(repo)
+    assert (manifest.read_bytes(), manifest.stat().st_mtime_ns) == before
 
 
 def test_roster_change_alone_never_denies_a_tool_call(

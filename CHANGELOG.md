@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Wait briefly for checkpoint and issue locks without queuing session launches
+  (#101).
+- Allow a repeated Stop after branch drift, and permit exact repair when the
+  assigned branch was renamed (#102, #126).
+- Report Git inspection timeouts through the hook failure contract and retain
+  an activity update and event record (#107).
+- Distinguish retryable SQLite contention from permanent operational errors,
+  reconcile FTS5 triggers at startup, and let reads skip busy telemetry writes
+  (#103, #104).
+- Keep reservation rebuilds and their schema version in one transaction so an
+  interrupted upgrade preserves held leases (#106).
+- Remove retired participant artifacts and explain how to preserve a kept
+  branch before reusing its participant name (#109).
+- Exclude the operator and revoked participants from addressable rosters and
+  reject messages they cannot receive (#110).
+- Require registration for verification, retirement, and merge commands;
+  `verify show` reads without creating project state (#111).
+
 ## [0.2.0](https://github.com/suneel944/agent-parley/compare/v0.1.1...v0.2.0) (2026-09-11)
 
 

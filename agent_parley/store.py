@@ -90,7 +90,9 @@ END;
 
 
 @contextlib.contextmanager
-def connect(home: Path, *, write: bool = False) -> Iterator[sqlite3.Connection]:
+def connect(
+    home: Path, *, write: bool = False, timeout: float = BUSY_TIMEOUT
+) -> Iterator[sqlite3.Connection]:
     """Opens a bounded transaction and always closes its connection.
 
     A writer waits `BUSY_TIMEOUT` seconds for the holding transaction to
@@ -102,8 +104,9 @@ def connect(home: Path, *, write: bool = False) -> Iterator[sqlite3.Connection]:
     coordination call. SQLite acquires uncontended locks immediately, so the
     budget adds no fixed delay; it bounds only a wait that is already
     happening.
+    Telemetry can opt out of waiting with a zero timeout.
     """
-    db = sqlite3.connect(home / DATABASE, timeout=BUSY_TIMEOUT)
+    db = sqlite3.connect(home / DATABASE, timeout=timeout)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     try:
@@ -144,30 +147,34 @@ def initialize(home: Path) -> None:
         ) as db:
             path.chmod(0o600)
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version == SCHEMA_VERSION:
-                return
             if version > SCHEMA_VERSION:
                 raise BridgeError(
                     "Unsupported store schema; use a newer bridge."
                 )
             db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA foreign_keys=ON")
             db.executescript(SCHEMA)
-            if version == 1:
-                _add_reservation_created(db)
-            _rebuild_reservations(db)
-            _add_message_search(db)
-        with connect(home, write=True) as db:
-            legacy = home / "mail.sqlite3"
-            if version == 0 and legacy.exists():
-                _import_legacy(db, legacy)
-            if version == 1:
-                db.execute(
-                    "UPDATE file_reservations SET created_ts=CURRENT_TIMESTAMP"
-                    " WHERE created_ts IS NULL"
-                )
-            _open_threads(db)
-            _rebuild_search(db)
-            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                if version == SCHEMA_VERSION:
+                    _add_message_search(db)
+                    return
+                if version == 1:
+                    _add_reservation_created(db)
+                _rebuild_reservations(db)
+                _add_message_search(db)
+                legacy = home / "mail.sqlite3"
+                if version == 0 and legacy.exists():
+                    _import_legacy(db, legacy)
+                if version == 1:
+                    db.execute(
+                        "UPDATE file_reservations "
+                        "SET created_ts=CURRENT_TIMESTAMP "
+                        "WHERE created_ts IS NULL"
+                    )
+                _open_threads(db)
+                _rebuild_search(db)
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -182,16 +189,37 @@ def _add_reservation_created(db: sqlite3.Connection) -> None:
 def _add_message_search(db: sqlite3.Connection) -> None:
     """Creates the full-text index where the SQLite build provides FTS5.
 
-    A build without the FTS5 module rejects the virtual table, which leaves
-    the store usable and search degraded rather than the store unopenable.
+    Startup reconciles triggers even at the current schema version. Without
+    FTS5, old triggers must be removed so ordinary message writes still work.
+    When FTS5 returns, missing triggers cause an index rebuild to include mail
+    delivered by the interpreter that could not maintain it.
     """
-    with contextlib.suppress(sqlite3.OperationalError):
-        db.executescript(SEARCH_SCHEMA)
+    if not _fts_available(db):
+        db.execute("DROP TRIGGER IF EXISTS message_indexed")
+        db.execute("DROP TRIGGER IF EXISTS message_unindexed")
+        return
+    triggers = db.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='trigger' "
+        "AND name IN ('message_indexed','message_unindexed')"
+    ).fetchone()[0]
+    statement = ""
+    for line in SEARCH_SCHEMA.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            db.execute(statement)
+            statement = ""
+    if triggers != 2:
+        _rebuild_search(db)
+
+
+def _fts_available(db: sqlite3.Connection) -> bool:
+    """Reports whether this interpreter can use and maintain an FTS5 index."""
+    return any(row[0] == "fts5" for row in db.execute("PRAGMA module_list"))
 
 
 def _searchable(db: sqlite3.Connection) -> bool:
     """Reports whether this store carries a full-text index."""
-    return bool(
+    return _fts_available(db) and bool(
         db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='message_search'"
@@ -232,7 +260,7 @@ def _rebuild_reservations(db: sqlite3.Connection) -> None:
     ]
     if not required or not required[0]:
         return
-    db.executescript(
+    db.execute(
         "CREATE TABLE rebuilt_reservations ("
         " id INTEGER PRIMARY KEY,"
         " project_id INTEGER NOT NULL REFERENCES projects(id),"
@@ -240,14 +268,18 @@ def _rebuild_reservations(db: sqlite3.Connection) -> None:
         " path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL,"
         " reason TEXT DEFAULT '',"
         " created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-        " expires_ts TEXT, released_ts TEXT);"
+        " expires_ts TEXT, released_ts TEXT)"
+    )
+    db.execute(
         "INSERT INTO rebuilt_reservations (id,project_id,agent_id,"
         "path_pattern,exclusive,reason,created_ts,expires_ts,released_ts) "
         "SELECT id,project_id,agent_id,path_pattern,exclusive,reason,"
         "coalesce(created_ts,CURRENT_TIMESTAMP),expires_ts,released_ts "
-        "FROM file_reservations;"
-        "DROP TABLE file_reservations;"
-        "ALTER TABLE rebuilt_reservations RENAME TO file_reservations;"
+        "FROM file_reservations"
+    )
+    db.execute("DROP TABLE file_reservations")
+    db.execute("ALTER TABLE rebuilt_reservations RENAME TO file_reservations")
+    db.execute(
         "CREATE INDEX IF NOT EXISTS leases ON "
         "file_reservations(project_id,expires_ts) WHERE released_ts IS NULL;"
     )
@@ -459,11 +491,16 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     for recipient in recipients:
         name = _text(recipient, "recipient", 80)
         row = db.execute(
-            "SELECT id FROM agents WHERE project_id=? AND name=?",
+            "SELECT id,token_digest FROM agents WHERE project_id=? AND name=?",
             (actor["project_id"], name),
         ).fetchone()
         if not row:
             raise BridgeError("Recipient is not registered in your project.")
+        if row["token_digest"] is None:
+            raise BridgeError(
+                f"Recipient {name!r} cannot receive mail: "
+                "operator or retired participant has no active credential."
+            )
         ids.append(row[0])
     existing = db.execute(
         "SELECT * FROM messages WHERE sender_id=? AND dedup_key=?",
@@ -506,7 +543,8 @@ def _roster(db: sqlite3.Connection, actor: dict) -> dict:
     """Lists this project's participants so peers stay addressable."""
     rows = db.execute(
         "SELECT name,substr(task_description,1,160) AS task_description,"
-        "last_active_ts FROM agents WHERE project_id=? ORDER BY name LIMIT ?",
+        "last_active_ts FROM agents WHERE project_id=? "
+        "AND token_digest IS NOT NULL ORDER BY name LIMIT ?",
         (actor["project_id"], MAX_ROSTER),
     ).fetchall()
     return {"you": actor["name"], "participants": [dict(row) for row in rows]}
@@ -690,8 +728,7 @@ def _search(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     )
     rows = None
     if _searchable(db):
-        with contextlib.suppress(sqlite3.OperationalError):
-            rows = _indexed_matches(db, actor, query, limit)
+        rows = _indexed_matches(db, actor, query, limit)
     indexed = rows is not None
     if rows is None:
         rows = _substring_matches(db, actor, query, limit)
@@ -863,13 +900,12 @@ def _observe(
 ) -> None:
     """Records an event that cannot share the served call's transaction.
 
-    A rejected call rolls its transaction back, and a read-only call holds no
-    write lock, so both are recorded afterwards in their own short
-    transaction. Telemetry never decides an outcome: a store that is busy or
-    unavailable loses the record rather than the call.
+    Rejected calls and read-only results attempt a separate write transaction
+    for telemetry and retention. This acquisition never waits for a writer;
+    a busy or unavailable store loses the record rather than delaying the call.
     """
     with contextlib.suppress(sqlite3.Error):
-        with connect(home, write=True) as db:
+        with connect(home, write=True, timeout=0) as db:
             _event(db, actor, tool, outcome, started, result_bytes)
 
 
@@ -894,7 +930,7 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
     started = time.monotonic()
     try:
         result = _dispatch(home, actor, tool, args, started)
-    except BridgeError:
+    except (BridgeError, sqlite3.OperationalError):
         _observe(home, actor, tool, "error", started, 0)
         raise
     if tool in READ_ONLY:
@@ -999,7 +1035,8 @@ def read_thread(
     """Reads one thread's mail as a registered participant.
 
     Operator reads are not served MCP calls, so they hold no write lock and
-    record no tool event.
+    record no tool event. Served MCP reads separately attempt a nonwaiting
+    telemetry write after reading the mail.
 
     Args:
         home: Private bridge state root.
