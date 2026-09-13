@@ -84,7 +84,7 @@ def change(
         blocker = parse_issue(on or "", "Blocker")
         if blocker == issue:
             raise BridgeError("An issue cannot wait on itself.")
-    with lock(directory / "issues.lock"):
+    with lock(directory / "issues.lock", timeout=1):
         state = snapshot(directory)
         record = state["issues"].get(issue)
         if action == "claim":

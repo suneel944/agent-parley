@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -41,12 +42,13 @@ def write_json(path: Path, value: dict) -> None:
 
 
 @contextlib.contextmanager
-def lock(path: Path, busy: str = "") -> Iterator[None]:
-    """Holds an exclusive nonblocking lock for the context lifetime.
+def lock(path: Path, busy: str = "", *, timeout: float = 0) -> Iterator[None]:
+    """Holds an exclusive lock with an optional bounded acquisition wait.
 
     Args:
         path: Lock file in an existing private directory.
         busy: Message replacing the generic contention text.
+        timeout: Seconds to wait for short operations; sessions never wait.
 
     Yields:
         None while the caller holds the operation lock.
@@ -55,14 +57,21 @@ def lock(path: Path, busy: str = "") -> Iterator[None]:
         BridgeError: If another process holds the lock.
     """
     with path.open("a") as stream:
-        try:
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise BridgeError(
-                busy
-                or f"Another bridge operation/session owns {path.name}; "
-                "retry later."
-            ) from None
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BridgeError(
+                        busy
+                        or "Another bridge operation/session owns "
+                        f"{path.name}; "
+                        "retry later."
+                    ) from None
+                time.sleep(min(0.01, remaining))
         try:
             yield
         finally:

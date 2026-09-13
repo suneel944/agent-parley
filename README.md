@@ -205,6 +205,9 @@ recorded dependency informs, it does not gate.
 an assigned lane, catch drift after any bypass, and deliver short updates only
 when coordination state actually changes. Each notice is capped at 1,536 UTF-8
 bytes; an unchanged checkpoint adds no context at all.
+If a rename removed the assigned branch, the hook names the exact repair.
+Branch drift blocks completion once; a Stop retry can end the session while
+status continues to show the drift.
 
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">

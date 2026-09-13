@@ -5,6 +5,8 @@ import contextlib
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agent_parley import store
+from agent_parley import server, store
 from agent_parley.checkpoints import MAX_CONTEXT_BYTES, checkpoint, mailbox
 from agent_parley.issues import describe
 from agent_parley.server import MAX_REQUEST_BYTES, TOOLS
@@ -252,7 +254,10 @@ def test_the_conflict_listing_separates_live_holders_from_stale_ones(
     } == {"GreenCastle": False, "RedRiver": True}
 
 
-def test_schema_upgrade_makes_a_lease_time_to_live_optional(bridge, actors):
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_schema_upgrade_makes_a_lease_time_to_live_optional(
+    bridge, actors, interrupted
+):
     store.call(
         bridge.home,
         actors[0],
@@ -280,6 +285,46 @@ def test_schema_upgrade_makes_a_lease_time_to_live_optional(bridge, actors):
         )
         db.execute("DROP TABLE retired_leases")
         db.execute("PRAGMA user_version=2")
+    if interrupted:
+        crash = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import os
+import sqlite3
+import sys
+from pathlib import Path
+from agent_parley import store
+
+original = sqlite3.connect
+class Interrupted(sqlite3.Connection):
+    def execute(self, sql, *args):
+        if sql.startswith('ALTER TABLE rebuilt_reservations'):
+            os._exit(77)
+        return super().execute(sql, *args)
+
+store.sqlite3.connect = lambda *a, **kw: original(
+    *a, **kw, factory=Interrupted
+)
+store.initialize(Path(sys.argv[1]))
+""",
+                str(bridge.home),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert crash.returncode == 77, crash.stderr
+        with store.connect(bridge.home) as db:
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert db.execute(
+                "SELECT path_pattern,expires_ts FROM file_reservations"
+            ).fetchone()[:] == ("src/a", deadline)
+            assert not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='rebuilt_reservations'"
+            ).fetchone()
     store.initialize(bridge.home)
     store.call(
         bridge.home, actors[1], "file_reservation_paths", {"paths": ["docs/b"]}
@@ -694,9 +739,7 @@ def test_search_degrades_to_substring_where_sqlite_lacks_fts5(
 ):
     home = tmp_path / "without-fts5"
     home.mkdir(parents=True)
-    monkeypatch.setattr(
-        store, "SEARCH_SCHEMA", store.SEARCH_SCHEMA.replace("fts5", "fts5x")
-    )
+    monkeypatch.setattr(store, "_fts_available", lambda db: False)
     store.initialize(home)
     identities = [
         store.authenticate(
@@ -847,6 +890,129 @@ def test_locked_store_fails_within_a_bounded_deadline(bridge, actors):
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             store.call(bridge.home, actors[0], "send_message", message())
         assert time.monotonic() - started < store.BUSY_TIMEOUT + 1
+
+
+def test_mcp_reads_return_while_a_writer_holds_the_store(bridge, actors):
+    sent = store.call(bridge.home, actors[0], "send_message", message())
+    reads = [
+        ("fetch_inbox", {}),
+        ("list_participants", {}),
+        ("read_thread", {"thread_id": sent["thread_id"]}),
+        ("search_messages", {"query": "Contract"}),
+    ]
+    with store.connect(bridge.home, write=True) as db:
+        for tool, args in reads:
+            started = time.monotonic()
+            result = store.call(bridge.home, actors[1], tool, args)
+            assert time.monotonic() - started < 0.5
+            assert result
+        assert db.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+
+
+def test_roster_and_delivery_exclude_uncredentialed_recipients(bridge, actors):
+    store.speak(bridge.home, "/project", "BlueLake", "Steer", "Work", "s1")
+    store.revoke(bridge.home, "/project", "BlueLake")
+    for index in range(31):
+        store.register(bridge.home, "/project", f"lane-{index:02}")
+    roster = store.call(bridge.home, actors[0], "list_participants", {})
+    names = {row["name"] for row in roster["participants"]}
+    assert len(names) == 32
+    assert "lane-30" in names
+    assert "operator" not in names
+    assert "BlueLake" not in names
+    for name in ("operator", "BlueLake"):
+        with pytest.raises(BridgeError, match="no active credential"):
+            store.call(
+                bridge.home, actors[0], "send_message", message(to=[name])
+            )
+    with store.connect(bridge.home) as db:
+        assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+    store.register(bridge.home, "/project", "BlueLake")
+    assert store.call(bridge.home, actors[0], "send_message", message())["id"]
+
+
+def test_startup_disables_old_fts_triggers_and_restores_the_index(
+    bridge, actors, monkeypatch
+):
+    store.call(bridge.home, actors[0], "send_message", message())
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_fts_available", lambda db: False)
+        store.initialize(bridge.home)
+        with store.connect(bridge.home) as db:
+            assert not db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger'"
+            ).fetchone()
+        sent = store.call(
+            bridge.home,
+            actors[0],
+            "send_message",
+            message(subject="Offline indexing", idempotency_key="offline"),
+        )
+        result = store.call(
+            bridge.home, actors[1], "search_messages", {"query": "Offline"}
+        )
+        assert result["index"] == "substring"
+    store.initialize(bridge.home)
+    result = store.call(
+        bridge.home, actors[1], "search_messages", {"query": "Offline"}
+    )
+    assert result["index"] == "fts5"
+    assert [item["id"] for item in result["messages"]] == [sent["id"]]
+
+
+@pytest.mark.parametrize(
+    "code,detail,retryable",
+    [
+        (sqlite3.SQLITE_BUSY, "database is locked", True),
+        (sqlite3.SQLITE_LOCKED, "database table is locked", True),
+        (sqlite3.SQLITE_BUSY_SNAPSHOT, "snapshot is busy", True),
+        (sqlite3.SQLITE_ERROR, "no such table: messages", False),
+        (
+            sqlite3.SQLITE_READONLY,
+            "attempt to write a readonly database",
+            False,
+        ),
+        (sqlite3.SQLITE_IOERR, "disk I/O error", False),
+    ],
+)
+def test_transport_classifies_and_records_operational_errors(
+    bridge, actors, monkeypatch, code, detail, retryable
+):
+    def fail(*args):
+        error = sqlite3.OperationalError(detail)
+        error.sqlite_errorcode = code
+        raise error
+
+    monkeypatch.setattr(store, "_serve", fail)
+    identity = store.register(bridge.home, "/project", "reader")
+    with server.Server(bridge.home, {"token": "health", "port": 0}) as service:
+        thread = threading.Thread(target=service.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = httpx.post(
+                f"http://127.0.0.1:{service.server_port}/mcp/",
+                headers={
+                    "Authorization": f"Bearer {identity['registration_token']}"
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "fetch_inbox", "arguments": {}},
+                },
+                trust_env=False,
+            )
+        finally:
+            service.shutdown()
+            thread.join(timeout=2)
+    result = response.json()["result"]
+    assert result["isError"]
+    text = result["content"][0]["text"]
+    assert ("retry later" in text) is retryable
+    if not retryable:
+        assert text == f"Store error: {detail}"
+    with store.connect(bridge.home) as db:
+        assert db.execute("SELECT outcome FROM events").fetchone()[0] == "error"
 
 
 def test_writer_waits_for_a_short_lived_competing_transaction(
