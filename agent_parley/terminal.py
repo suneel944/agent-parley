@@ -2,6 +2,7 @@
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -13,6 +14,14 @@ import tty
 from pathlib import Path
 
 PROMPT = "Review pending coordination messages and handoff reminders."
+
+
+def socket_path(directory: Path, name: str) -> Path:
+    """Keeps control socket names short while retaining private state scope."""
+    if directory.parent.name == "projects":
+        digest = hashlib.sha256(str(directory / name).encode()).hexdigest()[:20]
+        return directory.parent.parent / f"wake-{digest}.sock"
+    return directory / f"{name}-wake.sock"
 
 
 def request(directory: Path, name: str) -> str:
@@ -28,7 +37,7 @@ def request(directory: Path, name: str) -> str:
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(1)
         try:
-            client.connect(str(directory / f"{name}-wake.sock"))
+            client.connect(str(socket_path(directory, name)))
             client.sendall(b"wake\n")
             return client.recv(32).decode()
         except OSError:
@@ -61,7 +70,7 @@ def run(
         Native process exit status.
     """
     saved = termios.tcgetattr(0) if attached else None
-    path = lane.parent / f"{name}-wake.sock"
+    path = socket_path(lane.parent, name)
     activity = lane.parent / f"{name}-activity.json"
     with socket.socket(socket.AF_UNIX) as listener:
         path.unlink(missing_ok=True)

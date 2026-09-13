@@ -13,6 +13,16 @@ from agent_parley import terminal
 from agent_parley.state import write_json
 
 
+def test_control_socket_names_fit_valid_long_participants():
+    directory = Path(
+        "/home/operator/.local/state/agent-parley/projects/0123456789abcdef"
+    )
+    path = terminal.socket_path(directory, "a" * 39)
+    assert path.parent == directory.parent.parent
+    assert len(str(path).encode()) < 104
+    assert path != terminal.socket_path(directory, "b" * 39)
+
+
 @pytest.mark.parametrize(
     "activity,expected",
     [("idle", "accepted"), ("waiting for approval", "busy")],
