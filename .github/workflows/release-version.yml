@@ -51,9 +51,9 @@ jobs:
         run: |
           set -euo pipefail
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
-          git -c user.name='agent-parley release' \
-            -c user.email='release@users.noreply.github.com' \
-            commit --all --message "chore(main): release ${VERSION}"
+          git config --local user.name 'agent-parley release'
+          git config --local user.email 'release@users.noreply.github.com'
+          git commit --all --message "chore(main): release ${VERSION}"
           git tag --annotate "v${VERSION}" --message "Release v${VERSION}"
           git push "${remote}" HEAD:main
           git push "${remote}" "v${VERSION}"
