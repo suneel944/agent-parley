@@ -89,7 +89,8 @@ retained hook evidence. Neither view independently proves a reported result.
 
 `agent-parley say NAME TEXT --ack` sends from the CLI-only `operator` identity.
 It is an operator action, not a way for a lane to impersonate a supervisor.
-The participant reads it at a checkpoint; sending does not wake an idle CLI.
+The participant reads it at a checkpoint. The runtime can wake eligible idle
+lanes for pending mail; status reports attempts and manual-attention outcomes.
 
 When integration is authorized, inspect `agent-parley verify show` and
 `agent-parley participant merge NAME --preview`. `verify set COMMAND` configures
@@ -97,8 +98,10 @@ the repository's gate. `participant merge NAME` runs it in the base checkout
 and merges only after it passes; verify the merged result separately.
 `participant pr NAME` pushes the branch and opens or locates a PR using the
 lane's report and claimed issues. It uses native `gh` authentication, mirrors
-issue labels and milestones, and currently requires a recognized change-type
-label. Neither an issue claim nor a ready report grants integration authority.
+issue metadata under the configured project policy, and includes independently
+recorded gate and enforcement evidence. Neither a claim nor a ready report grants
+integration authority. A handoff reminder asks for an explicit completion message;
+it never transfers ownership or acknowledges mail.
 
 Use the caller's existing shell tooling conventions, including RTK where required.
 Installing this plugin does not authorize extra tasks, change native permissions,

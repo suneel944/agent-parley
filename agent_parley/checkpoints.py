@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import fcntl
 import json
 import re
 import shlex
@@ -9,10 +10,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 
-from agent_parley import process, roster
+from agent_parley import gemini, process, roster
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 from agent_parley.store import DATABASE
@@ -62,6 +64,7 @@ class Reason(StrEnum):
     COORDINATION_PENDING = "coordination_pending"
     COORDINATION_UNAVAILABLE = "coordination_unavailable"
     CHECKPOINT_FAILED = "checkpoint_failed"
+    WAKE_REQUESTED = "wake_requested"
 
 
 def decision_of(output: dict | None) -> str:
@@ -139,10 +142,43 @@ def record(
     }
     path = directory / f"{agent}-events.jsonl"
     with contextlib.suppress(OSError):
-        if path.exists() and path.stat().st_size >= MAX_EVENT_LOG_BYTES:
-            path.replace(directory / f"{agent}-events.1.jsonl")
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(entry) + "\n")
+        size = 0
+        with contextlib.suppress(FileNotFoundError):
+            size = path.stat().st_size
+        if size >= MAX_EVENT_LOG_BYTES:
+            with event_lock(directory, agent, exclusive=True):
+                if path.exists() and path.stat().st_size >= MAX_EVENT_LOG_BYTES:
+                    path.replace(directory / f"{agent}-events.1.jsonl")
+        with event_lock(directory, agent):
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry) + "\n")
+
+
+@contextlib.contextmanager
+def event_lock(
+    directory: Path, agent: str, *, exclusive: bool = False
+) -> Iterator[None]:
+    """Protects event-file lifetimes separately from coordination mutations.
+
+    Append writers share the lock and do not serialize one another. Rotation
+    and pruning need exclusive access: locking only maintenance would still
+    let a writer append to an inode that pruning has already replaced. The
+    lock file is never removed, and process exit releases its kernel lock.
+
+    Args:
+        directory: Private project state directory.
+        agent: Participant whose event files are protected.
+        exclusive: Whether to exclude readers and append writers.
+
+    Yields:
+        None while event paths cannot be replaced by another process.
+    """
+    with (directory / f"{agent}-events.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 def read_events(directory: Path, agent: str, since: float = 0.0) -> list[dict]:
@@ -175,7 +211,11 @@ def read_events(directory: Path, agent: str, since: float = 0.0) -> list[dict]:
                 continue
             if not isinstance(entry, dict):
                 continue
-            if float(entry.get("ts", 0) or 0) < since:
+            try:
+                timestamp = float(entry.get("ts", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if timestamp < since:
                 continue
             entries.append(entry)
     return entries
@@ -201,31 +241,38 @@ def prune(directory: Path, agent: str, now: float = 0.0) -> int:
     """
     floor = (now or time.time()) - MAX_EVENT_LOG_AGE
     discarded = 0
-    for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
-        path = directory / name
-        with contextlib.suppress(OSError):
-            if not path.exists():
-                continue
-            kept = []
-            dropped = 0
-            for line in path.read_text(errors="ignore").splitlines():
+    with contextlib.suppress(OSError):
+        with event_lock(directory, agent, exclusive=True):
+            for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
+                path = directory / name
+                temporary = path.with_name(f"{path.name}.tmp")
+                temporary.unlink(missing_ok=True)
+                if not path.exists():
+                    continue
+                kept = []
+                dropped = 0
+                for line in path.read_text(errors="ignore").splitlines():
+                    try:
+                        entry = json.loads(line)
+                        if not isinstance(entry, dict):
+                            raise ValueError("Expected an event object.")
+                        expired = float(entry.get("ts", 0) or 0) < floor
+                    except (ValueError, TypeError):
+                        expired = True
+                    if expired:
+                        dropped += 1
+                    else:
+                        kept.append(line)
+                if not dropped:
+                    continue
                 try:
-                    entry = json.loads(line)
-                except ValueError:
-                    dropped += 1
-                    continue
-                if float(entry.get("ts", 0) or 0) < floor:
-                    dropped += 1
-                    continue
-                kept.append(line)
-            if not dropped:
-                continue
-            temporary = path.with_name(f"{path.name}.tmp")
-            temporary.write_text(
-                "".join(f"{line}\n" for line in kept), encoding="utf-8"
-            )
-            temporary.replace(path)
-            discarded += dropped
+                    temporary.write_text(
+                        "".join(f"{line}\n" for line in kept), encoding="utf-8"
+                    )
+                    temporary.replace(path)
+                    discarded += dropped
+                finally:
+                    temporary.unlink(missing_ok=True)
     return discarded
 
 
@@ -652,6 +699,14 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "WHERE agent_id=? AND read_ts IS NULL",
             (agent["id"],),
         ).fetchone()[0]
+        outstanding = db.execute(
+            "SELECT m.id,a.name AS sender, "
+            "max(0,unixepoch('now')-unixepoch(m.created_ts)) AS age_seconds "
+            "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
+            "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? "
+            "AND m.ack_required=1 AND r.ack_ts IS NULL ORDER BY m.id LIMIT 32",
+            (agent["id"],),
+        ).fetchall()
         leases = db.execute(
             "SELECT count(*) AS held,coalesce(sum(expires_ts IS NOT NULL "
             "AND expires_ts<=datetime('now')),0) AS stale "
@@ -661,6 +716,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         return {
             "messages": [dict(row) for row in messages],
             "pending_ack": pending,
+            "outstanding_ack": [dict(row) for row in outstanding],
             "unread": unread,
             "reservations": leases["held"],
             "stale_reservations": leases["stale"],
@@ -795,8 +851,15 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             "reported task, and last coordination time."
                         )
                     if issue_notice:
+                        reminders = [
+                            item["handoff_prompt"]["text"]
+                            for item in issues["issues"].values()
+                            if item.get("handoff_prompt", {}).get("holder")
+                            == agent
+                            and not item["handoff_prompt"].get("responded_at")
+                        ]
                         parts.append(
-                            clip(describe(issues), 400)
+                            clip("\n".join(reminders) or describe(issues), 400)
                             + "\nRun agent-parley issue list for full state. "
                             "Pause offered work until resolved. "
                             "Silence never transfers ownership."
@@ -900,15 +963,23 @@ def main() -> int:
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--participant", "--agent", required=True)
+    parser.add_argument(
+        "--adapter", choices=("native", "gemini"), default="native"
+    )
     args = parser.parse_args()
     payload = {}
     try:
         payload = json.loads(sys.stdin.read(1_000_001))
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object")
+        if args.adapter == "gemini":
+            payload = gemini.payload(payload)
+        output = checkpoint(
+            args.home, args.directory, args.participant, payload
+        )
         print(
             json.dumps(
-                checkpoint(args.home, args.directory, args.participant, payload)
+                gemini.response(output) if args.adapter == "gemini" else output
             )
         )
         return 0

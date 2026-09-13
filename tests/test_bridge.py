@@ -1886,29 +1886,30 @@ def test_every_shipped_preset_rides_one_of_the_native_contracts():
     """Keeps presets on a CLI that accepts the configuration we emit."""
     for name, entry in roster.PRESETS.items():
         assert entry["adapter"] in roster.ADAPTERS, name
-        assert entry["command"] in ("claude", "codex", "copilot"), name
+        assert entry["command"] in ("claude", "codex", "copilot", "gemini"), (
+            name
+        )
 
 
-def test_gemini_preset_runs_the_codex_contract_against_a_vendor_endpoint(
+def test_gemini_preset_runs_native_cli_with_private_settings(
     bridge, repo, monkeypatch, tmp_path
 ):
-    """Drives Gemini models through the codex CLI, never the Gemini CLI."""
+    """Keeps native authentication and stores hook settings outside source."""
     entry = roster.provider(bridge.home, "gemini")
-    assert entry["adapter"] == "codex"
-    assert entry["command"] == "codex"
+    assert entry["adapter"] == "gemini"
+    assert entry["command"] == "gemini"
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(BridgeError, match="Export these"):
-        roster.launch_environment(bridge.home, entry, None)
+    assert roster.launch_environment(bridge.home, entry, None) == {}
     binary = tmp_path / "bin"
     binary.mkdir()
-    executable = binary / "codex"
+    executable = binary / "gemini"
     executable.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         "with open(os.environ['CAPTURE'], 'w') as f:\n"
         " json.dump({'argv': sys.argv[1:],\n"
-        "  'base_url': os.environ.get('OPENAI_BASE_URL', '')}, f)\n"
+        "  'settings': os.environ['GEMINI_CLI_SYSTEM_SETTINGS_PATH']}, f)\n"
     )
     executable.chmod(0o755)
     capture = tmp_path / "capture.json"
@@ -1924,13 +1925,15 @@ def test_gemini_preset_runs_the_codex_contract_against_a_vendor_endpoint(
     monkeypatch.setattr(bridge, "identity", fake_identity)
     assert bridge.launch("gemini", repo, "Work on issue 74", "gemini") == 0
     result = json.loads(capture.read_text())
-    assert result["base_url"] == "https://vendor.example/openai"
+    assert result["argv"][0] == "--prompt-interactive"
+    config = Path(result["settings"])
+    assert config.is_relative_to(bridge.home)
+    settings = json.loads(config.read_text())
+    assert settings["mcpServers"]["agent_parley"]["httpUrl"].endswith("/mcp/")
     assert (
-        'mcp_servers.agent_parley.bearer_token_env_var="AGENT_PARLEY_TOKEN"'
-        in result["argv"]
+        "--adapter gemini"
+        in settings["hooks"]["BeforeTool"][0]["hooks"][0]["command"]
     )
-    overrides = [arg for arg in result["argv"] if arg.startswith("hooks.")]
-    assert "PreToolUse" in tomllib.loads("\n".join(overrides))["hooks"]
     assert entry["env"] == {}
     assert "exported-by-the-user" not in json.dumps(result)
 
@@ -2708,6 +2711,10 @@ def test_pull_request_takes_its_classification_from_the_claimed_issue(
     bridge.issue(lane, "claim", "42")
 
     issue.write_text(json.dumps({"labels": [], "milestone": None}))
+    directory = lane.parent
+    manifest = roster.read(directory)
+    manifest["pull_request"] = {"require_label": True}
+    write_json(directory / "project.json", manifest)
     with pytest.raises(BridgeError, match="change-type label"):
         bridge.pull_request(repo, "codex")
     assert git(repo, "branch", "--remotes") == ""

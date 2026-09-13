@@ -74,6 +74,9 @@ CREATE TABLE IF NOT EXISTS events (
  result_bytes INTEGER NOT NULL,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS history ON events(project_id,id);
+CREATE TABLE IF NOT EXISTS participant_presence (
+ agent_id INTEGER PRIMARY KEY REFERENCES agents(id), state TEXT NOT NULL,
+ process_alive INTEGER NOT NULL, observed_ts REAL NOT NULL, last_active REAL);
 """
 SEARCH_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
@@ -981,7 +984,35 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
             started,
             len(json.dumps(result, ensure_ascii=False).encode()),
         )
+    if tool == "send_message" and args.get("ack_required"):
+        with contextlib.suppress(sqlite3.Error):
+            _recipient_warnings(home, actor, args, result)
     return result
+
+
+def _recipient_warnings(
+    home: Path, actor: dict, args: dict, result: dict
+) -> None:
+    """Adds observed availability without failing an already committed send."""
+    with connect(home) as db:
+        warnings = []
+        for name in args["to"]:
+            row = db.execute(
+                "SELECT s.state,s.observed_ts FROM agents a LEFT JOIN "
+                "participant_presence s ON s.agent_id=a.id "
+                "WHERE a.project_id=? AND a.name=?",
+                (actor["project_id"], name),
+            ).fetchone()
+            if row and row["state"] == "unreachable":
+                warnings.append(
+                    {
+                        "recipient": name,
+                        "state": "unreachable",
+                        "observed_ts": row["observed_ts"],
+                    }
+                )
+        if warnings:
+            result["recipient_warnings"] = warnings
 
 
 def _dispatch(
@@ -995,7 +1026,7 @@ def _dispatch(
                 db,
                 actor,
                 tool,
-                "ok",
+                "conflict" if result.get("conflicts") else "ok",
                 started,
                 len(json.dumps(result, ensure_ascii=False).encode()),
             )

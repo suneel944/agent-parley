@@ -11,6 +11,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import string
 import subprocess
 import sys
 import time
@@ -19,7 +20,17 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
-from agent_parley import dashboard, forge, process, roster, store
+from agent_parley import (
+    dashboard,
+    evidence,
+    forge,
+    gemini,
+    process,
+    roster,
+    store,
+    supervision,
+    terminal,
+)
 from agent_parley.checkpoints import (
     EVENTS,
     activity,
@@ -532,7 +543,9 @@ def gh(cwd: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
+def hygiene_metadata(
+    cwd: Path, issues: list[str], policy: dict | None = None
+) -> tuple[list[str], str]:
     """Reads the ownership metadata the claimed issues already carry.
 
     The repository requires every pull request to declare a change type and
@@ -544,6 +557,7 @@ def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
     Args:
         cwd: Checkout the GitHub CLI runs in, which selects the repository.
         issues: Repository issue numbers the lane claims.
+        policy: Validated project metadata settings.
 
     Returns:
         The change-type labels the issues carry, and the single milestone
@@ -555,6 +569,8 @@ def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
             cannot read an issue.
         subprocess.TimeoutExpired: If gh exceeds the command timeout.
     """
+    policy = roster.pull_request_policy(policy or {})
+    change_types = set(policy.get("change_type_labels", CHANGE_TYPE))
     labels: set[str] = set()
     milestones: set[str] = set()
     for number in issues:
@@ -563,17 +579,21 @@ def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
         )
         labels |= {
             label["name"] for label in record.get("labels") or []
-        } & CHANGE_TYPE
-        if milestone := record.get("milestone"):
+        } & change_types
+        if (milestone := record.get("milestone")) and policy.get(
+            "milestone", "match"
+        ) != "ignore":
             milestones.add(milestone["title"])
-    if not labels:
+        elif policy.get("milestone") == "required":
+            raise BridgeError(f"Claimed issue #{number} requires a milestone.")
+    if not labels and policy.get("require_label", False):
         raise BridgeError(
             "No claimed issue carries a change-type label, and the pull "
             "request takes its classification from the issue rather than "
             "choosing one. Label "
             + ", ".join(f"#{number}" for number in issues)
             + " with one of: "
-            + ", ".join(sorted(CHANGE_TYPE))
+            + ", ".join(sorted(change_types))
             + "."
         )
     if len(milestones) > 1:
@@ -586,7 +606,9 @@ def hygiene_metadata(cwd: Path, issues: list[str]) -> tuple[list[str], str]:
     return sorted(labels), milestones.pop() if milestones else ""
 
 
-def pull_request_body(state: dict, issues: list[str]) -> str:
+def pull_request_body(
+    state: dict, issues: list[str], template: str = ""
+) -> str:
     """Shapes one lane's recorded report into the repository template.
 
     The body reproduces what the participant reported and invents nothing
@@ -598,6 +620,8 @@ def pull_request_body(state: dict, issues: list[str]) -> str:
     Args:
         state: Recorded lane activity holding the reported outcome.
         issues: Repository issue numbers the lane claims.
+        template: Optional project or repository Markdown template. Supports
+            dollar placeholders for summary, evidence, remaining and issues.
 
     Returns:
         Markdown for the pull-request body.
@@ -611,7 +635,7 @@ def pull_request_body(state: dict, issues: list[str]) -> str:
         state.get("remaining", "").strip()
         or "The lane recorded no remaining work."
     )
-    return (
+    report = (
         "## Problem and result\n\n"
         f"{state['summary'].strip()}\n\n"
         f"Reported state: {state.get('outcome', 'unknown')}. A reported "
@@ -623,6 +647,16 @@ def pull_request_body(state: dict, issues: list[str]) -> str:
         "## Compatibility and risks\n\n"
         f"{remaining}\n"
     )
+    if not template:
+        return report
+    rendered = string.Template(template).safe_substitute(
+        summary=state["summary"].strip(),
+        evidence=evidence,
+        remaining=remaining,
+        issues=references,
+        outcome=state.get("outcome", "unknown"),
+    )
+    return rendered.rstrip() + "\n\n" + report
 
 
 def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
@@ -1248,6 +1282,23 @@ class Bridge:
         )
 
     def pull_request(self, repo: Path, name: str) -> str:
+        """Opens a verified pull request while excluding a live lane launch.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose committed work is reviewed.
+
+        Returns:
+            The pushed branch and opened or existing pull request.
+
+        Raises:
+            BridgeError: If the lane is active or integration is refused.
+        """
+        directory, _, _ = self._lane(repo, name)
+        with lock(directory / f"{name}.session.lock"):
+            return self._pull_request(repo, name)
+
+    def _pull_request(self, repo: Path, name: str) -> str:
         """Pushes one lane's branch and opens its pull request.
 
         The pull request carries the lane's recorded report, so the summary,
@@ -1315,7 +1366,24 @@ class Bridge:
                 "issue reference. Run `agent-parley issue claim NUMBER` in "
                 "the lane first."
             )
-        labels, milestone = hygiene_metadata(root, claimed)
+        policy = data.get("pull_request", {})
+        labels, milestone = hygiene_metadata(root, claimed, policy)
+        template = policy.get("body_template", "")
+        if not template:
+            for relative in (
+                ".github/PULL_REQUEST_TEMPLATE.md",
+                ".github/pull_request_template.md",
+                "docs/pull_request_template.md",
+                "pull_request_template.md",
+            ):
+                candidate = root / relative
+                if candidate.is_file():
+                    if candidate.stat().st_size > 20000:
+                        raise BridgeError(
+                            "Pull request template exceeds 20000 bytes."
+                        )
+                    template = candidate.read_text(encoding="utf-8")
+                    break
         base = current_branch(root)
         if base in ("<detached HEAD>", branch):
             raise BridgeError(
@@ -1323,6 +1391,24 @@ class Bridge:
                 "receive this pull request. Switch it to the branch the "
                 "pull request should target, then rerun."
             )
+        lane = Path(participant["lane"])
+        head = git(root, "rev-parse", branch)
+        if current_branch(lane) != branch:
+            raise BridgeError("Lane branch drifted; restore it before review.")
+        measured = evidence.collect(self.home, directory, data, name, head)
+        if command := data.get("verify"):
+            verify_base(lane, command)
+            measured["gate"] = {
+                "command": shlex.join(command),
+                "exit_status": 0,
+            }
+        if git(root, "rev-parse", branch) != head or git(
+            lane, "status", "--porcelain"
+        ):
+            raise BridgeError(
+                "Lane changed during verification; review and retry."
+            )
+        recorded = evidence.publish(directory, measured)
         git(root, "push", "--set-upstream", "origin", branch)
         listed = json.loads(
             gh(
@@ -1360,7 +1446,7 @@ class Bridge:
             "--title",
             title,
             "--body",
-            pull_request_body(state, claimed),
+            pull_request_body(state, claimed, template) + "\n" + recorded,
             "--assignee",
             "@me",
         ]
@@ -1807,6 +1893,17 @@ review, not merged or independently verified. An idle turn is not completion.
                     f"{participant_liveness(path.parent, agent)}\n"
                     f"    Provider: {participant['provider']}; {account}"
                 )
+                observed = supervision.presence(
+                    path.parent,
+                    agent,
+                    supervision.configuration(self.home, data)[
+                        "inactive_after"
+                    ],
+                )
+                print(
+                    f"    Availability: {observed['state']}; "
+                    f"session process alive: {observed['process_alive']}"
+                )
                 branch = lane_branch(Path(participant["lane"]))
                 if branch != participant["branch"]:
                     print(f"    {drift(agent, participant, branch)}")
@@ -1826,6 +1923,14 @@ review, not merged or independently verified. An idle turn is not completion.
                     print(f"    Remaining: {state['remaining']}")
                 if state.get("evidence"):
                     print(f"    Reported verification: {state['evidence']}")
+                wake_path = path.parent / f"{agent}-wake.json"
+                if wake_path.exists():
+                    wake_record = json.loads(wake_path.read_text())
+                    print(
+                        f"    Runtime wake: {wake_record['result']}; "
+                        f"attempt {wake_record['attempts']}; "
+                        f"{int(time.time() - wake_record['at'])}s ago"
+                    )
                 try:
                     mail = mailbox(
                         self.home, data["root"], name, state.get("cursor", 0)
@@ -1841,6 +1946,13 @@ review, not merged or independently verified. An idle turn is not completion.
                         "    Last coordination: "
                         f"{mail['last_coordination']} UTC"
                     )
+                    for pending in mail.get("outstanding_ack", []):
+                        print(
+                            "    Awaiting acknowledgement: "
+                            f"message {pending['id']} "
+                            f"from {pending['sender']}; "
+                            f"{pending['age_seconds']}s"
+                        )
                     task = (
                         state.get("last_prompt")
                         or mail["reported_task"]
@@ -1863,6 +1975,8 @@ review, not merged or independently verified. An idle turn is not completion.
         task: str,
         provider: str | None = None,
         credential: str | None = None,
+        *,
+        resume: bool = False,
     ) -> int:
         """Runs one participant's native CLI in its persistent lane.
 
@@ -1872,6 +1986,7 @@ review, not merged or independently verified. An idle turn is not completion.
             task: User task passed as an argument without shell expansion.
             provider: Provider definition driving this participant.
             credential: Credential profile selecting one account.
+            resume: Resume this lane's recorded native session interactively.
 
         Returns:
             The native process exit code.
@@ -1932,6 +2047,21 @@ review, not merged or independently verified. An idle turn is not completion.
                     json.dumps({"hooks": hooks}),
                     "--",
                     task,
+                ]
+            elif entry["adapter"] == "gemini":
+                env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(
+                    gemini.configure(
+                        lane.parent,
+                        agent,
+                        self.url + "/mcp/",
+                        hooks,
+                        env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH"),
+                    )
+                )
+                command = [
+                    executable,
+                    "--prompt-interactive",
+                    prompt + "\nUser task:\n" + task,
                 ]
             elif entry["adapter"] == "copilot":
                 config_home = account.get(entry.get("home_env", ""))
@@ -2004,8 +2134,19 @@ review, not merged or independently verified. An idle turn is not completion.
                 if activity_path.exists()
                 else {}
             )
+            if resume:
+                session = previous.get("session_id", "")
+                if not session or session.startswith("-") or len(session) > 128:
+                    raise BridgeError(
+                        "No usable native session to resume; launch manually."
+                    )
+                if entry["adapter"] == "codex":
+                    command[1:1] = ["resume", session]
+                else:
+                    command[1:1] = ["--resume", session]
             previous.update(
                 activity="starting; awaiting native hook",
+                launcher_managed=True,
                 task=task,
                 updated=time.time(),
                 session_id="",
@@ -2016,6 +2157,10 @@ review, not merged or independently verified. An idle turn is not completion.
             previous.pop("last_prompt", None)
             write_json(activity_path, previous)
             try:
+                if sys.stdin.isatty() or resume:
+                    return terminal.run(
+                        command, lane, env, agent, attached=sys.stdin.isatty()
+                    )
                 return subprocess.call(command, cwd=lane, env=env)
             finally:
                 with lock(lane.parent / f"{agent}-checkpoint.lock", timeout=1):
@@ -2131,6 +2276,7 @@ def main() -> int:
         "--credentials", help="Credential profile selecting one account."
     )
     run.add_argument("--repo", type=Path, default=Path.cwd())
+    run.add_argument("--resume", action="store_true")
     run.add_argument(
         "--task", default="Check shared coordination state and await my task."
     )
@@ -2306,6 +2452,7 @@ def main() -> int:
                 args.task,
                 args.provider,
                 args.credentials,
+                resume=args.resume,
             )
         elif args.command == "report":
             bridge.report(

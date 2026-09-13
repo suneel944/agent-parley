@@ -58,6 +58,38 @@ def _reachable(repo: Path) -> str | None:
     return project if project and shutil.which("gh") else None
 
 
+def branch_finished(repo: Path, branch: str) -> bool:
+    """Reports a merged or closed lane PR through the native forge account."""
+    project = _reachable(repo)
+    if not project:
+        return False
+    output = _run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            project,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "10",
+            "--json",
+            "state",
+        ],
+        5,
+    )
+    try:
+        records = json.loads(output or "[]")
+        return any(
+            record.get("state") in {"MERGED", "CLOSED"} for record in records
+        )
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 def _run(args: list[str], timeout: int) -> str | None:
     """Runs the GitHub CLI, reporting absence instead of raising."""
     try:
