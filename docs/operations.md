@@ -493,8 +493,8 @@ job's repository token, so the App needs no Actions permission. GitHub permits
 To cut a release by hand in an emergency, `Release` still accepts a
 `workflow_dispatch` with an existing tag, and reruns the same verification.
 
-After the GitHub release is published and its uploaded bytes have been verified
-against the local checksums, the workflow publishes the distribution to PyPI. It
+After the GitHub draft's uploaded bytes have been verified against the local
+checksums, the workflow publishes the distribution to PyPI. It
 stages a clean `dist/pypi` directory holding only the two files the index
 accepts, the `agent_parley` wheel and the source tarball, copied by exact name
 from the verified `dist/release` bundle, so the plugin archive, the exported
@@ -510,11 +510,12 @@ calling it would be shorter. The upload carries a signed
 attestation whose build configuration names the workflow that started the run,
 and PyPI checks that name against the trusted publisher: called from another
 workflow, the attestation names the caller, the check fails, and the upload is
-rejected with `400 Bad Request` after the release is already published. The
-step deliberately runs last, because a version published to PyPI can never be
-re-uploaded or replaced, so it must not run before the GitHub release is
-confirmed good. Rerunning the workflow against an existing tag stays safe:
-files already on the index are skipped rather than treated as a failure.
+rejected with `400 Bad Request`. The current workflow keeps the GitHub release
+as a draft until both PyPI files are visible with matching hashes, then marks
+it public and latest. Rerunning against an existing tag verifies the existing
+files and stages only missing packages; conflicting or yanked files fail.
+Publication does not close issues or milestones. After verification, move
+unfinished issues to the next milestone and close the released milestone.
 
 Publishing needed one manual step that only the repository owner could take,
 and it is done. The `agent-parley` project exists on PyPI and its trusted

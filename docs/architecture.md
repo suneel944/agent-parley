@@ -9,7 +9,7 @@ runs `participant merge`, and never on an agent's behalf.
 
 | Module | Responsibility |
 | --- | --- |
-| `cli` | Git worktrees, native configuration, launch, status and reports |
+| `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
@@ -226,8 +226,9 @@ creating project state. `verify set`, `participant retire`, and
 repository receives setup guidance even when it has pending work.
 
 Branch verification is scoped to the lane an operation touches, so a lane left
-on the wrong branch blocks only its own participant. `status` reports every
-lane's actual branch. `participant restore` returns one lane to its branch and
+on the wrong branch blocks only its own participant. `status` reports the actual
+branch when it differs from the assigned branch. `participant restore` returns
+one lane to its branch and
 `participant retire` removes one lane; both refuse while that participant holds
 its session lock or its worktree is dirty, and neither resets, cleans, stashes,
 or force-switches. Retiring invalidates that participant's credential and keeps
@@ -368,9 +369,9 @@ unwilling forge leaves the transition and the report exactly as recorded.
 
 The forge sees one assignee, the operator's account, because every lane runs
 under it. A handoff between participants therefore moves the ledger owner
-without moving the forge assignee, and change-type labels are never written at
-all: classification is the repository's own decision and a lane does not make
-it.
+without moving the forge assignee. Claim and handoff synchronization does not
+write change-type labels. Creating a pull request mirrors the claimed issues'
+existing labels and milestone; it does not invent a new classification.
 
 Shutdown verifies the module, state path and process creation time before
 signaling. It does not kill arbitrary PIDs.
@@ -501,13 +502,13 @@ measures latency separately; results depend on hardware and workload.
 
 ## Migration and verification limits
 
-Version 0.3 creates `bridge.sqlite3` and imports `mail.sqlite3` through a consistent
+Store initialization creates `bridge.sqlite3` and imports `mail.sqlite3` through a consistent
 read-only snapshot. IDs, acknowledgements and leases are retained; the original
 remains unchanged. Imported rows and the schema version commit together.
 Existing identities are rebound locally at launch. Stop old services and sessions
 before upgrading; no live workspace is automatically migrated or terminated.
 
-A store written by an earlier 0.3 release upgrades in place on first use: the
+A store written with an earlier schema upgrades in place on first use: the
 event table is created and reservations gain a creation time, which existing
 leases date from the upgrade. A store that still requires a deadline on every
 lease is copied once into a shape where the deadline is optional; every lease

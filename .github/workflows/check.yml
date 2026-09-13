@@ -19,12 +19,16 @@ jobs:
           RESULT: ${{ needs.python.result }}
         run: test "$RESULT" = success
   python:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         python: ['3.12', '3.13', '3.14']
+        os: [ubuntu-latest]
+        include:
+          - python: '3.12'
+            os: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
