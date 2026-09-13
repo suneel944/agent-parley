@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/suneel944/agent-parley/compare/v0.3.0...v0.4.0) (2026-09-13)
+
+
+### Features
+
+* complete coordination supervision and portable review workflows (#161) ([#105](https://github.com/suneel944/agent-parley/issues/105)) ([#115](https://github.com/suneel944/agent-parley/issues/115)) ([#118](https://github.com/suneel944/agent-parley/issues/118)) ([#129](https://github.com/suneel944/agent-parley/issues/129)) ([#130](https://github.com/suneel944/agent-parley/issues/130)) ([#131](https://github.com/suneel944/agent-parley/issues/131)) ([#140](https://github.com/suneel944/agent-parley/issues/140))
+
+### Bug fixes
+
+* verify native macOS startup and align operations (#139) ([#119](https://github.com/suneel944/agent-parley/issues/119)) ([#120](https://github.com/suneel944/agent-parley/issues/120)) ([#123](https://github.com/suneel944/agent-parley/issues/123))
+
 ## [0.3.0](https://github.com/suneel944/agent-parley/compare/v0.2.0...v0.3.0) (2026-09-13)
 
 
