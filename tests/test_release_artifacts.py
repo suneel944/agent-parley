@@ -19,6 +19,7 @@ def test_extracts_only_requested_version(heading):
     assert release_notes(text, "0.3.1") == (
         "## What's Changed\n\n### Fixes\n\n- Fixed.\n"
     )
+    assert release_notes(text, "0.3.0") == ("## What's Changed\n\nOlder.\n")
 
 
 @pytest.mark.parametrize(
@@ -33,14 +34,12 @@ def test_rejects_missing_or_empty_release_notes(text):
         release_notes(text, "0.3.1")
 
 
-def test_overview_and_full_changelog_wrap_the_generated_section():
-    text = "# Changelog\n\n## [0.3.1] - 2026-09-05\n\n### Fixes\n\n- Fixed.\n"
-    assert release_notes(
-        text, "0.3.1", "\nWhat this is.\n\n", "https://example.com/repo/"
-    ) == (
-        "## What's Changed\n\nWhat this is.\n\n### Fixes\n\n- Fixed.\n\n"
-        "**Full Changelog**: https://example.com/repo/commits/v0.3.1\n"
+def test_full_changelog_follows_version_content_without_overview():
+    text = (
+        "# Changelog\n\nGeneric project overview.\n\n"
+        "## [0.3.1] - 2026-09-05\n\n### Fixes\n\n- Fixed.\n"
     )
-    assert release_notes(text, "0.3.1", "   \n", "  ") == release_notes(
-        text, "0.3.1"
+    assert release_notes(text, "0.3.1", "https://example.com/repo/") == (
+        "## What's Changed\n\n### Fixes\n\n- Fixed.\n\n"
+        "**Full Changelog**: https://example.com/repo/commits/v0.3.1\n"
     )

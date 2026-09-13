@@ -7,10 +7,16 @@ its annotated tag, and dispatches the separate publication workflow. There is
 no proposal pull request. A tag push alone does not publish anything; an
 existing tag can be dispatched explicitly for recovery.
 
-Release 0.3.0 was published on 2026-09-13. All six GitHub bundle assets passed
+Release 0.4.0 was published on 2026-09-13. All six GitHub bundle assets passed
 checksum verification, and downloaded PyPI wheel and source archive hashes
 matched the GitHub packages. See the
-[successful publication run](https://github.com/suneel944/agent-parley/actions/runs/34765379270).
+[successful publication run](https://github.com/suneel944/agent-parley/actions/runs/34775070514).
+
+Published descriptions for 0.1.0, 0.1.1, 0.2.0, 0.3.0 and 0.4.0 are curated
+from their shipped changes in `CHANGELOG.md`, with one `What's Changed`
+heading and a full changelog link. The obsolete standing overview is no longer
+part of generated notes. Historical packaged notes retain their original
+bytes; an editorial page correction does not replace an asset or move a tag.
 
 ## Audited release history
 
