@@ -688,7 +688,14 @@ def test_partial_draft_with_conflicting_bytes_is_not_overwritten(
 
 @pytest.mark.parametrize(
     "state",
-    ["complete", "missing", "conflict", "changed_assets", "changed_tag"],
+    [
+        "complete",
+        "delayed",
+        "missing",
+        "conflict",
+        "changed_assets",
+        "changed_tag",
+    ],
 )
 def test_github_publication_requires_verified_pypi_completion(
     assets, tmp_path, monkeypatch, state
@@ -713,16 +720,23 @@ def test_github_publication_requires_verified_pypi_completion(
         ),
     )
     metadata = pypi_metadata(assets)
+    sleeps = []
+    monkeypatch.setattr(release.time, "sleep", sleeps.append)
     if state == "missing":
         metadata.pop()
     elif state == "conflict":
         metadata[0]["digests"]["sha256"] = "0" * 64
     elif state == "changed_assets":
         (assets / "CHANGELOG.md").write_text("Changed")
-    monkeypatch.setattr(release, "pypi_files", lambda version: metadata)
+    responses = iter([[], metadata[:1], metadata])
+    monkeypatch.setattr(
+        release,
+        "pypi_files",
+        lambda version: next(responses) if state == "delayed" else metadata,
+    )
     calls = []
     monkeypatch.setattr(release, "command", lambda *args: calls.append(args))
-    if state == "complete":
+    if state in {"complete", "delayed"}:
         release.main()
         assert calls == [
             ("gh", "release", "edit", TAG, "--draft=false", "--latest")
@@ -731,6 +745,8 @@ def test_github_publication_requires_verified_pypi_completion(
         with pytest.raises(ValueError):
             release.main()
         assert calls == []
+    expected_sleeps = {"missing": 6, "delayed": 2}.get(state, 0)
+    assert sleeps == [10] * expected_sleeps
 
 
 def test_release_step_commits_and_tags_without_inherited_git_identity(git_repo):
@@ -825,6 +841,15 @@ def test_version_workflow_cannot_recurse_or_publish_by_itself():
         for step in steps[2:]
     )
     assert not any("pypi" in str(step.get("uses", "")) for step in steps)
+    assert versioning["jobs"]["version"]["permissions"] == {
+        "contents": "read",
+        "actions": "write",
+    }
+    dispatch = steps[-1]
+    assert dispatch["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert dispatch["run"] == (
+        'gh workflow run release.yml --field "tag=v${VERSION}"'
+    )
     publication = yaml.safe_load((workflows / "release.yml").read_text())
     assert set(publication[True]) == {"workflow_dispatch"}
     assert "id-token" not in publication["jobs"]["build"]["permissions"]
