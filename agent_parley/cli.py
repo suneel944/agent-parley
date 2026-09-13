@@ -242,7 +242,8 @@ def merge_blockers(
     if not has_branch(root, branch):
         yield (
             f"Branch {branch} no longer exists. Recover it from the reflog, "
-            f"or retire {name} and add it again."
+            f"or retire {name}, follow any kept-branch recovery instructions, "
+            "then add it again."
         )
         return
     base = current_branch(root)
@@ -768,8 +769,16 @@ class Bridge:
                 running.stop()
             (self.home / "server.json").unlink(missing_ok=True)
 
-    def project(self, repo: Path) -> tuple[Path, Path]:
-        """Returns main worktree and shared state paths for a Git repository."""
+    def project(self, repo: Path, *, create: bool = True) -> tuple[Path, Path]:
+        """Returns repository paths, optionally creating its state directory.
+
+        Args:
+            repo: Main checkout or linked worktree.
+            create: Whether to create the private project directory.
+
+        Returns:
+            Main worktree and shared state directory paths.
+        """
         common = Path(
             git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         )
@@ -784,7 +793,8 @@ class Bridge:
         )
         key = hashlib.sha256(str(common.resolve()).encode()).hexdigest()[:16]
         directory = self.home / "projects" / key
-        directory.mkdir(parents=True, exist_ok=True)
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
         return root, directory
 
     def setup(self, repo: Path) -> dict:
@@ -816,15 +826,15 @@ class Bridge:
             root: Common repository root.
             directory: Private state directory for the repository.
             verify: Participants whose branch must match, or None for all.
-            preserve: Whether pending base-checkout work is stashed instead
-                of refused when this manifest is created.
+            preserve: Whether creation is allowed, preserving pending work
+                in a stash first. False requires an existing manifest.
 
         Returns:
             Manifest using the participant roster layout.
 
         Raises:
-            BridgeError: If a checked lane left its assigned branch, or if
-                pending work blocks a manifest that must not stash it.
+            BridgeError: If a checked lane left its assigned branch, or no
+                manifest exists and creation is not allowed.
         """
         path = directory / "project.json"
         if path.exists():
@@ -841,15 +851,11 @@ class Bridge:
                 if actual != participant["branch"]:
                     raise BridgeError(drift(name, participant, actual))
             return data
-        if preserve:
-            preserved = preserve_pending(root)
-            if preserved:
-                print(preserved, file=sys.stderr, flush=True)
-        elif git(root, "status", "--porcelain"):
-            raise BridgeError(
-                "Commit or preserve your pending changes first; "
-                "worktrees start at HEAD."
-            )
+        if not preserve:
+            return roster.read(directory)
+        preserved = preserve_pending(root)
+        if preserved:
+            print(preserved, file=sys.stderr, flush=True)
         data = {
             "version": roster.MANIFEST_VERSION,
             "root": str(root),
@@ -924,7 +930,10 @@ class Bridge:
             if lane.exists() or branch in refs:
                 raise BridgeError(
                     f"Existing lane or branch for {name}; "
-                    "preserve it before adding this participant."
+                    f"preserve the worktree if present, and rename any kept "
+                    f"branch with `git branch -m {shlex.quote(branch)} "
+                    "KEEP_NAME` before adding this participant. "
+                    "Choose an unused KEEP_NAME."
                 )
             git(root, "worktree", "add", "-b", branch, str(lane), data["base"])
             participants[name] = {
@@ -988,7 +997,8 @@ class Bridge:
             if not has_branch(lane, branch):
                 raise BridgeError(
                     f"Branch {branch} no longer exists. Recover it from the "
-                    f"reflog, or retire {name} and add it again."
+                    f"reflog, or retire {name}, follow any kept-branch "
+                    "recovery instructions, then add it again."
                 )
             if git(lane, "status", "--porcelain"):
                 raise BridgeError(
@@ -1020,7 +1030,8 @@ class Bridge:
         Raises:
             BridgeError: If the lane is busy or holds uncommitted changes.
         """
-        root, directory = self.project(repo)
+        root, directory = self.project(repo, create=False)
+        roster.read(directory)
         with lock(directory / "setup.lock"):
             data = self._project(root, directory, verify=set())
             participant = data["participants"].get(name)
@@ -1050,17 +1061,30 @@ class Bridge:
                     ):
                         note = (
                             f"Branch {branch} kept; it holds commits the "
-                            "project base does not."
+                            "project base does not. Before re-adding this "
+                            f"name, run `git branch -m {shlex.quote(branch)} "
+                            "KEEP_NAME` with an unused KEEP_NAME."
                         )
                     else:
                         git(root, "branch", "-d", branch)
                         note = f"Branch {branch} deleted; it added no commits."
                 store.revoke(self.home, data["root"], participant["display"])
-                for suffix in ("identity.json", "activity.json", "mcp.json"):
-                    (directory / f"{name}-{suffix}").unlink(missing_ok=True)
+                with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+                    for suffix in (
+                        "identity.json",
+                        "activity.json",
+                        "mcp.json",
+                        "events.jsonl",
+                        "events.1.jsonl",
+                        "events.jsonl.tmp",
+                        "events.1.jsonl.tmp",
+                    ):
+                        (directory / f"{name}-{suffix}").unlink(missing_ok=True)
                 del data["participants"][name]
                 write_json(directory / "project.json", data)
-                return f"Retired {name}. {note} Messages are preserved."
+            (directory / f"{name}-checkpoint.lock").unlink(missing_ok=True)
+            (directory / f"{name}.session.lock").unlink(missing_ok=True)
+            return f"Retired {name}. {note} Messages are preserved."
 
     def verification(self, repo: Path, command: str | None = None) -> str:
         """Reports or records the command every merge must pass first.
@@ -1082,13 +1106,16 @@ class Bridge:
             BridgeError: If the repository has no project yet, or the command
                 is not a usable argument list.
         """
-        root, directory = self.project(repo)
-        with lock(directory / "setup.lock"):
-            data = self._project(root, directory, verify=set())
-            if command is not None:
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if command is None:
+            configured = data["verify"]
+        else:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
                 data["verify"] = roster.verify_command(command)
                 write_json(directory / "project.json", data)
-            configured = data["verify"]
+                configured = data["verify"]
         if not configured:
             return (
                 f"{root} has no verification command; `participant merge` "
@@ -1115,7 +1142,8 @@ class Bridge:
                 fails, or if the merge cannot complete unattended.
             subprocess.TimeoutExpired: If verification exceeds its timeout.
         """
-        root, directory = self.project(repo)
+        root, directory = self.project(repo, create=False)
+        roster.read(directory)
         with lock(directory / "setup.lock"):
             data = self._project(root, directory, verify={name})
             participant = data["participants"].get(name)
@@ -1455,7 +1483,7 @@ review, not merged or independently verified. An idle turn is not completion.
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
             raise BridgeError("Ready-for-review reports require --evidence.")
-        with lock(directory / f"{agent}-checkpoint.lock"):
+        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
             path = directory / f"{agent}-activity.json"
             state = json.loads(path.read_text()) if path.exists() else {}
             arrived = outcome == "ready" and state.get("outcome") != "ready"
@@ -1961,7 +1989,7 @@ review, not merged or independently verified. An idle turn is not completion.
             try:
                 return subprocess.call(command, cwd=lane, env=env)
             finally:
-                with lock(lane.parent / f"{agent}-checkpoint.lock"):
+                with lock(lane.parent / f"{agent}-checkpoint.lock", timeout=1):
                     state = json.loads(activity_path.read_text())
                     state.update(activity="stopped", updated=time.time())
                     state.pop("session_pid", None)

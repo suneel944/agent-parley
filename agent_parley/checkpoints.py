@@ -61,6 +61,7 @@ class Reason(StrEnum):
     OBSERVED = "observed"
     COORDINATION_PENDING = "coordination_pending"
     COORDINATION_UNAVAILABLE = "coordination_unavailable"
+    CHECKPOINT_FAILED = "checkpoint_failed"
 
 
 def decision_of(output: dict | None) -> str:
@@ -343,16 +344,19 @@ def changes_lane_branch(payload: dict, lane: Path) -> bool:
     return False
 
 
-def restores_lane_branch(payload: dict, lane: Path, expected: str) -> bool:
+def restores_lane_branch(
+    payload: dict, lane: Path, expected: str, *, rename_from: str = ""
+) -> bool:
     """Reports whether a command only restores the assigned bridge branch.
 
     Args:
         payload: Native lifecycle hook payload.
         lane: Assigned bridge worktree.
         expected: Manifest-owned branch name.
+        rename_from: Actual branch when the expected ref is missing.
 
     Returns:
-        Whether the command is one exact switch back to ``expected``.
+        Whether the command exactly switches back or repairs a renamed ref.
     """
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
@@ -368,11 +372,41 @@ def restores_lane_branch(payload: dict, lane: Path, expected: str) -> bool:
     target, subcommand, args = action
     while args[:1] in (["-q"], ["--quiet"], ["--"]):
         args = args[1:]
-    return (
-        target.is_relative_to(lane)
-        and subcommand in {"switch", "checkout"}
-        and args == [expected]
+    return target.is_relative_to(lane) and (
+        (subcommand in {"switch", "checkout"} and args == [expected])
+        or (
+            bool(rename_from)
+            and subcommand == "branch"
+            and args in (["-m", rename_from, expected], [expected])
+        )
     )
+
+
+def branch_exists(lane: Path, branch: str) -> bool:
+    """Checks an exact local ref without changing the worktree.
+
+    Raises:
+        BridgeError: If Git cannot inspect refs.
+        subprocess.TimeoutExpired: If Git exceeds the hook deadline.
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(lane),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise BridgeError(result.stderr.strip() or "Cannot inspect lane ref.")
+    return result.returncode == 0
 
 
 def current_branch(lane: Path) -> str:
@@ -512,16 +546,25 @@ def branch_guard(
     """
     actual = current_branch(lane)
     if actual != expected:
+        missing = not branch_exists(lane, expected)
+        rename_from = actual if missing and actual != "<detached HEAD>" else ""
         if event == "PreToolUse" and restores_lane_branch(
-            payload, lane, expected
+            payload, lane, expected, rename_from=rename_from
         ):
             return None, Reason.BRANCH_RESTORE
+        repair = (
+            f"git branch -m {shlex.quote(actual)} {shlex.quote(expected)}"
+            if rename_from
+            else f"git switch {shlex.quote(expected)}"
+        )
         message = (
             f"Agent Parley lane is on {actual!r}, expected {expected!r}. "
-            f"Restore it with `git switch {shlex.quote(expected)}` before "
+            f"Restore it with `{repair}` before "
             "continuing; committed and uncommitted work must be preserved."
         )
         if event == "Stop":
+            if payload.get("stop_hook_active"):
+                return {}, Reason.BRANCH_DRIFT
             return {
                 "decision": "block",
                 "reason": message,
@@ -652,9 +695,27 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
     lane = Path(participant["lane"]).resolve()
     if not Path(payload.get("cwd", str(lane))).resolve().is_relative_to(lane):
         raise BridgeError("Hook cwd does not belong to this agent's worktree.")
-    guarded, guard_reason = branch_guard(
-        event, payload, lane, participant["branch"]
-    )
+    try:
+        guarded, guard_reason = branch_guard(
+            event, payload, lane, participant["branch"]
+        )
+    except subprocess.TimeoutExpired as exc:
+        message = f"Git branch inspection timed out after {exc.timeout}s."
+        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+            state = activity(directory, agent)
+            state.update(
+                updated=time.time(), event=event, checkpoint_error=message
+            )
+            write_json(directory / f"{agent}-activity.json", state)
+        failure_output = (
+            {"hookSpecificOutput": {"permissionDecision": "deny"}}
+            if event in ("PreToolUse", "SessionStart", "UserPromptSubmit")
+            else None
+        )
+        record(
+            directory, agent, payload, Reason.CHECKPOINT_FAILED, failure_output
+        )
+        raise BridgeError(message) from None
     if guarded is not None:
         record(directory, agent, payload, guard_reason, guarded)
         return guarded
@@ -662,7 +723,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         record(directory, agent, payload, guard_reason, None)
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
     state_path = directory / f"{agent}-activity.json"
-    with lock(directory / f"{agent}-checkpoint.lock"):
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
         state = (
             json.loads(state_path.read_text()) if state_path.exists() else {}
         )
@@ -679,6 +740,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
             state["issue_revision"] = -1
             state.pop("roster", None)
         state.update(session_id=session, updated=time.time(), event=event)
+        state.pop("checkpoint_error", None)
         if event == "SessionEnd":
             state["activity"] = "stopped"
         elif event == "Stop":

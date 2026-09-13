@@ -27,9 +27,11 @@ blocks its agent and must never wait on the coordination store's write lock.
 Served MCP calls are recorded in the store's `events` table inside the very
 transaction that carries the call's own effect, so an event exists exactly when
 the effect it describes was committed. A rejected call rolls that transaction
-back, and a read-only call holds no write lock, so both record afterwards in
-their own short transaction; a busy store loses the record rather than the
-call. Retention is bounded to the most recent 2000 events per project, and
+back, and read-only queries use a read transaction. Both attempt a separate
+write transaction for telemetry and retention with a zero lock wait; a busy
+store loses the record rather than delaying the call. This telemetry write
+does acquire a write lock when available. Retention is bounded to the most
+recent 2000 events per project, and
 telemetry never decides an outcome.
 
 The service is a singleton **per private state directory**. An exclusive startup
@@ -82,7 +84,13 @@ read in send order, so no reply tree is recorded. An inbox page names each
 message's thread, so a recipient can read or answer into it without a further
 call. Reading a thread and
 searching mail are scoped to what the caller already sees, so neither widens
-a lane's view of the project, and both are read-only and take no write lock.
+a lane's view of the project. Their queries take no write lock; served MCP
+reads then attempt the nonwaiting telemetry write described above. Operator
+thread and search commands record no tool event and take no write lock.
+
+The addressable roster omits the operator and revoked credentials before
+applying its 32-participant limit. Sending to either is refused with an
+explanation; retained mail remains available to a re-registered participant.
 
 No coordination tool returns a participant's whole starting context. The store
 holds projects, agents, messages, recipients, reservations and events, keyed by
@@ -189,6 +197,11 @@ Nothing is reset, cleaned or force-switched, and a checkout Git cannot fully
 stash still refuses. Later registrations read the existing manifest and never
 touch the checkout.
 
+`verify show` only reads an existing manifest, without taking a setup lock or
+creating project state. `verify set`, `participant retire`, and
+`participant merge` also require an existing manifest. An unregistered
+repository receives setup guidance even when it has pending work.
+
 Branch verification is scoped to the lane an operation touches, so a lane left
 on the wrong branch blocks only its own participant. `status` reports every
 lane's actual branch. `participant restore` returns one lane to its branch and
@@ -196,6 +209,11 @@ lane's actual branch. `participant restore` returns one lane to its branch and
 its session lock or its worktree is dirty, and neither resets, cleans, stashes,
 or force-switches. Retiring invalidates that participant's credential and keeps
 its branch whenever the branch holds commits the project base does not.
+Retiring removes identity, activity, MCP configuration, both event logs,
+temporary event files, and the participant's checkpoint and session lock
+files. Mail stays in the store. If the branch is kept, the response names the
+rename command and requires an unused destination before that name is added
+again, so a new lane does not inherit old hook totals.
 
 `participant merge` integrates one lane's branch into the base checkout. It runs
 in the common repository root, never inside another lane, and always records a
@@ -371,6 +389,8 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | HTTP request | 16,384 bytes |
 | Concurrent workers / socket timeout | 16 / 3 seconds |
 | Writer wait for a busy store | 5 seconds |
+| Read telemetry wait for a busy store | 0 seconds; observation skipped |
+| Checkpoint and issue operation lock wait | Up to 1 second |
 | New message body | 4,096 UTF-8 bytes |
 | Inbox page | Up to 5 messages; bodies omitted by default |
 | Thread page | Up to 10 messages; 240-character body previews |
@@ -399,13 +419,25 @@ fifty times that queue and absorbs the scheduling delay of a loaded shared
 machine. Below that margin ordinary contention reached a participant as a
 refused coordination call rather than a turn in the queue.
 
+Only SQLite busy and locked errors, including their extended error codes,
+request a retry. Other operational errors retain their diagnostic text and
+attempt an error event; unavailable storage can also prevent that telemetry.
+Short checkpoint updates and issue transitions wait up to one second for a
+file lock. Session locks retain immediate refusal and never queue a launch.
+
 Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refetch
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.
 Stored legacy text is not discarded to satisfy response budgets.
 
 Hooks read local state without network requests or model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,
-and block normal completion until the manifest-owned branch is restored. Session
+and block the first completion attempt while the lane is off its assigned
+branch. A repeated Stop carrying `stop_hook_active` is allowed while drift
+remains recorded and visible. If a rename removed the assigned ref, the
+guard names and permits the exact non-forced rename back, or creation of the
+expected branch followed by a separate switch. Pending work is preserved.
+Git inspection timeouts record a checkpoint failure and update activity,
+then use the event's failure exit contract without a Python traceback. Session
 cursors prevent duplicate delivery; issue revisions suppress unchanged reminders.
 A changed roster is announced once so a joining participant stays addressable;
 that announcement never denies a tool call and never blocks completion, because
@@ -469,15 +501,16 @@ rather than rewritten, and the backfill, the index and the schema version
 commit together, so an interrupted upgrade retries from the version it
 started at. The full-text index is an FTS5 virtual table over stored subjects
 and bodies, kept current by insert and delete triggers and built once from
-the messages already stored. Where SQLite was built without FTS5 the virtual
-table is refused, the upgrade continues, and the store opens normally;
+the messages already stored. Each startup checks the serving interpreter's
+FTS5 support, even at the current schema version. Without it, index creation
+is skipped and existing indexing triggers are removed so sends still work;
 searching then matches the query as a literal case-insensitive substring of a
 subject or body instead of as a phrase of indexed terms. That is narrower and
 slower, and every search result names which of the two answered it, so a
-degraded store is visible rather than silent. A store upgraded on a build
-without FTS5 keeps matching substrings on a build that has FTS5, because its
-schema version is already current; deleting and re-importing the store is the
-only way to gain the index afterwards.
+degraded store is visible rather than silent. When FTS5 becomes available
+again, startup restores the triggers and rebuilds the index, including mail
+delivered while indexing was unavailable. Other index failures are reported
+instead of being treated as absent FTS5 support.
 
 CI covers temporary Git repositories, independent MCP clients, concurrent calls,
 authorization failures, persistence, resource budgets and isolated wheel installs.

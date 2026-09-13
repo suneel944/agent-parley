@@ -368,7 +368,11 @@ class Handler(BaseHTTPRequestHandler):
                 "isError": True,
                 "content": [{"type": "text", "text": str(exc)}],
             }
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            retryable = getattr(exc, "sqlite_errorcode", 0) & 0xFF in (
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            )
             return {
                 "isError": True,
                 "content": [
@@ -377,6 +381,8 @@ class Handler(BaseHTTPRequestHandler):
                         "text": (
                             "Store unavailable or busy; retry later "
                             "using the same message key."
+                            if retryable
+                            else f"Store error: {exc}"
                         ),
                     }
                 ],
