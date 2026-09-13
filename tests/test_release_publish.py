@@ -825,6 +825,15 @@ def test_version_workflow_cannot_recurse_or_publish_by_itself():
         for step in steps[2:]
     )
     assert not any("pypi" in str(step.get("uses", "")) for step in steps)
+    assert versioning["jobs"]["version"]["permissions"] == {
+        "contents": "read",
+        "actions": "write",
+    }
+    dispatch = steps[-1]
+    assert dispatch["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert dispatch["run"] == (
+        'gh workflow run release.yml --field "tag=v${VERSION}"'
+    )
     publication = yaml.safe_load((workflows / "release.yml").read_text())
     assert set(publication[True]) == {"workflow_dispatch"}
     assert "id-token" not in publication["jobs"]["build"]["permissions"]

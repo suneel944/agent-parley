@@ -422,8 +422,9 @@ version across `pyproject.toml`, both plugin manifests, the Claude marketplace
 manifest, `uv.lock` and `.release-manifest.json`, and prepends a `CHANGELOG.md`
 entry built from the same commits the measurement counted. It then runs the
 policy gate against the raised markers, so a marker the bump misses fails the
-run rather than reaching a release. The App commits that to `main`, pushes the
-annotated `vVERSION` tag, and dispatches `Release` for it.
+run rather than reaching a release. The App commits that to `main` and pushes
+the annotated `vVERSION` tag. The job's repository `GITHUB_TOKEN`, granted
+`actions: write`, then dispatches `Release` for that tag.
 
 There is no release pull request. An earlier design kept one, and it did not
 prevent the incident it appeared to guard: a build-tooling commit with a `fix:`
@@ -473,14 +474,18 @@ reads as two different projects.
 One-time owner setup, without which `Auto version` fails as soon as a push
 warrants a version:
 register a GitHub App under the owner account with repository permissions
-Contents: read and write and Actions: read and write; install it on
+Contents: read and write; install it on
 `suneel944/agent-parley`; set the repository variable `RELEASE_BOT_APP_ID` to
 the App ID; set the repository secret `RELEASE_BOT_PRIVATE_KEY` to a generated
 private key in full PEM form; and add the App to the bypass actors of the
-`main` branch ruleset so it can push the release commit and tag. Contents
-covers the commit and the tag, Actions covers the `Release` dispatch. The App
-holds no Pull requests or Issues permission, so it cannot open, approve or
-merge anything.
+`main` PR/check and independent-approval rulesets so it can push the release
+commit. Keep deletion, force-push and linear-history rules in a separate
+ruleset with no bypass actors. Classic branch protection must be migrated to
+equivalent active rulesets before removing it; otherwise it still rejects
+the release App's push. Human pull requests retain their required checks.
+The App's Contents permission covers the commit and tag. Dispatch uses the
+job's repository token, so the App needs no Actions permission. GitHub permits
+`workflow_dispatch` events from `GITHUB_TOKEN` to start another workflow.
 
 To cut a release by hand in an emergency, `Release` still accepts a
 `workflow_dispatch` with an existing tag, and reruns the same verification.
