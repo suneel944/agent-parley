@@ -527,15 +527,24 @@ other route publishes nothing. `Auto version` dispatches it by name after
 pushing the tag it measured. Publishing an existing tag
 is idempotent, so a rerun verifies the uploaded bytes again instead of failing.
 
-Release notes are assembled from two sources so that no release needs hand
-editing: `docs/release-overview.md` is a standing description of what the
-project is and how to verify a download, and the bump step generates the
-version section of `CHANGELOG.md` from the commits the eligibility measurement
-counted. Maintenance, automation, build, refactor, documentation and test
-commits never count, so the notes carry features, fixes and performance, and
-the published notes and the decision to release describe the same work.
-Rewrite `docs/release-overview.md` when the product description changes, not
-when a version does.
+Release notes start with `What's Changed`, contain only the selected version's
+section from `CHANGELOG.md`, and end with its full changelog link. A standing
+product description is not injected into the changes. Regression tests cover
+version isolation, exclusion of changelog preambles, missing or empty entries,
+and preservation of the full changelog link.
+
+The bump step generates a version section from the product commits counted by
+release eligibility. Use descriptive Conventional Commit titles that name the
+user-visible change. Maintenance and tooling cannot raise a release version.
+An editorial correction can expand terse entries into concrete behavior after
+checking the shipped commits and linked issues. Keep section names consistent:
+`Features`, `Bug fixes`, `Performance`, `Documentation`, and `Known limitations`
+when applicable. Preserve historical archive and provenance notices.
+
+Keep reviewed wording in `CHANGELOG.md`. Updating a published GitHub page is an
+editorial operation: change its description only, never replace the tagged
+source, packaged notes, release assets or checksum manifest. Packaged notes
+remain the record created when that version was built.
 
 Every GitHub release is titled `Agent Parley vVERSION`, minted by publication
 rather than typed, so the releases page reads as one series. Releases published

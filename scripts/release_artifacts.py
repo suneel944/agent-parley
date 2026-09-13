@@ -14,21 +14,17 @@ from pathlib import Path
 def release_notes(
     changelog: str,
     version: str,
-    overview: str = "",
     repository: str = "",
 ) -> str:
     """Builds GitHub release notes for one version of the changelog.
 
     The result follows the conventional release-note shape: a "What's Changed"
-    heading, a short standing description of the project, the generated
-    subsections for this version, and a full changelog link.
+    heading, the generated subsections for this version, and a full changelog
+    link.
 
     Args:
         changelog: Complete Markdown changelog.
         version: Exact package version to extract.
-        overview: Standing product description placed before the section, so
-            that every release states what the project is without a per-release
-            edit.
         repository: Repository URL used for the full changelog link.
 
     Returns:
@@ -50,10 +46,7 @@ def release_notes(
     )[0].strip()
     if not section:
         raise ValueError("Release notes must not be empty.")
-    parts = ["## What's Changed"]
-    if overview.strip():
-        parts.append(overview.strip())
-    parts.append(section)
+    parts = ["## What's Changed", section]
     if repository.strip():
         link = f"{repository.strip().rstrip('/')}/commits/v{version}"
         parts.append(f"**Full Changelog**: {link}")
@@ -105,8 +98,7 @@ def main() -> None:
         if manifest["version"] != version:
             raise ValueError(f"{client} plugin version differs from package.")
     changelog = (root / "CHANGELOG.md").read_text()
-    overview = (root / "docs" / "release-overview.md").read_text()
-    notes = release_notes(changelog, version, overview, repository)
+    notes = release_notes(changelog, version, repository)
     output = root / "dist" / "release"
     shutil.rmtree(output, ignore_errors=True)
     output.mkdir(parents=True)
