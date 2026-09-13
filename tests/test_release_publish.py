@@ -146,6 +146,20 @@ def counted_repo(git_repo):
     return git_repo
 
 
+def write_issue_references(repo, references):
+    directory = repo / ".github"
+    directory.mkdir(exist_ok=True)
+    (directory / "release-history.json").write_text(
+        json.dumps(
+            {
+                "migrations": {},
+                "retired": [],
+                "issue_references": references,
+            }
+        )
+    )
+
+
 @pytest.mark.parametrize("annotated", [False, True])
 def test_real_tag_on_main_resolves_to_exact_commit(git_repo, annotated):
     args = ("-a", "-m", "Release") if annotated else ()
@@ -384,6 +398,101 @@ def test_ten_product_issues_propose_the_next_minor(counted_repo, local):
     assert release.release_candidate(counted_repo) == ("", 9, 0)
     product_commit(counted_repo, "feat: the tenth unit", body="Resolves #99")
     assert release.release_candidate(counted_repo) == ("0.2.0", 10, 1)
+
+
+def test_recovered_squash_references_restore_minor_release_and_changelog(
+    counted_repo, local
+):
+    product_commit(
+        counted_repo,
+        "fix: verify native startup",
+        body="Fixes #119\nFixes #120\nFixes #123",
+    )
+    product_commit(counted_repo, "feat: complete coordination workflows")
+    squash = release.command("git", "rev-parse", "HEAD", cwd=counted_repo)
+    recovered = [105, 115, 118, 129, 130, 131, 140]
+    write_issue_references(counted_repo, {squash: recovered})
+
+    assert release.release_candidate(counted_repo) == ("0.2.0", 10, 7)
+    changelog = release.changelog_entry(counted_repo, TAG, VERSION, "0.2.0")
+    for number in [119, 120, 123, *recovered]:
+        link = f"([#{number}]({release.REPOSITORY_URL}/issues/{number}))"
+        assert changelog.count(link) == 1
+
+
+def test_recovered_and_message_references_are_deduplicated(
+    counted_repo,
+):
+    product_commit(
+        counted_repo,
+        "feat: combine issue work",
+        body="Refs #7\nCloses #7\nResolves #8",
+    )
+    commit = release.command("git", "rev-parse", "HEAD", cwd=counted_repo)
+    write_issue_references(counted_repo, {commit: [7, 9]})
+
+    assert release.product_units(counted_repo, TAG) == (
+        {"#7", "#8", "#9"},
+        {"#7", "#8", "#9"},
+        False,
+    )
+    changelog = release.changelog_entry(counted_repo, TAG, VERSION, "0.2.0")
+    for number in (7, 8, 9):
+        link = f"([#{number}]({release.REPOSITORY_URL}/issues/{number}))"
+        assert changelog.count(link) == 1
+
+
+def test_recovered_references_cannot_count_ineligible_commits(git_repo):
+    (git_repo / release.MANIFEST_PATH).write_text('{".": "0.1.1"}')
+    product_commit(git_repo, "feat: historical product work")
+    historical = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    product_commit(git_repo, "feat: release baseline product work")
+    baseline = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    release.command("git", "tag", TAG, cwd=git_repo)
+
+    release.command("git", "checkout", "-b", "other", cwd=git_repo)
+    product_commit(git_repo, "feat: off-branch product work")
+    off_branch = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    release.command("git", "checkout", "main", cwd=git_repo)
+    product_commit(
+        git_repo,
+        "feat: release tooling only",
+        path="scripts/tool.py",
+    )
+    non_product = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    write_issue_references(
+        git_repo,
+        {
+            historical: [41],
+            baseline: [42],
+            off_branch: [43],
+            "f" * 40: [44],
+            non_product: [45],
+        },
+    )
+
+    assert release.product_units(git_repo, baseline) == (set(), set(), False)
+    changelog = release.changelog_entry(git_repo, baseline, VERSION, "0.2.0")
+    assert all(f"issues/{number}" not in changelog for number in range(41, 46))
+
+
+@pytest.mark.parametrize(
+    ("commit", "numbers"),
+    [
+        pytest.param("HEAD", [1], id="invalid-sha"),
+        pytest.param("f" * 40, True, id="boolean"),
+        pytest.param("f" * 40, "1", id="string"),
+        pytest.param("f" * 40, [], id="empty"),
+        pytest.param("f" * 40, [1, 1], id="duplicate"),
+        pytest.param("f" * 40, [True], id="boolean-number"),
+        pytest.param("f" * 40, ["1"], id="string-number"),
+        pytest.param("f" * 40, [0], id="non-positive"),
+    ],
+)
+def test_recovered_reference_schema_is_strict(git_repo, commit, numbers):
+    write_issue_references(git_repo, {commit: numbers})
+    with pytest.raises(ValueError, match="Recovered"):
+        release.release_history(git_repo)
 
 
 def test_the_feature_threshold_proposes_the_next_major(counted_repo, local):

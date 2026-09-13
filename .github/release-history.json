@@ -5,5 +5,8 @@
       "rewritten": "2c406150c9f559d5e975d88b645effbb449cf46d"
     }
   },
-  "retired": ["0.1.2"]
+  "retired": ["0.1.2"],
+  "issue_references": {
+    "4edd3fc6ed0f77bf516008b7d2f16f4fef578415": [105, 115, 118, 129, 130, 131, 140]
+  }
 }

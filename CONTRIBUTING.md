@@ -77,6 +77,10 @@ direct pushes. Revisit the review exception when additional maintainers join.
 
 Use Conventional Commit PR titles, such as `fix: preserve pending messages` or
 `ci: validate release metadata`; squash merges retain that title for changelogs.
+Repository squash defaults use `PR_TITLE` and `PR_BODY`. For releasing PRs,
+PR hygiene requires the same issue references in the validated PR body and
+commit messages, so either default body source preserves them. When using an
+explicit merge API message, preserve the PR body and its issue references.
 `feat`, `fix` and `perf` can contribute to a future release. Reserve them
 for changes a user of the distributed package would notice. Title workflow,
 tooling and documentation work `ci`, `build`, `chore`, `test`, `refactor` or
@@ -99,6 +103,11 @@ product work and stops there unless a version is warranted. Workflow repairs,
 release scripts, tests and documentation are structurally incapable of raising
 a version, because a commit counts only when a releasing conventional type
 introduces it and it also touches `agent_parley/` or `plugins/agent-parley/`.
+If an older squash commit lost its references, a reviewed `issue_references`
+entry in `.github/release-history.json` can recover them for that exact commit.
+Include the original PR as evidence. Recovery uses the same commit range,
+product checks and issue deduplication; it cannot turn tooling into product work
+or recount work included in the approved release.
 
 When eligibility is met, the release application raises every version marker,
 records a changelog entry built from the counted commits, runs the policy gate

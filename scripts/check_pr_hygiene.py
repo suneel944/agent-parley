@@ -7,18 +7,12 @@ import subprocess
 from typing import Any
 
 from scripts.check_policy import has_attribution
+from scripts.release_publish import ISSUE_REFERENCE, RELEASING_SUBJECT
 
 
 def issue_numbers(body: str) -> set[int]:
     """Returns explicit local issue references from a pull-request body."""
-    return {
-        int(match)
-        for match in re.findall(
-            r"(?im)\b(?:refs?|fix(?:es)?|clos(?:e[sd]?)|resolv(?:e[sd]?))"
-            r"\s+#([1-9][0-9]*)\b",
-            body,
-        )
-    }
+    return {int(match) for match in ISSUE_REFERENCE.findall(body)}
 
 
 def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
@@ -80,6 +74,31 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
+def validate_commit_references(
+    pr: dict[str, Any], commits: list[dict[str, Any]]
+) -> list[str]:
+    """Requires releasing commits to preserve the validated PR references.
+
+    Both default squash body sources must contain the same validated issue
+    IDs. This uses metadata available to read-only CI tokens; repository merge
+    settings are not returned to those tokens. Explicit merge API overrides
+    must still retain the validated references.
+    """
+    if not RELEASING_SUBJECT.match(pr.get("title", "")):
+        return []
+    referenced = {
+        number
+        for commit in commits
+        for number in issue_numbers(commit["commit"]["message"])
+    }
+    if referenced != issue_numbers(pr.get("body") or ""):
+        return [
+            "Preserve exactly the validated PR issue references in commit "
+            "messages using Refs #N or a closing keyword."
+        ]
+    return []
+
+
 def api(path: str, *, paginate: bool = False) -> Any:
     """Reads authenticated GitHub metadata through the native CLI.
 
@@ -113,6 +132,7 @@ def main() -> None:
     commits = api(
         f"repos/{repository}/pulls/{number}/commits?per_page=100", paginate=True
     )
+    errors += validate_commit_references(pr, commits)
     if any(has_attribution(commit["commit"]["message"]) for commit in commits):
         errors.append("Remove prohibited attribution from commit messages.")
     for endpoint in (

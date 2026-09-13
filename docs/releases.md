@@ -14,6 +14,46 @@ matched the GitHub packages. See the
 
 ## Audited release history
 
+### Recovering issue references lost during squash merging
+
+The repository uses the PR title and body as its squash commit defaults.
+PR hygiene requires releasing PRs to carry the same issue references in their
+validated bodies and commit messages. Both default body sources then retain
+the references. This check uses read-only CI metadata; repository squash
+settings are only visible with broader repository access. Explicit merge API
+message overrides must also preserve the issue references from the PR body.
+
+PR [#161](https://github.com/suneel944/agent-parley/pull/161) closed seven issues,
+but its squash commit `4edd3fc6ed0f77bf516008b7d2f16f4fef578415` omitted their
+references. Together with the three references retained by PR #139, the release
+counter saw four units instead of ten. The `issue_references` entry in
+`.github/release-history.json` records those seven references against the exact
+commit, preserving the existing Git history and release tags.
+
+Recovery metadata is reviewed alongside its source PR evidence. It contributes
+only when the named commit is in the unreleased range, has a releasing
+Conventional Commit title and changes the package or plugin. Its issue numbers
+share normal deduplication and replace the anonymous commit fallback. Changelog
+generation uses the same recovered references. Entries outside the current
+release range contribute nothing; keep them as an audit record.
+
+### Open follow-ups from the 0.4.0 implementation audit
+
+The original ten implementation issues were merged and passed the required
+gate. A subsequent audit identified further defects, tracked in milestone
+0.5.0: the P1 Copilot hook-format mismatch (#173), failed-resume identity loss
+(#175), stale PR evidence (#176), historical PR completion matching (#177),
+post-release reminder failures (#178), overwritten first-read and first-ack
+timestamps (#179), inconsistent event snapshots during rotation (#180), and
+missing wake delivery for handoff offers (#181).
+
+The release-accounting correction does not resolve those product defects.
+Issue #182 duplicates the accounting repair tracked by #174; its audit evidence
+remains available. Passing the existing test gate does not verify the newly
+reported cases or establish live native-client behavior.
+
+### Published artifact audit
+
 The read-only audit on 2026-09-10 downloaded the GitHub bundles and PyPI package
 files, verified both GitHub checksum manifests, and compared the package bytes.
 It predates 0.2.0, so the table below records the versions that existed then and
