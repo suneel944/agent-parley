@@ -113,10 +113,9 @@ holds projects, agents, messages, recipients, reservations and events, keyed by
 an authenticated project and lane. The issue ledger and the participant
 manifest are files in the project state directory, whose name derives from the
 repository's Git common directory, which the store never records. A served
-call carries no repository path, and the detached service must not run Git, so
-reaching that directory would need a new schema column, a launch-time map that
-goes stale as projects are added, or a scan of every project's manifest. None
-of those buys a capability. Dependency edges live in the same ledger file for
+call carries no repository path. The supervision worker separately discovers
+private project manifests for presence, reminders and wake requests; the served
+tool handlers do not run Git. Dependency edges live in the same ledger file for
 the same reason: `issues.json` already records ownership, offers and history
 per issue, and the checkpoint that reports a revision change reports the edges
 with it, so dependency notification costs no new substrate and no new tool.
@@ -129,6 +128,33 @@ store therefore stays free of repository paths, and refreshing context stays a
 checkpoint and CLI concern rather than a coordination tool.
 
 ## Participants, providers and accounts
+
+`supervision.py` owns the service's periodic presence observations, advisory
+handoff reminders and bounded wake requests. It reads project manifests to
+resolve lane state; this is the explicit bridge from served project identity to
+private launcher state. Its best-effort forge reads run outside store write
+transactions, and observation failures do not fail a committed coordination
+call. `participant_presence` is an additive table initialized with the store.
+The issue ledger retains reminders; only explicit issue transitions own claims.
+
+`terminal.py` owns a native pseudo-terminal and a private control socket under
+the existing session lock. `gemini.py` translates the additional native hook
+contract. `evidence.py` collects retained claim-window measurements and writes
+review artifacts beside the lane. The CLI orchestrates these modules and runs
+configured verification before publishing a PR; native authentication stays in
+the launch and forge paths.
+
+```mermaid
+flowchart LR
+    Service[Local service] --> Observer[Presence and reminder polling]
+    Observer --> Ledger[Explicit claims and advisory reminders]
+    Observer --> Wake[Bounded wake request]
+    Wake --> Terminal[Launcher-owned native terminal]
+    Terminal --> Native[Native CLI and permissions]
+    Native --> Hooks[Shared checkpoint engine]
+    Hooks --> Events[Retained event records]
+    Events --> Review[Claim-window review evidence]
+```
 
 A project holds a roster of participants. A participant is one lane: its own
 worktree, bridge branch, registration credential, activity file, event log and
@@ -154,6 +180,13 @@ call. A lane that never reaches a session boundary is still bounded by the byte
 cap. Each file is replaced atomically, and a failed rewrite leaves the log
 exactly as it was. A log failure never changes an enforcement outcome.
 
+Event-file lifetime has its own kernel lock, separate from the store and
+checkpoint locks. Append writers hold shared access; rotation and prune hold
+exclusive access, rechecking the byte cap after acquisition. Writers therefore
+do not serialize one another, but they wait for maintenance rather than append
+to a replaced inode. Locking maintenance alone cannot prevent that lost-write
+race. Interrupted prune temporaries are removed on the next prune.
+
 Retained records are readable as a whole or over a window. A window filters on
 the recorded time, so it reports a period rather than a file, and a record
 carrying no time is never counted inside one. Export writes the retained
@@ -176,7 +209,7 @@ unpinned numeric PID.
 
 A provider states which native CLI drives a participant and how that CLI reaches
 a model. Coordination needs an MCP server, a system prompt and lifecycle hooks,
-and three contracts implement that, so every provider names one of the three
+and four contracts implement that, so every provider names one of the four
 adapters and its executable must accept that contract in full. `claude` and
 `codex` take all three as command-line arguments of the session the launcher
 starts, so nothing is written into a configuration file the operator also owns
@@ -191,13 +224,12 @@ rather than placing lane hooks in the operator's own configuration directory.
 
 Providers for other vendors reuse an adapter and change the endpoint through
 environment variables, so a preset names the vendor whose models answer rather
-than that vendor's own agent CLI: `gemini` starts `codex` against a Gemini
-endpoint. The `deepseek`, `kimi`, `grok` and `gemini` presets carry no endpoint;
+than that vendor's own agent CLI. The `deepseek`, `kimi` and `grok` presets carry no endpoint;
 `agent-parley provider add` defines further providers locally.
 
-Gemini CLI, OpenCode and Amp stay uncovered, each for its own reason: Gemini
-CLI publishes no variable that relocates its configuration directory, OpenCode
-extends sessions through JavaScript plugins rather than hook commands, and Amp
+Gemini CLI uses a lane-private system settings overlay that preserves native
+system policy, with translated hook input and output in `gemini.py`.
+OpenCode extends sessions through JavaScript plugins rather than hook commands, and Amp
 accepts no system-prompt argument. None of them is a preset and none is drivable
 by naming it as a provider executable; `docs/operations.md` records each one's
 configuration surface.
@@ -299,7 +331,7 @@ labels and milestone are mirrored from the claimed issues, so classification
 comes from the issue rather than from the lane and the hygiene gate passes at
 creation. That metadata resolves before the push, so a refusal leaves no remote
 branch behind. It refuses on an unknown participant, a missing report, an
-unclassified claimed issue, claimed issues whose milestones disagree, an
+claimed issue rejected by the configured metadata policy, an
 unclaimed lane,
 a branch that adds no commits to the project base, and a base checkout on a
 detached HEAD or on the lane's own branch. An open pull request for the branch

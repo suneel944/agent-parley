@@ -259,9 +259,9 @@ agent-parley top --provider claude --provider codex
 ## Providers and accounts
 
 A provider states which native CLI drives a participant and how that CLI reaches
-a model. Every provider names one of three adapters, and the adapter decides how
+a model. Every provider names one of four adapters, and the adapter decides how
 that CLI is handed its MCP server, its coordination prompt and its hooks. Two of
-the three take a published plugin, which is why two plugin installations cover
+the four take a published plugin, which is why two plugin installations cover
 every model-endpoint preset:
 
 | Provider | Native CLI it drives | Plugin that carries `coordinate` |
@@ -269,18 +269,19 @@ every model-endpoint preset:
 | `claude` | `claude` | Claude Code |
 | `codex` | `codex` | Codex |
 | `copilot` | `copilot` | none; the launcher writes that lane's files |
-| `deepseek`, `kimi`, `grok`, `gemini` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
+| `gemini` | `gemini` | none; the launcher writes a private settings overlay |
+| `deepseek`, `kimi`, `grok` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
-`claude` and `codex` work out of the box. The `deepseek`, `kimi`, `grok` and
-`gemini` presets carry no endpoint, so their base URL and key must be exported in
+`claude`, `codex` and `gemini` use their native accounts. The `deepseek`, `kimi`
+and `grok` presets carry no endpoint, so their base URL and key must be exported in
 the launching shell; the launcher refuses to start when a required variable is
 unset rather than falling back to another account. Coordination state records
 variable names and config directories, never credential values.
 
-A preset names the vendor whose models answer, not a vendor's own agent CLI:
-`gemini` reaches Gemini models through the `codex` CLI, exactly as `grok` and
-`kimi` do for theirs.
+`agent-parley run gemini` starts Gemini CLI with a lane-private MCP and hook
+overlay while preserving native system settings and authentication. Existing
+explicit provider definitions keep their adapter until you update them.
 
 Credential profiles point a provider's config-home variable at a separate
 directory, so one provider can run under several logins. Up to 32 participants
@@ -288,7 +289,7 @@ per project.
 
 ### Other agent CLIs
 
-Three adapters cover three ways of accepting configuration. `claude` and
+Four adapters cover the native configuration contracts. `claude` and
 `codex` take MCP servers, the coordination prompt and lifecycle hooks as
 command-line arguments. `copilot` reads them from files instead, so Agent
 Parley writes `mcp-config.json` and `settings.json` into that lane's own
@@ -296,9 +297,8 @@ Copilot configuration directory; a `copilot` lane therefore requires a
 credential profile, and the launcher refuses without one rather than writing
 hooks into the configuration directory your own sessions use.
 
-Gemini CLI, OpenCode and Amp are not covered. Gemini CLI publishes no variable
-that relocates `~/.gemini`, so it cannot be given a lane of its own; OpenCode
-runs plugins rather than hook commands; Amp accepts no system-prompt argument.
+OpenCode and Amp remain recipes. OpenCode runs plugins rather than hook
+commands; Amp accepts no system-prompt argument.
 [Operations](docs/operations.md#other-agent-clis) records what each one
 supports and where its MCP and hook configuration lives.
 
@@ -400,7 +400,9 @@ permission settings still apply.
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent
 Parley integrates a lane only when you run `participant merge`, and it never
-approves a command or wakes an idle agent. Reported `ready` is ready for review,
+approves a command. The runtime can wake an idle lane to review pending mail,
+with global and per-lane opt-outs and at most three attempts per backlog.
+Reported `ready` is ready for review,
 not verified completion. Token usage still depends on the native agents:
 `CONTEXT` reports the bytes coordination itself injects and `TOKENS` repeats
 what a lane's own client counted, and neither is billed spend or a claim about

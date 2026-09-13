@@ -411,8 +411,19 @@ def main() -> None:
     os.umask(0o077)
     config = json.loads((args.home / "config.json").read_text())
     store.initialize(args.home)
-    with Server(args.home, config) as server:
-        server.serve_forever(poll_interval=0.2)
+    from agent_parley import supervision
+
+    stopped = threading.Event()
+    observer = threading.Thread(
+        target=supervision.run, args=(args.home, stopped), daemon=True
+    )
+    observer.start()
+    try:
+        with Server(args.home, config) as server:
+            server.serve_forever(poll_interval=0.2)
+    finally:
+        stopped.set()
+        observer.join(timeout=2)
 
 
 if __name__ == "__main__":

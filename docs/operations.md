@@ -171,6 +171,49 @@ history beyond what the state directory retains.
 
 ## Participants, providers and accounts
 
+### Availability, reminders and waking
+
+The local service observes each launcher's process identity and native checkpoint
+age. `status` distinguishes a stopped process from a live but quiet lane and
+lists outstanding acknowledgement IDs, senders and ages. Sending an
+`ack_required` message returns an availability warning when the latest runtime
+observation marks its recipient unreachable. Observed availability is separate
+from last coordination and never changes claims.
+
+The private project manifest accepts `"supervision"` with `interval` (default
+30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
+Numeric values range from 1 to 86400 seconds. The same keys in
+`$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
+`wake` and `prompts` cannot be enabled by a project. A participant entry may set
+`"wake": false` to opt out individually. These settings remain outside source.
+
+Releasing a claim with waiting peers creates a visible handoff reminder.
+The service also checks claimed lane PRs on each poll and reminds holders when
+one is merged or closed. Forge lookups are bounded and best effort; an offline
+forge cannot establish completion. Reminders appear in issue/status output and
+at checkpoints. An explicit subsequent message reaching every waiting peer
+marks a response observed; that is delivery evidence, not proof of a complete
+handoff. Ownership still moves only through the explicit offer/accept protocol.
+
+For eligible idle sessions, the launcher owns a native pseudo-terminal and a
+private wake socket. It admits only a fixed coordination prompt at a native idle
+checkpoint, with no partially entered operator input. Approval prompts and
+active turns refuse injection. A stopped session can resume its recorded session
+ID through the same native launch configuration and an interactive terminal;
+`agent-parley run NAME --resume` exposes that operation explicitly. Native trust,
+authentication and permission prompts remain in force. Environment-only vendor
+accounts that cannot be reconstructed safely require manual attention.
+
+Wake attempts are separated by the inactivity interval and capped at three for
+each unchanged backlog. Results appear in `status`, the retained event log and
+private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
+Lanes launched before wake sockets were introduced require relaunching. An
+unavailable adapter or socket is reported for manual attention. Waking never
+marks mail read, acknowledges it, releases reservations or transfers an issue.
+
+The automated tests exercise local processes, pseudo-terminals, hook payloads
+and real MCP transport. They do not establish live model behavior for a provider.
+
 ```sh
 agent-parley provider list
 agent-parley credentials add account-1 --config-home ~/.claude-account-1
@@ -189,14 +232,19 @@ instead of refusing to start. It names the stash entry and prints the
 of a repository shares one stash stack. Only that first registration touches the
 base checkout; `merge`, `restore` and `retire` still refuse on a dirty tree. The participant name is what peers
 address; the provider decides which native CLI starts and which endpoint it uses.
-The `deepseek`, `kimi`, `grok` and `gemini` presets need their vendor base URL
+The `deepseek`, `kimi` and `grok` presets need their vendor base URL
 and key exported in the launching shell; the launcher refuses to start when a
 required variable is unset, rather than falling back to another account.
 
-A preset is named after the vendor whose models answer, not after that vendor's
-own agent CLI. `gemini` starts the `codex` CLI against a Gemini endpoint and
-requires `OPENAI_BASE_URL` and `OPENAI_API_KEY`; it does not start the Gemini
-CLI. The same holds for `deepseek`, `kimi` and `grok`.
+The `gemini` preset starts the native Gemini CLI. It copies native system policy
+into a lane-private settings overlay, adds the MCP endpoint and translated
+checkpoint hooks, and selects that overlay with
+`GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Native user/project settings and authentication
+remain in effect. Credential profiles may select `GEMINI_CLI_HOME`, whose
+`.gemini` subdirectory holds that account's native configuration. Existing
+explicit provider definitions are preserved. The integration follows Gemini's
+[configuration](https://geminicli.com/docs/reference/configuration/) and
+[hook contracts](https://geminicli.com/docs/hooks/reference/).
 
 Credential profiles point a provider's config-home variable at a separate
 directory so one provider can run under several accounts. Define one profile per
@@ -233,7 +281,7 @@ The launch path was exercised against a stub executable that records its
 arguments and environment, not against a live Copilot session, so argument and
 file handling are verified while live model behavior is not.
 
-Gemini CLI, OpenCode and Amp remain uncovered, each for a different reason
+OpenCode and Amp remain uncovered, each for a different reason
 recorded below. `agent-parley provider add` will store a definition naming one
 of them, because the command is only resolved on `PATH` at launch, but the
 resulting session fails inside the native CLI. There is no flag that makes it
@@ -241,20 +289,17 @@ work and none should be added.
 
 | Agent CLI | MCP configuration | Lifecycle hooks | Per-account config home |
 | --- | --- | --- | --- |
-| Gemini CLI | `mcpServers` in `~/.gemini/settings.json`, or `gemini mcp add` | `hooks` in the same file | none published |
+| Gemini CLI | lane-private system settings overlay | translated native hooks | `GEMINI_CLI_HOME` |
 | Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `hooks` in `$COPILOT_HOME/settings.json` | `COPILOT_HOME` |
 | OpenCode | `mcp` in `opencode.json`, or `opencode mcp add` | JavaScript plugins only | `OPENCODE_CONFIG_DIR` |
 | Amp | `--mcp-config`, or `amp.mcpServers` in its settings file | `amp.hooks` in its settings file | `--settings-file`, `AMP_SETTINGS_FILE` |
 
-Copilot CLI is covered by the `copilot` adapter above. The other three are not.
+Copilot CLI and Gemini CLI have native adapters. The other two do not.
 Amp accepts `--mcp-config`, but it has no `--append-system-prompt`, and its
 settings arrive through `--settings-file` rather than `--settings`, so two
 thirds of the `claude` contract is rejected. OpenCode extends sessions through
 JavaScript plugins rather than hook commands, so lane checkpoints and the
-enforcement record would have no way to run. Gemini CLI publishes no variable
-that relocates `~/.gemini`, so a credential profile cannot give it an account
-of its own; `launch_environment` refuses a profile whose provider has no
-`home_env` rather than sharing one login.
+enforcement record would have no way to run.
 
 ## Recovery and teardown
 
@@ -344,15 +389,39 @@ branch is reported rather than duplicated, and its branch is still updated by
 the push. Pushing to `origin` happens only here; `status` never reaches a
 remote.
 
-The pull request opens owned and classified. Your own GitHub account becomes
-its assignee, and its change-type labels and milestone are read from the issues
-the lane claims rather than chosen by the lane, so a participant never
-classifies its own work. That metadata is resolved before the branch is pushed:
-an issue carrying no change-type label refuses the whole command, naming the
-issue and the labels the repository accepts, and claimed issues carrying
-different milestones refuse it as well. A reported `ready` outcome is the
-participant's own account, so an opened pull request still needs review and the
-target repository's own gate.
+Your native GitHub account becomes the assignee. Labels and milestone are read
+from claimed issues before pushing. Unlabelled issues are supported; a project
+can require classification explicitly. The private `project.json` accepts a
+`pull_request` object with these optional settings:
+
+```json
+{
+  "pull_request": {
+    "change_type_labels": ["bug", "enhancement"],
+    "require_label": false,
+    "milestone": "match",
+    "body_template": "## Review checklist\n\n- [ ] Reviewed"
+  }
+}
+```
+
+The default label vocabulary remains the shipped eight change types.
+`milestone` accepts `match` (reject conflicting milestones), `required` (every
+issue must also have one), or `ignore`. With no configured body template, the
+launcher reads the target repository's PR template when present. The report and
+issue references are always included; optional `$summary`, `$evidence`,
+`$remaining`, `$outcome` and `$issues` placeholders are expanded as text.
+
+The PR also carries independently recorded evidence: the configured command is
+executed in the lane, denials are counted by reason within the current claim
+window, and advisory reservation history and recorded conflicts are summarized.
+A failed gate, active session, dirty lane or changed commit refuses integration.
+No gate and no recorded denials are stated explicitly. A JSON evidence snapshot
+and a JSON Lines event slice are written beside the lane in private project
+state. The body names the slice and its SHA-256 digest; it is not uploaded or
+committed automatically. Counts cover retained observations, so missing or expired
+records cannot prove that no event occurred. Older logs did not distinguish
+reservation conflicts from successful calls.
 
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's

@@ -188,7 +188,15 @@ def change(
         state["issues"][issue] = record
         state["revision"] += 1
         write_json(directory / "issues.json", state)
-        return record
+    if action == "release":
+        from agent_parley import roster, supervision
+
+        manifest = roster.read(directory)
+        if supervision.configuration(directory.parent.parent, manifest)[
+            "prompts"
+        ]:
+            supervision.reminders(directory, manifest, set())
+    return record
 
 
 def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
@@ -209,6 +217,12 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
     for number, record in sorted(
         state["issues"].items(), key=lambda item: int(item[0])
     ):
+        if prompt := record.get("handoff_prompt"):
+            if not prompt.get("responded_at"):
+                age = max(0, int(time.time() - prompt["created"]))
+                lines.append(
+                    f"Handoff reminder unanswered {age}s: {prompt['text']}"
+                )
         if not record["owner"]:
             continue
         line = f"#{number}: {record['owner']}"

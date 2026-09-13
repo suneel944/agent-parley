@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_parley.state import BridgeError, lock, write_json
 
-ADAPTERS = ("claude", "codex", "copilot")
+ADAPTERS = ("claude", "codex", "copilot", "gemini")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
 VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL")
@@ -78,11 +78,11 @@ PRESETS: dict[str, dict] = {
         "require_env": [],
     },
     "gemini": {
-        "adapter": "codex",
-        "command": "codex",
-        "home_env": "CODEX_HOME",
+        "adapter": "gemini",
+        "command": "gemini",
+        "home_env": "GEMINI_CLI_HOME",
         "env": {},
-        "require_env": ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
+        "require_env": [],
     },
 }
 
@@ -494,13 +494,57 @@ def normalize(manifest: dict) -> dict:
             }
             for name, lane in manifest["lanes"].items()
         }
+    for participant in participants.values():
+        if type(participant.get("wake", True)) is not bool:
+            raise BridgeError("Participant wake setting must be a boolean.")
     return {
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
         "base": manifest["base"],
         "verify": list(manifest.get("verify") or []),
+        "pull_request": pull_request_policy(manifest.get("pull_request", {})),
+        "supervision": dict(manifest.get("supervision", {})),
         "participants": participants,
     }
+
+
+def pull_request_policy(value: dict) -> dict:
+    """Validates optional project pull-request metadata and body settings.
+
+    Args:
+        value: Policy object from the private project manifest.
+
+    Returns:
+        Validated settings; omitted fields retain the shipped defaults.
+
+    Raises:
+        BridgeError: If a setting is unknown or has an invalid value.
+    """
+    if not isinstance(value, dict) or set(value) - {
+        "change_type_labels",
+        "require_label",
+        "milestone",
+        "body_template",
+    }:
+        raise BridgeError("Invalid pull_request policy in project manifest.")
+    labels = value.get("change_type_labels", [])
+    if (
+        not isinstance(labels, list)
+        or len(labels) > 100
+        or any(
+            not isinstance(label, str) or not label.strip() or len(label) > 100
+            for label in labels
+        )
+    ):
+        raise BridgeError("change_type_labels must be a list of label names.")
+    if type(value.get("require_label", False)) is not bool:
+        raise BridgeError("require_label must be a boolean.")
+    if value.get("milestone", "match") not in {"match", "required", "ignore"}:
+        raise BridgeError("milestone must be match, required, or ignore.")
+    template = value.get("body_template", "")
+    if not isinstance(template, str) or len(template.encode()) > 20000:
+        raise BridgeError("body_template must contain at most 20000 bytes.")
+    return dict(value)
 
 
 def expand(manifest: dict) -> dict:
