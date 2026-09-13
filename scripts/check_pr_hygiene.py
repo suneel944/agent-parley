@@ -7,18 +7,12 @@ import subprocess
 from typing import Any
 
 from scripts.check_policy import has_attribution
+from scripts.release_publish import ISSUE_REFERENCE, RELEASING_SUBJECT
 
 
 def issue_numbers(body: str) -> set[int]:
     """Returns explicit local issue references from a pull-request body."""
-    return {
-        int(match)
-        for match in re.findall(
-            r"(?im)\b(?:refs?|fix(?:es)?|clos(?:e[sd]?)|resolv(?:e[sd]?))"
-            r"\s+#([1-9][0-9]*)\b",
-            body,
-        )
-    }
+    return {int(match) for match in ISSUE_REFERENCE.findall(body)}
 
 
 def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
@@ -80,17 +74,28 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
     return errors
 
 
-def validate_repository(repository: dict[str, Any]) -> list[str]:
-    """Requires squash defaults that retain the validated PR title and body.
+def validate_commit_references(
+    pr: dict[str, Any], commits: list[dict[str, Any]]
+) -> list[str]:
+    """Requires releasing commits to preserve the validated PR references.
 
-    Explicit merge API message overrides must also preserve issue references;
-    repository defaults cannot constrain an override supplied at merge time.
+    Both default squash body sources must contain the same validated issue
+    IDs. This uses metadata available to read-only CI tokens; repository merge
+    settings are not returned to those tokens. Explicit merge API overrides
+    must still retain the validated references.
     """
-    if (
-        repository.get("squash_merge_commit_title") != "PR_TITLE"
-        or repository.get("squash_merge_commit_message") != "PR_BODY"
-    ):
-        return ["Set squash merge defaults to the PR title and PR body."]
+    if not RELEASING_SUBJECT.match(pr.get("title", "")):
+        return []
+    referenced = {
+        number
+        for commit in commits
+        for number in issue_numbers(commit["commit"]["message"])
+    }
+    if referenced != issue_numbers(pr.get("body") or ""):
+        return [
+            "Preserve exactly the validated PR issue references in commit "
+            "messages using Refs #N or a closing keyword."
+        ]
     return []
 
 
@@ -123,11 +128,11 @@ def main() -> None:
         api(f"repos/{repository}/issues/{issue}")
         for issue in sorted(issue_numbers(pr.get("body") or ""))
     ]
-    errors = validate_repository(api(f"repos/{repository}"))
-    errors += validate(pr, issues)
+    errors = validate(pr, issues)
     commits = api(
         f"repos/{repository}/pulls/{number}/commits?per_page=100", paginate=True
     )
+    errors += validate_commit_references(pr, commits)
     if any(has_attribution(commit["commit"]["message"]) for commit in commits):
         errors.append("Remove prohibited attribution from commit messages.")
     for endpoint in (

@@ -29,7 +29,9 @@ CHANGELOG_SECTIONS = (
 )
 RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?!?:")
 ISSUE_REFERENCE = re.compile(
-    r"\b(?:refs|fixes|closes|resolves)\s+#(\d+)\b", re.IGNORECASE
+    r"\b(?:refs?|fix(?:es)?|clos(?:e[sd]?)|resolv(?:e[sd]?))"
+    r"\s+#([1-9][0-9]*)\b",
+    re.IGNORECASE,
 )
 
 

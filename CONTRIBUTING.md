@@ -77,9 +77,10 @@ direct pushes. Revisit the review exception when additional maintainers join.
 
 Use Conventional Commit PR titles, such as `fix: preserve pending messages` or
 `ci: validate release metadata`; squash merges retain that title for changelogs.
-Repository squash defaults must use `PR_TITLE` and `PR_BODY`; PR hygiene checks
-these settings so the validated issue references reach Git history. When using
-an explicit merge API message, preserve the PR body and its issue references.
+Repository squash defaults use `PR_TITLE` and `PR_BODY`. For releasing PRs,
+PR hygiene requires the same issue references in the validated PR body and
+commit messages, so either default body source preserves them. When using an
+explicit merge API message, preserve the PR body and its issue references.
 `feat`, `fix` and `perf` can contribute to a future release. Reserve them
 for changes a user of the distributed package would notice. Title workflow,
 tooling and documentation work `ci`, `build`, `chore`, `test`, `refactor` or
