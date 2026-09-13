@@ -1102,7 +1102,7 @@ def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     entries = [json.loads(line) for line in log.read_text().splitlines()]
     assert [entry["reason_class"] for entry in entries] == [
         "coordination_pending",
-        "ignored_event",
+        "observed",
         "branch_drift",
     ]
     assert [entry["decision"] for entry in entries] == [
@@ -2513,7 +2513,7 @@ def verification_script(directory, name, body):
 
 
 def test_merge_runs_the_repository_verification_command_first(
-    bridge, repo, paired, tmp_path
+    bridge, repo, paired, tmp_path, capfd
 ):
     lane = Path(paired["lanes"]["codex"])
     branch = paired["branches"]["codex"]
@@ -2543,8 +2543,9 @@ def test_merge_runs_the_repository_verification_command_first(
     with pytest.raises(BridgeError, match="Verification failed") as failure:
         bridge.merge(repo, "codex")
     assert "exited 3" in str(failure.value)
-    assert "checked line one" in str(failure.value)
-    assert "checked line two" in str(failure.value)
+    output = capfd.readouterr()
+    assert "checked line one" in output.out
+    assert "checked line two" in output.err
     assert Path(red_marker.read_text().strip()).resolve() == root.resolve()
     assert not (repo / "second.txt").exists()
 
@@ -2609,6 +2610,7 @@ def stub_github_cli(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_OPEN", str(listed))
     monkeypatch.setenv("GH_CREATE", str(created))
     monkeypatch.setenv("GH_ISSUE", str(issue))
+    monkeypatch.setattr(forge, "slug", lambda repo: "example/agent-parley")
     return listed, created, issue
 
 
@@ -2666,6 +2668,7 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
     assert options["--assignee"] == "@me"
     assert options["--label"] == "enhancement"
     assert options["--milestone"] == "0.2.0"
+    assert options["--repo"] == "example/agent-parley"
     assert (
         validate(
             {

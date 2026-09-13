@@ -10,13 +10,28 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check:
+    needs: python
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every supported Python check
+        env:
+          RESULT: ${{ needs.python.result }}
+        run: test "$RESULT" = success
+  python:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: ${{ matrix.python }}
       - run: make check
   secrets:
     runs-on: ubuntu-latest

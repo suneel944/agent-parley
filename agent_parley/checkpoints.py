@@ -685,7 +685,9 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         BridgeError: If the event targets another lane or locking fails.
     """
     event = payload.get("hook_event_name")
-    if event not in EVENTS or payload.get("agent_id"):
+    if event not in EVENTS or (
+        payload.get("agent_id") and event != "PreToolUse"
+    ):
         record(directory, agent, payload, Reason.IGNORED_EVENT, None)
         return {}
     manifest = roster.read(directory)
@@ -721,6 +723,9 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         return guarded
     if guard_reason is Reason.BRANCH_RESTORE:
         record(directory, agent, payload, guard_reason, None)
+    if payload.get("agent_id"):
+        record(directory, agent, payload, Reason.OBSERVED, None)
+        return {}
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
     state_path = directory / f"{agent}-activity.json"
     with lock(directory / f"{agent}-checkpoint.lock", timeout=1):

@@ -33,7 +33,6 @@ from agent_parley.issues import change, describe, parse_issue, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
 VERIFY_TIMEOUT = 1800
-VERIFY_TAIL_LINES = 20
 CHANGE_TYPE = frozenset(
     {
         "bug",
@@ -75,7 +74,7 @@ def git(repo: Path, *args: str) -> str:
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=None if args and args[0] in {"push", "pull", "fetch"} else 30,
         check=False,
     )
     if result.returncode:
@@ -374,7 +373,7 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     Raises:
         BridgeError: If either checkout cannot be merged from, or if the
             merge stopped on conflicts that only the operator can resolve.
-        subprocess.TimeoutExpired: If the merge exceeds its timeout.
+        subprocess.TimeoutExpired: If a preliminary read exceeds its timeout.
     """
     blocker = next(merge_blockers(root, lane, name, branch), "")
     if blocker:
@@ -400,7 +399,6 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         ],
         capture_output=True,
         text=True,
-        timeout=120,
         check=False,
     )
     if result.returncode:
@@ -474,7 +472,6 @@ def verify_base(root: Path, command: list[str]) -> None:
         result = subprocess.run(
             command,
             cwd=root,
-            capture_output=True,
             text=True,
             timeout=VERIFY_TIMEOUT,
             check=False,
@@ -487,13 +484,10 @@ def verify_base(root: Path, command: list[str]) -> None:
         ) from None
     if not result.returncode:
         return
-    tail = "\n".join(
-        (result.stdout + result.stderr).splitlines()[-VERIFY_TAIL_LINES:]
-    )
     raise BridgeError(
         f"Verification failed in the base checkout at {root}: `{quoted}` "
         f"exited {result.returncode}. Fix it and rerun; merge never skips "
-        f"verification and nothing was merged.\n{tail}"
+        "verification and nothing was merged. See the command output above."
     )
 
 
@@ -503,8 +497,7 @@ def gh(cwd: Path, *args: str) -> str:
     Authentication, host selection and repository permissions stay with the
     native `gh` installation. Agent Parley passes no token, reads no
     credential, and adds no flag that would bypass a repository rule. The
-    working directory selects the repository, exactly as it does when the
-    operator runs `gh` by hand.
+    origin remote selects the repository, matching the forge integration.
 
     Args:
         cwd: Checkout the command runs in, which selects the repository.
@@ -523,8 +516,11 @@ def gh(cwd: Path, *args: str) -> str:
             "Install and sign in to the native gh CLI first; Agent Parley "
             "uses your own GitHub authentication and never stores a token."
         )
+    repository = forge.slug(cwd)
+    if repository is None:
+        raise BridgeError("The origin remote must name a GitHub repository.")
     result = subprocess.run(
-        [executable, *args],
+        [executable, *args, "--repo", repository],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -627,6 +623,51 @@ def pull_request_body(state: dict, issues: list[str]) -> str:
         "## Compatibility and risks\n\n"
         f"{remaining}\n"
     )
+
+
+def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
+    """Merges lane configuration without replacing native user settings.
+
+    Existing hook order is retained and identical lane hooks are not appended
+    again on relaunch. Both documents are validated before either is written.
+
+    Args:
+        home: Credential profile's native configuration directory.
+        server: Agent Parley MCP server definition.
+        hooks: Native hook events and their command lists.
+
+    Raises:
+        BridgeError: If either existing document has an incompatible shape.
+    """
+    with lock(home / "agent-parley-config.lock"):
+        documents = []
+        for filename, key in (
+            ("mcp-config.json", "mcpServers"),
+            ("settings.json", "hooks"),
+        ):
+            path = home / filename
+            try:
+                data = json.loads(path.read_text()) if path.exists() else {}
+            except ValueError as exc:
+                raise BridgeError(f"Invalid configuration in {path}.") from exc
+            if not isinstance(data, dict) or not isinstance(
+                data.get(key, {}), dict
+            ):
+                raise BridgeError(f"Expected an object for {key} in {path}.")
+            data.setdefault(key, {})
+            documents.append((path, data))
+        documents[0][1]["mcpServers"]["agent_parley"] = server
+        settings = documents[1][1]
+        settings.setdefault("version", 1)
+        for event, commands in hooks.items():
+            existing = settings["hooks"].setdefault(event, [])
+            if not isinstance(existing, list):
+                raise BridgeError(f"Expected a hook list for {event}.")
+            existing.extend(
+                command for command in commands if command not in existing
+            )
+        for path, data in documents:
+            write_json(path, data)
 
 
 class Bridge:
@@ -1906,38 +1947,26 @@ review, not merged or independently verified. An idle turn is not completion.
                         "DIR`, sign in to it once, and launch with "
                         "--credentials NAME."
                     )
-                write_json(
-                    Path(config_home) / "mcp-config.json",
+                configure_copilot(
+                    Path(config_home),
                     {
-                        "mcpServers": {
-                            "agent_parley": {
-                                "type": "http",
-                                "url": self.url + "/mcp/",
-                                "headers": {
-                                    "Authorization": (
-                                        "Bearer ${AGENT_PARLEY_TOKEN}"
-                                    )
-                                },
-                                "tools": ["*"],
-                            }
-                        }
-                    },
-                )
-                write_json(
-                    Path(config_home) / "settings.json",
-                    {
-                        "version": 1,
-                        "hooks": {
-                            COPILOT_EVENTS[event]: [
-                                {
-                                    "type": "command",
-                                    "bash": groups[0]["hooks"][0]["command"],
-                                    "timeoutSec": 3,
-                                }
-                            ]
-                            for event, groups in hooks.items()
-                            if event in COPILOT_EVENTS
+                        "type": "http",
+                        "url": self.url + "/mcp/",
+                        "headers": {
+                            "Authorization": ("Bearer ${AGENT_PARLEY_TOKEN}")
                         },
+                        "tools": ["*"],
+                    },
+                    {
+                        COPILOT_EVENTS[event]: [
+                            {
+                                "type": "command",
+                                "bash": groups[0]["hooks"][0]["command"],
+                                "timeoutSec": 3,
+                            }
+                        ]
+                        for event, groups in hooks.items()
+                        if event in COPILOT_EVENTS
                     },
                 )
                 command = [
@@ -2218,6 +2247,7 @@ def main() -> int:
     )
     definitions = provider.add_subparsers(dest="action", required=True)
     definitions.add_parser("list")
+    definitions.add_parser("remove").add_argument("name")
     defining = definitions.add_parser("add")
     defining.add_argument("name")
     defining.add_argument("--adapter", choices=roster.ADAPTERS, required=True)
@@ -2230,6 +2260,7 @@ def main() -> int:
     )
     profiles = accounts.add_subparsers(dest="action", required=True)
     profiles.add_parser("list")
+    profiles.add_parser("remove").add_argument("name")
     profile = profiles.add_parser("add")
     profile.add_argument("name")
     profile.add_argument("--config-home", default="")
@@ -2372,6 +2403,14 @@ def main() -> int:
                     args.env,
                     args.require_env,
                 )
+                if args.name in roster.PRESETS:
+                    print(
+                        f"Warning: {args.name!r} shadows a built-in preset; "
+                        "provider remove restores it.",
+                        file=sys.stderr,
+                    )
+            elif args.action == "remove":
+                roster.remove(bridge.home, "provider", args.name)
             print(json.dumps(roster.providers(bridge.home), indent=2))
         elif args.command == "credentials":
             if args.action == "add":
@@ -2382,6 +2421,8 @@ def main() -> int:
                     args.env,
                     args.require_env,
                 )
+            elif args.action == "remove":
+                roster.remove(bridge.home, "credentials", args.name)
             print(json.dumps(roster.credentials(bridge.home), indent=2))
         else:
             bridge.status()

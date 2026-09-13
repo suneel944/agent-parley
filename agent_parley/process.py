@@ -12,6 +12,7 @@ beside its process ID, so a reused process ID never passes for the
 session that first claimed it.
 """
 
+import ctypes
 import functools
 import os
 import select
@@ -103,6 +104,44 @@ def linux_matches_command(pid: int, home: Path) -> bool:
     return command[1:5] == expected
 
 
+def libc_pidfd(name: str, *arguments: int | None) -> int:
+    """Calls the host's pidfd API when Python was built without its wrappers.
+
+    Portable Python builds can omit pidfd wrappers even on a capable host.
+    Calling the same libc API preserves the pinned-process signaling contract;
+    a missing host API fails closed instead of falling back to a numeric PID.
+
+    Args:
+        name: Either pidfd_open or pidfd_send_signal.
+        *arguments: Native arguments, including a null siginfo pointer.
+
+    Returns:
+        The file descriptor or successful signal result.
+
+    Raises:
+        BridgeError: If the host libc lacks the requested API.
+        OSError: If the native call fails, retaining its errno subclass.
+    """
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = getattr(library, name)
+    except AttributeError as exc:
+        raise BridgeError(
+            f"This Python build requires a host libc providing {name}."
+        ) from exc
+    function.argtypes = (
+        [ctypes.c_int, ctypes.c_uint]
+        if name == "pidfd_open"
+        else [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+    )
+    function.restype = ctypes.c_int
+    result = int(function(*arguments))
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return result
+
+
 def linux_terminate(pid: int, ticks: str) -> None:
     """Pins the process with pidfd before signaling and waiting for exit.
 
@@ -115,13 +154,20 @@ def linux_terminate(pid: int, ticks: str) -> None:
             not exit within the shutdown timeout.
     """
     try:
-        fd = os.pidfd_open(pid)
+        fd = (
+            os.pidfd_open(pid)
+            if hasattr(os, "pidfd_open")
+            else libc_pidfd("pidfd_open", pid, 0)
+        )
     except ProcessLookupError:
         return
     try:
         if linux_start_ticks(pid) != ticks:
             raise BridgeError("Server PID changed; refusing to signal it.")
-        signal.pidfd_send_signal(fd, signal.SIGTERM)
+        if hasattr(signal, "pidfd_send_signal"):
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+        else:
+            libc_pidfd("pidfd_send_signal", fd, signal.SIGTERM, None, 0)
         if not select.select([fd], [], [], STOP_TIMEOUT)[0]:
             raise BridgeError("Server did not stop within 10s.")
         try:

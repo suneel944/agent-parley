@@ -4,6 +4,22 @@
 
 ### Fixes
 
+- Preserve Copilot account settings, other MCP servers and existing hooks
+  across lane launches (#108).
+- Let Git network operations and merges finish without a kill timeout, stream
+  verification output, and pin pull requests to the origin repository (#112).
+- Fit the live dashboard to terminal dimensions, mark hidden participants,
+  and retain the missing-checkpoint warning (#113).
+- Guard sub-agent tool commands before ignoring child lifecycle state (#125).
+- Add inbox receipt timestamps and pending-message filters under one response
+  budget, and validate body offsets even when the inbox is empty (#116).
+- Add provider and credential removal, warn on preset overrides, and validate
+  credential profiles before creating their configuration directories (#117).
+- Document inherited lane-token exposure and mitigation, list all commands and
+  MCP tools, and update the installed coordination skill (#114, #121, #122).
+- Run the required CI gate on Python 3.12, 3.13 and 3.14 and preserve safe
+  Linux shutdown on Python builds without pidfd wrappers (#124).
+
 - Wait briefly for checkpoint and issue locks without queuing session launches
   (#101).
 - Allow a repeated Stop after branch drift, and permit exact repair when the

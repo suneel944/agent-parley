@@ -10,8 +10,9 @@ all participants must use the same private state root.
 
 Start with `agent-parley status`, `agent-parley participant list`, and
 `agent-parley issue list` in the current repository. These show ownership separately from activity and reported outcomes.
-If the executable is missing, installation from the Agent Parley checkout is
-`make install`. Do not install software merely to answer a status question.
+If installation is part of the task, use `uv tool install agent-parley`.
+Contributors can use `make install` from a checkout. Do not install software
+merely to answer a status question.
 
 ## Select the correct lane
 
@@ -27,7 +28,7 @@ agent-parley run codex --repo /path/to/repository
 agent-parley run claude-2 --provider claude --credentials account-2 --repo /path/to/repository
 ```
 
-A project can hold any number of participants, including several of the same
+A project can hold up to 32 participants, including several of the same
 provider under different accounts. Use `list_participants` over MCP, or
 `agent-parley participant list`, to see who is currently addressable.
 
@@ -64,6 +65,40 @@ Reports are agent claims, not independent verification. Handoffs neither transfe
 file reservations nor acknowledge mail. Acknowledge reviewed messages explicitly
 through MCP. Coordinate integration separately; do not infer merge/push authority
 from issue ownership.
+
+## Read mail and inspect evidence
+
+Use `fetch_inbox` with `unread` or `unacknowledged` to find pending mail; rows
+carry `read_ts` and `ack_ts`. Fetching changes neither. Page with `after_id`,
+request bodies only when needed, and use `body_offset` for long bodies.
+`mark_message_read` records reading; `acknowledge_message` records review.
+Use `read_thread` or `agent-parley mail thread ID` to recover a conversation,
+and `search_messages` or `agent-parley mail search QUERY` to locate prior
+decisions. Both are scoped to mail this lane sent or received. Replies can use
+`reply_to` or the existing `thread_id` with `send_message`.
+
+`file_reservation_paths` and `release_file_reservations` manage advisory path
+reservations. They are not filesystem locks. `list_participants` discovers
+current identities; do not guess who is addressable.
+
+`agent-parley top --once` prints a snapshot; `top --provider NAME --since 6h`
+narrows it. `agent-parley events export --since 7d --output FILE` exports
+retained hook evidence. Neither view independently proves a reported result.
+
+## Operator and integration commands
+
+`agent-parley say NAME TEXT --ack` sends from the CLI-only `operator` identity.
+It is an operator action, not a way for a lane to impersonate a supervisor.
+The participant reads it at a checkpoint; sending does not wake an idle CLI.
+
+When integration is authorized, inspect `agent-parley verify show` and
+`agent-parley participant merge NAME --preview`. `verify set COMMAND` configures
+the repository's gate. `participant merge NAME` runs it in the base checkout
+and merges only after it passes; verify the merged result separately.
+`participant pr NAME` pushes the branch and opens or locates a PR using the
+lane's report and claimed issues. It uses native `gh` authentication, mirrors
+issue labels and milestones, and currently requires a recognized change-type
+label. Neither an issue claim nor a ready report grants integration authority.
 
 Use the caller's existing shell tooling conventions, including RTK where required.
 Installing this plugin does not authorize extra tasks, change native permissions,

@@ -47,6 +47,107 @@ def message(**overrides):
     }
 
 
+def test_inbox_filters_report_receipts_without_mutating_them(bridge, actors):
+    ids = []
+    for index, ack in enumerate([False, True, True, True]):
+        sent = store.call(
+            bridge.home,
+            actors[0],
+            "send_message",
+            message(idempotency_key=f"filter-{index}", ack_required=ack),
+        )
+        ids.append(sent["id"])
+    store.call(
+        bridge.home, actors[1], "mark_message_read", {"message_id": ids[1]}
+    )
+    store.call(
+        bridge.home, actors[1], "acknowledge_message", {"message_id": ids[2]}
+    )
+    inbox = store.call(bridge.home, actors[1], "fetch_inbox", {})
+    assert inbox["messages"][1]["read_ts"] is not None
+    assert inbox["messages"][1]["ack_ts"] is None
+    assert inbox["messages"][2]["ack_ts"] is not None
+    for filters in (
+        {"unread": True},
+        {"unacknowledged": True},
+        {"unread": True, "unacknowledged": True},
+    ):
+        expected = [
+            row["id"]
+            for row in inbox["messages"]
+            if (not filters.get("unread") or row["read_ts"] is None)
+            and (
+                not filters.get("unacknowledged")
+                or row["ack_required"]
+                and row["ack_ts"] is None
+            )
+        ]
+        result = store.call(bridge.home, actors[1], "fetch_inbox", filters)
+        assert [row["id"] for row in result["messages"]] == expected
+        first = store.call(
+            bridge.home, actors[1], "fetch_inbox", {**filters, "limit": 1}
+        )
+        rest = store.call(
+            bridge.home,
+            actors[1],
+            "fetch_inbox",
+            {**filters, "after_id": first["next_after_id"]},
+        )
+        assert [
+            row["id"] for row in first["messages"] + rest["messages"]
+        ] == expected
+    assert store.call(bridge.home, actors[1], "fetch_inbox", {}) == inbox
+    assert (
+        store.call(bridge.home, actors[0], "fetch_inbox", {"unread": True})[
+            "messages"
+        ]
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"body_offset": -1},
+        {"body_offset": True},
+        {"unread": 1},
+        {"unacknowledged": "true"},
+    ],
+)
+def test_inbox_validates_filters_and_offsets_even_when_empty(
+    bridge, actors, args
+):
+    with pytest.raises(BridgeError):
+        store.call(bridge.home, actors[1], "fetch_inbox", args)
+
+
+@pytest.mark.parametrize(
+    "tool", ["fetch_inbox", "read_thread", "search_messages"]
+)
+def test_mail_budget_includes_paging_metadata(
+    bridge, actors, monkeypatch, tool
+):
+    sent = store.call(
+        bridge.home,
+        actors[0],
+        "send_message",
+        message(body_md="budget receipt"),
+    )
+    args = {
+        "read_thread": {"thread_id": sent["thread_id"]},
+        "search_messages": {"query": "budget"},
+        "fetch_inbox": {},
+    }[tool]
+    full = store.call(bridge.home, actors[1], tool, args)
+    assert len(full["messages"]) == 1
+    budget = len(json.dumps(full, ensure_ascii=False).encode()) - 1
+    monkeypatch.setattr(store, "MAX_RESULT_BYTES", budget)
+    bounded = store.call(bridge.home, actors[1], tool, args)
+    assert len(json.dumps(bounded, ensure_ascii=False).encode()) <= budget
+    assert bounded["messages"] == []
+    assert bounded["has_more"] is True
+
+
 def test_concurrent_sends_are_idempotent_and_changed_retries_fail(
     bridge, actors
 ):
