@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -785,6 +786,12 @@ def main() -> None:
                 shutil.copyfile(path, destination / path.name)
             emit("pending", str(bool(pending)).lower())
         else:
+            for _ in range(6):
+                if not pending:
+                    break
+                print("Waiting for uploaded files to appear in PyPI metadata.")
+                time.sleep(10)
+                pending = pending_files(assets, tag[1:], pypi_files(tag[1:]))
             if pending:
                 raise ValueError(
                     "PyPI publication is incomplete; retry this release."

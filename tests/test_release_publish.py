@@ -688,7 +688,14 @@ def test_partial_draft_with_conflicting_bytes_is_not_overwritten(
 
 @pytest.mark.parametrize(
     "state",
-    ["complete", "missing", "conflict", "changed_assets", "changed_tag"],
+    [
+        "complete",
+        "delayed",
+        "missing",
+        "conflict",
+        "changed_assets",
+        "changed_tag",
+    ],
 )
 def test_github_publication_requires_verified_pypi_completion(
     assets, tmp_path, monkeypatch, state
@@ -713,16 +720,23 @@ def test_github_publication_requires_verified_pypi_completion(
         ),
     )
     metadata = pypi_metadata(assets)
+    sleeps = []
+    monkeypatch.setattr(release.time, "sleep", sleeps.append)
     if state == "missing":
         metadata.pop()
     elif state == "conflict":
         metadata[0]["digests"]["sha256"] = "0" * 64
     elif state == "changed_assets":
         (assets / "CHANGELOG.md").write_text("Changed")
-    monkeypatch.setattr(release, "pypi_files", lambda version: metadata)
+    responses = iter([[], metadata[:1], metadata])
+    monkeypatch.setattr(
+        release,
+        "pypi_files",
+        lambda version: next(responses) if state == "delayed" else metadata,
+    )
     calls = []
     monkeypatch.setattr(release, "command", lambda *args: calls.append(args))
-    if state == "complete":
+    if state in {"complete", "delayed"}:
         release.main()
         assert calls == [
             ("gh", "release", "edit", TAG, "--draft=false", "--latest")
@@ -731,6 +745,8 @@ def test_github_publication_requires_verified_pypi_completion(
         with pytest.raises(ValueError):
             release.main()
         assert calls == []
+    expected_sleeps = {"missing": 6, "delayed": 2}.get(state, 0)
+    assert sleeps == [10] * expected_sleeps
 
 
 def test_release_step_commits_and_tags_without_inherited_git_identity(git_repo):

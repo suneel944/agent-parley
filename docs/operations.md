@@ -448,6 +448,9 @@ release.
 Publication is a separate `Release` run naming an existing tag. It reruns the
 gate, creates a draft, uploads assets, downloads and verifies their checksums,
 then publishes. Failed verification leaves a draft.
+After uploading to PyPI, verification allows six retries ten seconds apart
+for missing index metadata to become visible. Conflicting or yanked files
+still fail immediately; missing files after the retries leave the draft intact.
 
 The release workflow answers only to `workflow_dispatch`. It deliberately has
 no tag trigger: publication must name a tag explicitly, so a tag pushed by any
