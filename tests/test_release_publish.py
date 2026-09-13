@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -730,6 +731,75 @@ def test_github_publication_requires_verified_pypi_completion(
         with pytest.raises(ValueError):
             release.main()
         assert calls == []
+
+
+def test_release_step_commits_and_tags_without_inherited_git_identity(git_repo):
+    root = Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load(
+        (root / ".github/workflows/release-version.yml").read_text()
+    )
+    step = next(
+        step
+        for step in workflow["jobs"]["version"]["steps"]
+        if step.get("name") == "Commit the release and push its tag"
+    )
+    remote = git_repo / "remote.git"
+    release.command("git", "init", "--bare", str(remote))
+    release.command(
+        "git",
+        "config",
+        f"url.{remote}.insteadOf",
+        "https://x-access-token:fixture@github.com/owner/repo.git",
+        cwd=git_repo,
+    )
+    for key in ("user.name", "user.email"):
+        release.command("git", "config", "--unset-all", key, cwd=git_repo)
+    release.command("git", "config", "user.useConfigOnly", "true", cwd=git_repo)
+    (git_repo / "pyproject.toml").write_text(
+        '[project]\nname = "agent-parley"\nversion = "0.3.0"\n'
+    )
+    subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=git_repo,
+        env={
+            "PATH": os.environ["PATH"],
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GH_TOKEN": "fixture",
+            "GH_REPO": "owner/repo",
+            "VERSION": "0.3.0",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=20,
+    )
+    commit = release.command("git", "rev-parse", "HEAD", cwd=git_repo)
+    assert release.command("git", "rev-parse", "main", cwd=remote) == commit
+    assert (
+        release.command("git", "rev-parse", "v0.3.0^{commit}", cwd=remote)
+        == commit
+    )
+    assert (
+        release.command("git", "cat-file", "-t", "v0.3.0", cwd=remote) == "tag"
+    )
+    identity = "agent-parley release <release@users.noreply.github.com>"
+    assert (
+        release.command(
+            "git", "log", "-1", "--format=%an <%ae>", "main", cwd=remote
+        )
+        == identity
+    )
+    assert (
+        release.command(
+            "git",
+            "for-each-ref",
+            "--format=%(taggername) %(taggeremail)",
+            "refs/tags/v0.3.0",
+            cwd=remote,
+        )
+        == identity
+    )
 
 
 def test_version_workflow_cannot_recurse_or_publish_by_itself():
