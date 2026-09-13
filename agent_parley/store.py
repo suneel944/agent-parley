@@ -105,12 +105,30 @@ def connect(
     budget adds no fixed delay; it bounds only a wait that is already
     happening.
     Telemetry can opt out of waiting with a zero timeout.
+
+    Transaction acquisition uses a monotonic deadline rather than SQLite's
+    accumulated sleep budget, which can overrun wall time on macOS. A writer
+    holds its reservation before yielding, so its statements do not need a
+    second busy wait.
     """
-    db = sqlite3.connect(home / DATABASE, timeout=timeout)
+    db = sqlite3.connect(home / DATABASE, timeout=0)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     try:
-        db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                break
+            except sqlite3.OperationalError as exc:
+                remaining = deadline - time.monotonic()
+                if (
+                    getattr(exc, "sqlite_errorcode", 0) & 0xFF
+                    != sqlite3.SQLITE_BUSY
+                    or remaining <= 0
+                ):
+                    raise
+                time.sleep(min(0.05, remaining))
         yield db
         db.commit()
     except BaseException:
