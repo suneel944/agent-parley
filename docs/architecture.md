@@ -228,8 +228,8 @@ repository receives setup guidance even when it has pending work.
 Branch verification is scoped to the lane an operation touches, so a lane left
 on the wrong branch blocks only its own participant. `status` reports the actual
 branch when it differs from the assigned branch. `participant restore` returns
-one lane to its branch and
-`participant retire` removes one lane; both refuse while that participant holds
+one lane to its branch and `participant retire` removes one lane; both refuse
+while that participant holds
 its session lock or its worktree is dirty, and neither resets, cleans, stashes,
 or force-switches. Retiring invalidates that participant's credential and keeps
 its branch whenever the branch holds commits the project base does not.
@@ -502,8 +502,8 @@ measures latency separately; results depend on hardware and workload.
 
 ## Migration and verification limits
 
-Store initialization creates `bridge.sqlite3` and imports `mail.sqlite3` through a consistent
-read-only snapshot. IDs, acknowledgements and leases are retained; the original
+Store initialization creates `bridge.sqlite3` and imports `mail.sqlite3`
+through a consistent read-only snapshot. IDs, acknowledgements and leases are retained; the original
 remains unchanged. Imported rows and the schema version commit together.
 Existing identities are rebound locally at launch. Stop old services and sessions
 before upgrading; no live workspace is automatically migrated or terminated.

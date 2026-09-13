@@ -53,8 +53,8 @@ file trees remain identical.
 | v0.1.1 | `5a45a2d076531936a653e31873fd176d29b232e2` | `2c406150c9f559d5e975d88b645effbb449cf46d` |
 
 The historical `v0.1.1` tag has an operational mapping in
-`.github/release-history.json`. Validation of a mapped tag requires its exact original commit,
-an identical full Git tree at the mapped commit, and mapped ancestry of the
+`.github/release-history.json`. Validation of a mapped tag requires its exact
+original commit, an identical full Git tree at the mapped commit, and mapped ancestry of the
 workflow's main revision. Unmapped tags still require ordinary ancestry.
 Publication continues to check out the original tag commit and reuse its
 verified assets. The initial archival release is not enabled for retries.
@@ -138,8 +138,9 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    the only mechanical marker for a patch release; nothing else reaches that
    rung. Below all three thresholds nothing is proposed and the step reports
    the counts it measured. Counting is local and repeatable: it reads Git
-   history and nothing else, so `python3 -m scripts.release_publish candidate`
-   answers the same question before any merge. Every push to `main` runs it,
+   history; selecting an available version additionally queries the release
+   services described below. `python3 -m scripts.release_publish candidate`
+   performs those checks before any merge. Every push to `main` runs it,
    and a push below all three thresholds ends there.
 2. The chosen number must be free. Previously consumed versions cannot be
    reused, including a deleted or yanked 0.1.2. A release that lands on an
@@ -223,5 +224,6 @@ published curated branch using read-only GitHub requests and the proposed scan
 boundary. It stopped at the mapped release and built zero release proposals.
 That audit is historical: versioning no longer runs Release Please, and the
 equivalent check today is `python3 -m scripts.release_publish candidate`, which
-reads Git history alone and reaches the same conclusion without opening a pull
-request, tagging a commit, dispatching workflows, or uploading packages.
+counts local Git history and checks version availability when a threshold is
+met. It does not open pull requests, tag commits, dispatch workflows, or upload
+packages.
