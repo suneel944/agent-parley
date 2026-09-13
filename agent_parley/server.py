@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 import os
 import socket
+import socketserver
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -163,6 +164,17 @@ class Server(ThreadingHTTPServer):
         self.token = config["token"]
         self.slots = threading.BoundedSemaphore(16)
         super().__init__(("127.0.0.1", config["port"]), Handler)
+
+    def server_bind(self) -> None:
+        """Binds loopback without HTTPServer's unnecessary reverse DNS lookup.
+
+        Readiness is authenticated at a numeric loopback address. Resolving
+        the runner's host name can block startup on macOS without providing
+        information used by this service.
+        """
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
 
     def process_request(
         self,

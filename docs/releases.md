@@ -1,10 +1,16 @@
 # Release operations
 
-The approved version is **0.2.0**, published on 2026-09-11. Preparation and
-publication remain separate. Every push to `main` measures release eligibility
-and opens or updates a proposal when the delivered product work warrants one;
-merging that proposal and publishing an existing tag stay manual actions, and
-neither a merge nor a tag push publishes anything. Both workflows are active.
+The approved version is recorded in `.release-manifest.json` and must match
+the package and plugin markers. Every push to `main` measures release
+eligibility. An eligible push automatically prepares a release commit, pushes
+its annotated tag, and dispatches the separate publication workflow. There is
+no proposal pull request. A tag push alone does not publish anything; an
+existing tag can be dispatched explicitly for recovery.
+
+Release 0.3.0 was published on 2026-09-13. All six GitHub bundle assets passed
+checksum verification, and downloaded PyPI wheel and source archive hashes
+matched the GitHub packages. See the
+[successful publication run](https://github.com/suneel944/agent-parley/actions/runs/34765379270).
 
 ## Audited release history
 
@@ -46,9 +52,9 @@ file trees remain identical.
 | v0.1.0 | `1221ae6acbe4a0398fb5f3e51db4fc670395b0e1` | `d8aea19fa65ac5d70a60705bc44f9728bc113619` |
 | v0.1.1 | `5a45a2d076531936a653e31873fd176d29b232e2` | `2c406150c9f559d5e975d88b645effbb449cf46d` |
 
-Only the approved release has an operational mapping in
-`.github/release-history.json`. Validation requires its exact original commit,
-an identical full Git tree at the mapped commit, and mapped ancestry of the
+The historical `v0.1.1` tag has an operational mapping in
+`.github/release-history.json`. Validation of a mapped tag requires its exact
+original commit, an identical full Git tree at the mapped commit, and mapped ancestry of the
 workflow's main revision. Unmapped tags still require ordinary ancestry.
 Publication continues to check out the original tag commit and reuse its
 verified assets. The initial archival release is not enabled for retries.
@@ -132,8 +138,9 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    the only mechanical marker for a patch release; nothing else reaches that
    rung. Below all three thresholds nothing is proposed and the step reports
    the counts it measured. Counting is local and repeatable: it reads Git
-   history and nothing else, so `python3 -m scripts.release_publish candidate`
-   answers the same question before any merge. Every push to `main` runs it,
+   history; selecting an available version additionally queries the release
+   services described below. `python3 -m scripts.release_publish candidate`
+   performs those checks before any merge. Every push to `main` runs it,
    and a push below all three thresholds ends there.
 2. The chosen number must be free. Previously consumed versions cannot be
    reused, including a deleted or yanked 0.1.2. A release that lands on an
@@ -157,7 +164,8 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    release. If `main` advanced between the measurement and the push, the push
    is rejected and the run fails rather than tagging a tree nothing measured.
    The next eligible push measures again and succeeds.
-5. The same step dispatches `Release` with the pushed tag. Publication stays a
+5. The next step uses the repository token with `actions: write` to dispatch
+   `Release` with the pushed tag. Publication stays a
    separate top-level workflow so the index's trusted-publisher configuration
    continues to match the workflow that claims it, and so a retry is one
    dispatch rather than a repeat of the versioning path.
@@ -168,6 +176,12 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
 Dispatching `Auto version` by hand runs the same measurement on demand and
 reaches the same conclusion. Dispatching `Release` by hand with an existing tag
 is the retry and republication route; it never creates a version.
+
+Publication does not comment on or close tracking issues or milestones. After
+verifying a release, the maintainer closes completed issues, moves unfinished
+issues to the next bare-version milestone, and closes the released milestone.
+Historical milestones are left closed. The next milestone is a planning target;
+creating it does not bump package metadata or authorize a release by itself.
 
 ## Retry contract
 
@@ -188,8 +202,11 @@ closed. A deleted PyPI filename cannot be recovered by retrying.
 PyPI and GitHub are separate services, so publication cannot be one atomic
 transaction. If PyPI succeeds and the GitHub publication step fails, rerun the
 same workflow: PyPI files are checked, no duplicate upload is attempted, and the
-GitHub publication can finish. PyPI metadata propagation or service outages may
-require a later retry. No error creates a new version automatically.
+GitHub publication can finish. Completion retries missing PyPI metadata six
+times, ten seconds apart, to allow index visibility to catch up with an upload.
+Hash conflicts and yanked files fail immediately. An exhausted retry budget or
+a service error leaves the draft for a later retry. No error creates a new
+version automatically.
 
 ## Verification limits
 
@@ -207,5 +224,6 @@ published curated branch using read-only GitHub requests and the proposed scan
 boundary. It stopped at the mapped release and built zero release proposals.
 That audit is historical: versioning no longer runs Release Please, and the
 equivalent check today is `python3 -m scripts.release_publish candidate`, which
-reads Git history alone and reaches the same conclusion without opening a pull
-request, tagging a commit, dispatching workflows, or uploading packages.
+counts local Git history and checks version availability when a threshold is
+met. It does not open pull requests, tag commits, dispatch workflows, or upload
+packages.

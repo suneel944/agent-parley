@@ -77,10 +77,11 @@ direct pushes. Revisit the review exception when additional maintainers join.
 
 Use Conventional Commit PR titles, such as `fix: preserve pending messages` or
 `ci: validate release metadata`; squash merges retain that title for changelogs.
-`feat`, `fix` and `perf` contribute to a future release proposal. Reserve them
+`feat`, `fix` and `perf` can contribute to a future release. Reserve them
 for changes a user of the distributed package would notice. Title workflow,
 tooling and documentation work `ci`, `build`, `chore`, `test`, `refactor` or
-`docs`. Merging a PR never starts version preparation or publication.
+`docs`. Merging to `main` runs the release eligibility measurement; only
+eligible product changes proceed to version preparation and publication.
 Assign an owner, add a change-type label, and reference an existing
 local issue with `Refs #N` or a closing keyword. Match linked issue milestones
 when present. Release PRs always require a milestone. Bot-generated descriptions
@@ -102,7 +103,8 @@ introduces it and it also touches `agent_parley/` or `plugins/agent-parley/`.
 When eligibility is met, the release application raises every version marker,
 records a changelog entry built from the counted commits, runs the policy gate
 against the raised markers, commits `chore(main): release X.Y.Z` to `main`,
-pushes the annotated tag, and dispatches Release for it. Package, plugin,
+pushes the annotated tag, and the job's repository token dispatches Release
+for it. Package, plugin,
 marketplace, release manifest and lockfile versions must agree; the policy gate
 runs before the commit, so a marker the bump misses fails the run. The release
 commit subject is the loop guard, so a release cannot trigger another release.
