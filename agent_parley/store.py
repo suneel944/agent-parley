@@ -111,7 +111,7 @@ def connect(
     holds its reservation before yielding, so its statements do not need a
     second busy wait.
     """
-    db = sqlite3.connect(home / DATABASE, timeout=0)
+    db = sqlite3.connect(home / DATABASE, timeout=0 if write else timeout)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     try:
