@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.0](https://github.com/suneel944/agent-parley/compare/v0.2.0...v0.3.0) (2026-09-13)
+
+
+### Bug fixes
+
+* give a writer time to queue behind a busy store (#99) ([#98](https://github.com/suneel944/agent-parley/issues/98))
+* harden hook recovery, store upgrades and participant lifecycle (#133)
+* name the real credentials command when a copilot lane has no profile (#93) ([#92](https://github.com/suneel944/agent-parley/issues/92))
+* preserve lane configuration and harden coordination workflows (#135) ([#108](https://github.com/suneel944/agent-parley/issues/108)) ([#112](https://github.com/suneel944/agent-parley/issues/112)) ([#113](https://github.com/suneel944/agent-parley/issues/113)) ([#114](https://github.com/suneel944/agent-parley/issues/114)) ([#116](https://github.com/suneel944/agent-parley/issues/116)) ([#117](https://github.com/suneel944/agent-parley/issues/117)) ([#121](https://github.com/suneel944/agent-parley/issues/121)) ([#122](https://github.com/suneel944/agent-parley/issues/122)) ([#124](https://github.com/suneel944/agent-parley/issues/124)) ([#125](https://github.com/suneel944/agent-parley/issues/125))
+
 ## Unreleased
 
 ### Fixes
