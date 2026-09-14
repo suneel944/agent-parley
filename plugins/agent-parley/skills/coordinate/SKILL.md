@@ -73,6 +73,10 @@ Record outcomes with `agent-parley report --state partial|blocked|ready --summar
 "result"`. Partial/blocked requires `--remaining`; ready requires `--evidence`.
 Every `issue` transition and `report` accepts `--idempotency-key KEY`; a script
 that retries with the key it first used records one attempt, not two.
+
+`agent-parley plan show` prints the recorded work order as a tree: which issues
+wait on which, and who owns each. Read it before choosing work. The edges are
+advisory, so a waiting issue is information, not a gate.
 Reports are agent claims, not independent verification. Handoffs neither transfer
 file reservations nor acknowledge mail. Acknowledge reviewed messages explicitly
 through MCP. Coordinate integration separately; do not infer merge/push authority

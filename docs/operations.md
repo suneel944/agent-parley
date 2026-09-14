@@ -101,6 +101,51 @@ A dependency is information, not a gate. Nothing prevents work on a waiting
 issue, no transition clears a dependency, and finishing the blocking issue does
 not drop the edge; the owner runs `issue unblock` when the wait is over.
 
+### Recording the work order as a plan file
+
+Entering a dozen dependencies one `issue block` at a time leaves no artifact to
+review. Write the order once, as TOML:
+
+```toml
+[plan]
+name = "Parser rewrite"
+
+[dependencies]
+"42" = ["17"]
+"43" = ["17"]
+"44" = ["42", "43"]
+
+[groups]
+parallel = ["42", "43"]
+```
+
+```sh
+agent-parley plan diff work-order.toml
+agent-parley plan apply work-order.toml
+agent-parley plan show
+agent-parley plan show --json
+```
+
+`plan apply` records exactly the advisory dependencies `issue block` records and
+nothing else. It claims no issue, assigns no lane and gates no transition, so a
+plan that turns out to be wrong blocks nobody. Run `plan diff` first to see the
+edges an apply would add before it adds them.
+
+`plan show` prints the applied plan as an indented tree, each issue under the
+issues it waits on, with its current owner and any recorded forge title beside
+it. Each apply records a version carrying the file's digest and the identity
+that applied it, and the twenty most recent versions are kept.
+
+Applying adds edges and never removes one. An edge entered with `issue block`
+after the apply is listed as `recorded by hand`, and an edge the file no longer
+names stays in the ledger and is reported by `plan diff` as `unlisted` until
+`issue unblock` removes it, so the document and the ledger never silently
+disagree.
+
+A plan that names a malformed issue number, exceeds a bound, or describes a
+dependency cycle is refused before any edge is written. Groups name issues that
+may proceed together; recording one changes no behavior today.
+
 ### Retrying a write safely
 
 A command that fails after its change has landed cannot be told apart from one
