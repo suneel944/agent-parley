@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from agent_parley import (
+    approvals,
     checkpoints,
     dashboard,
     evidence,
@@ -46,6 +47,7 @@ from agent_parley import (
 from agent_parley.checkpoints import (
     EVENTS,
     activity,
+    branch_head,
     current_branch,
     lane_branch,
     mailbox,
@@ -569,6 +571,13 @@ def lane_detail(record: dict, data: dict) -> None:
                 )
             )
     print(f"    Reported outcome: {record['outcome']}")
+    approval = record["approval"] or {}
+    if approval.get("state", approvals.UNREPORTED) != approvals.UNREPORTED:
+        detail = approval["detail"]
+        print(
+            f"    Approval: {approval['state']}"
+            + (f"; {detail}" if detail else "")
+        )
     print(
         f"    Context delivered: {record['injected_bytes']} "
         f"UTF-8 bytes in {record['injections']} notices"
@@ -2306,6 +2315,41 @@ class Bridge:
             )
         return directory, data, participant
 
+    def _reviewed(self, directory: Path, data: dict, name: str) -> dict:
+        """Reads the operator decision standing against a lane's work now."""
+        branch = data["participants"][name]["branch"]
+        head = branch_head(Path(data["root"]), branch)
+        return approvals.review(directory, data, name, head)
+
+    def _require_approval(
+        self, directory: Path, data: dict, name: str, step: str
+    ) -> None:
+        """Refuses an integration step the operator has not approved.
+
+        The decision is read again here, under the lane's session exclusion
+        and immediately before the branch is merged or pushed, so an approval
+        recorded for earlier commits cannot carry a later head into the base
+        repository or the forge.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding this participant.
+            name: Participant whose work would be integrated.
+            step: Step being attempted, ``merge`` or ``pr``.
+
+        Raises:
+            BridgeError: If the project requires approval for this step and no
+                matching decision is recorded, if the recorded decision is a
+                rejection, or if the lane's log cannot be read.
+        """
+        if step not in data["approval"]:
+            return
+        refusal = approvals.refusal(
+            name, step, self._reviewed(directory, data, name)
+        )
+        if refusal:
+            raise BridgeError(refusal)
+
     def restore(self, repo: Path, name: str) -> str:
         """Returns a drifted lane to its branch without discarding work.
 
@@ -2475,6 +2519,51 @@ class Bridge:
         return (
             f"{root} runs `{shlex.join(configured)}` in the base checkout "
             "before every `participant merge`."
+        )
+
+    def approval_policy(
+        self, repo: Path, steps: list[str] | None = None
+    ) -> str:
+        """Reports or records the steps that require an operator approval.
+
+        The requirement belongs to the repository rather than to a
+        participant, so it lives beside the roster and the verification
+        command in that repository's project manifest.
+
+        Args:
+            repo: Any checkout of the target repository.
+            steps: Steps to require a recorded approval before, an empty list
+                to require none, or None to report the current setting
+                without changing it.
+
+        Returns:
+            An account of the configured requirement.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or a step is
+                not one the gate can stand in front of.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if steps is None:
+            required = data["approval"]
+        else:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["approval"] = roster.approval_steps(steps)
+                write_json(directory / "project.json", data)
+                required = data["approval"]
+        if not required:
+            return (
+                f"{root} requires no recorded operator approval; "
+                "`participant merge` and `participant pr` run unchanged."
+            )
+        commands = ", ".join(
+            f"`{approvals.COMMANDS[step]}`" for step in required
+        )
+        return (
+            f"{root} refuses {commands} until `agent-parley approve NAME` "
+            "records a decision on the lane's current ready report."
         )
 
     def initialization(self, repo: Path, command: str | None = None) -> str:
@@ -2882,8 +2971,10 @@ class Bridge:
 
         Raises:
             BridgeError: If the lane drifted, if the participant holds a
-                running session, if the repository's verification command
-                fails, or if the merge cannot complete unattended.
+                running session, if the project requires an operator approval
+                the lane's current ready report does not have, if the
+                repository's verification command fails, or if the merge
+                cannot complete unattended.
             subprocess.TimeoutExpired: If verification exceeds its timeout.
         """
         root, directory = self.project(repo, create=False)
@@ -2917,11 +3008,13 @@ class Bridge:
             An account of what was merged.
 
         Raises:
-            BridgeError: If the gate fails or the merge cannot complete
-                unattended.
+            BridgeError: If the project requires an operator approval the
+                lane's current ready report does not have, if the gate fails,
+                or if the merge cannot complete unattended.
         """
         participant = data["participants"][name]
         with lock(directory / f"{name}.session.lock", session_busy(name)):
+            self._require_approval(directory, data, name, "merge")
             if data["verify"]:
                 verify_base(root, data["verify"])
             merged = merge_branch(
@@ -3226,6 +3319,129 @@ class Bridge:
         with lock(directory / f"{name}.session.lock"):
             return self._pull_request(repo, name)
 
+    def _decide(
+        self, repo: Path, name: str, decision: str, reason: str = ""
+    ) -> str:
+        """Records one operator decision about a lane's ready report.
+
+        The command runs from the base checkout only. Running it inside an
+        assigned worktree is refused, so the lane's own command line cannot
+        approve the lane's own work. That is this product's command-line
+        boundary and not an operating-system one: a program running as the
+        same user can write coordination state directly, so separate the
+        operator from the lanes at the operating-system level when that
+        distinction has to hold.
+
+        Args:
+            repo: Any checkout of the target repository, outside every lane.
+            name: Participant whose ready report is decided.
+            decision: Recorded outcome, approved or rejected.
+            reason: Required explanation for a rejection, delivered to the
+                lane as operator mail.
+
+        Returns:
+            An account of the decision, what it is bound to, and what
+            invalidates it.
+
+        Raises:
+            BridgeError: If the command runs inside a lane, if the
+                participant is unknown, if the lane has no current ready
+                report, if a rejection carries no reason, or if the decision
+                cannot be recorded.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if name not in data["participants"]:
+            raise BridgeError(
+                f"{name} is not a participant in this project; "
+                "run agent-parley participant list."
+            )
+        if decision == approvals.REJECTED and not reason.strip():
+            raise BridgeError(
+                "A rejection requires a reason; the lane is told what to "
+                "change."
+            )
+        here = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        for lane in data["participants"].values():
+            if here == Path(lane["lane"]).resolve():
+                raise BridgeError(
+                    "Approvals are recorded from the base checkout at "
+                    f"{root}, never from an assigned worktree, so a lane "
+                    "does not decide its own work."
+                )
+        reviewed = self._reviewed(directory, data, name)
+        if reviewed["state"] == approvals.UNREPORTED:
+            raise BridgeError(
+                f"{name} has no current ready report to decide. Wait for "
+                "the lane to report ready, then record the decision."
+            )
+        bound = reviewed["binding"]
+        approvals.remember(
+            directory,
+            name,
+            {
+                "kind": "approval",
+                "decision": decision,
+                "operator": approvals.operator(),
+                "reason": reason,
+                "binding": bound,
+            },
+        )
+        if decision == approvals.REJECTED:
+            try:
+                self.say(
+                    repo,
+                    name,
+                    f"The operator rejected report {bound['report']}: {reason}",
+                    subject="Report rejected",
+                )
+                delivery = "and told the lane why"
+            except (BridgeError, OSError) as exc:
+                delivery = f"but the lane could not be told: {exc}"
+            return (
+                f"Rejected {name}'s report {bound['report']} at "
+                f"{bound['head'][:12]}, {delivery}. The lane keeps working; "
+                "`participant merge` and `participant pr` stay refused "
+                "until a new decision is recorded."
+            )
+        return (
+            f"Approved {name}'s report {bound['report']} at "
+            f"{bound['head'][:12]} on {bound['branch']} for {bound['base']}. "
+            "This records a human decision, not a verification of the code. "
+            f"{approvals.RENEWED}"
+        )
+
+    def approve(self, repo: Path, name: str) -> str:
+        """Records that the operator approved a lane's ready report.
+
+        Args:
+            repo: Any checkout of the target repository, outside every lane.
+            name: Participant whose ready report is approved.
+
+        Returns:
+            An account of the approval and what invalidates it.
+
+        Raises:
+            BridgeError: If the decision cannot be recorded for this lane.
+        """
+        return self._decide(repo, name, approvals.APPROVED)
+
+    def reject(self, repo: Path, name: str, reason: str) -> str:
+        """Records that the operator rejected a lane's ready report.
+
+        Args:
+            repo: Any checkout of the target repository, outside every lane.
+            name: Participant whose ready report is rejected.
+            reason: Explanation delivered to the lane as operator mail.
+
+        Returns:
+            An account of the rejection.
+
+        Raises:
+            BridgeError: If the decision cannot be recorded for this lane.
+        """
+        return self._decide(repo, name, approvals.REJECTED, reason)
+
     def _pull_request(self, repo: Path, name: str) -> str:
         """Pushes one lane's branch and opens its pull request.
 
@@ -3268,6 +3484,7 @@ class Bridge:
         directory, data, participant = self._lane(repo, name)
         root = Path(data["root"])
         branch = participant["branch"]
+        self._require_approval(directory, data, name, "pr")
         path = directory / f"{name}-activity.json"
         state = json.loads(path.read_text()) if path.exists() else {}
         if not state.get("summary", "").strip():
@@ -4329,6 +4546,34 @@ attempt of the recorded budget, which is also only reported.
             for name in data["participants"]
         }
 
+    def _approval_state(
+        self, directory: Path, data: dict, agent: str
+    ) -> dict | None:
+        """Reads how a lane stands against the approval its project requires.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding this participant.
+            agent: Participant that owns the lane.
+
+        Returns:
+            The decision state beside the lane's ready report, or None when
+            the project requires no approval. A state that cannot be read is
+            reported as unreadable rather than as approved, matching the
+            refusal the integration commands would raise.
+        """
+        if not data["approval"]:
+            return None
+        try:
+            reviewed = self._reviewed(directory, data, agent)
+        except (BridgeError, OSError) as exc:
+            return {"state": "unreadable", "report": "", "detail": str(exc)}
+        return {
+            "state": reviewed["state"],
+            "report": reviewed["report"],
+            "detail": reviewed["detail"],
+        }
+
     def _lane_status(self, directory: Path, data: dict, agent: str) -> dict:
         """Reads one lane's reported state, ownership context and mailbox.
 
@@ -4379,6 +4624,7 @@ attempt of the recorded budget, which is also only reported.
             "drift": branch != participant["branch"],
             "paused": participant.get("paused", False),
             "outcome": state.get("outcome", "unknown"),
+            "approval": self._approval_state(directory, data, agent),
             "summary": state.get("summary", ""),
             "remaining": state.get("remaining", ""),
             "evidence": state.get("evidence", ""),
@@ -5398,6 +5644,45 @@ def main() -> int:
             add_selector(command)
         if action == "restart":
             command.add_argument("--task", default="")
+    granting = commands.add_parser(
+        "approve",
+        help="Record that you approve a lane's ready report for integration.",
+    )
+    granting.add_argument(
+        "participant", help="Participant whose ready report you approve."
+    )
+    granting.add_argument("--repo", type=Path, default=Path.cwd())
+    refusing = commands.add_parser(
+        "reject",
+        help="Record that you reject a lane's ready report, and say why.",
+    )
+    refusing.add_argument(
+        "participant", help="Participant whose ready report you reject."
+    )
+    refusing.add_argument(
+        "reason", help="Explanation delivered to the lane as operator mail."
+    )
+    refusing.add_argument("--repo", type=Path, default=Path.cwd())
+    requirement = commands.add_parser(
+        "approval",
+        help="Show or set the steps that require a recorded approval first.",
+    )
+    requirements = requirement.add_subparsers(dest="action", required=True)
+    stating = requirements.add_parser("show")
+    stating.add_argument("--repo", type=Path, default=Path.cwd())
+    requiring = requirements.add_parser("set")
+    requiring.add_argument(
+        "steps",
+        nargs="*",
+        metavar="STEP",
+        help=(
+            "Steps refused without a recorded operator approval of the "
+            "lane's current ready report, from "
+            + ", ".join(roster.APPROVAL_STEPS)
+            + "; pass none to require no approval."
+        ),
+    )
+    requiring.add_argument("--repo", type=Path, default=Path.cwd())
     gate = commands.add_parser(
         "verify",
         help="Show or set the command a repository requires before a merge.",
@@ -5881,6 +6166,21 @@ def main() -> int:
                 print(
                     bridge.resources(repository, getattr(args, "names", None))
                 )
+        elif args.command == "approve":
+            print(bridge.approve(args.repo.resolve(), args.participant))
+        elif args.command == "reject":
+            print(
+                bridge.reject(
+                    args.repo.resolve(), args.participant, args.reason
+                )
+            )
+        elif args.command == "approval":
+            print(
+                bridge.approval_policy(
+                    args.repo.resolve(),
+                    args.steps if args.action == "set" else None,
+                )
+            )
         elif args.command in ("verify", "init"):
             repository = args.repo.resolve()
             if getattr(args, "json", False):

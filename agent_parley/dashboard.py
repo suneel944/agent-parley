@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_parley import (
+    approvals,
     metrics,
     plan,
     process,
@@ -23,6 +24,7 @@ from agent_parley import (
 )
 from agent_parley.checkpoints import (
     activity,
+    branch_head,
     event_summary,
     lane_branch,
     mailbox,
@@ -187,6 +189,31 @@ def _branch(lane: Path, cache: dict) -> str:
     return value
 
 
+def _awaiting_approval(directory: Path, data: dict, agent: str) -> bool:
+    """Reports whether a lane's ready report still awaits an operator.
+
+    Args:
+        directory: Private state directory for the common repository.
+        data: Project manifest holding this participant.
+        agent: Participant that owns the lane.
+
+    Returns:
+        True when the project requires an approval the lane does not have.
+        A decision that cannot be read counts as awaiting, matching the
+        refusal the integration commands would raise.
+    """
+    if not data["approval"]:
+        return False
+    head = branch_head(
+        Path(data["root"]), data["participants"][agent]["branch"]
+    )
+    try:
+        reviewed = approvals.review(directory, data, agent, head)
+    except BridgeError:
+        return True
+    return reviewed["state"] == approvals.AWAITING
+
+
 def _row(
     home: Path,
     directory: Path,
@@ -299,6 +326,7 @@ def _row(
         "unfit": published["reason"],
         "work_offer": bool(published["offer"]),
         "offer_kind": (published["offer"] or {}).get("kind", ""),
+        "awaiting_approval": _awaiting_approval(directory, data, agent),
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
         ).replace("\n", " ")[:MAX_PROMPT],
@@ -321,9 +349,10 @@ def _totals(projects: list[dict]) -> dict:
         projects: Per-project row groups as held in a snapshot.
 
     Returns:
-        Participant, event, denial, context and idle totals, the number of
-        plan groups whose every member is reported ready, and the lane
-        holding the longest observed idle interval. A ready-group count
+        Participant, event, denial, context and idle totals, how many lanes
+        still await an operator approval, the number of plan groups whose
+        every member is reported ready, and the lane holding the longest
+        observed idle interval. A ready-group count
         belongs to its project rather than to a row, so narrowing the rows
         never changes it.
     """
@@ -334,6 +363,7 @@ def _totals(projects: list[dict]) -> dict:
         "context": 0,
         "idle": 0,
         "ready_groups": 0,
+        "awaiting_approval": 0,
     }
     leader = ""
     longest = 0
@@ -345,6 +375,7 @@ def _totals(projects: list[dict]) -> dict:
             totals["denials"] += row["denials"]
             totals["context"] += row["injected_bytes"]
             totals["idle"] += row["idle_seconds"]
+            totals["awaiting_approval"] += int(row["awaiting_approval"])
             if row["idle_seconds"] > longest:
                 leader = row["participant"]
                 longest = row["idle_seconds"]
@@ -801,6 +832,11 @@ def layout(
             f" (most {totals['idle_leader']} "
             f"{tables.age(totals['idle_leader_seconds'])})"
             if totals["idle_leader"]
+            else ""
+        )
+        + (
+            f"  awaiting approval {totals['awaiting_approval']}"
+            if totals.get("awaiting_approval")
             else ""
         )
         + (

@@ -31,8 +31,17 @@ MAX_REPORT_RECORDS = 2000
 MAX_WAITS = 64
 
 
-def _report_path(directory: Path, name: str) -> Path:
-    """Returns the durable report and integration log for one lane."""
+def report_path(directory: Path, name: str) -> Path:
+    """Returns the durable report, decision and integration log for one lane.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The append-only log path, which lives in coordination state rather
+        than in the target repository.
+    """
     return directory / f"{name}-{REPORTS}"
 
 
@@ -56,7 +65,7 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
         recorded.
     """
     record = {"id": uuid.uuid4().hex[:16], "at": time.time(), **entry}
-    path = _report_path(directory, name)
+    path = report_path(directory, name)
     try:
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -80,7 +89,7 @@ def report_records(
         Records oldest first. A damaged line is skipped rather than failing a
         report, and the most recent records are kept when the log is long.
     """
-    path = _report_path(directory, name)
+    path = report_path(directory, name)
     if not path.exists():
         return []
     records = []

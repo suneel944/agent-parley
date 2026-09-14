@@ -22,6 +22,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text |
 | `metrics` | Idle intervals and waiting times derived from retained records |
+| `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
