@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
-from agent_parley import issues, retries, roster
+from agent_parley import issues, protocol, retries, roster
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
@@ -1182,6 +1182,27 @@ def schema_state(schema: int) -> str:
     if schema > SCHEMA_VERSION:
         return SCHEMA_UNSUPPORTED
     return SCHEMA_CURRENT
+
+
+def remedy(state: str) -> str:
+    """Names the operator action that makes a store state usable again.
+
+    Every surface that reports an unusable store prescribes the same repair,
+    so the mapping lives beside the classification rather than being restated
+    wherever a report is rendered.
+
+    Args:
+        state: Classification returned by `schema_state`.
+
+    Returns:
+        The command that repairs the store, or an empty string when the state
+        needs no action.
+    """
+    if state == SCHEMA_BEHIND:
+        return protocol.MIGRATE
+    if state == SCHEMA_UNSUPPORTED:
+        return protocol.UPGRADE
+    return ""
 
 
 def refused(home: Path, actor: dict, tool: str) -> None:

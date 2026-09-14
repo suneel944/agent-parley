@@ -2499,17 +2499,13 @@ attempt of the recorded budget, which is also only reported.
             )
         schema = store.schema_version(self.home)
         state = store.schema_state(schema)
-        remedies = {
-            store.SCHEMA_BEHIND: protocol.MIGRATE,
-            store.SCHEMA_UNSUPPORTED: protocol.UPGRADE,
-        }
         components.append(
             {
                 "component": "store",
                 "version": f"schema {schema}",
                 "protocol": protocol.PROTOCOL,
                 "state": state,
-                "remedy": remedies.get(state, ""),
+                "remedy": store.remedy(state),
                 "compatible": state in store.SCHEMA_USABLE,
             }
         )
