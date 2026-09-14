@@ -466,6 +466,37 @@ nothing. Reading is incremental: each refresh folds only the records appended
 since the previous one, up to 1 MiB per lane, so watching a long session never
 re-reads its history.
 
+`FIT` is the capacity check the runtime last read for that lane, and a `+`
+after it means an advisory work offer is waiting for that lane to act on. Four
+checks run, each from what the host can already read and none of them asking a
+vendor: the recorded session process is running and its session has not ended
+or stopped for an approval; the lane's own client records carry no rate-limit
+or usage-window refusal inside the stall interval, read from the same files
+`TOKENS` parses; the worktree is on its assigned branch or has nothing
+uncommitted elsewhere; and the lane owes no acknowledgement older than the
+stall interval. Each check is provider specific and defaults to no opinion, so
+a provider whose client publishes nothing skips that check rather than blocking
+an offer, and only a check that actually failed makes a lane unfit. An unfit
+lane prints the failed check under its row, and no offer names it. A blank cell
+means nothing has been published for that lane yet.
+
+Two offers are built on that check, both advisory and neither moving ownership.
+A lane that holds no claim and passes the check is offered, at its next
+checkpoint, the unclaimed ledger issues no recorded dependency blocks — ordered
+so the ones other owned issues wait on come first — together with the peers
+holding more than one claim. A lane that holds more than one claim is told
+which fit peers have been idle past the stall interval, so it can shed one.
+Both messages count against the same 1,536-byte checkpoint budget as every
+other injection and are delivered once per distinct offer: a lane whose
+situation has not changed sees nothing new. Nothing is claimed for a lane,
+`issue offer` remains the only transfer path, and the recipient still accepts
+or declines.
+
+Idleness here is observed coordination inactivity, which is not the same thing
+as a live process or as provider capacity; the three are checked separately and
+reported separately, because a quiet coordination channel alone does not prove
+that a native turn is idle or that a lane can safely accept input.
+
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six
 hours rather than across the whole retained log. Accepted windows are a count

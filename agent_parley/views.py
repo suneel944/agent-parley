@@ -443,6 +443,9 @@ def _row(row: dict) -> dict:
         "tokens": row["tokens"],
         "idle_seconds": row["idle_seconds"],
         "idle_complete": row["idle_complete"],
+        "fit": row["fit"],
+        "unfit_reason": row["unfit"] or None,
+        "work_offer": row["offer_kind"] or None,
         "prompt": row["prompt"],
     }
 

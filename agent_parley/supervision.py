@@ -1,6 +1,7 @@
 """Observes lane availability and reminds holders about waiting peers."""
 
 import contextlib
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -9,7 +10,15 @@ import threading
 import time
 from pathlib import Path
 
-from agent_parley import forge, issues, process, roster, store, terminal
+from agent_parley import (
+    forge,
+    issues,
+    process,
+    records,
+    roster,
+    store,
+    terminal,
+)
 from agent_parley.state import BridgeError, lock, write_json
 
 DEFAULTS = {
@@ -133,6 +142,305 @@ def stall_marker(idle: dict) -> str:
         f"for {idle['sender']}"
     )
     return f"idle; {item} waiting {int(idle['age_seconds'])}s"
+
+
+FIT_CHECKS = ("session", "capacity", "worktree", "mail")
+UNKNOWN_FIT: dict = {
+    "fit": None,
+    "checks": dict.fromkeys(FIT_CHECKS),
+    "failed": [],
+    "reason": "",
+    "offer": None,
+}
+
+
+def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
+    """Reads whether the lane's recorded session process is running.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        The check result and, when it failed, why. A lane that published no
+        activity yet reports None, which is no opinion rather than a refusal.
+    """
+    from agent_parley import checkpoints
+
+    state = checkpoints.activity(directory, name)
+    if not state:
+        return None, ""
+    if not process.alive(state.get("session_pid"), state.get("session_ticks")):
+        return False, "its session process is not running"
+    if state.get("activity") == "stopped":
+        return False, "its session ended"
+    if state.get("activity") == "waiting for approval":
+        return False, "it is waiting for a native approval"
+    return True, ""
+
+
+def _capacity_check(
+    home: Path, participant: dict, after: float
+) -> tuple[bool | None, str]:
+    """Reads the lane's own client records for a recent usage refusal.
+
+    The reader is provider specific and defaults to no opinion, so a provider
+    whose client publishes no such record skips the check instead of blocking
+    an offer. Nothing is asked of a vendor.
+
+    Args:
+        home: Private bridge state root.
+        participant: Manifest entry naming the lane, provider and account.
+        after: Seconds within which a recorded refusal still counts.
+
+    Returns:
+        The check result and, when it failed, how old the refusal is.
+    """
+    at = records.reported_refusal(home, participant)
+    if at is None:
+        return None, ""
+    age = max(0.0, time.time() - at)
+    if age < after:
+        return False, f"its client refused a request {int(age)}s ago"
+    return True, ""
+
+
+def _worktree_check(participant: dict) -> tuple[bool | None, str]:
+    """Reads whether the lane is on its branch or has nothing uncommitted.
+
+    Args:
+        participant: Manifest entry naming the lane and its assigned branch.
+
+    Returns:
+        The check result and, when it failed, the branch that holds the work.
+        A worktree Git cannot inspect reports None.
+    """
+    from agent_parley import checkpoints
+
+    lane = Path(participant["lane"])
+    branch = checkpoints.lane_branch(lane)
+    if branch == participant["branch"]:
+        return True, ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(lane), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    if result.returncode:
+        return None, ""
+    if result.stdout.strip():
+        return False, f"it holds uncommitted work on {branch}"
+    return True, ""
+
+
+def _mail_check(
+    home: Path, manifest: dict, name: str, after: float
+) -> tuple[bool | None, str]:
+    """Reads whether the lane owes an old acknowledgement.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest holding this participant.
+        name: Participant that owns the lane.
+        after: Seconds after which an unanswered acknowledgement counts.
+
+    Returns:
+        The check result and, when it failed, the age of the oldest item. An
+        unreadable mailbox reports None.
+    """
+    from agent_parley import checkpoints
+
+    try:
+        mail = checkpoints.mailbox(
+            home, manifest["root"], manifest["participants"][name]["display"]
+        )
+    except (BridgeError, OSError, sqlite3.Error):
+        return None, ""
+    oldest = max(
+        (int(item["age_seconds"]) for item in mail["outstanding_ack"]),
+        default=0,
+    )
+    if oldest >= after:
+        return False, f"it owes an acknowledgement {oldest}s old"
+    return True, ""
+
+
+def fit(
+    home: Path, directory: Path, manifest: dict, name: str, after: float
+) -> dict:
+    """Reports whether a lane could take more work right now.
+
+    Offering work to a lane that cannot take it stalls twice, so every offer
+    is checked first against what the runtime can read locally: the recorded
+    session process, the lane's own client records, its worktree, and the
+    acknowledgements it owes. Each check defaults to no opinion, and only a
+    check that actually failed makes a lane unfit.
+
+    The result describes what was observed. It grants nothing, revokes
+    nothing, and never moves ownership.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Project manifest holding this participant.
+        name: Participant whose lane is being considered.
+        after: Seconds of the interval a refusal or an unanswered item is
+            still counted within.
+
+    Returns:
+        Whether the lane is fit, each check's result, the names of the failed
+        checks and one line naming the first failure.
+    """
+    participant = manifest["participants"][name]
+    results = {
+        "session": _session_check(directory, name),
+        "capacity": _capacity_check(home, participant, after),
+        "worktree": _worktree_check(participant),
+        "mail": _mail_check(home, manifest, name, after),
+    }
+    failed = [check for check in FIT_CHECKS if results[check][0] is False]
+    return {
+        "fit": not failed,
+        "checks": {check: results[check][0] for check in FIT_CHECKS},
+        "failed": failed,
+        "reason": (
+            f"unfit ({failed[0]}): {name} {results[failed[0]][1]}"
+            if failed
+            else ""
+        ),
+    }
+
+
+def idle_seconds(directory: Path, name: str) -> int:
+    """Reports how long the lane's still-open idle stretch has lasted.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        Seconds of observed coordination inactivity since the lane's last turn
+        ended, or zero when no stretch is open. This measures a quiet
+        coordination channel, which is not a claim about what the native
+        client is doing inside a turn.
+    """
+    from agent_parley import metrics
+
+    return next(
+        (
+            int(interval["seconds"])
+            for interval in reversed(
+                metrics.idle_intervals(directory, name)["intervals"]
+            )
+            if interval.get("open")
+        ),
+        0,
+    )
+
+
+def published_work(directory: Path, name: str) -> dict:
+    """Reads the fit result and work offer last published for a lane.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        The published record, or an unknown result when the supervisor has
+        published nothing for this lane yet.
+    """
+    unknown = {**UNKNOWN_FIT, "checks": dict(UNKNOWN_FIT["checks"])}
+    try:
+        record = json.loads((directory / f"{name}-work.json").read_text())
+    except (OSError, ValueError):
+        return unknown
+    return {**unknown, **record} if isinstance(record, dict) else unknown
+
+
+def _pull_text(available: list[str], busy: list[str]) -> str:
+    """Describes the work an idle lane could take from the ledger."""
+    parts = ["Work offer. You hold no claim and every fit check passed."]
+    if available:
+        listed = ", ".join(f"#{number}" for number in available[:5])
+        parts.append(
+            f"Unclaimed and unblocked, most unblocking first: {listed}."
+        )
+    if busy:
+        parts.append(f"Holding more than one claim: {', '.join(busy)}.")
+    parts.append(
+        "Claim one yourself with agent-parley issue claim, or ask a holder "
+        "for a handoff. Nothing is claimed for you."
+    )
+    return " ".join(parts)
+
+
+def _rebalance_text(owned: list[str], idle: list[str]) -> str:
+    """Describes the claims a busy lane could shed to an idle fit peer."""
+    listed = ", ".join(f"#{number}" for number in owned[:5])
+    return (
+        f"Rebalance offer. {', '.join(idle)} read as fit and have been idle "
+        f"past the stall interval while you hold {listed}. Shed one with "
+        "agent-parley issue offer if it helps; you decide, and ownership "
+        "moves only when the recipient accepts."
+    )
+
+
+def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
+    """Publishes each lane's fit result and any advisory work offer.
+
+    A lane holding no claim is offered the unclaimed work and told which peers
+    hold more than one claim. A lane holding more than one claim is told which
+    fit peers have been idle past the stall interval. Both are advisory: the
+    ledger is not touched, nothing is claimed, and ``issue offer`` remains the
+    only path that moves work.
+
+    An offer carries a digest of its own content as its identifier, so a lane
+    whose situation has not changed sees the same offer rather than a new one
+    on every poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+    """
+    after = config["stalled_after"]
+    ledger = issues.snapshot(directory)
+    owned = issues.holders(ledger)
+    available = issues.unclaimed(ledger)
+    busy = sorted(name for name, held in owned.items() if len(held) > 1)
+    results = {
+        name: fit(home, directory, manifest, name, after)
+        for name in manifest["participants"]
+    }
+    idle = [
+        name
+        for name in sorted(manifest["participants"])
+        if results[name]["fit"]
+        and not owned.get(name)
+        and idle_seconds(directory, name) >= after
+    ]
+    for name in manifest["participants"]:
+        result = results[name]
+        held = owned.get(name, [])
+        offer = None
+        if result["fit"] and not held and (available or busy):
+            offer = {"kind": "pull", "text": _pull_text(available, busy)}
+        elif len(held) > 1 and (peers := [e for e in idle if e != name]):
+            offer = {"kind": "rebalance", "text": _rebalance_text(held, peers)}
+        if offer:
+            offer["id"] = hashlib.sha256(
+                f"{offer['kind']}\x00{offer['text']}".encode()
+            ).hexdigest()[:16]
+        published = {**result, "offer": offer}
+        path = directory / f"{name}-work.json"
+        if published != published_work(directory, name):
+            write_json(path, published)
 
 
 def configuration(home: Path, manifest: dict) -> dict:
@@ -350,6 +658,7 @@ def poll(home: Path, directory: Path) -> None:
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
         observe_responses(home, directory, manifest)
+        work(home, directory, manifest, config)
     if config["wake"]:
         for name, participant in manifest["participants"].items():
             if participant.get("wake", True):

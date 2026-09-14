@@ -998,7 +998,7 @@ def test_top_reports_tokens_each_native_client_recorded(
     output = capsys.readouterr().out
     lines = output.splitlines()
     assert any(
-        line.startswith("PARTICIPANT") and line.endswith("IDLE")
+        line.startswith("PARTICIPANT") and line.endswith("FIT")
         for line in lines
     )
     assert (
@@ -1022,7 +1022,7 @@ def test_top_leaves_tokens_blank_without_readable_session_records(
     dashboard.run(bridge.home, lambda: False, once=True)
     lines = capsys.readouterr().out.splitlines()
     assert any(
-        line.startswith("PARTICIPANT") and line.endswith("IDLE")
+        line.startswith("PARTICIPANT") and line.endswith("FIT")
         for line in lines
     )
     row = next(line for line in lines if line.startswith("claude "))
