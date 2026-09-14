@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.0](https://github.com/suneel944/agent-parley/compare/v0.5.0...v0.6.0) (2026-09-14)
+
+
+### Features
+
+* apply and show a plan file that records issue order and parallel groups (#207) ([#157](https://github.com/suneel944/agent-parley/issues/157))
+* make writing coordination operations retry-safe across CLI and MCP (#206) ([#156](https://github.com/suneel944/agent-parley/issues/156))
+* mark a lane idle when it holds unanswered mail and serves no calls (#202) ([#143](https://github.com/suneel944/agent-parley/issues/143))
+* measure and show every second a lane spends idle or waiting (#203) ([#147](https://github.com/suneel944/agent-parley/issues/147))
+* print every read-only command as JSON for scripts and other agents (#197) ([#150](https://github.com/suneel944/agent-parley/issues/150))
+* query the ownership history of an issue, a lane or a claim (#205) ([#154](https://github.com/suneel944/agent-parley/issues/154))
+* record a deadline and a retry budget on claims, offers and acknowledgements (#204) ([#152](https://github.com/suneel944/agent-parley/issues/152))
+* refuse a mismatched launcher, plugin or store protocol at the boundary (#208) ([#159](https://github.com/suneel944/agent-parley/issues/159)) ([#199](https://github.com/suneel944/agent-parley/issues/199))
+* refuse assistant attribution in a lane's branches, commits and pull requests (#198) ([#146](https://github.com/suneel944/agent-parley/issues/146))
+* reserve named resources such as ports and databases, not only paths (#201) ([#149](https://github.com/suneel944/agent-parley/issues/149))
+
 ## [0.5.0](https://github.com/suneel944/agent-parley/compare/v0.4.0...v0.5.0) (2026-09-14)
 
 
