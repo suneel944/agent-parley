@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 
-from agent_parley import copilot, gemini, policy, process, roster
+from agent_parley import copilot, gemini, policy, process, protocol, roster
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 from agent_parley.store import DATABASE
@@ -1235,7 +1235,15 @@ def main() -> int:
         choices=("native", "gemini", "copilot"),
         default="native",
     )
+    parser.add_argument("--protocol", type=int, default=protocol.PROTOCOL)
     args = parser.parse_args()
+    if not protocol.compatible(args.protocol):
+        print(
+            "Agent Parley checkpoint refused: "
+            + protocol.mismatch("lane's configured hook", args.protocol),
+            file=sys.stderr,
+        )
+        return 2
     payload = {}
     try:
         payload = json.loads(sys.stdin.read(1_000_001))

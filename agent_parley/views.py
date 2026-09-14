@@ -106,6 +106,28 @@ def offer(value: dict | None) -> dict | None:
     }
 
 
+def doctor(reported: dict) -> dict:
+    """Reports the launcher, plugin and store versions and their fit.
+
+    Args:
+        reported: Component report produced by the launcher.
+
+    Returns:
+        The protocol this build speaks, the protocols it accepts, the store
+        schema it writes, one record per component, and whether the set is
+        consistent. The store schema is reported as `store_schema`, because
+        `schema` already names the document's own schema identifier. No
+        credential and no profile path is included.
+    """
+    return {
+        "protocol": reported["protocol"],
+        "supported": reported["supported"],
+        "store_schema": reported["schema"],
+        "components": reported["components"],
+        "consistent": reported["consistent"],
+    }
+
+
 def work_plan(applied: dict) -> dict:
     """Reports an applied work-order plan beside current ownership.
 

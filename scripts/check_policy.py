@@ -10,7 +10,7 @@ import tomllib
 from pathlib import Path
 
 from agent_parley.policy import has_attribution
-from scripts import release_publish
+from scripts import codex_bundle, release_publish
 
 
 def contribution_errors(root: Path) -> list[str]:
@@ -105,6 +105,7 @@ def main() -> None:
         path = root / "plugins/agent-parley" / f".{client}-plugin/plugin.json"
         if json.loads(path.read_text())["version"] != metadata["version"]:
             errors.append(f"{client} plugin version differs from package")
+    errors.extend(codex_bundle.manifest_errors(root))
     marketplace = json.loads(
         (root / ".claude-plugin/marketplace.json").read_text()
     )
@@ -132,7 +133,7 @@ def main() -> None:
         raise SystemExit("\n".join(errors))
     print(
         "Policy: documented code, no inline comments, "
-        "stdlib runtime, aligned versions"
+        "stdlib runtime, aligned versions, directory-ready manifests"
     )
 
 

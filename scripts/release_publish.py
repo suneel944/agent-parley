@@ -21,6 +21,8 @@ MAJOR_THRESHOLD = 100
 RETIREMENT_LIMIT = 100
 PACKAGE_PATHS = ("agent_parley", "plugins/agent-parley")
 MANIFEST_PATH = ".release-manifest.json"
+COMPATIBILITY_START = "<!-- compatibility:start -->"
+COMPATIBILITY_END = "<!-- compatibility:end -->"
 REPOSITORY_URL = "https://github.com/suneel944/agent-parley"
 CHANGELOG_SECTIONS = (
     ("feat", "Features"),
@@ -503,6 +505,67 @@ def changelog_entry(
     return "\n".join(lines) + "\n\n"
 
 
+def declared_constant(path: Path, name: str) -> str:
+    """Reads one integer constant from a module without importing it.
+
+    Args:
+        path: Module carrying the constant.
+        name: Constant to read.
+
+    Returns:
+        The constant's digits.
+
+    Raises:
+        ValueError: If the module declares no such constant.
+    """
+    found = re.search(rf"(?m)^{name} = (\d+)$", path.read_text())
+    if not found:
+        raise ValueError(f"{path.name} declares no {name}.")
+    return found[1]
+
+
+def write_compatibility(root: Path, version: str) -> None:
+    """Rewrites the documented compatibility table from the code constants.
+
+    The table states which launcher version speaks which wire protocol against
+    which store schema. Writing it here, from the constants themselves, is what
+    keeps the document from drifting away from the numbers the code uses.
+
+    Args:
+        root: Checkout to update in place.
+        version: Version being prepared.
+
+    Raises:
+        ValueError: If the document carries no compatibility block or a
+            constant cannot be read.
+    """
+    protocol = declared_constant(root / "agent_parley/protocol.py", "PROTOCOL")
+    schema = declared_constant(root / "agent_parley/store.py", "SCHEMA_VERSION")
+    path = root / "docs/operations.md"
+    text = path.read_text()
+    start = text.find(COMPATIBILITY_START)
+    end = text.find(COMPATIBILITY_END)
+    if start < 0 or end < start:
+        raise ValueError("docs/operations.md carries no compatibility block.")
+    headings = ("| Launcher", "| ---", f"| {version} |")
+    rows = [
+        line
+        for line in text[start:end].splitlines()
+        if line.startswith("| ") and not line.startswith(headings)
+    ]
+    block = "\n".join(
+        [
+            COMPATIBILITY_START,
+            "| Launcher | Wire protocol | Store schema |",
+            "| --- | --- | --- |",
+            f"| {version} | {protocol} | {schema} |",
+            *rows,
+            "",
+        ]
+    )
+    path.write_text(text[:start] + block + text[end:])
+
+
 def bump(root: Path, baseline: str, approved: str, version: str) -> None:
     """Writes one version to every marker and records the changelog entry.
 
@@ -550,6 +613,7 @@ def bump(root: Path, baseline: str, approved: str, version: str) -> None:
     (root / MANIFEST_PATH).write_text(
         json.dumps({".": version}, indent=2) + "\n"
     )
+    write_compatibility(root, version)
     changelog = root / "CHANGELOG.md"
     heading = "# Changelog\n\n"
     body = changelog.read_text().removeprefix(heading)

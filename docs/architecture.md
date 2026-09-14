@@ -24,6 +24,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
+| `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `state` | Private atomic JSON publication and operation locks |
 
@@ -375,6 +376,24 @@ That distinction lets a reader separate a lane still working on a path from a
 lane that died holding it, without any process deciding on that lane's behalf.
 No time-to-live applies to issue ownership, which changes hands only through
 release, or an explicit offer and acceptance.
+
+Three versions move independently: the installed package, the wire protocol a
+hook or a served call speaks, and the store schema on disk. They are separate
+because several package versions normally share one protocol, so equal package
+versions are not the only compatible combination. Each boundary states its
+number and compares it where the call already crosses. The launcher compares the
+installed plugin's declared protocol before it starts a lane and refuses with
+both numbers and the one command that updates it. The launcher writes its own
+protocol into the hook command it configures, so a hook validates locally and
+never reaches the network to learn a version. A served call declares its
+protocol in the `Agent-Parley-Protocol` header, and an unaccepted one is denied
+by name and counted where every other denial is counted; a call that declares
+nothing is served, because the header was added after the first protocol.
+`store.initialize` still refuses a newer schema and `roster.normalize` still
+refuses a newer manifest; neither is replaced by a weaker check and neither
+migrates downwards. `agent-parley doctor` reports all three and exits non-zero
+on a mismatch without opening a lane, writing configuration, or printing a
+credential.
 
 A work-order plan is one TOML file the operator writes, parsed by the standard
 library. Applying it records the same advisory dependency edges `issue block`

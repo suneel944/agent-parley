@@ -101,6 +101,47 @@ A dependency is information, not a gate. Nothing prevents work on a waiting
 issue, no transition clears a dependency, and finishing the blocking issue does
 not drop the edge; the owner runs `issue unblock` when the wait is over.
 
+### Compatibility and `doctor`
+
+Three numbers move independently: the launcher's package version, the wire
+protocol a hook or served call speaks, and the store schema on disk. Several
+package versions normally share one protocol, so equal package versions are not
+the only compatible combination.
+
+<!-- compatibility:start -->
+| Launcher | Wire protocol | Store schema |
+| --- | --- | --- |
+| 0.6.0 | 1 | 7 |
+<!-- compatibility:end -->
+
+The release path rewrites that table from the constants in
+`agent_parley/protocol.py` and `agent_parley/store.py`, so it cannot drift from
+the numbers the code uses.
+
+```sh
+agent-parley doctor
+agent-parley doctor --json
+```
+
+`doctor` prints the launcher version and protocol, the protocol each shipped
+plugin manifest declares, and the store's schema against the schema this build
+writes, then a verdict line. Its exit status is non-zero on a mismatch, so a
+script can gate on it. It reads only: it opens no lane, writes no configuration,
+repairs nothing, and prints no credential or profile path.
+
+Drift is refused where the call already crosses a boundary, not discovered
+mid-turn:
+
+- `agent-parley run` refuses to start a lane whose installed plugin declares an
+  unaccepted protocol, naming both numbers and the one command that updates it.
+- A lane's hooks carry the launcher's protocol in the command the launcher
+  wrote, so the hook boundary is checked locally and no hook reaches the network
+  to learn a version.
+- A served call declaring an unaccepted protocol in its `Agent-Parley-Protocol`
+  header is denied with both numbers, and `top` counts that denial.
+- Opening a store written by a newer schema is refused, never migrated
+  downwards, exactly as a newer project manifest already is.
+
 ### Recording the work order as a plan file
 
 Entering a dozen dependencies one `issue block` at a time leaves no artifact to
@@ -925,8 +966,10 @@ The official catalog is curated separately; see
 
 For Codex, follow [OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission).
 This is a skills-only plugin. Submission requires a verified publisher, listing
-and policy URLs, a skill bundle, and review cases. Neither catalog submission
-has been made. CI builds artifacts; it does not submit review forms.
+and policy URLs, a skill bundle, and review cases. `make codex-bundle` builds
+the skill bundle the portal accepts. The Codex listing is live; the Claude
+submission is awaiting review.
+CI builds artifacts; it does not submit review forms.
 
 `docs/catalog-submission.md` records what each catalog asks for, the checks that
 can be run in this repository before submitting, and the steps that are bound to

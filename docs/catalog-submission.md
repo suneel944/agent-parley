@@ -6,9 +6,12 @@ mechanically verifiable inside this repository and how to verify it, the
 validator evidence captured for the current version, and the steps that only
 the repository owner can carry out.
 
-Repository installation does not imply public directory approval. Neither
-catalog submission has been made. Nothing in this document submits a listing,
-and continuous integration builds artifacts rather than filling review forms.
+Repository installation does not imply public directory approval. The Codex
+listing went live on 2026-09-14 at
+`https://chatgpt.com/plugins/plugins_6aa7c91c25008191ad715f14756e5deb`; the
+Claude submission was made the same day and is awaiting review.
+Nothing in this document submits a listing, and continuous integration builds
+artifacts rather than filling review forms.
 See the `## Plugins` section of `docs/operations.md` for the installation path
 this listing would describe.
 
@@ -58,6 +61,17 @@ configuration and any Claude-only settings. Skill text must be
 provider-neutral: no instruction that depends on a Claude-specific feature,
 and no assumption about which model reads it.
 
+The portal's scan of that Claude manifest demands fields the Claude directory
+does not: an `interface` block with `shortDescription`, which the submission
+form reuses as the listing subtitle and caps at 30 characters, plus `logo`
+and `composerIcon` pointing to square images inside the archive. Adding `interface` to the repository's Claude manifest would make
+`claude plugin validate --strict` fail, so the repository keeps those fields
+in `.codex-plugin/plugin.json` and `make codex-bundle` merges them into the
+archived copy. The archive lands at
+`dist/agent-parley-VERSION-codex-skills.zip` and contains only the merged
+manifest, `skills/` and `assets/`. `scripts/check_policy.py` fails the gate if
+either manifest drifts from the shape its directory reads.
+
 Both forms change over time. Re-read them at submission time and treat the
 lists above as a preparation aid, not as a transcription of the current form
 fields.
@@ -72,8 +86,12 @@ confirm the stated expectation before opening either form.
 - Marketplace manifest is valid.
   `claude plugin validate .`
 - Package, plugin and marketplace versions move together, no prohibited
-  attribution text is present, and runtime dependencies remain empty.
+  attribution text is present, runtime dependencies remain empty, the Claude
+  manifest carries no `interface` block, and the Codex manifest carries a
+  short description within the limit and square listing images.
   `uv run --locked python scripts/check_policy.py`
+- The Codex submission archive builds from the repository.
+  `make codex-bundle`
 - The `coordinate` skill carries YAML frontmatter with `name` and
   `description`.
   `head -5 plugins/agent-parley/skills/coordinate/SKILL.md`
@@ -145,9 +163,10 @@ proxy handling for its loopback requests, and on the package declaring no
 runtime dependencies. If any of those three change, the policy must change
 with them in the same commit.
 
-One gap remains, and it does not block the validator. There is no listing
-imagery. `docs/assets/` holds the README banner; a directory listing asks for
-an icon and may ask for screenshots sized to its own requirements.
+Listing imagery lives under `plugins/agent-parley/assets/`: `logo.png` and
+`icon.png`, both 512 by 512 pixels, referenced from the Codex manifest as
+`interface.logo` and `interface.composerIcon`. Screenshots are not included;
+a directory may ask for them sized to its own requirements.
 
 The skill frontmatter itself is in good shape: `name` is `coordinate` and the
 `description` is 211 characters covering both what the skill does and when to
