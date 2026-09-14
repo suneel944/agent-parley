@@ -281,9 +281,19 @@ def wake(
 ) -> None:
     """Requests or resumes a native turn with bounded attempts per backlog.
 
+    The backlog counts every reason this lane owes someone a turn: unread or
+    unacknowledged mail, an unanswered completion reminder it holds, and a
+    handoff offer naming it as recipient. An offer alone is enough, because a
+    peer that offers an issue to an idle lane would otherwise wait for an
+    unrelated trigger. An offer that was cancelled, declined or accepted is no
+    longer recorded on its issue and so leaves the backlog, and a replacement
+    offer carries a new identifier, which resets the bounded attempt count
+    rather than extending the old one.
+
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
-    Nothing reads, acknowledges, releases or transfers work for the lane.
+    Nothing reads, acknowledges, releases, accepts or transfers work for the
+    lane; waking only asks the lane to take its own turn.
     """
     participant = manifest["participants"][name]
     path = directory / f"{name}-activity.json"
@@ -305,11 +315,17 @@ def wake(
             (manifest["root"], participant["display"]),
         ).fetchall()
     backlog = [str(row["id"]) for row in pending]
+    ledger = issues.snapshot(directory)["issues"].values()
     backlog.extend(
         record["handoff_prompt"]["id"]
-        for record in issues.snapshot(directory)["issues"].values()
+        for record in ledger
         if record.get("handoff_prompt", {}).get("holder") == name
         and not record["handoff_prompt"].get("responded_at")
+    )
+    backlog.extend(
+        record["offer"]["id"]
+        for record in ledger
+        if (record.get("offer") or {}).get("to") == name
     )
     if not backlog:
         return
