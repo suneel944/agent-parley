@@ -292,6 +292,16 @@ enumerated reason and lands in that participant's event log; every served call
 is recorded inside the transaction that carried its effect. That is why `top`
 can show what was denied, to whom, and how often.
 
+**Idle time is a number, not an impression.** `top` gains an `IDLE` column: how
+long each lane went without coordination activity inside the window, with the
+project total and the worst lane in the header. `status` prints the same figure
+and, under it, every pending item with the seconds it has already waited — a
+message before its first read, an `ack_required` message before acknowledgement,
+a handoff offer before an answer, a `ready` report before integration. Every
+figure comes from records the runtime already keeps, so it reports observed
+coordination inactivity and never claims to know what the native client was
+doing inside a turn.
+
 That history is bounded, and it can leave the state directory. A lane keeps two
 event files and discards records older than fourteen days, so `top` reports
 recent enforcement rather than the whole project. `--since` narrows any count

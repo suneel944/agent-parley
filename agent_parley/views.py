@@ -202,6 +202,8 @@ def _row(row: dict) -> dict:
         "calls": row["calls"],
         "errors": row["errors"],
         "tokens": row["tokens"],
+        "idle_seconds": row["idle_seconds"],
+        "idle_complete": row["idle_complete"],
         "prompt": row["prompt"],
     }
 
