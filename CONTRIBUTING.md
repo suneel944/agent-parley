@@ -109,6 +109,14 @@ Include the original PR as evidence. Recovery uses the same commit range,
 product checks and issue deduplication; it cannot turn tooling into product work
 or recount work included in the approved release.
 
+A product commit that carries the Conventional Commits breaking marker, as in
+`feat!:` or `feat(lane)!:`, proposes the next major version and outranks the
+issue count. Use it when a release breaks a documented contract, such as
+removing a command-line flag or a `--json` field. It takes effect on the push
+that merges it, so a breaking change lands with the merge that completes a
+milestone rather than partway through one; landing it earlier cuts the major
+release and leaves the remaining milestone work for the release after it.
+
 When eligibility is met, the release application raises every version marker,
 records a changelog entry built from the counted commits, runs the policy gate
 against the raised markers, commits `chore(main): release X.Y.Z` to `main`,

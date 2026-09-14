@@ -435,6 +435,7 @@ def test_recovered_and_message_references_are_deduplicated(
         {"#7", "#8", "#9"},
         {"#7", "#8", "#9"},
         False,
+        False,
     )
     changelog = release.changelog_entry(counted_repo, TAG, VERSION, "0.2.0")
     for number in (7, 8, 9):
@@ -471,7 +472,12 @@ def test_recovered_references_cannot_count_ineligible_commits(git_repo):
         },
     )
 
-    assert release.product_units(git_repo, baseline) == (set(), set(), False)
+    assert release.product_units(git_repo, baseline) == (
+        set(),
+        set(),
+        False,
+        False,
+    )
     changelog = release.changelog_entry(git_repo, baseline, VERSION, "0.2.0")
     assert all(f"issues/{number}" not in changelog for number in range(41, 46))
 
@@ -495,18 +501,42 @@ def test_recovered_reference_schema_is_strict(git_repo, commit, numbers):
         release.release_history(git_repo)
 
 
-def test_the_feature_threshold_proposes_the_next_major(counted_repo, local):
-    below = release.MAJOR_THRESHOLD - 1
-    for number in range(below):
+def test_a_breaking_marker_proposes_the_next_major(counted_repo, local):
+    product_commit(counted_repo, "feat: an ordinary feature", body="Refs #1")
+    assert release.release_candidate(counted_repo) == ("", 1, 1)
+    product_commit(counted_repo, "feat(lane)!: retire the old flag")
+    assert release.release_candidate(counted_repo) == ("1.0.0", 2, 2)
+
+
+def test_a_breaking_marker_outranks_the_minor_threshold(counted_repo, local):
+    product_commit(counted_repo, "fix!: reject an ambiguous participant name")
+    for number in range(release.MINOR_THRESHOLD):
+        product_commit(
+            counted_repo, f"fix: repair {number}", body=f"Refs #{number}"
+        )
+    assert release.release_candidate(counted_repo)[0] == "1.0.0"
+
+
+def test_a_breaking_marker_outside_the_package_proposes_nothing(
+    counted_repo, local
+):
+    product_commit(
+        counted_repo,
+        "feat!: change the release measurement contract",
+        path="scripts/tool.py",
+    )
+    assert release.release_candidate(counted_repo) == ("", 0, 0)
+
+
+def test_unmarked_features_never_propose_a_major(counted_repo, local):
+    for number in range(release.MINOR_THRESHOLD):
         product_commit(
             counted_repo, f"feat: feature {number}", body=f"Refs #{number}"
         )
-    assert release.release_candidate(counted_repo) == ("0.2.0", below, below)
-    product_commit(counted_repo, "feat: the last one", body="Refs #999")
     assert release.release_candidate(counted_repo) == (
-        "1.0.0",
-        release.MAJOR_THRESHOLD,
-        release.MAJOR_THRESHOLD,
+        "0.2.0",
+        release.MINOR_THRESHOLD,
+        release.MINOR_THRESHOLD,
     )
 
 
@@ -605,9 +635,8 @@ def test_candidate_phase_reports_measured_eligibility(
         }
         assert printed == (
             "2 product issues and 2 product features since v0.1.1; "
-            f"{release.MINOR_THRESHOLD} issues or "
-            f"{release.MAJOR_THRESHOLD} features or one fix(urgent) commit "
-            "are required."
+            f"{release.MINOR_THRESHOLD} issues or one breaking commit or "
+            "one fix(urgent) commit are required."
         )
     else:
         assert emitted == {
