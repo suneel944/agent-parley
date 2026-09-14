@@ -14,10 +14,17 @@ from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 
-from agent_parley import copilot, gemini, policy, process, protocol, roster
+from agent_parley import (
+    copilot,
+    gemini,
+    policy,
+    process,
+    protocol,
+    roster,
+    store,
+)
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, lock, write_json
-from agent_parley.store import DATABASE
 
 MAX_CONTEXT_BYTES = 1536
 MAX_CAUSE_BYTES = 200
@@ -35,6 +42,16 @@ GIT_OPTIONS_WITH_VALUE = frozenset(
         "--super-prefix",
         "--work-tree",
     }
+)
+DIAGNOSTIC_TOOLS = frozenset(
+    {"Glob", "Grep", "NotebookRead", "Read", "ToolSearch"}
+)
+BRIDGE_COMMAND = "agent-parley"
+UNCHECKED_SHELL = ("<", ">", "`", "$(", "\n", "\r")
+OUTAGE_CHECK = "Run agent-parley status for the bridge's own report."
+OUTAGE_GUIDANCE = (
+    "Reads and agent-parley commands still run; hold edits, commits and "
+    "spawns until coordination answers again."
 )
 
 
@@ -572,6 +589,81 @@ def attributed_command(payload: dict, lane: Path) -> tuple[str, str] | None:
     return None
 
 
+def diagnosable(payload: dict) -> bool:
+    """Reports whether a call may still run while coordination is down.
+
+    A guard that denies the remedy it prescribes cannot be satisfied: the
+    session stays inert until somebody outside it intervenes. Calls that only
+    read, the project's own coordination tools, and the bridge command line
+    that reports and repairs the store are therefore left alone during an
+    outage. Everything that edits, commits or spawns is still refused, because
+    none of those can be checked against coordination that is unreadable.
+
+    A command tool is cleared only when every simple command in it invokes the
+    bridge, so an allowed check chained onto an edit is not laundered through
+    the same call.
+
+    Redirection, here-strings, process substitution, command substitution and
+    a line break are not simple-command boundaries: the tokenizer keeps them
+    inside a segment whose first word is still the bridge, so a cleared call
+    could truncate a tracked file or run a second, unchecked program. A
+    command carrying any of them is refused rather than parsed, because a
+    refusal during an outage costs one retype and the alternative costs the
+    file the outage branch promises to protect.
+
+    Args:
+        payload: Native lifecycle hook payload.
+
+    Returns:
+        True when the named call neither edits nor spawns, False otherwise.
+    """
+    tool = str(payload.get("tool_name", ""))
+    if tool in DIAGNOSTIC_TOOLS or tool.startswith("mcp__agent_parley__"):
+        return True
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return False
+    command = str(tool_input.get("command", tool_input.get("cmd", "")))
+    if any(construct in command for construct in UNCHECKED_SHELL):
+        return False
+    segments = [
+        words
+        for segment in shell_segments(command)
+        if (words := invoked(segment))
+    ]
+    return bool(segments) and all(
+        Path(words[0]).name == BRIDGE_COMMAND for words in segments
+    )
+
+
+def outage(home: Path, cause: str) -> str:
+    """Describes a coordination outage in terms the operator can act on.
+
+    The failure that produced the outage is named rather than summarized away,
+    because the agent reading the denial has no other view of it. A store left
+    behind the running code is the common case and has a known repair, so that
+    repair is prescribed in place of the generic status check.
+
+    Args:
+        home: Private bridge state root.
+        cause: Bounded text of the failure that made coordination unreadable.
+
+    Returns:
+        One sentence naming the cause, followed by the remedy and the scope of
+        what remains allowed.
+    """
+    action = OUTAGE_CHECK
+    with contextlib.suppress(OSError, sqlite3.Error):
+        action = (
+            store.remedy(store.schema_state(store.schema_version(home)))
+            or OUTAGE_CHECK
+        )
+    return (
+        f"Agent Parley cannot verify coordination: {cause} "
+        f"{action} {OUTAGE_GUIDANCE}"
+    )
+
+
 def restores_lane_branch(
     payload: dict, lane: Path, expected: str, *, rename_from: str = ""
 ) -> bool:
@@ -869,7 +961,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         BridgeError: If the agent is not registered.
         sqlite3.Error: If the local mailbox cannot be read.
     """
-    path = home / DATABASE
+    path = home / store.DATABASE
     with contextlib.closing(
         sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.3)
     ) as db:
@@ -1207,13 +1299,11 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                         ) + len(text.encode())
                         state["injections"] = state.get("injections", 0) + 1
             except (OSError, sqlite3.Error, BridgeError) as exc:
-                state["coordination_error"] = str(exc)
+                cause = clip(str(exc), MAX_CAUSE_BYTES)
+                state["coordination_error"] = cause
                 reason = Reason.COORDINATION_UNAVAILABLE
-                text = (
-                    "Agent Parley cannot verify coordination; "
-                    "pause edits and check bridge status."
-                )
-                if event == "PreToolUse":
+                text = outage(home, cause)
+                if event == "PreToolUse" and not diagnosable(payload):
                     output = {
                         "hookSpecificOutput": {
                             "hookEventName": event,
