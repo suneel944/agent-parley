@@ -200,14 +200,15 @@ def test_dashboard_fits_terminal_and_names_hidden_participants(
     assert codex["state"] == "running; no hooks"
     rows[:] = [{**codex, "participant": f"lane-{index}"} for index in range(20)]
     lines = dashboard.render(view, width=width, height=12)
-    assert len(lines) == 12
+    assert len(lines) <= 12
     assert all(len(line) <= width for line in lines)
     shown = sum(line.startswith("lane-") for line in lines)
-    assert lines[-1].startswith(f"{20 - shown} participants hidden")
+    assert lines[-1] == f"rows 1-{shown} of 20"
     assert "MAIL" in "\n".join(lines)
     if width >= 80:
         assert "running; no hooks" in "\n".join(lines)
-    if width < 162:
+    span = sum(size + 2 for _, size in dashboard.COLUMNS) - 2
+    if width < span:
         assert "Hidden columns:" in "\n".join(lines)
 
 

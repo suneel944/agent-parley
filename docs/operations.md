@@ -283,6 +283,57 @@ MCP calls with rejections, and the tokens that lane's own native client
 recorded. The header carries server health and the project's
 denial rate. The view is read-only and makes no model call; `q` leaves it.
 
+The table is fitted to the terminal rather than fixed. Each column is as
+wide as the widest value in that frame and never narrower than its declared
+minimum. When the set does not fit, columns are dropped in this order, and
+the header names the ones that went:
+
+```text
+PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, LEASES, IDLE, ISSUES,
+DENIALS
+```
+
+`PARTICIPANT`, `STATE` and `MAIL` are never dropped; if they alone still do
+not fit they share the width that is left, and a value a column could not
+show in full ends in an ellipsis. Rows past the last line are paged rather
+than discarded: the footer reads `rows 1-8 of 31`, and the page follows the
+selection, so moving past the last visible lane scrolls the table. A lane
+never loses its stall marker or its last prompt to a page break.
+
+Keys in the live view:
+
+| Key | Does |
+| --- | --- |
+| `j`, `k`, down, up | Select the next or previous lane, paging the table. |
+| `enter` | Show every recorded field of the selected lane, unclipped. |
+| `s` | Order by the next column. |
+| `r` | Reverse the order. |
+| `f` | Narrow to participants, comma separated; empty clears. |
+| `o` | Narrow to projects, comma separated; empty clears. |
+| `c` | Choose the columns shown; empty shows all. |
+| `?` | Show the key map and the column legend. |
+| `q` | Leave. The view never writes state. |
+
+The same choices are available on the command line as `--sort COLUMN`,
+`--reverse`, `--project ROOT`, `--participant NAME` and `--columns LIST`,
+and they apply to `--once` and `--json` as well as to the live view. A sort
+on a counted column orders from the largest value down. Narrowing recounts
+the header, so it never counts a row the table does not show. A project is
+matched by path or by its trailing directory name.
+
+Branch drift, a stale lease, a rejected call, an overdue issue and a lost
+session process are drawn in colour where the terminal reports colour
+support and in bold where it does not. Each also prints its own `!` or word
+in the table, so a monochrome terminal and a piped capture read the same.
+The legend that explains the columns moved behind `?` and out of every
+frame.
+
+A resize redraws the frame from scratch. Each line is written on its own,
+so a write the terminal refuses is counted and named in the footer instead
+of leaving a half-drawn frame. `--once` prints at the width of the terminal
+when one is attached and at the full width of the table when the output is
+a pipe, so a captured file holds every column intact.
+
 A reservation can name something that is not a file. Lanes collide on one local
 database, one dev-server port, one hardware device, one integration suite that
 cannot run twice at once, and a worktree isolates none of them. The same
