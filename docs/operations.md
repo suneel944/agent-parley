@@ -358,6 +358,13 @@ than fourteen days are discarded at the next session start or session end, so a
 long-running lane reports recent enforcement, not project history; served-call
 counts cover the most recent 2000 events per project.
 
+Every recorded decision carries the failure that produced it, when one did, so
+a run of denials stays answerable after the lane recovers. The live copy of
+that failure is cleared by the first call that succeeds, which is exactly what
+the remedy for an outage produces, so recovery would otherwise destroy the only
+record of the cause. The retained text is bounded, and the most recent one is
+reported beside the counts.
+
 `IDLE` is how long that lane went without coordination activity inside the
 window. An idle interval opens when a turn ends, which the native client
 reports as a `Stop` or `SessionEnd` checkpoint, and closes at the lane's next

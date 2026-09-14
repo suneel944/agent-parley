@@ -121,6 +121,7 @@ def test_a_held_maintenance_lock_reports_the_log_unavailable(tmp_path):
         "injected_bytes": 0,
         "last_ts": 0.0,
         "last_reason": "unavailable",
+        "last_cause": "",
     }
     assert checkpoints.read_events(tmp_path, "lane") == [{"ts": 1}]
 
