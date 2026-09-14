@@ -257,3 +257,28 @@ def test_portable_python_pidfd_preserves_native_errors():
         process.libc_pidfd("pidfd_open", 2**30, 0)
     with pytest.raises(OSError):
         process.libc_pidfd("pidfd_send_signal", -1, signal.SIGTERM, None, 0)
+
+
+def test_the_hook_module_imports_without_launcher_only_dependencies():
+    launcher_only = (
+        "argparse",
+        "dataclasses",
+        "inspect",
+        "importlib.metadata",
+        "tomllib",
+        "agent_parley.gemini",
+        "agent_parley.copilot",
+    )
+    loaded = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, agent_parley.checkpoints; "
+            f"print(sorted(set(sys.modules) & set({launcher_only!r})))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout.strip()
+    assert loaded == "[]"

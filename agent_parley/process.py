@@ -21,8 +21,8 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from agent_parley.state import BridgeError
 
@@ -301,9 +301,12 @@ def darwin_terminate(reader: PsReader, pid: int, ticks: str) -> None:
     raise BridgeError("Server did not stop within 10s.")
 
 
-@dataclass(frozen=True)
-class Platform:
+class Platform(NamedTuple):
     """Bundles the process primitives one operating system provides.
+
+    A named tuple rather than a dataclass keeps this module, which the
+    lifecycle hook imports on every native tool call, clear of the
+    `dataclasses` and `inspect` import cost.
 
     Attributes:
         start_ticks: Returns a process's recorded creation identity.
@@ -420,8 +423,7 @@ def alive(pid: int | None, ticks: str | None) -> bool:
         return False
 
 
-@dataclass(frozen=True)
-class ServerProcess:
+class ServerProcess(NamedTuple):
     """Holds a verified process ID and kernel creation identity."""
 
     pid: int

@@ -19,9 +19,7 @@ protocol into the hook command it configures, so the hook boundary is checked
 locally, and the HTTP boundary is checked where calls actually cross it.
 """
 
-import importlib.metadata
 import json
-import tomllib
 from pathlib import Path
 
 CLIENTS = ("claude", "codex")
@@ -62,9 +60,16 @@ def launcher_version() -> str:
     exists, because it is the file the release path raises. A package
     installed without one, which is every wheel, keeps its recorded metadata.
 
+    The readers are imported here rather than at module load because this
+    module sits on the lifecycle hook's import path, which runs once per
+    native tool call, and only the launcher and the doctor ask for a version.
+
     Returns:
         The running package version.
     """
+    import importlib.metadata
+    import tomllib
+
     try:
         declared = tomllib.loads(
             (package_root() / "pyproject.toml").read_text()
