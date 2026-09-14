@@ -8,9 +8,17 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import metrics, records, roster, store, supervision
+from agent_parley import (
+    approvals,
+    metrics,
+    records,
+    roster,
+    store,
+    supervision,
+)
 from agent_parley.checkpoints import (
     activity,
+    branch_head,
     event_summary,
     lane_branch,
     mailbox,
@@ -112,6 +120,31 @@ def _branch(lane: Path, cache: dict) -> str:
     value = lane_branch(lane)
     cache[key] = (now, value)
     return value
+
+
+def _awaiting_approval(directory: Path, data: dict, agent: str) -> bool:
+    """Reports whether a lane's ready report still awaits an operator.
+
+    Args:
+        directory: Private state directory for the common repository.
+        data: Project manifest holding this participant.
+        agent: Participant that owns the lane.
+
+    Returns:
+        True when the project requires an approval the lane does not have.
+        A decision that cannot be read counts as awaiting, matching the
+        refusal the integration commands would raise.
+    """
+    if not data["approval"]:
+        return False
+    head = branch_head(
+        Path(data["root"]), data["participants"][agent]["branch"]
+    )
+    try:
+        reviewed = approvals.review(directory, data, agent, head)
+    except BridgeError:
+        return True
+    return reviewed["state"] == approvals.AWAITING
 
 
 def _row(
@@ -218,6 +251,7 @@ def _row(
         ),
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
+        "awaiting_approval": _awaiting_approval(directory, data, agent),
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
         ).replace("\n", " ")[:MAX_PROMPT],
@@ -262,6 +296,7 @@ def collect(
         "denials": 0,
         "context": 0,
         "idle": 0,
+        "awaiting_approval": 0,
     }
     leader = ""
     for path in sorted((home / "projects").glob("*/project.json")):
@@ -295,6 +330,7 @@ def collect(
             totals["denials"] += row["denials"]
             totals["context"] += row["injected_bytes"]
             totals["idle"] += row["idle_seconds"]
+            totals["awaiting_approval"] += int(row["awaiting_approval"])
             if row["idle_seconds"] > totals.get("idle_leader_seconds", 0):
                 leader = row["participant"]
                 totals["idle_leader_seconds"] = row["idle_seconds"]
@@ -363,6 +399,11 @@ def render(
             f" (most {totals['idle_leader']} "
             f"{_age(totals['idle_leader_seconds'])})"
             if totals["idle_leader"]
+            else ""
+        )
+        + (
+            f"  awaiting approval {totals['awaiting_approval']}"
+            if totals.get("awaiting_approval")
             else ""
         )
         + (

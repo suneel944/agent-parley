@@ -34,6 +34,7 @@ LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
 MAX_VERIFY_ARGUMENTS = 64
 MANIFEST_VERSION = 2
+APPROVAL_STEPS = ("merge", "pr")
 PROVIDERS = "providers.json"
 CREDENTIALS = "credentials.json"
 
@@ -721,10 +722,35 @@ def normalize(manifest: dict) -> dict:
         "initialize": list(manifest.get("initialize") or []),
         "resources": resources(list(manifest.get("resources") or [])),
         "deadlines": deadlines(dict(manifest.get("deadlines") or {})),
+        "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "supervision": dict(manifest.get("supervision", {})),
         "participants": participants,
     }
+
+
+def approval_steps(value: object) -> list[str]:
+    """Validates the steps a project requires a recorded approval before.
+
+    Args:
+        value: Step names from the private project manifest.
+
+    Returns:
+        The required steps, ordered and without repetition. An empty list
+        requires no approval, which is the shipped default.
+
+    Raises:
+        BridgeError: If a step is not one the gate can stand in front of.
+    """
+    if not isinstance(value, list) or any(
+        step not in APPROVAL_STEPS for step in value
+    ):
+        raise BridgeError(
+            "Approval steps must be chosen from: "
+            + ", ".join(APPROVAL_STEPS)
+            + "."
+        )
+    return [step for step in APPROVAL_STEPS if step in value]
 
 
 def pull_request_policy(value: dict) -> dict:

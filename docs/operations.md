@@ -837,6 +837,58 @@ command is a different decision from reading Git state. The gate reports the
 base checkout as it stands before the merge, which is not a claim about the
 merged result.
 
+## Requiring a recorded approval
+
+A repository can require your own recorded decision before either command that
+carries a lane's work out of its worktree:
+
+```sh
+agent-parley approval show
+agent-parley approval set merge pr
+agent-parley approval set
+agent-parley approve claude-1
+agent-parley reject claude-1 'Needs a test for the retry path'
+```
+
+`approval set` records the requirement in the project manifest beside the
+roster, outside the target source tree, and takes any of `merge`, `pr`, both,
+or nothing at all. A repository with nothing required integrates exactly as
+before.
+
+With a step required, `participant merge` and `participant pr` refuse until a
+decision for that lane's current ready report is recorded, and the refusal
+names the report and the `agent-parley approve NAME` that grants it. The
+decision is bound to the identifier of that report, the exact commit the lane
+branch points at, the branch and base it targets, the repository root, and a
+digest of the verification command, the pull-request policy and the approval
+requirement in force. Anything in that binding changing invalidates the
+decision, so new commits invalidate it even when the lane never reports again,
+and the refusal says which of those changed. The binding is read again
+immediately before the merge or the push, while the lane's session exclusion is
+held, so an approval recorded for earlier commits cannot carry a later head
+into the base repository or the forge. A decision log that cannot be read, or
+that holds a damaged record, refuses integration rather than treating the
+missing decision as consent.
+
+`reject` requires a reason, records it, and delivers it to the lane as operator
+mail. It gates nothing else: the lane keeps its session, its claims and its
+work, and can go on committing. Only these two commands are refused, and only
+until a further decision is recorded.
+
+Both commands run from the base checkout and refuse to run inside an assigned
+worktree, so no lane records the approval of its own work through them. That is
+this tool's command-line boundary, not an operating-system one: a program
+running under your account can write coordination state directly. Separate the
+operator from the lanes as different operating-system users, or in different
+containers, when that distinction has to hold. The decision also records that a
+named local account decided, not that the code is correct. The verification
+command, the attribution scan and GitHub's own checks all still run unchanged.
+
+`status` prints `awaiting approval`, `approved` or `rejected` beside a lane's
+ready report, naming what invalidated an earlier decision; `top` counts the
+lanes awaiting one in its header; and `history --kind approval` lists the
+decisions, their operator and their reasons with the rest of the chain.
+
 Four commands drive a lane's life from the base checkout, and every one of them
 writes an event so `top` and `events export` show what the operator did and when.
 

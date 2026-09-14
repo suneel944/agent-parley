@@ -188,6 +188,39 @@ reporting the exit status. It runs as an argument list, never through a shell, a
 skips it. It reports the base checkout as it stands before the merge, which is
 not a claim about the merged result.
 
+A repository can also require your own recorded decision before a lane's work
+leaves its worktree:
+
+```sh
+agent-parley approval set merge pr   # refuse both until a decision exists
+agent-parley approval show           # report what is required
+agent-parley approval set            # require no approval again
+agent-parley approve claude-2        # record that you approved its report
+agent-parley reject claude-2 'Needs a test for the retry path'
+```
+
+With the requirement set, `participant merge` and `participant pr` refuse until
+`approve` records a decision on that lane's current ready report, and the
+refusal names both the report and the command that grants it. The decision is
+bound to that report, the lane's exact commit, its branch and base, and the
+verification and pull-request settings in force, so new commits, a further
+report, a retargeted base or a changed gate each need a new decision; the
+binding is rechecked immediately before the merge or the push. A decision that
+cannot be read refuses integration rather than allowing it. A rejection
+delivers your reason to the lane as operator mail and the lane keeps working:
+only these two commands are gated. `status` shows `awaiting approval`,
+`approved` or `rejected` beside a ready report, `top` counts the lanes awaiting
+one, and `history --kind approval` lists the decisions with the rest of the
+chain.
+
+`approve` and `reject` run from the base checkout and refuse to run inside an
+assigned worktree, so no lane records the approval of its own work through
+these commands. That is this tool's command-line boundary and not an
+operating-system one: a program running as you can write coordination state
+directly. The decision also records that a human decided, not that the code is
+correct; the verification command, the attribution scan and GitHub's own
+checks all still run.
+
 A new lane starts as a bare worktree, so every agent would otherwise spend its
 first turns installing dependencies or copying an untracked file. Record that
 setup once instead:
@@ -446,6 +479,10 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `participant restart NAME` | Start a stopped lane again from a clean worktree. |
 | `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
+| `approve NAME` | Record your approval of a lane's current ready report. |
+| `reject NAME REASON` | Record a rejection and deliver the reason to the lane. |
+| `approval show` | Show which steps require a recorded approval first. |
+| `approval set [STEP ...]` | Require an approval before `merge`, `pr`, both, or none. |
 | `provider list` | List built-in presets and local overrides. |
 | `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
 | `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |

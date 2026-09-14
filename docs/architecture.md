@@ -21,6 +21,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `dashboard` | Read-only live operator view of every participant |
 | `views` | Machine-readable rendering of read-only command results |
 | `metrics` | Idle intervals and waiting times derived from retained records |
+| `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
