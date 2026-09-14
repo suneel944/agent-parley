@@ -397,10 +397,17 @@ def revoke(home: Path, root: str, name: str) -> int:
 
 
 def authenticate(home: Path, token: str) -> dict | None:
-    """Resolves a bearer credential to exactly one project and lane."""
+    """Resolves a bearer credential to exactly one project and lane.
+
+    The canonical project key travels with the actor so a caller outside the
+    store can find the project's manifest without a checkout to resolve its
+    directory key from.
+    """
     with connect(home) as db:
         row = db.execute(
-            "SELECT id,project_id,name FROM agents WHERE token_digest=?",
+            "SELECT a.id,a.project_id,a.name,p.human_key AS project "
+            "FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE a.token_digest=?",
             (hashlib.sha256(token.encode()).hexdigest(),),
         ).fetchone()
         return dict(row) if row else None

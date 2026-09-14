@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from agent_parley import (
+    checkpoints,
     dashboard,
     evidence,
     forge,
@@ -1311,6 +1313,202 @@ class Bridge:
             "checkout while it runs."
         )
 
+    def _record_operator(
+        self, directory: Path, name: str, reason: checkpoints.Reason, note: str
+    ) -> None:
+        """Writes one operator lifecycle decision into the lane's event log."""
+        checkpoints.record(
+            directory,
+            name,
+            {"hook_event_name": "OperatorCommand"},
+            reason,
+            None,
+            note,
+        )
+
+    def pause(self, repo: Path, name: str, *, resume: bool = False) -> str:
+        """Refuses or restores a lane's coordination without ending it.
+
+        A paused lane keeps its session, its claims and its reservations. It
+        is refused the ability to act: every served coordination call and
+        every native tool use comes back denied, naming the operator as the
+        cause. Nothing is released on the lane's behalf, because pausing is
+        not a handoff.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane is paused or restored.
+            resume: Whether to clear the pause instead of setting it.
+
+        Returns:
+            An account of the lane's new state and what it still holds.
+
+        Raises:
+            BridgeError: If the participant does not exist.
+        """
+        directory, _, _ = self._lane(repo, name)
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            participant = data["participants"][name]
+            if participant.get("paused", False) is not resume:
+                state = "paused" if not resume else "not paused"
+                return f"{name} is already {state}; nothing changed."
+            participant["paused"] = not resume
+            write_json(directory / "project.json", data)
+        self._record_operator(
+            directory,
+            name,
+            (
+                checkpoints.Reason.OPERATOR_RESUMED
+                if resume
+                else checkpoints.Reason.OPERATOR_PAUSED
+            ),
+            "paused" if not resume else "",
+        )
+        if resume:
+            return f"{name} is resumed and serves coordination calls again."
+        held = self._holdings(directory, name)
+        return (
+            f"{name} is paused. Its session, claims and reservations are "
+            f"retained and nothing was released. {held}"
+        )
+
+    def _holdings(self, directory: Path, name: str) -> str:
+        """Describes what one lane still owns, for an operator to act on."""
+        owned = sorted(
+            (
+                number
+                for number, record in snapshot(directory)["issues"].items()
+                if record["owner"] == name
+            ),
+            key=int,
+        )
+        claims = (
+            "It still owns " + ", ".join(f"#{number}" for number in owned)
+            if owned
+            else "It owns no issue"
+        )
+        return (
+            f"{claims}. Ownership moves only through an explicit release or "
+            "an accepted handoff."
+        )
+
+    def stop(self, repo: Path, name: str) -> str:
+        """Ends one lane's native session from the base checkout.
+
+        The lane is told once that the operator is ending its session, then
+        the recorded session process is signalled exactly as a normal exit
+        signals it and given a bounded time to leave. Identity is the recorded
+        process ID together with its kernel creation time, checked here and
+        again inside the platform's terminate step, so a recycled process ID
+        is never signalled. The command-line check used to recognize the
+        coordination server does not apply: a lane runs a native client, not
+        this package.
+
+        Claims and reservations stay owned. Ending a session is not a handoff,
+        so what the lane still holds is reported for the operator to move
+        deliberately. The command is recorded either way, including when it
+        finds no session to end, so the ledger shows every operator action
+        rather than only the ones that changed something.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose session is ended.
+
+        Returns:
+            An account of what was stopped and what the lane still holds.
+
+        Raises:
+            BridgeError: If the participant does not exist, or the recorded
+                process did not exit within the shutdown timeout.
+        """
+        directory, _, _ = self._lane(repo, name)
+        path = directory / f"{name}-activity.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        pid = state.get("session_pid")
+        ticks = str(state.get("session_ticks") or "")
+        if type(pid) is not int or not process.alive(pid, ticks):
+            self._record_operator(
+                directory,
+                name,
+                checkpoints.Reason.OPERATOR_STOPPED,
+                "no verified session",
+            )
+            return (
+                f"{name} has no verified running session to stop. "
+                f"{self._holdings(directory, name)}"
+            )
+        with contextlib.suppress(BridgeError, OSError):
+            self.say(repo, name, "The operator is ending this session.")
+        process.ServerProcess(pid, ticks).stop()
+        with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+            state = json.loads(path.read_text()) if path.exists() else {}
+            state.update(activity="stopped", updated=time.time())
+            state.pop("session_pid", None)
+            state.pop("session_ticks", None)
+            write_json(path, state)
+        self._record_operator(
+            directory, name, checkpoints.Reason.OPERATOR_STOPPED, "stopped"
+        )
+        return (
+            f"{name}'s session was ended from the base checkout. "
+            f"{self._holdings(directory, name)}"
+        )
+
+    def restart(self, repo: Path, name: str, task: str = "") -> int:
+        """Starts one lane again from a clean worktree on its own branch.
+
+        A restart is refused while a session is alive, because two clients in
+        one worktree would fight over it. The worktree must already be clean
+        and on its assigned branch: nothing here resets, cleans, stashes or
+        force-switches, so a dirty tree is a refusal naming the paths rather
+        than work thrown away. Any recorded lane initialization command runs
+        again, because a restart recreates the starting state.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane is started again.
+            task: Opening instruction for the new session.
+
+        Returns:
+            The native client's exit status.
+
+        Raises:
+            BridgeError: If a session is alive, the worktree is dirty, or the
+                lane is not on its assigned branch.
+        """
+        directory, data, participant = self._lane(repo, name)
+        state = checkpoints.activity(directory, name)
+        if process.alive(state.get("session_pid"), state.get("session_ticks")):
+            raise BridgeError(
+                f"{name} still has a live session. Run `agent-parley "
+                f"participant stop {name}` first; a restart never runs two "
+                "clients in one worktree."
+            )
+        lane = Path(participant["lane"])
+        pending = git(lane, "status", "--porcelain")
+        if pending:
+            raise BridgeError(
+                f"{name}'s worktree has uncommitted changes, so it is not "
+                "restarted; nothing here resets, cleans or stashes. Commit "
+                "or move this work first:\n" + pending
+            )
+        actual = current_branch(lane)
+        if actual != participant["branch"]:
+            raise BridgeError(drift(name, participant, actual))
+        if data.get("initialize"):
+            initialize_lane(lane, data["initialize"], Path(data["root"]))
+        self._record_operator(
+            directory, name, checkpoints.Reason.OPERATOR_RESTARTED, "starting"
+        )
+        return self.launch(
+            name,
+            repo,
+            task or terminal.PROMPT,
+            participant["provider"],
+            participant["credential"],
+        )
+
     def merge(self, repo: Path, name: str) -> str:
         """Merges one participant's bridge branch into the base checkout.
 
@@ -2505,12 +2703,23 @@ def main() -> int:
     joining.add_argument("--provider")
     joining.add_argument("--credentials")
     joining.add_argument("--repo", type=Path, default=Path.cwd())
-    for action in ("restore", "retire", "merge", "pr"):
+    for action in (
+        "restore",
+        "retire",
+        "merge",
+        "pr",
+        "pause",
+        "resume",
+        "stop",
+        "restart",
+    ):
         command = roles.add_parser(action)
         command.add_argument("name")
         command.add_argument("--repo", type=Path, default=Path.cwd())
         if action == "merge":
             command.add_argument("--preview", action="store_true")
+        if action == "restart":
+            command.add_argument("--task", default="")
     gate = commands.add_parser(
         "verify",
         help="Show or set the command a repository requires before a merge.",
@@ -2687,6 +2896,18 @@ def main() -> int:
                 )
             elif args.action == "pr":
                 print(bridge.pull_request(repository, args.name))
+            elif args.action in ("pause", "resume"):
+                print(
+                    bridge.pause(
+                        repository,
+                        args.name,
+                        resume=args.action == "resume",
+                    )
+                )
+            elif args.action == "stop":
+                print(bridge.stop(repository, args.name))
+            elif args.action == "restart":
+                return bridge.restart(repository, args.name, args.task)
             if not preview:
                 _, directory = bridge.project(repository)
                 print(roster.describe(roster.read(directory)))

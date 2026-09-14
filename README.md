@@ -133,6 +133,25 @@ participant can be named `operator`, and no MCP tool sends as it, so an agent
 cannot write in its name. Repeating the same message delivers nothing further,
 and `--ack` asks the lane to acknowledge it.
 
+Steer a lane's life without typing into its terminal either:
+
+```sh
+agent-parley participant pause claude-2     # refuse its calls, keep its work
+agent-parley participant resume claude-2    # let it act again
+agent-parley participant stop claude-2      # end its session cleanly
+agent-parley participant restart claude-2   # start it again from clean state
+```
+
+A paused lane keeps its session, its claims and its reservations. Only acting is
+refused: every coordination call and every tool use comes back denied naming the
+operator, and `top` shows `paused`. `stop` tells the lane once, then signals the
+recorded session process exactly as a normal exit does, and it never signals a
+process whose recorded identity no longer matches. `restart` refuses while a
+session is alive, refuses a dirty worktree naming the paths, replays the recorded
+`init` command and launches the same provider and account as before. None of the
+four releases a claim: ownership still moves only through an explicit release or
+an accepted handoff, and all four land in the event log.
+
 When a lane's work is ready, integrate it from the base checkout:
 
 ```sh
@@ -349,6 +368,10 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `participant add NAME` | Create a lane with an optional provider and credential profile. |
 | `participant restore NAME` | Restore the assigned branch while preserving work. |
 | `participant retire NAME` | Retire an idle lane while preserving recoverable work. |
+| `participant pause NAME` | Refuse a lane's calls and tool use; keep its session and claims. |
+| `participant resume NAME` | Let a paused lane act again. |
+| `participant stop NAME` | End a lane's session from the base checkout; keep its claims. |
+| `participant restart NAME` | Start a stopped lane again from a clean worktree. |
 | `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
 | `provider list` | List built-in presets and local overrides. |

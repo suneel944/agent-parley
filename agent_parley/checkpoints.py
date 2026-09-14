@@ -67,6 +67,11 @@ class Reason(StrEnum):
     COORDINATION_UNAVAILABLE = "coordination_unavailable"
     CHECKPOINT_FAILED = "checkpoint_failed"
     WAKE_REQUESTED = "wake_requested"
+    OPERATOR_PAUSED = "operator_paused"
+    OPERATOR_RESUMED = "operator_resumed"
+    OPERATOR_STOPPED = "operator_stopped"
+    OPERATOR_RESTARTED = "operator_restarted"
+    PAUSED = "paused"
 
 
 def decision_of(output: dict | None) -> str:
@@ -798,6 +803,41 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         }
 
 
+def paused_output(event: str) -> dict | None:
+    """Builds the native refusal a paused lane receives for one event.
+
+    A paused lane keeps its session, its claims and its reservations; only
+    acting is refused. Tool use is denied outright, a turn boundary is told
+    why so the agent stops rather than retrying, and an event that carries no
+    decision channel is observed without one.
+
+    Args:
+        event: Native lifecycle event name.
+
+    Returns:
+        Native hook output refusing the event, or None when the event has no
+        way to carry a refusal.
+    """
+    if event == "PreToolUse":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": roster.PAUSED_REASON,
+            }
+        }
+    if event == "Stop":
+        return None
+    if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": roster.PAUSED_REASON,
+            }
+        }
+    return None
+
+
 def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
     """Observes a native event and prepares bounded coordination context.
 
@@ -832,6 +872,10 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
     lane = Path(participant["lane"]).resolve()
     if not Path(payload.get("cwd", str(lane))).resolve().is_relative_to(lane):
         raise BridgeError("Hook cwd does not belong to this agent's worktree.")
+    if participant.get("paused", False):
+        refusal = paused_output(event)
+        record(directory, agent, payload, Reason.PAUSED, refusal, "paused")
+        return refusal or {}
     try:
         guarded, guard_reason = branch_guard(
             event, payload, lane, participant["branch"]

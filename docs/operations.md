@@ -386,6 +386,38 @@ command is a different decision from reading Git state. The gate reports the
 base checkout as it stands before the merge, which is not a claim about the
 merged result.
 
+Four commands drive a lane's life from the base checkout, and every one of them
+writes an event so `top` and `events export` show what the operator did and when.
+
+`participant pause NAME` and `participant resume NAME` change whether a lane may
+act. A paused lane keeps its session, its claims and its reservations: pausing is
+not a handoff and releases nothing. Every served coordination call from that lane
+is refused at the service boundary with an enumerated reason naming the operator,
+the lifecycle hooks refuse tool use with that same reason, and `top` reports
+`paused` in `STATE`. Resuming clears the flag and nothing else. Pausing a lane
+that is already paused reports that and changes nothing.
+
+`participant stop NAME` ends the session from outside its terminal. It delivers
+one final operator notice, signals the recorded session process exactly as a
+normal exit signals it, and waits a bounded time for it to leave. Identity is the
+recorded process ID together with its kernel creation time, checked before
+signalling and again inside the platform's terminate step, so a recycled process
+ID is never signalled. The command-line check that recognizes the coordination
+server does not apply here, because a lane runs a native client rather than this
+package. Claims and reservations stay owned and the command prints what the lane
+still holds, so an operator moves that work deliberately. A stop that finds no
+running session is still recorded.
+
+`participant restart NAME` starts a lane again. It refuses while a session is
+alive, because two clients in one worktree would fight over it. It refuses a
+dirty worktree and names the paths, and it refuses a lane that is not on its
+assigned branch: nothing here resets, cleans, stashes or force-switches. It
+replays the recorded lane initialization command when one exists, then launches
+the same provider and credential profile as the previous run.
+
+These are command-line actions only. No MCP tool exposes them, so a participant
+cannot pause, stop or restart itself or a peer.
+
 A repository can also record one command that prepares every new lane:
 
 ```sh
