@@ -2245,8 +2245,11 @@ review, not merged or independently verified. An idle turn is not completion.
                 if activity_path.exists()
                 else {}
             )
+            previous.setdefault(
+                "resumable_session", previous.get("session_id", "")
+            )
             if resume:
-                session = previous.get("session_id", "")
+                session = previous["resumable_session"]
                 if not session or session.startswith("-") or len(session) > 128:
                     raise BridgeError(
                         "No usable native session to resume; launch manually."
