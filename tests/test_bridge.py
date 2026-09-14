@@ -1837,11 +1837,12 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
 
     settings = json.loads((account / "settings.json").read_text())
     assert settings["version"] == 1
-    assert set(settings["hooks"]) == set(COPILOT_EVENTS.values())
-    hook = settings["hooks"]["sessionStart"][0]
+    assert set(settings["hooks"]) == set(COPILOT_EVENTS)
+    hook = settings["hooks"]["SessionStart"][0]
     assert hook["type"] == "command"
     assert hook["timeoutSec"] == 3
     assert "agent_parley.checkpoints" in hook["bash"]
+    assert hook["bash"].endswith("--adapter copilot")
 
 
 def test_provider_definitions_never_store_credential_values(

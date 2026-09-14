@@ -277,9 +277,22 @@ refuses one without a profile instead of writing lane hooks into the directory
 your own Copilot sessions use. Sign in to that directory once, as with any
 other profile.
 
-The launch path was exercised against a stub executable that records its
-arguments and environment, not against a live Copilot session, so argument and
-file handling are verified while live model behavior is not.
+Copilot CLI chooses its hook payload format from the case of the configured
+event name. A camelCase name such as `preToolUse` delivers camelCase fields
+(`sessionId`, `toolName`, `toolArgs`); a PascalCase name such as `PreToolUse`
+delivers the compatible snake_case fields (`session_id`, `hook_event_name`,
+`tool_input`) that the shared checkpoint parser reads. Lane hooks are registered
+under the PascalCase names for that reason, and the hook command carries
+`--adapter copilot`. Copilot reads `permissionDecision`,
+`permissionDecisionReason` and `additionalContext` at the top level of a hook
+result rather than inside `hookSpecificOutput`, so the adapter flattens the
+shared output into those fields. It never answers a native approval prompt and
+never grants a permission Copilot refused.
+
+The launch path and the hook wire contract were exercised against a stub
+executable and by running the exact configured hook command with native
+payloads, not against a live Copilot session, so argument handling, file
+handling and hook translation are verified while live model behavior is not.
 
 OpenCode and Amp remain uncovered, each for a different reason
 recorded below. `agent-parley provider add` will store a definition naming one
