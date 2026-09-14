@@ -597,6 +597,20 @@ still held: nothing revokes it, reassigns it, or narrows what it blocks, and
 only its owner releases it. Reading `!` as "an agent died holding this" is the
 point; acting on it is the operator's decision, exactly as with a stalled
 issue owner.
+
+A person editing the base checkout is the one writer reservations never saw.
+Each `top` and `status` frame runs `git status --porcelain` once for the base
+checkout of every project and compares the dirty paths against each lane's
+active reservation patterns, using the same overlap rule a competing
+reservation is judged by, so a glob reservation matches a new file under it. A
+match is printed as an indented line under the lane's row in `top`, listed
+under the reservation count in `status`, and carried in the `operator_edits`
+field of `top --json` and `status --json`. The lane's lifecycle hook delivers
+one bounded advisory notice naming the paths and stating that nothing was
+reverted; the notice repeats only when the set of paths changes, which the hook
+records in the lane's activity state. Nothing pauses, reverts or locks, and a
+Git failure or timeout reports nothing rather than an error. `--no-operator-edits`
+on `top` skips the reading for a repository whose base checkout is always dirty.
 Use `--once`, or pipe it, for one plain snapshot instead of a live view, and
 `--interval` to change the redraw period. `--provider NAME` reports only the
 participants driven by that provider and is repeatable; the header then counts

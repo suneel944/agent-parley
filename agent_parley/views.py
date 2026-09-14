@@ -446,6 +446,7 @@ def _row(row: dict) -> dict:
         "state": row["state"],
         "stalled": row["stalled"],
         "stall": row["stall"],
+        "operator_edits": list(row["operator_edits"]),
         "last_event_at": timestamp(row["last_event_ts"] or None),
         "branch": row["branch"],
         "drift": row["drift"],

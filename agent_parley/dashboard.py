@@ -270,6 +270,7 @@ def _row(
     )
     idle = metrics.idle_intervals(directory, agent, context["since"])
     published = supervision.published_work(directory, agent)
+    edited = context["operator_edits"].get(agent, [])
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -290,6 +291,8 @@ def _row(
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
+        "operator_edits": edited,
+        "operator_edit": supervision.operator_edit_marker(edited),
         "event_age": (
             tables.age(time.time() - events["last_ts"])
             if events["last_ts"]
@@ -393,6 +396,7 @@ def collect(
     providers: tuple[str, ...] = (),
     window: float = 0.0,
     readings: dict | None = None,
+    operator_edits: bool = True,
 ) -> dict:
     """Reads one snapshot of every registered project without changing state.
 
@@ -409,6 +413,9 @@ def collect(
         readings: Caller-owned cache of each lane's last session-record
             reading, so a live view folds only newly appended records instead
             of re-reading a whole transcript on every refresh.
+        operator_edits: Whether to read the base checkout once per project
+            for dirty paths that overlap a lane's reservation. Off for a
+            repository whose base checkout is always dirty.
 
     Returns:
         Server health, per-project participant rows, the plan groups whose
@@ -436,6 +443,9 @@ def collect(
             "stalled_after": supervision.configuration(home, data)[
                 "stalled_after"
             ],
+            "operator_edits": (
+                supervision.operator_edits(home, data) if operator_edits else {}
+            ),
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -730,6 +740,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
             ]
             if row["stall"]:
                 lines.append(f"    {row['stall']}")
+            if row["operator_edit"]:
+                lines.append(f"    {row['operator_edit']}")
             if row["unfit"]:
                 lines.append(f"    {row['unfit']}")
             if row["work_offer"]:
@@ -1077,6 +1089,7 @@ def _loop(
     providers: tuple[str, ...],
     window: float,
     choices: dict,
+    operator_edits: bool = True,
 ) -> None:
     """Redraws the snapshot until the operator quits; never writes state."""
     branches: dict = {}
@@ -1091,7 +1104,15 @@ def _loop(
     while True:
         height, width = screen.getmaxyx()
         view = select(
-            collect(home, running(), branches, providers, window, readings),
+            collect(
+                home,
+                running(),
+                branches,
+                providers,
+                window,
+                readings,
+                operator_edits,
+            ),
             shaping["sort"],
             shaping["reverse"],
             shaping["projects"],
@@ -1161,6 +1182,7 @@ def run(
     projects: tuple[str, ...] = (),
     participants: tuple[str, ...] = (),
     columns: tuple[str, ...] = (),
+    operator_edits: bool = True,
 ) -> None:
     """Shows the dashboard, printing a plain snapshot when it cannot draw.
 
@@ -1177,6 +1199,8 @@ def run(
         projects: Repository roots to report; every project when empty.
         participants: Participant names to report; every one when empty.
         columns: Column names to show; all of them when empty.
+        operator_edits: Whether each frame reads the base checkout for
+            dirty paths that overlap a lane's reservation.
 
     A snapshot is printed at the width of the terminal when one is
     attached and at the full width of the table when the output is a pipe,
@@ -1193,7 +1217,14 @@ def run(
     }
     if once or not sys.stdout.isatty():
         view = select(
-            collect(home, running(), {}, providers, window),
+            collect(
+                home,
+                running(),
+                {},
+                providers,
+                window,
+                operator_edits=operator_edits,
+            ),
             ordering,
             reverse,
             projects,
@@ -1205,4 +1236,13 @@ def run(
         for line in render(view, available, columns=shown):
             print(line)
         return
-    curses.wrapper(_loop, home, running, interval, providers, window, shaping)
+    curses.wrapper(
+        _loop,
+        home,
+        running,
+        interval,
+        providers,
+        window,
+        shaping,
+        operator_edits,
+    )

@@ -608,6 +608,8 @@ def lane_detail(record: dict, data: dict) -> None:
         f"active reservations: {mail['reservations']}"
         + (f" ({stale} stale)" if stale else "")
     )
+    if edited := record["operator_edits"]:
+        print("    " + supervision.operator_edit_marker(edited))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
     print(f"    Last coordination: {mail['last_coordination_at']}")
@@ -4575,13 +4577,21 @@ attempt of the recorded budget, which is also only reported.
             "detail": reviewed["detail"],
         }
 
-    def _lane_status(self, directory: Path, data: dict, agent: str) -> dict:
+    def _lane_status(
+        self,
+        directory: Path,
+        data: dict,
+        agent: str,
+        edited: Sequence[str] = (),
+    ) -> dict:
         """Reads one lane's reported state, ownership context and mailbox.
 
         Args:
             directory: Private state directory for the common repository.
             data: Project manifest holding this participant.
             agent: Participant that owns the lane.
+            edited: Reserved paths an operator changed in the base checkout,
+                read once per project by the caller.
 
         Returns:
             The lane's session, availability, branch, reported outcome and
@@ -4659,6 +4669,7 @@ attempt of the recorded budget, which is also only reported.
                 "served_age_seconds": stalled["served_age_seconds"],
                 "marker": supervision.stall_marker(stalled),
             },
+            "operator_edits": list(edited),
             "idle_seconds": idle["seconds"],
             "idle_complete": idle["complete"],
             "waiting": metrics.pending(
@@ -4737,6 +4748,7 @@ attempt of the recorded budget, which is also only reported.
         projects = []
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
+            edits = supervision.operator_edits(self.home, data)
             projects.append(
                 {
                     "root": data["root"],
@@ -4747,7 +4759,9 @@ attempt of the recorded budget, which is also only reported.
                         reported_ready(path.parent),
                     ),
                     "participants": [
-                        self._lane_status(path.parent, data, agent)
+                        self._lane_status(
+                            path.parent, data, agent, edits.get(agent, [])
+                        )
                         for agent in sorted(data["participants"])
                     ],
                 }
@@ -5215,6 +5229,14 @@ def main() -> int:
         help=(
             "Show only these columns, comma separated, such as "
             "PARTICIPANT,STATE,IDLE. Every column is shown by default."
+        ),
+    )
+    watch.add_argument(
+        "--no-operator-edits",
+        action="store_true",
+        help=(
+            "Skip reading the base checkout for operator edits on reserved "
+            "paths, for a repository whose base checkout is always dirty."
         ),
     )
     measured = commands.add_parser(
@@ -5871,6 +5893,7 @@ def main() -> int:
                                     {},
                                     tuple(args.provider or ()),
                                     args.since,
+                                    operator_edits=not args.no_operator_edits,
                                 ),
                                 args.sort or "",
                                 args.reverse,
@@ -5893,6 +5916,7 @@ def main() -> int:
                     tuple(args.project or ()),
                     tuple(args.participant or ()),
                     names,
+                    not args.no_operator_edits,
                 )
         elif args.command == "metrics":
             if args.every and not args.output:

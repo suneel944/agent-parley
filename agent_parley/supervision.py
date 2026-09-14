@@ -144,6 +144,95 @@ def stall_marker(idle: dict) -> str:
     return f"idle; {item} waiting {int(idle['age_seconds'])}s"
 
 
+def dirty_paths(root: str) -> list[str] | None:
+    """Lists the paths Git reports as changed in the base checkout.
+
+    Args:
+        root: Canonical project key, which is the base checkout's path.
+
+    Returns:
+        Repository-relative paths in porcelain order, a rename reported by its
+        new name, or None when Git could not answer inside its timeout. A
+        checkout Git cannot inspect is no opinion rather than a clean one.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, "status", "--porcelain", "-uall"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    paths = []
+    for line in result.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        entry = line[3:]
+        if line[0] in "RC" and " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.append(entry.rstrip("/"))
+    return paths
+
+
+def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
+    """Names the reserved paths an operator has changed in the base checkout.
+
+    Reservations only ever saw other lanes. A person editing the base checkout
+    is invisible to every lane until the merge conflicts, so this reading
+    compares what Git reports as dirty there against every lane's active
+    reservation patterns, using the same overlap rule a competing reservation
+    is judged by. One Git call and one store query answer every lane.
+
+    The reading is advisory. Nothing pauses, reverts or locks; a reservation
+    stays what it always was, and the operator's work stays where it is.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+
+    Returns:
+        Mapping of participant name to the sorted dirty paths that overlap a
+        reservation it holds. Empty when the checkout is clean, when nothing
+        is reserved, or when Git or the store could not be read.
+    """
+    dirty = dirty_paths(manifest["root"])
+    if not dirty:
+        return {}
+    try:
+        held = store.active_reservations(home, manifest["root"])
+    except (BridgeError, OSError, sqlite3.Error):
+        return {}
+    collisions: dict[str, list[str]] = {}
+    for name, participant in manifest["participants"].items():
+        patterns = held.get(participant["display"], [])
+        matched = sorted(
+            {
+                path
+                for path in dirty
+                for pattern in patterns
+                if store.overlapping(path, pattern)
+            }
+        )
+        if matched:
+            collisions[name] = matched
+    return collisions
+
+
+def operator_edit_marker(paths: list[str]) -> str:
+    """Describes an operator collision in one line, naming the paths."""
+    if not paths:
+        return ""
+    plural = "" if len(paths) == 1 else "s"
+    return (
+        f"operator edited reserved path{plural} {', '.join(paths)} in the "
+        "base checkout; nothing was reverted"
+    )
+
+
 FIT_CHECKS = ("session", "capacity", "worktree", "mail")
 UNKNOWN_FIT: dict = {
     "fit": None,
