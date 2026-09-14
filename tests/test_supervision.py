@@ -106,7 +106,9 @@ def test_closed_pr_reminds_holder_and_preserves_claim(
     bridge.issue(peer, "claim", "2")
     bridge.issue(peer, "block", "2", on="1")
     monkeypatch.setattr(
-        supervision.forge, "branch_finished", lambda *args: True
+        supervision.forge,
+        "branch_completion",
+        lambda *args: ("MERGED", time.time()),
     )
     supervision.poll(bridge.home, lane.parent)
     record = issues.snapshot(lane.parent)["issues"]["1"]
