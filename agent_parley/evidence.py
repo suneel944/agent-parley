@@ -9,6 +9,10 @@ from pathlib import Path
 from agent_parley import checkpoints, issues, store
 from agent_parley.state import write_json
 
+SECTION_START = "<!-- agent-parley:evidence:start -->"
+SECTION_END = "<!-- agent-parley:evidence:end -->"
+SECTION_HEADING = "## Recorded review evidence"
+
 
 def collect(
     home: Path, directory: Path, manifest: dict, name: str, head: str
@@ -85,6 +89,48 @@ def collect(
     }
 
 
+def section(rendered: str) -> str:
+    """Wraps rendered evidence in the markers that make it replaceable.
+
+    Args:
+        rendered: Review summary produced by :func:`publish`.
+
+    Returns:
+        The summary delimited so a later push can replace exactly this text.
+    """
+    return f"{SECTION_START}\n{rendered.rstrip()}\n{SECTION_END}\n"
+
+
+def refresh(body: str, rendered: str) -> str:
+    """Replaces the managed evidence section and preserves every human edit.
+
+    A pull request body is written once at creation and then belongs to the
+    people reviewing it. Only the delimited evidence section is owned here, so
+    a later push rewrites that span and leaves reviewer prose, checklists and
+    added headings untouched. A body written before the markers existed is
+    recognized by the evidence heading and its trailing span is replaced, and
+    a body carrying neither marker nor heading gains the section at the end
+    rather than losing anything.
+
+    Args:
+        body: Current pull-request body, including any human edits.
+        rendered: Review summary produced by :func:`publish`.
+
+    Returns:
+        The body with exactly one current, delimited evidence section.
+    """
+    replacement = section(rendered)
+    start = body.find(SECTION_START)
+    end = body.find(SECTION_END)
+    if start != -1 and end > start:
+        tail = body[end + len(SECTION_END) :].lstrip("\n")
+        return body[:start] + replacement + tail
+    heading = body.find(SECTION_HEADING)
+    if heading != -1:
+        return body[:heading] + replacement
+    return body.rstrip("\n") + "\n\n" + replacement
+
+
 def publish(directory: Path, record: dict) -> str:
     """Writes a private evidence artifact and renders its review summary.
 
@@ -124,7 +170,7 @@ def publish(directory: Path, record: dict) -> str:
         or "none recorded"
     )
     return (
-        "## Recorded review evidence\n\n"
+        f"{SECTION_HEADING}\n\n"
         f"Commit: `{record['head']}`. {gate_text}\n\n"
         f"Retained hook denials by reason: {reasons}.\n\n"
         f"Advisory reservations held during the claim: {paths}. "
