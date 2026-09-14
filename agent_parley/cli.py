@@ -56,15 +56,17 @@ CHANGE_TYPE = frozenset(
         "release",
     }
 )
-COPILOT_EVENTS = {
-    "SessionStart": "sessionStart",
-    "UserPromptSubmit": "userPromptSubmitted",
-    "PreToolUse": "preToolUse",
-    "PostToolUse": "postToolUse",
-    "PermissionRequest": "permissionRequest",
-    "Stop": "agentStop",
-    "SessionEnd": "sessionEnd",
-}
+COPILOT_EVENTS = frozenset(
+    {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PermissionRequest",
+        "Stop",
+        "SessionEnd",
+    }
+)
 
 
 def git(repo: Path, *args: str) -> str:
@@ -661,6 +663,14 @@ def pull_request_body(
 
 def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
     """Merges lane configuration without replacing native user settings.
+
+    Copilot CLI selects its payload format from the case of the configured
+    event name: a camelCase name delivers camelCase fields such as
+    ``sessionId`` and ``toolArgs``, while a PascalCase name delivers the
+    compatible snake_case fields the shared checkpoint parser already reads.
+    Lane hooks are therefore registered under the shared PascalCase names, so
+    a native event reaches the coordination guards instead of being discarded
+    at the ignored-event boundary.
 
     Existing hook order is retained and identical lane hooks are not appended
     again on relaunch. Both documents are validated before either is written.
@@ -2088,10 +2098,11 @@ review, not merged or independently verified. An idle turn is not completion.
                         "tools": ["*"],
                     },
                     {
-                        COPILOT_EVENTS[event]: [
+                        event: [
                             {
                                 "type": "command",
-                                "bash": groups[0]["hooks"][0]["command"],
+                                "bash": groups[0]["hooks"][0]["command"]
+                                + " --adapter copilot",
                                 "timeoutSec": 3,
                             }
                         ]

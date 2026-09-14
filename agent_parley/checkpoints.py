@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 
-from agent_parley import gemini, process, roster
+from agent_parley import copilot, gemini, process, roster
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 from agent_parley.store import DATABASE
@@ -964,7 +964,9 @@ def main() -> int:
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--participant", "--agent", required=True)
     parser.add_argument(
-        "--adapter", choices=("native", "gemini"), default="native"
+        "--adapter",
+        choices=("native", "gemini", "copilot"),
+        default="native",
     )
     args = parser.parse_args()
     payload = {}
@@ -974,14 +976,16 @@ def main() -> int:
             raise ValueError("Expected a hook object")
         if args.adapter == "gemini":
             payload = gemini.payload(payload)
+        elif args.adapter == "copilot":
+            payload = copilot.payload(payload)
         output = checkpoint(
             args.home, args.directory, args.participant, payload
         )
-        print(
-            json.dumps(
-                gemini.response(output) if args.adapter == "gemini" else output
-            )
-        )
+        if args.adapter == "gemini":
+            output = gemini.response(output)
+        elif args.adapter == "copilot":
+            output = copilot.response(output)
+        print(json.dumps(output))
         return 0
     except (OSError, ValueError, KeyError, BridgeError) as exc:
         print(f"Agent Parley checkpoint failed: {exc}", file=sys.stderr)
