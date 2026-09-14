@@ -160,19 +160,24 @@ def overrides(pairs: list[str]) -> dict[str, str]:
     return result
 
 
-def verify_command(command: str) -> list[str]:
-    """Parses a repository's pre-merge verification command into arguments.
+def verify_command(
+    command: str, label: str = "Verification command"
+) -> list[str]:
+    """Parses a repository command an operator configured into arguments.
 
     The command is stored and run as argument tokens, never through a shell,
-    so redirection, expansion and chaining cannot ride into a merge gate. An
-    empty command removes the gate rather than configuring an empty one, which
-    keeps "no gate" a single represented state.
+    so redirection, expansion and chaining cannot ride into a gate. An empty
+    command removes the gate rather than configuring an empty one, which keeps
+    "no gate" a single represented state. The same parsing serves the
+    pre-merge verification gate and the lane initialization command, because
+    both are operator-configured argument lists run without a shell.
 
     Args:
         command: Command line an operator configured for this repository.
+        label: Name of the configured command, reported when it is rejected.
 
     Returns:
-        Argument tokens, or an empty list when no gate is configured.
+        Argument tokens, or an empty list when no command is configured.
 
     Raises:
         BridgeError: If the command cannot be read as an argument list.
@@ -183,15 +188,15 @@ def verify_command(command: str) -> list[str]:
         parsed = shlex.split(command)
     except ValueError as exc:
         raise BridgeError(
-            f"Verification command is not a usable argument list: {exc}."
+            f"{label} is not a usable argument list: {exc}."
         ) from None
     if not parsed or len(parsed) > MAX_VERIFY_ARGUMENTS:
         raise BridgeError(
-            "Verification command must name an executable followed by at "
+            f"{label} must name an executable followed by at "
             f"most {MAX_VERIFY_ARGUMENTS - 1} arguments."
         )
     if any("\x00" in token for token in parsed):
-        raise BridgeError("Verification command must not contain NUL bytes.")
+        raise BridgeError(f"{label} must not contain NUL bytes.")
     return parsed
 
 
@@ -502,6 +507,7 @@ def normalize(manifest: dict) -> dict:
         "root": manifest["root"],
         "base": manifest["base"],
         "verify": list(manifest.get("verify") or []),
+        "initialize": list(manifest.get("initialize") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "supervision": dict(manifest.get("supervision", {})),
         "participants": participants,

@@ -386,6 +386,34 @@ command is a different decision from reading Git state. The gate reports the
 base checkout as it stands before the merge, which is not a claim about the
 merged result.
 
+A repository can also record one command that prepares every new lane:
+
+```sh
+agent-parley init show
+agent-parley init set 'uv sync --locked'
+agent-parley init set ''
+```
+
+`init set` records that command in the same project manifest, outside the target
+source tree, and `init show` reports it. A repository with nothing configured
+hands the native CLI a bare worktree exactly as before. With a command
+configured, the launcher runs it in the new worktree after `git worktree add`
+and before the native CLI starts, so dependencies, an untracked environment
+file or a warmed build are in place for the agent's first turn rather than
+costing it several. `participant add` runs it on the same path, because both
+create a lane through the same step.
+
+The command is stored as argument tokens and run without a shell, like the
+verification gate, and no flag skips it. It runs only at lane creation, never on
+a resume, so a resumed session does not repeat setup. `AGENT_PARLEY_BASE` names
+the base checkout while it runs, which is how a command copies a file Git does
+not track. A non-zero exit refuses the launch and reports the exit status with
+the last twenty lines of the combined output; a command that cannot run at all is
+a refusal, not a skip. The worktree is left in place in both cases, because an
+operator needs to inspect what the command did before it failed. The participant
+is not registered in the roster, so correcting the command and rerunning starts
+from the same point.
+
 `participant pr` pushes one lane's bridge branch to `origin` and opens a pull
 request for it. The body is the lane's own recorded report: its summary, its
 verification evidence and its remaining work, under the three headings the
