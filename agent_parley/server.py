@@ -12,7 +12,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent_parley import retries, roster, store
+from agent_parley import protocol, retries, roster, store
 from agent_parley.state import BridgeError
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
@@ -372,9 +372,31 @@ class Handler(BaseHTTPRequestHandler):
             response["error"] = {"code": -32601, "message": "Method not found"}
         self._reply(200, response)
 
+    def _declared_protocol(self) -> int:
+        """Returns the wire protocol this caller declared, or this build's.
+
+        A caller that declares nothing is served, because the header was added
+        after the first protocol and its absence means exactly that. A caller
+        that declares something unreadable is treated as declaring an unknown
+        protocol and is refused by name rather than guessed at.
+        """
+        header = self.headers.get(protocol.HEADER)
+        if header is None:
+            return protocol.PROTOCOL
+        try:
+            return int(header)
+        except ValueError:
+            return protocol.UNKNOWN
+
     def _call(self, actor: dict, params: dict) -> dict:
         """Validates the tool envelope and contains expected domain failures."""
         try:
+            declared = self._declared_protocol()
+            if not protocol.compatible(declared):
+                store.refused(
+                    self.server.home, actor, str(params.get("name", ""))[:80]
+                )
+                raise BridgeError(protocol.mismatch("plugin", declared))
             tool = next(
                 (t for t in TOOLS if t["name"] == params.get("name")), None
             )

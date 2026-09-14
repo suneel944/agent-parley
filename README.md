@@ -259,6 +259,13 @@ attempt of the recorded budget. Ownership never moves on a timer: an overdue
 claim is still owned, and only an explicit release or an accepted handoff
 transfers it.
 
+**An out-of-date install says so before it costs a turn.** The launcher, the
+plugin and the store each state a protocol number, and a mismatch is refused at
+the boundary with both numbers and the one command that fixes it — when a lane
+starts, when a hook runs, and when a served call arrives. `agent-parley doctor`
+prints all three and exits non-zero on a mismatch, so a script can gate on it. It
+reads only, and prints no credential.
+
 **The work order is a file you can review.** Write the issues, the dependencies
 between them and the groups that may run in parallel as TOML, then
 `agent-parley plan apply work-order.toml`. Applying records the same advisory
@@ -427,6 +434,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
+| `doctor` | Report launcher, plugin and store versions and their fit; non-zero exit on a mismatch. |
 | `issue ... --idempotency-key KEY` | Retry any transition safely; the repeat returns the first result. |
 | `participant list` | List the project's lanes and their identities. |
 | `participant add NAME` | Create a lane with an optional provider and credential profile. |

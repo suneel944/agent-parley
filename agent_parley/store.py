@@ -1132,6 +1132,40 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
     return result
 
 
+def schema_version(home: Path) -> int:
+    """Returns the schema version the store on disk declares.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        The declared schema, or zero when no store has been created yet or the
+        file cannot be opened. Reading never creates or upgrades a store.
+    """
+    path = home / DATABASE
+    if not path.exists():
+        return 0
+    try:
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            return int(db.execute("PRAGMA user_version").fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
+def refused(home: Path, actor: dict, tool: str) -> None:
+    """Records a call refused at the transport boundary.
+
+    A refusal that never reaches a tool still cost the lane its turn, so it is
+    counted where every other denial is counted rather than disappearing.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        tool: Tool the refused call named, or an empty name.
+    """
+    _observe(home, actor, tool or "unknown", "error", time.monotonic(), 0)
+
+
 def _refused(
     home: Path, actor: dict, tool: str, args: dict, exc: BridgeError
 ) -> None:

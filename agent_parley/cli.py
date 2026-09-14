@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import importlib.metadata
 import json
 import os
 import secrets
@@ -32,6 +33,7 @@ from agent_parley import (
     plan,
     policy,
     process,
+    protocol,
     retries,
     roster,
     store,
@@ -2193,6 +2195,8 @@ attempt of the recorded budget, which is also only reported.
                 str(directory),
                 "--participant",
                 agent,
+                "--protocol",
+                str(protocol.PROTOCOL),
             ]
         )
         return {
@@ -2451,6 +2455,58 @@ attempt of the recorded budget, which is also only reported.
         elif action == "release":
             forge.unassign(repo, parse_issue(number))
         return record
+
+    def doctor(self) -> dict:
+        """Reports the launcher, plugin and store versions and their fit.
+
+        The command reads. It opens no lane, writes no configuration and
+        repairs nothing, so it stays safe to run while lanes are working, and
+        it reports no credential, token or path inside a credential profile.
+
+        Returns:
+            The launcher's package version and wire protocol, the protocol each
+            shipped plugin manifest declares, the store's schema version
+            against the schema this build writes, and whether the whole set is
+            consistent.
+        """
+        components = [
+            {
+                "component": "launcher",
+                "version": importlib.metadata.version("agent-parley"),
+                "protocol": protocol.PROTOCOL,
+                "compatible": True,
+            }
+        ]
+        for client, manifest in protocol.manifests(
+            protocol.package_root()
+        ).items():
+            declared = protocol.installed(manifest)
+            components.append(
+                {
+                    "component": f"{client} plugin",
+                    "version": "",
+                    "protocol": declared,
+                    "compatible": protocol.compatible(declared),
+                }
+            )
+        schema = store.schema_version(self.home)
+        components.append(
+            {
+                "component": "store",
+                "version": f"schema {schema}",
+                "protocol": protocol.PROTOCOL,
+                "compatible": schema <= store.SCHEMA_VERSION,
+            }
+        )
+        return {
+            "protocol": protocol.PROTOCOL,
+            "supported": list(protocol.SUPPORTED),
+            "schema": store.SCHEMA_VERSION,
+            "components": components,
+            "consistent": all(
+                component["compatible"] for component in components
+            ),
+        }
 
     def work_plan(
         self, repo: Path, action: str, path: Path | None = None
@@ -3017,6 +3073,15 @@ attempt of the recorded budget, which is also only reported.
                 f"Install and sign in to the native {entry['command']} CLI "
                 "first."
             )
+        manifest = protocol.manifests(protocol.package_root()).get(
+            entry["adapter"]
+        )
+        if manifest is not None and manifest.exists():
+            declared = protocol.installed(manifest)
+            if not protocol.compatible(declared):
+                raise BridgeError(
+                    protocol.mismatch("installed plugin", declared)
+                )
         lane = Path(participant["lane"])
         with lock(lane.parent / f"{agent}.session.lock"):
             self.up()
@@ -3041,7 +3106,8 @@ attempt of the recorded budget, which is also only reported.
                                 "headers": {
                                     "Authorization": (
                                         "Bearer ${AGENT_PARLEY_TOKEN}"
-                                    )
+                                    ),
+                                    protocol.HEADER: str(protocol.PROTOCOL),
                                 },
                             }
                         }
@@ -3093,7 +3159,8 @@ attempt of the recorded budget, which is also only reported.
                         "type": "http",
                         "url": self.url + "/mcp/",
                         "headers": {
-                            "Authorization": ("Bearer ${AGENT_PARLEY_TOKEN}")
+                            "Authorization": ("Bearer ${AGENT_PARLEY_TOKEN}"),
+                            protocol.HEADER: str(protocol.PROTOCOL),
                         },
                         "tools": ["*"],
                     },
@@ -3432,6 +3499,11 @@ def main() -> int:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    checking = commands.add_parser(
+        "doctor",
+        help="Report launcher, plugin and store versions and their fit.",
+    )
+    checking.add_argument("--json", action="store_true", help=JSON_HELP)
     planning = commands.add_parser(
         "plan", help="Apply, compare or show the recorded work-order plan."
     )
@@ -3745,6 +3817,14 @@ def main() -> int:
                 print(views.render("issues", views.ledger(result)))
             else:
                 print(describe(result, bridge.liveness(args.repo.resolve())))
+        elif args.command == "doctor":
+            reported = bridge.doctor()
+            print(
+                views.render("doctor", views.doctor(reported))
+                if args.json
+                else protocol.render(reported)
+            )
+            return 0 if reported["consistent"] else 1
         elif args.command == "plan":
             applied = bridge.work_plan(
                 args.repo.resolve(), args.action, getattr(args, "path", None)

@@ -986,6 +986,19 @@ def versioned_repo(git_repo):
         (directory / "plugin.json").write_text(
             json.dumps({"version": "0.1.1"}) + "\n"
         )
+    directory = git_repo / "agent_parley"
+    directory.mkdir(exist_ok=True)
+    (directory / "protocol.py").write_text("PROTOCOL = 1\n")
+    (directory / "store.py").write_text("SCHEMA_VERSION = 7\n")
+    directory = git_repo / "docs"
+    directory.mkdir(exist_ok=True)
+    (directory / "operations.md").write_text(
+        f"{release.COMPATIBILITY_START}\n"
+        "| Launcher | Wire protocol | Store schema |\n"
+        "| --- | --- | --- |\n"
+        "| 0.1.1 | 1 | 6 |\n"
+        f"{release.COMPATIBILITY_END}\n"
+    )
     release.command("git", "add", "-A", cwd=git_repo)
     release.command("git", "commit", "-m", "chore: markers", cwd=git_repo)
     release.command("git", "tag", TAG, cwd=git_repo)
@@ -1023,6 +1036,9 @@ def test_bump_raises_every_marker_and_lists_only_counted_work(versioned_repo):
             / f".{client}-plugin/plugin.json"
         )
         assert json.loads(path.read_text())["version"] == "0.2.0"
+    documented = (versioned_repo / "docs/operations.md").read_text()
+    assert "| 0.2.0 | 1 | 7 |" in documented
+    assert "| 0.1.1 | 1 | 6 |" in documented
     changelog = (versioned_repo / "CHANGELOG.md").read_text()
     assert changelog.startswith("# Changelog\n\n## [0.2.0](")
     assert "* add a lane ([#12]" in changelog
