@@ -184,6 +184,8 @@ def _row(row: dict) -> dict:
         "provider": row["provider_name"],
         "credential": row["credential"],
         "state": row["state"],
+        "stalled": row["stalled"],
+        "stall": row["stall"],
         "last_event_at": timestamp(row["last_event_ts"] or None),
         "branch": row["branch"],
         "drift": row["drift"],
@@ -200,6 +202,8 @@ def _row(row: dict) -> dict:
         "calls": row["calls"],
         "errors": row["errors"],
         "tokens": row["tokens"],
+        "idle_seconds": row["idle_seconds"],
+        "idle_complete": row["idle_complete"],
         "prompt": row["prompt"],
     }
 

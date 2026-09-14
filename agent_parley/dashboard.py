@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import records, roster, store
+from agent_parley import metrics, records, roster, store, supervision
 from agent_parley.checkpoints import (
     activity,
     event_summary,
@@ -34,6 +34,7 @@ COLUMNS = (
     ("DENIALS", 9),
     ("CALLS", 9),
     ("TOKENS", 9),
+    ("IDLE", 8),
 )
 
 
@@ -158,6 +159,10 @@ def _row(
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
     liveness = participant_liveness(directory, agent)
+    stalled = supervision.stall(
+        home, directory, data, agent, context["stalled_after"]
+    )
+    idle = metrics.idle_intervals(directory, agent, context["since"])
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -169,10 +174,15 @@ def _row(
         "state": (
             f"paused; {liveness}"
             if participant.get("paused", False)
+            else f"idle {_age(stalled['age_seconds'])}; {liveness}"
+            if stalled["stalled"]
             else "running; no hooks"
             if "checkpoints unavailable" in liveness
             else liveness
         ),
+        "stalled": stalled["stalled"],
+        "stall": supervision.stall_marker(stalled),
+        "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
         "event_age": (
             _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
         ),
@@ -195,6 +205,8 @@ def _row(
         "tokens": records.reported_tokens(
             home, participant, context["records"]
         ),
+        "idle_seconds": idle["seconds"],
+        "idle_complete": idle["complete"],
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
         ).replace("\n", " ")[:MAX_PROMPT],
@@ -233,7 +245,14 @@ def collect(
     since = time.time() - window if window else 0.0
     cache = {} if readings is None else readings
     projects = []
-    totals = {"participants": 0, "events": 0, "denials": 0, "context": 0}
+    totals: dict[str, int] = {
+        "participants": 0,
+        "events": 0,
+        "denials": 0,
+        "context": 0,
+        "idle": 0,
+    }
+    leader = ""
     for path in sorted((home / "projects").glob("*/project.json")):
         try:
             data = roster.read(path.parent)
@@ -249,6 +268,9 @@ def collect(
             "branches": branches,
             "records": cache,
             "since": since,
+            "stalled_after": supervision.configuration(home, data)[
+                "stalled_after"
+            ],
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -261,12 +283,20 @@ def collect(
             totals["events"] += row["hook_events"]
             totals["denials"] += row["denials"]
             totals["context"] += row["injected_bytes"]
+            totals["idle"] += row["idle_seconds"]
+            if row["idle_seconds"] > totals.get("idle_leader_seconds", 0):
+                leader = row["participant"]
+                totals["idle_leader_seconds"] = row["idle_seconds"]
         projects.append({"root": data["root"], "rows": rows})
     return {
         "running": running,
         "home": str(home),
         "projects": projects,
-        "totals": totals,
+        "totals": {
+            **totals,
+            "idle_leader_seconds": totals.get("idle_leader_seconds", 0),
+            "idle_leader": leader,
+        },
         "providers": list(providers),
         "window": window,
     }
@@ -288,7 +318,7 @@ def render(
     columns = list(enumerate(COLUMNS))
     omitted = []
     if width is not None:
-        for index in (1, 3, 4, 8, 10, 11, 7, 5, 9):
+        for index in (1, 3, 4, 8, 10, 11, 7, 12, 5, 9):
             if sum(cell[1][1] + 2 for cell in columns) - 2 <= width:
                 break
             omitted.append(COLUMNS[index][0])
@@ -316,7 +346,14 @@ def render(
         f"participants {totals['participants']}  "
         f"hook events {totals['events']}  "
         f"denials {totals['denials']} ({rate})  "
-        f"context {_size(totals['context'])}"
+        f"context {_size(totals['context'])}  "
+        f"idle {_age(totals['idle'])}"
+        + (
+            f" (most {totals['idle_leader']} "
+            f"{_age(totals['idle_leader_seconds'])})"
+            if totals["idle_leader"]
+            else ""
+        )
         + (
             f"  provider {','.join(view['providers'])}"
             if view.get("providers")
@@ -341,6 +378,7 @@ def render(
             )
         for row in project["rows"]:
             row_positions.append(len(lines))
+            marker = row["stall"]
             lines.append(
                 "  ".join(
                     _fit(value, selected_columns[index][1])
@@ -370,21 +408,36 @@ def render(
                             f"{row['calls']}"
                             + (f"!{row['errors']}" if row["errors"] else ""),
                             _tokens(row["tokens"]),
+                            _age(row["idle_seconds"])
+                            + ("" if row["idle_complete"] else "+"),
                         ),
                     )
                     if index in selected_columns
                 ).rstrip()
             )
+            if marker:
+                lines.append(f"    {marker}")
             if row["prompt"]:
                 lines.append(f"    last: {row['prompt']}")
     lines.append("")
+    lines.append(
+        "A lane marked idle is alive, has served no coordination call within "
+        "the configured interval, and holds unread or unacknowledged mail at "
+        "least that old; the line under it names the oldest waiting item. The "
+        "marker only reports: nothing is revoked and no ownership moves."
+    )
     lines.append(
         "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
         "!past a declared time to live, with the age of the oldest; DENIALS "
         "denied or blocked of retained hook events; CALLS served MCP calls, "
         "!rejected; TOKENS what that lane's own native client recorded for "
         "its session, not billed spend and not comparable between vendors, "
-        "blank when its records were not readable. A branch marked ! left "
+        "blank when its records were not readable; IDLE observed coordination "
+        "inactivity inside the window, measured from this lane's own recorded "
+        "turn ends, with + when the window reaches past what retention kept. "
+        "IDLE says how long a lane went without coordination activity; it "
+        "does not claim to know what the native client was doing inside a "
+        "turn. A branch marked ! left "
         "its assigned bridge branch. A stale lease is still held; releasing "
         "it is its owner's to do."
     )

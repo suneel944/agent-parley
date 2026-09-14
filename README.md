@@ -250,6 +250,13 @@ status continues to show the drift.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
+**A stalled lane says so.** `top` and `status` mark a lane `idle` when its
+process is alive, no coordination call has been served for it within the
+configured interval, and it holds unread or unacknowledged mail at least that
+old — and they name the oldest waiting item and how long it has waited. The
+marker only reports: nothing is revoked, no claim is released and no ownership
+moves.
+
 **Your history stays yours.** A lane branch is `parley/PROJECT_KEY/lane-N`: it
 carries no participant, provider or account name, and `agent-parley branch set
 PREFIX` changes the prefix per project. No lane signs its work either. A commit,
@@ -284,6 +291,16 @@ Enforcement is recorded, not discarded. Every hook decision carries an
 enumerated reason and lands in that participant's event log; every served call
 is recorded inside the transaction that carried its effect. That is why `top`
 can show what was denied, to whom, and how often.
+
+**Idle time is a number, not an impression.** `top` gains an `IDLE` column: how
+long each lane went without coordination activity inside the window, with the
+project total and the worst lane in the header. `status` prints the same figure
+and, under it, every pending item with the seconds it has already waited — a
+message before its first read, an `ack_required` message before acknowledgement,
+a handoff offer before an answer, a `ready` report before integration. Every
+figure comes from records the runtime already keeps, so it reports observed
+coordination inactivity and never claims to know what the native client was
+doing inside a turn.
 
 That history is bounded, and it can leave the state directory. A lane keeps two
 event files and discards records older than fourteen days, so `top` reports

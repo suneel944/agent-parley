@@ -27,6 +27,7 @@ from agent_parley import (
     evidence,
     forge,
     gemini,
+    metrics,
     policy,
     process,
     roster,
@@ -1263,6 +1264,9 @@ class Bridge:
                         git(root, "branch", "-d", branch)
                         note = f"Branch {branch} deleted; it added no commits."
                 store.revoke(self.home, data["root"], participant["display"])
+                metrics.record_report(
+                    directory, name, {"kind": "integration", "action": "retire"}
+                )
                 with lock(directory / f"{name}-checkpoint.lock", timeout=1):
                     for suffix in (
                         "identity.json",
@@ -1687,12 +1691,18 @@ class Bridge:
             with lock(directory / f"{name}.session.lock", session_busy(name)):
                 if data["verify"]:
                     verify_base(root, data["verify"])
-                return merge_branch(
+                merged = merge_branch(
                     root,
                     Path(participant["lane"]),
                     name,
                     participant["branch"],
                 )
+                metrics.record_report(
+                    directory,
+                    name,
+                    {"kind": "integration", "action": "merge"},
+                )
+                return merged
 
     def preview_merge(self, repo: Path, name: str) -> str:
         """Reports what merging a participant's lane would do, changing nothing.
@@ -1946,6 +1956,9 @@ class Bridge:
             arguments.extend(["--milestone", milestone])
         created = gh(root, *arguments)
         opened = created.splitlines()[-1] if created else "a pull request"
+        metrics.record_report(
+            directory, name, {"kind": "integration", "action": "pull_request"}
+        )
         return f"Pushed {branch} and opened {opened}"
 
     async def identity(self, agent: str, data: dict) -> dict:
@@ -2119,6 +2132,9 @@ review, not merged or independently verified. An idle turn is not completion.
                 reported_at=time.time(),
             )
             write_json(path, state)
+        metrics.record_report(
+            directory, agent, {"kind": "report", "state": outcome}
+        )
         if arrived:
             body = report_comment(summary, evidence)
             for issue, record in snapshot(directory)["issues"].items():
@@ -2302,6 +2318,14 @@ review, not merged or independently verified. An idle turn is not completion.
         participant and remain oldest first within one, which is the order
         the log retains them in.
 
+        Each line also names its kind in ``record``: ``event`` for a hook
+        decision, ``idle_interval`` for a measured stretch of observed
+        coordination inactivity, and ``wait`` for how long a message, an
+        acknowledgement, a handoff offer or a ready report waited. The
+        intervals and waits leave with the records so they can be kept and
+        compared across sessions, providers and accounts once retention has
+        discarded the events they were derived from.
+
         Args:
             repo: Any checkout of the target repository.
             participants: Participants to export; every participant when
@@ -2330,11 +2354,30 @@ review, not merged or independently verified. An idle turn is not completion.
             name for name in names if not participants or name in participants
         ]
         since = time.time() - window if window else 0.0
-        lines = [
-            json.dumps({"participant": name, **entry})
-            for name in selected
-            for entry in read_events(directory, name, since)
-        ]
+        lines = []
+        for name in selected:
+            lines += [
+                json.dumps({"participant": name, "record": "event", **entry})
+                for entry in read_events(directory, name, since)
+            ]
+            idle = metrics.idle_intervals(directory, name, since)
+            lines += [
+                json.dumps(
+                    {
+                        "participant": name,
+                        "record": "idle_interval",
+                        "complete": idle["complete"],
+                        **interval,
+                    }
+                )
+                for interval in idle["intervals"]
+            ]
+            lines += [
+                json.dumps({"participant": name, "record": "wait", **wait})
+                for wait in metrics.waits(
+                    self.home, directory, data, name, since
+                )
+            ]
         text = "".join(f"{line}\n" for line in lines)
         if output is None:
             sys.stdout.write(text)
@@ -2390,6 +2433,14 @@ review, not merged or independently verified. An idle turn is not completion.
         )
         branch = lane_branch(Path(participant["lane"]))
         reported_at = state.get("reported_at")
+        stalled = supervision.stall(
+            self.home,
+            directory,
+            data,
+            agent,
+            supervision.configuration(self.home, data)["stalled_after"],
+        )
+        idle = metrics.idle_intervals(directory, agent)
         record = {
             "participant": agent,
             "identity": name,
@@ -2416,6 +2467,20 @@ review, not merged or independently verified. An idle turn is not completion.
             ),
             "injected_bytes": state.get("injected_bytes", 0),
             "injections": state.get("injections", 0),
+            "idle": {
+                "stalled": stalled["stalled"],
+                "kind": stalled["kind"],
+                "message_id": stalled["message_id"],
+                "sender": stalled["sender"],
+                "age_seconds": stalled["age_seconds"],
+                "served_age_seconds": stalled["served_age_seconds"],
+                "marker": supervision.stall_marker(stalled),
+            },
+            "idle_seconds": idle["seconds"],
+            "idle_complete": idle["complete"],
+            "waiting": metrics.pending(
+                metrics.waits(self.home, directory, data, agent)
+            ),
             "wake": None,
             "mail": None,
         }
@@ -2524,6 +2589,19 @@ review, not merged or independently verified. An idle turn is not completion.
                             data["participants"][agent],
                             record["branch"],
                         )
+                    )
+                if record["idle"]["stalled"]:
+                    print(f"    {record['idle']['marker']}")
+                print(
+                    "    Observed coordination inactivity: "
+                    f"{record['idle_seconds']}s"
+                    + ("" if record["idle_complete"] else " (incomplete)")
+                )
+                for wait in record["waiting"]:
+                    item = wait.get("message_id") or wait.get("issue") or ""
+                    print(
+                        f"    Waiting {wait['seconds']}s: {wait['kind']}"
+                        + (f" {item}" if item else "")
                     )
                 print(f"    Reported outcome: {record['outcome']}")
                 print(

@@ -15,6 +15,7 @@ from agent_parley.state import BridgeError, lock, write_json
 DEFAULTS = {
     "interval": 30,
     "inactive_after": 300,
+    "stalled_after": 600,
     "prompts": True,
     "wake": True,
 }
@@ -25,7 +26,7 @@ def settings(value: dict) -> dict:
     if not isinstance(value, dict) or set(value) - set(DEFAULTS):
         raise BridgeError("Invalid supervision settings.")
     result = {**DEFAULTS, **value}
-    for field in ("interval", "inactive_after"):
+    for field in ("interval", "inactive_after", "stalled_after"):
         if (
             type(result[field]) not in (int, float)
             or not 1 <= result[field] <= 86400
@@ -62,6 +63,76 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "last_active": value.get("updated"),
         "age_seconds": int(age),
     }
+
+
+def stall(
+    home: Path, directory: Path, manifest: dict, name: str, after: float
+) -> dict:
+    """Names a live lane that owes an answer and is serving no calls.
+
+    A lane whose turn ended while an unread or unacknowledged message sat in
+    its inbox looks healthy in every column: the process is alive, the branch
+    is right, and the mail counter is a number rather than a wait. Naming that
+    stall needs no new mechanism, because the runtime already records when the
+    message arrived and when a call was last served for the lane.
+
+    The report is read-only. It revokes nothing, releases nothing, moves no
+    ownership and wakes nobody; it states what an operator or a waiting peer
+    would otherwise have to work out from timestamps by hand.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private state directory for the common repository.
+        manifest: Project manifest holding this participant.
+        name: Participant that owns the lane.
+        after: Seconds of silence after which a waiting item reads as a stall.
+
+    Returns:
+        Whether the lane is stalled, the oldest waiting item and its age, and
+        the age of the last served call. A lane whose recorded session process
+        is not alive is never reported as stalled: it is stopped, which the
+        session state already says.
+    """
+    from agent_parley import checkpoints
+
+    idle = {
+        "stalled": False,
+        "kind": None,
+        "message_id": None,
+        "sender": "",
+        "age_seconds": 0,
+        "served_age_seconds": None,
+    }
+    state = checkpoints.activity(directory, name)
+    if not process.alive(state.get("session_pid"), state.get("session_ticks")):
+        return idle
+    try:
+        report = store.waiting(
+            home, manifest["root"], manifest["participants"][name]["display"]
+        )
+    except (BridgeError, OSError, sqlite3.Error):
+        return idle
+    served = report["served_age_seconds"]
+    idle.update(report)
+    idle["stalled"] = bool(
+        report["kind"]
+        and report["age_seconds"] >= after
+        and (served is None or served >= after)
+    )
+    return idle
+
+
+def stall_marker(idle: dict) -> str:
+    """Describes a stall in one line, naming the oldest waiting item."""
+    if not idle["stalled"]:
+        return ""
+    item = (
+        f"message {idle['message_id']} from {idle['sender']}"
+        if idle["kind"] == "unread"
+        else f"acknowledgement of message {idle['message_id']} "
+        f"for {idle['sender']}"
+    )
+    return f"idle; {item} waiting {int(idle['age_seconds'])}s"
 
 
 def configuration(home: Path, manifest: dict) -> dict:
