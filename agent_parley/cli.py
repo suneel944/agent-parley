@@ -3337,6 +3337,44 @@ def main() -> int:
             "6h or 7d. The whole retained log is counted by default."
         ),
     )
+    watch.add_argument(
+        "--sort",
+        metavar="COLUMN",
+        help=(
+            "Order rows by a column, such as IDLE or DENIALS. Counted "
+            "columns order from the largest value down."
+        ),
+    )
+    watch.add_argument(
+        "--reverse",
+        action="store_true",
+        help="Reverse the reported order.",
+    )
+    watch.add_argument(
+        "--project",
+        action="append",
+        metavar="ROOT",
+        help=(
+            "Report only this repository, by path or by directory name. "
+            "Repeat the flag to report several."
+        ),
+    )
+    watch.add_argument(
+        "--participant",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Report only this participant. Repeat the flag to report several."
+        ),
+    )
+    watch.add_argument(
+        "--columns",
+        metavar="LIST",
+        help=(
+            "Show only these columns, comma separated, such as "
+            "PARTICIPANT,STATE,IDLE. Every column is shown by default."
+        ),
+    )
     past = commands.add_parser(
         "history",
         help="Read the recorded history of an issue, a lane or a claim.",
@@ -3728,17 +3766,40 @@ def main() -> int:
                 "Coordination server stopped. Worktrees and messages retained."
             )
         elif args.command == "top":
+            names = tuple(
+                name.strip().upper()
+                for name in (args.columns or "").replace(",", " ").split()
+            )
+            unknown = [
+                name for name in names if name not in dict(dashboard.COLUMNS)
+            ]
+            if unknown:
+                parser.error(
+                    f"Unknown column {', '.join(unknown)}. Choose from: "
+                    f"{', '.join(name for name, _ in dashboard.COLUMNS)}."
+                )
+            if args.sort and args.sort.upper() not in dashboard.SORT_KEYS:
+                parser.error(
+                    f"Unknown sort column {args.sort}. Choose from: "
+                    f"{', '.join(dashboard.SORT_KEYS)}."
+                )
             if args.json:
                 print(
                     views.render(
                         "top",
                         views.frame(
-                            dashboard.collect(
-                                bridge.home,
-                                bool(bridge.server_process()),
-                                {},
-                                tuple(args.provider or ()),
-                                args.since,
+                            dashboard.select(
+                                dashboard.collect(
+                                    bridge.home,
+                                    bool(bridge.server_process()),
+                                    {},
+                                    tuple(args.provider or ()),
+                                    args.since,
+                                ),
+                                args.sort or "",
+                                args.reverse,
+                                tuple(args.project or ()),
+                                tuple(args.participant or ()),
                             )
                         ),
                     )
@@ -3751,6 +3812,11 @@ def main() -> int:
                     args.interval,
                     tuple(args.provider or ()),
                     args.since,
+                    args.sort or "",
+                    args.reverse,
+                    tuple(args.project or ()),
+                    tuple(args.participant or ()),
+                    names,
                 )
         elif args.command == "history":
             if args.subject is None:

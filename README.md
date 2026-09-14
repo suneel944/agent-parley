@@ -361,6 +361,42 @@ agent-parley top --provider codex
 agent-parley top --provider claude --provider codex
 ```
 
+## Shape the table
+
+`top` fits the terminal it is given. Every column is as wide as the widest
+value in the frame, and a terminal too narrow for the whole set drops the
+lowest-priority columns in a fixed order and names them under the header
+instead of clipping every cell. Rows past the fold are paged, never dropped:
+the footer reads `rows 1-8 of 31`. `--once` prints at the width of the
+terminal and at the full width of the table when the output is a pipe, so a
+captured file keeps every column intact.
+
+```sh
+agent-parley top --sort IDLE --reverse
+agent-parley top --project payments --participant codex
+agent-parley top --columns PARTICIPANT,STATE,ISSUES,IDLE
+```
+
+The same choices are reachable from the live view with single keys:
+
+| Key | Does |
+| --- | --- |
+| `j`, `k`, down, up | Select the next or previous lane, paging the table. |
+| `enter` | Show every recorded field of the selected lane, unclipped. |
+| `s` | Order by the next column. |
+| `r` | Reverse the order. |
+| `f` | Narrow to participants, comma separated; empty clears. |
+| `o` | Narrow to projects, comma separated; empty clears. |
+| `c` | Choose the columns shown; empty shows all. |
+| `?` | Show the key map and the column legend. |
+| `q` | Leave. The view never writes state. |
+
+A lane that drifted from its branch, holds a stale lease, had a call
+rejected, owns an overdue issue or lost its session process is drawn in
+colour where the terminal offers it and in bold where it does not. Each of
+those also prints its own marker in the table, so a monochrome pipe reads
+exactly the same.
+
 ## Providers and accounts
 
 A provider states which native CLI drives a participant and how that CLI reaches
@@ -420,7 +456,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `status` | Show server health, ownership, activity and reported outcomes. |
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
-| `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider` and `--since` filter it. |
+| `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--project`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
 | `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
 | `issue list` | Show claims, dependencies and handoff offers. |
