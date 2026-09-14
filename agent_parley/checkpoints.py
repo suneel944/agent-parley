@@ -887,7 +887,9 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         ).fetchone()[0]
         outstanding = db.execute(
             "SELECT m.id,a.name AS sender, "
-            "max(0,unixepoch('now')-unixepoch(m.created_ts)) AS age_seconds "
+            "max(0,unixepoch('now')-unixepoch(m.created_ts)) AS age_seconds, "
+            "max(0,unixepoch('now')-unixepoch(m.ack_deadline_ts)) "
+            "AS overdue_seconds "
             "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? "
             "AND m.ack_required=1 AND r.ack_ts IS NULL ORDER BY m.id LIMIT 32",
@@ -1113,6 +1115,15 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             if item.get("handoff_prompt", {}).get("holder")
                             == agent
                             and not item["handoff_prompt"].get("responded_at")
+                        ]
+                        reminders += [
+                            item["deadline_notice"]["text"]
+                            for item in issues["issues"].values()
+                            if (notice := item.get("deadline_notice"))
+                            and (
+                                notice["holder"] == agent
+                                or agent in notice.get("waiting", [])
+                            )
                         ]
                         parts.append(
                             clip("\n".join(reminders) or describe(issues), 400)

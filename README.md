@@ -250,6 +250,15 @@ status continues to show the drift.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
+**A deadline reports; it never transfers.** `issue claim 42 --within 2h`,
+`issue offer ... --within 30m` and `say ... --ack --within 15m` record a
+deadline, and `agent-parley deadlines set` gives a project defaults to inherit.
+Past its deadline a claim reads `overdue` with the seconds over, `top` marks the
+issue `#42!`, and a lane that reports `blocked` on work it still holds spends one
+attempt of the recorded budget. Ownership never moves on a timer: an overdue
+claim is still owned, and only an explicit release or an accepted handoff
+transfers it.
+
 **A stalled lane says so.** `top` and `status` mark a lane `idle` when its
 process is alive, no coordination call has been served for it within the
 configured interval, and it holds unread or unacknowledged mail at least that
@@ -415,6 +424,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
 | `resources show` | Show the named resources lanes may reserve. |
 | `resources set NAMES` | Declare them; an empty string accepts any well-formed name. |
+| `deadlines show` | Show this project's deadline and attempt defaults. |
+| `deadlines set` | Set `--claim`, `--offer`, `--ack` windows and `--attempts`. |
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `init show` | Show the command every new lane runs before it starts. |

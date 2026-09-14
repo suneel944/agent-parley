@@ -16,7 +16,7 @@ from agent_parley.checkpoints import (
     mailbox,
     participant_liveness,
 )
-from agent_parley.issues import snapshot
+from agent_parley.issues import deadline_state, snapshot
 from agent_parley.state import BridgeError
 
 BRANCH_TTL = 5.0
@@ -146,6 +146,12 @@ def _row(
         ),
         key=int,
     )
+    overdue = [
+        number
+        for number in owned
+        if deadline_state(issues[number])["overdue"]
+        or deadline_state(issues[number])["budget_exceeded"]
+    ]
     offers = sum(
         1
         for record in issues.values()
@@ -190,7 +196,12 @@ def _row(
         "branch": branch,
         "drift": branch != participant["branch"],
         "owned": owned,
-        "issues": ",".join(f"#{number}" for number in owned) or "-",
+        "overdue": overdue,
+        "issues": ",".join(
+            f"#{number}" + ("!" if number in overdue else "")
+            for number in owned
+        )
+        or "-",
         "offers": offers,
         "unread": mail.get("unread", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
@@ -425,6 +436,11 @@ def render(
         "the configured interval, and holds unread or unacknowledged mail at "
         "least that old; the line under it names the oldest waiting item. The "
         "marker only reports: nothing is revoked and no ownership moves."
+    )
+    lines.append(
+        "An issue marked ! is past its recorded deadline or its attempt "
+        "budget. It is still owned: a deadline reports, and only an explicit "
+        "release or an accepted handoff moves ownership."
     )
     lines.append(
         "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "

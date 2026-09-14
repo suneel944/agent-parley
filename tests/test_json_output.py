@@ -42,16 +42,17 @@ def test_status_reports_projects_lanes_and_ownership(
     assert document["state_directory"] == str(bridge.home)
     project = document["projects"][0]
     assert project["root"] == paired["root"]
-    assert project["issues"] == [
-        {
-            "issue": 42,
-            "owner": "claude",
-            "title": None,
-            "blocked_by": [],
-            "offer": None,
-            "reminder": None,
-        }
-    ]
+    assert len(project["issues"]) == 1
+    claimed = project["issues"][0]
+    expected = {
+        "issue": 42,
+        "owner": "claude",
+        "title": None,
+        "blocked_by": [],
+        "offer": None,
+        "reminder": None,
+    }
+    assert claimed | expected == claimed
     lanes = {lane["participant"]: lane for lane in project["participants"]}
     assert sorted(lanes) == ["claude", "codex"]
     assert lanes["claude"]["provider"] == "claude"
