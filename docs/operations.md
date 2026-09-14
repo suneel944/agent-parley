@@ -109,6 +109,43 @@ MCP calls with rejections, and the tokens that lane's own native client
 recorded. The header carries server health and the project's
 denial rate. The view is read-only and makes no model call; `q` leaves it.
 
+A reservation can name something that is not a file. Lanes collide on one local
+database, one dev-server port, one hardware device, one integration suite that
+cannot run twice at once, and a worktree isolates none of them. The same
+reservation tools accept a named resource written with a scheme, so it can never
+be confused with a path:
+
+```sh
+port:5432
+db:local
+suite:integration
+device:android-1
+```
+
+A named resource conflicts on an exact match only: no glob, no prefix and no
+path containment applies, because a port number is not a directory. Everything
+else is unchanged — the same 128-lease cap, the same optional `ttl_seconds` and
+stale marking, the same conflict naming the owner and that owner's reason, the
+same release by owner only, and the same rows in `top`, whose `LEASES` cell
+counts paths and named resources together. `status` additionally lists the named
+resources a lane holds, because a name is short enough to read and a path list
+is not.
+
+A project can declare which resources exist, so a mistyped name is refused
+before two lanes reserve two spellings of the same thing:
+
+```sh
+agent-parley resources show
+agent-parley resources set 'port:5432 db:local suite:integration'
+agent-parley resources set ''      # accept any well-formed name again
+```
+
+With a declaration in place, an undeclared name is refused with the declared
+list in the message. With none, every well-formed name is accepted. The
+declaration lives in coordination state beside the roster, so it commits
+nothing to the target repository, and it grants nothing: it only narrows what
+may be reserved.
+
 A reservation may declare `ttl_seconds`, and one taken without it never
 reports as stale. Once a declared time to live passes, the LEASES count in
 `top` gains `!` and the stale count, `status` reports the stale share of a
@@ -209,12 +246,15 @@ and thread IDs on `mail_thread` and `mail_search`, participant names, registered
 identities and branch names everywhere they apply. It carries no credential
 value; a credential profile is named, never its contents.
 
-`status` reports `server`, `state_directory` and one entry per project holding
+`resources show --json` reports `root`, the declared `resources` array and
+`declared`. `status` reports `server`, `state_directory` and one entry per
+project holding
 `root`, the issue ledger as `revision` and `issues`, and `participants`. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
 `session`, `availability`, `branch`, `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
-`report_age_seconds`, `injected_bytes`, `injections`, `wake` and `mail`. A
+`report_age_seconds`, `injected_bytes`, `injections`, `wake` and `mail`, whose
+`named_resources` array lists the named resources that lane holds. A
 mailbox that cannot be read reports `{"error": "..."}` in `mail` rather than
 failing the document, exactly as the table reports coordination as unavailable.
 

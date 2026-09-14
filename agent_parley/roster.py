@@ -255,6 +255,39 @@ def verify_command(
     return parsed
 
 
+MAX_RESOURCES = 64
+RESOURCE = re.compile(r"[a-z][a-z0-9_-]{0,15}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
+
+def resources(declared: list) -> list[str]:
+    """Validates the named resources a project declares as existing.
+
+    A declaration is a convenience, not a security boundary: it catches a
+    mistyped resource before two lanes reserve different spellings of the same
+    thing. A project that declares nothing accepts every well-formed name.
+
+    Args:
+        declared: Resource names such as ``port:5432`` or ``db:local``.
+
+    Returns:
+        The accepted names, deduplicated and ordered.
+
+    Raises:
+        BridgeError: If a name is malformed or the list is too long.
+    """
+    if not isinstance(declared, list) or len(declared) > MAX_RESOURCES:
+        raise BridgeError(
+            f"A project declares at most {MAX_RESOURCES} named resources."
+        )
+    for name in declared:
+        if not isinstance(name, str) or not RESOURCE.fullmatch(name):
+            raise BridgeError(
+                f"{name!r} is not a named resource; write a scheme and a "
+                "name, such as port:5432 or suite:integration."
+            )
+    return sorted(set(declared))
+
+
 PAUSED_REASON = (
     "This lane is paused by the operator. Coordination calls and tool use "
     "stay refused until `agent-parley participant resume` runs in the base "
@@ -631,6 +664,7 @@ def normalize(manifest: dict) -> dict:
         ),
         "verify": list(manifest.get("verify") or []),
         "initialize": list(manifest.get("initialize") or []),
+        "resources": resources(list(manifest.get("resources") or [])),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "supervision": dict(manifest.get("supervision", {})),
         "participants": participants,

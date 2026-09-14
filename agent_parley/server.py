@@ -92,10 +92,21 @@ TOOLS = [
     ),
     _tool(
         "file_reservation_paths",
-        "Reserve paths atomically; conflicts grant nothing and name the "
+        "Reserve repository-relative paths, or named resources written with a "
+        "scheme such as port:5432, db:local, suite:integration or "
+        "device:android-1, atomically; conflicts grant nothing and name the "
         "blocking owner with that owner's reason.",
         {
-            "paths": {"type": "array", "items": TEXT, "maxItems": 16},
+            "paths": {
+                "type": "array",
+                "items": TEXT,
+                "maxItems": 16,
+                "description": (
+                    "Repository-relative paths, or named resources written "
+                    "as SCHEME:NAME. A named resource conflicts on an exact "
+                    "match only."
+                ),
+            },
             "ttl_seconds": {
                 **INTEGER,
                 "minimum": 30,

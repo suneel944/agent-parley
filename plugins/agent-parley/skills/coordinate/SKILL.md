@@ -83,7 +83,10 @@ decisions. Both are scoped to mail this lane sent or received. Replies can use
 `reply_to` or the existing `thread_id` with `send_message`.
 
 `file_reservation_paths` and `release_file_reservations` manage advisory path
-reservations. They are not filesystem locks. `list_participants` discovers
+reservations. They are not filesystem locks. Reserve a named resource instead
+of a path when the contested thing is not a file — `port:5432`, `db:local`,
+`suite:integration`, `device:android-1` — because a worktree isolates none of
+those and a named resource conflicts on an exact match. `list_participants` discovers
 current identities; do not guess who is addressable.
 
 `agent-parley top --once` prints a snapshot; `top --provider NAME --since 6h`

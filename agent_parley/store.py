@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
+from agent_parley import roster
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
@@ -791,7 +792,29 @@ def _search(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     return result
 
 
-def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
+def named_resource(pattern: str) -> bool:
+    """Reports whether a reservation key names a resource rather than a path.
+
+    A resource is written with a scheme, such as ``port:5432`` or
+    ``suite:integration``, and a repository-relative path never carries one,
+    so the two key types cannot be confused for each other.
+
+    Args:
+        pattern: Reservation key as the caller wrote it.
+
+    Returns:
+        Whether the key names a resource.
+    """
+    scheme, separator, _ = pattern.partition(":")
+    return bool(separator) and "/" not in scheme
+
+
+def _reserve(
+    db: sqlite3.Connection,
+    actor: dict,
+    args: dict,
+    declared: frozenset[str] | None = None,
+) -> dict:
     """Grants all requested leases or none; two globs conservatively overlap.
 
     A conflict names the blocking owner and that owner's declared reason,
@@ -806,17 +829,57 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     from one that died holding the path. Staleness is a report: the lease is
     not revoked, not reassigned, and blocks exactly the paths it already
     blocked until its owner releases it.
+
+    A key written with a scheme, such as ``port:5432``, ``db:local``,
+    ``suite:integration`` or ``device:android-1``, reserves a named resource
+    rather than a path. Lanes collide on those as readily as on files, and a
+    worktree isolates neither. A named resource conflicts on an exact match
+    only: no glob, no prefix and no path containment applies to it, because a
+    port number is not a directory. Where a project declares which resources
+    exist, an undeclared name is refused with that list; where it declares
+    none, every well-formed name is accepted.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        args: Validated tool arguments.
+        declared: Resources this project declared, or None when it declared
+            none and any well-formed name is acceptable.
+
+    Returns:
+        The granted leases, or the conflicts that granted nothing.
+
+    Raises:
+        BridgeError: If a key is malformed, names an undeclared resource, or
+            the lane already holds the maximum number of leases.
     """
     paths = args.get("paths")
     if not isinstance(paths, list) or not 1 <= len(paths) <= 16:
-        raise BridgeError("paths must contain 1..16 repository-relative paths.")
+        raise BridgeError(
+            "paths must contain 1..16 repository-relative paths or named "
+            "resources such as port:5432."
+        )
     ttl = args.get("ttl_seconds")
     if ttl is not None:
         ttl = _number(ttl, "ttl_seconds", 30, 3600)
     exclusive = _flag(args.get("exclusive", True), "exclusive")
     reason = _text(args.get("reason", ""), "reason", 160, empty=True)
+    keys = []
     for pattern in paths:
         _text(pattern, "path", 240)
+        if named_resource(pattern):
+            if not roster.RESOURCE.fullmatch(pattern):
+                raise BridgeError(
+                    f"{pattern!r} is not a named resource; write a scheme and "
+                    "a name, such as port:5432 or suite:integration."
+                )
+            if declared is not None and pattern not in declared:
+                raise BridgeError(
+                    f"{pattern!r} is not declared for this project. Declared "
+                    "resources: " + (", ".join(sorted(declared)) or "none")
+                )
+            keys.append(pattern)
+            continue
         parts = PurePosixPath(pattern)
         if (
             parts.is_absolute()
@@ -825,7 +888,8 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
             or str(parts) == "."
         ):
             raise BridgeError("Reservations require repository-relative paths.")
-    paths = [str(PurePosixPath(pattern)) for pattern in paths]
+        keys.append(str(parts))
+    paths = keys
     leases = db.execute(
         "SELECT f.id,f.path_pattern,f.exclusive,a.name,"
         "substr(f.reason,1,80) AS reason,"
@@ -839,16 +903,19 @@ def _reserve(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     for pattern in set(paths):
         for lease in leases:
             other = lease["path_pattern"]
-            both_globs = any(c in pattern for c in "*?[") and any(
-                c in other for c in "*?["
-            )
-            overlaps = (
-                both_globs
-                or fnmatch.fnmatchcase(pattern, other)
-                or fnmatch.fnmatchcase(other, pattern)
-                or pattern.startswith(other.rstrip("/") + "/")
-                or other.startswith(pattern.rstrip("/") + "/")
-            )
+            if named_resource(pattern) or named_resource(other):
+                overlaps = pattern == other
+            else:
+                both_globs = any(c in pattern for c in "*?[") and any(
+                    c in other for c in "*?["
+                )
+                overlaps = (
+                    both_globs
+                    or fnmatch.fnmatchcase(pattern, other)
+                    or fnmatch.fnmatchcase(other, pattern)
+                    or pattern.startswith(other.rstrip("/") + "/")
+                    or other.startswith(pattern.rstrip("/") + "/")
+                )
             if (exclusive or lease["exclusive"]) and overlaps:
                 conflict = {"path": pattern, "owner": lease["name"]}
                 if lease["reason"]:
@@ -1025,9 +1092,20 @@ def _recipient_warnings(
 def _dispatch(
     home: Path, actor: dict, tool: str, args: dict, started: float
 ) -> dict:
-    """Runs one coordination tool inside its own bounded transaction."""
+    """Runs one coordination tool inside its own bounded transaction.
+
+    A reservation is validated against the resources its project declared.
+    That declaration lives in the project manifest beside the roster, which
+    only a state directory can resolve, so it is read here and handed to the
+    tool rather than looked up inside the transaction.
+    """
+    declared = (
+        declared_resources(home, str(actor.get("project", "")))
+        if tool == "file_reservation_paths"
+        else None
+    )
     with connect(home, write=tool not in READ_ONLY) as db:
-        result = _serve(db, actor, tool, args)
+        result = _serve(db, actor, tool, args, declared)
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -1040,7 +1118,35 @@ def _dispatch(
         return result
 
 
-def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
+def declared_resources(home: Path, root: str) -> frozenset[str] | None:
+    """Reads the named resources a project declared, if it declared any.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key recorded in the manifest.
+
+    Returns:
+        The declared resources, or None when the project declares none and any
+        well-formed name is acceptable. An unreadable manifest also reports
+        None, because a declaration must be readable to restrict anything.
+    """
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        return None
+    try:
+        resources = roster.read(directory)["resources"]
+    except (BridgeError, OSError, ValueError):
+        return None
+    return frozenset(resources) if resources else None
+
+
+def _serve(
+    db: sqlite3.Connection,
+    actor: dict,
+    tool: str,
+    args: dict,
+    declared: frozenset[str] | None = None,
+) -> dict:
     """Applies one validated coordination tool to the open transaction.
 
     Marking a message read or acknowledged stamps only the timestamp that is
@@ -1053,6 +1159,8 @@ def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
         actor: Authenticated project and lane.
         tool: Coordination tool named by the caller.
         args: Validated tool arguments.
+        declared: Named resources this project declared, or None when it
+            declared none.
 
     Returns:
         The tool result.
@@ -1076,7 +1184,7 @@ def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
     if tool == "search_messages":
         return _search(db, actor, args)
     if tool == "file_reservation_paths":
-        return _reserve(db, actor, args)
+        return _reserve(db, actor, args, declared)
     if tool == "release_file_reservations":
         result = db.execute(
             "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
