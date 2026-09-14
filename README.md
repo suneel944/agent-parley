@@ -54,6 +54,15 @@ wrote to disk. No vendor is asked, no key is read and no price is applied, so
 it is a relative signal between refreshes rather than billed spend, and the
 cell is blank when nothing could be read.
 
+An operator editing the base checkout is otherwise invisible to a lane until
+the merge conflicts. Every `top` and `status` frame reads `git status` of the
+base checkout once per project and matches the dirty paths against each lane's
+active reservations with the same rule a competing reservation is judged by. A
+match is printed under the lane's row, and the lane receives one advisory
+notice naming the path, repeated only when the set of paths changes. Nothing
+pauses, reverts or locks; reservations stay advisory. `--no-operator-edits`
+skips the reading for a repository whose base checkout is always dirty.
+
 Every frame on this page is real command output from a demo project. Only the
 state and project paths are shortened.
 

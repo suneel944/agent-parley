@@ -909,6 +909,37 @@ def named_resource(pattern: str) -> bool:
     return bool(separator) and "/" not in scheme
 
 
+def overlapping(pattern: str, other: str) -> bool:
+    """Reports whether two reservation keys can name the same thing.
+
+    Named resources overlap only when spelled identically. Paths overlap when
+    either matches the other as a glob, when one lies under the other as a
+    directory, or when both are globs, which the matcher cannot compare and
+    so treats as a collision. A plain path checked against a pattern uses the
+    same rule, so a dirty file in a checkout is matched exactly the way a
+    competing reservation would be.
+
+    Args:
+        pattern: Reservation key or repository-relative path.
+        other: Reservation key it is compared against.
+
+    Returns:
+        Whether the two keys overlap.
+    """
+    if named_resource(pattern) or named_resource(other):
+        return pattern == other
+    both_globs = any(c in pattern for c in "*?[") and any(
+        c in other for c in "*?["
+    )
+    return (
+        both_globs
+        or fnmatch.fnmatchcase(pattern, other)
+        or fnmatch.fnmatchcase(other, pattern)
+        or pattern.startswith(other.rstrip("/") + "/")
+        or other.startswith(pattern.rstrip("/") + "/")
+    )
+
+
 def _reserve(
     db: sqlite3.Connection,
     actor: dict,
@@ -1006,20 +1037,9 @@ def _reserve(
     for pattern in set(paths):
         for lease in leases:
             other = lease["path_pattern"]
-            if named_resource(pattern) or named_resource(other):
-                overlaps = pattern == other
-            else:
-                both_globs = any(c in pattern for c in "*?[") and any(
-                    c in other for c in "*?["
-                )
-                overlaps = (
-                    both_globs
-                    or fnmatch.fnmatchcase(pattern, other)
-                    or fnmatch.fnmatchcase(other, pattern)
-                    or pattern.startswith(other.rstrip("/") + "/")
-                    or other.startswith(pattern.rstrip("/") + "/")
-                )
-            if (exclusive or lease["exclusive"]) and overlaps:
+            if (exclusive or lease["exclusive"]) and overlapping(
+                pattern, other
+            ):
                 conflict = {"path": pattern, "owner": lease["name"]}
                 if lease["reason"]:
                     conflict["reason"] = lease["reason"]
@@ -2148,3 +2168,32 @@ def usage(home: Path, root: str) -> dict[str, dict]:
                 lease_age=max(0, row["lease_age"] or 0),
             )
     return report
+
+
+def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
+    """Reports every unreleased, unexpired reservation key for one project.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        Mapping of registered identity to the keys it holds, in sorted order.
+        A lease past its declared time to live is left out: it is still held
+        and still reported as stale elsewhere, but the paths it names no
+        longer read as reserved for the purpose of naming a collision.
+    """
+    if not (home / DATABASE).exists():
+        return {}
+    held: dict[str, list[str]] = {}
+    with connect(home) as db:
+        for row in db.execute(
+            "SELECT a.name AS name,f.path_pattern AS pattern "
+            "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
+            "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
+            "AND f.released_ts IS NULL AND (f.expires_ts IS NULL "
+            "OR f.expires_ts>CURRENT_TIMESTAMP) ORDER BY a.name,f.path_pattern",
+            (root,),
+        ):
+            held.setdefault(row["name"], []).append(row["pattern"])
+    return held
