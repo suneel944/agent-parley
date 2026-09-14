@@ -213,6 +213,65 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def deadline_notices(directory: Path, manifest: dict) -> None:
+    """Records one bounded notice for each claim that passed its budget.
+
+    The notice is written once per breach, identified by the deadline or the
+    attempt count that caused it, so a lane and its waiting peers are told
+    once rather than on every read. Recording a notice moves nothing: the
+    issue keeps its owner, its offer and its dependencies, and the notice
+    itself says so.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        changed = False
+        for number, record in ledger["issues"].items():
+            holder = record.get("owner")
+            if holder not in manifest["participants"]:
+                continue
+            timing = issues.deadline_state(record)
+            if not (timing["overdue"] or timing["budget_exceeded"]):
+                continue
+            identifier = (
+                f"{number}:{timing['deadline']}:{timing['attempts']}:"
+                f"{int(timing['budget_exceeded'])}"
+            )
+            if record.get("deadline_notice", {}).get("id") == identifier:
+                continue
+            waiting = sorted(
+                {
+                    other["owner"]
+                    for other in ledger["issues"].values()
+                    if number in other.get("blocked_by", [])
+                    and other.get("owner")
+                }
+            )
+            cause = (
+                "is past its attempt budget"
+                if timing["budget_exceeded"]
+                else f"is overdue by {timing['overdue_seconds']}s"
+            )
+            record["deadline_notice"] = {
+                "id": identifier,
+                "holder": holder,
+                "waiting": waiting,
+                "created": time.time(),
+                "text": (
+                    f"Issue #{number} {cause}. {holder} still owns it: a "
+                    "deadline reports, it never transfers. Ask for a handoff "
+                    "or release it explicitly."
+                ),
+            }
+            changed = True
+        if changed:
+            ledger["revision"] += 1
+            write_json(directory / "issues.json", ledger)
+
+
 def claimed_since(record: dict) -> float:
     """Reports when the current ownership generation of an issue began.
 
@@ -287,6 +346,7 @@ def poll(home: Path, directory: Path) -> None:
                 if completion[1] >= since
             )
         reminders(directory, manifest, closed)
+        deadline_notices(directory, manifest)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
         observe_responses(home, directory, manifest)

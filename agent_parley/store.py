@@ -15,7 +15,7 @@ from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BUSY_TIMEOUT = 5.0
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS messages (
  sender_id INTEGER NOT NULL REFERENCES agents(id), thread_id TEXT DEFAULT '',
  subject TEXT NOT NULL, body_md TEXT NOT NULL, ack_required INTEGER DEFAULT 0,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
- UNIQUE(sender_id,dedup_key));
+ ack_deadline_ts TEXT, UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -181,6 +181,7 @@ def initialize(home: Path) -> None:
                 if version == SCHEMA_VERSION:
                     _add_message_search(db)
                     return
+                _add_ack_deadline(db)
                 if version == 1:
                     _add_reservation_created(db)
                 _rebuild_reservations(db)
@@ -197,6 +198,18 @@ def initialize(home: Path) -> None:
                 _open_threads(db)
                 _rebuild_search(db)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _add_ack_deadline(db: sqlite3.Connection) -> None:
+    """Adds the optional acknowledgement deadline to an older store.
+
+    The column is additive and nullable, so every stored message keeps its
+    text, its recipients and its timestamps, and a message delivered before
+    the upgrade simply carries no deadline.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+    if "ack_deadline_ts" not in columns:
+        db.execute("ALTER TABLE messages ADD COLUMN ack_deadline_ts TEXT")
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -503,6 +516,9 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     thread = _text(args.get("thread_id", ""), "thread_id", 80, empty=True)
     key = _text(args.get("idempotency_key"), "idempotency_key", 80)
     ack = _flag(args.get("ack_required", False), "ack_required")
+    within = args.get("ack_within")
+    if within is not None:
+        within = _number(within, "ack_within", 1, 86400 * 30)
     if "reply_to" in args:
         if thread:
             raise BridgeError("Answer with reply_to or thread_id, not both.")
@@ -557,8 +573,18 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         }
     cursor = db.execute(
         "INSERT INTO messages(project_id,sender_id,subject,body_md,"
-        "thread_id,ack_required,dedup_key) VALUES (?,?,?,?,?,?,?)",
-        (actor["project_id"], actor["id"], subject, body, thread, ack, key),
+        "thread_id,ack_required,dedup_key,ack_deadline_ts) "
+        "VALUES (?,?,?,?,?,?,?,datetime('now',?))",
+        (
+            actor["project_id"],
+            actor["id"],
+            subject,
+            body,
+            thread,
+            ack,
+            key,
+            None if within is None else f"+{int(within)} seconds",
+        ),
     )
     message_id = cursor.lastrowid
     db.executemany(
@@ -1287,6 +1313,7 @@ def speak(
     key: str,
     *,
     ack: bool = False,
+    within: float | None = None,
 ) -> dict:
     """Delivers one supervising operator's message to a registered lane.
 
@@ -1303,6 +1330,9 @@ def speak(
         body: Message body the participant reads.
         key: Idempotency key; an identical resend returns the original.
         ack: Whether the participant must acknowledge the message.
+        within: Seconds the acknowledgement is expected to take, recorded as a
+            deadline beside the message. Past it the acknowledgement reads as
+            overdue; nothing is escalated, resent or acknowledged for the lane.
 
     Returns:
         The delivered message identifier, carrying ``duplicate`` when this key
@@ -1348,6 +1378,7 @@ def speak(
                 "body_md": body,
                 "idempotency_key": key,
                 "ack_required": ack,
+                "ack_within": within,
             },
         )
 

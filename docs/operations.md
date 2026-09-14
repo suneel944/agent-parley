@@ -101,6 +101,42 @@ A dependency is information, not a gate. Nothing prevents work on a waiting
 issue, no transition clears a dependency, and finishing the blocking issue does
 not drop the edge; the owner runs `issue unblock` when the wait is over.
 
+### Deadlines and attempt budgets
+
+A claim, a handoff offer and an acknowledgement can carry a deadline:
+
+```sh
+agent-parley issue claim 42 --within 2h
+agent-parley issue offer 42 --to codex --summary "commit, checks" --within 30m
+agent-parley say codex "Confirm the schema change" --ack --within 15m
+agent-parley deadlines show
+agent-parley deadlines set --claim 4h --offer 30m --ack 15m --attempts 3
+```
+
+**An overdue claim is still owned.** Past its deadline the claim reads `overdue`
+in `status`, `issue list` and `top` — where the issue is marked `#42!` — with the
+seconds it is over. Ownership does not move, nothing is revoked, and only an
+explicit release or an accepted handoff ever transfers an issue. The same is
+true of an exhausted attempt budget.
+
+A lane that reports `blocked` on an issue it still holds spends one attempt.
+`status` and `issue list` show attempts against the budget, and exceeding the
+budget is another visible state with the same guarantee: what to do about it
+stays the owner's or the operator's decision.
+
+`deadlines set` records the defaults every claim, offer and acknowledgement
+inherits when it passes no `--within`, so lanes carry a budget without repeating
+a flag. Windows take the same units as `--since` (`45m`, `6h`, `7d`), and a
+project that records none gives a deadline only to the records that ask for one.
+
+Deadlines are evaluated when a checkpoint, a `status`, a `top` refresh or a
+served call reads the record, from the stored timestamps. The service gains no
+background scheduler, and a stopped service produces no phantom transitions. The
+runtime records one bounded notice per breach, addressed to the owner and to any
+lane waiting on that issue through a recorded dependency, so a peer can decide
+whether to ask for a handoff; the notice reaches them through the checkpoint
+delivery that already carries ledger changes.
+
 `agent-parley top` watches every participant live: session state, event age,
 branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
@@ -303,11 +339,13 @@ project holding
 participant carries `participant`, `identity`, `provider`, `credential`,
 `session`, `availability`, `branch`, `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
-`report_age_seconds`, `injected_bytes`, `injections`, `idle`, `idle_seconds`,
-`idle_complete`, `waiting`, `wake` and `mail`, whose `named_resources` array
-lists the named resources that lane holds. `idle` carries `stalled`, the
-waiting item's `kind`, `message_id`, `sender` and `age_seconds`, the
-`served_age_seconds` since the last served call, and the same `marker` the
+`report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
+`idle_seconds`, `idle_complete`, `waiting`, `wake` and `mail`, whose
+`named_resources` array lists the named resources that lane holds. `claims`
+carries one record per issue that lane owns, with its `deadline_at`, `overdue`,
+`overdue_seconds`, `attempts`, `budget` and `budget_exceeded`. `idle` carries
+`stalled`, the waiting item's `kind`, `message_id`, `sender` and `age_seconds`,
+the `served_age_seconds` since the last served call, and the same `marker` the
 table prints. `waiting` carries one record per pending wait, longest first,
 each with its `kind`, its item and `seconds`. A
 mailbox that cannot be read reports `{"error": "..."}` in `mail` rather than
@@ -326,7 +364,10 @@ are null when its mailbox could not be read: null states that nothing was read,
 never that the count is zero.
 
 `issues` reports `revision` and an `issues` array whose records carry `issue`,
-`owner`, `title`, `blocked_by`, `offer` and `reminder`. `participants` reports
+`owner`, `title`, `deadline_at`, `overdue`, `overdue_seconds`, `attempts`,
+`attempt_budget`, `budget_exceeded`, `blocked_by`, `offer` and `reminder`; an
+`offer` additionally carries `deadline_at`, `overdue` and `overdue_seconds`.
+`deadlines show --json` reports `root` and the recorded `deadlines` defaults. `participants` reports
 `root` and a `participants` array carrying `participant`, `identity`,
 `provider`, `credential`, `branch`, `lane`, `paused` and `wake`.
 

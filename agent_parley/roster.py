@@ -255,6 +255,61 @@ def verify_command(
     return parsed
 
 
+DEADLINE_FIELDS = ("claim", "offer", "ack")
+MAX_DEADLINE = 86400 * 30
+MAX_ATTEMPTS = 1000
+
+
+def deadlines(value: dict) -> dict:
+    """Validates the deadline and attempt-budget defaults of one project.
+
+    A default is inherited by a claim, an offer or an acknowledgement that
+    passes no explicit window, so lanes carry a budget without repeating a
+    flag. A deadline never transfers ownership: it only makes an overdue
+    claim, offer or acknowledgement say so.
+
+    Args:
+        value: Defaults recorded in the project manifest.
+
+    Returns:
+        Validated defaults; an absent field records no default.
+
+    Raises:
+        BridgeError: If a field is unknown or holds an unusable value.
+    """
+    if not isinstance(value, dict) or set(value) - {
+        *DEADLINE_FIELDS,
+        "attempts",
+    }:
+        raise BridgeError(
+            "Deadline defaults accept only: "
+            + ", ".join([*DEADLINE_FIELDS, "attempts"])
+            + "."
+        )
+    result = {}
+    for field in DEADLINE_FIELDS:
+        seconds = value.get(field)
+        if seconds is None:
+            continue
+        if (
+            type(seconds) not in (int, float)
+            or not 1 <= seconds <= MAX_DEADLINE
+        ):
+            raise BridgeError(
+                f"The {field} deadline must be between 1 and "
+                f"{MAX_DEADLINE} seconds."
+            )
+        result[field] = seconds
+    budget = value.get("attempts")
+    if budget is not None:
+        if type(budget) is not int or not 1 <= budget <= MAX_ATTEMPTS:
+            raise BridgeError(
+                f"The attempt budget must be between 1 and {MAX_ATTEMPTS}."
+            )
+        result["attempts"] = budget
+    return result
+
+
 MAX_RESOURCES = 64
 RESOURCE = re.compile(r"[a-z][a-z0-9_-]{0,15}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 
@@ -665,6 +720,7 @@ def normalize(manifest: dict) -> dict:
         "verify": list(manifest.get("verify") or []),
         "initialize": list(manifest.get("initialize") or []),
         "resources": resources(list(manifest.get("resources") or [])),
+        "deadlines": deadlines(dict(manifest.get("deadlines") or {})),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "supervision": dict(manifest.get("supervision", {})),
         "participants": participants,

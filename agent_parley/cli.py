@@ -45,7 +45,17 @@ from agent_parley.checkpoints import (
     participant_liveness,
     read_events,
 )
-from agent_parley.issues import change, describe, parse_issue, snapshot
+from agent_parley.issues import (
+    attempt as change_attempt,
+)
+from agent_parley.issues import (
+    change,
+    deadline_state,
+    describe,
+    offer_state,
+    parse_issue,
+    snapshot,
+)
 from agent_parley.state import BridgeError, lock, write_json
 
 VERIFY_TIMEOUT = 1800
@@ -1466,6 +1476,61 @@ class Bridge:
             "list."
         )
 
+    def budgets(self, repo: Path, defaults: dict | None = None) -> str:
+        """Reports or records the deadline and attempt defaults of a project.
+
+        The defaults let lanes inherit a time budget without repeating a flag.
+        They change nothing about ownership: an overdue claim is still owned,
+        an exhausted attempt budget releases nothing, and only an explicit
+        release or an accepted handoff ever moves an issue.
+
+        Args:
+            repo: Any checkout of the target repository.
+            defaults: Fields to record, or None to report the current
+                defaults. A field set to None is removed.
+
+        Returns:
+            An account of the recorded defaults.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or a default is
+                not a usable window or budget.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if defaults is not None:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                merged = {
+                    key: value
+                    for key, value in {
+                        **data["deadlines"],
+                        **defaults,
+                    }.items()
+                    if value is not None
+                }
+                data["deadlines"] = roster.deadlines(merged)
+                write_json(directory / "project.json", data)
+        recorded = data["deadlines"]
+        if not recorded:
+            return (
+                f"{root} records no deadline defaults, so a claim, an offer "
+                "or an acknowledgement carries a deadline only when it passes "
+                "--within."
+            )
+        windows = ", ".join(
+            f"{field} {int(recorded[field])}s"
+            for field in roster.DEADLINE_FIELDS
+            if field in recorded
+        )
+        budget = recorded.get("attempts")
+        return (
+            f"{root} records defaults: {windows or 'no deadlines'}"
+            + (f", attempt budget {budget}" if budget else "")
+            + ". An overdue claim is still owned; only an explicit release or "
+            "an accepted handoff moves it."
+        )
+
     def _record_operator(
         self, directory: Path, name: str, reason: checkpoints.Reason, note: str
     ) -> None:
@@ -2057,6 +2122,11 @@ with `--state partial --summary "..." --remaining "..."`
 or `--state ready --summary "..." --evidence "commands and results"`.
 Use --state blocked with --remaining to explain a blocker. Ready means ready for
 review, not merged or independently verified. An idle turn is not completion.
+A claim, an offer and an acknowledgement can carry a deadline: `issue claim N
+--within 2h`, `issue offer N --to PEER --summary "..." --within 30m`. Past its
+deadline a claim reads overdue and states the seconds over. Nothing is revoked
+and no ownership moves; a blocked report on work you still hold spends one
+attempt of the recorded budget, which is also only reported.
 """
 
     def hooks(self, agent: str, directory: Path) -> dict:
@@ -2135,6 +2205,16 @@ review, not merged or independently verified. An idle turn is not completion.
         metrics.record_report(
             directory, agent, {"kind": "report", "state": outcome}
         )
+        owned = sorted(
+            (
+                number
+                for number, record in snapshot(directory)["issues"].items()
+                if record["owner"] == agent
+            ),
+            key=int,
+        )
+        if outcome == "blocked":
+            change_attempt(directory, agent, owned)
         if arrived:
             body = report_comment(summary, evidence)
             for issue, record in snapshot(directory)["issues"].items():
@@ -2149,6 +2229,7 @@ review, not merged or independently verified. An idle turn is not completion.
         subject: str = "",
         key: str = "",
         ack: bool = False,
+        within: float | None = None,
     ) -> dict:
         """Writes one operator message into a participant's lane inbox.
 
@@ -2164,6 +2245,9 @@ review, not merged or independently verified. An idle turn is not completion.
             subject: Subject line; a plain default is used when empty.
             key: Idempotency key; derived from the message when empty.
             ack: Whether the participant must acknowledge the message.
+            within: Seconds the acknowledgement is expected to take, recorded
+                as a deadline. None takes the project default, and a message
+                that requires no acknowledgement records none.
 
         Returns:
             The delivered message identifier, carrying ``duplicate`` when this
@@ -2184,6 +2268,9 @@ review, not merged or independently verified. An idle turn is not completion.
             )
         subject = subject or "Operator message"
         identity = participant["display"]
+        expected = (
+            within if within is not None else data["deadlines"].get("ack")
+        )
         return store.speak(
             self.home,
             data["root"],
@@ -2192,6 +2279,7 @@ review, not merged or independently verified. An idle turn is not completion.
             text,
             key or operator_key(identity, subject, text),
             ack=ack,
+            within=expected if ack else None,
         )
 
     def issue(
@@ -2204,6 +2292,7 @@ review, not merged or independently verified. An idle turn is not completion.
         summary: str = "",
         offer_id: str | None = None,
         on: str | None = None,
+        within: float | None = None,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -2225,6 +2314,8 @@ review, not merged or independently verified. An idle turn is not completion.
             summary: Handoff context supplied by the owner.
             offer_id: Exact current offer ID for acceptance or decline.
             on: Issue this one waits on, for a block or unblock.
+            within: Seconds this claim or offer is expected to take, recorded
+                as a deadline. None takes the project default.
 
         Returns:
             The whole ledger for list, or the resulting issue record.
@@ -2254,6 +2345,8 @@ review, not merged or independently verified. An idle turn is not completion.
             offer_id=offer_id,
             on=on,
             title=title,
+            within=within,
+            defaults=data["deadlines"],
         )
         if action == "claim":
             forge.assign(repo, parse_issue(number))
@@ -2467,6 +2560,21 @@ review, not merged or independently verified. An idle turn is not completion.
             ),
             "injected_bytes": state.get("injected_bytes", 0),
             "injections": state.get("injections", 0),
+            "claims": [
+                {
+                    "issue": int(number),
+                    **deadline_state(record),
+                    "deadline_at": views.timestamp(
+                        deadline_state(record)["deadline"]
+                    ),
+                    "offer": offer_state(record.get("offer")),
+                }
+                for number, record in sorted(
+                    snapshot(directory)["issues"].items(),
+                    key=lambda i: int(i[0]),
+                )
+                if record.get("owner") == agent
+            ],
             "idle": {
                 "stalled": stalled["stalled"],
                 "kind": stalled["kind"],
@@ -2603,6 +2711,22 @@ review, not merged or independently verified. An idle turn is not completion.
                         f"    Waiting {wait['seconds']}s: {wait['kind']}"
                         + (f" {item}" if item else "")
                     )
+                for claim in record["claims"]:
+                    if claim["overdue"]:
+                        print(
+                            f"    Issue #{claim['issue']} is overdue by "
+                            f"{claim['overdue_seconds']}s and still owned."
+                        )
+                    if claim["budget"]:
+                        print(
+                            f"    Issue #{claim['issue']} attempts "
+                            f"{claim['attempts']}/{claim['budget']}"
+                            + (
+                                "; budget exceeded and still owned"
+                                if claim["budget_exceeded"]
+                                else ""
+                            )
+                        )
                 print(f"    Reported outcome: {record['outcome']}")
                 print(
                     f"    Context delivered: {record['injected_bytes']} "
@@ -3012,6 +3136,16 @@ def main() -> int:
         action="store_true",
         help="Require the participant to acknowledge the message.",
     )
+    steer.add_argument(
+        "--within",
+        type=duration,
+        metavar="WINDOW",
+        help=(
+            "Record a deadline for the acknowledgement, such as 15m. Past it "
+            "the acknowledgement reads overdue; nothing is resent, escalated "
+            "or acknowledged for the lane."
+        ),
+    )
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -3033,6 +3167,17 @@ def main() -> int:
             command.add_argument("--json", action="store_true", help=JSON_HELP)
         else:
             command.add_argument("number")
+        if action in ("claim", "offer", "accept"):
+            command.add_argument(
+                "--within",
+                type=duration,
+                metavar="WINDOW",
+                help=(
+                    "Record a deadline for this work, such as 45m, 6h or 7d. "
+                    "Past it the record reads overdue and states the seconds "
+                    "over; ownership never moves on a deadline."
+                ),
+            )
         if action == "offer":
             command.add_argument("--to", required=True)
             command.add_argument("--summary", required=True)
@@ -3137,6 +3282,38 @@ def main() -> int:
         ),
     )
     naming_set.add_argument("--repo", type=Path, default=Path.cwd())
+    budgets = commands.add_parser(
+        "deadlines",
+        help="Show or set this project's deadline and attempt defaults.",
+    )
+    budget_actions = budgets.add_subparsers(dest="action", required=True)
+    budget_show = budget_actions.add_parser("show")
+    budget_show.add_argument("--repo", type=Path, default=Path.cwd())
+    budget_show.add_argument("--json", action="store_true", help=JSON_HELP)
+    budget_set = budget_actions.add_parser("set")
+    budget_set.add_argument("--repo", type=Path, default=Path.cwd())
+    for field, described in (
+        ("claim", "a claim"),
+        ("offer", "a handoff offer"),
+        ("ack", "an acknowledgement"),
+    ):
+        budget_set.add_argument(
+            f"--{field}",
+            type=duration,
+            metavar="WINDOW",
+            help=(
+                f"Default window for {described}, such as 45m, 6h or 7d. "
+                "An overdue record is reported, never transferred."
+            ),
+        )
+    budget_set.add_argument(
+        "--attempts",
+        type=int,
+        help=(
+            "Attempts a claim may report blocked before the budget reads as "
+            "exceeded. Exceeding it releases nothing."
+        ),
+    )
     shared = commands.add_parser(
         "resources",
         help="Show or declare the named resources lanes may reserve.",
@@ -3258,6 +3435,7 @@ def main() -> int:
                 args.subject,
                 args.key,
                 args.ack,
+                args.within,
             )
             state = (
                 "already delivered"
@@ -3277,6 +3455,7 @@ def main() -> int:
                 summary=getattr(args, "summary", ""),
                 offer_id=getattr(args, "offer_id", None),
                 on=getattr(args, "on", None),
+                within=getattr(args, "within", None),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))
@@ -3350,6 +3529,34 @@ def main() -> int:
                     args.repo.resolve(), getattr(args, "prefix", None)
                 )
             )
+        elif args.command == "deadlines":
+            repository = args.repo.resolve()
+            if getattr(args, "json", False):
+                _, directory = bridge.project(repository, create=False)
+                data = roster.read(directory)
+                print(
+                    views.render(
+                        "deadlines",
+                        {
+                            "root": data["root"],
+                            "deadlines": data["deadlines"],
+                        },
+                    )
+                )
+            elif args.action == "set":
+                print(
+                    bridge.budgets(
+                        repository,
+                        {
+                            "claim": args.claim,
+                            "offer": args.offer,
+                            "ack": args.ack,
+                            "attempts": args.attempts,
+                        },
+                    )
+                )
+            else:
+                print(bridge.budgets(repository))
         elif args.command == "resources":
             repository = args.repo.resolve()
             if getattr(args, "json", False):

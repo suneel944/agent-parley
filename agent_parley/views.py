@@ -17,6 +17,8 @@ from __future__ import annotations
 import datetime
 import json
 
+from agent_parley import issues as issues_state
+
 SCHEMA = "agent-parley/read/v1"
 
 
@@ -89,14 +91,18 @@ def render(kind: str, payload: dict) -> str:
 
 
 def offer(value: dict | None) -> dict | None:
-    """Reports one pending handoff offer with its identifier and age."""
+    """Reports one pending handoff offer with its identifier and deadline."""
     if not value:
         return None
+    waiting = issues_state.offer_state(value)
     return {
         "offer_id": value["id"],
         "to": value["to"],
         "summary": value["summary"],
         "created_at": timestamp(value.get("created")),
+        "deadline_at": timestamp(waiting["deadline"]),
+        "overdue": waiting["overdue"],
+        "overdue_seconds": waiting["overdue_seconds"],
     }
 
 
@@ -116,11 +122,18 @@ def issues(state: dict) -> list[dict]:
         state["issues"].items(), key=lambda item: int(item[0])
     ):
         prompt = record.get("handoff_prompt") or {}
+        timing = issues_state.deadline_state(record)
         reported.append(
             {
                 "issue": int(number),
                 "owner": record.get("owner"),
                 "title": record.get("title"),
+                "deadline_at": timestamp(timing["deadline"]),
+                "overdue": timing["overdue"],
+                "overdue_seconds": timing["overdue_seconds"],
+                "attempts": timing["attempts"],
+                "attempt_budget": timing["budget"],
+                "budget_exceeded": timing["budget_exceeded"],
                 "blocked_by": [
                     int(other) for other in record.get("blocked_by", [])
                 ],
