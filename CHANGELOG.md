@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0](https://github.com/suneel944/agent-parley/compare/v0.4.0...v0.5.0) (2026-09-14)
+
+
+### Features
+
+* pause, resume, stop and restart a lane from the base checkout (#196) ([#153](https://github.com/suneel944/agent-parley/issues/153))
+* run a recorded initialization command in every new lane before the agent starts (#195) ([#148](https://github.com/suneel944/agent-parley/issues/148))
+
+### Bug fixes
+
+* correlate completion reminders with the current lane pull request (#190) ([#177](https://github.com/suneel944/agent-parley/issues/177))
+* include pending handoff offers in the recipient wake backlog (#191) ([#181](https://github.com/suneel944/agent-parley/issues/181))
+* preserve successful issue release results when reminders fail (#192) ([#178](https://github.com/suneel944/agent-parley/issues/178))
+* preserve the last resumable session after a failed launch (#189) ([#175](https://github.com/suneel944/agent-parley/issues/175))
+* refresh recorded evidence when pushing an existing pull request (#193) ([#176](https://github.com/suneel944/agent-parley/issues/176))
+* retain first-read and first-acknowledgement timestamps on retries (#187) ([#179](https://github.com/suneel944/agent-parley/issues/179))
+* take a consistent event snapshot across log rotation (#194) ([#180](https://github.com/suneel944/agent-parley/issues/180))
+* translate Copilot hook payloads before coordination enforcement (#188) ([#173](https://github.com/suneel944/agent-parley/issues/173))
+
 ## [0.4.0](https://github.com/suneel944/agent-parley/compare/v0.3.0...v0.4.0) (2026-09-13)
 
 ### Features
