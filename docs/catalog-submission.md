@@ -6,8 +6,10 @@ mechanically verifiable inside this repository and how to verify it, the
 validator evidence captured for the current version, and the steps that only
 the repository owner can carry out.
 
-Repository installation does not imply public directory approval. Both
-submissions were made by the owner on 2026-09-14 and are awaiting review.
+Repository installation does not imply public directory approval. The Codex
+listing went live on 2026-09-14 at
+`https://chatgpt.com/plugins/plugins_6aa7c91c25008191ad715f14756e5deb`; the
+Claude submission was made the same day and is awaiting review.
 Nothing in this document submits a listing, and continuous integration builds
 artifacts rather than filling review forms.
 See the `## Plugins` section of `docs/operations.md` for the installation path
