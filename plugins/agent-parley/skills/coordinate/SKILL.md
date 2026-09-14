@@ -48,6 +48,11 @@ worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
   pass project/agent names as tool arguments. Send concise state changes with an
   idempotency key; reuse that key only when retrying the same send. Use checkpoint
   previews, fetch bodies only when needed, and avoid repeated empty inbox polling.
+- Retry a failed write with the `idempotency_key` it first carried. The repeat
+  returns the first result and writes nothing further. A retry without a key can
+  reserve twice, so `file_reservation_paths`, `release_file_reservations`,
+  `acknowledge_message` and `mark_message_read` all accept one. The same key with
+  different arguments is refused, and a refused call replays as the same refusal.
 - To hand off, stop editing the issue and run `agent-parley issue offer NUMBER
   --to PARTICIPANT --summary "commit, checks, remaining"`.
   The owner stays paused while the offer is pending.
@@ -66,6 +71,8 @@ integration, on every repository and with no flag that skips it.
 
 Record outcomes with `agent-parley report --state partial|blocked|ready --summary
 "result"`. Partial/blocked requires `--remaining`; ready requires `--evidence`.
+Every `issue` transition and `report` accepts `--idempotency-key KEY`; a script
+that retries with the key it first used records one attempt, not two.
 Reports are agent claims, not independent verification. Handoffs neither transfer
 file reservations nor acknowledge mail. Acknowledge reviewed messages explicitly
 through MCP. Coordinate integration separately; do not infer merge/push authority

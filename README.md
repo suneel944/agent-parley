@@ -283,7 +283,11 @@ reservation can name something that is not a file — `port:5432`, `db:local`,
 those; a named resource conflicts on an exact match, and
 `agent-parley resources set` declares which ones exist.
 Sends need an idempotency key, so a retry returns the original message instead
-of a duplicate. Fetching an inbox never marks a message read. A send can answer
+of a duplicate. Every other write takes one too — reservations, releases,
+acknowledgements, issue transitions and reports — so a retried call returns the
+first result and changes nothing further, and the same key with different
+arguments is refused rather than applied. Fetching an inbox never marks a
+message read. A send can answer
 another message, which puts both in one thread, and a participant can read a
 thread in order or search its own mail:
 
@@ -402,7 +406,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider` and `--since` filter it. |
-| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`. |
+| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
 | `issue list` | Show claims, dependencies and handoff offers. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
@@ -413,6 +417,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
+| `issue ... --idempotency-key KEY` | Retry any transition safely; the repeat returns the first result. |
 | `participant list` | List the project's lanes and their identities. |
 | `participant add NAME` | Create a lane with an optional provider and credential profile. |
 | `participant restore NAME` | Restore the assigned branch while preserving work. |
@@ -474,10 +479,10 @@ participant or project. Reservations are advisory, not filesystem locks.
 | --- | --- |
 | `send_message` | Send to peers using an idempotency key; optionally join a thread or require acknowledgement. |
 | `fetch_inbox` | Page inbox metadata and optional bodies; filter with `unread` or `unacknowledged`. |
-| `mark_message_read` | Explicitly mark a received message read. |
-| `acknowledge_message` | Explicitly acknowledge a reviewed message. |
-| `file_reservation_paths` | Reserve advisory path patterns and report conflicts. |
-| `release_file_reservations` | Release reservations owned by this lane. |
+| `mark_message_read` | Explicitly mark a received message read; takes an optional `idempotency_key`. |
+| `acknowledge_message` | Explicitly acknowledge a reviewed message; takes an optional `idempotency_key`. |
+| `file_reservation_paths` | Reserve advisory path patterns and report conflicts; takes an optional `idempotency_key`. |
+| `release_file_reservations` | Release reservations owned by this lane; takes an optional `idempotency_key`. |
 | `list_participants` | Discover addressable identities, tasks and last coordination times. |
 | `read_thread` | Page messages this lane sent or received in one thread. |
 | `search_messages` | Search only messages this lane sent or received. |
