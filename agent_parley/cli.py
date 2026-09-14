@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
-import importlib.metadata
 import json
 import os
 import secrets
@@ -2472,7 +2471,7 @@ attempt of the recorded budget, which is also only reported.
         components = [
             {
                 "component": "launcher",
-                "version": importlib.metadata.version("agent-parley"),
+                "version": protocol.launcher_version(),
                 "protocol": protocol.PROTOCOL,
                 "compatible": True,
             }

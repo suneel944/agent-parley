@@ -19,7 +19,9 @@ protocol into the hook command it configures, so the hook boundary is checked
 locally, and the HTTP boundary is checked where calls actually cross it.
 """
 
+import importlib.metadata
 import json
+import tomllib
 from pathlib import Path
 
 CLIENTS = ("claude", "codex")
@@ -41,6 +43,33 @@ def manifests(root: Path) -> dict[str, Path]:
 def package_root() -> Path:
     """Returns the directory the plugin manifests are shipped beside."""
     return Path(__file__).resolve().parent.parent
+
+
+def launcher_version() -> str:
+    """Returns the version of the code that runs, not the one installed.
+
+    An editable install records its version once, when it was installed, so a
+    checkout that has moved on keeps reporting the older number through
+    installation metadata. `make install-dev` is the documented development
+    path, so every contributor meets this, and a stale launcher number sends
+    an operator to the compatibility contract for drift that is not there.
+
+    The project file beside the package is therefore authoritative wherever it
+    exists, because it is the file the release path raises. A package
+    installed without one, which is every wheel, keeps its recorded metadata.
+
+    Returns:
+        The running package version.
+    """
+    try:
+        declared = tomllib.loads(
+            (package_root() / "pyproject.toml").read_text()
+        )["project"]["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        declared = None
+    if isinstance(declared, str):
+        return declared
+    return importlib.metadata.version("agent-parley")
 
 
 def installed(path: Path) -> int:

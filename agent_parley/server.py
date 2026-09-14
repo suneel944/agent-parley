@@ -2,7 +2,6 @@
 
 import argparse
 import hmac
-import importlib.metadata
 import json
 import os
 import socket
@@ -359,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "agent-parley",
-                    "version": importlib.metadata.version("agent-parley"),
+                    "version": protocol.launcher_version(),
                 },
             }
         elif method == "ping":
