@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.7.0](https://github.com/suneel944/agent-parley/compare/v0.6.0...v0.7.0) (2026-09-14)
+
+
+### Features
+
+* deliver an operator message or offer at a time or on a condition (#225) ([#160](https://github.com/suneel944/agent-parley/issues/160))
+* export coordination metrics as Prometheus text or JSON (#222) ([#155](https://github.com/suneel944/agent-parley/issues/155))
+* fit top to the terminal, page its rows and shape it from the keyboard (#223) ([#151](https://github.com/suneel944/agent-parley/issues/151))
+* integrate, select, table and gate lanes as one coordination surface (#239) ([#141](https://github.com/suneel944/agent-parley/issues/141)) ([#158](https://github.com/suneel944/agent-parley/issues/158)) ([#162](https://github.com/suneel944/agent-parley/issues/162)) ([#168](https://github.com/suneel944/agent-parley/issues/168)) ([#169](https://github.com/suneel944/agent-parley/issues/169))
+* let the operator offer an issue to a lane with issue assign (#226) ([#165](https://github.com/suneel944/agent-parley/issues/165))
+* offer unclaimed and shed-able work to a fit idle lane (#224) ([#145](https://github.com/suneel944/agent-parley/issues/145))
+
+### Bug fixes
+
+* keep the diagnostic path open when coordination fails (#221) ([#213](https://github.com/suneel944/agent-parley/issues/213))
+* refuse a store behind the running code in the doctor report (#219) ([#215](https://github.com/suneel944/agent-parley/issues/215))
+* report the launcher version of the code that runs (#218) ([#216](https://github.com/suneel944/agent-parley/issues/216))
+* retain the cause of a coordination outage past its recovery (#220) ([#217](https://github.com/suneel944/agent-parley/issues/217))
+
 ## [0.6.0](https://github.com/suneel944/agent-parley/compare/v0.5.0...v0.6.0) (2026-09-14)
 
 
