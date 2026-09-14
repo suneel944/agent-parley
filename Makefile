@@ -1,4 +1,4 @@
-.PHONY: install install-dev install-system build check release-artifacts benchmark
+.PHONY: install install-dev install-system build check release-artifacts codex-bundle benchmark
 install:
 	@set -eu; \
 	bridge_requirements=$$(mktemp); \
@@ -23,6 +23,9 @@ build:
 
 release-artifacts: build
 	uv run --locked python scripts/release_artifacts.py
+
+codex-bundle:
+	uv run --locked python scripts/codex_bundle.py
 
 benchmark:
 	uv run --locked python scripts/benchmark.py

@@ -966,8 +966,10 @@ The official catalog is curated separately; see
 
 For Codex, follow [OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission).
 This is a skills-only plugin. Submission requires a verified publisher, listing
-and policy URLs, a skill bundle, and review cases. Neither catalog submission
-has been made. CI builds artifacts; it does not submit review forms.
+and policy URLs, a skill bundle, and review cases. `make codex-bundle` builds
+the skill bundle the portal accepts. The Codex listing is live; the Claude
+submission is awaiting review.
+CI builds artifacts; it does not submit review forms.
 
 `docs/catalog-submission.md` records what each catalog asks for, the checks that
 can be run in this repository before submitting, and the steps that are bound to
