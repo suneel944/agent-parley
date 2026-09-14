@@ -27,6 +27,7 @@ from agent_parley import (
     evidence,
     forge,
     gemini,
+    policy,
     process,
     roster,
     store,
@@ -233,6 +234,42 @@ def session_busy(name: str) -> str:
     return f"{name} has a running session; stop that terminal first."
 
 
+def attributed_commits(root: Path, base: str, branch: str) -> list[str]:
+    """Lists the commits a lane would integrate that claim assistant authorship.
+
+    A hook is a tool-level check and a session can reach Git another way, so
+    integration reads the commits themselves. Subject, body and trailers are
+    all examined, because a credit hides as easily in a trailer as in a
+    sentence. This is the backstop and it has no skip flag, in the same way
+    the verification gate has none.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        base: Commit the range starts after, exclusive.
+        branch: Bridge branch the integration would carry.
+
+    Returns:
+        One refusal per offending commit, naming that commit and the rule it
+        breaks, oldest first.
+
+    Raises:
+        BridgeError: If Git cannot read the commit range.
+        subprocess.TimeoutExpired: If the read exceeds the command timeout.
+    """
+    log = git(
+        root, "log", "--reverse", "--format=%H%x00%B%x01", f"{base}..{branch}"
+    )
+    refusals = []
+    for entry in log.split("\x01"):
+        commit, separator, message = entry.strip().partition("\x00")
+        if not separator:
+            continue
+        rule = policy.matched_rule(message)
+        if rule:
+            refusals.append(policy.refusal(f"Commit {commit[:12]}", rule))
+    return refusals
+
+
 def merge_blockers(
     root: Path, lane: Path, name: str, branch: str, session: str = ""
 ) -> Iterator[str]:
@@ -297,6 +334,7 @@ def merge_blockers(
             f"{name} has uncommitted changes that {branch} does not carry. "
             "Commit them in the lane first; merge only ever merges commits."
         )
+    yield from attributed_commits(root, "HEAD", branch)
     if session:
         yield session_busy(name)
 
@@ -415,7 +453,7 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
             "merge",
             "--no-ff",
             "-m",
-            f"Merge bridge lane {name} from {branch}",
+            f"Merge lane branch {branch}",
             branch,
         ],
         capture_output=True,
@@ -445,15 +483,17 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     )
 
 
-def report_comment(agent: str, summary: str, evidence: str) -> str:
+def report_comment(summary: str, evidence: str) -> str:
     """Shapes one lane's ready report for the issue it claims.
 
     The comment reproduces the lane's own summary and evidence and adds no
-    assessment of its own, so a reader on the forge sees what the participant
-    reported and what that report is worth.
+    assessment of its own, so a reader on the forge sees what was reported and
+    what that report is worth. It names neither the participant nor the
+    provider that produced the work: which assistant wrote a change belongs in
+    coordination state, where `top` and `status` read it, and never on the
+    user's forge.
 
     Args:
-        agent: Participant that reported the state.
         summary: The lane's account of its result.
         evidence: The verification evidence the lane recorded.
 
@@ -461,7 +501,7 @@ def report_comment(agent: str, summary: str, evidence: str) -> str:
         Markdown for the issue comment.
     """
     return (
-        f"Lane `{agent}` reports ready for review.\n\n"
+        "Reported ready for review.\n\n"
         f"{summary.strip()}\n\n"
         "Verification recorded by the lane:\n\n"
         f"{evidence.strip()}\n\n"
@@ -1071,17 +1111,19 @@ class Bridge:
             ):
                 raise BridgeError(f"Identity {name} is already registered.")
             lane = directory / name
-            branch = f"parley/{directory.name}/{name}"
-            refs = git(
-                root, "for-each-ref", "--format=%(refname:short)", "refs/heads"
-            ).splitlines()
-            if lane.exists() or branch in refs:
+            refs = set(
+                git(
+                    root,
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads",
+                ).splitlines()
+            )
+            branch = roster.next_lane_branch(data, directory.name, refs)
+            if lane.exists():
                 raise BridgeError(
-                    f"Existing lane or branch for {name}; "
-                    f"preserve the worktree if present, and rename any kept "
-                    f"branch with `git branch -m {shlex.quote(branch)} "
-                    "KEEP_NAME` before adding this participant. "
-                    "Choose an unused KEEP_NAME."
+                    f"Existing lane directory for {name}; preserve or remove "
+                    f"the worktree at {lane} before adding this participant."
                 )
             git(root, "worktree", "add", "-b", branch, str(lane), data["base"])
             if data.get("initialize"):
@@ -1092,6 +1134,7 @@ class Bridge:
                 "lane": str(lane),
                 "branch": branch,
                 "credential": credential,
+                "scheme": "lane",
             }
             try:
                 write_json(directory / "project.json", data)
@@ -1211,9 +1254,10 @@ class Bridge:
                     ):
                         note = (
                             f"Branch {branch} kept; it holds commits the "
-                            "project base does not. Before re-adding this "
-                            f"name, run `git branch -m {shlex.quote(branch)} "
-                            "KEEP_NAME` with an unused KEEP_NAME."
+                            "project base does not. Nothing renames or "
+                            "deletes it, and a new lane takes the next free "
+                            "branch name, so adding this participant again "
+                            "leaves those commits exactly where they are."
                         )
                     else:
                         git(root, "branch", "-d", branch)
@@ -1340,6 +1384,42 @@ class Bridge:
             "verify": list(data["verify"]),
             "initialize": list(data["initialize"]),
         }
+
+    def branch_naming(self, repo: Path, prefix: str | None = None) -> str:
+        """Reports or records the prefix new lane branches are created under.
+
+        The prefix belongs to the repository rather than to a participant, so
+        it lives beside the roster in that repository's project manifest.
+        Changing it renames nothing: lanes that already exist keep the branch
+        they were created with, and the manifest records which scheme each one
+        uses.
+
+        Args:
+            repo: Any checkout of the target repository.
+            prefix: Prefix for new lane branches, or None to report the
+                current setting without changing it.
+
+        Returns:
+            An account of the configured prefix and the names it produces.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or the prefix
+                is not a usable Git ref path component.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if prefix is not None:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["branch_prefix"] = roster.branch_prefix(prefix)
+                write_json(directory / "project.json", data)
+        configured = data["branch_prefix"]
+        return (
+            f"{root} creates lane branches as "
+            f"{configured}/{directory.name}/lane-N. A lane branch carries no "
+            "participant, provider or account name. Existing lanes keep the "
+            "branch they were created with."
+        )
 
     def _record_operator(
         self, directory: Path, name: str, reason: checkpoints.Reason, note: str
@@ -1694,6 +1774,13 @@ class Bridge:
                 f"{branch} adds no commits to the project base, so {name} "
                 "has nothing to open a pull request for."
             )
+        refusals = attributed_commits(root, data["base"], branch)
+        if refusals:
+            raise BridgeError(
+                "\n".join(refusals)
+                + "\nRewrite those commit messages in the lane and rerun; "
+                "nothing was pushed and no pull request was opened."
+            )
         claimed = sorted(
             (
                 number
@@ -1896,7 +1983,11 @@ then release your reservations. Avoid repeated empty inbox polling.
 Edit only your worktree. Do not reset, clean, switch, merge, or modify a peer
 worktree or the main checkout. Preserve existing work on your branch. Shared
 ports/databases need coordination; worktrees do not isolate those resources.
-Follow repository commit rules. Integration into the main branch remains a
+Follow repository commit rules. Attribution of any kind is refused: a commit,
+merge, tag or pull request that credits an assistant, names a vendor or model in
+an authorship position, or carries a generator signature is denied before it
+lands and again at integration. No flag skips that.
+Integration into the main branch remains a
 separate reviewed action with combined verification. If coordination is down,
 report it and pause edits rather than silently continuing without coordination.
 
@@ -1985,7 +2076,7 @@ review, not merged or independently verified. An idle turn is not completion.
             )
             write_json(path, state)
         if arrived:
-            body = report_comment(agent, summary, evidence)
+            body = report_comment(summary, evidence)
             for issue, record in snapshot(directory)["issues"].items():
                 if record["owner"] == agent:
                     forge.comment(repo, issue, body)
@@ -2901,6 +2992,23 @@ def main() -> int:
         ),
     )
     recording.add_argument("--repo", type=Path, default=Path.cwd())
+    naming = commands.add_parser(
+        "branch",
+        help="Show or set the prefix new lane branches are created under.",
+    )
+    namings = naming.add_subparsers(dest="action", required=True)
+    naming_show = namings.add_parser("show")
+    naming_show.add_argument("--repo", type=Path, default=Path.cwd())
+    naming_set = namings.add_parser("set")
+    naming_set.add_argument(
+        "prefix",
+        metavar="PREFIX",
+        help=(
+            "Prefix for new lane branches, such as parley. Existing lanes "
+            "keep the branch they were created with."
+        ),
+    )
+    naming_set.add_argument("--repo", type=Path, default=Path.cwd())
     provider = commands.add_parser(
         "provider", help="Inspect or define providers that drive a native CLI."
     )
@@ -3090,6 +3198,12 @@ def main() -> int:
             elif not preview:
                 _, directory = bridge.project(repository)
                 print(roster.describe(roster.read(directory)))
+        elif args.command == "branch":
+            print(
+                bridge.branch_naming(
+                    args.repo.resolve(), getattr(args, "prefix", None)
+                )
+            )
         elif args.command in ("verify", "init"):
             repository = args.repo.resolve()
             if getattr(args, "json", False):

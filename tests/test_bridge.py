@@ -112,11 +112,12 @@ def test_missing_commit_and_existing_branch_preserved(bridge, repo, tmp_path):
     with pytest.raises(BridgeError):
         bridge.setup(empty)
     _, directory = bridge.project(repo)
-    branch = f"parley/{directory.name}/codex"
+    branch = f"parley/{directory.name}/lane-1"
     git(repo, "branch", branch)
-    with pytest.raises(BridgeError, match="Existing lane"):
+    (directory / "codex").mkdir(parents=True)
+    with pytest.raises(BridgeError, match="Existing lane directory"):
         bridge.add_participant(repo, "codex", "codex")
-    assert not (directory / "codex").exists()
+    assert "codex" not in roster.read(directory)["participants"]
     assert git(repo, "rev-parse", branch) == git(repo, "rev-parse", "HEAD")
 
 
@@ -1455,7 +1456,8 @@ def test_a_ready_report_comments_once_on_every_claimed_issue(
 
     bridge.report(claude, "ready", "Lane result", "", "make check passed")
     assert [number for number, _ in posted] == ["432", "433"]
-    assert "Lane `claude` reports ready for review." in posted[0][1]
+    assert "Reported ready for review." in posted[0][1]
+    assert "claude" not in posted[0][1]
     assert "make check passed" in posted[0][1]
     assert "neither review nor independent verification" in posted[0][1]
 
@@ -2131,12 +2133,13 @@ def test_retire_keeps_a_branch_that_still_holds_commits(bridge, repo, paired):
     )
     message = bridge.retire(repo, "codex")
     assert "kept" in message
-    assert f"git branch -m {branch} KEEP_NAME" in message
+    assert "next free branch name" in message
     assert not lane.exists()
     assert git(repo, "rev-parse", "--verify", branch)
     assert "kept.txt" in git(repo, "show", "--name-only", branch)
-    with pytest.raises(BridgeError, match="git branch -m"):
-        bridge.add_participant(repo, "codex", "codex")
+    again = bridge.add_participant(repo, "codex", "codex")
+    assert again["branches"]["codex"] != branch
+    assert "kept.txt" in git(repo, "show", "--name-only", branch)
     git(repo, "branch", "-m", branch, "kept-codex")
     readded = bridge.add_participant(repo, "codex", "codex")
     assert Path(readded["lanes"]["codex"]).exists()
@@ -2359,8 +2362,8 @@ def test_merge_integrates_a_lane_branch_and_leaves_the_lane_alone(
     message = bridge.merge(repo, "codex")
     assert f"Merged {branch} into {base}" in message
     assert (repo / "feature.txt").read_text() == "lane work\n"
-    assert git(repo, "log", "-1", "--pretty=%s") == (
-        f"Merge bridge lane codex from {branch}"
+    assert (
+        git(repo, "log", "-1", "--pretty=%s") == f"Merge lane branch {branch}"
     )
     assert len(git(repo, "log", "-1", "--pretty=%P").split()) == 2
     assert lane.exists()
