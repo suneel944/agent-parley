@@ -47,36 +47,66 @@ def _issues(value: object, label: str, limit: int) -> list[str]:
     return numbers
 
 
-def _ordered(dependencies: dict[str, list[str]]) -> None:
-    """Refuses a plan whose dependencies cannot all be satisfied.
+def _sortable(name: str) -> tuple[int, int, str]:
+    """Orders numeric names by value and every other name by its text."""
+    return (0, int(name), "") if name.isdigit() else (1, 0, name)
 
-    A cycle describes an order no lane can work in, so it is refused when the
-    file is read rather than written into the ledger as edges an operator then
-    has to unpick by hand.
+
+def order(
+    dependencies: dict[str, list[str]],
+    label: str = "Dependencies",
+    mark: str = "",
+) -> list[str]:
+    """Returns every named item after the items it waits on.
+
+    A cycle describes an order nothing can proceed in, so it is refused and
+    named rather than resolved by dropping an edge or by falling back to the
+    order the names happened to arrive in. Ordering is used both when a plan
+    file is read and when ready lanes are integrated, so one refusal covers
+    both.
 
     Args:
-        dependencies: Blockers recorded against each issue.
+        dependencies: Names mapped to the names each one waits on. A name
+            that appears only as a dependency constrains the order but is not
+            itself returned.
+        label: Subject a cycle refusal names.
+        mark: Prefix a cycle refusal puts before each name, so issue numbers
+            keep the `#` they carry everywhere else and lane names keep none.
+
+    Returns:
+        Every key of the mapping, each one after every key it waits on. Names
+        freed at the same step are returned in numeric order when they are
+        numbers and in alphabetical order otherwise, so one graph always
+        yields one order.
 
     Raises:
         BridgeError: If the dependencies contain a cycle.
     """
-    pending = {issue: set(blockers) for issue, blockers in dependencies.items()}
+    pending = {name: set(waits) for name, waits in dependencies.items()}
+    sequence: list[str] = []
     while pending:
-        ready = {
-            issue
-            for issue, blockers in pending.items()
-            if not blockers & set(pending)
-        }
-        if not ready:
+        free = sorted(
+            (
+                name
+                for name, waits in pending.items()
+                if not waits & set(pending)
+            ),
+            key=_sortable,
+        )
+        if not free:
             raise BridgeError(
-                "Plan dependencies form a cycle: "
-                + ", ".join(f"#{issue}" for issue in sorted(pending, key=int))
+                f"{label} form a cycle: "
+                + ", ".join(
+                    f"{mark}{name}" for name in sorted(pending, key=_sortable)
+                )
             )
+        sequence += free
         pending = {
-            issue: blockers
-            for issue, blockers in pending.items()
-            if issue not in ready
+            name: waits
+            for name, waits in pending.items()
+            if name not in set(free)
         }
+    return sequence
 
 
 def read(path: Path) -> dict:
@@ -129,7 +159,7 @@ def read(path: Path) -> dict:
     for issue, blockers in dependencies.items():
         if issue in blockers:
             raise BridgeError(f"Issue #{issue} cannot wait on itself.")
-    _ordered(dependencies)
+    order(dependencies, "Plan dependencies", "#")
     return {
         "name": _named(heading.get("name", path.stem), "plan.name"),
         "dependencies": dependencies,
@@ -169,6 +199,72 @@ def planned(document: dict) -> set[tuple[str, str]]:
         for issue, blockers in document["dependencies"].items()
         for blocker in blockers
     }
+
+
+def groups(directory: Path) -> dict[str, list[str]]:
+    """Returns the groups the most recently applied plan named."""
+    history = recorded(directory)
+    version = history["versions"][-1] if history["versions"] else {}
+    return version.get("groups", {})
+
+
+def members(directory: Path, name: str) -> list[str]:
+    """Returns the issues one group of the applied plan names.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Group named by the applied plan.
+
+    Returns:
+        The group's issue numbers, in the order the plan file listed them.
+
+    Raises:
+        BridgeError: If no plan is applied, if the plan names no such group,
+            or if the group is empty.
+    """
+    named = groups(directory)
+    if not named:
+        raise BridgeError(
+            "No applied plan names any group; apply one with "
+            "`agent-parley plan apply FILE`."
+        )
+    if name not in named:
+        raise BridgeError(
+            f"The applied plan names no group {name}. It names: "
+            + ", ".join(sorted(named))
+        )
+    if not named[name]:
+        raise BridgeError(f"Group {name} names no issues.")
+    return named[name]
+
+
+def ready_groups(
+    named: dict[str, list[str]], state: dict, reported: set[str]
+) -> list[str]:
+    """Names the groups whose every member is held by a lane reported ready.
+
+    A ready group is the operator's signal that a set is integrable as a set.
+    It reports what the lanes themselves reported and nothing more: a reported
+    state is a lane's own account, never review or independent verification.
+
+    Args:
+        named: Groups the applied plan names, mapped to their issues.
+        state: Published issue ledger.
+        reported: Participants whose latest report is the ready state.
+
+    Returns:
+        The group names whose members are all claimed and all held by a
+        participant in the reported set, in alphabetical order.
+    """
+    return sorted(
+        name
+        for name, issues in named.items()
+        if issues
+        and all(
+            state["issues"].get(issue, {}).get("owner") in reported
+            for issue in issues
+        )
+    )
 
 
 def diff(directory: Path, path: Path) -> dict:
@@ -258,14 +354,21 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
     return version
 
 
-def describe(directory: Path) -> dict:
+def describe(directory: Path, reported: set[str] | None = None) -> dict:
     """Returns the applied plan beside the current state of every issue.
+
+    Args:
+        directory: Private state directory for the common repository.
+        reported: Participants whose latest report is the ready state, used
+            to mark the groups that are integrable as a set. No group is
+            marked when the caller supplies none.
 
     Returns:
         The latest version's name, digest, operator and time, one entry per
         planned issue carrying its owner and the issues it waits on, the
-        groups the plan named, and every recorded edge the plan does not name,
-        which is an edge entered by hand after the apply.
+        groups the plan named, the groups whose members are all reported
+        ready, and every recorded edge the plan does not name, which is an
+        edge entered by hand after the apply.
     """
     history = recorded(directory)
     version = history["versions"][-1] if history["versions"] else {}
@@ -291,6 +394,9 @@ def describe(directory: Path) -> dict:
             for number in numbers
         ],
         "groups": version.get("groups", {}),
+        "ready_groups": ready_groups(
+            version.get("groups", {}), state, set(reported or ())
+        ),
         "unplanned": sorted(
             edges(state) - planned({"dependencies": dependencies})
         ),
@@ -320,7 +426,8 @@ def render(document: dict) -> str:
     Returns:
         One line per issue, indented under the issues it waits on, carrying
         the current owner and any recorded title, followed by the plan's
-        groups and any edge recorded by hand after the apply.
+        groups, each marked when every member is reported ready, and any edge
+        recorded by hand after the apply.
     """
     if not document["plan"]:
         return "No plan applied."
@@ -355,10 +462,13 @@ def render(document: dict) -> str:
 
     for number in sorted(roots, key=int):
         branch(number, 0, ())
-    for name, members in sorted(document["groups"].items()):
-        lines.append(
-            f"  group {name}: " + ", ".join(f"#{member}" for member in members)
+    for name, listed in sorted(document["groups"].items()):
+        line = f"  group {name}: " + ", ".join(
+            f"#{member}" for member in listed
         )
+        if name in document.get("ready_groups", []):
+            line += " (every member reported ready)"
+        lines.append(line)
     for issue, blocker in document["unplanned"]:
         lines.append(f"  recorded by hand: #{issue} waits on #{blocker}")
     return "\n".join(lines)

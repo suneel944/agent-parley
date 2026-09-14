@@ -606,6 +606,254 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     )
 
 
+def lane_dependencies(
+    state: dict, candidates: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Maps each candidate lane to the candidate lanes it waits on.
+
+    The edges are the advisory dependencies the ledger already records. An
+    edge that leaves the candidate set constrains nothing here, because the
+    lane holding the other end is not being integrated in this run.
+
+    Args:
+        state: Published issue ledger.
+        candidates: Participants mapped to the issues each one holds.
+
+    Returns:
+        One entry per candidate, naming the other candidates whose issues its
+        own issues wait on.
+    """
+    holder = {
+        issue: name for name, issues in candidates.items() for issue in issues
+    }
+    return {
+        name: sorted(
+            {
+                holder[blocker]
+                for issue in issues
+                for blocker in state["issues"]
+                .get(issue, {})
+                .get("blocked_by", [])
+                if holder.get(blocker, name) != name
+            }
+        )
+        for name, issues in candidates.items()
+    }
+
+
+def lane_session(directory: Path, name: str) -> str:
+    """Names the running session that blocks a lane merge, if any.
+
+    The recorded session process is read rather than the session lock taken,
+    so reading a lane while its agent still works cannot make that session
+    fail.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lane's liveness when a session is running, an empty string
+        otherwise.
+    """
+    state = activity(directory, name)
+    running = process.alive(
+        state.get("session_pid"), state.get("session_ticks")
+    )
+    return participant_liveness(directory, name) if running else ""
+
+
+def reported_ready(directory: Path) -> set[str]:
+    """Names every participant whose latest report is the ready state.
+
+    A reported state is a lane's own account of its work. It is neither
+    review nor independent verification, and this reads it without changing
+    it. A plan can be applied and shown before any participant exists, so a
+    repository with no manifest yet reports nobody rather than refusing.
+
+    Args:
+        directory: Private state directory for the common repository.
+
+    Returns:
+        The participants that currently report ready.
+    """
+    if not (directory / "project.json").exists():
+        return set()
+    return {
+        name
+        for name in roster.read(directory)["participants"]
+        if activity(directory, name).get("outcome") == "ready"
+    }
+
+
+def ready_lanes(
+    directory: Path, data: dict, state: dict
+) -> dict[str, list[str]]:
+    """Maps every lane whose latest report is ready to the issues it holds.
+
+    Args:
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the roster.
+        state: Published issue ledger.
+
+    Returns:
+        One entry per participant whose latest report is the ready state,
+        carrying the issues that participant currently holds.
+    """
+    return {
+        name: sorted(
+            (
+                number
+                for number, record in state["issues"].items()
+                if record["owner"] == name
+            ),
+            key=int,
+        )
+        for name in sorted(data["participants"])
+        if activity(directory, name).get("outcome") == "ready"
+    }
+
+
+def group_lanes(
+    data: dict, state: dict, name: str, listed: list[str]
+) -> dict[str, list[str]]:
+    """Maps each lane holding a member of one group to the members it holds.
+
+    Args:
+        data: Project manifest holding the roster.
+        state: Published issue ledger.
+        name: Group named by the applied plan.
+        listed: Issues the group names.
+
+    Returns:
+        One entry per participant holding at least one member.
+
+    Raises:
+        BridgeError: If a member is unclaimed, or is held by somebody who is
+            not a participant in this project.
+    """
+    lanes: dict[str, list[str]] = {}
+    for issue in listed:
+        owner = state["issues"].get(issue, {}).get("owner")
+        if not owner:
+            raise BridgeError(
+                f"Group {name} cannot be integrated: #{issue} is unclaimed. "
+                "Every member is integrated from the lane that holds it."
+            )
+        if owner not in data["participants"]:
+            raise BridgeError(
+                f"Group {name} cannot be integrated: #{issue} is held by "
+                f"{owner}, which is not a participant in this project."
+            )
+        lanes.setdefault(owner, []).append(issue)
+    return lanes
+
+
+def lane_refusals(
+    root: Path, directory: Path, participant: dict, name: str
+) -> list[str]:
+    """Collects every condition that refuses one lane's merge right now.
+
+    The conditions are exactly the ones `participant merge --preview` lists,
+    read the same way and in the same words, so a bulk preflight can never
+    admit a lane the single-lane command would refuse. Every check reads; the
+    participant's session lock is never taken.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        directory: Private state directory for the common repository.
+        participant: Roster record holding the lane and its assigned branch.
+        name: Participant that owns the lane.
+
+    Returns:
+        One refusal message per unmet condition, empty when nothing refuses
+        the merge at this moment.
+    """
+    session = lane_session(directory, name)
+    lane = Path(participant["lane"])
+    refusals = []
+    actual = lane_branch(lane)
+    if actual != participant["branch"]:
+        refusals.append(drift(name, participant, actual))
+    refusals += merge_blockers(root, lane, name, participant["branch"], session)
+    return refusals
+
+
+def group_refusal(
+    group: str, sequence: list[str], refusals: dict[str, list[str]]
+) -> str:
+    """Reports why a whole group was refused before anything was merged.
+
+    Args:
+        group: Group named by the applied plan.
+        sequence: Members' lanes in dependency order.
+        refusals: Conditions currently refusing each lane.
+
+    Returns:
+        Every refusing condition of every member, and a statement that the
+        preflight admits a group whole or not at all.
+    """
+    lines = [
+        f"Group {group} is refused as a whole, so nothing was merged and "
+        "the base checkout is unchanged."
+    ]
+    for name in sequence:
+        for refusal in refusals[name]:
+            lines.append(f"- {name}: {refusal}")
+    lines.append(
+        "A group preflight admits every member or none. Clear these, then "
+        "rerun; a refused member is never followed by a member that waits "
+        "on it."
+    )
+    return "\n".join(lines)
+
+
+def unattempted(name: str, waits: dict[str, list[str]], stopped: str) -> str:
+    """Reports why one lane was left alone after an ordered run stopped."""
+    return (
+        f"not attempted; it waits on {stopped}."
+        if stopped in waits.get(name, [])
+        else f"not attempted; the run stopped at {stopped}."
+    )
+
+
+def merged_lanes(
+    bridge: Bridge, repo: Path, args: argparse.Namespace, preview: bool
+) -> str:
+    """Runs the merge the command line selected, one lane or a set.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `participant merge` arguments.
+        preview: Whether the run only reports what a merge would do.
+
+    Returns:
+        The account the selected merge produced.
+
+    Raises:
+        BridgeError: If the selection is ambiguous or names nothing.
+    """
+    if args.all or args.group:
+        if args.name:
+            raise BridgeError(
+                "`participant merge` integrates one named lane, every ready "
+                "lane with --all, or one group with --group NAME. Drop the "
+                "participant name to integrate a set."
+            )
+        return bridge.integrate(repo, group=args.group, preview=preview)
+    if not args.name:
+        raise BridgeError(
+            "`participant merge` needs a participant name, --all or "
+            "--group NAME."
+        )
+    return (
+        bridge.preview_merge(repo, args.name)
+        if preview
+        else bridge.merge(repo, args.name)
+    )
+
+
 def held_claim(directory: Path, name: str) -> dict:
     """Names the claim a lane's integration record belongs to.
 
@@ -659,19 +907,25 @@ def report_comment(summary: str, evidence: str) -> str:
     )
 
 
-def verify_base(root: Path, command: list[str]) -> None:
+def verify_base(
+    root: Path, command: list[str], integrated: bool = False
+) -> None:
     """Runs a repository's verification command in the base checkout.
 
     Executing a configured command is a different trust decision from reading
-    Git state, so the gate is a separate step that runs before the merge and
-    never rewrites, resets or stages anything itself. It reports the checkout
-    as it stands before the merge, which is not a claim about the merged
-    result. The command is run as an argument list without a shell, and no
-    flag skips it: a repository that configures a gate always pays it.
+    Git state, so the gate is a separate step that never rewrites, resets or
+    stages anything itself. Run before a merge it reports the checkout as it
+    stands, which is not a claim about the merged result; run after one it
+    reports the integrated result itself. The command is run as an argument
+    list without a shell, and no flag skips it: a repository that configures
+    a gate always pays it.
 
     Args:
         root: Common repository root, which is always the base checkout.
         command: Argument tokens recorded in the project manifest.
+        integrated: Whether the run follows a merge, which decides whether a
+            failure reports that nothing was merged or that the merge stands
+            and is unverified. Nothing is ever reset or reverted either way.
 
     Raises:
         BridgeError: If the command cannot run, or if it exits non-zero.
@@ -694,10 +948,16 @@ def verify_base(root: Path, command: list[str]) -> None:
         ) from None
     if not result.returncode:
         return
+    outcome = (
+        "The merge commits already recorded stand and are unverified; "
+        "nothing was reset or reverted."
+        if integrated
+        else "Nothing was merged."
+    )
     raise BridgeError(
         f"Verification failed in the base checkout at {root}: `{quoted}` "
         f"exited {result.returncode}. Fix it and rerun; merge never skips "
-        "verification and nothing was merged. See the command output above."
+        f"verification. {outcome} See the command output above."
     )
 
 
@@ -1897,25 +2157,50 @@ class Bridge:
                     f"{name} is not a participant in this project; "
                     "run agent-parley participant list."
                 )
-            with lock(directory / f"{name}.session.lock", session_busy(name)):
-                if data["verify"]:
-                    verify_base(root, data["verify"])
-                merged = merge_branch(
-                    root,
-                    Path(participant["lane"]),
-                    name,
-                    participant["branch"],
-                )
-                metrics.record_report(
-                    directory,
-                    name,
-                    {
-                        "kind": "integration",
-                        "action": "merge",
-                        **held_claim(directory, name),
-                    },
-                )
-                return merged
+            return self._integrate_lane(root, directory, data, name)
+
+    def _integrate_lane(
+        self, root: Path, directory: Path, data: dict, name: str
+    ) -> str:
+        """Runs the gate and merges one lane while its session is excluded.
+
+        Every integration path goes through this step, so a lane merged in a
+        group or in a bulk run is merged on exactly the terms the single-lane
+        command merges it on.
+
+        Args:
+            root: Common repository root, which is always the base checkout.
+            directory: Private state directory for the common repository.
+            data: Project manifest holding the roster and the gate command.
+            name: Participant whose bridge branch is merged.
+
+        Returns:
+            An account of what was merged.
+
+        Raises:
+            BridgeError: If the gate fails or the merge cannot complete
+                unattended.
+        """
+        participant = data["participants"][name]
+        with lock(directory / f"{name}.session.lock", session_busy(name)):
+            if data["verify"]:
+                verify_base(root, data["verify"])
+            merged = merge_branch(
+                root,
+                Path(participant["lane"]),
+                name,
+                participant["branch"],
+            )
+            metrics.record_report(
+                directory,
+                name,
+                {
+                    "kind": "integration",
+                    "action": "merge",
+                    **held_claim(directory, name),
+                },
+            )
+            return merged
 
     def preview_merge(self, repo: Path, name: str) -> str:
         """Reports what merging a participant's lane would do, changing nothing.
@@ -1948,11 +2233,7 @@ class Bridge:
                     f"{name} is not a participant in this project; "
                     "run agent-parley participant list."
                 )
-            state = activity(directory, name)
-            running = process.alive(
-                state.get("session_pid"), state.get("session_ticks")
-            )
-            session = participant_liveness(directory, name) if running else ""
+            session = lane_session(directory, name)
         return merge_preview(
             root,
             Path(participant["lane"]),
@@ -1960,6 +2241,155 @@ class Bridge:
             participant["branch"],
             session,
         )
+
+    def integrate(
+        self, repo: Path, group: str = "", preview: bool = False
+    ) -> str:
+        """Integrates several lanes in the order their dependencies imply.
+
+        Candidates are every lane whose latest report is ready, or the lanes
+        holding the members of one group of the applied plan. They are ordered
+        from the advisory dependency edges the ledger already records, so a
+        lane whose issue waits on another is merged after the lane holding
+        that issue. A cycle among the candidates is refused and named; it is
+        never quietly ordered.
+
+        Every candidate is preflighted with the same conditions
+        `participant merge --preview` reports, and each merge then runs
+        through the single-lane path, so no lane is integrated on easier terms
+        than it would be alone. A group is admitted whole or not at all: one
+        refused member leaves the group unmerged. Execution is still ordered
+        rather than atomic, so a merge or gate failure part way through stops
+        the run and leaves the earlier merge commits in place; the report then
+        names what was integrated, what refused and what was not attempted.
+        Nothing is ever reset or reverted.
+
+        Args:
+            repo: Any checkout of the target repository.
+            group: Group of the applied plan to integrate; every ready lane
+                when empty.
+            preview: Whether to report the plan and every candidate's preview
+                without merging anything.
+
+        Returns:
+            The ordered plan when previewing, otherwise an account of every
+            lane that was integrated.
+
+        Raises:
+            BridgeError: If the candidates cannot be ordered, if a group is
+                refused, or if the run stops on a refusal or a failure, whose
+                report names everything already integrated.
+        """
+        root, directory = self.project(repo, create=False)
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            state = snapshot(directory)
+            candidates = (
+                group_lanes(data, state, group, plan.members(directory, group))
+                if group
+                else ready_lanes(directory, data, state)
+            )
+            subject = f"Group {group}" if group else "Ready lanes"
+            if not candidates:
+                return f"{subject}: no lane to integrate, so nothing merged."
+            waits = lane_dependencies(state, candidates)
+            sequence = plan.order(waits, "Lane dependencies")
+            refusals = {
+                name: lane_refusals(
+                    root, directory, data["participants"][name], name
+                )
+                for name in sequence
+            }
+            if preview:
+                return self._integration_preview(
+                    root, directory, data, subject, sequence
+                )
+            if group and any(refusals.values()):
+                raise BridgeError(group_refusal(group, sequence, refusals))
+            return self._integrate_sequence(
+                root, directory, data, subject, sequence, waits, refusals
+            )
+
+    def _integration_preview(
+        self,
+        root: Path,
+        directory: Path,
+        data: dict,
+        subject: str,
+        sequence: list[str],
+    ) -> str:
+        """Reports the ordered plan and every candidate's own preview."""
+        report = [
+            f"{subject}: {len(sequence)} lanes in dependency order: "
+            + ", ".join(sequence)
+            + ".",
+            "Preview only: nothing is merged and no lane is verified.",
+        ]
+        for name in sequence:
+            participant = data["participants"][name]
+            report.append(f"\n{name}:")
+            report.append(
+                merge_preview(
+                    root,
+                    Path(participant["lane"]),
+                    name,
+                    participant["branch"],
+                    lane_session(directory, name),
+                )
+            )
+        return "\n".join(report)
+
+    def _integrate_sequence(
+        self,
+        root: Path,
+        directory: Path,
+        data: dict,
+        subject: str,
+        sequence: list[str],
+        waits: dict[str, list[str]],
+        refusals: dict[str, list[str]],
+    ) -> str:
+        """Merges an ordered run and reports how far it got."""
+        report = [
+            f"{subject}: {len(sequence)} lanes in dependency order: "
+            + ", ".join(sequence)
+            + "."
+        ]
+        merged: list[str] = []
+        stopped = ""
+        for name in sequence:
+            if stopped:
+                report.append(f"- {name}: {unattempted(name, waits, stopped)}")
+                continue
+            if refusals[name]:
+                stopped = name
+                report.append(f"- {name}: refused. {refusals[name][0]}")
+                continue
+            try:
+                outcome = self._integrate_lane(root, directory, data, name)
+            except BridgeError as failure:
+                stopped = name
+                report.append(f"- {name}: stopped. {failure}")
+                continue
+            merged.append(name)
+            report.append(f"- {name}: {outcome}")
+            if not data["verify"]:
+                continue
+            try:
+                verify_base(root, data["verify"], integrated=True)
+            except BridgeError as failure:
+                stopped = name
+                report.append(
+                    f"- {name} is integrated but unverified. {failure}"
+                )
+        report.append(
+            f"Integrated {len(merged)} of {len(sequence)} lanes: "
+            + (", ".join(merged) or "none")
+            + "."
+        )
+        if stopped:
+            raise BridgeError("\n".join(report))
+        return "\n".join(report)
 
     def pull_request(self, repo: Path, name: str) -> str:
         """Opens a verified pull request while excluding a live lane launch.
@@ -2843,7 +3273,7 @@ attempt of the recorded budget, which is also only reported.
         """
         _, directory = self.project(repo)
         if action == "show":
-            return plan.describe(directory)
+            return plan.describe(directory, reported_ready(directory))
         if path is None:
             raise BridgeError("Name the plan file to apply or compare.")
         if action == "apply":
@@ -3246,6 +3676,11 @@ attempt of the recorded budget, which is also only reported.
                 {
                     "root": data["root"],
                     **views.ledger(snapshot(path.parent)),
+                    "ready_groups": plan.ready_groups(
+                        plan.groups(path.parent),
+                        snapshot(path.parent),
+                        reported_ready(path.parent),
+                    ),
                     "participants": [
                         self._lane_status(path.parent, data, agent)
                         for agent in sorted(data["participants"])
@@ -3265,6 +3700,10 @@ attempt of the recorded budget, which is also only reported.
             project["root"]: project["participants"]
             for project in report["projects"]
         }
+        integrable = {
+            project["root"]: project["ready_groups"]
+            for project in report["projects"]
+        }
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
         schema = store.schema_state(store.schema_version(self.home))
@@ -3275,6 +3714,13 @@ attempt of the recorded budget, which is also only reported.
             data = roster.normalize(json.loads(path.read_text()))
             print(f"\nProject: {data['root']}")
             print(describe(snapshot(path.parent)))
+            if groups := integrable.get(data["root"], []):
+                print(
+                    "Every member reported ready in: "
+                    + ", ".join(groups)
+                    + ". Integrate one with `agent-parley participant merge "
+                    "--group NAME`."
+                )
             for record in lanes.get(data["root"], []):
                 agent = record["participant"]
                 account = record["credential"] or "default account"
@@ -4088,10 +4534,33 @@ def main() -> int:
         "restart",
     ):
         command = roles.add_parser(action)
-        command.add_argument("name")
+        if action == "merge":
+            command.add_argument("name", nargs="?", default="")
+        else:
+            command.add_argument("name")
         command.add_argument("--repo", type=Path, default=Path.cwd())
         if action == "merge":
             command.add_argument("--preview", action="store_true")
+            scope = command.add_mutually_exclusive_group()
+            scope.add_argument(
+                "--all",
+                action="store_true",
+                help=(
+                    "Integrate every lane reported ready, ordered by the "
+                    "recorded dependency edges, stopping at the first "
+                    "refusal or failure."
+                ),
+            )
+            scope.add_argument(
+                "--group",
+                default="",
+                metavar="NAME",
+                help=(
+                    "Integrate one group of the applied plan. Preflight "
+                    "admits every member or none; execution is ordered, not "
+                    "atomic, and stops at the first refusal or failure."
+                ),
+            )
         if action == "restart":
             command.add_argument("--task", default="")
     gate = commands.add_parser(
@@ -4489,11 +4958,7 @@ def main() -> int:
             elif args.action == "retire":
                 print(bridge.retire(repository, args.name))
             elif args.action == "merge":
-                print(
-                    bridge.preview_merge(repository, args.name)
-                    if preview
-                    else bridge.merge(repository, args.name)
-                )
+                print(merged_lanes(bridge, repository, args, preview))
             elif args.action == "pr":
                 print(bridge.pull_request(repository, args.name))
             elif args.action in ("pause", "resume"):

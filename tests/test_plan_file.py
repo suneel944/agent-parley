@@ -104,7 +104,9 @@ def test_a_plan_is_reported_as_one_document(bridge, repo, paired):
     )
     assert document["kind"] == "plan"
     assert document["plan"] == "Parser rewrite"
-    assert document["groups"] == [{"group": "parallel", "issues": ["42", "43"]}]
+    assert document["groups"] == [
+        {"group": "parallel", "issues": ["42", "43"], "ready": False}
+    ]
     assert {entry["issue"] for entry in document["issues"]} == {
         "17",
         "42",
@@ -126,7 +128,7 @@ def test_a_cycle_is_refused_before_any_edge_is_written(bridge, repo, paired):
         '[dependencies]\n"42" = ["43"]\n"43" = ["42"]\n',
         "cycle.toml",
     )
-    with pytest.raises(BridgeError, match="cycle"):
+    with pytest.raises(BridgeError, match="cycle: #42, #43"):
         bridge.work_plan(repo, "apply", path)
     assert issues.snapshot(directory)["issues"] == {}
 

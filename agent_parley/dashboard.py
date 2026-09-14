@@ -12,6 +12,7 @@ from typing import Any
 
 from agent_parley import (
     metrics,
+    plan,
     process,
     records,
     roster,
@@ -340,6 +341,15 @@ def _row(
     }
 
 
+def _reported_ready(directory: Path, data: dict) -> set[str]:
+    """Names the participants whose latest report is the ready state."""
+    return {
+        name
+        for name in data["participants"]
+        if activity(directory, name).get("outcome") == "ready"
+    }
+
+
 def _totals(projects: list[dict]) -> dict:
     """Counts the reported rows so a header never counts a hidden one.
 
@@ -347,8 +357,11 @@ def _totals(projects: list[dict]) -> dict:
         projects: Per-project row groups as held in a snapshot.
 
     Returns:
-        Participant, event, denial, context and idle totals, with the lane
-        holding the longest observed idle interval.
+        Participant, event, denial, context and idle totals, the number of
+        plan groups whose every member is reported ready, and the lane
+        holding the longest observed idle interval. A ready-group count
+        belongs to its project rather than to a row, so narrowing the rows
+        never changes it.
     """
     totals = {
         "participants": 0,
@@ -356,10 +369,12 @@ def _totals(projects: list[dict]) -> dict:
         "denials": 0,
         "context": 0,
         "idle": 0,
+        "ready_groups": 0,
     }
     leader = ""
     longest = 0
     for project in projects:
+        totals["ready_groups"] += len(project.get("ready_groups", []))
         for row in project["rows"]:
             totals["participants"] += 1
             totals["events"] += row["hook_events"]
@@ -401,9 +416,9 @@ def collect(
             of re-reading a whole transcript on every refresh.
 
     Returns:
-        Server health, per-project participant rows, and totals over the
-        reported rows, so a header never counts a participant the table
-        does not show.
+        Server health, per-project participant rows, the plan groups whose
+        every member is reported ready, and totals over the reported rows, so
+        a header never counts a participant the table does not show.
     """
     since = time.time() - window if window else 0.0
     cache = {} if readings is None else readings
@@ -433,7 +448,17 @@ def collect(
         ]
         if providers:
             rows = [row for row in rows if row["provider_name"] in providers]
-        projects.append({"root": data["root"], "rows": rows})
+        projects.append(
+            {
+                "root": data["root"],
+                "rows": rows,
+                "ready_groups": plan.ready_groups(
+                    plan.groups(path.parent),
+                    context["issues"],
+                    _reported_ready(path.parent, data),
+                ),
+            }
+        )
     return {
         "running": running,
         "home": str(home),
@@ -806,6 +831,7 @@ def layout(
         f"hook events {totals['events']}  "
         f"denials {totals['denials']} ({rate})  "
         f"context {_size(totals['context'])}  "
+        f"ready groups {totals.get('ready_groups', 0)}  "
         f"idle {_age(totals['idle'])}"
         + (
             f" (most {totals['idle_leader']} "

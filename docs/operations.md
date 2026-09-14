@@ -230,7 +230,42 @@ disagree.
 
 A plan that names a malformed issue number, exceeds a bound, or describes a
 dependency cycle is refused before any edge is written. Groups name issues that
-may proceed together; recording one changes no behavior today.
+may proceed together, and `participant merge --group NAME` integrates one.
+
+### Integrating several lanes at once
+
+```sh
+agent-parley participant merge --all
+agent-parley participant merge --group rewrite
+agent-parley participant merge --group rewrite --preview
+```
+
+`--all` takes every lane whose latest report is ready; `--group` takes the lanes
+holding one group's members, refusing when a member is unclaimed. Both order the
+candidates from the recorded dependency edges, so a lane whose issue waits on
+another is merged after the lane holding that issue. Edges leaving the candidate
+set constrain nothing, and a cycle among the candidates is refused and named
+rather than quietly ordered.
+
+Every candidate is preflighted with the conditions `--preview` reports, and each
+merge runs through the single-lane path, so no lane is integrated on easier
+terms than it would be alone. A group is admitted whole or not at all: one
+refused member leaves the group unmerged and the base checkout unchanged.
+Execution is ordered rather than all-or-nothing: the run stops at the first
+refusal or failure, a refused lane is never followed by a lane that waits on it,
+and the report names what was integrated, what refused and what was not
+attempted, with the dependency reason. Nothing is reset or reverted, and a
+conflict is left in the working tree for you.
+
+With a verification command recorded, it runs before each merge as usual and
+again after it, so a set whose halves pass alone but fail together is caught
+before you move on. A failure after a merge stops the run and leaves that merge
+commit present and visibly unverified.
+
+`plan show` and `status` mark a group whose every member is reported ready, and
+the `top` header counts those groups, so an integrable set is visible before
+anyone merges. A reported state is the lane's own account of its work, never
+review or independent verification.
 
 ### Retrying a write safely
 

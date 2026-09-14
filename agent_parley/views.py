@@ -280,7 +280,8 @@ def work_plan(applied: dict) -> dict:
     Returns:
         The plan's identity and the operator that applied it, one record per
         planned issue carrying its owner and the issues it waits on, the
-        groups as an array, and every edge recorded by hand after the apply.
+        groups as an array, each marked when every member is reported ready,
+        and every edge recorded by hand after the apply.
     """
     return {
         "plan": applied["plan"],
@@ -290,7 +291,11 @@ def work_plan(applied: dict) -> dict:
         "versions": applied["versions"],
         "issues": applied["issues"],
         "groups": [
-            {"group": name, "issues": members}
+            {
+                "group": name,
+                "issues": members,
+                "ready": name in applied.get("ready_groups", []),
+            }
             for name, members in sorted(applied["groups"].items())
         ],
         "unplanned": [

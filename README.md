@@ -188,6 +188,33 @@ The preview only reads. It changes nothing, and it never takes the lane's
 session lock, so it is safe while that agent is still working. It attempts no
 merge, so it cannot predict conflicts.
 
+With several lanes finished, integrate them as a set instead of deciding the
+order by hand:
+
+```sh
+agent-parley participant merge --all              # every lane reported ready
+agent-parley participant merge --group rewrite    # one group of the plan
+agent-parley participant merge --all --preview    # the ordered plan only
+```
+
+Both order the lanes from the dependency edges already recorded, so a lane whose
+issue waits on another is merged after the lane holding that issue. A cycle is
+refused and named, never quietly ordered. Every candidate is preflighted with
+the same conditions `--preview` reports, and each merge then runs through the
+single-lane path, so nothing is integrated on easier terms than it would be
+alone.
+
+A group is admitted whole or not at all: one refused member leaves the group
+unmerged. Execution is ordered rather than atomic, so a merge or a gate failure
+part way through stops the run, leaves the earlier merge commits in place and
+reports what was integrated, what refused and what was not attempted. Nothing is
+reset or reverted.
+
+Groups whose every member is reported ready are marked by `plan show` and
+`status`, and counted in the `top` header, so you learn a set is integrable
+without asking each lane. A reported state is a lane's own account, never review
+or independent verification.
+
 A repository can also require its own command to pass before any merge. The
 command is recorded in coordination state, not in the repository:
 
@@ -201,7 +228,9 @@ With one configured, `participant merge` runs it in the base checkout first and
 streams the command's output, refusing the merge on a non-zero exit and
 reporting the exit status. It runs as an argument list, never through a shell, and no flag
 skips it. It reports the base checkout as it stands before the merge, which is
-not a claim about the merged result.
+not a claim about the merged result. In a `--all` or `--group` run it also runs
+after each member, so a set whose halves pass alone but fail together is caught;
+a failure there leaves the merge commit present and visibly unverified.
 
 A new lane starts as a bare worktree, so every agent would otherwise spend its
 first turns installing dependencies or copying an untracked file. Record that
