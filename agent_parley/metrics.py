@@ -22,13 +22,14 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_parley import checkpoints, issues, process, store
+from agent_parley import attachments, checkpoints, issues, process, store
 from agent_parley.state import BridgeError, lock, write_text
 
 TURN_END = frozenset({"Stop", "SessionEnd"})
 REPORTS = "reports.jsonl"
 MAX_REPORT_RECORDS = 2000
 MAX_REPORT_LOG_BYTES = 262144
+MAX_REPORT_BYTES = 4096
 MAX_WAITS = 64
 
 
@@ -87,12 +88,29 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
                     write_text(
                         path, "\n".join(kept[-MAX_REPORT_RECORDS:]) + "\n"
                     )
+                    for dropped in kept[:-MAX_REPORT_RECORDS]:
+                        _drop_attachment(directory, dropped)
         except BridgeError:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line)
     except OSError:
         return record
     return record
+
+
+def _drop_attachment(directory: Path, line: str) -> None:
+    """Removes the attachment of one report record the rotation dropped.
+
+    Args:
+        directory: Private state directory for the common repository.
+        line: Serialized record leaving the log; a damaged line is ignored.
+    """
+    try:
+        dropped = json.loads(line)
+    except ValueError:
+        return
+    if isinstance(dropped, dict) and dropped.get("attachment"):
+        attachments.remove(directory, str(dropped["attachment"]))
 
 
 def report_records(

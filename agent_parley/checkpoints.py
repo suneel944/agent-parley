@@ -105,6 +105,32 @@ def decision_of(output: dict | None) -> str:
     return "allow"
 
 
+def offered_attachments(issues: dict, agent: str) -> str:
+    """Names the attachments of handoff offers waiting on one lane.
+
+    The issue notice is clipped, so a reference at the end of a long
+    summary would be lost; the references are restated after it instead.
+
+    Args:
+        issues: Published issue ledger snapshot.
+        agent: Lane the notice is delivered to.
+
+    Returns:
+        A line per attached offer, or an empty string when none waits.
+    """
+    lines = []
+    for item in issues.get("issues", {}).values():
+        offer = item.get("offer") or {}
+        if offer.get("to") != agent or not offer.get("attachment"):
+            continue
+        from agent_parley import attachments
+
+        found = attachments.find(str(offer.get("summary", "")))
+        if found:
+            lines.append("\n" + attachments.marker(*found))
+    return "".join(lines)
+
+
 def injected_bytes(output: dict | None) -> int:
     """Measures the text a native hook output delivers into agent context.
 
@@ -1014,7 +1040,8 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             raise BridgeError("Agent identity is not registered.")
         messages = db.execute(
             "SELECT m.id,a.name AS sender,substr(m.subject,1,80) AS subject,"
-            "substr(m.body_md,1,160) AS body_md,m.ack_required "
+            "substr(m.body_md,1,160) AS body_md,"
+            "substr(m.body_md,-80) AS body_tail,m.ack_required "
             "FROM messages m JOIN message_recipients r ON r.message_id=m.id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? AND m.id>? "
             "AND (r.read_ts IS NULL "
@@ -1308,6 +1335,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             + "\nRun agent-parley issue list for full state. "
                             "Pause offered work until resolved. "
                             "Silence never transfers ownership."
+                            + offered_attachments(issues, agent)
                         )
                     if work_notice and offer:
                         parts.append(clip(offer["text"], 400))
@@ -1340,6 +1368,13 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             f"{clip(message['subject'], 80)}\n"
                             f"{clip(message['body_md'], 160)}"
                         )
+                        tail = str(dict(message).get("body_tail") or "")
+                        if "[attachment " in tail:
+                            from agent_parley import attachments
+
+                            attached = attachments.find(tail)
+                            if attached:
+                                preview += "\n" + attachments.marker(*attached)
                         candidate = "\n\n".join([*parts, preview, footer])
                         if len(candidate.encode()) > MAX_CONTEXT_BYTES:
                             break

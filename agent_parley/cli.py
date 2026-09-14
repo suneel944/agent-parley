@@ -20,11 +20,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from agent_parley import (
     approvals,
+    attachments,
     budgets,
     checkpoints,
     completion,
@@ -527,6 +529,32 @@ def narrow(report: dict, selection: Selection) -> dict:
             }
         )
     return {**report, "projects": projects}
+
+
+def shown_record(record: dict) -> str:
+    """Formats one shown message or report for a terminal.
+
+    The record's fields print one per line, then the stored body or
+    evidence, then the whole attachment when it was read.
+
+    Args:
+        record: Message or report record, optionally carrying
+            ``attachment_body``.
+
+    Returns:
+        The text to print.
+    """
+    body = record.get("body_md", record.get("evidence", ""))
+    attached = record.get("attachment_body")
+    fields = [
+        f"{name}: {value}"
+        for name, value in record.items()
+        if name not in ("body_md", "evidence", "attachment_body")
+    ]
+    text = "\n".join(fields) + "\n\n" + str(body)
+    if attached is not None:
+        text += f"\n\n--- attachment {record.get('attachment')} ---\n{attached}"
+    return text
 
 
 def reported_lanes(report: dict) -> int:
@@ -3994,6 +4022,23 @@ attempt of the recorded budget, which is also only reported.
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
             raise BridgeError("Ready-for-review reports require --evidence.")
+        for field, value in (("summary", summary), ("remaining", remaining)):
+            if len(value.encode()) > metrics.MAX_REPORT_BYTES:
+                raise BridgeError(
+                    f"Report --{field} exceeds its "
+                    f"{metrics.MAX_REPORT_BYTES}-byte budget; put the detail "
+                    "in --evidence, which is attached when it is longer."
+                )
+        identifier = uuid.uuid4().hex[:16]
+        evidence, attached = attachments.spill(
+            directory,
+            "report",
+            identifier,
+            evidence,
+            metrics.MAX_REPORT_BYTES,
+            agent,
+            [],
+        )
         scope = retries.scope(agent, "report", retries.validate(key))
         fingerprint = retries.digest(
             "report",
@@ -4040,12 +4085,17 @@ attempt of the recorded budget, which is also only reported.
             directory,
             agent,
             {
+                "id": identifier,
                 "kind": "report",
                 "state": outcome,
                 "issue": int(claimed[0]) if claimed else None,
                 "claim_id": (
                     held[claimed[0]].get("claim_id") if claimed else None
                 ),
+                "summary": summary,
+                "remaining": remaining,
+                "evidence": evidence,
+                "attachment": attached or None,
             },
         )
         owned = sorted(
@@ -4557,6 +4607,39 @@ attempt of the recorded budget, which is also only reported.
             return plan.apply(directory, path)
         return plan.diff(directory, path)
 
+    def show_report(self, repo: Path, identifier: str, full: bool) -> dict:
+        """Reads one of this lane's durable report records.
+
+        Args:
+            repo: Assigned agent worktree.
+            identifier: Report record identifier.
+            full: Whether to read the attached evidence whole.
+
+        Returns:
+            The record, with the whole attachment under ``attachment_body``
+            when asked for and present.
+
+        Raises:
+            BridgeError: If the lane is unknown or no record carries the
+                identifier.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        for record in reversed(metrics.report_records(directory, agent)):
+            if record.get("id") == identifier:
+                break
+        else:
+            raise BridgeError(
+                f"No report {identifier} is recorded for {agent}."
+            )
+        if full and record.get("attachment"):
+            record["attachment_body"] = attachments.body(
+                directory, str(record["attachment"]), agent
+            )
+        return record
+
     def mail(
         self,
         repo: Path,
@@ -4567,6 +4650,7 @@ attempt of the recorded budget, which is also only reported.
         after: int = 0,
         limit: int = store.MAX_SEARCH_HITS,
         identifier: int = 0,
+        full: bool = False,
     ) -> dict:
         """Reads a mail thread, searches mail, or handles pending items.
 
@@ -4582,16 +4666,17 @@ attempt of the recorded budget, which is also only reported.
         Args:
             repo: Assigned agent worktree, or any checkout of the repository
                 for pending items.
-            action: Thread, search, pending or cancel.
+            action: Thread, search, show, pending or cancel.
             thread: Thread identifier for a thread read.
             query: Text to search subjects and bodies for.
             after: Last thread message already read.
             limit: Maximum search hits reported.
-            identifier: Pending item to cancel.
+            identifier: Pending item to cancel, or message to show.
+            full: Whether a shown message's attachment is read whole.
 
         Returns:
-            One thread page, the matching messages, the pending items, or the
-            outcome of a cancellation.
+            One thread page, the matching messages, one message, the pending
+            items, or the outcome of a cancellation.
 
         Raises:
             BridgeError: If the lane or its registered identity is unknown.
@@ -4609,6 +4694,18 @@ attempt of the recorded budget, which is also only reported.
             return store.read_thread(
                 self.home, data["root"], name, thread, after
             )
+        if action == "show":
+            message = store.read_message(
+                self.home, data["root"], name, identifier
+            )
+            found = attachments.find(message["body_md"])
+            if found:
+                message["attachment"], message["attachment_bytes"] = found
+            if full and found:
+                message["attachment_body"] = attachments.body(
+                    directory, found[0], name
+                )
+            return message
         return store.search_messages(
             self.home, data["root"], name, query, limit
         )
@@ -5681,10 +5778,20 @@ def main() -> int:
         "report", help="Record a partial, blocked, or ready-for-review handoff."
     )
     report.add_argument("--repo", type=Path, default=Path.cwd())
-    report.add_argument(
-        "--state", choices=("partial", "blocked", "ready"), required=True
+    report.add_argument("--state", choices=("partial", "blocked", "ready"))
+    report.add_argument("--summary", default="")
+    records = report.add_subparsers(dest="action")
+    showing_report = records.add_parser(
+        "show", help="Print one recorded report of this lane."
     )
-    report.add_argument("--summary", required=True)
+    showing_report.add_argument("report_id")
+    showing_report.add_argument("--repo", type=Path, default=Path.cwd())
+    showing_report.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the whole attached evidence after the record.",
+    )
+    showing_report.add_argument("--json", action="store_true", help=JSON_HELP)
     report.add_argument("--remaining", default="")
     report.add_argument("--evidence", default="")
     report.add_argument(
@@ -5920,6 +6027,17 @@ def main() -> int:
     reading.add_argument("--repo", type=Path, default=Path.cwd())
     reading.add_argument("--after-id", type=int, default=0)
     reading.add_argument("--json", action="store_true", help=JSON_HELP)
+    showing_mail = letters.add_parser(
+        "show", help="Print one message you sent or received."
+    )
+    showing_mail.add_argument("message_id", type=int)
+    showing_mail.add_argument("--repo", type=Path, default=Path.cwd())
+    showing_mail.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the whole attachment after the stored body.",
+    )
+    showing_mail.add_argument("--json", action="store_true", help=JSON_HELP)
     finding = letters.add_parser("search")
     finding.add_argument("query")
     finding.add_argument("--repo", type=Path, default=Path.cwd())
@@ -6341,7 +6459,18 @@ def main() -> int:
                 args.credentials,
                 resume=args.resume,
             )
+        elif args.command == "report" and args.action == "show":
+            record = bridge.show_report(
+                args.repo.resolve(), args.report_id, args.full
+            )
+            print(
+                views.render("report_show", record)
+                if args.json
+                else shown_record(record)
+            )
         elif args.command == "report":
+            if not args.state or not args.summary:
+                parser.error("report needs --state and --summary.")
             bridge.report(
                 args.repo.resolve(),
                 args.state,
@@ -6462,11 +6591,15 @@ def main() -> int:
                 query=getattr(args, "query", ""),
                 after=getattr(args, "after_id", 0),
                 limit=getattr(args, "limit", store.MAX_SEARCH_HITS),
-                identifier=getattr(args, "item_id", 0),
+                identifier=getattr(args, "item_id", 0)
+                or getattr(args, "message_id", 0),
+                full=getattr(args, "full", False),
             )
             if args.action == "cancel":
                 state = "cancelled" if page["cancelled"] else "not pending"
                 print(f"Operator item {page['id']}: {state}.")
+            elif args.action == "show" and not args.json:
+                print(shown_record(page))
             else:
                 print(
                     views.render(f"mail_{args.action}", page)

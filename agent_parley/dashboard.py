@@ -124,6 +124,10 @@ LEGEND = (
     "unfit lane names the check that failed, and no offer names that "
     "lane. A blank cell means nothing was published for it yet. An offer "
     "claims nothing and transfers nothing.",
+    "CONTEXT counts only the bytes coordination injected into a lane's "
+    "context. A message, report or offer above its cap is kept whole as "
+    "an attachment and its record carries a reference; the attachment's "
+    "size is never counted here, only the reference that named it.",
     "A row carrying drift, a stale lease, a rejected call, an overdue "
     "issue or a stopped session is drawn in colour where the terminal "
     "offers it and in bold where it does not. Every one of those also "

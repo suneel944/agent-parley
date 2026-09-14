@@ -93,6 +93,18 @@ and `search_messages` or `agent-parley mail search QUERY` to locate prior
 decisions. Both are scoped to mail this lane sent or received. Replies can use
 `reply_to` or the existing `thread_id` with `send_message`.
 
+A message body is capped at 4,096 UTF-8 bytes, report `--evidence` at 4,096
+and a handoff summary at 2,048. Anything longer is attached automatically:
+the record keeps the first slice and ends with
+`[attachment message-12: 20480 bytes]`, and the peer's notice ends with that
+reference. Attach when the detail is evidence a peer must inspect, such as a
+test log, a diff or a design note; keep the decision itself in the bounded
+body. A peer sees only the reference and must call `read_attachment` with it,
+one page at a time, or print it with `agent-parley mail show ID --full` or
+`agent-parley report show ID --full`. Only the writer and the addressees can
+read an attachment. One attachment is capped at 65,536 bytes and a lane holds
+at most 1 MiB of them.
+
 `file_reservation_paths` and `release_file_reservations` manage advisory path
 reservations. They are not filesystem locks. Reserve a named resource instead
 of a path when the contested thing is not a file — `port:5432`, `db:local`,

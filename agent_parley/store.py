@@ -10,7 +10,14 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
-from agent_parley import forecast, issues, protocol, retries, roster
+from agent_parley import (
+    attachments,
+    forecast,
+    issues,
+    protocol,
+    retries,
+    roster,
+)
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
@@ -55,9 +62,11 @@ PREVIEW_CHARACTERS = 240
 READ_ONLY = (
     "fetch_inbox",
     "list_participants",
+    "read_attachment",
     "read_thread",
     "search_messages",
 )
+ATTACHED = ("send_message", "read_attachment")
 RETRIED = {
     "acknowledge_message": ("message_id",),
     "mark_message_read": ("message_id",),
@@ -576,16 +585,33 @@ def _answered_thread(db: sqlite3.Connection, actor: dict, value: object) -> str:
 
 
 def _send(
-    db: sqlite3.Connection, actor: dict, args: dict, claim: str = ""
+    db: sqlite3.Connection,
+    actor: dict,
+    args: dict,
+    claim: str = "",
+    directory: Path | None = None,
 ) -> dict:
     """Atomically delivers an idempotent message to authorized recipients.
 
     A send naming ``reply_to`` joins the thread of the message it answers. A
     send naming neither ``reply_to`` nor ``thread_id`` opens its own thread,
     so every delivered message belongs to exactly one thread.
+
+    A body above ``MAX_BODY_BYTES`` is spilled whole to an attachment keyed
+    by the message identifier, and the stored body is the bounded slice
+    ending with that reference and the byte count, so a recipient's inbox
+    and checkpoint previews stay exactly as bounded as before.
     """
     subject = _text(args.get("subject"), "subject", 160)
-    body = _text(args.get("body_md"), "body_md", MAX_BODY_BYTES)
+    body = _text(
+        args.get("body_md"), "body_md", attachments.MAX_ATTACHMENT_BYTES
+    )
+    oversized = len(body.encode()) > MAX_BODY_BYTES
+    if oversized and directory is None:
+        raise BridgeError(
+            f"body_md exceeds its {MAX_BODY_BYTES}-byte budget and this "
+            "project keeps no attachments."
+        )
     thread = _text(args.get("thread_id", ""), "thread_id", 80, empty=True)
     key = _text(args.get("idempotency_key"), "idempotency_key", 80)
     ack = _flag(args.get("ack_required", False), "ack_required")
@@ -632,12 +658,17 @@ def _send(
                 (existing["id"],),
             )
         }
+        stored = (
+            attachments.bounded("message", existing["id"], body, MAX_BODY_BYTES)
+            if oversized
+            else body
+        )
         if (
             existing["subject"],
             existing["body_md"],
             existing["thread_id"],
             existing["ack_required"],
-        ) != (subject, body, thread, ack) or previous != set(ids):
+        ) != (subject, stored, thread, ack) or previous != set(ids):
             raise BridgeError("Idempotency key already names another message.")
         return {
             "id": existing["id"],
@@ -665,7 +696,23 @@ def _send(
         "INSERT INTO message_recipients(message_id,agent_id) VALUES (?,?)",
         [(message_id, recipient) for recipient in set(ids)],
     )
-    return {"id": message_id, "thread_id": thread}
+    result = {"id": message_id, "thread_id": thread}
+    if oversized and directory is not None:
+        stored, ref = attachments.spill(
+            directory,
+            "message",
+            message_id,
+            body,
+            MAX_BODY_BYTES,
+            actor["name"],
+            [str(name) for name in recipients],
+        )
+        db.execute(
+            "UPDATE messages SET body_md=? WHERE id=?", (stored, message_id)
+        )
+        result["attachment"] = ref
+        result["attachment_bytes"] = len(body.encode())
+    return result
 
 
 def _roster(db: sqlite3.Connection, actor: dict) -> dict:
@@ -1381,8 +1428,15 @@ def _dispatch(
         if tool == "file_reservation_paths"
         else None
     )
+    directory = (
+        roster.locate(home, str(actor.get("project", "")))
+        if tool in ATTACHED
+        else None
+    )
     with connect(home, write=tool not in READ_ONLY) as db:
-        result = _serve(db, actor, tool, args, declared, claim, commits)
+        result = _serve(
+            db, actor, tool, args, declared, claim, commits, directory
+        )
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -1551,6 +1605,7 @@ def _serve(
     declared: frozenset[str] | None = None,
     claim: str = "",
     commits: list[list[str]] | None = None,
+    directory: Path | None = None,
 ) -> dict:
     """Applies one validated coordination tool to the open transaction.
 
@@ -1576,6 +1631,8 @@ def _serve(
             records a tool writes. Empty records no claim.
         commits: Files per recent commit of the base checkout for a
             reservation forecast, or None when none was read.
+        directory: Project state directory attachments live under, or None
+            when the project has no registered manifest.
 
     Returns:
         The tool result.
@@ -1590,13 +1647,15 @@ def _serve(
         )
     key = retries.validate(args.get("idempotency_key"))
     if not key or tool not in RETRIED:
-        return _effect(db, actor, tool, args, declared, claim, commits)
+        return _effect(
+            db, actor, tool, args, declared, claim, commits, directory
+        )
     fingerprint = retries.digest(
         tool, {name: args.get(name) for name in RETRIED[tool]}
     )
     if recorded := _recorded(db, actor, tool, key):
         return retries.replayed(recorded, tool, key, fingerprint)
-    result = _effect(db, actor, tool, args, declared, claim, commits)
+    result = _effect(db, actor, tool, args, declared, claim, commits, directory)
     _retain(db, actor, tool, key, fingerprint, retries.SERVED, result)
     return result
 
@@ -1609,6 +1668,7 @@ def _effect(
     declared: frozenset[str] | None,
     claim: str,
     commits: list[list[str]] | None = None,
+    directory: Path | None = None,
 ) -> dict:
     """Performs the effect of one coordination tool without retry bookkeeping.
 
@@ -1623,6 +1683,8 @@ def _effect(
             records a tool writes. Empty records no claim.
         commits: Files per recent commit of the base checkout for a
             reservation forecast, or None when none was read.
+        directory: Project state directory attachments live under, or None
+            when the project has no registered manifest.
 
     Returns:
         The tool result.
@@ -1631,7 +1693,16 @@ def _effect(
         BridgeError: If the tool is unknown or its preconditions fail.
     """
     if tool == "send_message":
-        return _send(db, actor, args, claim)
+        return _send(db, actor, args, claim, directory)
+    if tool == "read_attachment":
+        if directory is None:
+            raise BridgeError("This project keeps no attachments.")
+        return attachments.page(
+            directory,
+            attachments.validate(args.get("reference")),
+            actor["name"],
+            _number(args.get("offset", 0), "offset", 0, 10**9),
+        )
     if tool == "fetch_inbox":
         return _inbox(db, actor, args)
     if tool == "list_participants":
@@ -1704,6 +1775,41 @@ def read_thread(
     with connect(home) as db:
         actor = _identify(db, root, name)
         return _thread(db, actor, {"thread_id": thread, "after_id": after})
+
+
+def read_message(home: Path, root: str, name: str, message_id: int) -> dict:
+    """Reads one message whole as the participant that sent or received it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own mail is read.
+        message_id: Message identifier.
+
+    Returns:
+        The message with its stored body, which ends with an attachment
+        reference when the body was spilled.
+
+    Raises:
+        BridgeError: If no store exists, the participant is unregistered, or
+            the message is not one this participant sent or received.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home) as db:
+        actor = _identify(db, root, name)
+        row = db.execute(
+            "SELECT m.id,a.name AS sender,m.thread_id,m.subject,m.body_md,"
+            "m.created_ts,m.ack_required FROM messages m "
+            + MAIL_SCOPE
+            + "AND m.id=?",
+            (actor["id"], actor["project_id"], actor["id"], message_id),
+        ).fetchone()
+    if not row:
+        raise BridgeError(
+            f"Message {message_id} is not one {name} sent or received."
+        )
+    return dict(row)
 
 
 def search_messages(
