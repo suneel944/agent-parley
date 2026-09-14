@@ -388,6 +388,17 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
 
+Every read-only command above also accepts `--json` and prints exactly one JSON
+document, so a script, a shell prompt or another agent reads coordination state
+without parsing a table: `status`, `top`, `issue list`, `participant list`,
+`mail thread`, `mail search`, `verify show`, `init show`, `provider list` and
+`credentials list`. `top --json` prints one frame and exits. The document
+carries the identifiers the table abbreviates — offer, message and thread IDs —
+with every time in RFC 3339, and no credential value. Field names are
+documented in [docs/operations.md](docs/operations.md) and carry the same
+stability promise as the flags. `events export` stays JSON Lines, because it is
+a stream rather than a snapshot.
+
 Removing a definition leaves participant references intact. Redefine that name
 before relaunching a lane that uses it. A removed provider override immediately
 reveals its built-in preset, if any.

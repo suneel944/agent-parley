@@ -169,6 +169,76 @@ exported by default. `--since` takes the same windows as `top`. Export reads
 state and never writes it, and it is the supported way to keep enforcement
 history beyond what the state directory retains.
 
+### Machine-readable output
+
+Every read-only command also accepts `--json` and prints exactly one JSON
+document on standard output:
+
+```sh
+agent-parley status --json
+agent-parley top --json
+agent-parley issue list --json
+agent-parley participant list --json
+agent-parley mail thread THREAD_ID --json
+agent-parley mail search "reservation conflict" --json
+agent-parley verify show --json
+agent-parley init show --json
+agent-parley provider list --json
+agent-parley credentials list --json
+```
+
+`top --json` prints one frame and exits rather than drawing the live view;
+`--provider` and `--since` narrow it exactly as they narrow the table. Write
+commands are unchanged, and a refusal still goes to standard error with a
+non-zero exit status, so a script tells a refusal from a document by the exit
+status alone.
+
+Every document carries the same envelope:
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | `agent-parley/read/v1`, the version of this contract. |
+| `kind` | The command reported: `status`, `top`, `issues`, `participants`, `mail_thread`, `mail_search`, `verify`, `init`, `providers` or `credentials`. |
+| `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
+
+Repeated rows are arrays rather than objects keyed by name, so a reader pages
+them without knowing the identifiers in advance, and every recorded time is RFC
+3339 in UTC whether the lane state files or SQLite recorded it. The document
+carries the identifiers the table abbreviates: offer IDs on `issues`, message
+and thread IDs on `mail_thread` and `mail_search`, participant names, registered
+identities and branch names everywhere they apply. It carries no credential
+value; a credential profile is named, never its contents.
+
+`status` reports `server`, `state_directory` and one entry per project holding
+`root`, the issue ledger as `revision` and `issues`, and `participants`. Each
+participant carries `participant`, `identity`, `provider`, `credential`,
+`session`, `availability`, `branch`, `assigned_branch`, `drift`, `paused`,
+`outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
+`report_age_seconds`, `injected_bytes`, `injections`, `wake` and `mail`. A
+mailbox that cannot be read reports `{"error": "..."}` in `mail` rather than
+failing the document, exactly as the table reports coordination as unavailable.
+
+`top` reports `server`, `state_directory`, `window_seconds`, `providers`,
+`totals` and one entry per project holding `root` and `participants`. Each row
+carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
+`branch`, `drift`, `issues`, `offers`, `unread`, `pending_ack`, `leases`,
+`stale_leases`, `lease_age_seconds`, `injected_bytes`, `hook_events`,
+`denials`, `calls`, `errors`, `tokens` and `prompt`. `tokens` is null when that
+lane's own session records could not be read, and `unread` and `pending_ack`
+are null when its mailbox could not be read: null states that nothing was read,
+never that the count is zero.
+
+`issues` reports `revision` and an `issues` array whose records carry `issue`,
+`owner`, `title`, `blocked_by`, `offer` and `reminder`. `participants` reports
+`root` and a `participants` array carrying `participant`, `identity`,
+`provider`, `credential`, `branch`, `lane`, `paused` and `wake`.
+
+These field names carry the same stability promise as the command-line flags:
+removing a field is a breaking change, and a release that adds one raises the
+schema version only when an existing field changes meaning. `events export`
+stays JSON Lines, one record per line, because it is a stream rather than a
+snapshot; `--json` snapshots and that stream are separate contracts.
+
 ## Participants, providers and accounts
 
 ### Availability, reminders and waking

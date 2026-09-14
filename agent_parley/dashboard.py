@@ -165,6 +165,7 @@ def _row(
             f"{participant['provider']}/"
             f"{participant['credential'] or 'default'}"
         ),
+        "credential": participant["credential"],
         "state": (
             f"paused; {liveness}"
             if participant.get("paused", False)
@@ -175,8 +176,10 @@ def _row(
         "event_age": (
             _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
         ),
+        "last_event_ts": events["last_ts"],
         "branch": branch,
         "drift": branch != participant["branch"],
+        "owned": owned,
         "issues": ",".join(f"#{number}" for number in owned) or "-",
         "offers": offers,
         "unread": mail.get("unread", "?"),

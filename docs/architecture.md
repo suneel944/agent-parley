@@ -18,6 +18,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `forge` | Optional best-effort issue lookups and mirrors on the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view of every participant |
+| `views` | Machine-readable rendering of read-only command results |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `state` | Private atomic JSON publication and operation locks |
 

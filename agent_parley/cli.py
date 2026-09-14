@@ -32,6 +32,7 @@ from agent_parley import (
     store,
     supervision,
     terminal,
+    views,
 )
 from agent_parley.checkpoints import (
     EVENTS,
@@ -58,6 +59,10 @@ CHANGE_TYPE = frozenset(
         "performance",
         "release",
     }
+)
+JSON_HELP = (
+    "Print one JSON document on standard output instead of the table. "
+    "Field names are documented in docs/operations.md."
 )
 COPILOT_EVENTS = frozenset(
     {
@@ -1313,6 +1318,29 @@ class Bridge:
             "checkout while it runs."
         )
 
+    def commands(self, repo: Path) -> dict:
+        """Reports the commands a repository configured, without running them.
+
+        Args:
+            repo: Any checkout of the target repository.
+
+        Returns:
+            The base checkout, the verification command every merge must pass,
+            and the command every new lane runs before its agent starts. Each
+            command is the stored argument list, empty when none is
+            configured.
+
+        Raises:
+            BridgeError: If the repository has no project yet.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        return {
+            "root": str(root),
+            "verify": list(data["verify"]),
+            "initialize": list(data["initialize"]),
+        }
+
     def _record_operator(
         self, directory: Path, name: str, reason: checkpoints.Reason, note: str
     ) -> None:
@@ -2202,105 +2230,210 @@ review, not merged or independently verified. An idle turn is not completion.
             for name in data["participants"]
         }
 
-    def status(self) -> None:
-        """Prints activity, reported outcomes, and coordination state."""
+    def _lane_status(self, directory: Path, data: dict, agent: str) -> dict:
+        """Reads one lane's reported state, ownership context and mailbox.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding this participant.
+            agent: Participant that owns the lane.
+
+        Returns:
+            The lane's session, availability, branch, reported outcome and
+            mailbox counts. An unreadable mailbox is reported as an error
+            beside the rest of the lane rather than failing the whole report.
+        """
         import sqlite3
 
-        healthy = self.server_process() and self.ready()
-        print(f"Server: {'ready' if healthy else 'not ready'}")
-        print(f"State: {self.home}")
+        participant = data["participants"][agent]
+        name = participant["display"]
+        state = activity(directory, agent)
+        observed = supervision.presence(
+            directory,
+            agent,
+            supervision.configuration(self.home, data)["inactive_after"],
+        )
+        branch = lane_branch(Path(participant["lane"]))
+        reported_at = state.get("reported_at")
+        record = {
+            "participant": agent,
+            "identity": name,
+            "provider": participant["provider"],
+            "credential": participant["credential"],
+            "session": participant_liveness(directory, agent),
+            "availability": {
+                "state": observed["state"],
+                "process_alive": observed["process_alive"],
+                "last_active_at": views.timestamp(observed["last_active"]),
+                "age_seconds": observed["age_seconds"],
+            },
+            "branch": branch,
+            "assigned_branch": participant["branch"],
+            "drift": branch != participant["branch"],
+            "paused": participant.get("paused", False),
+            "outcome": state.get("outcome", "unknown"),
+            "summary": state.get("summary", ""),
+            "remaining": state.get("remaining", ""),
+            "evidence": state.get("evidence", ""),
+            "reported_at": views.timestamp(reported_at),
+            "report_age_seconds": (
+                int(time.time() - reported_at) if reported_at else None
+            ),
+            "injected_bytes": state.get("injected_bytes", 0),
+            "injections": state.get("injections", 0),
+            "wake": None,
+            "mail": None,
+        }
+        wake_path = directory / f"{agent}-wake.json"
+        if wake_path.exists():
+            wake = json.loads(wake_path.read_text())
+            record["wake"] = {
+                "result": wake["result"],
+                "attempts": wake["attempts"],
+                "at": views.timestamp(wake["at"]),
+                "age_seconds": int(time.time() - wake["at"]),
+            }
+        try:
+            mail = mailbox(
+                self.home, data["root"], name, state.get("cursor", 0)
+            )
+        except (sqlite3.Error, BridgeError, OSError) as exc:
+            record["mail"] = {"error": str(exc)}
+            return record
+        record["mail"] = {
+            "unread": mail["unread"],
+            "pending_ack": mail["pending_ack"],
+            "reservations": mail["reservations"],
+            "stale_reservations": mail.get("stale_reservations", 0),
+            "last_coordination_at": views.timestamp(mail["last_coordination"]),
+            "outstanding_ack": [
+                {
+                    "message_id": pending["id"],
+                    "sender": pending["sender"],
+                    "age_seconds": pending["age_seconds"],
+                }
+                for pending in mail.get("outstanding_ack", [])
+            ],
+            "awaiting_delivery": len(mail["messages"]),
+            "task": (
+                state.get("last_prompt")
+                or mail["reported_task"]
+                or state.get("task", "")
+            )[:240],
+        }
+        return record
+
+    def status_snapshot(self) -> dict:
+        """Reads server health and every registered lane without writing.
+
+        The same reading answers the printed report and the machine-readable
+        document, so a script and an operator never see two different states
+        of the same coordination store.
+
+        Returns:
+            Server readiness, the private state directory, and one record per
+            registered project holding its issue ledger and its lanes.
+        """
+        healthy = bool(self.server_process()) and self.ready()
+        projects = []
+        for path in sorted((self.home / "projects").glob("*/project.json")):
+            data = roster.normalize(json.loads(path.read_text()))
+            projects.append(
+                {
+                    "root": data["root"],
+                    **views.ledger(snapshot(path.parent)),
+                    "participants": [
+                        self._lane_status(path.parent, data, agent)
+                        for agent in sorted(data["participants"])
+                    ],
+                }
+            )
+        return {
+            "server": {"ready": healthy},
+            "state_directory": str(self.home),
+            "projects": projects,
+        }
+
+    def status(self) -> None:
+        """Prints activity, reported outcomes, and coordination state."""
+        report = self.status_snapshot()
+        lanes = {
+            project["root"]: project["participants"]
+            for project in report["projects"]
+        }
+        ready = "ready" if report["server"]["ready"] else "not ready"
+        print(f"Server: {ready}")
+        print(f"State: {report['state_directory']}")
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
             print(f"\nProject: {data['root']}")
             print(describe(snapshot(path.parent)))
-            for agent, participant in sorted(data["participants"].items()):
-                name = participant["display"]
-                account = participant["credential"] or "default account"
-                state_path = path.parent / f"{agent}-activity.json"
-                state = (
-                    json.loads(state_path.read_text())
-                    if state_path.exists()
-                    else {}
+            for record in lanes.get(data["root"], []):
+                agent = record["participant"]
+                account = record["credential"] or "default account"
+                print(
+                    f"  {agent} ({record['identity']}): {record['session']}\n"
+                    f"    Provider: {record['provider']}; {account}"
                 )
                 print(
-                    f"  {agent} ({name}): "
-                    f"{participant_liveness(path.parent, agent)}\n"
-                    f"    Provider: {participant['provider']}; {account}"
+                    f"    Availability: {record['availability']['state']}; "
+                    "session process alive: "
+                    f"{record['availability']['process_alive']}"
                 )
-                observed = supervision.presence(
-                    path.parent,
-                    agent,
-                    supervision.configuration(self.home, data)[
-                        "inactive_after"
-                    ],
-                )
-                print(
-                    f"    Availability: {observed['state']}; "
-                    f"session process alive: {observed['process_alive']}"
-                )
-                branch = lane_branch(Path(participant["lane"]))
-                if branch != participant["branch"]:
-                    print(f"    {drift(agent, participant, branch)}")
-                print(
-                    f"    Reported outcome: {state.get('outcome', 'unknown')}"
-                )
-                print(
-                    f"    Context delivered: {state.get('injected_bytes', 0)} "
-                    f"UTF-8 bytes in {state.get('injections', 0)} notices"
-                )
-                if state.get("reported_at"):
-                    report_age = int(time.time() - state["reported_at"])
-                    print(f"    Report age: {report_age}s")
-                if state.get("summary"):
-                    print(f"    Summary: {state['summary']}")
-                if state.get("remaining"):
-                    print(f"    Remaining: {state['remaining']}")
-                if state.get("evidence"):
-                    print(f"    Reported verification: {state['evidence']}")
-                wake_path = path.parent / f"{agent}-wake.json"
-                if wake_path.exists():
-                    wake_record = json.loads(wake_path.read_text())
+                if record["drift"]:
                     print(
-                        f"    Runtime wake: {wake_record['result']}; "
-                        f"attempt {wake_record['attempts']}; "
-                        f"{int(time.time() - wake_record['at'])}s ago"
-                    )
-                try:
-                    mail = mailbox(
-                        self.home, data["root"], name, state.get("cursor", 0)
-                    )
-                    stale = mail.get("stale_reservations", 0)
-                    print(
-                        f"    Unread: {mail['unread']}; "
-                        f"pending acknowledgements: {mail['pending_ack']}; "
-                        f"active reservations: {mail['reservations']}"
-                        + (f" ({stale} stale)" if stale else "")
-                    )
-                    print(
-                        "    Last coordination: "
-                        f"{mail['last_coordination']} UTC"
-                    )
-                    for pending in mail.get("outstanding_ack", []):
-                        print(
-                            "    Awaiting acknowledgement: "
-                            f"message {pending['id']} "
-                            f"from {pending['sender']}; "
-                            f"{pending['age_seconds']}s"
+                        "    "
+                        + drift(
+                            agent,
+                            data["participants"][agent],
+                            record["branch"],
                         )
-                    task = (
-                        state.get("last_prompt")
-                        or mail["reported_task"]
-                        or state.get("task", "")
                     )
-                    print(f"    Latest prompt/task (reported): {task[:240]}")
-                    if mail["messages"]:
-                        print(
-                            "    Awaiting checkpoint delivery: "
-                            f"{len(mail['messages'])} "
-                            "(batch capped at 3)"
-                        )
-                except (sqlite3.Error, BridgeError, OSError) as exc:
-                    print(f"    Coordination unavailable: {exc}")
+                print(f"    Reported outcome: {record['outcome']}")
+                print(
+                    f"    Context delivered: {record['injected_bytes']} "
+                    f"UTF-8 bytes in {record['injections']} notices"
+                )
+                if record["report_age_seconds"] is not None:
+                    print(f"    Report age: {record['report_age_seconds']}s")
+                if record["summary"]:
+                    print(f"    Summary: {record['summary']}")
+                if record["remaining"]:
+                    print(f"    Remaining: {record['remaining']}")
+                if record["evidence"]:
+                    print(f"    Reported verification: {record['evidence']}")
+                if wake := record["wake"]:
+                    print(
+                        f"    Runtime wake: {wake['result']}; "
+                        f"attempt {wake['attempts']}; "
+                        f"{wake['age_seconds']}s ago"
+                    )
+                mail = record["mail"] or {}
+                if "error" in mail:
+                    print(f"    Coordination unavailable: {mail['error']}")
+                    continue
+                stale = mail["stale_reservations"]
+                print(
+                    f"    Unread: {mail['unread']}; "
+                    f"pending acknowledgements: {mail['pending_ack']}; "
+                    f"active reservations: {mail['reservations']}"
+                    + (f" ({stale} stale)" if stale else "")
+                )
+                print(f"    Last coordination: {mail['last_coordination_at']}")
+                for pending in mail["outstanding_ack"]:
+                    print(
+                        "    Awaiting acknowledgement: "
+                        f"message {pending['message_id']} "
+                        f"from {pending['sender']}; "
+                        f"{pending['age_seconds']}s"
+                    )
+                print(f"    Latest prompt/task (reported): {mail['task']}")
+                if mail["awaiting_delivery"]:
+                    print(
+                        "    Awaiting checkpoint delivery: "
+                        f"{mail['awaiting_delivery']} "
+                        "(batch capped at 3)"
+                    )
 
     def launch(
         self,
@@ -2528,11 +2661,17 @@ def main() -> int:
         "down",
         help="Stop the coordination server; retain all data and worktrees.",
     )
-    commands.add_parser(
+    health = commands.add_parser(
         "status", help="Show server health and registered workspaces."
     )
+    health.add_argument("--json", action="store_true", help=JSON_HELP)
     watch = commands.add_parser(
         "top", help="Watch every participant's live coordination state."
+    )
+    watch.add_argument(
+        "--json",
+        action="store_true",
+        help="Print one JSON frame and exit instead of drawing a live view.",
     )
     watch.add_argument(
         "--once",
@@ -2671,7 +2810,9 @@ def main() -> int:
     ):
         command = actions.add_parser(action)
         command.add_argument("--repo", type=Path, default=Path.cwd())
-        if action != "list":
+        if action == "list":
+            command.add_argument("--json", action="store_true", help=JSON_HELP)
+        else:
             command.add_argument("number")
         if action == "offer":
             command.add_argument("--to", required=True)
@@ -2688,16 +2829,19 @@ def main() -> int:
     reading.add_argument("thread_id")
     reading.add_argument("--repo", type=Path, default=Path.cwd())
     reading.add_argument("--after-id", type=int, default=0)
+    reading.add_argument("--json", action="store_true", help=JSON_HELP)
     finding = letters.add_parser("search")
     finding.add_argument("query")
     finding.add_argument("--repo", type=Path, default=Path.cwd())
     finding.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
+    finding.add_argument("--json", action="store_true", help=JSON_HELP)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
     roles = participant.add_subparsers(dest="action", required=True)
     listing = roles.add_parser("list")
     listing.add_argument("--repo", type=Path, default=Path.cwd())
+    listing.add_argument("--json", action="store_true", help=JSON_HELP)
     joining = roles.add_parser("add")
     joining.add_argument("name")
     joining.add_argument("--provider")
@@ -2727,6 +2871,7 @@ def main() -> int:
     gates = gate.add_subparsers(dest="action", required=True)
     showing = gates.add_parser("show")
     showing.add_argument("--repo", type=Path, default=Path.cwd())
+    showing.add_argument("--json", action="store_true", help=JSON_HELP)
     setting = gates.add_parser("set")
     setting.add_argument(
         "command_line",
@@ -2744,6 +2889,7 @@ def main() -> int:
     preparations = preparation.add_subparsers(dest="action", required=True)
     reporting = preparations.add_parser("show")
     reporting.add_argument("--repo", type=Path, default=Path.cwd())
+    reporting.add_argument("--json", action="store_true", help=JSON_HELP)
     recording = preparations.add_parser("set")
     recording.add_argument(
         "command_line",
@@ -2759,7 +2905,9 @@ def main() -> int:
         "provider", help="Inspect or define providers that drive a native CLI."
     )
     definitions = provider.add_subparsers(dest="action", required=True)
-    definitions.add_parser("list")
+    definitions.add_parser("list").add_argument(
+        "--json", action="store_true", help=JSON_HELP
+    )
     definitions.add_parser("remove").add_argument("name")
     defining = definitions.add_parser("add")
     defining.add_argument("name")
@@ -2772,7 +2920,9 @@ def main() -> int:
         "credentials", help="Inspect or define per-account profiles."
     )
     profiles = accounts.add_subparsers(dest="action", required=True)
-    profiles.add_parser("list")
+    profiles.add_parser("list").add_argument(
+        "--json", action="store_true", help=JSON_HELP
+    )
     profiles.add_parser("remove").add_argument("name")
     profile = profiles.add_parser("add")
     profile.add_argument("name")
@@ -2791,14 +2941,30 @@ def main() -> int:
                 "Coordination server stopped. Worktrees and messages retained."
             )
         elif args.command == "top":
-            dashboard.run(
-                bridge.home,
-                lambda: bool(bridge.server_process()),
-                args.once,
-                args.interval,
-                tuple(args.provider or ()),
-                args.since,
-            )
+            if args.json:
+                print(
+                    views.render(
+                        "top",
+                        views.frame(
+                            dashboard.collect(
+                                bridge.home,
+                                bool(bridge.server_process()),
+                                {},
+                                tuple(args.provider or ()),
+                                args.since,
+                            )
+                        ),
+                    )
+                )
+            else:
+                dashboard.run(
+                    bridge.home,
+                    lambda: bool(bridge.server_process()),
+                    args.once,
+                    args.interval,
+                    tuple(args.provider or ()),
+                    args.since,
+                )
         elif args.command == "events":
             message = bridge.export_events(
                 args.repo.resolve(),
@@ -2858,24 +3024,25 @@ def main() -> int:
                 offer_id=getattr(args, "offer_id", None),
                 on=getattr(args, "on", None),
             )
-            print(
-                describe(result, bridge.liveness(args.repo.resolve()))
-                if args.action == "list"
-                else json.dumps(result, indent=2)
-            )
+            if args.action != "list":
+                print(json.dumps(result, indent=2))
+            elif args.json:
+                print(views.render("issues", views.ledger(result)))
+            else:
+                print(describe(result, bridge.liveness(args.repo.resolve())))
         elif args.command == "mail":
+            page = bridge.mail(
+                args.repo.resolve(),
+                args.action,
+                thread=getattr(args, "thread_id", ""),
+                query=getattr(args, "query", ""),
+                after=getattr(args, "after_id", 0),
+                limit=getattr(args, "limit", store.MAX_SEARCH_HITS),
+            )
             print(
-                json.dumps(
-                    bridge.mail(
-                        args.repo.resolve(),
-                        args.action,
-                        thread=getattr(args, "thread_id", ""),
-                        query=getattr(args, "query", ""),
-                        after=getattr(args, "after_id", 0),
-                        limit=getattr(args, "limit", store.MAX_SEARCH_HITS),
-                    ),
-                    indent=2,
-                )
+                views.render(f"mail_{args.action}", page)
+                if args.json
+                else json.dumps(page, indent=2)
             )
         elif args.command == "participant":
             repository = args.repo.resolve()
@@ -2908,23 +3075,50 @@ def main() -> int:
                 print(bridge.stop(repository, args.name))
             elif args.action == "restart":
                 return bridge.restart(repository, args.name, args.task)
-            if not preview:
+            if getattr(args, "json", False):
+                _, directory = bridge.project(repository)
+                data = roster.read(directory)
+                print(
+                    views.render(
+                        "participants",
+                        {
+                            "root": data["root"],
+                            "participants": views.participants(data),
+                        },
+                    )
+                )
+            elif not preview:
                 _, directory = bridge.project(repository)
                 print(roster.describe(roster.read(directory)))
-        elif args.command == "verify":
-            print(
-                bridge.verification(
-                    args.repo.resolve(),
-                    getattr(args, "command_line", None),
+        elif args.command in ("verify", "init"):
+            repository = args.repo.resolve()
+            if getattr(args, "json", False):
+                configured = bridge.commands(repository)
+                stored = configured[
+                    "verify" if args.command == "verify" else "initialize"
+                ]
+                print(
+                    views.render(
+                        args.command,
+                        {
+                            "root": configured["root"],
+                            "command": stored,
+                            "configured": bool(stored),
+                        },
+                    )
                 )
-            )
-        elif args.command == "init":
-            print(
-                bridge.initialization(
-                    args.repo.resolve(),
-                    getattr(args, "command_line", None),
+            elif args.command == "verify":
+                print(
+                    bridge.verification(
+                        repository, getattr(args, "command_line", None)
+                    )
                 )
-            )
+            else:
+                print(
+                    bridge.initialization(
+                        repository, getattr(args, "command_line", None)
+                    )
+                )
         elif args.command == "provider":
             if args.action == "add":
                 roster.define_provider(
@@ -2944,7 +3138,20 @@ def main() -> int:
                     )
             elif args.action == "remove":
                 roster.remove(bridge.home, "provider", args.name)
-            print(json.dumps(roster.providers(bridge.home), indent=2))
+            defined = roster.providers(bridge.home)
+            print(
+                views.render(
+                    "providers",
+                    {
+                        "providers": [
+                            {"name": name, **entry}
+                            for name, entry in sorted(defined.items())
+                        ]
+                    },
+                )
+                if getattr(args, "json", False)
+                else json.dumps(defined, indent=2)
+            )
         elif args.command == "credentials":
             if args.action == "add":
                 roster.define_credential(
@@ -2956,7 +3163,22 @@ def main() -> int:
                 )
             elif args.action == "remove":
                 roster.remove(bridge.home, "credentials", args.name)
-            print(json.dumps(roster.credentials(bridge.home), indent=2))
+            registered = roster.credentials(bridge.home)
+            print(
+                views.render(
+                    "credentials",
+                    {
+                        "credentials": [
+                            {"name": name, **entry}
+                            for name, entry in sorted(registered.items())
+                        ]
+                    },
+                )
+                if getattr(args, "json", False)
+                else json.dumps(registered, indent=2)
+            )
+        elif args.json:
+            print(views.render("status", bridge.status_snapshot()))
         else:
             bridge.status()
         return 0
