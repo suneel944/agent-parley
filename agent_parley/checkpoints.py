@@ -843,8 +843,9 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
 
     Returns:
         Message previews, pending counts, held reservations with how many are
-        past a declared time to live, and coordination age. A stale
-        reservation is still held; nothing releases it on its owner's behalf.
+        past a declared time to live, the named resources among them, and
+        coordination age. A stale reservation is still held; nothing releases
+        it on its owner's behalf.
 
     Raises:
         BridgeError: If the agent is not registered.
@@ -898,6 +899,14 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "FROM file_reservations WHERE agent_id=? AND released_ts IS NULL",
             (agent["id"],),
         ).fetchone()
+        named = db.execute(
+            "SELECT path_pattern FROM file_reservations WHERE agent_id=? "
+            "AND released_ts IS NULL AND instr(path_pattern,':')>0 "
+            "AND (instr(path_pattern,'/')=0 "
+            "OR instr(path_pattern,':')<instr(path_pattern,'/')) "
+            "ORDER BY path_pattern LIMIT 16",
+            (agent["id"],),
+        ).fetchall()
         return {
             "messages": [dict(row) for row in messages],
             "pending_ack": pending,
@@ -905,6 +914,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "unread": unread,
             "reservations": leases["held"],
             "stale_reservations": leases["stale"],
+            "named_resources": [row["path_pattern"] for row in named],
             "reported_task": agent["task_description"],
             "last_coordination": agent["last_active_ts"],
         }

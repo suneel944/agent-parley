@@ -1421,6 +1421,47 @@ class Bridge:
             "branch they were created with."
         )
 
+    def resources(self, repo: Path, declared: str | None = None) -> str:
+        """Reports or records the named resources a project declares.
+
+        The declaration lives beside the roster in coordination state, so it
+        commits nothing to the target repository. It narrows what a lane may
+        reserve by name; it grants nothing, revokes nothing and holds no lease
+        of its own.
+
+        Args:
+            repo: Any checkout of the target repository.
+            declared: Space-separated resource names, an empty string to
+                accept any well-formed name again, or None to report the
+                current declaration without changing it.
+
+        Returns:
+            An account of the declared resources.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or a name is
+                not a scheme and a name such as ``port:5432``.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if declared is not None:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["resources"] = roster.resources(shlex.split(declared))
+                write_json(directory / "project.json", data)
+        current = data["resources"]
+        if not current:
+            return (
+                f"{root} declares no named resources, so a lane may reserve "
+                "any well-formed name, such as port:5432 or db:local."
+            )
+        return (
+            f"{root} declares {len(current)} named resources: "
+            + ", ".join(current)
+            + ". A lane that reserves an undeclared name is refused with this "
+            "list."
+        )
+
     def _record_operator(
         self, directory: Path, name: str, reason: checkpoints.Reason, note: str
     ) -> None:
@@ -1969,7 +2010,10 @@ Record a dependency with `agent-parley issue block NUMBER --on OTHER`, and drop
 it with `issue unblock NUMBER --on OTHER`. `issue list` then names who holds
 each blocking issue. A recorded dependency is information, not a gate: nothing
 stops work on a waiting issue and no transition clears the dependency for you.
-Reserve repo-relative file paths before editing. Reservations are advisory:
+Reserve repo-relative file paths before editing, and reserve a named resource
+such as port:5432, db:local, suite:integration or device:android-1 when the
+contested thing is not a file; a worktree isolates none of those, and a named
+resource conflicts on an exact match. Reservations are advisory:
 if conflicts are returned, stop overlapping work, release the conflicting grant,
 and agree on ownership with the peer. Do not treat a granted lease as permission
 to ignore conflicts. Renew reservations before expiry while work continues.
@@ -2396,6 +2440,7 @@ review, not merged or independently verified. An idle turn is not completion.
             "pending_ack": mail["pending_ack"],
             "reservations": mail["reservations"],
             "stale_reservations": mail.get("stale_reservations", 0),
+            "named_resources": list(mail.get("named_resources", [])),
             "last_coordination_at": views.timestamp(mail["last_coordination"]),
             "outstanding_ack": [
                 {
@@ -2510,6 +2555,11 @@ review, not merged or independently verified. An idle turn is not completion.
                     f"active reservations: {mail['reservations']}"
                     + (f" ({stale} stale)" if stale else "")
                 )
+                if mail["named_resources"]:
+                    print(
+                        "    Named resources held: "
+                        + ", ".join(mail["named_resources"])
+                    )
                 print(f"    Last coordination: {mail['last_coordination_at']}")
                 for pending in mail["outstanding_ack"]:
                     print(
@@ -3009,6 +3059,24 @@ def main() -> int:
         ),
     )
     naming_set.add_argument("--repo", type=Path, default=Path.cwd())
+    shared = commands.add_parser(
+        "resources",
+        help="Show or declare the named resources lanes may reserve.",
+    )
+    declarations = shared.add_subparsers(dest="action", required=True)
+    declared_show = declarations.add_parser("show")
+    declared_show.add_argument("--repo", type=Path, default=Path.cwd())
+    declared_show.add_argument("--json", action="store_true", help=JSON_HELP)
+    declared_set = declarations.add_parser("set")
+    declared_set.add_argument(
+        "names",
+        metavar="NAMES",
+        help=(
+            "Space-separated resource names such as 'port:5432 db:local'; "
+            "pass an empty string to accept any well-formed name again."
+        ),
+    )
+    declared_set.add_argument("--repo", type=Path, default=Path.cwd())
     provider = commands.add_parser(
         "provider", help="Inspect or define providers that drive a native CLI."
     )
@@ -3204,6 +3272,25 @@ def main() -> int:
                     args.repo.resolve(), getattr(args, "prefix", None)
                 )
             )
+        elif args.command == "resources":
+            repository = args.repo.resolve()
+            if getattr(args, "json", False):
+                _, directory = bridge.project(repository, create=False)
+                data = roster.read(directory)
+                print(
+                    views.render(
+                        "resources",
+                        {
+                            "root": data["root"],
+                            "resources": data["resources"],
+                            "declared": bool(data["resources"]),
+                        },
+                    )
+                )
+            else:
+                print(
+                    bridge.resources(repository, getattr(args, "names", None))
+                )
         elif args.command in ("verify", "init"):
             repository = args.repo.resolve()
             if getattr(args, "json", False):

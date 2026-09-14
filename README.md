@@ -261,7 +261,11 @@ check, on any repository or for any provider. Which assistant did the work stays
 in coordination state, where `top` and `status` read it.
 
 **Nine scoped MCP tools carry the coordination.** Conflicting reservations
-grant nothing and name the blocking owner with that owner's declared reason.
+grant nothing and name the blocking owner with that owner's declared reason. A
+reservation can name something that is not a file — `port:5432`, `db:local`,
+`suite:integration`, `device:android-1` — because a worktree isolates none of
+those; a named resource conflicts on an exact match, and
+`agent-parley resources set` declares which ones exist.
 Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Fetching an inbox never marks a message read. A send can answer
 another message, which puts both in one thread, and a participant can read a
@@ -392,6 +396,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
 | `branch show` | Show the prefix new lane branches are created under. |
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
+| `resources show` | Show the named resources lanes may reserve. |
+| `resources set NAMES` | Declare them; an empty string accepts any well-formed name. |
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `init show` | Show the command every new lane runs before it starts. |
