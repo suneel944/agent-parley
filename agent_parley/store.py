@@ -1352,6 +1352,74 @@ def speak(
         )
 
 
+def waiting(home: Path, root: str, name: str) -> dict:
+    """Reports one lane's oldest unanswered item and its last served call.
+
+    A stalled lane looks healthy from every angle the view already had: the
+    process is alive, the branch is right, and the mail counter is a number
+    rather than a wait. These two readings are what turns those into a stall:
+    how long the oldest item has waited, and how long it has been since the
+    lane last had a coordination call served for it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose mailbox is read.
+
+    Returns:
+        The oldest waiting item with its kind, sender, identifier and age in
+        seconds, and the age of the last served call. An item is ``None`` when
+        the lane owes nothing, and the served age is ``None`` when no call was
+        ever served or the record has been retired.
+    """
+    report: dict = {
+        "kind": None,
+        "message_id": None,
+        "sender": "",
+        "age_seconds": 0,
+        "served_age_seconds": None,
+    }
+    if not (home / DATABASE).exists():
+        return report
+    with connect(home) as db:
+        agent = db.execute(
+            "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE p.human_key=? AND a.name=?",
+            (root, name),
+        ).fetchone()
+        if not agent:
+            return report
+        served = db.execute(
+            "SELECT max(0,unixepoch('now')-unixepoch(max(created_ts))) AS age "
+            "FROM events WHERE agent_id=?",
+            (agent["id"],),
+        ).fetchone()
+        report["served_age_seconds"] = served["age"]
+        for kind, condition in (
+            ("acknowledgement", "m.ack_required=1 AND r.ack_ts IS NULL"),
+            ("unread", "r.read_ts IS NULL"),
+        ):
+            row = db.execute(
+                "SELECT m.id,a.name AS sender,"
+                "max(0,unixepoch('now')-unixepoch(m.created_ts)) AS age "
+                "FROM message_recipients r "
+                "JOIN messages m ON m.id=r.message_id "
+                "JOIN agents a ON a.id=m.sender_id "
+                f"WHERE r.agent_id=? AND {condition} ORDER BY m.id LIMIT 1",
+                (agent["id"],),
+            ).fetchone()
+            if row and (
+                report["kind"] is None or row["age"] > report["age_seconds"]
+            ):
+                report.update(
+                    kind=kind,
+                    message_id=row["id"],
+                    sender=row["sender"],
+                    age_seconds=row["age"],
+                )
+    return report
+
+
 def usage(home: Path, root: str) -> dict[str, dict]:
     """Reports retained tool events and held leases for one project.
 

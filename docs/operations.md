@@ -146,6 +146,23 @@ declaration lives in coordination state beside the roster, so it commits
 nothing to the target repository, and it grants nothing: it only narrows what
 may be reserved.
 
+`top` and `status` mark a lane `idle` when its recorded session process is
+alive, no coordination call has been served for it within the configured
+interval, and it holds unread mail or an unacknowledged message at least that
+old. The marker names the oldest waiting item and how long it has waited, so a
+stalled lane reads differently from a busy one instead of looking healthy in
+every column. It is read-only: nothing is revoked, no claim is released, no
+ownership moves and no lane is woken by it. A lane whose session process is not
+alive is never marked idle, because `stopped` already says that. `--provider`
+selects which lanes are reported, exactly as for every other column; `--since`
+narrows counted history and does not change the idle interval, which is its own
+setting.
+
+The interval defaults to 600 seconds. Set it per project under `supervision` in
+that project's manifest in coordination state, or globally in
+`supervision.json` beside it, as `stalled_after`; it accepts 1 to 86400
+seconds, the same bounds as `inactive_after`.
+
 A reservation may declare `ttl_seconds`, and one taken without it never
 reports as stale. Once a declared time to live passes, the LEASES count in
 `top` gains `!` and the stale count, `status` reports the stale share of a
@@ -253,15 +270,19 @@ project holding
 participant carries `participant`, `identity`, `provider`, `credential`,
 `session`, `availability`, `branch`, `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
-`report_age_seconds`, `injected_bytes`, `injections`, `wake` and `mail`, whose
-`named_resources` array lists the named resources that lane holds. A
+`report_age_seconds`, `injected_bytes`, `injections`, `idle`, `wake` and
+`mail`, whose `named_resources` array lists the named resources that lane
+holds. `idle` carries `stalled`, the waiting item's `kind`, `message_id`,
+`sender` and `age_seconds`, the `served_age_seconds` since the last served
+call, and the same `marker` the table prints. A
 mailbox that cannot be read reports `{"error": "..."}` in `mail` rather than
 failing the document, exactly as the table reports coordination as unavailable.
 
 `top` reports `server`, `state_directory`, `window_seconds`, `providers`,
 `totals` and one entry per project holding `root` and `participants`. Each row
 carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
-`branch`, `drift`, `issues`, `offers`, `unread`, `pending_ack`, `leases`,
+`stalled`, `stall`, `branch`, `drift`, `issues`, `offers`, `unread`,
+`pending_ack`, `leases`,
 `stale_leases`, `lease_age_seconds`, `injected_bytes`, `hook_events`,
 `denials`, `calls`, `errors`, `tokens` and `prompt`. `tokens` is null when that
 lane's own session records could not be read, and `unread` and `pending_ack`

@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import records, roster, store
+from agent_parley import records, roster, store, supervision
 from agent_parley.checkpoints import (
     activity,
     event_summary,
@@ -158,6 +158,9 @@ def _row(
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
     liveness = participant_liveness(directory, agent)
+    idle = supervision.stall(
+        home, directory, data, agent, context["stalled_after"]
+    )
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -169,10 +172,15 @@ def _row(
         "state": (
             f"paused; {liveness}"
             if participant.get("paused", False)
+            else f"idle {_age(idle['age_seconds'])}; {liveness}"
+            if idle["stalled"]
             else "running; no hooks"
             if "checkpoints unavailable" in liveness
             else liveness
         ),
+        "stalled": idle["stalled"],
+        "stall": supervision.stall_marker(idle),
+        "stall_age": idle["age_seconds"] if idle["stalled"] else 0,
         "event_age": (
             _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
         ),
@@ -249,6 +257,9 @@ def collect(
             "branches": branches,
             "records": cache,
             "since": since,
+            "stalled_after": supervision.configuration(home, data)[
+                "stalled_after"
+            ],
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -341,6 +352,7 @@ def render(
             )
         for row in project["rows"]:
             row_positions.append(len(lines))
+            marker = row["stall"]
             lines.append(
                 "  ".join(
                     _fit(value, selected_columns[index][1])
@@ -375,9 +387,17 @@ def render(
                     if index in selected_columns
                 ).rstrip()
             )
+            if marker:
+                lines.append(f"    {marker}")
             if row["prompt"]:
                 lines.append(f"    last: {row['prompt']}")
     lines.append("")
+    lines.append(
+        "A lane marked idle is alive, has served no coordination call within "
+        "the configured interval, and holds unread or unacknowledged mail at "
+        "least that old; the line under it names the oldest waiting item. The "
+        "marker only reports: nothing is revoked and no ownership moves."
+    )
     lines.append(
         "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
         "!past a declared time to live, with the age of the oldest; DENIALS "
