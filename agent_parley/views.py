@@ -115,9 +115,12 @@ def doctor(reported: dict) -> dict:
     Returns:
         The protocol this build speaks, the protocols it accepts, the store
         schema it writes, one record per component, and whether the set is
-        consistent. The store schema is reported as `store_schema`, because
-        `schema` already names the document's own schema identifier. No
-        credential and no profile path is included.
+        consistent. Each component record carries the state this build puts it
+        in and the one command that state needs, so a script gating on this
+        output can report the cause rather than only the verdict. The store
+        schema is reported as `store_schema`, because `schema` already names
+        the document's own schema identifier. No credential and no profile
+        path is included.
     """
     return {
         "protocol": reported["protocol"],

@@ -16,6 +16,11 @@ from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
 SCHEMA_VERSION = 7
+SCHEMA_ABSENT = "absent"
+SCHEMA_BEHIND = "needs migration"
+SCHEMA_CURRENT = "ok"
+SCHEMA_UNSUPPORTED = "unsupported"
+SCHEMA_USABLE = frozenset({SCHEMA_ABSENT, SCHEMA_CURRENT})
 BUSY_TIMEOUT = 5.0
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
@@ -1150,6 +1155,33 @@ def schema_version(home: Path) -> int:
             return int(db.execute("PRAGMA user_version").fetchone()[0])
     except sqlite3.Error:
         return 0
+
+
+def schema_state(schema: int) -> str:
+    """Classifies a store schema against the schema this build writes.
+
+    A store behind this build is not compatible with it. Every process running
+    this code queries columns the older store does not have, so reporting the
+    pair as merely older would describe a working system during an outage.
+    Migration happens when the service opens the store, so the state names
+    what is missing rather than performing it.
+
+    Args:
+        schema: Schema the store on disk declares, or zero when none exists.
+
+    Returns:
+        `SCHEMA_ABSENT` when no store has been created, `SCHEMA_CURRENT` when
+        the store matches this build, `SCHEMA_BEHIND` when it predates this
+        build and has not been migrated, and `SCHEMA_UNSUPPORTED` when a newer
+        build wrote it, which is refused rather than downgraded.
+    """
+    if not schema:
+        return SCHEMA_ABSENT
+    if schema < SCHEMA_VERSION:
+        return SCHEMA_BEHIND
+    if schema > SCHEMA_VERSION:
+        return SCHEMA_UNSUPPORTED
+    return SCHEMA_CURRENT
 
 
 def refused(home: Path, actor: dict, tool: str) -> None:

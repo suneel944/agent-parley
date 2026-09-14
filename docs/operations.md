@@ -131,7 +131,22 @@ metadata is used only for a package installed without one.
 
 `doctor` prints the launcher version and protocol, the protocol each shipped
 plugin manifest declares, and the store's schema against the schema this build
-writes, then a verdict line. Its exit status is non-zero on a mismatch, so a
+writes, then a verdict line. Each line carries the state this build puts that
+component in, printed in upper case when the build does not accept it.
+
+The store has four states. `absent` means no store has been created yet, which
+is consistent because the service writes it at the current schema. `ok` means
+the store matches this build. `needs migration` means the store predates this
+build and has not been migrated: every process running this code queries
+columns the older store does not have, so this is a mismatch, not merely an
+older number. `unsupported` means a newer build wrote the store, which is
+refused rather than downgraded.
+
+The verdict names one command per distinct cause, because a store behind this
+build and a plugin speaking another protocol need different commands. A behind
+store is resolved by restarting the service, which migrates it; a newer store
+by installing the build that wrote it; a plugin mismatch by reinstalling the
+plugin. Its exit status is non-zero on a mismatch, so a
 script can gate on it. It reads only: it opens no lane, writes no configuration,
 repairs nothing, and prints no credential or profile path.
 
