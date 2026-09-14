@@ -21,6 +21,132 @@ from agent_parley import issues as issues_state
 
 SCHEMA = "agent-parley/read/v1"
 
+LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "agent_parley_lane_session_alive",
+        "gauge",
+        "alive",
+        "Whether the lane's recorded session process is alive.",
+    ),
+    (
+        "agent_parley_lane_branch_drift",
+        "gauge",
+        "drift",
+        "Whether the lane sits on a branch other than the assigned one.",
+    ),
+    (
+        "agent_parley_lane_issues_held",
+        "gauge",
+        "issues_held",
+        "Issues the participant owns in the ledger.",
+    ),
+    (
+        "agent_parley_lane_offers_pending",
+        "gauge",
+        "offers",
+        "Handoff offers awaiting this participant's answer.",
+    ),
+    (
+        "agent_parley_lane_mail_unread",
+        "gauge",
+        "unread",
+        "Unread messages in the participant's mailbox.",
+    ),
+    (
+        "agent_parley_lane_mail_pending_ack",
+        "gauge",
+        "pending_ack",
+        "Messages awaiting acknowledgement from this participant.",
+    ),
+    (
+        "agent_parley_lane_leases_held",
+        "gauge",
+        "leases",
+        "Advisory reservations the participant holds.",
+    ),
+    (
+        "agent_parley_lane_leases_stale",
+        "gauge",
+        "stale_leases",
+        "Held reservations whose holder has no live session.",
+    ),
+    (
+        "agent_parley_lane_idle_seconds",
+        "gauge",
+        "idle_seconds",
+        "Seconds the lane has been idle in the reported window.",
+    ),
+    (
+        "agent_parley_lane_context_bytes_total",
+        "counter",
+        "injected_bytes",
+        "Coordination context bytes injected in the reported window.",
+    ),
+    (
+        "agent_parley_lane_hook_events_total",
+        "counter",
+        "hook_events",
+        "Hook events recorded in the reported window.",
+    ),
+    (
+        "agent_parley_lane_hook_denials_total",
+        "counter",
+        "denials",
+        "Hook events that denied an action in the reported window.",
+    ),
+    (
+        "agent_parley_lane_served_calls_total",
+        "counter",
+        "calls",
+        "Coordination tool calls served for this participant.",
+    ),
+    (
+        "agent_parley_lane_served_rejections_total",
+        "counter",
+        "errors",
+        "Coordination tool calls rejected for this participant.",
+    ),
+    (
+        "agent_parley_lane_tokens_total",
+        "counter",
+        "tokens",
+        "Tokens the native client counted, never billed spend.",
+    ),
+)
+
+PROJECT_METRICS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "agent_parley_project_participants",
+        "gauge",
+        "",
+        "Participants reported for this project.",
+    ),
+    (
+        "agent_parley_project_idle_seconds",
+        "gauge",
+        "idle_seconds",
+        "Idle seconds summed over the project's reported lanes.",
+    ),
+    (
+        "agent_parley_project_context_bytes_total",
+        "counter",
+        "injected_bytes",
+        "Context bytes injected across the project's reported lanes.",
+    ),
+    (
+        "agent_parley_project_hook_events_total",
+        "counter",
+        "hook_events",
+        "Hook events recorded across the project's reported lanes.",
+    ),
+    (
+        "agent_parley_project_hook_denials_total",
+        "counter",
+        "denials",
+        "Denials recorded across the project's reported lanes.",
+    ),
+)
+
 
 def timestamp(value: float | str | None) -> str | None:
     """Converts a recorded time to RFC 3339 in UTC.
@@ -344,4 +470,161 @@ def frame(view: dict) -> dict:
             }
             for project in view["projects"]
         ],
+    }
+
+
+def _measured(value: object) -> float | None:
+    """Reports one measured field as a number, or None where nothing was read.
+
+    Args:
+        value: Field taken from a snapshot row.
+
+    Returns:
+        The field as a float, with a boolean reported as one or zero, or None
+        where the field states that nothing could be read.
+    """
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _total(rows: list[dict], key: str) -> float:
+    """Sums one measured field over the rows a project reports.
+
+    Args:
+        rows: Snapshot rows the project reports.
+        key: Field to sum, or the empty string to count the rows themselves.
+
+    Returns:
+        The sum over the rows, counting an unreadable field as zero so a
+        project total never disappears because one lane could not be read.
+    """
+    if not key:
+        return float(len(rows))
+    return sum(_measured(row.get(key)) or 0.0 for row in rows)
+
+
+def _number(value: float) -> str:
+    """Formats one sample value without a decimal part it does not need."""
+    return str(int(value)) if value == int(value) else repr(value)
+
+
+def _label(value: object) -> str:
+    """Escapes one label value for the text exposition format."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+
+
+def _description(text: str) -> str:
+    """Escapes one metric description for the text exposition format."""
+    return text.replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def families(view: dict) -> list[dict]:
+    """Reports the exported counters and gauges of one live snapshot.
+
+    Every lane series is labelled by project, participant and provider, and
+    every project series by project alone. A field that states nothing could
+    be read, such as tokens on an unreadable session record, contributes no
+    sample rather than a zero, so a reader never mistakes an unread value for
+    a measured one.
+
+    Args:
+        view: Snapshot produced by the dashboard collector.
+
+    Returns:
+        One record per metric family carrying its ``name``, ``type``,
+        ``help`` and its ``samples``, each sample carrying its ``labels`` and
+        its ``value``.
+    """
+    reported = []
+    for name, kind, key, text in LANE_METRICS:
+        samples = []
+        for project in view["projects"]:
+            for row in project["rows"]:
+                value = _measured(row.get(key))
+                if value is None:
+                    continue
+                samples.append(
+                    {
+                        "labels": {
+                            "project": project["root"],
+                            "participant": row["participant"],
+                            "provider": row["provider_name"],
+                        },
+                        "value": value,
+                    }
+                )
+        reported.append(
+            {"name": name, "type": kind, "help": text, "samples": samples}
+        )
+    for name, kind, key, text in PROJECT_METRICS:
+        reported.append(
+            {
+                "name": name,
+                "type": kind,
+                "help": text,
+                "samples": [
+                    {
+                        "labels": {"project": project["root"]},
+                        "value": _total(project["rows"], key),
+                    }
+                    for project in view["projects"]
+                ],
+            }
+        )
+    return reported
+
+
+def exposition(view: dict) -> str:
+    """Formats one live snapshot in the Prometheus text exposition format.
+
+    Each family prints its description and type once, followed by its
+    samples, so a textfile collector or any scraper that reads a file parses
+    the frame without a listener. A family with nothing to report still
+    prints its description and type, which states that the metric exists and
+    measured nothing.
+
+    Args:
+        view: Snapshot produced by the dashboard collector.
+
+    Returns:
+        The frame as exposition text ending in a newline.
+    """
+    lines = []
+    for family in families(view):
+        lines.append(f"# HELP {family['name']} {_description(family['help'])}")
+        lines.append(f"# TYPE {family['name']} {family['type']}")
+        for sample in family["samples"]:
+            labels = ",".join(
+                f'{name}="{_label(value)}"'
+                for name, value in sample["labels"].items()
+            )
+            value = _number(sample["value"])
+            lines.append(f"{family['name']}{{{labels}}} {value}")
+    return "\n".join(lines) + "\n"
+
+
+def measurements(view: dict) -> dict:
+    """Reports the exported counters and gauges as one object.
+
+    Args:
+        view: Snapshot produced by the dashboard collector.
+
+    Returns:
+        The state directory the snapshot was read from, the window its counts
+        cover, the providers it reports, and the same families the exposition
+        text carries.
+    """
+    return {
+        "state_directory": view["home"],
+        "window_seconds": view["window"] or None,
+        "providers": list(view.get("providers") or []),
+        "metrics": families(view),
     }

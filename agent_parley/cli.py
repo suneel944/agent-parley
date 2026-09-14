@@ -60,7 +60,7 @@ from agent_parley.issues import (
     parse_issue,
     snapshot,
 )
-from agent_parley.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, lock, write_json, write_text
 
 VERIFY_TIMEOUT = 1800
 INIT_OUTPUT_LINES = 20
@@ -3375,6 +3375,53 @@ def main() -> int:
             "PARTICIPANT,STATE,IDLE. Every column is shown by default."
         ),
     )
+    measured = commands.add_parser(
+        "metrics",
+        help="Print the counters and gauges the live view computes.",
+    )
+    measured.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print the same values as one JSON document instead of the "
+            "Prometheus text exposition format."
+        ),
+    )
+    measured.add_argument(
+        "--output",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write the frame to this file, replaced atomically, instead of "
+            "printing it."
+        ),
+    )
+    measured.add_argument(
+        "--every",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Rewrite the file on this interval until interrupted.",
+    )
+    measured.add_argument(
+        "--provider",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Report only participants driven by this provider. Repeat the "
+            "flag to report several."
+        ),
+    )
+    measured.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Count only enforcement history inside this window, such as 45m, "
+            "6h or 7d. The whole retained log is counted by default."
+        ),
+    )
     past = commands.add_parser(
         "history",
         help="Read the recorded history of an issue, a lane or a claim.",
@@ -3818,6 +3865,25 @@ def main() -> int:
                     tuple(args.participant or ()),
                     names,
                 )
+        elif args.command == "metrics":
+            if args.every and not args.output:
+                parser.error("--every needs --output.")
+            with contextlib.suppress(KeyboardInterrupt):
+                while True:
+                    frame = dashboard.export(
+                        bridge.home,
+                        bool(bridge.server_process()),
+                        tuple(args.provider or ()),
+                        args.since,
+                        args.json,
+                    )
+                    if args.output:
+                        write_text(args.output, frame)
+                    else:
+                        print(frame, end="")
+                    if not args.every:
+                        break
+                    time.sleep(args.every)
         elif args.command == "history":
             if args.subject is None:
                 parser.error("history takes issue, participant or claim.")

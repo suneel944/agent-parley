@@ -24,11 +24,27 @@ def write_json(path: Path, value: dict) -> None:
     Raises:
         OSError: If writing or replacing the destination fails.
     """
+    write_text(path, json.dumps(value, indent=2) + "\n")
+
+
+def write_text(path: Path, text: str) -> None:
+    """Writes text using atomic replacement.
+
+    A reader of the destination sees either the previous file or the whole new
+    one, never a partial frame, because the content is written to a temporary
+    file in the same directory and renamed over the destination.
+
+    Args:
+        path: Destination in an existing directory.
+        text: Content to publish.
+
+    Raises:
+        OSError: If writing or replacing the destination fails.
+    """
     fd, temporary = tempfile.mkstemp(dir=path.parent)
     try:
         with os.fdopen(fd, "w") as stream:
-            json.dump(value, stream, indent=2)
-            stream.write("\n")
+            stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)

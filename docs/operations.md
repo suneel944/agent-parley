@@ -555,7 +555,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `issues`, `participants`, `history`, `mail_thread`, `mail_search`, `verify`, `init`, `resources`, `providers` or `credentials`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `issues`, `participants`, `history`, `mail_thread`, `mail_search`, `verify`, `init`, `resources`, `providers` or `credentials`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -617,6 +617,59 @@ removing a field is a breaking change, and a release that adds one raises the
 schema version only when an existing field changes meaning. `events export`
 stays JSON Lines, one record per line, because it is a stream rather than a
 snapshot; `--json` snapshots and that stream are separate contracts.
+
+### Metrics a monitoring stack can read
+
+`agent-parley metrics` prints the counters and gauges the live view computes,
+in the Prometheus text exposition format:
+
+```sh
+agent-parley metrics
+agent-parley metrics --json
+agent-parley metrics --provider codex --since 6h
+agent-parley metrics --output /var/lib/node_exporter/parley.prom --every 30
+```
+
+Every lane series is labelled `project`, `participant` and `provider`, and
+every project series `project`. The lane families are
+`agent_parley_lane_session_alive`, `agent_parley_lane_branch_drift`,
+`agent_parley_lane_issues_held`, `agent_parley_lane_offers_pending`,
+`agent_parley_lane_mail_unread`, `agent_parley_lane_mail_pending_ack`,
+`agent_parley_lane_leases_held`, `agent_parley_lane_leases_stale`,
+`agent_parley_lane_idle_seconds`, `agent_parley_lane_context_bytes_total`,
+`agent_parley_lane_hook_events_total`,
+`agent_parley_lane_hook_denials_total`,
+`agent_parley_lane_served_calls_total`,
+`agent_parley_lane_served_rejections_total` and
+`agent_parley_lane_tokens_total`. The project families are
+`agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
+`agent_parley_project_context_bytes_total`,
+`agent_parley_project_hook_events_total` and
+`agent_parley_project_hook_denials_total`, each summed over the rows that
+project reports, so a total never counts a lane the export does not show.
+`tokens` is what the native client counted, not billed spend, exactly as the
+`TOKENS` column is.
+
+A measurement that could not be read reports no sample rather than a zero:
+an unreadable mailbox or session record leaves `mail_unread`, `mail_pending_ack`
+or `tokens` absent for that lane, while the family still prints its `# HELP`
+and `# TYPE` lines so a reader sees that the metric exists. A label value
+carrying a quote, a backslash or a newline is escaped as the exposition format
+requires, so a repository path never breaks a frame.
+
+`--provider` and `--since` narrow the export exactly as they narrow the table.
+`--json` prints the same values as one snapshot document of kind `metrics`,
+carrying `state_directory`, `window_seconds`, `providers` and a `metrics`
+array whose records carry `name`, `type`, `help` and `samples`, each sample
+carrying its `labels` and its `value`.
+
+`--output PATH` writes the frame to a file by atomic rename instead of
+printing it, so the textfile collector of `node_exporter`, or any scraper that
+reads a file, never reads a partial frame. `--every SECONDS` rewrites that file
+on an interval until the command is interrupted, and needs `--output`. There is
+no HTTP endpoint and no new port: the file is the interface, and the
+coordination server's loopback listener is unchanged. The command reads the
+same records `top` reads, takes no lock and writes no coordination state.
 
 ## Participants, providers and accounts
 

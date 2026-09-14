@@ -18,15 +18,15 @@ runs `participant merge`, and never on an agent's behalf.
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
-| `dashboard` | Read-only live operator view of every participant |
-| `views` | Machine-readable rendering of read-only command results |
+| `dashboard` | Read-only live operator view and metrics frames of every participant |
+| `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text |
 | `metrics` | Idle intervals and waiting times derived from retained records |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
-| `state` | Private atomic JSON publication and operation locks |
+| `state` | Private atomic JSON and text publication and operation locks |
 
 Enforcement and telemetry share one substrate, on purpose, in two places. Hook
 decisions are appended per participant beside the lane state, because a hook
