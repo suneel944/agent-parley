@@ -430,6 +430,18 @@ starts, when a hook runs, and when a served call arrives. `agent-parley doctor`
 prints all three and exits non-zero on a mismatch, so a script can gate on it. It
 reads only, and prints no credential.
 
+**One screen says what needs you now.** `agent-parley problems` lists, oldest
+first, every condition an operator should act on: a lane stalled or inactive
+past its supervision threshold, a claim past its deadline, a handoff offer with
+no answer, a message awaiting acknowledgement past `--ack-after`, a lane whose
+branch drifted or whose worktree is dirty with no recent activity, a lane over
+its advisory budget, a store schema behind the code, and a service that is down.
+Each row names the lane, the condition, how long it has held and the exact
+command that clears it. An empty list exits zero with one line saying so; any
+row exits 1, so a shell or a cron can notice. `--json` prints the same rows,
+and `P` in `top` shows them in place. The view reads the same snapshot `status`
+prints and moves nothing.
+
 **The work order is a file you can review.** Write the issues, the dependencies
 between them and the groups that may run in parallel as TOML, then
 `agent-parley plan apply work-order.toml`. Applying records the same advisory
@@ -690,6 +702,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
 | `doctor` | Report launcher, plugin and store versions and their fit; non-zero exit on a mismatch. |
+| `problems` | List every lane, claim and store condition that needs an operator, oldest first, with the command that clears each; `--ack-after` sets the acknowledgement age, `--json` prints it for scripts, exit 1 when any row exists. |
 | `issue ... --idempotency-key KEY` | Retry any transition safely; the repeat returns the first result. |
 | `participant list` | List the project's lanes and their identities. |
 | `participant add NAME` | Create a lane with an optional provider and credential profile. |

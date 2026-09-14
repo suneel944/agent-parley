@@ -235,6 +235,43 @@ mid-turn:
 - Opening a store written by a newer schema is refused, never migrated
   downwards, exactly as a newer project manifest already is.
 
+### Triage with `problems`
+
+`doctor` answers whether the installation is consistent and `top` shows every
+lane; `problems` answers what needs an operator right now.
+
+```sh
+agent-parley problems
+agent-parley problems --ack-after 900
+agent-parley problems --json
+```
+
+The command derives its rows from the same reading `status` and `top` print,
+the supervision thresholds and the store classification, and writes nothing.
+Rows are ordered by how long each has held, longest first; a store or service
+row carries no age and leads the list, because no lane can be acted on until
+the store is usable and the service is up. Each row names the lane, the
+condition, its age and the one command that clears it:
+
+| Condition | When | Clears with |
+| --- | --- | --- |
+| `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
+| `service` | The coordination server is not ready. | `agent-parley up` |
+| `stalled` | A live lane holds mail older than `stalled_after` and served no call inside it. | `agent-parley run NAME --resume` |
+| `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley run NAME --resume` |
+| `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
+| `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
+| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. | `agent-parley run NAME --resume` |
+| `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
+| `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
+| `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
+
+An empty list prints one line saying so and exits zero; any row exits 1, so a
+shell or a cron can gate on it. `--json` prints the same rows inside the shared
+snapshot envelope with `count`. The `P` key in `top` shows the same rows in
+place of the table until any key returns. Every command named is a suggestion:
+the view revokes nothing, releases nothing and wakes nobody.
+
 ### Recording the work order as a plan file
 
 Entering a dozen dependencies one `issue block` at a time leaves no artifact to
