@@ -60,9 +60,9 @@ provider-neutral: no instruction that depends on a Claude-specific feature,
 and no assumption about which model reads it.
 
 The portal's scan of that Claude manifest demands fields the Claude directory
-does not: an `interface` block with `shortDescription` of at most 240
-characters, plus `logo` and `composerIcon` pointing to square images inside
-the archive. Adding `interface` to the repository's Claude manifest would make
+does not: an `interface` block with `shortDescription`, which the submission
+form reuses as the listing subtitle and caps at 30 characters, plus `logo`
+and `composerIcon` pointing to square images inside the archive. Adding `interface` to the repository's Claude manifest would make
 `claude plugin validate --strict` fail, so the repository keeps those fields
 in `.codex-plugin/plugin.json` and `make codex-bundle` merges them into the
 archived copy. The archive lands at

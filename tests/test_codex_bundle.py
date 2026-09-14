@@ -71,7 +71,7 @@ def test_rejects_long_short_description(tmp_path):
         ),
     )
     errors = codex_bundle.manifest_errors(root)
-    assert errors == ["Codex interface.shortDescription exceeds 240 characters"]
+    assert errors == ["Codex interface.shortDescription exceeds 30 characters"]
     with pytest.raises(ValueError):
         codex_bundle.build(root, tmp_path / "dist")
 

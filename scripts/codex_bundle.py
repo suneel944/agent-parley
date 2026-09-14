@@ -5,7 +5,8 @@ The Claude plugin directory reads the repository, so the Claude manifest in
 accepts. The Codex plugin directory takes an uploaded archive instead, reads
 the Claude manifest inside it, and requires the listing fields it converts
 into ``.codex-plugin/plugin.json``: an ``interface`` block with a short
-description of at most 240 characters plus a logo and a composer icon that
+description that also serves as the 30 character listing subtitle, plus a
+logo and a composer icon that
 resolve to square images inside the archive. Those fields live in the
 repository's Codex manifest, and this module merges them into the archived
 Claude manifest so neither directory's format leaks into the other's.
@@ -20,7 +21,7 @@ from pathlib import Path
 from scripts.release_artifacts import add_entry
 
 PLUGIN_DIRECTORY = Path("plugins") / "agent-parley"
-SHORT_DESCRIPTION_LIMIT = 240
+SHORT_DESCRIPTION_LIMIT = 30
 IMAGE_FIELDS = ("logo", "composerIcon")
 CLAUDE_LISTING_FIELDS = (
     "description",
