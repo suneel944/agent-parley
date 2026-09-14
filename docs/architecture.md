@@ -19,6 +19,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `forge` | Optional best-effort issue lookups and mirrors on the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view of every participant |
+| `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results |
 | `metrics` | Idle intervals and waiting times derived from retained records |
 | `history` | Read-only ownership history across the ledger, reports and store |

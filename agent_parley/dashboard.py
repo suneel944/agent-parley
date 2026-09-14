@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import metrics, records, roster, store, supervision
+from agent_parley import metrics, records, roster, store, supervision, tables
 from agent_parley.checkpoints import (
     activity,
     event_summary,
@@ -38,26 +38,6 @@ COLUMNS = (
 )
 
 
-def _age(seconds: float) -> str:
-    """Formats an age compactly, without ever implying sub-second precision."""
-    if seconds < 0:
-        return "-"
-    if seconds < 90:
-        return f"{int(seconds)}s"
-    if seconds < 5400:
-        return f"{int(seconds / 60)}m"
-    return f"{int(seconds / 3600)}h"
-
-
-def _size(count: int) -> str:
-    """Formats a byte count in units an operator can compare at a glance."""
-    if count < 1024:
-        return f"{count}B"
-    if count < 1024 * 1024:
-        return f"{count / 1024:.1f}kB"
-    return f"{count / 1024 / 1024:.1f}MB"
-
-
 def _tokens(count: int | None) -> str:
     """Formats a reported token count, or nothing when none was readable.
 
@@ -76,22 +56,6 @@ def _tokens(count: int | None) -> str:
     if count < 1000000:
         return f"{count / 1000:.1f}k"
     return f"{count / 1000000:.1f}M"
-
-
-def _fit(value: str, width: int) -> str:
-    """Pads a cell, marking any value the column could not show in full.
-
-    Args:
-        value: Cell text.
-        width: Column width.
-
-    Returns:
-        Text padded to the column width, ending in an ellipsis when clipped,
-        so a truncated branch or issue list never reads as complete.
-    """
-    if len(value) > width:
-        return value[: width - 1] + "…"
-    return value.ljust(width)
 
 
 def _branch(lane: Path, cache: dict) -> str:
@@ -177,20 +141,19 @@ def _row(
             f"{participant['credential'] or 'default'}"
         ),
         "credential": participant["credential"],
-        "state": (
-            f"paused; {liveness}"
-            if participant.get("paused", False)
-            else f"idle {_age(stalled['age_seconds'])}; {liveness}"
-            if stalled["stalled"]
-            else "running; no hooks"
-            if "checkpoints unavailable" in liveness
-            else liveness
+        "state": tables.session(
+            liveness,
+            participant.get("paused", False),
+            stalled["stalled"],
+            stalled["age_seconds"],
         ),
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
         "event_age": (
-            _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
+            tables.age(time.time() - events["last_ts"])
+            if events["last_ts"]
+            else "-"
         ),
         "last_event_ts": events["last_ts"],
         "branch": branch,
@@ -326,21 +289,9 @@ def render(
     Returns:
         Header, one line per participant, and an indented prompt line.
     """
-    columns = list(enumerate(COLUMNS))
-    omitted = []
-    if width is not None:
-        for index in (1, 3, 4, 8, 10, 11, 7, 12, 5, 9):
-            if sum(cell[1][1] + 2 for cell in columns) - 2 <= width:
-                break
-            omitted.append(COLUMNS[index][0])
-            columns = [cell for cell in columns if cell[0] != index]
-        if sum(cell[1][1] + 2 for cell in columns) - 2 > width:
-            cell_width = max(
-                1, (width - 2 * (len(columns) - 1)) // len(columns)
-            )
-            columns = [
-                (index, (name, cell_width)) for index, (name, _) in columns
-            ]
+    columns, omitted = tables.layout(
+        COLUMNS, width, (1, 3, 4, 8, 10, 11, 7, 12, 5, 9)
+    )
     selected_columns = dict(columns)
     row_positions = []
     totals = view["totals"]
@@ -357,11 +308,11 @@ def render(
         f"participants {totals['participants']}  "
         f"hook events {totals['events']}  "
         f"denials {totals['denials']} ({rate})  "
-        f"context {_size(totals['context'])}  "
-        f"idle {_age(totals['idle'])}"
+        f"context {tables.size(totals['context'])}  "
+        f"idle {tables.age(totals['idle'])}"
         + (
             f" (most {totals['idle_leader']} "
-            f"{_age(totals['idle_leader_seconds'])})"
+            f"{tables.age(totals['idle_leader_seconds'])})"
             if totals["idle_leader"]
             else ""
         )
@@ -371,16 +322,16 @@ def render(
             else ""
         )
         + (
-            f"  last {_age(view['window'])}"
+            f"  last {tables.age(view['window'])}"
             if view.get("window")
             else "  all retained"
         ),
     ]
     if omitted:
         lines.append("Hidden columns: " + ", ".join(omitted))
-    header = "  ".join(name.ljust(size) for _, (name, size) in columns)
+    header = tables.heading(columns)
     for project in view["projects"]:
-        lines.extend(["", f"project {project['root']}", header.rstrip()])
+        lines.extend(["", f"project {project['root']}", header])
         if not project["rows"]:
             lines.append(
                 "  no participants for the selected provider"
@@ -391,8 +342,8 @@ def render(
             row_positions.append(len(lines))
             marker = row["stall"]
             lines.append(
-                "  ".join(
-                    _fit(value, selected_columns[index][1])
+                tables.GAP.join(
+                    tables.fit(value, selected_columns[index][1])
                     for index, value in enumerate(
                         (
                             row["participant"],
@@ -410,16 +361,16 @@ def render(
                                 else ""
                             )
                             + (
-                                f" {_age(row['lease_age'])}"
+                                f" {tables.age(row['lease_age'])}"
                                 if row["leases"]
                                 else ""
                             ),
-                            _size(row["injected_bytes"]),
+                            tables.size(row["injected_bytes"]),
                             f"{row['denials']}/{row['hook_events']}",
                             f"{row['calls']}"
                             + (f"!{row['errors']}" if row["errors"] else ""),
                             _tokens(row["tokens"]),
-                            _age(row["idle_seconds"])
+                            tables.age(row["idle_seconds"])
                             + ("" if row["idle_complete"] else "+"),
                         ),
                     )
@@ -458,14 +409,14 @@ def render(
         "it is its owner's to do."
     )
     if width is not None:
-        lines = [_fit(line, max(1, width)).rstrip() for line in lines]
+        lines = [tables.fit(line, max(1, width)).rstrip() for line in lines]
     if height is not None and len(lines) > max(0, height):
         available = max(0, height - 1)
         hidden = sum(position >= available for position in row_positions)
         footer = f"{hidden} participants hidden; more details: top --once"
         lines = lines[:available] + [footer]
         if width is not None:
-            lines[-1] = _fit(lines[-1], max(1, width)).rstrip()
+            lines[-1] = tables.fit(lines[-1], max(1, width)).rstrip()
         lines = lines[: max(0, height)]
     return lines
 

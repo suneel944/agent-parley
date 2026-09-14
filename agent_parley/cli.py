@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ from agent_parley import (
     roster,
     store,
     supervision,
+    tables,
     terminal,
     views,
 )
@@ -240,6 +242,289 @@ def drift(name: str, participant: dict, actual: str) -> str:
         f"`agent-parley participant retire {name}` to drop the lane. "
         "Both preserve committed and uncommitted work; neither discards."
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class Selection:
+    """Narrows a status reading to the lanes an operator asked about.
+
+    Every field is a filter, and filters combine: a lane is reported only
+    when it satisfies all of them. The same selection narrows the table and
+    the machine-readable document, so a script and an operator never disagree
+    about which lanes matched.
+
+    Attributes:
+        participant: Single participant to report in full detail.
+        project: Repository root to report, as a path or as recorded.
+        providers: Providers to report; every provider when empty.
+        outcome: Reported outcome to report, such as ``ready``.
+        drifted: Report only lanes away from their assigned branch.
+        pending: Report only lanes holding unread mail, unanswered
+            acknowledgements, an offer, or a reservation past its declared
+            time to live.
+        idle: Report only live lanes that served no coordination call inside
+            the window.
+        since: Seconds of coordination inactivity `idle` requires; the
+            project's configured interval when zero.
+        issue: Issue number a lane must hold or be offered.
+    """
+
+    participant: str = ""
+    project: str = ""
+    providers: tuple[str, ...] = ()
+    outcome: str = ""
+    drifted: bool = False
+    pending: bool = False
+    idle: bool = False
+    since: float = 0.0
+    issue: int = 0
+
+    def filtered(self) -> bool:
+        """Reports whether the operator narrowed the reading at all."""
+        return bool(
+            self.participant
+            or self.project
+            or self.providers
+            or self.outcome
+            or self.drifted
+            or self.pending
+            or self.idle
+            or self.issue
+        )
+
+    def describe(self) -> str:
+        """Names the filters that were applied, for an empty result."""
+        applied = []
+        if self.participant:
+            applied.append(f"participant {self.participant}")
+        if self.project:
+            applied.append(f"--project {self.project}")
+        applied.extend(f"--provider {name}" for name in self.providers)
+        if self.outcome:
+            applied.append(f"--outcome {self.outcome}")
+        if self.drifted:
+            applied.append("--drifted")
+        if self.pending:
+            applied.append("--pending")
+        if self.idle:
+            applied.append("--idle")
+        if self.issue:
+            applied.append(f"--issue {self.issue}")
+        return " ".join(applied)
+
+    def holds_project(self, root: str) -> bool:
+        """Reports whether one project root satisfies the project filter."""
+        if not self.project:
+            return True
+        return root in (
+            self.project,
+            str(Path(self.project).expanduser().resolve()),
+        )
+
+    def holds(self, record: dict, offers: tuple[int, ...]) -> bool:
+        """Reports whether one lane satisfies every applied filter.
+
+        Args:
+            record: One lane record from the status reading.
+            offers: Issue numbers offered to this lane and still pending.
+
+        Returns:
+            Whether the lane is reported. A mailbox that could not be read
+            answers no pending work rather than inventing a count.
+        """
+        mail = record["mail"] or {}
+        held = [claim["issue"] for claim in record["claims"]]
+        waiting = bool(
+            mail.get("unread")
+            or mail.get("pending_ack")
+            or mail.get("stale_reservations")
+            or offers
+        )
+        return (
+            (not self.participant or record["participant"] == self.participant)
+            and (not self.providers or record["provider"] in self.providers)
+            and (not self.outcome or record["outcome"] == self.outcome)
+            and (not self.drifted or record["drift"])
+            and (not self.pending or waiting)
+            and (not self.idle or self._inactive(record))
+            and (not self.issue or self.issue in held or self.issue in offers)
+        )
+
+    def _inactive(self, record: dict) -> bool:
+        """Reports whether a live lane served no call inside the window."""
+        if not record["availability"]["process_alive"]:
+            return False
+        if self.since:
+            return record["idle"]["served_age_seconds"] >= self.since
+        return record["idle"]["stalled"]
+
+
+def pending_offers(project: dict, agent: str) -> tuple[int, ...]:
+    """Reports the issues offered to one participant and still unanswered.
+
+    Args:
+        project: One project record from the status reading.
+        agent: Participant the offers are addressed to.
+
+    Returns:
+        Issue numbers in ledger order. An offer is a request: it moves no
+        ownership until the participant accepts it.
+    """
+    return tuple(
+        record["issue"]
+        for record in project["issues"]
+        if record["offer"] and record["offer"]["to"] == agent
+    )
+
+
+def narrow(report: dict, selection: Selection) -> dict:
+    """Applies a selection to a status reading without changing its shape.
+
+    Args:
+        report: Reading produced by `Bridge.status_snapshot`.
+        selection: Filters the operator asked for.
+
+    Returns:
+        The same document with each project holding only the lanes that
+        matched, and without the projects the project filter excluded. Every
+        other field is carried through, so the machine-readable contract is
+        the unfiltered one with fewer rows.
+    """
+    projects = []
+    for project in report["projects"]:
+        if not selection.holds_project(project["root"]):
+            continue
+        projects.append(
+            {
+                **project,
+                "participants": [
+                    record
+                    for record in project["participants"]
+                    if selection.holds(
+                        record, pending_offers(project, record["participant"])
+                    )
+                ],
+            }
+        )
+    return {**report, "projects": projects}
+
+
+def reported_lanes(report: dict) -> int:
+    """Counts the lanes a narrowed status reading still holds."""
+    return sum(len(project["participants"]) for project in report["projects"])
+
+
+def lane_detail(record: dict, data: dict) -> None:
+    """Prints one lane's full reading under its table row.
+
+    Args:
+        record: One lane record from the status reading.
+        data: Project manifest holding the participant.
+    """
+    agent = record["participant"]
+    account = record["credential"] or "default account"
+    print(
+        f"  {agent} ({record['identity']}): {record['session']}\n"
+        f"    Provider: {record['provider']}; {account}"
+    )
+    print(
+        f"    Availability: {record['availability']['state']}; "
+        "session process alive: "
+        f"{record['availability']['process_alive']}"
+    )
+    if record["drift"]:
+        print(
+            "    " + drift(agent, data["participants"][agent], record["branch"])
+        )
+    if record["idle"]["stalled"]:
+        print(f"    {record['idle']['marker']}")
+    print(
+        "    Observed coordination inactivity: "
+        f"{record['idle_seconds']}s"
+        + ("" if record["idle_complete"] else " (incomplete)")
+    )
+    for wait in record["waiting"]:
+        item = wait.get("message_id") or wait.get("issue") or ""
+        print(
+            f"    Waiting {wait['seconds']}s: {wait['kind']}"
+            + (f" {item}" if item else "")
+        )
+    for claim in record["claims"]:
+        if claim["overdue"]:
+            print(
+                f"    Issue #{claim['issue']} is overdue by "
+                f"{claim['overdue_seconds']}s and still owned."
+            )
+        if claim["budget"]:
+            print(
+                f"    Issue #{claim['issue']} attempts "
+                f"{claim['attempts']}/{claim['budget']}"
+                + (
+                    "; budget exceeded and still owned"
+                    if claim["budget_exceeded"]
+                    else ""
+                )
+            )
+    print(f"    Reported outcome: {record['outcome']}")
+    print(
+        f"    Context delivered: {record['injected_bytes']} "
+        f"UTF-8 bytes in {record['injections']} notices"
+    )
+    if record["report_age_seconds"] is not None:
+        print(f"    Report age: {record['report_age_seconds']}s")
+    if record["summary"]:
+        print(f"    Summary: {record['summary']}")
+    if record["remaining"]:
+        print(f"    Remaining: {record['remaining']}")
+    if record["evidence"]:
+        print(f"    Reported verification: {record['evidence']}")
+    if wake := record["wake"]:
+        print(
+            f"    Runtime wake: {wake['result']}; "
+            f"attempt {wake['attempts']}; "
+            f"{wake['age_seconds']}s ago"
+        )
+    mail = record["mail"] or {}
+    if "error" in mail:
+        print(f"    Coordination unavailable: {mail['error']}")
+        return
+    stale = mail["stale_reservations"]
+    print(
+        f"    Unread: {mail['unread']}; "
+        f"pending acknowledgements: {mail['pending_ack']}; "
+        f"active reservations: {mail['reservations']}"
+        + (f" ({stale} stale)" if stale else "")
+    )
+    if mail["named_resources"]:
+        print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    print(f"    Last coordination: {mail['last_coordination_at']}")
+    for pending in mail["outstanding_ack"]:
+        print(
+            "    Awaiting acknowledgement: "
+            f"message {pending['message_id']} "
+            f"from {pending['sender']}; "
+            f"{pending['age_seconds']}s"
+        )
+    print(f"    Latest prompt/task (reported): {mail['task']}")
+    if mail["awaiting_delivery"]:
+        print(
+            "    Awaiting checkpoint delivery: "
+            f"{mail['awaiting_delivery']} "
+            "(batch capped at 3)"
+        )
+
+
+def terminal_width() -> int | None:
+    """Reports the columns a table may use on this stream.
+
+    Returns:
+        The width of the attached terminal, or None when standard output is
+        a file or a pipe, which receives every column instead of a table
+        shaped for a terminal that is not there.
+    """
+    if not sys.stdout.isatty():
+        return None
+    return max(1, shutil.get_terminal_size().columns)
 
 
 def session_busy(name: str) -> str:
@@ -2940,123 +3225,60 @@ attempt of the recorded budget, which is also only reported.
             "projects": projects,
         }
 
-    def status(self) -> None:
-        """Prints activity, reported outcomes, and coordination state."""
-        report = self.status_snapshot()
-        lanes = {
-            project["root"]: project["participants"]
-            for project in report["projects"]
-        }
+    def status(
+        self, selection: Selection | None = None, width: int | None = None
+    ) -> int:
+        """Prints one table per project, or one lane in full detail.
+
+        The table answers which lanes are ready, drifted or waiting at a
+        glance. A named participant is reported as the full reading instead
+        of a row, because a single lane is read rather than compared.
+
+        Args:
+            selection: Filters the operator asked for; every lane when None.
+            width: Columns the tables may use, or None to print every column,
+                which is what a redirected stream receives.
+
+        Returns:
+            The number of lanes reported, so a caller can gate on a filter
+            having matched at least one lane.
+        """
+        selection = selection or Selection()
+        report = narrow(self.status_snapshot(), selection)
+        kept = {project["root"]: project for project in report["projects"]}
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             print(f"Store: {schema}; {repair}")
         print(f"State: {report['state_directory']}")
+        matched = reported_lanes(report)
+        if selection.filtered() and not matched:
+            print(f"No participant matches {selection.describe()}.")
+            return matched
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
+            project = kept.get(data["root"])
+            if project is None:
+                continue
+            reported = project["participants"]
+            if selection.filtered() and not reported:
+                continue
             print(f"\nProject: {data['root']}")
             print(describe(snapshot(path.parent)))
-            for record in lanes.get(data["root"], []):
-                agent = record["participant"]
-                account = record["credential"] or "default account"
-                print(
-                    f"  {agent} ({record['identity']}): {record['session']}\n"
-                    f"    Provider: {record['provider']}; {account}"
+            if selection.participant:
+                for record in reported:
+                    lane_detail(record, data)
+                continue
+            rows = [
+                tables.status_row(
+                    record, pending_offers(project, record["participant"])
                 )
-                print(
-                    f"    Availability: {record['availability']['state']}; "
-                    "session process alive: "
-                    f"{record['availability']['process_alive']}"
-                )
-                if record["drift"]:
-                    print(
-                        "    "
-                        + drift(
-                            agent,
-                            data["participants"][agent],
-                            record["branch"],
-                        )
-                    )
-                if record["idle"]["stalled"]:
-                    print(f"    {record['idle']['marker']}")
-                print(
-                    "    Observed coordination inactivity: "
-                    f"{record['idle_seconds']}s"
-                    + ("" if record["idle_complete"] else " (incomplete)")
-                )
-                for wait in record["waiting"]:
-                    item = wait.get("message_id") or wait.get("issue") or ""
-                    print(
-                        f"    Waiting {wait['seconds']}s: {wait['kind']}"
-                        + (f" {item}" if item else "")
-                    )
-                for claim in record["claims"]:
-                    if claim["overdue"]:
-                        print(
-                            f"    Issue #{claim['issue']} is overdue by "
-                            f"{claim['overdue_seconds']}s and still owned."
-                        )
-                    if claim["budget"]:
-                        print(
-                            f"    Issue #{claim['issue']} attempts "
-                            f"{claim['attempts']}/{claim['budget']}"
-                            + (
-                                "; budget exceeded and still owned"
-                                if claim["budget_exceeded"]
-                                else ""
-                            )
-                        )
-                print(f"    Reported outcome: {record['outcome']}")
-                print(
-                    f"    Context delivered: {record['injected_bytes']} "
-                    f"UTF-8 bytes in {record['injections']} notices"
-                )
-                if record["report_age_seconds"] is not None:
-                    print(f"    Report age: {record['report_age_seconds']}s")
-                if record["summary"]:
-                    print(f"    Summary: {record['summary']}")
-                if record["remaining"]:
-                    print(f"    Remaining: {record['remaining']}")
-                if record["evidence"]:
-                    print(f"    Reported verification: {record['evidence']}")
-                if wake := record["wake"]:
-                    print(
-                        f"    Runtime wake: {wake['result']}; "
-                        f"attempt {wake['attempts']}; "
-                        f"{wake['age_seconds']}s ago"
-                    )
-                mail = record["mail"] or {}
-                if "error" in mail:
-                    print(f"    Coordination unavailable: {mail['error']}")
-                    continue
-                stale = mail["stale_reservations"]
-                print(
-                    f"    Unread: {mail['unread']}; "
-                    f"pending acknowledgements: {mail['pending_ack']}; "
-                    f"active reservations: {mail['reservations']}"
-                    + (f" ({stale} stale)" if stale else "")
-                )
-                if mail["named_resources"]:
-                    print(
-                        "    Named resources held: "
-                        + ", ".join(mail["named_resources"])
-                    )
-                print(f"    Last coordination: {mail['last_coordination_at']}")
-                for pending in mail["outstanding_ack"]:
-                    print(
-                        "    Awaiting acknowledgement: "
-                        f"message {pending['message_id']} "
-                        f"from {pending['sender']}; "
-                        f"{pending['age_seconds']}s"
-                    )
-                print(f"    Latest prompt/task (reported): {mail['task']}")
-                if mail["awaiting_delivery"]:
-                    print(
-                        "    Awaiting checkpoint delivery: "
-                        f"{mail['awaiting_delivery']} "
-                        "(batch capped at 3)"
-                    )
+                for record in reported
+            ]
+            for row in tables.status_table(rows, width):
+                print(row)
+        return matched
 
     def launch(
         self,
@@ -3299,6 +3521,79 @@ def main() -> int:
         "status", help="Show server health and registered workspaces."
     )
     health.add_argument("--json", action="store_true", help=JSON_HELP)
+    health.add_argument(
+        "participant",
+        nargs="?",
+        default="",
+        help=(
+            "Report this participant alone, as the whole reading rather than "
+            "one table row."
+        ),
+    )
+    health.add_argument(
+        "--project",
+        metavar="ROOT",
+        default="",
+        help="Report only the project at this repository root.",
+    )
+    health.add_argument(
+        "--provider",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Report only participants driven by this provider. Repeat the "
+            "flag to report several."
+        ),
+    )
+    health.add_argument(
+        "--outcome",
+        choices=("ready", "blocked", "unknown"),
+        default="",
+        help="Report only lanes that reported this outcome.",
+    )
+    health.add_argument(
+        "--drifted",
+        action="store_true",
+        help=(
+            "Report only lanes away from their assigned branch. The command "
+            "exits non-zero when one matches."
+        ),
+    )
+    health.add_argument(
+        "--pending",
+        action="store_true",
+        help=(
+            "Report only lanes holding unread mail, unanswered "
+            "acknowledgements, an offer, or a reservation past its declared "
+            "time to live. The command exits non-zero when one matches."
+        ),
+    )
+    health.add_argument(
+        "--idle",
+        action="store_true",
+        help=(
+            "Report only live lanes that served no coordination call inside "
+            "the window. This measures coordination inactivity, not what a "
+            "native client was doing inside a turn."
+        ),
+    )
+    health.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Inactivity an idle lane must show, such as 45m, 6h or 7d. The "
+            "project's configured interval decides by default."
+        ),
+    )
+    health.add_argument(
+        "--issue",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Report only lanes holding or offered this issue.",
+    )
     watch = commands.add_parser(
         "top", help="Watch every participant's live coordination state."
     )
@@ -4071,10 +4366,26 @@ def main() -> int:
                 if getattr(args, "json", False)
                 else json.dumps(registered, indent=2)
             )
-        elif args.json:
-            print(views.render("status", bridge.status_snapshot()))
         else:
-            bridge.status()
+            selection = Selection(
+                participant=args.participant,
+                project=args.project,
+                providers=tuple(args.provider or ()),
+                outcome=args.outcome,
+                drifted=args.drifted,
+                pending=args.pending,
+                idle=args.idle,
+                since=args.since,
+                issue=args.issue,
+            )
+            if args.json:
+                narrowed = narrow(bridge.status_snapshot(), selection)
+                print(views.render("status", narrowed))
+                matched = reported_lanes(narrowed)
+            else:
+                matched = bridge.status(selection, terminal_width())
+            if matched and (selection.drifted or selection.pending):
+                return 1
         return 0
     except (
         BridgeError,

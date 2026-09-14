@@ -114,7 +114,7 @@ def test_a_malformed_declaration_is_refused(bridge, repo):
 def test_status_reports_held_named_resources(bridge, repo, paired, capsys):
     holder = actor(bridge, paired["root"], "claude")
     reserve(bridge, holder, "port:5432", "suite:integration", ttl_seconds=60)
-    bridge.status()
+    bridge.status(cli.Selection(participant="claude"))
     output = capsys.readouterr().out
     assert "active reservations: 2" in output
     assert "Named resources held: port:5432, suite:integration" in output

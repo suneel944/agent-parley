@@ -4,7 +4,7 @@ import json
 import os
 import time
 
-from agent_parley import dashboard, metrics, store
+from agent_parley import cli, dashboard, metrics, store
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
 
@@ -200,7 +200,7 @@ def test_status_and_export_carry_the_figures(bridge, repo, paired, capsys):
     bridge.report(
         paired["lanes"]["claude"], "ready", "Engine built", "", "checks pass"
     )
-    bridge.status()
+    bridge.status(cli.Selection(participant="claude"))
     printed = capsys.readouterr().out
     assert "Observed coordination inactivity: 600s" in printed
     assert "Waiting" in printed and "report_integration" in printed

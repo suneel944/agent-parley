@@ -45,6 +45,7 @@ from agent_parley.cli import (
     COPILOT_EVENTS,
     Bridge,
     BridgeError,
+    Selection,
     git,
     lock,
     main,
@@ -797,7 +798,7 @@ def test_liveness_follows_the_session_process_not_the_session_lock(
     }
     write_json(directory / "claude-activity.json", running)
     with lock(directory / "claude.session.lock"):
-        bridge.status()
+        bridge.status(Selection(participant="claude"))
     output = capsys.readouterr().out
     assert "running; checkpoints unavailable (relaunch)" in output
     assert "Reported outcome: unknown" in output
@@ -806,7 +807,7 @@ def test_liveness_follows_the_session_process_not_the_session_lock(
         {**running, "session_ticks": "0", "activity": "working"},
     )
     with lock(directory / "claude.session.lock"):
-        bridge.status()
+        bridge.status(Selection(participant="claude"))
     assert "claude (claude): stopped" in capsys.readouterr().out
 
 
