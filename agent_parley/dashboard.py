@@ -11,16 +11,20 @@ from pathlib import Path
 from typing import Any
 
 from agent_parley import (
+    approvals,
     metrics,
+    plan,
     process,
     records,
     roster,
     store,
     supervision,
+    tables,
     views,
 )
 from agent_parley.checkpoints import (
     activity,
+    branch_head,
     event_summary,
     lane_branch,
     mailbox,
@@ -130,26 +134,6 @@ def _number(value: object) -> int:
         return -1
 
 
-def _age(seconds: float) -> str:
-    """Formats an age compactly, without ever implying sub-second precision."""
-    if seconds < 0:
-        return "-"
-    if seconds < 90:
-        return f"{int(seconds)}s"
-    if seconds < 5400:
-        return f"{int(seconds / 60)}m"
-    return f"{int(seconds / 3600)}h"
-
-
-def _size(count: int) -> str:
-    """Formats a byte count in units an operator can compare at a glance."""
-    if count < 1024:
-        return f"{count}B"
-    if count < 1024 * 1024:
-        return f"{count / 1024:.1f}kB"
-    return f"{count / 1024 / 1024:.1f}MB"
-
-
 def _tokens(count: int | None) -> str:
     """Formats a reported token count, or nothing when none was readable.
 
@@ -185,22 +169,6 @@ def _fitness(row: dict) -> str:
     return value + ("+" if row["work_offer"] else "")
 
 
-def _fit(value: str, width: int) -> str:
-    """Pads a cell, marking any value the column could not show in full.
-
-    Args:
-        value: Cell text.
-        width: Column width.
-
-    Returns:
-        Text padded to the column width, ending in an ellipsis when clipped,
-        so a truncated branch or issue list never reads as complete.
-    """
-    if len(value) > width:
-        return value[: width - 1] + "…"
-    return value.ljust(width)
-
-
 def _branch(lane: Path, cache: dict) -> str:
     """Reads a lane branch at most once per branch refresh interval.
 
@@ -219,6 +187,31 @@ def _branch(lane: Path, cache: dict) -> str:
     value = lane_branch(lane)
     cache[key] = (now, value)
     return value
+
+
+def _awaiting_approval(directory: Path, data: dict, agent: str) -> bool:
+    """Reports whether a lane's ready report still awaits an operator.
+
+    Args:
+        directory: Private state directory for the common repository.
+        data: Project manifest holding this participant.
+        agent: Participant that owns the lane.
+
+    Returns:
+        True when the project requires an approval the lane does not have.
+        A decision that cannot be read counts as awaiting, matching the
+        refusal the integration commands would raise.
+    """
+    if not data["approval"]:
+        return False
+    head = branch_head(
+        Path(data["root"]), data["participants"][agent]["branch"]
+    )
+    try:
+        reviewed = approvals.review(directory, data, agent, head)
+    except BridgeError:
+        return True
+    return reviewed["state"] == approvals.AWAITING
 
 
 def _row(
@@ -288,20 +281,19 @@ def _row(
             f"{participant['credential'] or 'default'}"
         ),
         "credential": participant["credential"],
-        "state": (
-            f"paused; {liveness}"
-            if participant.get("paused", False)
-            else f"idle {_age(stalled['age_seconds'])}; {liveness}"
-            if stalled["stalled"]
-            else "running; no hooks"
-            if "checkpoints unavailable" in liveness
-            else liveness
+        "state": tables.session(
+            liveness,
+            participant.get("paused", False),
+            stalled["stalled"],
+            stalled["age_seconds"],
         ),
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
         "event_age": (
-            _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
+            tables.age(time.time() - events["last_ts"])
+            if events["last_ts"]
+            else "-"
         ),
         "last_event_ts": events["last_ts"],
         "branch": branch,
@@ -334,9 +326,19 @@ def _row(
         "unfit": published["reason"],
         "work_offer": bool(published["offer"]),
         "offer_kind": (published["offer"] or {}).get("kind", ""),
+        "awaiting_approval": _awaiting_approval(directory, data, agent),
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
         ).replace("\n", " ")[:MAX_PROMPT],
+    }
+
+
+def _reported_ready(directory: Path, data: dict) -> set[str]:
+    """Names the participants whose latest report is the ready state."""
+    return {
+        name
+        for name in data["participants"]
+        if activity(directory, name).get("outcome") == "ready"
     }
 
 
@@ -347,8 +349,12 @@ def _totals(projects: list[dict]) -> dict:
         projects: Per-project row groups as held in a snapshot.
 
     Returns:
-        Participant, event, denial, context and idle totals, with the lane
-        holding the longest observed idle interval.
+        Participant, event, denial, context and idle totals, how many lanes
+        still await an operator approval, the number of plan groups whose
+        every member is reported ready, and the lane holding the longest
+        observed idle interval. A ready-group count
+        belongs to its project rather than to a row, so narrowing the rows
+        never changes it.
     """
     totals = {
         "participants": 0,
@@ -356,16 +362,20 @@ def _totals(projects: list[dict]) -> dict:
         "denials": 0,
         "context": 0,
         "idle": 0,
+        "ready_groups": 0,
+        "awaiting_approval": 0,
     }
     leader = ""
     longest = 0
     for project in projects:
+        totals["ready_groups"] += len(project.get("ready_groups", []))
         for row in project["rows"]:
             totals["participants"] += 1
             totals["events"] += row["hook_events"]
             totals["denials"] += row["denials"]
             totals["context"] += row["injected_bytes"]
             totals["idle"] += row["idle_seconds"]
+            totals["awaiting_approval"] += int(row["awaiting_approval"])
             if row["idle_seconds"] > longest:
                 leader = row["participant"]
                 longest = row["idle_seconds"]
@@ -401,9 +411,9 @@ def collect(
             of re-reading a whole transcript on every refresh.
 
     Returns:
-        Server health, per-project participant rows, and totals over the
-        reported rows, so a header never counts a participant the table
-        does not show.
+        Server health, per-project participant rows, the plan groups whose
+        every member is reported ready, and totals over the reported rows, so
+        a header never counts a participant the table does not show.
     """
     since = time.time() - window if window else 0.0
     cache = {} if readings is None else readings
@@ -433,7 +443,17 @@ def collect(
         ]
         if providers:
             rows = [row for row in rows if row["provider_name"] in providers]
-        projects.append({"root": data["root"], "rows": rows})
+        projects.append(
+            {
+                "root": data["root"],
+                "rows": rows,
+                "ready_groups": plan.ready_groups(
+                    plan.groups(path.parent),
+                    context["issues"],
+                    _reported_ready(path.parent, data),
+                ),
+            }
+        )
     return {
         "running": running,
         "home": str(home),
@@ -495,12 +515,12 @@ def _cells(row: dict) -> tuple[str, ...]:
         f"{row['unread']}/{row['pending_ack']}",
         f"{row['leases']}"
         + (f"!{row['stale_leases']}" if row["stale_leases"] else "")
-        + (f" {_age(row['lease_age'])}" if row["leases"] else ""),
-        _size(row["injected_bytes"]),
+        + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
+        tables.size(row["injected_bytes"]),
         f"{row['denials']}/{row['hook_events']}",
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         _tokens(row["tokens"]),
-        _age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
+        tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _fitness(row),
     )
 
@@ -704,8 +724,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
         for row in project["rows"]:
             cells = _cells(row)
             lines = [
-                "  ".join(
-                    _fit(cells[index], size) for index, _, size in columns
+                tables.GAP.join(
+                    tables.fit(cells[index], size) for index, _, size in columns
                 ).rstrip()
             ]
             if row["stall"]:
@@ -805,12 +825,18 @@ def layout(
         f"participants {totals['participants']}  "
         f"hook events {totals['events']}  "
         f"denials {totals['denials']} ({rate})  "
-        f"context {_size(totals['context'])}  "
-        f"idle {_age(totals['idle'])}"
+        f"context {tables.size(totals['context'])}  "
+        f"ready groups {totals.get('ready_groups', 0)}  "
+        f"idle {tables.age(totals['idle'])}"
         + (
             f" (most {totals['idle_leader']} "
-            f"{_age(totals['idle_leader_seconds'])})"
+            f"{tables.age(totals['idle_leader_seconds'])})"
             if totals["idle_leader"]
+            else ""
+        )
+        + (
+            f"  awaiting approval {totals['awaiting_approval']}"
+            if totals.get("awaiting_approval")
             else ""
         )
         + (
@@ -819,7 +845,7 @@ def layout(
             else ""
         )
         + (
-            f"  last {_age(view['window'])}"
+            f"  last {tables.age(view['window'])}"
             if view.get("window")
             else "  all retained"
         ),
@@ -873,7 +899,7 @@ def layout(
     if footer:
         lines.append(footer)
     if width is not None:
-        lines = [_fit(line, max(1, width)).rstrip() for line in lines]
+        lines = [tables.fit(line, max(1, width)).rstrip() for line in lines]
     if height is not None:
         lines = lines[: max(0, height)]
     return {

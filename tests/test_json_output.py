@@ -80,7 +80,7 @@ def test_status_reports_a_report_and_its_age(
 
 
 def test_status_text_still_prints_the_same_report(bridge, repo, paired, capsys):
-    bridge.status()
+    bridge.status(cli.Selection(participant="claude"))
     output = capsys.readouterr().out
     assert "Server: not ready" in output
     assert "claude (claude):" in output

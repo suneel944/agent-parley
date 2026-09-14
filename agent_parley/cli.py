@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import datetime
 import hashlib
 import json
@@ -19,10 +20,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from agent_parley import (
+    approvals,
     checkpoints,
     dashboard,
     evidence,
@@ -38,12 +40,14 @@ from agent_parley import (
     roster,
     store,
     supervision,
+    tables,
     terminal,
     views,
 )
 from agent_parley.checkpoints import (
     EVENTS,
     activity,
+    branch_head,
     current_branch,
     lane_branch,
     mailbox,
@@ -345,6 +349,296 @@ def drift(name: str, participant: dict, actual: str) -> str:
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class Selection:
+    """Narrows a status reading to the lanes an operator asked about.
+
+    Every field is a filter, and filters combine: a lane is reported only
+    when it satisfies all of them. The same selection narrows the table and
+    the machine-readable document, so a script and an operator never disagree
+    about which lanes matched.
+
+    Attributes:
+        participant: Single participant to report in full detail.
+        project: Repository root to report, as a path or as recorded.
+        providers: Providers to report; every provider when empty.
+        outcome: Reported outcome to report, such as ``ready``.
+        drifted: Report only lanes away from their assigned branch.
+        pending: Report only lanes holding unread mail, unanswered
+            acknowledgements, an offer, or a reservation past its declared
+            time to live.
+        idle: Report only live lanes that served no coordination call inside
+            the window.
+        since: Seconds of coordination inactivity `idle` requires; the
+            project's configured interval when zero.
+        issue: Issue number a lane must hold or be offered.
+    """
+
+    participant: str = ""
+    project: str = ""
+    providers: tuple[str, ...] = ()
+    outcome: str = ""
+    drifted: bool = False
+    pending: bool = False
+    idle: bool = False
+    since: float = 0.0
+    issue: int = 0
+
+    def filtered(self) -> bool:
+        """Reports whether the operator narrowed the reading at all."""
+        return bool(
+            self.participant
+            or self.project
+            or self.providers
+            or self.outcome
+            or self.drifted
+            or self.pending
+            or self.idle
+            or self.issue
+        )
+
+    def describe(self) -> str:
+        """Names the filters that were applied, for an empty result."""
+        applied = []
+        if self.participant:
+            applied.append(f"participant {self.participant}")
+        if self.project:
+            applied.append(f"--project {self.project}")
+        applied.extend(f"--provider {name}" for name in self.providers)
+        if self.outcome:
+            applied.append(f"--outcome {self.outcome}")
+        if self.drifted:
+            applied.append("--drifted")
+        if self.pending:
+            applied.append("--pending")
+        if self.idle:
+            applied.append("--idle")
+        if self.issue:
+            applied.append(f"--issue {self.issue}")
+        return " ".join(applied)
+
+    def holds_project(self, root: str) -> bool:
+        """Reports whether one project root satisfies the project filter."""
+        if not self.project:
+            return True
+        return root in (
+            self.project,
+            str(Path(self.project).expanduser().resolve()),
+        )
+
+    def holds(self, record: dict, offers: tuple[int, ...]) -> bool:
+        """Reports whether one lane satisfies every applied filter.
+
+        Args:
+            record: One lane record from the status reading.
+            offers: Issue numbers offered to this lane and still pending.
+
+        Returns:
+            Whether the lane is reported. A mailbox that could not be read
+            answers no pending work rather than inventing a count.
+        """
+        mail = record["mail"] or {}
+        held = [claim["issue"] for claim in record["claims"]]
+        waiting = bool(
+            mail.get("unread")
+            or mail.get("pending_ack")
+            or mail.get("stale_reservations")
+            or offers
+        )
+        return (
+            (not self.participant or record["participant"] == self.participant)
+            and (not self.providers or record["provider"] in self.providers)
+            and (not self.outcome or record["outcome"] == self.outcome)
+            and (not self.drifted or record["drift"])
+            and (not self.pending or waiting)
+            and (not self.idle or self._inactive(record))
+            and (not self.issue or self.issue in held or self.issue in offers)
+        )
+
+    def _inactive(self, record: dict) -> bool:
+        """Reports whether a live lane served no call inside the window."""
+        if not record["availability"]["process_alive"]:
+            return False
+        if self.since:
+            return record["idle"]["served_age_seconds"] >= self.since
+        return record["idle"]["stalled"]
+
+
+def pending_offers(project: dict, agent: str) -> tuple[int, ...]:
+    """Reports the issues offered to one participant and still unanswered.
+
+    Args:
+        project: One project record from the status reading.
+        agent: Participant the offers are addressed to.
+
+    Returns:
+        Issue numbers in ledger order. An offer is a request: it moves no
+        ownership until the participant accepts it.
+    """
+    return tuple(
+        record["issue"]
+        for record in project["issues"]
+        if record["offer"] and record["offer"]["to"] == agent
+    )
+
+
+def narrow(report: dict, selection: Selection) -> dict:
+    """Applies a selection to a status reading without changing its shape.
+
+    Args:
+        report: Reading produced by `Bridge.status_snapshot`.
+        selection: Filters the operator asked for.
+
+    Returns:
+        The same document with each project holding only the lanes that
+        matched, and without the projects the project filter excluded. Every
+        other field is carried through, so the machine-readable contract is
+        the unfiltered one with fewer rows.
+    """
+    projects = []
+    for project in report["projects"]:
+        if not selection.holds_project(project["root"]):
+            continue
+        projects.append(
+            {
+                **project,
+                "participants": [
+                    record
+                    for record in project["participants"]
+                    if selection.holds(
+                        record, pending_offers(project, record["participant"])
+                    )
+                ],
+            }
+        )
+    return {**report, "projects": projects}
+
+
+def reported_lanes(report: dict) -> int:
+    """Counts the lanes a narrowed status reading still holds."""
+    return sum(len(project["participants"]) for project in report["projects"])
+
+
+def lane_detail(record: dict, data: dict) -> None:
+    """Prints one lane's full reading under its table row.
+
+    Args:
+        record: One lane record from the status reading.
+        data: Project manifest holding the participant.
+    """
+    agent = record["participant"]
+    account = record["credential"] or "default account"
+    print(
+        f"  {agent} ({record['identity']}): {record['session']}\n"
+        f"    Provider: {record['provider']}; {account}"
+    )
+    print(
+        f"    Availability: {record['availability']['state']}; "
+        "session process alive: "
+        f"{record['availability']['process_alive']}"
+    )
+    if record["drift"]:
+        print(
+            "    " + drift(agent, data["participants"][agent], record["branch"])
+        )
+    if record["idle"]["stalled"]:
+        print(f"    {record['idle']['marker']}")
+    print(
+        "    Observed coordination inactivity: "
+        f"{record['idle_seconds']}s"
+        + ("" if record["idle_complete"] else " (incomplete)")
+    )
+    for wait in record["waiting"]:
+        item = wait.get("message_id") or wait.get("issue") or ""
+        print(
+            f"    Waiting {wait['seconds']}s: {wait['kind']}"
+            + (f" {item}" if item else "")
+        )
+    for claim in record["claims"]:
+        if claim["overdue"]:
+            print(
+                f"    Issue #{claim['issue']} is overdue by "
+                f"{claim['overdue_seconds']}s and still owned."
+            )
+        if claim["budget"]:
+            print(
+                f"    Issue #{claim['issue']} attempts "
+                f"{claim['attempts']}/{claim['budget']}"
+                + (
+                    "; budget exceeded and still owned"
+                    if claim["budget_exceeded"]
+                    else ""
+                )
+            )
+    print(f"    Reported outcome: {record['outcome']}")
+    approval = record["approval"] or {}
+    if approval.get("state", approvals.UNREPORTED) != approvals.UNREPORTED:
+        detail = approval["detail"]
+        print(
+            f"    Approval: {approval['state']}"
+            + (f"; {detail}" if detail else "")
+        )
+    print(
+        f"    Context delivered: {record['injected_bytes']} "
+        f"UTF-8 bytes in {record['injections']} notices"
+    )
+    if record["report_age_seconds"] is not None:
+        print(f"    Report age: {record['report_age_seconds']}s")
+    if record["summary"]:
+        print(f"    Summary: {record['summary']}")
+    if record["remaining"]:
+        print(f"    Remaining: {record['remaining']}")
+    if record["evidence"]:
+        print(f"    Reported verification: {record['evidence']}")
+    if wake := record["wake"]:
+        print(
+            f"    Runtime wake: {wake['result']}; "
+            f"attempt {wake['attempts']}; "
+            f"{wake['age_seconds']}s ago"
+        )
+    mail = record["mail"] or {}
+    if "error" in mail:
+        print(f"    Coordination unavailable: {mail['error']}")
+        return
+    stale = mail["stale_reservations"]
+    print(
+        f"    Unread: {mail['unread']}; "
+        f"pending acknowledgements: {mail['pending_ack']}; "
+        f"active reservations: {mail['reservations']}"
+        + (f" ({stale} stale)" if stale else "")
+    )
+    if mail["named_resources"]:
+        print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    print(f"    Last coordination: {mail['last_coordination_at']}")
+    for pending in mail["outstanding_ack"]:
+        print(
+            "    Awaiting acknowledgement: "
+            f"message {pending['message_id']} "
+            f"from {pending['sender']}; "
+            f"{pending['age_seconds']}s"
+        )
+    print(f"    Latest prompt/task (reported): {mail['task']}")
+    if mail["awaiting_delivery"]:
+        print(
+            "    Awaiting checkpoint delivery: "
+            f"{mail['awaiting_delivery']} "
+            "(batch capped at 3)"
+        )
+
+
+def terminal_width() -> int | None:
+    """Reports the columns a table may use on this stream.
+
+    Returns:
+        The width of the attached terminal, or None when standard output is
+        a file or a pipe, which receives every column instead of a table
+        shaped for a terminal that is not there.
+    """
+    if not sys.stdout.isatty():
+        return None
+    return max(1, shutil.get_terminal_size().columns)
+
+
 def session_busy(name: str) -> str:
     """Builds the refusal used while a participant still holds a session.
 
@@ -606,6 +900,708 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     )
 
 
+def lane_dependencies(
+    state: dict, candidates: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Maps each candidate lane to the candidate lanes it waits on.
+
+    The edges are the advisory dependencies the ledger already records. An
+    edge that leaves the candidate set constrains nothing here, because the
+    lane holding the other end is not being integrated in this run.
+
+    Args:
+        state: Published issue ledger.
+        candidates: Participants mapped to the issues each one holds.
+
+    Returns:
+        One entry per candidate, naming the other candidates whose issues its
+        own issues wait on.
+    """
+    holder = {
+        issue: name for name, issues in candidates.items() for issue in issues
+    }
+    return {
+        name: sorted(
+            {
+                holder[blocker]
+                for issue in issues
+                for blocker in state["issues"]
+                .get(issue, {})
+                .get("blocked_by", [])
+                if holder.get(blocker, name) != name
+            }
+        )
+        for name, issues in candidates.items()
+    }
+
+
+def lane_session(directory: Path, name: str) -> str:
+    """Names the running session that blocks a lane merge, if any.
+
+    The recorded session process is read rather than the session lock taken,
+    so reading a lane while its agent still works cannot make that session
+    fail.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lane's liveness when a session is running, an empty string
+        otherwise.
+    """
+    state = activity(directory, name)
+    running = process.alive(
+        state.get("session_pid"), state.get("session_ticks")
+    )
+    return participant_liveness(directory, name) if running else ""
+
+
+def reported_ready(directory: Path) -> set[str]:
+    """Names every participant whose latest report is the ready state.
+
+    A reported state is a lane's own account of its work. It is neither
+    review nor independent verification, and this reads it without changing
+    it. A plan can be applied and shown before any participant exists, so a
+    repository with no manifest yet reports nobody rather than refusing.
+
+    Args:
+        directory: Private state directory for the common repository.
+
+    Returns:
+        The participants that currently report ready.
+    """
+    if not (directory / "project.json").exists():
+        return set()
+    return {
+        name
+        for name in roster.read(directory)["participants"]
+        if activity(directory, name).get("outcome") == "ready"
+    }
+
+
+def ready_lanes(
+    directory: Path, data: dict, state: dict
+) -> dict[str, list[str]]:
+    """Maps every lane whose latest report is ready to the issues it holds.
+
+    Args:
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the roster.
+        state: Published issue ledger.
+
+    Returns:
+        One entry per participant whose latest report is the ready state,
+        carrying the issues that participant currently holds.
+    """
+    return {
+        name: sorted(
+            (
+                number
+                for number, record in state["issues"].items()
+                if record["owner"] == name
+            ),
+            key=int,
+        )
+        for name in sorted(data["participants"])
+        if activity(directory, name).get("outcome") == "ready"
+    }
+
+
+def group_lanes(
+    data: dict, state: dict, name: str, listed: list[str]
+) -> dict[str, list[str]]:
+    """Maps each lane holding a member of one group to the members it holds.
+
+    Args:
+        data: Project manifest holding the roster.
+        state: Published issue ledger.
+        name: Group named by the applied plan.
+        listed: Issues the group names.
+
+    Returns:
+        One entry per participant holding at least one member.
+
+    Raises:
+        BridgeError: If a member is unclaimed, or is held by somebody who is
+            not a participant in this project.
+    """
+    lanes: dict[str, list[str]] = {}
+    for issue in listed:
+        owner = state["issues"].get(issue, {}).get("owner")
+        if not owner:
+            raise BridgeError(
+                f"Group {name} cannot be integrated: #{issue} is unclaimed. "
+                "Every member is integrated from the lane that holds it."
+            )
+        if owner not in data["participants"]:
+            raise BridgeError(
+                f"Group {name} cannot be integrated: #{issue} is held by "
+                f"{owner}, which is not a participant in this project."
+            )
+        lanes.setdefault(owner, []).append(issue)
+    return lanes
+
+
+def lane_refusals(
+    root: Path, directory: Path, participant: dict, name: str
+) -> list[str]:
+    """Collects every condition that refuses one lane's merge right now.
+
+    The conditions are exactly the ones `participant merge --preview` lists,
+    read the same way and in the same words, so a bulk preflight can never
+    admit a lane the single-lane command would refuse. Every check reads; the
+    participant's session lock is never taken.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        directory: Private state directory for the common repository.
+        participant: Roster record holding the lane and its assigned branch.
+        name: Participant that owns the lane.
+
+    Returns:
+        One refusal message per unmet condition, empty when nothing refuses
+        the merge at this moment.
+    """
+    session = lane_session(directory, name)
+    lane = Path(participant["lane"])
+    refusals = []
+    actual = lane_branch(lane)
+    if actual != participant["branch"]:
+        refusals.append(drift(name, participant, actual))
+    refusals += merge_blockers(root, lane, name, participant["branch"], session)
+    return refusals
+
+
+def group_refusal(
+    group: str, sequence: list[str], refusals: dict[str, list[str]]
+) -> str:
+    """Reports why a whole group was refused before anything was merged.
+
+    Args:
+        group: Group named by the applied plan.
+        sequence: Members' lanes in dependency order.
+        refusals: Conditions currently refusing each lane.
+
+    Returns:
+        Every refusing condition of every member, and a statement that the
+        preflight admits a group whole or not at all.
+    """
+    lines = [
+        f"Group {group} is refused as a whole, so nothing was merged and "
+        "the base checkout is unchanged."
+    ]
+    for name in sequence:
+        for refusal in refusals[name]:
+            lines.append(f"- {name}: {refusal}")
+    lines.append(
+        "A group preflight admits every member or none. Clear these, then "
+        "rerun; a refused member is never followed by a member that waits "
+        "on it."
+    )
+    return "\n".join(lines)
+
+
+def unattempted(name: str, waits: dict[str, list[str]], stopped: str) -> str:
+    """Reports why one lane was left alone after an ordered run stopped."""
+    return (
+        f"not attempted; it waits on {stopped}."
+        if stopped in waits.get(name, [])
+        else f"not attempted; the run stopped at {stopped}."
+    )
+
+
+def outside_prerequisites(
+    state: dict, candidates: dict[str, list[str]]
+) -> list[str]:
+    """Names the prerequisites of a selection that lie outside it.
+
+    A selection narrows what a run attempts; it never lifts a recorded
+    dependency. Every issue a selected lane holds is read for the issues it
+    waits on, and each one that no selected lane holds is named here. The
+    ledger records no completion, so a prerequisite nobody holds is reported
+    as released rather than as finished work.
+
+    Args:
+        state: Published issue ledger.
+        candidates: Selected participants mapped to the issues each holds.
+
+    Returns:
+        One line per prerequisite outside the selection, ordered by issue.
+    """
+    held = {issue for issues in candidates.values() for issue in issues}
+    waited = {
+        blocker
+        for issues in candidates.values()
+        for number in issues
+        for blocker in state["issues"].get(number, {}).get("blocked_by", [])
+        if blocker not in held
+    }
+    lines = []
+    for issue in sorted(waited, key=int):
+        owner = state["issues"].get(issue, {}).get("owner", "")
+        satisfied = (
+            f"held by {owner}, so it is not satisfied here"
+            if owner
+            else "released, so no lane still holds it"
+        )
+        lines.append(
+            f"#{issue} is a prerequisite outside this selection, {satisfied}."
+        )
+    return lines
+
+
+def add_selector(
+    command: argparse.ArgumentParser, *, everything: bool = True
+) -> None:
+    """Adds the shared lane selector and its one confirmation to a command.
+
+    The filters read the same lane facts `status` reports, and a lane matches
+    when every given filter holds, so they narrow rather than widen.
+
+    Args:
+        command: Subcommand that otherwise acts on one named participant.
+        everything: Whether to add ``--all``. A command that already declares
+            it in a scope group of its own passes False.
+    """
+    selection = command.add_argument_group(
+        "lane selection",
+        "Act on several lanes instead of one. The command prints the lanes "
+        "it matched, asks once for the whole set, and reports each lane.",
+    )
+    if everything:
+        selection.add_argument(
+            "--all",
+            action="store_true",
+            help="Select every lane the other filters leave.",
+        )
+    selection.add_argument(
+        "--provider",
+        default="",
+        metavar="NAME",
+        help="Select only the lanes a named provider drives.",
+    )
+    selection.add_argument(
+        "--outcome",
+        default="",
+        metavar="STATE",
+        help=(
+            "Select only the lanes whose own latest report is this state. A "
+            "reported state is the lane's account, never a review."
+        ),
+    )
+    selection.add_argument(
+        "--drifted",
+        action="store_true",
+        help="Select only the lanes sitting off the branch they were given.",
+    )
+    selection.add_argument(
+        "--idle",
+        action="store_true",
+        help="Select only the lanes supervision currently reads as stalled.",
+    )
+    selection.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the single confirmation covering the whole selected set.",
+    )
+
+
+def selected(args: argparse.Namespace) -> bool:
+    """Reports whether the command line carries any lane selector."""
+    return bool(
+        args.all or args.provider or args.outcome or args.drifted or args.idle
+    )
+
+
+def matching_lanes(
+    home: Path, directory: Path, data: dict, args: argparse.Namespace
+) -> list[str]:
+    """Names every participant the command line's lane selector matched.
+
+    The filters read the provider that drives a lane, the lane's own latest
+    reported outcome, whether its checkout sits on the branch it was assigned
+    and whether supervision currently reads it as stalled. `--all` adds no
+    filter of its own, so it selects whatever the others leave.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the roster.
+        args: Parsed arguments carrying the selector flags.
+
+    Returns:
+        The matched participants in roster order.
+    """
+    stalled_after = supervision.configuration(home, data)["stalled_after"]
+    names = []
+    for name in sorted(data["participants"]):
+        participant = data["participants"][name]
+        if args.provider and participant["provider"] != args.provider:
+            continue
+        reported = activity(directory, name).get("outcome", "unknown")
+        if args.outcome and reported != args.outcome:
+            continue
+        branch = lane_branch(Path(participant["lane"]))
+        if args.drifted and branch == participant["branch"]:
+            continue
+        stalled = supervision.stall(home, directory, data, name, stalled_after)
+        if args.idle and not stalled["stalled"]:
+            continue
+        names.append(name)
+    return names
+
+
+def selection_plan(
+    action: str, names: Sequence[str], notes: Sequence[str] = ()
+) -> str:
+    """Lists the lanes a selector matched and what the command will do.
+
+    Args:
+        action: What happens to each matched lane, in the infinitive.
+        names: Matched participants in the order they will be acted on.
+        notes: Extra lines reported before the confirmation, such as the
+            prerequisites that lie outside the selected set.
+
+    Returns:
+        The plan an operator reads before the single confirmation.
+    """
+    if not names:
+        return "Selector matched no lane, so nothing was done."
+    plural = "" if len(names) == 1 else "s"
+    lines = [f"Plan: {action} {len(names)} lane{plural}."]
+    lines += [f"- {name}: {action}" for name in names]
+    lines += list(notes)
+    return "\n".join(lines)
+
+
+def confirmed(proposal: str, assume_yes: bool) -> bool:
+    """Prints one plan and asks once for the whole selected set.
+
+    Args:
+        proposal: The plan the operator reads before answering.
+        assume_yes: Whether `--yes` already confirmed the whole set.
+
+    Returns:
+        Whether the operator confirmed. A closed or empty answer declines.
+    """
+    print(proposal)
+    if assume_yes:
+        return True
+    try:
+        answer = input("Proceed with these lanes? [y/N]: ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def bulk_lanes(
+    action: str,
+    names: Sequence[str],
+    step: Callable[[str], str],
+    *,
+    assume_yes: bool = False,
+    notes: Sequence[str] = (),
+) -> int:
+    """Runs one operator action over a selected set after one confirmation.
+
+    Independent operations continue past a lane that refuses: the refusal is
+    printed beside its lane and every remaining lane is still attempted. The
+    closing tally names what was done and what refused. Integration does not
+    take this path, because an ordered merge run stops at the first refusal
+    and leaves the lanes that wait on it unattempted.
+
+    Args:
+        action: What happens to each matched lane, in the infinitive.
+        names: Matched participants in the order they are acted on.
+        step: Runs the action for one lane and returns that lane's account.
+        assume_yes: Whether `--yes` already confirmed the whole set.
+        notes: Extra lines the plan reports before the confirmation.
+
+    Returns:
+        0 when every matched lane was done, when nothing matched, or when the
+        operator declined; 1 when any lane refused or failed.
+    """
+    proposal = selection_plan(action, names, notes)
+    if not names:
+        print(proposal)
+        return 0
+    if not confirmed(proposal, assume_yes):
+        print("Declined: nothing was done.")
+        return 0
+    done: list[str] = []
+    refused: list[str] = []
+    for name in names:
+        try:
+            print(f"- {name}: {step(name)}")
+            done.append(name)
+        except (
+            BridgeError,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+        ) as failure:
+            print(f"- {name}: refused. {failure}")
+            refused.append(name)
+    tally = f"Done {len(done)} of {len(names)}: " + (", ".join(done) or "none")
+    if refused:
+        tally += f". Refused or failed: {', '.join(refused)}"
+    print(f"{tally}.")
+    return 1 if refused else 0
+
+
+def operator_message(delivered: dict, name: str) -> str:
+    """Reports what one operator message did for one lane.
+
+    Args:
+        delivered: Result of the send, either delivered or recorded.
+        name: Lane the message was addressed to.
+
+    Returns:
+        The account an operator reads for that lane.
+    """
+    if "kind" in delivered:
+        return (
+            f"Operator item {delivered['id']} recorded for {name}; "
+            f"{delivered['repeats_left']} delivery(s) pending."
+        )
+    state = "already delivered" if delivered.get("duplicate") else "delivered"
+    return f"Operator message {delivered['id']} {state} to {name}."
+
+
+def lane_roster(bridge: Bridge, repo: Path) -> tuple[Path, dict]:
+    """Reads the private state directory and roster a selector resolves in."""
+    _, directory = bridge.project(repo, create=False)
+    return directory, roster.read(directory)
+
+
+def spoken_lanes(bridge: Bridge, repo: Path, args: argparse.Namespace) -> int:
+    """Sends one operator message to every lane a selector matched.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `say` arguments carrying the selector.
+
+    Returns:
+        0 when every matched lane received the message, 1 otherwise.
+
+    Raises:
+        BridgeError: If a participant name and a selector are both given, if
+            the message text is missing, or if one idempotency key is offered
+            for several lanes.
+    """
+    if args.participant and args.text:
+        raise BridgeError(
+            "`say` addresses one named lane or a selected set, never both. "
+            "Drop the participant name to message a set."
+        )
+    text = args.text or args.participant
+    if not text:
+        raise BridgeError("`say` needs the message text to send.")
+    if args.key:
+        raise BridgeError(
+            "--key names one message, so it cannot cover several lanes. The "
+            "default key already distinguishes each lane's own copy."
+        )
+    directory, data = lane_roster(bridge, repo)
+    return bulk_lanes(
+        "send an operator message to",
+        matching_lanes(bridge.home, directory, data, args),
+        lambda name: operator_message(
+            bridge.say(
+                repo,
+                name,
+                text,
+                args.subject,
+                "",
+                args.ack,
+                args.within,
+                after=args.after,
+                at=args.at,
+                when_released=args.when_released,
+                unless_reported=args.unless_reported,
+                every=args.every,
+                until=args.until,
+            ),
+            name,
+        ),
+        assume_yes=args.yes,
+    )
+
+
+BULK_PARTICIPANT = {
+    "stop": "stop",
+    "pause": "pause",
+    "resume": "resume",
+    "pr": "open a pull request from",
+}
+
+
+def participant_lanes(
+    bridge: Bridge, repo: Path, args: argparse.Namespace
+) -> int:
+    """Runs one participant action over every lane a selector matched.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `participant` arguments carrying the selector.
+
+    Returns:
+        0 when every matched lane was done, 1 when any refused or failed.
+
+    Raises:
+        BridgeError: If a participant name and a selector are both given.
+    """
+    if args.name:
+        raise BridgeError(
+            f"`participant {args.action}` acts on one named lane or on a "
+            "selected set, never both. Drop the participant name to act on "
+            "a set."
+        )
+    steps: dict[str, Callable[[str], str]] = {
+        "stop": lambda name: bridge.stop(repo, name),
+        "pause": lambda name: bridge.pause(repo, name),
+        "resume": lambda name: bridge.pause(repo, name, resume=True),
+        "pr": lambda name: bridge.pull_request(repo, name),
+    }
+    directory, data = lane_roster(bridge, repo)
+    return bulk_lanes(
+        BULK_PARTICIPANT[args.action],
+        matching_lanes(bridge.home, directory, data, args),
+        steps[args.action],
+        assume_yes=args.yes,
+    )
+
+
+def assigned_lanes(
+    bridge: Bridge, repo: Path, args: argparse.Namespace
+) -> list[str]:
+    """Resolves a lane selector to the one lane an issue is offered to.
+
+    One issue carries one offer, so a selector stands in for a lane's name
+    only while it matches a single lane. A wider match is refused and every
+    matched lane is named, because choosing among them is the operator's
+    decision and never this command's.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `issue assign` arguments carrying the selector.
+
+    Returns:
+        The single matched lane, or nothing when the selector matched nobody.
+
+    Raises:
+        BridgeError: If a lane name or ``--unassign`` accompanies a selector,
+            or if the selector matched more than one lane.
+    """
+    if args.name:
+        raise BridgeError(
+            "`issue assign` offers an issue to one named lane or to the one "
+            "lane a selector matches, never both."
+        )
+    if args.unassign:
+        raise BridgeError(
+            "--unassign withdraws the offer recorded on one issue, so it "
+            "takes no lane selector."
+        )
+    directory, data = lane_roster(bridge, repo)
+    names = matching_lanes(bridge.home, directory, data, args)
+    if len(names) > 1:
+        raise BridgeError(
+            f"Selector matched {len(names)} lanes: {', '.join(names)}. One "
+            "issue is offered to one lane, so narrow the selector."
+        )
+    return names
+
+
+def assigned_selection(
+    bridge: Bridge, repo: Path, args: argparse.Namespace
+) -> int:
+    """Offers one issue to the single lane a selector matched.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `issue assign` arguments carrying the selector.
+
+    Returns:
+        0 when the offer or request was recorded, 1 when it was refused.
+    """
+    return bulk_lanes(
+        f"offer #{args.number} to",
+        assigned_lanes(bridge, repo, args),
+        lambda name: assignment(
+            bridge.issue_assign(repo, args.number, name, reason=args.reason)
+        ),
+        assume_yes=args.yes,
+    )
+
+
+def merged_lanes(
+    bridge: Bridge, repo: Path, args: argparse.Namespace, preview: bool
+) -> str:
+    """Runs the merge the command line selected, one lane or a set.
+
+    A selected set is ordered, planned and confirmed once before anything is
+    merged. The filters narrow the lanes that report ready, because bulk
+    integration only ever considers lanes whose own report is ready.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `participant merge` arguments.
+        preview: Whether the run only reports what a merge would do.
+
+    Returns:
+        The account the selected merge produced.
+
+    Raises:
+        BridgeError: If the selection is ambiguous or names nothing, or if
+            the ordered run stops on a refusal or a failure.
+    """
+    narrowing = bool(args.provider or args.outcome or args.drifted or args.idle)
+    if selected(args) or args.group:
+        if args.name:
+            raise BridgeError(
+                "`participant merge` integrates one named lane, every ready "
+                "lane with --all, a selected set, or one group with --group "
+                "NAME. Drop the participant name to integrate a set."
+            )
+        names: list[str] = []
+        if narrowing:
+            directory, data = lane_roster(bridge, repo)
+            names = matching_lanes(bridge.home, directory, data, args)
+        if preview:
+            return bridge.integrate(
+                repo, group=args.group, preview=True, lanes=names
+            )
+        proposed = bridge.integration_plan(repo, group=args.group, lanes=names)
+        if not proposed["sequence"]:
+            subject = proposed["subject"]
+            return f"{subject}: no lane to integrate, so nothing merged."
+        if not confirmed(
+            selection_plan(
+                "integrate", proposed["sequence"], proposed["outside"]
+            ),
+            args.yes,
+        ):
+            return "Declined: nothing was merged."
+        return bridge.integrate(repo, group=args.group, lanes=names)
+    if not args.name:
+        raise BridgeError(
+            "`participant merge` needs a participant name, --all, a "
+            "selector or --group NAME."
+        )
+    return (
+        bridge.preview_merge(repo, args.name)
+        if preview
+        else bridge.merge(repo, args.name)
+    )
+
+
 def held_claim(directory: Path, name: str) -> dict:
     """Names the claim a lane's integration record belongs to.
 
@@ -659,19 +1655,25 @@ def report_comment(summary: str, evidence: str) -> str:
     )
 
 
-def verify_base(root: Path, command: list[str]) -> None:
+def verify_base(
+    root: Path, command: list[str], integrated: bool = False
+) -> None:
     """Runs a repository's verification command in the base checkout.
 
     Executing a configured command is a different trust decision from reading
-    Git state, so the gate is a separate step that runs before the merge and
-    never rewrites, resets or stages anything itself. It reports the checkout
-    as it stands before the merge, which is not a claim about the merged
-    result. The command is run as an argument list without a shell, and no
-    flag skips it: a repository that configures a gate always pays it.
+    Git state, so the gate is a separate step that never rewrites, resets or
+    stages anything itself. Run before a merge it reports the checkout as it
+    stands, which is not a claim about the merged result; run after one it
+    reports the integrated result itself. The command is run as an argument
+    list without a shell, and no flag skips it: a repository that configures
+    a gate always pays it.
 
     Args:
         root: Common repository root, which is always the base checkout.
         command: Argument tokens recorded in the project manifest.
+        integrated: Whether the run follows a merge, which decides whether a
+            failure reports that nothing was merged or that the merge stands
+            and is unverified. Nothing is ever reset or reverted either way.
 
     Raises:
         BridgeError: If the command cannot run, or if it exits non-zero.
@@ -694,10 +1696,16 @@ def verify_base(root: Path, command: list[str]) -> None:
         ) from None
     if not result.returncode:
         return
+    outcome = (
+        "The merge commits already recorded stand and are unverified; "
+        "nothing was reset or reverted."
+        if integrated
+        else "Nothing was merged."
+    )
     raise BridgeError(
         f"Verification failed in the base checkout at {root}: `{quoted}` "
         f"exited {result.returncode}. Fix it and rerun; merge never skips "
-        "verification and nothing was merged. See the command output above."
+        f"verification. {outcome} See the command output above."
     )
 
 
@@ -1307,6 +2315,41 @@ class Bridge:
             )
         return directory, data, participant
 
+    def _reviewed(self, directory: Path, data: dict, name: str) -> dict:
+        """Reads the operator decision standing against a lane's work now."""
+        branch = data["participants"][name]["branch"]
+        head = branch_head(Path(data["root"]), branch)
+        return approvals.review(directory, data, name, head)
+
+    def _require_approval(
+        self, directory: Path, data: dict, name: str, step: str
+    ) -> None:
+        """Refuses an integration step the operator has not approved.
+
+        The decision is read again here, under the lane's session exclusion
+        and immediately before the branch is merged or pushed, so an approval
+        recorded for earlier commits cannot carry a later head into the base
+        repository or the forge.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding this participant.
+            name: Participant whose work would be integrated.
+            step: Step being attempted, ``merge`` or ``pr``.
+
+        Raises:
+            BridgeError: If the project requires approval for this step and no
+                matching decision is recorded, if the recorded decision is a
+                rejection, or if the lane's log cannot be read.
+        """
+        if step not in data["approval"]:
+            return
+        refusal = approvals.refusal(
+            name, step, self._reviewed(directory, data, name)
+        )
+        if refusal:
+            raise BridgeError(refusal)
+
     def restore(self, repo: Path, name: str) -> str:
         """Returns a drifted lane to its branch without discarding work.
 
@@ -1476,6 +2519,51 @@ class Bridge:
         return (
             f"{root} runs `{shlex.join(configured)}` in the base checkout "
             "before every `participant merge`."
+        )
+
+    def approval_policy(
+        self, repo: Path, steps: list[str] | None = None
+    ) -> str:
+        """Reports or records the steps that require an operator approval.
+
+        The requirement belongs to the repository rather than to a
+        participant, so it lives beside the roster and the verification
+        command in that repository's project manifest.
+
+        Args:
+            repo: Any checkout of the target repository.
+            steps: Steps to require a recorded approval before, an empty list
+                to require none, or None to report the current setting
+                without changing it.
+
+        Returns:
+            An account of the configured requirement.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or a step is
+                not one the gate can stand in front of.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if steps is None:
+            required = data["approval"]
+        else:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["approval"] = roster.approval_steps(steps)
+                write_json(directory / "project.json", data)
+                required = data["approval"]
+        if not required:
+            return (
+                f"{root} requires no recorded operator approval; "
+                "`participant merge` and `participant pr` run unchanged."
+            )
+        commands = ", ".join(
+            f"`{approvals.COMMANDS[step]}`" for step in required
+        )
+        return (
+            f"{root} refuses {commands} until `agent-parley approve NAME` "
+            "records a decision on the lane's current ready report."
         )
 
     def initialization(self, repo: Path, command: str | None = None) -> str:
@@ -1883,8 +2971,10 @@ class Bridge:
 
         Raises:
             BridgeError: If the lane drifted, if the participant holds a
-                running session, if the repository's verification command
-                fails, or if the merge cannot complete unattended.
+                running session, if the project requires an operator approval
+                the lane's current ready report does not have, if the
+                repository's verification command fails, or if the merge
+                cannot complete unattended.
             subprocess.TimeoutExpired: If verification exceeds its timeout.
         """
         root, directory = self.project(repo, create=False)
@@ -1897,25 +2987,52 @@ class Bridge:
                     f"{name} is not a participant in this project; "
                     "run agent-parley participant list."
                 )
-            with lock(directory / f"{name}.session.lock", session_busy(name)):
-                if data["verify"]:
-                    verify_base(root, data["verify"])
-                merged = merge_branch(
-                    root,
-                    Path(participant["lane"]),
-                    name,
-                    participant["branch"],
-                )
-                metrics.record_report(
-                    directory,
-                    name,
-                    {
-                        "kind": "integration",
-                        "action": "merge",
-                        **held_claim(directory, name),
-                    },
-                )
-                return merged
+            return self._integrate_lane(root, directory, data, name)
+
+    def _integrate_lane(
+        self, root: Path, directory: Path, data: dict, name: str
+    ) -> str:
+        """Runs the gate and merges one lane while its session is excluded.
+
+        Every integration path goes through this step, so a lane merged in a
+        group or in a bulk run is merged on exactly the terms the single-lane
+        command merges it on.
+
+        Args:
+            root: Common repository root, which is always the base checkout.
+            directory: Private state directory for the common repository.
+            data: Project manifest holding the roster and the gate command.
+            name: Participant whose bridge branch is merged.
+
+        Returns:
+            An account of what was merged.
+
+        Raises:
+            BridgeError: If the project requires an operator approval the
+                lane's current ready report does not have, if the gate fails,
+                or if the merge cannot complete unattended.
+        """
+        participant = data["participants"][name]
+        with lock(directory / f"{name}.session.lock", session_busy(name)):
+            self._require_approval(directory, data, name, "merge")
+            if data["verify"]:
+                verify_base(root, data["verify"])
+            merged = merge_branch(
+                root,
+                Path(participant["lane"]),
+                name,
+                participant["branch"],
+            )
+            metrics.record_report(
+                directory,
+                name,
+                {
+                    "kind": "integration",
+                    "action": "merge",
+                    **held_claim(directory, name),
+                },
+            )
+            return merged
 
     def preview_merge(self, repo: Path, name: str) -> str:
         """Reports what merging a participant's lane would do, changing nothing.
@@ -1948,11 +3065,7 @@ class Bridge:
                     f"{name} is not a participant in this project; "
                     "run agent-parley participant list."
                 )
-            state = activity(directory, name)
-            running = process.alive(
-                state.get("session_pid"), state.get("session_ticks")
-            )
-            session = participant_liveness(directory, name) if running else ""
+            session = lane_session(directory, name)
         return merge_preview(
             root,
             Path(participant["lane"]),
@@ -1960,6 +3073,234 @@ class Bridge:
             participant["branch"],
             session,
         )
+
+    def _integration_candidates(
+        self,
+        directory: Path,
+        data: dict,
+        state: dict,
+        group: str,
+        lanes: Sequence[str],
+    ) -> tuple[str, dict[str, list[str]]]:
+        """Names the lanes one bulk merge considers and what it reports under.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding the roster.
+            state: Published issue ledger.
+            group: Group of the applied plan; every ready lane when empty.
+            lanes: Lanes a selector matched; unrestricted when empty.
+
+        Returns:
+            The subject the run reports under and the candidate lanes mapped
+            to the issues each one holds.
+
+        Raises:
+            BridgeError: If a named group holds a member no participant owns.
+        """
+        if group:
+            return f"Group {group}", group_lanes(
+                data, state, group, plan.members(directory, group)
+            )
+        ready = ready_lanes(directory, data, state)
+        if not lanes:
+            return "Ready lanes", ready
+        chosen = set(lanes)
+        return "Selected ready lanes", {
+            name: issues for name, issues in ready.items() if name in chosen
+        }
+
+    def integration_plan(
+        self, repo: Path, group: str = "", lanes: Sequence[str] = ()
+    ) -> dict:
+        """Orders the lanes a bulk merge would attempt and names its waits.
+
+        The order is the one the run itself uses, read from the same advisory
+        dependency edges, so the plan an operator confirms is the run that
+        follows. Prerequisites outside the selected set are named with the
+        ledger's account of them, because narrowing a selection never lifts a
+        recorded dependency.
+
+        Args:
+            repo: Any checkout of the target repository.
+            group: Group of the applied plan; every ready lane when empty.
+            lanes: Lanes a selector matched; unrestricted when empty.
+
+        Returns:
+            The subject the run reports under, the candidate lanes in
+            dependency order, and one line per prerequisite outside the set.
+
+        Raises:
+            BridgeError: If the repository has no project, a group member is
+                unheld, or the candidates form a dependency cycle.
+        """
+        _, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        state = snapshot(directory)
+        subject, candidates = self._integration_candidates(
+            directory, data, state, group, lanes
+        )
+        return {
+            "subject": subject,
+            "sequence": plan.order(
+                lane_dependencies(state, candidates), "Lane dependencies"
+            ),
+            "outside": outside_prerequisites(state, candidates),
+        }
+
+    def integrate(
+        self,
+        repo: Path,
+        group: str = "",
+        preview: bool = False,
+        lanes: Sequence[str] = (),
+    ) -> str:
+        """Integrates several lanes in the order their dependencies imply.
+
+        Candidates are every lane whose latest report is ready, the subset of
+        those a lane selector matched, or the lanes holding the members of one
+        group of the applied plan. A selector narrows the ready lanes and
+        never admits a lane on easier terms. They are ordered
+        from the advisory dependency edges the ledger already records, so a
+        lane whose issue waits on another is merged after the lane holding
+        that issue. A cycle among the candidates is refused and named; it is
+        never quietly ordered.
+
+        Every candidate is preflighted with the same conditions
+        `participant merge --preview` reports, and each merge then runs
+        through the single-lane path, so no lane is integrated on easier terms
+        than it would be alone. A group is admitted whole or not at all: one
+        refused member leaves the group unmerged. Execution is still ordered
+        rather than atomic, so a merge or gate failure part way through stops
+        the run and leaves the earlier merge commits in place; the report then
+        names what was integrated, what refused and what was not attempted.
+        Nothing is ever reset or reverted.
+
+        Args:
+            repo: Any checkout of the target repository.
+            group: Group of the applied plan to integrate; every ready lane
+                when empty.
+            preview: Whether to report the plan and every candidate's preview
+                without merging anything.
+            lanes: Lanes a selector matched, narrowing the ready lanes an
+                ungrouped run considers; unrestricted when empty.
+
+        Returns:
+            The ordered plan when previewing, otherwise an account of every
+            lane that was integrated.
+
+        Raises:
+            BridgeError: If the candidates cannot be ordered, if a group is
+                refused, or if the run stops on a refusal or a failure, whose
+                report names everything already integrated.
+        """
+        root, directory = self.project(repo, create=False)
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            state = snapshot(directory)
+            subject, candidates = self._integration_candidates(
+                directory, data, state, group, lanes
+            )
+            if not candidates:
+                return f"{subject}: no lane to integrate, so nothing merged."
+            waits = lane_dependencies(state, candidates)
+            sequence = plan.order(waits, "Lane dependencies")
+            refusals = {
+                name: lane_refusals(
+                    root, directory, data["participants"][name], name
+                )
+                for name in sequence
+            }
+            if preview:
+                return self._integration_preview(
+                    root, directory, data, subject, sequence
+                )
+            if group and any(refusals.values()):
+                raise BridgeError(group_refusal(group, sequence, refusals))
+            return self._integrate_sequence(
+                root, directory, data, subject, sequence, waits, refusals
+            )
+
+    def _integration_preview(
+        self,
+        root: Path,
+        directory: Path,
+        data: dict,
+        subject: str,
+        sequence: list[str],
+    ) -> str:
+        """Reports the ordered plan and every candidate's own preview."""
+        report = [
+            f"{subject}: {len(sequence)} lanes in dependency order: "
+            + ", ".join(sequence)
+            + ".",
+            "Preview only: nothing is merged and no lane is verified.",
+        ]
+        for name in sequence:
+            participant = data["participants"][name]
+            report.append(f"\n{name}:")
+            report.append(
+                merge_preview(
+                    root,
+                    Path(participant["lane"]),
+                    name,
+                    participant["branch"],
+                    lane_session(directory, name),
+                )
+            )
+        return "\n".join(report)
+
+    def _integrate_sequence(
+        self,
+        root: Path,
+        directory: Path,
+        data: dict,
+        subject: str,
+        sequence: list[str],
+        waits: dict[str, list[str]],
+        refusals: dict[str, list[str]],
+    ) -> str:
+        """Merges an ordered run and reports how far it got."""
+        report = [
+            f"{subject}: {len(sequence)} lanes in dependency order: "
+            + ", ".join(sequence)
+            + "."
+        ]
+        merged: list[str] = []
+        stopped = ""
+        for name in sequence:
+            if stopped:
+                report.append(f"- {name}: {unattempted(name, waits, stopped)}")
+                continue
+            if refusals[name]:
+                stopped = name
+                report.append(f"- {name}: refused. {refusals[name][0]}")
+                continue
+            try:
+                outcome = self._integrate_lane(root, directory, data, name)
+            except BridgeError as failure:
+                stopped = name
+                report.append(f"- {name}: stopped. {failure}")
+                continue
+            merged.append(name)
+            report.append(f"- {name}: {outcome}")
+            if not data["verify"]:
+                continue
+            try:
+                verify_base(root, data["verify"], integrated=True)
+            except BridgeError as failure:
+                stopped = name
+                report.append(
+                    f"- {name} is integrated but unverified. {failure}"
+                )
+        report.append(
+            f"Integrated {len(merged)} of {len(sequence)} lanes: "
+            + (", ".join(merged) or "none")
+            + "."
+        )
+        if stopped:
+            raise BridgeError("\n".join(report))
+        return "\n".join(report)
 
     def pull_request(self, repo: Path, name: str) -> str:
         """Opens a verified pull request while excluding a live lane launch.
@@ -1977,6 +3318,129 @@ class Bridge:
         directory, _, _ = self._lane(repo, name)
         with lock(directory / f"{name}.session.lock"):
             return self._pull_request(repo, name)
+
+    def _decide(
+        self, repo: Path, name: str, decision: str, reason: str = ""
+    ) -> str:
+        """Records one operator decision about a lane's ready report.
+
+        The command runs from the base checkout only. Running it inside an
+        assigned worktree is refused, so the lane's own command line cannot
+        approve the lane's own work. That is this product's command-line
+        boundary and not an operating-system one: a program running as the
+        same user can write coordination state directly, so separate the
+        operator from the lanes at the operating-system level when that
+        distinction has to hold.
+
+        Args:
+            repo: Any checkout of the target repository, outside every lane.
+            name: Participant whose ready report is decided.
+            decision: Recorded outcome, approved or rejected.
+            reason: Required explanation for a rejection, delivered to the
+                lane as operator mail.
+
+        Returns:
+            An account of the decision, what it is bound to, and what
+            invalidates it.
+
+        Raises:
+            BridgeError: If the command runs inside a lane, if the
+                participant is unknown, if the lane has no current ready
+                report, if a rejection carries no reason, or if the decision
+                cannot be recorded.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if name not in data["participants"]:
+            raise BridgeError(
+                f"{name} is not a participant in this project; "
+                "run agent-parley participant list."
+            )
+        if decision == approvals.REJECTED and not reason.strip():
+            raise BridgeError(
+                "A rejection requires a reason; the lane is told what to "
+                "change."
+            )
+        here = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        for lane in data["participants"].values():
+            if here == Path(lane["lane"]).resolve():
+                raise BridgeError(
+                    "Approvals are recorded from the base checkout at "
+                    f"{root}, never from an assigned worktree, so a lane "
+                    "does not decide its own work."
+                )
+        reviewed = self._reviewed(directory, data, name)
+        if reviewed["state"] == approvals.UNREPORTED:
+            raise BridgeError(
+                f"{name} has no current ready report to decide. Wait for "
+                "the lane to report ready, then record the decision."
+            )
+        bound = reviewed["binding"]
+        approvals.remember(
+            directory,
+            name,
+            {
+                "kind": "approval",
+                "decision": decision,
+                "operator": approvals.operator(),
+                "reason": reason,
+                "binding": bound,
+            },
+        )
+        if decision == approvals.REJECTED:
+            try:
+                self.say(
+                    repo,
+                    name,
+                    f"The operator rejected report {bound['report']}: {reason}",
+                    subject="Report rejected",
+                )
+                delivery = "and told the lane why"
+            except (BridgeError, OSError) as exc:
+                delivery = f"but the lane could not be told: {exc}"
+            return (
+                f"Rejected {name}'s report {bound['report']} at "
+                f"{bound['head'][:12]}, {delivery}. The lane keeps working; "
+                "`participant merge` and `participant pr` stay refused "
+                "until a new decision is recorded."
+            )
+        return (
+            f"Approved {name}'s report {bound['report']} at "
+            f"{bound['head'][:12]} on {bound['branch']} for {bound['base']}. "
+            "This records a human decision, not a verification of the code. "
+            f"{approvals.RENEWED}"
+        )
+
+    def approve(self, repo: Path, name: str) -> str:
+        """Records that the operator approved a lane's ready report.
+
+        Args:
+            repo: Any checkout of the target repository, outside every lane.
+            name: Participant whose ready report is approved.
+
+        Returns:
+            An account of the approval and what invalidates it.
+
+        Raises:
+            BridgeError: If the decision cannot be recorded for this lane.
+        """
+        return self._decide(repo, name, approvals.APPROVED)
+
+    def reject(self, repo: Path, name: str, reason: str) -> str:
+        """Records that the operator rejected a lane's ready report.
+
+        Args:
+            repo: Any checkout of the target repository, outside every lane.
+            name: Participant whose ready report is rejected.
+            reason: Explanation delivered to the lane as operator mail.
+
+        Returns:
+            An account of the rejection.
+
+        Raises:
+            BridgeError: If the decision cannot be recorded for this lane.
+        """
+        return self._decide(repo, name, approvals.REJECTED, reason)
 
     def _pull_request(self, repo: Path, name: str) -> str:
         """Pushes one lane's branch and opens its pull request.
@@ -2020,6 +3484,7 @@ class Bridge:
         directory, data, participant = self._lane(repo, name)
         root = Path(data["root"])
         branch = participant["branch"]
+        self._require_approval(directory, data, name, "pr")
         path = directory / f"{name}-activity.json"
         state = json.loads(path.read_text()) if path.exists() else {}
         if not state.get("summary", "").strip():
@@ -2843,7 +4308,7 @@ attempt of the recorded budget, which is also only reported.
         """
         _, directory = self.project(repo)
         if action == "show":
-            return plan.describe(directory)
+            return plan.describe(directory, reported_ready(directory))
         if path is None:
             raise BridgeError("Name the plan file to apply or compare.")
         if action == "apply":
@@ -3081,6 +4546,34 @@ attempt of the recorded budget, which is also only reported.
             for name in data["participants"]
         }
 
+    def _approval_state(
+        self, directory: Path, data: dict, agent: str
+    ) -> dict | None:
+        """Reads how a lane stands against the approval its project requires.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding this participant.
+            agent: Participant that owns the lane.
+
+        Returns:
+            The decision state beside the lane's ready report, or None when
+            the project requires no approval. A state that cannot be read is
+            reported as unreadable rather than as approved, matching the
+            refusal the integration commands would raise.
+        """
+        if not data["approval"]:
+            return None
+        try:
+            reviewed = self._reviewed(directory, data, agent)
+        except (BridgeError, OSError) as exc:
+            return {"state": "unreadable", "report": "", "detail": str(exc)}
+        return {
+            "state": reviewed["state"],
+            "report": reviewed["report"],
+            "detail": reviewed["detail"],
+        }
+
     def _lane_status(self, directory: Path, data: dict, agent: str) -> dict:
         """Reads one lane's reported state, ownership context and mailbox.
 
@@ -3131,6 +4624,7 @@ attempt of the recorded budget, which is also only reported.
             "drift": branch != participant["branch"],
             "paused": participant.get("paused", False),
             "outcome": state.get("outcome", "unknown"),
+            "approval": self._approval_state(directory, data, agent),
             "summary": state.get("summary", ""),
             "remaining": state.get("remaining", ""),
             "evidence": state.get("evidence", ""),
@@ -3246,6 +4740,11 @@ attempt of the recorded budget, which is also only reported.
                 {
                     "root": data["root"],
                     **views.ledger(snapshot(path.parent)),
+                    "ready_groups": plan.ready_groups(
+                        plan.groups(path.parent),
+                        snapshot(path.parent),
+                        reported_ready(path.parent),
+                    ),
                     "participants": [
                         self._lane_status(path.parent, data, agent)
                         for agent in sorted(data["participants"])
@@ -3258,128 +4757,67 @@ attempt of the recorded budget, which is also only reported.
             "projects": projects,
         }
 
-    def status(self) -> None:
-        """Prints activity, reported outcomes, and coordination state."""
-        report = self.status_snapshot()
-        lanes = {
-            project["root"]: project["participants"]
-            for project in report["projects"]
-        }
+    def status(
+        self, selection: Selection | None = None, width: int | None = None
+    ) -> int:
+        """Prints one table per project, or one lane in full detail.
+
+        The table answers which lanes are ready, drifted or waiting at a
+        glance. A named participant is reported as the full reading instead
+        of a row, because a single lane is read rather than compared.
+
+        Args:
+            selection: Filters the operator asked for; every lane when None.
+            width: Columns the tables may use, or None to print every column,
+                which is what a redirected stream receives.
+
+        Returns:
+            The number of lanes reported, so a caller can gate on a filter
+            having matched at least one lane.
+        """
+        selection = selection or Selection()
+        report = narrow(self.status_snapshot(), selection)
+        kept = {project["root"]: project for project in report["projects"]}
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             print(f"Store: {schema}; {repair}")
         print(f"State: {report['state_directory']}")
+        matched = reported_lanes(report)
+        if selection.filtered() and not matched:
+            print(f"No participant matches {selection.describe()}.")
+            return matched
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
+            project = kept.get(data["root"])
+            if project is None:
+                continue
+            reported = project["participants"]
+            if selection.filtered() and not reported:
+                continue
             print(f"\nProject: {data['root']}")
             print(describe(snapshot(path.parent)))
-            for record in lanes.get(data["root"], []):
-                agent = record["participant"]
-                account = record["credential"] or "default account"
+            if groups := project.get("ready_groups") or []:
                 print(
-                    f"  {agent} ({record['identity']}): {record['session']}\n"
-                    f"    Provider: {record['provider']}; {account}"
+                    "Every member reported ready in: "
+                    + ", ".join(groups)
+                    + ". Integrate one with `agent-parley participant merge "
+                    "--group NAME`."
                 )
-                print(
-                    f"    Availability: {record['availability']['state']}; "
-                    "session process alive: "
-                    f"{record['availability']['process_alive']}"
+            if selection.participant:
+                for record in reported:
+                    lane_detail(record, data)
+                continue
+            rows = [
+                tables.status_row(
+                    record, pending_offers(project, record["participant"])
                 )
-                if record["drift"]:
-                    print(
-                        "    "
-                        + drift(
-                            agent,
-                            data["participants"][agent],
-                            record["branch"],
-                        )
-                    )
-                if record["idle"]["stalled"]:
-                    print(f"    {record['idle']['marker']}")
-                print(
-                    "    Observed coordination inactivity: "
-                    f"{record['idle_seconds']}s"
-                    + ("" if record["idle_complete"] else " (incomplete)")
-                )
-                for wait in record["waiting"]:
-                    item = wait.get("message_id") or wait.get("issue") or ""
-                    print(
-                        f"    Waiting {wait['seconds']}s: {wait['kind']}"
-                        + (f" {item}" if item else "")
-                    )
-                for claim in record["claims"]:
-                    if claim["overdue"]:
-                        print(
-                            f"    Issue #{claim['issue']} is overdue by "
-                            f"{claim['overdue_seconds']}s and still owned."
-                        )
-                    if claim["budget"]:
-                        print(
-                            f"    Issue #{claim['issue']} attempts "
-                            f"{claim['attempts']}/{claim['budget']}"
-                            + (
-                                "; budget exceeded and still owned"
-                                if claim["budget_exceeded"]
-                                else ""
-                            )
-                        )
-                print(f"    Reported outcome: {record['outcome']}")
-                print(
-                    f"    Context delivered: {record['injected_bytes']} "
-                    f"UTF-8 bytes in {record['injections']} notices"
-                )
-                if record["report_age_seconds"] is not None:
-                    print(f"    Report age: {record['report_age_seconds']}s")
-                if record["summary"]:
-                    print(f"    Summary: {record['summary']}")
-                if record["remaining"]:
-                    print(f"    Remaining: {record['remaining']}")
-                if record["evidence"]:
-                    print(f"    Reported verification: {record['evidence']}")
-                if wake := record["wake"]:
-                    print(
-                        f"    Runtime wake: {wake['result']}; "
-                        f"attempt {wake['attempts']}; "
-                        f"{wake['age_seconds']}s ago"
-                    )
-                mail = record["mail"] or {}
-                if "error" in mail:
-                    print(f"    Coordination unavailable: {mail['error']}")
-                    continue
-                stale = mail["stale_reservations"]
-                print(
-                    f"    Unread: {mail['unread']}; "
-                    f"pending acknowledgements: {mail['pending_ack']}; "
-                    f"active reservations: {mail['reservations']}"
-                    + (f" ({stale} stale)" if stale else "")
-                )
-                if mail["named_resources"]:
-                    print(
-                        "    Named resources held: "
-                        + ", ".join(mail["named_resources"])
-                    )
-                print(f"    Last coordination: {mail['last_coordination_at']}")
-                for pending in mail["outstanding_ack"]:
-                    print(
-                        "    Awaiting acknowledgement: "
-                        f"message {pending['message_id']} "
-                        f"from {pending['sender']}; "
-                        f"{pending['age_seconds']}s"
-                    )
-                print(f"    Latest prompt/task (reported): {mail['task']}")
-                if mail["awaiting_delivery"]:
-                    print(
-                        "    Awaiting checkpoint delivery: "
-                        f"{mail['awaiting_delivery']} "
-                        "(batch capped at 3)"
-                    )
-                if mail["pending_operator_items"]:
-                    print(
-                        "    Pending operator items: "
-                        f"{mail['pending_operator_items']}"
-                    )
+                for record in reported
+            ]
+            for row in tables.status_table(rows, width):
+                print(row)
+        return matched
 
     def launch(
         self,
@@ -3622,6 +5060,79 @@ def main() -> int:
         "status", help="Show server health and registered workspaces."
     )
     health.add_argument("--json", action="store_true", help=JSON_HELP)
+    health.add_argument(
+        "participant",
+        nargs="?",
+        default="",
+        help=(
+            "Report this participant alone, as the whole reading rather than "
+            "one table row."
+        ),
+    )
+    health.add_argument(
+        "--project",
+        metavar="ROOT",
+        default="",
+        help="Report only the project at this repository root.",
+    )
+    health.add_argument(
+        "--provider",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Report only participants driven by this provider. Repeat the "
+            "flag to report several."
+        ),
+    )
+    health.add_argument(
+        "--outcome",
+        choices=("ready", "blocked", "unknown"),
+        default="",
+        help="Report only lanes that reported this outcome.",
+    )
+    health.add_argument(
+        "--drifted",
+        action="store_true",
+        help=(
+            "Report only lanes away from their assigned branch. The command "
+            "exits non-zero when one matches."
+        ),
+    )
+    health.add_argument(
+        "--pending",
+        action="store_true",
+        help=(
+            "Report only lanes holding unread mail, unanswered "
+            "acknowledgements, an offer, or a reservation past its declared "
+            "time to live. The command exits non-zero when one matches."
+        ),
+    )
+    health.add_argument(
+        "--idle",
+        action="store_true",
+        help=(
+            "Report only live lanes that served no coordination call inside "
+            "the window. This measures coordination inactivity, not what a "
+            "native client was doing inside a turn."
+        ),
+    )
+    health.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Inactivity an idle lane must show, such as 45m, 6h or 7d. The "
+            "project's configured interval decides by default."
+        ),
+    )
+    health.add_argument(
+        "--issue",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Report only lanes holding or offered this issue.",
+    )
     watch = commands.add_parser(
         "top", help="Watch every participant's live coordination state."
     )
@@ -3854,9 +5365,20 @@ def main() -> int:
         "say", help="Send one lane a coordination message as the operator."
     )
     steer.add_argument(
-        "participant", help="Participant whose inbox receives the message."
+        "participant",
+        nargs="?",
+        default="",
+        help=(
+            "Participant whose inbox receives the message. A lane selector "
+            "replaces it, and the message text is then the only positional."
+        ),
     )
-    steer.add_argument("text", help="Message body the participant reads.")
+    steer.add_argument(
+        "text",
+        nargs="?",
+        default="",
+        help="Message body the participant reads.",
+    )
     steer.add_argument("--repo", type=Path, default=Path.cwd())
     steer.add_argument(
         "--subject",
@@ -3938,6 +5460,7 @@ def main() -> int:
         metavar="HH:MM",
         help="Stop a repeat at this time of day in the local timezone.",
     )
+    add_selector(steer)
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -4022,6 +5545,7 @@ def main() -> int:
             "was accepted is refused, naming the lane that holds the issue."
         ),
     )
+    add_selector(assigning)
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -4088,12 +5612,77 @@ def main() -> int:
         "restart",
     ):
         command = roles.add_parser(action)
-        command.add_argument("name")
+        if action in BULK_PARTICIPANT or action == "merge":
+            command.add_argument("name", nargs="?", default="")
+        else:
+            command.add_argument("name")
         command.add_argument("--repo", type=Path, default=Path.cwd())
         if action == "merge":
             command.add_argument("--preview", action="store_true")
+            scope = command.add_mutually_exclusive_group()
+            scope.add_argument(
+                "--all",
+                action="store_true",
+                help=(
+                    "Integrate every lane reported ready, ordered by the "
+                    "recorded dependency edges, stopping at the first "
+                    "refusal or failure."
+                ),
+            )
+            scope.add_argument(
+                "--group",
+                default="",
+                metavar="NAME",
+                help=(
+                    "Integrate one group of the applied plan. Preflight "
+                    "admits every member or none; execution is ordered, not "
+                    "atomic, and stops at the first refusal or failure."
+                ),
+            )
+            add_selector(command, everything=False)
+        elif action in BULK_PARTICIPANT:
+            add_selector(command)
         if action == "restart":
             command.add_argument("--task", default="")
+    granting = commands.add_parser(
+        "approve",
+        help="Record that you approve a lane's ready report for integration.",
+    )
+    granting.add_argument(
+        "participant", help="Participant whose ready report you approve."
+    )
+    granting.add_argument("--repo", type=Path, default=Path.cwd())
+    refusing = commands.add_parser(
+        "reject",
+        help="Record that you reject a lane's ready report, and say why.",
+    )
+    refusing.add_argument(
+        "participant", help="Participant whose ready report you reject."
+    )
+    refusing.add_argument(
+        "reason", help="Explanation delivered to the lane as operator mail."
+    )
+    refusing.add_argument("--repo", type=Path, default=Path.cwd())
+    requirement = commands.add_parser(
+        "approval",
+        help="Show or set the steps that require a recorded approval first.",
+    )
+    requirements = requirement.add_subparsers(dest="action", required=True)
+    stating = requirements.add_parser("show")
+    stating.add_argument("--repo", type=Path, default=Path.cwd())
+    requiring = requirements.add_parser("set")
+    requiring.add_argument(
+        "steps",
+        nargs="*",
+        metavar="STEP",
+        help=(
+            "Steps refused without a recorded operator approval of the "
+            "lane's current ready report, from "
+            + ", ".join(roster.APPROVAL_STEPS)
+            + "; pass none to require no approval."
+        ),
+    )
+    requiring.add_argument("--repo", type=Path, default=Path.cwd())
     gate = commands.add_parser(
         "verify",
         help="Show or set the command a repository requires before a merge.",
@@ -4361,7 +5950,14 @@ def main() -> int:
                 key=args.idempotency_key,
             )
             print(f"Recorded outcome: {args.state}")
+        elif args.command == "say" and selected(args):
+            return spoken_lanes(bridge, args.repo.resolve(), args)
         elif args.command == "say":
+            if not args.participant or not args.text:
+                parser.error(
+                    "say needs a participant and a message, or a lane "
+                    "selector and a message."
+                )
             delivered = bridge.say(
                 args.repo.resolve(),
                 args.participant,
@@ -4377,22 +5973,13 @@ def main() -> int:
                 every=args.every,
                 until=args.until,
             )
-            if "kind" in delivered:
-                print(
-                    f"Operator item {delivered['id']} recorded for "
-                    f"{args.participant}; "
-                    f"{delivered['repeats_left']} delivery(s) pending."
-                )
-            else:
-                state = (
-                    "already delivered"
-                    if delivered.get("duplicate")
-                    else "delivered"
-                )
-                print(
-                    f"Operator message {delivered['id']} {state} to "
-                    f"{args.participant}."
-                )
+            print(operator_message(delivered, args.participant))
+        elif (
+            args.command == "issue"
+            and args.action == "assign"
+            and selected(args)
+        ):
+            return assigned_selection(bridge, args.repo.resolve(), args)
         elif args.command == "issue" and args.action == "assign":
             if args.unassign and args.name:
                 parser.error("issue assign takes a lane or --unassign.")
@@ -4480,6 +6067,13 @@ def main() -> int:
         elif args.command == "participant":
             repository = args.repo.resolve()
             preview = getattr(args, "preview", False)
+            if args.action in BULK_PARTICIPANT and selected(args):
+                return participant_lanes(bridge, repository, args)
+            if args.action in BULK_PARTICIPANT and not args.name:
+                parser.error(
+                    f"participant {args.action} needs a participant name or "
+                    "a lane selector."
+                )
             if args.action == "add":
                 bridge.add_participant(
                     repository, args.name, args.provider, args.credentials
@@ -4489,11 +6083,7 @@ def main() -> int:
             elif args.action == "retire":
                 print(bridge.retire(repository, args.name))
             elif args.action == "merge":
-                print(
-                    bridge.preview_merge(repository, args.name)
-                    if preview
-                    else bridge.merge(repository, args.name)
-                )
+                print(merged_lanes(bridge, repository, args, preview))
             elif args.action == "pr":
                 print(bridge.pull_request(repository, args.name))
             elif args.action in ("pause", "resume"):
@@ -4576,6 +6166,21 @@ def main() -> int:
                 print(
                     bridge.resources(repository, getattr(args, "names", None))
                 )
+        elif args.command == "approve":
+            print(bridge.approve(args.repo.resolve(), args.participant))
+        elif args.command == "reject":
+            print(
+                bridge.reject(
+                    args.repo.resolve(), args.participant, args.reason
+                )
+            )
+        elif args.command == "approval":
+            print(
+                bridge.approval_policy(
+                    args.repo.resolve(),
+                    args.steps if args.action == "set" else None,
+                )
+            )
         elif args.command in ("verify", "init"):
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -4663,10 +6268,26 @@ def main() -> int:
                 if getattr(args, "json", False)
                 else json.dumps(registered, indent=2)
             )
-        elif args.json:
-            print(views.render("status", bridge.status_snapshot()))
         else:
-            bridge.status()
+            selection = Selection(
+                participant=args.participant,
+                project=args.project,
+                providers=tuple(args.provider or ()),
+                outcome=args.outcome,
+                drifted=args.drifted,
+                pending=args.pending,
+                idle=args.idle,
+                since=args.since,
+                issue=args.issue,
+            )
+            if args.json:
+                narrowed = narrow(bridge.status_snapshot(), selection)
+                print(views.render("status", narrowed))
+                matched = reported_lanes(narrowed)
+            else:
+                matched = bridge.status(selection, terminal_width())
+            if matched and (selection.drifted or selection.pending):
+                return 1
         return 0
     except (
         BridgeError,

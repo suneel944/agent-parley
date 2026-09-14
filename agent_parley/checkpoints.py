@@ -755,6 +755,31 @@ def current_branch(lane: Path) -> str:
     return result.stdout.strip() or "<detached HEAD>"
 
 
+def branch_head(repo: Path, branch: str) -> str:
+    """Reports the commit one branch points at, without failing the caller.
+
+    Args:
+        repo: Checkout the branch is read from.
+        branch: Branch name to resolve.
+
+    Returns:
+        The commit the branch points at, or an empty string when Git cannot
+        report one, which callers treat as work they cannot vouch for rather
+        than as work that has not changed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", branch],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "" if result.returncode else result.stdout.strip()
+
+
 def lane_branch(lane: Path) -> str:
     """Reports a lane's branch without failing on an unusable worktree.
 

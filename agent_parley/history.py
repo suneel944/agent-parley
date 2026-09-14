@@ -23,7 +23,14 @@ from pathlib import Path
 from agent_parley import issues, metrics, store
 from agent_parley.state import BridgeError
 
-KINDS = ("claim", "handoff", "report", "reservation", "message")
+KINDS = (
+    "claim",
+    "handoff",
+    "report",
+    "approval",
+    "reservation",
+    "message",
+)
 CLAIM_ACTIONS = frozenset({"claim", "release"})
 HANDOFF_ACTIONS = frozenset(
     {
@@ -121,27 +128,47 @@ def holdings(directory: Path, number: str) -> list[dict]:
     return held
 
 
+def _decided_report(record: dict) -> str:
+    """Returns the report identifier an operator decision was bound to."""
+    binding = record.get("binding")
+    if str(record.get("kind", "")) != "approval":
+        return ""
+    return str(binding.get("report", "")) if isinstance(binding, dict) else ""
+
+
+def _decided(record: dict) -> str:
+    """Describes one recorded operator decision for the chain."""
+    reason = str(record.get("reason", "")).strip()
+    who = record.get("operator", "unknown")
+    described = f"{record.get('decision', '')} by {who}"
+    return f"{described}: {reason}" if reason else described
+
+
 def _report_records(directory: Path, manifest: dict) -> list[dict]:
-    """Reads the durable report and integration log of every lane."""
+    """Reads the durable report, decision and integration log of every lane."""
     records = []
     for name in manifest["participants"]:
         for record in metrics.report_records(directory, name):
             kind = str(record.get("kind", ""))
-            detail = (
-                f"reported {record.get('state', '')}"
-                if kind == "report"
-                else f"integrated by {record.get('action', '')}"
-            )
+            detail = f"integrated by {record.get('action', '')}"
+            if kind == "report":
+                detail = f"reported {record.get('state', '')}"
+            elif kind == "approval":
+                detail = _decided(record)
             records.append(
                 {
-                    "kind": "report",
-                    "action": record.get("state") or record.get("action", ""),
+                    "kind": "approval" if kind == "approval" else "report",
+                    "action": (
+                        record.get("state")
+                        or record.get("decision")
+                        or record.get("action", "")
+                    ),
                     "at": float(record.get("at", 0) or 0),
                     "participant": name,
                     "provider": _provider(manifest, name),
                     "issue": record.get("issue"),
                     "claim_id": record.get("claim_id"),
-                    "report_id": record.get("id"),
+                    "report_id": _decided_report(record) or record.get("id"),
                     "detail": detail,
                 }
             )

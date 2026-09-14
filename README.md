@@ -117,10 +117,25 @@ agent-parley run claude-2 --provider claude --credentials account-2
 Then watch the work:
 
 ```sh
-agent-parley status   # ownership, activity and reported results
+agent-parley status   # one table per project: ownership, activity, outcomes
 agent-parley top      # every lane live, including what enforcement denied
 agent-parley metrics  # the same numbers as Prometheus text, or --json
 ```
+
+`status` prints one row per participant. Narrow it by appending a participant
+name, which reports that lane in full instead of as a row, or by filters that
+combine:
+
+```sh
+agent-parley status claude-1          # one lane, the whole reading
+agent-parley status --drifted         # lanes off their assigned branch
+agent-parley status --pending         # unread mail, offers or stale leases
+agent-parley status --outcome blocked --provider codex
+```
+
+`--drifted` and `--pending` exit non-zero when a lane matches, so a shell gate
+fails on drift without parsing the table. Columns shrink to the terminal, and a
+redirected stream receives every column instead.
 
 Steer one lane without taking over its terminal:
 
@@ -188,6 +203,67 @@ The preview only reads. It changes nothing, and it never takes the lane's
 session lock, so it is safe while that agent is still working. It attempts no
 merge, so it cannot predict conflicts.
 
+With several lanes finished, integrate them as a set instead of deciding the
+order by hand:
+
+```sh
+agent-parley participant merge --all              # every lane reported ready
+agent-parley participant merge --group rewrite    # one group of the plan
+agent-parley participant merge --all --preview    # the ordered plan only
+```
+
+Both order the lanes from the dependency edges already recorded, so a lane whose
+issue waits on another is merged after the lane holding that issue. A cycle is
+refused and named, never quietly ordered. Every candidate is preflighted with
+the same conditions `--preview` reports, and each merge then runs through the
+single-lane path, so nothing is integrated on easier terms than it would be
+alone.
+
+A group is admitted whole or not at all: one refused member leaves the group
+unmerged. Execution is ordered rather than atomic, so a merge or a gate failure
+part way through stops the run, leaves the earlier merge commits in place and
+reports what was integrated, what refused and what was not attempted. Nothing is
+reset or reverted.
+
+With eight lanes, ending the day should not be eight commands. `say`,
+`participant stop`, `participant pause`, `participant resume`,
+`participant merge`, `participant pr` and `issue assign` take a lane selector in
+place of the positional name:
+
+```sh
+agent-parley say "Wrap up for today." --all
+agent-parley participant stop --provider claude
+agent-parley participant merge --outcome ready --yes
+agent-parley participant resume --idle
+agent-parley participant pr --drifted
+```
+
+`--all` selects every lane and the other filters narrow it, so they combine.
+Each filter reads the same lane facts `status` reports: the provider driving a
+lane, the lane's own latest reported outcome, whether its checkout sits on the
+branch it was assigned, and whether supervision reads it as stalled. A
+positional name and a selector together are refused.
+
+Every bulk run prints the lanes it matched and what will happen to each, then
+asks once for the whole set; `--yes` skips that one question. A selector that
+matches nothing does nothing and says so. Independent operations continue past
+a lane that refuses, printing its refusal beside it, and the closing tally names
+what was done and what refused. Integration is different: it keeps the ordered
+stop-on-failure contract above, so the first refusal leaves every later lane
+unattempted. The exit status is non-zero when any lane refused or failed.
+
+A bulk merge only ever considers lanes that report ready, and its plan names
+the prerequisites that lie outside the selected set with the ledger's account
+of each, because narrowing a selection never lifts a recorded dependency.
+`issue assign` carries one offer, so a selector stands in for its lane only
+while it matches a single lane; a wider match is refused and names what it
+matched.
+
+Groups whose every member is reported ready are marked by `plan show` and
+`status`, and counted in the `top` header, so you learn a set is integrable
+without asking each lane. A reported state is a lane's own account, never review
+or independent verification.
+
 A repository can also require its own command to pass before any merge. The
 command is recorded in coordination state, not in the repository:
 
@@ -201,7 +277,42 @@ With one configured, `participant merge` runs it in the base checkout first and
 streams the command's output, refusing the merge on a non-zero exit and
 reporting the exit status. It runs as an argument list, never through a shell, and no flag
 skips it. It reports the base checkout as it stands before the merge, which is
-not a claim about the merged result.
+not a claim about the merged result. In a `--all` or `--group` run it also runs
+after each member, so a set whose halves pass alone but fail together is caught;
+a failure there leaves the merge commit present and visibly unverified.
+
+A repository can also require your own recorded decision before a lane's work
+leaves its worktree:
+
+```sh
+agent-parley approval set merge pr   # refuse both until a decision exists
+agent-parley approval show           # report what is required
+agent-parley approval set            # require no approval again
+agent-parley approve claude-2        # record that you approved its report
+agent-parley reject claude-2 'Needs a test for the retry path'
+```
+
+With the requirement set, `participant merge` and `participant pr` refuse until
+`approve` records a decision on that lane's current ready report, and the
+refusal names both the report and the command that grants it. The decision is
+bound to that report, the lane's exact commit, its branch and base, and the
+verification and pull-request settings in force, so new commits, a further
+report, a retargeted base or a changed gate each need a new decision; the
+binding is rechecked immediately before the merge or the push. A decision that
+cannot be read refuses integration rather than allowing it. A rejection
+delivers your reason to the lane as operator mail and the lane keeps working:
+only these two commands are gated. `status` shows `awaiting approval`,
+`approved` or `rejected` beside a ready report, `top` counts the lanes awaiting
+one, and `history --kind approval` lists the decisions with the rest of the
+chain.
+
+`approve` and `reject` run from the base checkout and refuse to run inside an
+assigned worktree, so no lane records the approval of its own work through
+these commands. That is this tool's command-line boundary and not an
+operating-system one: a program running as you can write coordination state
+directly. The decision also records that a human decided, not that the code is
+correct; the verification command, the attribution scan and GitHub's own
+checks all still run.
 
 A new lane starts as a bare worktree, so every agent would otherwise spend its
 first turns installing dependencies or copying an untracked file. Record that
@@ -502,7 +613,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | --- | --- |
 | `up` | Start the local coordination server. |
 | `down` | Stop the server while retaining state and worktrees. |
-| `status` | Show server health, ownership, activity and reported outcomes. |
+| `status` | Show server health and one table per project; `NAME` reports one lane in full, and `--project`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since` and `--issue` narrow the rows. |
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--project`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
@@ -534,6 +645,11 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `participant restart NAME` | Start a stopped lane again from a clean worktree. |
 | `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
+| `... --all --provider N --outcome S --drifted --idle` | Select several lanes for one `say`, `issue assign`, `participant stop/pause/resume/pr/merge`; one plan and one confirmation, `--yes` to skip it. |
+| `approve NAME` | Record your approval of a lane's current ready report. |
+| `reject NAME REASON` | Record a rejection and deliver the reason to the lane. |
+| `approval show` | Show which steps require a recorded approval first. |
+| `approval set [STEP ...]` | Require an approval before `merge`, `pr`, both, or none. |
 | `provider list` | List built-in presets and local overrides. |
 | `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
 | `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |

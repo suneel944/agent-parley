@@ -190,7 +190,7 @@ def test_status_and_issue_list_report_the_state(
     bridge.report(lane, "blocked", "Waiting", "Needs a decision", "")
     bridge.report(lane, "blocked", "Waiting", "Needs a decision", "")
     age_claim(directory, "42", 300)
-    bridge.status()
+    bridge.status(cli.Selection(participant="claude"))
     printed = capsys.readouterr().out
     assert "is overdue by" in printed and "still owned" in printed
     assert "attempts 2/1" in printed

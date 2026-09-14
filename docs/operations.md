@@ -70,6 +70,50 @@ as its source, an unclaimed issue appearing for as long as an offer waits on it.
 nobody has answered. An offer that was already accepted is refused, naming the
 lane that holds the issue, because only that lane can hand it on.
 
+### Reading status
+
+`status` prints the server line, the state directory, and then one table per
+project with a row per participant: `PARTICIPANT`, `PROVIDER`, `ACCOUNT`,
+`SESSION`, `BRANCH` with `!` when the lane left its assigned branch, `OUTCOME`,
+`ISSUES` held with `!` on an issue past its deadline or attempt budget and `+N`
+for offers waiting on that lane, `MAIL` as unread over pending acknowledgement,
+`LEASES` held with `!` and the stale count, `REPORTED` as the age of the last
+report, and `TASK`. A mailbox that could not be read prints `?` rather than a
+zero. Column widths follow the widest value and then the terminal, by the rule
+`top` uses: the least useful column is dropped first, the dropped headings are
+named under the table, and `TASK` takes whatever width is left. A pipe or a
+file receives the whole table, because no width is imposed on a stream that is
+not a terminal.
+
+Appending a participant name reports that lane as the whole reading —
+availability, drift, waiting items, claims, reported outcome, mail counters and
+the latest prompt — instead of as a row. Filters combine, and a lane is
+reported only when it satisfies all of them:
+
+```sh
+agent-parley status --project /path/to/repo
+agent-parley status --provider codex --outcome blocked
+agent-parley status --drifted
+agent-parley status --pending
+agent-parley status --idle --since 45m
+agent-parley status --issue 42
+```
+
+`--pending` reports a lane holding unread mail, an unanswered acknowledgement,
+an offer, or a reservation past its declared time to live. `--idle` reports a
+live lane that served no coordination call inside `--since`, or inside the
+project's configured interval when no window is given; it measures
+coordination inactivity, not what a native client was doing inside a turn.
+`--issue` reports the lanes that hold or are offered one issue. A selection
+that matches nothing prints one line naming the filters that were applied.
+
+`--drifted` and `--pending` exit non-zero when at least one lane matches, so a
+shell gate fails on drift or on unfinished coordination without parsing text.
+Every other reading exits zero. `--json` prints the same document as an
+unfiltered `status --json`, holding only the matching rows.
+
+`status` stays read-only: it takes no lock, calls no vendor and writes nothing.
+
 `issue list` also shows the forge title beside the owner, as
 `#42: claude — Some issue title`, when `gh` is installed and authenticated and
 the repository's `origin` remote points at GitHub. Without any of those the
@@ -230,7 +274,86 @@ disagree.
 
 A plan that names a malformed issue number, exceeds a bound, or describes a
 dependency cycle is refused before any edge is written. Groups name issues that
-may proceed together; recording one changes no behavior today.
+may proceed together, and `participant merge --group NAME` integrates one.
+
+### Integrating several lanes at once
+
+```sh
+agent-parley participant merge --all
+agent-parley participant merge --group rewrite
+agent-parley participant merge --group rewrite --preview
+```
+
+`--all` takes every lane whose latest report is ready; `--group` takes the lanes
+holding one group's members, refusing when a member is unclaimed. Both order the
+candidates from the recorded dependency edges, so a lane whose issue waits on
+another is merged after the lane holding that issue. Edges leaving the candidate
+set constrain nothing, and a cycle among the candidates is refused and named
+rather than quietly ordered.
+
+Every candidate is preflighted with the conditions `--preview` reports, and each
+merge runs through the single-lane path, so no lane is integrated on easier
+terms than it would be alone. A group is admitted whole or not at all: one
+refused member leaves the group unmerged and the base checkout unchanged.
+Execution is ordered rather than all-or-nothing: the run stops at the first
+refusal or failure, a refused lane is never followed by a lane that waits on it,
+and the report names what was integrated, what refused and what was not
+attempted, with the dependency reason. Nothing is reset or reverted, and a
+conflict is left in the working tree for you.
+
+With a verification command recorded, it runs before each merge as usual and
+again after it, so a set whose halves pass alone but fail together is caught
+before you move on. A failure after a merge stops the run and leaves that merge
+commit present and visibly unverified.
+
+`plan show` and `status` mark a group whose every member is reported ready, and
+the `top` header counts those groups, so an integrable set is visible before
+anyone merges. A reported state is the lane's own account of its work, never
+review or independent verification.
+
+### Selecting several lanes for one command
+
+```sh
+agent-parley say "Wrap up for today." --all
+agent-parley participant stop --provider claude --yes
+agent-parley participant resume --idle
+agent-parley participant merge --outcome ready
+agent-parley issue assign 42 --idle --provider codex
+```
+
+`say`, `issue assign`, `participant stop`, `participant pause`,
+`participant resume`, `participant pr` and `participant merge` take a lane
+selector where they otherwise take a positional name. `--all` selects every
+lane; `--provider NAME`, `--outcome STATE`, `--drifted` and `--idle` narrow the
+selection, and a lane matches only when every given filter holds. The filters
+read the same facts `status` reports. A positional name and a selector together
+are refused, because a command that means two things is a command that loses a
+lane.
+
+Every bulk run prints the lanes it matched and what will happen to each, then
+asks once for the whole set. `--yes` answers that one question in advance.
+A selector matching nothing does nothing and says so.
+
+Non-integration operations are independent, so a lane's refusal is printed
+beside that lane and the remaining lanes are still attempted. The closing tally
+names what was done and what refused, and the exit status is non-zero when any
+lane refused or failed. Integration keeps its ordered contract instead: the run
+stops at the first refusal or failure and leaves every later lane unattempted,
+including the lanes that wait on the one that stopped.
+
+A bulk merge considers only lanes whose own report is ready, so a selector
+narrows that set rather than widening it, and its plan names every prerequisite
+that lies outside the selected set: held by a lane that is not selected, and so
+not satisfied here, or released and held by nobody. Narrowing a selection never
+lifts a recorded dependency and never admits a lane on easier terms than the
+single-lane merge would.
+
+One issue carries one offer, so `issue assign` accepts a selector only while it
+matches a single lane. A wider match is refused and names every lane it matched,
+because choosing between them is the operator's decision. `--unassign`
+withdraws the offer recorded on one issue and takes no selector. `say --key`
+names one message and is refused with a selector, because the default key
+already gives each lane its own copy.
 
 ### Retrying a write safely
 
@@ -1048,6 +1171,58 @@ ride into a gate, and no flag skips it. Removing it is an explicit
 command is a different decision from reading Git state. The gate reports the
 base checkout as it stands before the merge, which is not a claim about the
 merged result.
+
+## Requiring a recorded approval
+
+A repository can require your own recorded decision before either command that
+carries a lane's work out of its worktree:
+
+```sh
+agent-parley approval show
+agent-parley approval set merge pr
+agent-parley approval set
+agent-parley approve claude-1
+agent-parley reject claude-1 'Needs a test for the retry path'
+```
+
+`approval set` records the requirement in the project manifest beside the
+roster, outside the target source tree, and takes any of `merge`, `pr`, both,
+or nothing at all. A repository with nothing required integrates exactly as
+before.
+
+With a step required, `participant merge` and `participant pr` refuse until a
+decision for that lane's current ready report is recorded, and the refusal
+names the report and the `agent-parley approve NAME` that grants it. The
+decision is bound to the identifier of that report, the exact commit the lane
+branch points at, the branch and base it targets, the repository root, and a
+digest of the verification command, the pull-request policy and the approval
+requirement in force. Anything in that binding changing invalidates the
+decision, so new commits invalidate it even when the lane never reports again,
+and the refusal says which of those changed. The binding is read again
+immediately before the merge or the push, while the lane's session exclusion is
+held, so an approval recorded for earlier commits cannot carry a later head
+into the base repository or the forge. A decision log that cannot be read, or
+that holds a damaged record, refuses integration rather than treating the
+missing decision as consent.
+
+`reject` requires a reason, records it, and delivers it to the lane as operator
+mail. It gates nothing else: the lane keeps its session, its claims and its
+work, and can go on committing. Only these two commands are refused, and only
+until a further decision is recorded.
+
+Both commands run from the base checkout and refuse to run inside an assigned
+worktree, so no lane records the approval of its own work through them. That is
+this tool's command-line boundary, not an operating-system one: a program
+running under your account can write coordination state directly. Separate the
+operator from the lanes as different operating-system users, or in different
+containers, when that distinction has to hold. The decision also records that a
+named local account decided, not that the code is correct. The verification
+command, the attribution scan and GitHub's own checks all still run unchanged.
+
+`status` prints `awaiting approval`, `approved` or `rejected` beside a lane's
+ready report, naming what invalidated an earlier decision; `top` counts the
+lanes awaiting one in its header; and `history --kind approval` lists the
+decisions, their operator and their reasons with the rest of the chain.
 
 Four commands drive a lane's life from the base checkout, and every one of them
 writes an event so `top` and `events export` show what the operator did and when.
