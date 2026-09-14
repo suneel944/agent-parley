@@ -36,6 +36,7 @@ agent-parley issue list
 agent-parley issue claim 42
 agent-parley issue offer 42 --to codex --summary "commit, checks, remaining work"
 agent-parley issue accept 42 --offer-id CURRENT_OFFER_ID
+agent-parley issue assign 42 codex --reason "Codex already read that parser"
 agent-parley issue block 42 --on 17
 agent-parley issue unblock 42 --on 17
 agent-parley report --state ready --summary "Result" --evidence "Checks and results"
@@ -45,6 +46,29 @@ agent-parley mail search "reservation conflict"
 ```
 
 `issue offer --to` names another participant in the same project.
+
+### Directing work to a lane
+
+`issue assign NUMBER NAME` hands a lane work without typing into its terminal.
+It runs from any checkout as `operator`, and it offers rather than takes: what
+it records is an offer, so ownership still moves only when a lane accepts one.
+
+An unclaimed issue is offered to the named lane directly, with an offer
+identifier the lane quotes to `issue accept` or `issue decline` like any peer
+offer. An issue another lane holds is not taken from it: the command records a
+request to that owner instead, mails the owner the same identifier, and the
+owner's `issue accept NUMBER --offer-id ID` is what creates the offer to the
+named lane. The command prints which of the two it recorded, and the owner
+keeps the issue throughout either way.
+
+`--reason "text"` travels with the offer, is stored on the record, and is what
+`history issue NUMBER` reports beside the transition, so a later reader sees why
+the work moved. `issue list` and `status` show a pending offer with `operator`
+as its source, an unclaimed issue appearing for as long as an offer waits on it.
+
+`issue assign NUMBER --unassign` withdraws an operator offer or request that
+nobody has answered. An offer that was already accepted is refused, naming the
+lane that holds the issue, because only that lane can hand it on.
 
 `issue list` also shows the forge title beside the owner, as
 `#42: claude — Some issue title`, when `gh` is installed and authenticated and

@@ -496,6 +496,7 @@ supports and where its MCP and hook configuration lives.
 Use `agent-parley COMMAND --help` for arguments. `--home DIR` selects private
 state globally; repository commands accept `--repo PATH` unless noted below.
 Issue mutations, reports and lane mail resolve identity from the current lane.
+`say` and `issue assign` act as `operator` from any checkout of the repository.
 
 | Command | Purpose |
 | --- | --- |
@@ -516,6 +517,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `issue accept NUMBER --offer-id ID` | Accept the current offer addressed to this lane. |
 | `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
+| `issue assign NUMBER NAME` | Offer an issue to a lane as `operator`; `--reason` travels with the offer and `--unassign` withdraws one no lane accepted. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |

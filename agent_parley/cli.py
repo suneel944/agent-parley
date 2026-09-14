@@ -233,6 +233,39 @@ def operator_key(name: str, subject: str, body: str) -> str:
     return f"operator-{digest.hexdigest()[:48]}"
 
 
+def assignment(result: dict) -> str:
+    """Says which of the two operator assignment paths was recorded.
+
+    Args:
+        result: Outcome of one issue assignment or withdrawal.
+
+    Returns:
+        One line naming what was recorded and the identifier the answering
+        lane quotes, with a second line when the request's notice did not
+        reach the owner's inbox.
+    """
+    issue = result["issue"]
+    owner = result["owner"]
+    if result["recorded"] == "withdrawal":
+        return f"Withdrew the operator offer on issue #{issue}."
+    if result["recorded"] == "offer":
+        return (
+            f"Offered issue #{issue} to {result['to']}; offer "
+            f"{result['offer_id']}. Ownership moves when {result['to']} "
+            "accepts it."
+        )
+    line = (
+        f"Asked {owner} to hand issue #{issue} to {result['to']}; offer "
+        f"{result['offer_id']}. {owner} still owns it."
+    )
+    if not result["delivered"]:
+        line += (
+            f"\nThe notice did not reach {owner}: {result['detail']} "
+            "The request stands and is listed by issue list."
+        )
+    return line
+
+
 def has_branch(repo: Path, branch: str) -> bool:
     """Reports whether a branch still exists in a repository."""
     return bool(
@@ -2598,6 +2631,130 @@ attempt of the recorded budget, which is also only reported.
             forge.unassign(repo, parse_issue(number))
         return record
 
+    def issue_assign(
+        self,
+        repo: Path,
+        number: str,
+        name: str = "",
+        *,
+        reason: str = "",
+        withdraw: bool = False,
+    ) -> dict:
+        """Offers one issue to a lane, or withdraws that offer again.
+
+        The operator directs work by offering it, never by taking it. An
+        unheld issue is offered to the named lane directly, and that lane
+        answers the offer exactly as it answers a peer's. A held issue stays
+        with its owner: the operator's wish is recorded as a request that
+        owner answers, and only that answer creates the offer to the named
+        lane. No command line moves ownership that a lane has not accepted.
+
+        Args:
+            repo: Any checkout of the target repository.
+            number: Repository issue number being offered.
+            name: Lane the issue is offered to.
+            reason: Why the operator is moving the work. It travels with the
+                offer and is kept on the record.
+            withdraw: Whether to withdraw an operator offer no lane accepted.
+
+        Returns:
+            Which of the two paths was recorded, the issue, the identifier the
+            answering lane quotes, the recipient, the current owner, and,
+            where a request was recorded, whether its notice reached the
+            owner's inbox and why it did not.
+
+        Raises:
+            BridgeError: If the repository has no project, the named lane is
+                not a participant or already owns the issue, or no operator
+                offer is pending to withdraw.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        issue = parse_issue(number)
+        record = change(
+            directory,
+            roster.OPERATOR,
+            "unassign" if withdraw else "assign",
+            number,
+            participants=set(data["participants"]),
+            to=name,
+            summary=reason,
+            defaults=data["deadlines"],
+        )
+        result = {
+            "issue": int(issue),
+            "recorded": "withdrawal",
+            "owner": record["owner"],
+            "to": name,
+            "offer_id": "",
+            "delivered": True,
+            "detail": "",
+        }
+        if withdraw:
+            return result
+        if pending := record.get("request"):
+            result.update(
+                recorded="request",
+                to=pending["to"],
+                offer_id=pending["id"],
+                **self._request_notice(data, record["owner"], issue, pending),
+            )
+            return result
+        offer = record["offer"]
+        result.update(recorded="offer", to=offer["to"], offer_id=offer["id"])
+        return result
+
+    def _request_notice(
+        self, data: dict, owner: str, issue: str, request: dict
+    ) -> dict:
+        """Delivers the operator's handoff request to the issue's owner.
+
+        The ledger already carries the request when this runs, so a mailbox
+        that cannot be written leaves the request in force and is reported
+        rather than reversing it. The owner reads the offer identifier it
+        must quote to authorize the handoff, and nothing here accepts,
+        declines or transfers anything on that owner's behalf.
+
+        Args:
+            data: Project manifest for the repository.
+            owner: Lane that holds the issue.
+            issue: Repository issue number the request names.
+            request: Recorded request, carrying its identifier and reason.
+
+        Returns:
+            Whether the notice reached the owner's inbox, and the failure
+            text when it did not.
+        """
+        participant = data["participants"].get(owner) or {}
+        subject = f"Operator request: hand issue #{issue} to {request['to']}"
+        body = "\n".join(
+            [
+                f"The operator asks you to hand issue #{issue} to "
+                f"{request['to']}.",
+                f"Reason: {request['reason'] or 'none given'}",
+                f"Authorize it with: agent-parley issue accept {issue} "
+                f"--offer-id {request['id']}",
+                f"Refuse it with: agent-parley issue decline {issue} "
+                f"--offer-id {request['id']}",
+                "You keep the issue until you authorize the handoff, and "
+                f"{request['to']} owns it only after accepting the offer "
+                "your authorization creates.",
+            ]
+        )
+        identity = participant.get("display", owner)
+        try:
+            store.speak(
+                self.home,
+                data["root"],
+                identity,
+                subject,
+                body,
+                operator_key(identity, subject, body),
+            )
+        except BridgeError as exc:
+            return {"delivered": False, "detail": str(exc)}
+        return {"delivered": True, "detail": ""}
+
     def doctor(self) -> dict:
         """Reports the launcher, plugin and store versions and their fit.
 
@@ -3836,6 +3993,35 @@ def main() -> int:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    assigning = actions.add_parser(
+        "assign",
+        help="Offer an issue to a lane as the operator, or withdraw it.",
+    )
+    assigning.add_argument("--repo", type=Path, default=Path.cwd())
+    assigning.add_argument("number")
+    assigning.add_argument(
+        "name",
+        nargs="?",
+        default="",
+        help="Lane the issue is offered to.",
+    )
+    assigning.add_argument(
+        "--reason",
+        default="",
+        metavar="TEXT",
+        help=(
+            "Why the work is moving. It travels with the offer and is kept "
+            "on the record."
+        ),
+    )
+    assigning.add_argument(
+        "--unassign",
+        action="store_true",
+        help=(
+            "Withdraw an operator offer no lane has accepted. An offer that "
+            "was accepted is refused, naming the lane that holds the issue."
+        ),
+    )
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -4207,6 +4393,22 @@ def main() -> int:
                     f"Operator message {delivered['id']} {state} to "
                     f"{args.participant}."
                 )
+        elif args.command == "issue" and args.action == "assign":
+            if args.unassign and args.name:
+                parser.error("issue assign takes a lane or --unassign.")
+            if not args.unassign and not args.name:
+                parser.error("issue assign needs a lane, or --unassign.")
+            print(
+                assignment(
+                    bridge.issue_assign(
+                        args.repo.resolve(),
+                        args.number,
+                        args.name,
+                        reason=args.reason,
+                        withdraw=args.unassign,
+                    )
+                )
+            )
         elif args.command == "issue":
             result = bridge.issue(
                 args.repo.resolve(),
