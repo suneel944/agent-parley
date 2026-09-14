@@ -427,6 +427,7 @@ def participants(manifest: dict) -> list[dict]:
             "lane": participant["lane"],
             "paused": participant.get("paused", False),
             "wake": participant.get("wake", True),
+            "budget": participant.get("budget") or {},
         }
         for name, participant in sorted(manifest["participants"].items())
     ]
@@ -465,6 +466,8 @@ def _row(row: dict) -> dict:
         "tokens": row["tokens"],
         "idle_seconds": row["idle_seconds"],
         "idle_complete": row["idle_complete"],
+        "over_budget": row.get("over_budget", False),
+        "budget": row.get("budget") or {},
         "fit": row["fit"],
         "unfit_reason": row["unfit"] or None,
         "work_offer": row["offer_kind"] or None,

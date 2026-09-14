@@ -25,6 +25,7 @@ from pathlib import Path
 
 from agent_parley import (
     approvals,
+    budgets,
     checkpoints,
     completion,
     dashboard,
@@ -372,6 +373,8 @@ class Selection:
             the window.
         since: Seconds of coordination inactivity `idle` requires; the
             project's configured interval when zero.
+        over_budget: Report only lanes over any of their advisory token,
+            call or hour limits.
         issue: Issue number a lane must hold or be offered.
     """
 
@@ -383,6 +386,7 @@ class Selection:
     pending: bool = False
     idle: bool = False
     since: float = 0.0
+    over_budget: bool = False
     issue: int = 0
 
     def filtered(self) -> bool:
@@ -395,6 +399,7 @@ class Selection:
             or self.drifted
             or self.pending
             or self.idle
+            or self.over_budget
             or self.issue
         )
 
@@ -414,6 +419,8 @@ class Selection:
             applied.append("--pending")
         if self.idle:
             applied.append("--idle")
+        if self.over_budget:
+            applied.append("--over-budget")
         if self.issue:
             applied.append(f"--issue {self.issue}")
         return " ".join(applied)
@@ -453,6 +460,10 @@ class Selection:
             and (not self.drifted or record["drift"])
             and (not self.pending or waiting)
             and (not self.idle or self._inactive(record))
+            and (
+                not self.over_budget
+                or (record.get("budget") or {}).get("over", False)
+            )
             and (not self.issue or self.issue in held or self.issue in offers)
         )
 
@@ -544,6 +555,8 @@ def lane_detail(record: dict, data: dict) -> None:
         )
     if record["idle"]["stalled"]:
         print(f"    {record['idle']['marker']}")
+    if record["budget"]["marker"]:
+        print(f"    {record['budget']['marker']}")
     print(
         "    Observed coordination inactivity: "
         f"{record['idle_seconds']}s"
@@ -1204,16 +1217,59 @@ def add_selector(
         help="Select only the lanes supervision currently reads as stalled.",
     )
     selection.add_argument(
+        "--over-budget",
+        action="store_true",
+        help=(
+            "Select only the lanes over any of their advisory token, call "
+            "or hour limits."
+        ),
+    )
+    selection.add_argument(
         "--yes",
         action="store_true",
         help="Skip the single confirmation covering the whole selected set.",
     )
 
 
+def add_budget_flags(command: argparse.ArgumentParser) -> None:
+    """Adds the three advisory limit flags a budget command accepts.
+
+    Args:
+        command: Parser for a participant, provider or project budget.
+    """
+    for field, kind, described in (
+        ("tokens", int, "tokens the lane's own client may record"),
+        ("calls", int, "coordination calls the lane may be served"),
+        ("hours", float, "hours the lane's session may stay alive"),
+    ):
+        command.add_argument(
+            f"--{field}",
+            type=kind,
+            metavar="N",
+            help=(
+                f"Advisory limit on the {described}; 0 removes it. Crossing "
+                "it marks the lane and sends one notice, and stops nothing."
+            ),
+        )
+
+
+def budget_changes(args: argparse.Namespace) -> dict | None:
+    """Reads the budget flags, or None when none was given."""
+    changes = {field: getattr(args, field) for field in roster.BUDGET_FIELDS}
+    if all(value is None for value in changes.values()):
+        return None
+    return changes
+
+
 def selected(args: argparse.Namespace) -> bool:
     """Reports whether the command line carries any lane selector."""
     return bool(
-        args.all or args.provider or args.outcome or args.drifted or args.idle
+        args.all
+        or args.provider
+        or args.outcome
+        or args.drifted
+        or args.idle
+        or getattr(args, "over_budget", False)
     )
 
 
@@ -1223,9 +1279,10 @@ def matching_lanes(
     """Names every participant the command line's lane selector matched.
 
     The filters read the provider that drives a lane, the lane's own latest
-    reported outcome, whether its checkout sits on the branch it was assigned
-    and whether supervision currently reads it as stalled. `--all` adds no
-    filter of its own, so it selects whatever the others leave.
+    reported outcome, whether its checkout sits on the branch it was assigned,
+    whether supervision currently reads it as stalled and whether it is over
+    an advisory budget. `--all` adds no filter of its own, so it selects
+    whatever the others leave.
 
     Args:
         home: Private bridge state root.
@@ -1236,7 +1293,16 @@ def matching_lanes(
     Returns:
         The matched participants in roster order.
     """
+    import sqlite3
+
     stalled_after = supervision.configuration(home, data)["stalled_after"]
+    over_budget = getattr(args, "over_budget", False)
+    usage = {}
+    if over_budget:
+        try:
+            usage = store.usage(home, data["root"])
+        except sqlite3.Error:
+            usage = {}
     names = []
     for name in sorted(data["participants"]):
         participant = data["participants"][name]
@@ -1250,6 +1316,11 @@ def matching_lanes(
             continue
         stalled = supervision.stall(home, directory, data, name, stalled_after)
         if args.idle and not stalled["stalled"]:
+            continue
+        if (
+            over_budget
+            and not budgets.report(home, directory, data, name, usage)["over"]
+        ):
             continue
         names.append(name)
     return names
@@ -1565,7 +1636,13 @@ def merged_lanes(
         BridgeError: If the selection is ambiguous or names nothing, or if
             the ordered run stops on a refusal or a failure.
     """
-    narrowing = bool(args.provider or args.outcome or args.drifted or args.idle)
+    narrowing = bool(
+        args.provider
+        or args.outcome
+        or args.drifted
+        or args.idle
+        or getattr(args, "over_budget", False)
+    )
     if selected(args) or args.group:
         if args.name:
             raise BridgeError(
@@ -2764,6 +2841,101 @@ class Bridge:
             + (f", attempt budget {budget}" if budget else "")
             + ". An overdue claim is still owned; only an explicit release or "
             "an accepted handoff moves it."
+        )
+
+    def budget(
+        self, repo: Path, scope: str, name: str, changes: dict | None = None
+    ) -> str:
+        """Reports or records the advisory consumption limits of one record.
+
+        A budget is distinct from the project's deadlines: deadlines are
+        windows and attempt counts on claims, offers and acknowledgements,
+        while a budget is a ceiling on the tokens, served calls and session
+        hours a lane consumes. A participant's limit wins over its
+        provider's, which wins over the project's, field by field. Crossing
+        a limit marks the lane and sends it one notice; nothing is stopped,
+        revoked or refused, and a token budget counts what the lane's own
+        client recorded rather than spend.
+
+        Args:
+            repo: Any checkout of the target repository.
+            scope: ``participant``, ``provider`` or ``project``.
+            name: Participant or provider the limits belong to; ignored for
+                the project.
+            changes: Flag values per field; None reports the current
+                limits. A field left None is unchanged and 0 removes it.
+
+        Returns:
+            An account of the recorded limits and, for a participant, of
+            its consumption against the limits that apply.
+
+        Raises:
+            BridgeError: If the record does not exist or a limit is unusable.
+        """
+        import sqlite3
+
+        if scope == "provider":
+            if changes is not None:
+                roster.provider_budget(self.home, name, changes)
+            recorded = dict(
+                roster.provider(self.home, name).get("budget") or {}
+            )
+            return f"provider {name} " + self._budget_account(recorded)
+        _, directory = self.project(repo, create=False)
+        if changes is not None:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                if scope == "project":
+                    data["budget"] = roster.merged_budget(
+                        data["budget"], changes
+                    )
+                else:
+                    participant = data["participants"].get(name)
+                    if participant is None:
+                        raise BridgeError(
+                            f"{name} is not a participant in this project; "
+                            "run agent-parley participant list."
+                        )
+                    participant["budget"] = roster.merged_budget(
+                        participant.get("budget") or {}, changes
+                    )
+                write_json(directory / "project.json", data)
+        data = roster.read(directory)
+        if scope == "project":
+            return f"{data['root']} " + self._budget_account(data["budget"])
+        if name not in data["participants"]:
+            raise BridgeError(
+                f"{name} is not a participant in this project; "
+                "run agent-parley participant list."
+            )
+        try:
+            usage = store.usage(self.home, data["root"])
+        except sqlite3.Error:
+            usage = {}
+        reading = budgets.report(self.home, directory, data, name, usage)
+        own = data["participants"][name].get("budget") or {}
+        standing = budgets.marker(reading) or "no budget applies"
+        return (
+            f"{name} "
+            + self._budget_account(own)
+            + f" Standing: {standing}. A budget informs and does not gate."
+        )
+
+    @staticmethod
+    def _budget_account(recorded: dict) -> str:
+        """Words the limits one record carries of its own."""
+        if not recorded:
+            return "records no budget of its own."
+        return (
+            "records a budget of "
+            + ", ".join(
+                f"{field} {recorded[field]:,}"
+                if field != "hours"
+                else f"hours {recorded[field]:g}"
+                for field in roster.BUDGET_FIELDS
+                if field in recorded
+            )
+            + "."
         )
 
     def _record_operator(
@@ -4618,6 +4790,11 @@ attempt of the recorded budget, which is also only reported.
             supervision.configuration(self.home, data)["stalled_after"],
         )
         idle = metrics.idle_intervals(directory, agent)
+        try:
+            usage = store.usage(self.home, data["root"])
+        except sqlite3.Error:
+            usage = {}
+        budget = budgets.report(self.home, directory, data, agent, usage)
         record = {
             "participant": agent,
             "identity": name,
@@ -4672,6 +4849,10 @@ attempt of the recorded budget, which is also only reported.
             "operator_edits": list(edited),
             "idle_seconds": idle["seconds"],
             "idle_complete": idle["complete"],
+            "budget": {
+                **budget,
+                "marker": budgets.marker(budget),
+            },
             "waiting": metrics.pending(
                 metrics.waits(self.home, directory, data, agent)
             ),
@@ -5034,6 +5215,7 @@ attempt of the recorded budget, which is also only reported.
                 cursor=0,
                 session_pid=os.getpid(),
                 session_ticks=process.start_ticks(os.getpid()),
+                session_started=time.time(),
             )
             previous.pop("last_prompt", None)
             write_json(activity_path, previous)
@@ -5146,6 +5328,15 @@ def main() -> int:
         help=(
             "Inactivity an idle lane must show, such as 45m, 6h or 7d. The "
             "project's configured interval decides by default."
+        ),
+    )
+    health.add_argument(
+        "--over-budget",
+        action="store_true",
+        help=(
+            "Report only lanes over any of their advisory token, call or "
+            "hour limits. A budget informs and does not gate; the command "
+            "exits non-zero when one matches."
         ),
     )
     health.add_argument(
@@ -5674,6 +5865,16 @@ def main() -> int:
             add_selector(command)
         if action == "restart":
             command.add_argument("--task", default="")
+    limiting = roles.add_parser(
+        "budget",
+        help=(
+            "Show or set a lane's advisory token, call and hour limits; "
+            "crossing one marks the lane and stops nothing."
+        ),
+    )
+    limiting.add_argument("name")
+    limiting.add_argument("--repo", type=Path, default=Path.cwd())
+    add_budget_flags(limiting)
     granting = commands.add_parser(
         "approve",
         help="Record that you approve a lane's ready report for integration.",
@@ -5799,6 +6000,20 @@ def main() -> int:
             "exceeded. Exceeding it releases nothing."
         ),
     )
+    ceiling = commands.add_parser(
+        "budget",
+        help=(
+            "Show or set the advisory token, call and hour limits every "
+            "lane of this project inherits."
+        ),
+    )
+    ceiling_actions = ceiling.add_subparsers(dest="action", required=True)
+    ceiling_show = ceiling_actions.add_parser("show")
+    ceiling_show.add_argument("--repo", type=Path, default=Path.cwd())
+    ceiling_show.add_argument("--json", action="store_true", help=JSON_HELP)
+    ceiling_set = ceiling_actions.add_parser("set")
+    ceiling_set.add_argument("--repo", type=Path, default=Path.cwd())
+    add_budget_flags(ceiling_set)
     shared = commands.add_parser(
         "resources",
         help="Show or declare the named resources lanes may reserve.",
@@ -5832,6 +6047,15 @@ def main() -> int:
     defining.add_argument("--home-env", default="")
     defining.add_argument("--env", action="append", default=[])
     defining.add_argument("--require-env", action="append", default=[])
+    capping = definitions.add_parser(
+        "budget",
+        help=(
+            "Show or set the advisory limits every lane on this provider "
+            "inherits unless its own budget says otherwise."
+        ),
+    )
+    capping.add_argument("name")
+    add_budget_flags(capping)
     accounts = commands.add_parser(
         "credentials", help="Inspect or define per-account profiles."
     )
@@ -6137,6 +6361,16 @@ def main() -> int:
                 print(bridge.stop(repository, args.name))
             elif args.action == "restart":
                 return bridge.restart(repository, args.name, args.task)
+            elif args.action == "budget":
+                print(
+                    bridge.budget(
+                        repository,
+                        "participant",
+                        args.name,
+                        budget_changes(args),
+                    )
+                )
+                return 0
             if getattr(args, "json", False):
                 _, directory = bridge.project(repository)
                 data = roster.read(directory)
@@ -6186,6 +6420,26 @@ def main() -> int:
                 )
             else:
                 print(bridge.budgets(repository))
+        elif args.command == "budget":
+            repository = args.repo.resolve()
+            if getattr(args, "json", False):
+                _, directory = bridge.project(repository, create=False)
+                data = roster.read(directory)
+                print(
+                    views.render(
+                        "budget",
+                        {"root": data["root"], "budget": data["budget"]},
+                    )
+                )
+            else:
+                print(
+                    bridge.budget(
+                        repository,
+                        "project",
+                        "",
+                        budget_changes(args) if args.action == "set" else None,
+                    )
+                )
         elif args.command == "resources":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -6268,6 +6522,13 @@ def main() -> int:
                     )
             elif args.action == "remove":
                 roster.remove(bridge.home, "provider", args.name)
+            elif args.action == "budget":
+                print(
+                    bridge.budget(
+                        Path.cwd(), "provider", args.name, budget_changes(args)
+                    )
+                )
+                return 0
             defined = roster.providers(bridge.home)
             print(
                 views.render(
@@ -6317,6 +6578,7 @@ def main() -> int:
                 pending=args.pending,
                 idle=args.idle,
                 since=args.since,
+                over_budget=args.over_budget,
                 issue=args.issue,
             )
             if args.json:
@@ -6325,7 +6587,9 @@ def main() -> int:
                 matched = reported_lanes(narrowed)
             else:
                 matched = bridge.status(selection, terminal_width())
-            if matched and (selection.drifted or selection.pending):
+            if matched and (
+                selection.drifted or selection.pending or selection.over_budget
+            ):
                 return 1
         return 0
     except (

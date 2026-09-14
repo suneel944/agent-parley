@@ -96,6 +96,7 @@ agent-parley status --provider codex --outcome blocked
 agent-parley status --drifted
 agent-parley status --pending
 agent-parley status --idle --since 45m
+agent-parley status --over-budget
 agent-parley status --issue 42
 ```
 
@@ -104,7 +105,9 @@ an offer, or a reservation past its declared time to live. `--idle` reports a
 live lane that served no coordination call inside `--since`, or inside the
 project's configured interval when no window is given; it measures
 coordination inactivity, not what a native client was doing inside a turn.
-`--issue` reports the lanes that hold or are offered one issue. A selection
+`--over-budget` reports the lanes over any of their advisory token, call or
+hour limits and exits non-zero when one matches; the budget informs and does
+not gate. `--issue` reports the lanes that hold or are offered one issue. A selection
 that matches nothing prints one line naming the filters that were applied.
 
 `--drifted` and `--pending` exit non-zero when at least one lane matches, so a
@@ -325,7 +328,8 @@ agent-parley issue assign 42 --idle --provider codex
 `say`, `issue assign`, `participant stop`, `participant pause`,
 `participant resume`, `participant pr` and `participant merge` take a lane
 selector where they otherwise take a positional name. `--all` selects every
-lane; `--provider NAME`, `--outcome STATE`, `--drifted` and `--idle` narrow the
+lane; `--provider NAME`, `--outcome STATE`, `--drifted`, `--idle` and
+`--over-budget` narrow the
 selection, and a lane matches only when every given filter holds. The filters
 read the same facts `status` reports. A positional name and a selector together
 are refused, because a command that means two things is a command that loses a
@@ -422,6 +426,44 @@ runtime records one bounded notice per breach, addressed to the owner and to any
 lane waiting on that issue through a recorded dependency, so a peer can decide
 whether to ask for a handoff; the notice reaches them through the checkpoint
 delivery that already carries ledger changes.
+
+### Giving a lane a budget
+
+```sh
+agent-parley participant budget claude --tokens 2000000 --calls 5000 --hours 8
+agent-parley participant budget claude
+agent-parley provider budget codex --calls 5000
+agent-parley budget set --tokens 2000000
+agent-parley budget show
+agent-parley status --over-budget
+agent-parley participant pause --over-budget
+```
+
+A budget is distinct from a deadline: deadlines are windows and attempt
+counts on claims, offers and acknowledgements, while a budget is a ceiling on
+what a lane consumes. `participant budget NAME` records limits on one lane,
+`provider budget NAME` on every lane that provider drives, and `budget set` on
+every lane of the project; a participant's limit wins over its provider's,
+which wins over the project's, field by field, and any limit may stay unset.
+Passing `0` for a field removes it. `participant budget NAME` with no flags
+prints the lane's own limits and its standing against the limits that apply.
+
+Consumption is measured from readings that already exist. Tokens are what the
+lane's own native client recorded for its session, exactly as the `TOKENS`
+column reports them: no vendor request, no key, no price, so a token budget is
+a count and **not** spend. Calls are the coordination calls the store served
+for the lane within retention. Hours are how long the session process the
+launcher recorded has been alive; a stopped lane counts no hours.
+
+Crossing a limit is a visible state and one notice. `top` and `status` print
+`budget; tokens 1,200,000 of 2,000,000 (60%)` under a lane that carries a
+limit and `over budget; tokens 2,400,000 of 2,000,000 (120%)!` once one is
+crossed; `status NAME` and the JSON documents carry the figures under
+`budget`. The lane receives one bounded checkpoint notice naming the crossed
+limit, recorded in its lane state so it is not repeated until the limit is
+crossed again. Nothing is stopped, revoked or refused: `--over-budget` selects
+the crossed lanes, and `participant pause --over-budget` or `participant stop
+--over-budget` is the operator's decision to make.
 
 ### Delivering a message or an offer later
 
@@ -855,9 +897,12 @@ identifiers their kind adds: `path` for a reservation, `message_id` and
 `owner`, `title`, `deadline_at`, `overdue`, `overdue_seconds`, `attempts`,
 `attempt_budget`, `budget_exceeded`, `blocked_by`, `offer` and `reminder`; an
 `offer` additionally carries `deadline_at`, `overdue` and `overdue_seconds`.
-`deadlines show --json` reports `root` and the recorded `deadlines` defaults. `participants` reports
+`deadlines show --json` reports `root` and the recorded `deadlines` defaults.
+`budget show --json` reports `root` and the recorded `budget` defaults. `participants` reports
 `root` and a `participants` array carrying `participant`, `identity`,
-`provider`, `credential`, `branch`, `lane`, `paused` and `wake`.
+`provider`, `credential`, `branch`, `lane`, `paused`, `wake` and `budget`.
+Each `status` lane and each `top` row carries `over_budget` and a `budget`
+record with `limits`, `used`, `share`, `crossed` and `over`.
 
 These field names carry the same stability promise as the command-line flags:
 removing a field is a breaking change, and a release that adds one raises the

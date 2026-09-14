@@ -311,6 +311,75 @@ def deadlines(value: dict) -> dict:
     return result
 
 
+BUDGET_FIELDS = ("tokens", "calls", "hours")
+MAX_BUDGET = 10**12
+
+
+def budget(value: dict) -> dict:
+    """Validates the advisory consumption limits recorded on one record.
+
+    A budget names how many tokens, served calls or session hours a lane may
+    consume before it is reported as over budget. It is advisory: crossing it
+    marks the lane and sends it one notice, and nothing is stopped, revoked
+    or refused. A token budget counts what the lane's own client recorded,
+    never billed spend.
+
+    Args:
+        value: Limits recorded on a participant, a provider or a project.
+
+    Returns:
+        Validated limits; an absent field records no limit.
+
+    Raises:
+        BridgeError: If a field is unknown or holds an unusable value.
+    """
+    if not isinstance(value, dict) or set(value) - set(BUDGET_FIELDS):
+        raise BridgeError(
+            "A budget accepts only: " + ", ".join(BUDGET_FIELDS) + "."
+        )
+    result = {}
+    for field in BUDGET_FIELDS:
+        limit = value.get(field)
+        if limit is None:
+            continue
+        whole = field != "hours"
+        if (
+            type(limit) not in ((int,) if whole else (int, float))
+            or not 0 < limit <= MAX_BUDGET
+        ):
+            raise BridgeError(
+                f"The {field} budget must be a positive "
+                + ("whole number" if whole else "number")
+                + f" no greater than {MAX_BUDGET}."
+            )
+        result[field] = limit
+    return result
+
+
+def merged_budget(current: dict, changes: dict) -> dict:
+    """Applies budget flags to recorded limits, treating zero as unset.
+
+    Args:
+        current: Limits already recorded.
+        changes: Flag values; None leaves a field alone and 0 removes it.
+
+    Returns:
+        The validated result.
+
+    Raises:
+        BridgeError: If a resulting limit is unusable.
+    """
+    merged = {**current}
+    for field, limit in changes.items():
+        if limit is None:
+            continue
+        if limit == 0:
+            merged.pop(field, None)
+        else:
+            merged[field] = limit
+    return budget(merged)
+
+
 MAX_RESOURCES = 64
 RESOURCE = re.compile(r"[a-z][a-z0-9_-]{0,15}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 
@@ -529,6 +598,32 @@ def define_provider(
     )
 
 
+def provider_budget(home: Path, name: str, changes: dict) -> dict:
+    """Records advisory consumption limits on one provider definition.
+
+    A built-in preset gains a local override carrying the budget, so the
+    preset's launch contract is preserved and `provider remove` drops the
+    budget with the override.
+
+    Args:
+        home: Private bridge state root.
+        name: Provider name.
+        changes: Flag values per budget field; None leaves a field alone
+            and 0 removes it.
+
+    Returns:
+        The stored provider definition.
+
+    Raises:
+        BridgeError: If the provider is not defined or a limit is unusable.
+    """
+    entry = dict(provider(home, name))
+    entry["budget"] = merged_budget(
+        budget(dict(entry.get("budget") or {})), changes
+    )
+    return _define(home, PROVIDERS, name, entry)
+
+
 def credentials(home: Path) -> dict:
     """Returns every locally defined credential profile."""
     return _registry(home, CREDENTIALS, {})
@@ -711,6 +806,8 @@ def normalize(manifest: dict) -> dict:
                 + ", ".join(SCHEMES)
                 + "."
             )
+        if "budget" in participant:
+            participant["budget"] = budget(dict(participant["budget"] or {}))
     return {
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
@@ -722,6 +819,7 @@ def normalize(manifest: dict) -> dict:
         "initialize": list(manifest.get("initialize") or []),
         "resources": resources(list(manifest.get("resources") or [])),
         "deadlines": deadlines(dict(manifest.get("deadlines") or {})),
+        "budget": budget(dict(manifest.get("budget") or {})),
         "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "supervision": dict(manifest.get("supervision", {})),

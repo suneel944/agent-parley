@@ -12,6 +12,7 @@ from typing import Any
 
 from agent_parley import (
     approvals,
+    budgets,
     metrics,
     plan,
     process,
@@ -100,6 +101,10 @@ LEGEND = (
     "An issue marked ! is past its recorded deadline or its attempt "
     "budget. It is still owned: a deadline reports, and only an explicit "
     "release or an accepted handoff moves ownership.",
+    "A lane with a token, call or hour budget carries a line showing the "
+    "share consumed; over budget marks a crossed limit with !. The budget "
+    "informs and does not gate: nothing is stopped or refused, and a token "
+    "budget counts what the client recorded, not spend.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, with the age of the oldest; DENIALS "
     "denied or blocked of retained hook events; CALLS served MCP calls, "
@@ -271,6 +276,9 @@ def _row(
     idle = metrics.idle_intervals(directory, agent, context["since"])
     published = supervision.published_work(directory, agent)
     edited = context["operator_edits"].get(agent, [])
+    budget = budgets.report(
+        home, directory, data, agent, context["usage"], context["records"]
+    )
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -325,6 +333,9 @@ def _row(
         ),
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
+        "budget": budget,
+        "over_budget": budget["over"],
+        "budget_marker": budgets.marker(budget),
         "fit": published["fit"],
         "unfit": published["reason"],
         "work_offer": bool(published["offer"]),
@@ -742,6 +753,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
                 lines.append(f"    {row['stall']}")
             if row["operator_edit"]:
                 lines.append(f"    {row['operator_edit']}")
+            if row.get("budget_marker"):
+                lines.append(f"    {row['budget_marker']}")
             if row["unfit"]:
                 lines.append(f"    {row['unfit']}")
             if row["work_offer"]:
