@@ -728,6 +728,12 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
 def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
     """Observes a native event and prepares bounded coordination context.
 
+    A native event carrying a session identity confirms that identity as the
+    lane's resumable session. The launcher clears the live session field
+    before it starts a client, so this confirmation is what separates an
+    attempted launch from a session that actually reported itself, and it is
+    what a later resume reads.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -801,6 +807,8 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
             state["issue_revision"] = -1
             state.pop("roster", None)
         state.update(session_id=session, updated=time.time(), event=event)
+        if session:
+            state["resumable_session"] = session
         state.pop("checkpoint_error", None)
         if event == "SessionEnd":
             state["activity"] = "stopped"
