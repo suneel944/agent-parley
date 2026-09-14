@@ -453,7 +453,12 @@ issue this lane owns, stay correct without a key.
 Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer
 ID. Cancellation invalidates that ID. No timeout or process exit transfers
-ownership. Reported `ready` outcomes do not establish verified completion.
+ownership. The operator directs work through the same table rather than beside
+it: `issue assign` records an offer carrying `operator` as its source on an
+unheld issue, and on a held one records a request its owner answers, whose
+acceptance is what creates the offer to the named lane. Neither path writes an
+owner, so the command line cannot take work from a lane that has not agreed to
+give it up. Reported `ready` outcomes do not establish verified completion.
 Ownership listings report each owner's session state and the age of its last
 observed checkpoint. That report is for an operator; silence, an idle session
 and a stopped session all leave ownership where it is. `agent-parley top`

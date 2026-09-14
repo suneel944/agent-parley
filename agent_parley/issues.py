@@ -13,6 +13,9 @@ from agent_parley.state import BridgeError, lock, write_json
 
 MAX_BLOCKERS = 10
 SUPERVISION_ERROR = "supervision-error.json"
+OPERATOR = "operator"
+PEER = "peer"
+MAX_REASON = 2000
 
 
 def deadline_state(record: dict, now: float = 0.0) -> dict:
@@ -82,6 +85,20 @@ def released(record: dict) -> bool:
         return True
     prompt = record.get("handoff_prompt") or {}
     return prompt.get("trigger") == "pull request ended"
+
+
+def offer_source(offer: dict | None) -> str:
+    """Reports who raised one pending offer.
+
+    Args:
+        offer: Pending offer recorded on an issue, or None.
+
+    Returns:
+        ``operator`` for an offer the command line recorded, and ``peer`` for
+        an offer one lane made to another, including every offer recorded
+        before offers carried a source.
+    """
+    return (offer or {}).get("source") or PEER
 
 
 def attempt(directory: Path, agent: str, numbers: list[str]) -> dict:
@@ -250,16 +267,18 @@ def change(
 
     Args:
         directory: Private state directory for the common repository.
-        agent: Acting lane, resolved by the CLI from its worktree.
-        action: Claim, release, offer, accept, decline, cancel, block, or
-            unblock.
+        agent: Acting lane, resolved by the CLI from its worktree, or the
+            operator identity for an assignment.
+        action: Claim, release, offer, accept, decline, cancel, block,
+            unblock, assign, or unassign.
         issue: Positive repository issue number, optionally prefixed with #.
         participants: Every participant registered for this project.
         key: Idempotency key. Empty applies the transition without retry
             bookkeeping, which stays correct for transitions that are already
             idempotent, such as reclaiming an issue this lane owns.
-        to: Recipient participant for an offer.
-        summary: Peer-provided handoff context.
+        to: Recipient participant for an offer or an operator assignment.
+        summary: Peer-provided handoff context, or the operator's stated
+            reason for an assignment.
         offer_id: Exact current offer required for acceptance or decline.
         on: Issue this one waits on, for a block or unblock.
         title: Optional forge-supplied issue title recorded on a claim. It is
@@ -317,6 +336,168 @@ def change(
         raise
 
 
+def _unseen() -> dict:
+    """Returns an empty record for an issue the ledger has not seen yet."""
+    return {
+        "owner": None,
+        "offer": None,
+        "request": None,
+        "blocked_by": [],
+        "history": [],
+        "deadline": None,
+        "attempts": 0,
+        "budget": None,
+    }
+
+
+def _assign(
+    record: dict | None,
+    issue: str,
+    *,
+    recipient: str | None,
+    reason: str,
+    participants: set[str],
+    budgets: dict,
+) -> dict:
+    """Records an operator offer, or a request to the issue's current owner.
+
+    An operator directs work by offering it. An unheld issue receives the
+    offer directly and the named lane answers it like any other. A held issue
+    is not taken from its owner: the operator's wish is recorded as a request
+    the owner answers, and only that answer creates the offer to the named
+    lane. Ownership therefore still moves on an explicit acceptance alone.
+
+    Args:
+        record: Published record for this issue, or None when it has none.
+        issue: Repository issue number the offer is recorded against.
+        recipient: Participant the operator offers the issue to.
+        reason: Operator-provided rationale, travelling with the offer.
+        participants: Every participant registered for this project.
+        budgets: Project deadline and attempt-budget defaults.
+
+    Returns:
+        The record carrying either the recorded offer or the recorded request.
+
+    Raises:
+        BridgeError: If the recipient is not a participant, already owns the
+            issue, the reason is too long, or an offer or request is pending.
+    """
+    if recipient not in participants:
+        raise BridgeError(
+            "Choose a participant in this project; "
+            "run agent-parley participant list."
+        )
+    if len(reason) > MAX_REASON:
+        raise BridgeError(
+            f"Assignment reason must be at most {MAX_REASON} characters."
+        )
+    record = record or _unseen()
+    if record["owner"] == recipient:
+        raise BridgeError(f"Issue #{issue} is already owned by {recipient}.")
+    if record["offer"]:
+        raise BridgeError(
+            "An offer is pending on this issue; answer or cancel it first."
+        )
+    if record.get("request"):
+        raise BridgeError(
+            "An operator request is pending on this issue; "
+            "withdraw it with issue assign --unassign."
+        )
+    entry = {
+        "id": uuid.uuid4().hex,
+        "to": recipient,
+        "reason": reason,
+        "created": time.time(),
+        "source": OPERATOR,
+    }
+    if record["owner"]:
+        record["request"] = entry
+        return record
+    record["offer"] = _operator_offer(entry, issue, budgets)
+    return record
+
+
+def _operator_offer(entry: dict, issue: str, budgets: dict) -> dict:
+    """Shapes an operator offer so it reads exactly like a peer offer.
+
+    Args:
+        entry: Recorded operator intent, carrying its identifier, recipient
+            and reason.
+        issue: Repository issue number the offer names.
+        budgets: Project deadline and attempt-budget defaults.
+
+    Returns:
+        A pending offer carrying the operator's reason as its summary and the
+        identifier the operator was given, so one identifier names the work
+        from the command that recorded it to the lane that answers it. The
+        project's answer deadline applies when one is configured, measured
+        from the moment the offer started waiting.
+    """
+    answer = budgets.get("offer")
+    return {
+        **entry,
+        "summary": entry["reason"] or f"Operator offered issue #{issue}.",
+        "created": time.time(),
+        "deadline": time.time() + answer if answer else None,
+    }
+
+
+def _withdraw(record: dict | None, issue: str) -> dict:
+    """Withdraws an operator offer or request that nobody has accepted.
+
+    Args:
+        record: Published record for this issue, or None when it has none.
+        issue: Repository issue number the withdrawal names.
+
+    Returns:
+        The record with the pending operator offer or request removed.
+
+    Raises:
+        BridgeError: If no operator offer is pending, naming the lane that
+            holds the issue when one was already accepted.
+    """
+    if record and record.get("request"):
+        record["request"] = None
+        return record
+    if record and offer_source(record["offer"]) == OPERATOR:
+        record["offer"] = None
+        return record
+    if record and record["owner"]:
+        raise BridgeError(
+            f"No operator offer is pending on issue #{issue}; "
+            f"{record['owner']} accepted it and only that lane can hand it on."
+        )
+    raise BridgeError(f"No operator offer is pending on issue #{issue}.")
+
+
+def _answer_request(
+    record: dict, agent: str, issue: str, action: str, budgets: dict
+) -> dict:
+    """Applies the owner's answer to an operator handoff request.
+
+    Args:
+        record: Published record carrying the pending request.
+        agent: Lane answering the request.
+        issue: Repository issue number the request names.
+        action: Accept or decline.
+        budgets: Project deadline and attempt-budget defaults.
+
+    Returns:
+        The record carrying the offer the owner authorized, or the record with
+        the request removed when the owner declined.
+
+    Raises:
+        BridgeError: If a lane other than the owner answers.
+    """
+    request = record["request"]
+    if record["owner"] != agent:
+        raise BridgeError(f"Only {record['owner']} can answer this request.")
+    if action == "accept":
+        record["offer"] = _operator_offer(request, issue, budgets)
+    record["request"] = None
+    return record
+
+
 def _change(
     directory: Path,
     agent: str,
@@ -338,16 +519,18 @@ def _change(
 
     Args:
         directory: Private state directory for the common repository.
-        agent: Acting lane, resolved by the CLI from its worktree.
-        action: Claim, release, offer, accept, decline, cancel, block, or
-            unblock.
+        agent: Acting lane, resolved by the CLI from its worktree, or the
+            operator identity for an assignment.
+        action: Claim, release, offer, accept, decline, cancel, block,
+            unblock, assign, or unassign.
         issue: Positive repository issue number, optionally prefixed with #.
         participants: Every participant registered for this project.
         scope: Retained key this transition is recorded under. Empty records
             no key and applies the transition directly.
         fingerprint: Digest of the arguments the key was issued against.
-        to: Recipient participant for an offer.
-        summary: Peer-provided handoff context.
+        to: Recipient participant for an offer or an operator assignment.
+        summary: Peer-provided handoff context, or the operator's stated
+            reason for an assignment.
         offer_id: Exact current offer required for acceptance or decline.
         on: Issue this one waits on, for a block or unblock.
         title: Optional forge-supplied issue title recorded on a claim. It is
@@ -366,6 +549,7 @@ def _change(
     """
     issue = parse_issue(issue)
     budgets = defaults or {}
+    logged = action
     blocker = ""
     if action in ("block", "unblock"):
         blocker = parse_issue(on or "", "Blocker")
@@ -391,6 +575,7 @@ def _change(
             record = {
                 "owner": agent,
                 "offer": None,
+                "request": None,
                 "blocked_by": previous.get("blocked_by", []),
                 "history": previous.get("history", []),
                 "deadline": time.time() + expected if expected else None,
@@ -401,10 +586,28 @@ def _change(
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
+        elif action == "assign":
+            record = _assign(
+                record,
+                issue,
+                recipient=to,
+                reason=summary.strip(),
+                participants=participants,
+                budgets=budgets,
+            )
+        elif action == "unassign":
+            record = _withdraw(record, issue)
         else:
-            if not record or not record["owner"]:
+            answering = action in ("accept", "decline")
+            if not record or not (
+                record["owner"] or (answering and record["offer"])
+            ):
                 raise BridgeError(f"Issue #{issue} has no owner.")
-            if action in ("accept", "decline"):
+            request = record.get("request")
+            if answering and request and request["id"] == offer_id:
+                record = _answer_request(record, agent, issue, action, budgets)
+                logged = "authorize" if action == "accept" else "refuse"
+            elif answering:
                 offer = record["offer"]
                 if not offer or offer["id"] != offer_id:
                     raise BridgeError(
@@ -420,6 +623,7 @@ def _change(
                     )
                     record.update(
                         owner=agent,
+                        request=None,
                         deadline=(time.time() + expected if expected else None),
                         attempts=0,
                         budget=budgets.get("attempts") or None,
@@ -463,7 +667,9 @@ def _change(
                         raise BridgeError("No handoff is pending.")
                     record["offer"] = None
                 elif action == "release":
-                    record.update(owner=None, offer=None, deadline=None)
+                    record.update(
+                        owner=None, offer=None, request=None, deadline=None
+                    )
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
                     if blocker in waiting:
@@ -487,11 +693,12 @@ def _change(
                     raise BridgeError("Unknown issue action.")
         record["history"].append(
             {
-                "action": action,
+                "action": logged,
                 "actor": agent,
                 "at": time.time(),
                 "owner": record["owner"],
                 "offer": record["offer"],
+                "request": record.get("request"),
                 "offer_id": offer_id,
                 "claim_id": record.get("claim_id"),
             }
@@ -548,7 +755,9 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
     Returns:
         One line for each owned issue, carrying any recorded forge title as
         display context, naming any issue it waits on and who holds that
-        issue, or a notice that none are claimed.
+        issue, or a notice that none are claimed. An unclaimed issue appears
+        only while an offer waits on it, reported as unclaimed and naming the
+        operator as the source when the command line recorded that offer.
     """
     lines = []
     for number, record in sorted(
@@ -560,9 +769,9 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
                 lines.append(
                     f"Handoff reminder unanswered {age}s: {prompt['text']}"
                 )
-        if not record["owner"]:
+        if not record["owner"] and not record["offer"]:
             continue
-        line = f"#{number}: {record['owner']}"
+        line = f"#{number}: {record['owner'] or 'unclaimed'}"
         if liveness and record["owner"] in liveness:
             line += f" ({liveness[record['owner']]})"
         if title := record.get("title"):
@@ -586,12 +795,29 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         if offer := record["offer"]:
             age = max(0, int(time.time() - offer["created"]))
             waiting = offer_state(offer)
+            operator = offer_source(offer) == OPERATOR
+            label = "operator offer" if operator else "handoff"
             line += (
-                f"; handoff to {offer['to']} pending {age}s; "
+                f"; {label} to {offer['to']} pending {age}s; "
                 f"offer {offer['id']}"
             )
             if waiting["overdue"]:
                 line += f"; overdue {waiting['overdue_seconds']}s"
-            line += "\n  Peer-provided summary: " + json.dumps(offer["summary"])
+            note = (
+                "Operator-stated reason"
+                if operator
+                else "Peer-provided summary"
+            )
+            line += f"\n  {note}: " + json.dumps(offer["summary"])
+        if request := record.get("request"):
+            age = max(0, int(time.time() - request["created"]))
+            line += (
+                f"; operator asked {record['owner']} to hand it to "
+                f"{request['to']} {age}s ago; offer {request['id']}"
+            )
+            if request["reason"]:
+                line += "\n  Operator-stated reason: " + json.dumps(
+                    request["reason"]
+                )
         lines.append(line)
     return "\n".join(lines) or "No issues claimed."

@@ -25,7 +25,18 @@ from agent_parley.state import BridgeError
 
 KINDS = ("claim", "handoff", "report", "reservation", "message")
 CLAIM_ACTIONS = frozenset({"claim", "release"})
-HANDOFF_ACTIONS = frozenset({"offer", "accept", "decline", "cancel"})
+HANDOFF_ACTIONS = frozenset(
+    {
+        "offer",
+        "accept",
+        "decline",
+        "cancel",
+        "assign",
+        "unassign",
+        "authorize",
+        "refuse",
+    }
+)
 MAX_RECORDS = 500
 
 
@@ -33,6 +44,14 @@ def _provider(manifest: dict, participant: str | None) -> str:
     """Names the provider driving one participant, when it is still known."""
     entry = manifest["participants"].get(participant or "")
     return str(entry["provider"]) if entry else ""
+
+
+def _detail(action: str, number: str, entry: dict) -> str:
+    """Names one ledger transition, carrying any operator-stated reason."""
+    detail = f"{action} #{number}"
+    pending = entry.get("offer") or entry.get("request") or {}
+    reason = pending.get("reason")
+    return f"{detail}: {reason}" if reason else detail
 
 
 def _ledger_records(directory: Path, manifest: dict) -> list[dict]:
@@ -57,7 +76,7 @@ def _ledger_records(directory: Path, manifest: dict) -> list[dict]:
                     "issue": int(number),
                     "claim_id": entry.get("claim_id"),
                     "owner": entry.get("owner"),
-                    "detail": f"{action} #{number}",
+                    "detail": _detail(action, number, entry),
                 }
             )
     return records

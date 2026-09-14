@@ -224,11 +224,25 @@ def offer(value: dict | None) -> dict | None:
     return {
         "offer_id": value["id"],
         "to": value["to"],
+        "source": issues_state.offer_source(value),
         "summary": value["summary"],
         "created_at": timestamp(value.get("created")),
         "deadline_at": timestamp(waiting["deadline"]),
         "overdue": waiting["overdue"],
         "overdue_seconds": waiting["overdue_seconds"],
+    }
+
+
+def request(value: dict | None) -> dict | None:
+    """Reports one operator request that the issue's owner has not answered."""
+    if not value:
+        return None
+    return {
+        "offer_id": value["id"],
+        "to": value["to"],
+        "source": value.get("source") or issues_state.OPERATOR,
+        "reason": value.get("reason", ""),
+        "created_at": timestamp(value.get("created")),
     }
 
 
@@ -311,7 +325,8 @@ def issues(state: dict) -> list[dict]:
     Returns:
         One record per issue, carrying its owner, any recorded forge title,
         the issues it waits on, its pending offer with that offer's
-        identifier, and any unanswered completion reminder.
+        identifier and source, any unanswered operator request to its owner,
+        and any unanswered completion reminder.
     """
     reported = []
     for number, record in sorted(
@@ -334,6 +349,7 @@ def issues(state: dict) -> list[dict]:
                     int(other) for other in record.get("blocked_by", [])
                 ],
                 "offer": offer(record.get("offer")),
+                "request": request(record.get("request")),
                 "reminder": (
                     {
                         "text": prompt["text"],
