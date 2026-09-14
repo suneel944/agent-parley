@@ -250,6 +250,13 @@ status continues to show the drift.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
+**A stalled lane says so.** `top` and `status` mark a lane `idle` when its
+process is alive, no coordination call has been served for it within the
+configured interval, and it holds unread or unacknowledged mail at least that
+old — and they name the oldest waiting item and how long it has waited. The
+marker only reports: nothing is revoked, no claim is released and no ownership
+moves.
+
 **Your history stays yours.** A lane branch is `parley/PROJECT_KEY/lane-N`: it
 carries no participant, provider or account name, and `agent-parley branch set
 PREFIX` changes the prefix per project. No lane signs its work either. A commit,

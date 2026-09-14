@@ -2390,6 +2390,13 @@ review, not merged or independently verified. An idle turn is not completion.
         )
         branch = lane_branch(Path(participant["lane"]))
         reported_at = state.get("reported_at")
+        idle = supervision.stall(
+            self.home,
+            directory,
+            data,
+            agent,
+            supervision.configuration(self.home, data)["stalled_after"],
+        )
         record = {
             "participant": agent,
             "identity": name,
@@ -2416,6 +2423,15 @@ review, not merged or independently verified. An idle turn is not completion.
             ),
             "injected_bytes": state.get("injected_bytes", 0),
             "injections": state.get("injections", 0),
+            "idle": {
+                "stalled": idle["stalled"],
+                "kind": idle["kind"],
+                "message_id": idle["message_id"],
+                "sender": idle["sender"],
+                "age_seconds": idle["age_seconds"],
+                "served_age_seconds": idle["served_age_seconds"],
+                "marker": supervision.stall_marker(idle),
+            },
             "wake": None,
             "mail": None,
         }
@@ -2525,6 +2541,8 @@ review, not merged or independently verified. An idle turn is not completion.
                             record["branch"],
                         )
                     )
+                if record["idle"]["stalled"]:
+                    print(f"    {record['idle']['marker']}")
                 print(f"    Reported outcome: {record['outcome']}")
                 print(
                     f"    Context delivered: {record['injected_bytes']} "
