@@ -22,6 +22,8 @@ from agent_parley.store import DATABASE
 MAX_CONTEXT_BYTES = 1536
 MAX_EVENT_LOG_BYTES = 262144
 MAX_EVENT_LOG_AGE = 1209600
+EVENT_LOCK_TIMEOUT = 2.0
+EVENT_LOCK_POLL = 0.01
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
         "-C",
@@ -156,68 +158,124 @@ def record(
 
 @contextlib.contextmanager
 def event_lock(
-    directory: Path, agent: str, *, exclusive: bool = False
+    directory: Path,
+    agent: str,
+    *,
+    exclusive: bool = False,
+    timeout: float = 0.0,
 ) -> Iterator[None]:
     """Protects event-file lifetimes separately from coordination mutations.
 
-    Append writers share the lock and do not serialize one another. Rotation
-    and pruning need exclusive access: locking only maintenance would still
-    let a writer append to an inode that pruning has already replaced. The
-    lock file is never removed, and process exit releases its kernel lock.
+    Append writers and readers share the lock and do not serialize one
+    another. Rotation and pruning need exclusive access: locking only
+    maintenance would still let a writer append to an inode that pruning has
+    already replaced, and would let a reader collect the rotated file and the
+    current file from two different generations. The lock file is never
+    removed, and process exit releases its kernel lock.
+
+    A reader must not wait without bound behind maintenance, so a positive
+    timeout polls for the lock and reports an explicit failure instead of
+    blocking. Writers on the hook path keep waiting, because dropping a
+    record is worse for them than a brief wait.
 
     Args:
         directory: Private project state directory.
         agent: Participant whose event files are protected.
         exclusive: Whether to exclude readers and append writers.
+        timeout: Seconds to wait before reporting the log unavailable. Zero
+            waits indefinitely.
 
     Yields:
         None while event paths cannot be replaced by another process.
+
+    Raises:
+        BridgeError: If a bounded acquisition does not succeed in time.
     """
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     with (directory / f"{agent}-events.lock").open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        if timeout <= 0:
+            fcntl.flock(stream, mode)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(stream, mode | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise BridgeError(
+                            f"The event log for {agent} stayed locked for "
+                            f"{timeout:g}s, so no consistent snapshot could "
+                            "be taken. Retry once maintenance finishes."
+                        ) from None
+                    time.sleep(EVENT_LOCK_POLL)
         try:
             yield
         finally:
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def read_events(directory: Path, agent: str, since: float = 0.0) -> list[dict]:
+def read_events(
+    directory: Path,
+    agent: str,
+    since: float = 0.0,
+    timeout: float = EVENT_LOCK_TIMEOUT,
+) -> list[dict]:
     """Reads the retained hook event records for one participant.
 
     Records are returned oldest first, the rotated file before the current
     one, so a reader covers everything still retained rather than the current
-    file alone. An unreadable file and a malformed line are skipped, because a
-    damaged log must never fail a report.
+    file alone. Both files are read under the shared event lock, because a
+    rotation between the two reads would move records out of the current file
+    after it was read and into a rotated file that was already read, and the
+    snapshot would omit them. Those records stay on disk; the defect was an
+    incomplete snapshot, never a deletion.
+
+    An unreadable file and a malformed line are still skipped, because a
+    damaged log must never fail a report. A log held by maintenance longer
+    than the bound is a different outcome and is reported rather than
+    answered with a partial snapshot. A participant with no log at all is
+    answered without taking the lock, so reading never creates state for a
+    lane that has recorded nothing.
 
     Args:
         directory: Private state directory for the common repository.
         agent: Participant that owns the lane.
         since: Unix time floor; a record older than it, or carrying no time,
             is omitted. Zero returns everything retained.
+        timeout: Seconds to wait for a consistent view before reporting the
+            log unavailable.
 
     Returns:
         Retained records, oldest first.
+
+    Raises:
+        BridgeError: If the event log stays locked for longer than timeout.
     """
+    names = (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl")
+    if not any((directory / name).exists() for name in names):
+        return []
     entries = []
-    for name in (f"{agent}-events.1.jsonl", f"{agent}-events.jsonl"):
-        try:
-            text = (directory / name).read_text(errors="ignore")
-        except OSError:
-            continue
-        for line in text.splitlines():
+    with event_lock(directory, agent, timeout=timeout):
+        for name in names:
             try:
-                entry = json.loads(line)
-            except ValueError:
+                text = (directory / name).read_text(errors="ignore")
+            except OSError:
                 continue
-            if not isinstance(entry, dict):
-                continue
-            try:
-                timestamp = float(entry.get("ts", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if timestamp < since:
-                continue
-            entries.append(entry)
+            for line in text.splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    timestamp = float(entry.get("ts", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp < since:
+                    continue
+                entries.append(entry)
     return entries
 
 
@@ -550,6 +608,12 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
     first, so reaching the byte cap does not reset a running total. Only one
     rotation is retained, so a record older than that is not counted.
 
+    A live view must keep drawing, so a log held by maintenance past the
+    bound reports zero counts with an unavailable reason class rather than
+    failing the whole report. A caller that needs a complete snapshot, such
+    as review evidence or an event export, reads the log directly and
+    receives the failure instead.
+
     Args:
         directory: Private state directory for the common repository.
         agent: Participant that owns the lane.
@@ -560,7 +624,16 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
         Observed event count, denials, injected bytes, and the time and
         reason class of the most recent record.
     """
-    entries = read_events(directory, agent, since)
+    try:
+        entries = read_events(directory, agent, since)
+    except BridgeError:
+        return {
+            "events": 0,
+            "denials": 0,
+            "injected_bytes": 0,
+            "last_ts": 0.0,
+            "last_reason": "unavailable",
+        }
     last = entries[-1] if entries else {}
     return {
         "events": len(entries),
