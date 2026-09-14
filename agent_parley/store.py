@@ -1036,6 +1036,11 @@ def _dispatch(
 def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
     """Applies one validated coordination tool to the open transaction.
 
+    Marking a message read or acknowledged stamps only the timestamp that is
+    still unset, so a retry or a later acknowledgement keeps the first reading
+    and the first acknowledgement as recorded. Marking read never disturbs an
+    acknowledgement already recorded against the same message.
+
     Args:
         db: Open transaction owned by the caller.
         actor: Authenticated project and lane.
@@ -1076,8 +1081,9 @@ def _serve(db: sqlite3.Connection, actor: dict, tool: str, args: dict) -> dict:
         message = _number(args.get("message_id"), "message_id", 1, 2**63 - 1)
         ack = tool == "acknowledge_message"
         result = db.execute(
-            "UPDATE message_recipients SET read_ts=CURRENT_TIMESTAMP"
-            + (",ack_ts=CURRENT_TIMESTAMP" if ack else "")
+            "UPDATE message_recipients "
+            "SET read_ts=COALESCE(read_ts,CURRENT_TIMESTAMP)"
+            + (",ack_ts=COALESCE(ack_ts,CURRENT_TIMESTAMP)" if ack else "")
             + " WHERE message_id=? AND agent_id=?",
             (message, actor["id"]),
         )
