@@ -37,6 +37,33 @@ def test_the_documented_table_matches_the_code_constants():
     assert int(schema) == store.SCHEMA_VERSION
 
 
+def test_the_launcher_version_follows_the_checkout():
+    declared = (ROOT / "pyproject.toml").read_text()
+    version = re.search(r'^version = "([^"]+)"', declared, re.M)[1]
+    assert protocol.launcher_version() == version
+
+
+def test_an_installed_package_without_a_project_file_keeps_its_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(protocol, "package_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        protocol.importlib.metadata, "version", lambda name: "9.9.9"
+    )
+    assert protocol.launcher_version() == "9.9.9"
+
+
+def test_an_unreadable_project_file_keeps_the_recorded_metadata(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "pyproject.toml").write_text("not = [toml")
+    monkeypatch.setattr(protocol, "package_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        protocol.importlib.metadata, "version", lambda name: "9.9.9"
+    )
+    assert protocol.launcher_version() == "9.9.9"
+
+
 def test_a_mismatch_names_both_numbers_and_one_command():
     sentence = protocol.mismatch("installed plugin", 99)
     assert "protocol 99" in sentence

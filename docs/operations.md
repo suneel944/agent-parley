@@ -123,6 +123,12 @@ agent-parley doctor
 agent-parley doctor --json
 ```
 
+The launcher version reported here is the version of the code that is running.
+An editable install, which `make install-dev` creates, records its version once
+at install time and keeps reporting it after the checkout has moved on, so the
+project file beside the package is read wherever it exists and installation
+metadata is used only for a package installed without one.
+
 `doctor` prints the launcher version and protocol, the protocol each shipped
 plugin manifest declares, and the store's schema against the schema this build
 writes, then a verdict line. Its exit status is non-zero on a mismatch, so a
