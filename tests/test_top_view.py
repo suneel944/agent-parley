@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import dashboard
+from agent_parley import dashboard, tables
 from agent_parley.state import BridgeError
 
 HOME = Path("/tmp/parley-top-view")
@@ -156,7 +156,7 @@ def test_a_column_is_as_wide_as_its_widest_value_in_the_frame():
     row = next(line for line in frame["lines"] if line.startswith("codex "))
     assert "release/candidate-77" in row
     assert "…" not in row
-    assert "…" in dashboard._fit("release/candidate-77", 18)
+    assert "…" in tables.fit("release/candidate-77", 18)
 
 
 def test_a_narrow_terminal_drops_columns_instead_of_clipping_every_cell():

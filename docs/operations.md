@@ -70,6 +70,50 @@ as its source, an unclaimed issue appearing for as long as an offer waits on it.
 nobody has answered. An offer that was already accepted is refused, naming the
 lane that holds the issue, because only that lane can hand it on.
 
+### Reading status
+
+`status` prints the server line, the state directory, and then one table per
+project with a row per participant: `PARTICIPANT`, `PROVIDER`, `ACCOUNT`,
+`SESSION`, `BRANCH` with `!` when the lane left its assigned branch, `OUTCOME`,
+`ISSUES` held with `!` on an issue past its deadline or attempt budget and `+N`
+for offers waiting on that lane, `MAIL` as unread over pending acknowledgement,
+`LEASES` held with `!` and the stale count, `REPORTED` as the age of the last
+report, and `TASK`. A mailbox that could not be read prints `?` rather than a
+zero. Column widths follow the widest value and then the terminal, by the rule
+`top` uses: the least useful column is dropped first, the dropped headings are
+named under the table, and `TASK` takes whatever width is left. A pipe or a
+file receives the whole table, because no width is imposed on a stream that is
+not a terminal.
+
+Appending a participant name reports that lane as the whole reading —
+availability, drift, waiting items, claims, reported outcome, mail counters and
+the latest prompt — instead of as a row. Filters combine, and a lane is
+reported only when it satisfies all of them:
+
+```sh
+agent-parley status --project /path/to/repo
+agent-parley status --provider codex --outcome blocked
+agent-parley status --drifted
+agent-parley status --pending
+agent-parley status --idle --since 45m
+agent-parley status --issue 42
+```
+
+`--pending` reports a lane holding unread mail, an unanswered acknowledgement,
+an offer, or a reservation past its declared time to live. `--idle` reports a
+live lane that served no coordination call inside `--since`, or inside the
+project's configured interval when no window is given; it measures
+coordination inactivity, not what a native client was doing inside a turn.
+`--issue` reports the lanes that hold or are offered one issue. A selection
+that matches nothing prints one line naming the filters that were applied.
+
+`--drifted` and `--pending` exit non-zero when at least one lane matches, so a
+shell gate fails on drift or on unfinished coordination without parsing text.
+Every other reading exits zero. `--json` prints the same document as an
+unfiltered `status --json`, holding only the matching rows.
+
+`status` stays read-only: it takes no lock, calls no vendor and writes nothing.
+
 `issue list` also shows the forge title beside the owner, as
 `#42: claude — Some issue title`, when `gh` is installed and authenticated and
 the repository's `origin` remote points at GitHub. Without any of those the

@@ -117,10 +117,25 @@ agent-parley run claude-2 --provider claude --credentials account-2
 Then watch the work:
 
 ```sh
-agent-parley status   # ownership, activity and reported results
+agent-parley status   # one table per project: ownership, activity, outcomes
 agent-parley top      # every lane live, including what enforcement denied
 agent-parley metrics  # the same numbers as Prometheus text, or --json
 ```
+
+`status` prints one row per participant. Narrow it by appending a participant
+name, which reports that lane in full instead of as a row, or by filters that
+combine:
+
+```sh
+agent-parley status claude-1          # one lane, the whole reading
+agent-parley status --drifted         # lanes off their assigned branch
+agent-parley status --pending         # unread mail, offers or stale leases
+agent-parley status --outcome blocked --provider codex
+```
+
+`--drifted` and `--pending` exit non-zero when a lane matches, so a shell gate
+fails on drift without parsing the table. Columns shrink to the terminal, and a
+redirected stream receives every column instead.
 
 Steer one lane without taking over its terminal:
 
@@ -565,7 +580,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | --- | --- |
 | `up` | Start the local coordination server. |
 | `down` | Stop the server while retaining state and worktrees. |
-| `status` | Show server health, ownership, activity and reported outcomes. |
+| `status` | Show server health and one table per project; `NAME` reports one lane in full, and `--project`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since` and `--issue` narrow the rows. |
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--project`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |

@@ -18,6 +18,7 @@ from agent_parley import (
     roster,
     store,
     supervision,
+    tables,
     views,
 )
 from agent_parley.checkpoints import (
@@ -131,26 +132,6 @@ def _number(value: object) -> int:
         return -1
 
 
-def _age(seconds: float) -> str:
-    """Formats an age compactly, without ever implying sub-second precision."""
-    if seconds < 0:
-        return "-"
-    if seconds < 90:
-        return f"{int(seconds)}s"
-    if seconds < 5400:
-        return f"{int(seconds / 60)}m"
-    return f"{int(seconds / 3600)}h"
-
-
-def _size(count: int) -> str:
-    """Formats a byte count in units an operator can compare at a glance."""
-    if count < 1024:
-        return f"{count}B"
-    if count < 1024 * 1024:
-        return f"{count / 1024:.1f}kB"
-    return f"{count / 1024 / 1024:.1f}MB"
-
-
 def _tokens(count: int | None) -> str:
     """Formats a reported token count, or nothing when none was readable.
 
@@ -184,22 +165,6 @@ def _fitness(row: dict) -> str:
     """
     value = "" if row["fit"] is None else "fit" if row["fit"] else "unfit"
     return value + ("+" if row["work_offer"] else "")
-
-
-def _fit(value: str, width: int) -> str:
-    """Pads a cell, marking any value the column could not show in full.
-
-    Args:
-        value: Cell text.
-        width: Column width.
-
-    Returns:
-        Text padded to the column width, ending in an ellipsis when clipped,
-        so a truncated branch or issue list never reads as complete.
-    """
-    if len(value) > width:
-        return value[: width - 1] + "…"
-    return value.ljust(width)
 
 
 def _branch(lane: Path, cache: dict) -> str:
@@ -289,20 +254,19 @@ def _row(
             f"{participant['credential'] or 'default'}"
         ),
         "credential": participant["credential"],
-        "state": (
-            f"paused; {liveness}"
-            if participant.get("paused", False)
-            else f"idle {_age(stalled['age_seconds'])}; {liveness}"
-            if stalled["stalled"]
-            else "running; no hooks"
-            if "checkpoints unavailable" in liveness
-            else liveness
+        "state": tables.session(
+            liveness,
+            participant.get("paused", False),
+            stalled["stalled"],
+            stalled["age_seconds"],
         ),
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
         "event_age": (
-            _age(time.time() - events["last_ts"]) if events["last_ts"] else "-"
+            tables.age(time.time() - events["last_ts"])
+            if events["last_ts"]
+            else "-"
         ),
         "last_event_ts": events["last_ts"],
         "branch": branch,
@@ -520,12 +484,12 @@ def _cells(row: dict) -> tuple[str, ...]:
         f"{row['unread']}/{row['pending_ack']}",
         f"{row['leases']}"
         + (f"!{row['stale_leases']}" if row["stale_leases"] else "")
-        + (f" {_age(row['lease_age'])}" if row["leases"] else ""),
-        _size(row["injected_bytes"]),
+        + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
+        tables.size(row["injected_bytes"]),
         f"{row['denials']}/{row['hook_events']}",
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         _tokens(row["tokens"]),
-        _age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
+        tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _fitness(row),
     )
 
@@ -729,8 +693,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
         for row in project["rows"]:
             cells = _cells(row)
             lines = [
-                "  ".join(
-                    _fit(cells[index], size) for index, _, size in columns
+                tables.GAP.join(
+                    tables.fit(cells[index], size) for index, _, size in columns
                 ).rstrip()
             ]
             if row["stall"]:
@@ -830,12 +794,12 @@ def layout(
         f"participants {totals['participants']}  "
         f"hook events {totals['events']}  "
         f"denials {totals['denials']} ({rate})  "
-        f"context {_size(totals['context'])}  "
+        f"context {tables.size(totals['context'])}  "
         f"ready groups {totals.get('ready_groups', 0)}  "
-        f"idle {_age(totals['idle'])}"
+        f"idle {tables.age(totals['idle'])}"
         + (
             f" (most {totals['idle_leader']} "
-            f"{_age(totals['idle_leader_seconds'])})"
+            f"{tables.age(totals['idle_leader_seconds'])})"
             if totals["idle_leader"]
             else ""
         )
@@ -845,7 +809,7 @@ def layout(
             else ""
         )
         + (
-            f"  last {_age(view['window'])}"
+            f"  last {tables.age(view['window'])}"
             if view.get("window")
             else "  all retained"
         ),
@@ -899,7 +863,7 @@ def layout(
     if footer:
         lines.append(footer)
     if width is not None:
-        lines = [_fit(line, max(1, width)).rstrip() for line in lines]
+        lines = [tables.fit(line, max(1, width)).rstrip() for line in lines]
     if height is not None:
         lines = lines[: max(0, height)]
     return {

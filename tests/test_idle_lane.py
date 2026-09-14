@@ -119,7 +119,7 @@ def test_top_and_status_both_mark_the_lane(
     assert rows["claude"]["state"].startswith("idle ")
     assert rows["codex"]["stalled"] is False
     assert any("idle; message" in line for line in dashboard.render(view))
-    bridge.status()
+    bridge.status(cli.Selection(participant="claude"))
     assert "idle; message" in capsys.readouterr().out
     monkeypatch.setattr(
         sys,

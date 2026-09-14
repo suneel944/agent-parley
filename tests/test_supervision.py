@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import issues, process, roster, store, supervision, terminal
+from agent_parley import (
+    cli,
+    issues,
+    process,
+    roster,
+    store,
+    supervision,
+    terminal,
+)
 from agent_parley.checkpoints import mailbox
 from agent_parley.state import write_json
 
@@ -68,7 +76,7 @@ def test_send_reports_unreachable_and_status_lists_ack_age(
     pending = mailbox(bridge.home, paired["root"], "codex")["outstanding_ack"]
     assert pending[0]["id"] == message["id"]
     assert pending[0]["age_seconds"] >= 0
-    bridge.status()
+    bridge.status(cli.Selection(participant="codex"))
     assert "Awaiting acknowledgement: message" in capsys.readouterr().out
 
 
