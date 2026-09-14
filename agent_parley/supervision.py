@@ -142,6 +142,31 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def claimed_since(record: dict) -> float:
+    """Reports when the current ownership generation of an issue began.
+
+    A lane branch is reused across claims, so a pull request that ended before
+    the current claim started describes earlier work and must not report that
+    claim as finished. The generation starts at the most recent claim or
+    accepted handoff; a record whose history no longer names one is treated as
+    having always been owned, which preserves the previous observation.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        Unix time the current ownership generation began, or zero.
+    """
+    return max(
+        (
+            float(entry.get("at", 0) or 0)
+            for entry in record.get("history", [])
+            if entry.get("action") in {"claim", "accept"}
+        ),
+        default=0.0,
+    )
+
+
 def poll(home: Path, directory: Path) -> None:
     """Refreshes one project's observed presence and outstanding reminders."""
     manifest = roster.read(directory)
@@ -170,18 +195,26 @@ def poll(home: Path, directory: Path) -> None:
                 ),
             )
     if config["prompts"]:
-        closed = set()
+        closed: set[str] = set()
         ledger = issues.snapshot(directory)
         for name, participant in manifest["participants"].items():
             claimed = {
-                number
+                number: claimed_since(record)
                 for number, record in ledger["issues"].items()
                 if record.get("owner") == name
             }
-            if claimed and forge.branch_finished(
+            if not claimed:
+                continue
+            completion = forge.branch_completion(
                 Path(manifest["root"]), participant["branch"]
-            ):
-                closed.update(claimed)
+            )
+            if completion is None or completion[0] not in {"MERGED", "CLOSED"}:
+                continue
+            closed.update(
+                number
+                for number, since in claimed.items()
+                if completion[1] >= since
+            )
         reminders(directory, manifest, closed)
         observe_responses(home, directory, manifest)
     if config["wake"]:

@@ -11,6 +11,7 @@ import json
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 MAX_TITLE = 200
@@ -58,11 +59,27 @@ def _reachable(repo: Path) -> str | None:
     return project if project and shutil.which("gh") else None
 
 
-def branch_finished(repo: Path, branch: str) -> bool:
-    """Reports a merged or closed lane PR through the native forge account."""
+def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
+    """Reports the newest pull request opened from a lane branch.
+
+    A lane branch outlives the work it was first used for, so the branch name
+    alone cannot say whether the current work ended. Only the newest pull
+    request describes the current use of the branch; an older merged or closed
+    one belongs to a finished generation and must not speak for it. The caller
+    correlates the reported creation time with the claim it is asking about.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        branch: Lane branch whose pull requests are read.
+
+    Returns:
+        The newest pull request's state and creation time in Unix seconds, or
+        None when the forge is unavailable, the branch has no pull request, or
+        the response cannot be read.
+    """
     project = _reachable(repo)
     if not project:
-        return False
+        return None
     output = _run(
         [
             "gh",
@@ -77,17 +94,29 @@ def branch_finished(repo: Path, branch: str) -> bool:
             "--limit",
             "10",
             "--json",
-            "state",
+            "state,createdAt",
         ],
         5,
     )
     try:
         records = json.loads(output or "[]")
-        return any(
-            record.get("state") in {"MERGED", "CLOSED"} for record in records
+        newest = max(
+            (
+                (str(record["state"]), _epoch(record["createdAt"]))
+                for record in records
+                if record.get("state") and record.get("createdAt")
+            ),
+            key=lambda entry: entry[1],
+            default=None,
         )
-    except (ValueError, TypeError, AttributeError):
-        return False
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+    return newest
+
+
+def _epoch(value: str) -> float:
+    """Converts a forge timestamp to Unix seconds, or raises ValueError."""
+    return datetime.fromisoformat(value).timestamp()
 
 
 def _run(args: list[str], timeout: int) -> str | None:
