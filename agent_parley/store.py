@@ -10,12 +10,12 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
-from agent_parley import issues, roster
+from agent_parley import issues, retries, roster
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 BUSY_TIMEOUT = 5.0
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
@@ -32,6 +32,12 @@ READ_ONLY = (
     "read_thread",
     "search_messages",
 )
+RETRIED = {
+    "acknowledge_message": ("message_id",),
+    "mark_message_read": ("message_id",),
+    "file_reservation_paths": ("paths", "ttl_seconds", "exclusive", "reason"),
+    "release_file_reservations": (),
+}
 NO_PROJECT = (
     "This repository has no coordination project yet; launch a participant "
     "once with agent-parley run so the project registers."
@@ -78,6 +84,14 @@ CREATE INDEX IF NOT EXISTS history ON events(project_id,id);
 CREATE TABLE IF NOT EXISTS participant_presence (
  agent_id INTEGER PRIMARY KEY REFERENCES agents(id), state TEXT NOT NULL,
  process_alive INTEGER NOT NULL, observed_ts REAL NOT NULL, last_active REAL);
+CREATE TABLE IF NOT EXISTS idempotent_calls (
+ id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
+ agent_id INTEGER NOT NULL REFERENCES agents(id), tool TEXT NOT NULL,
+ idempotency_key TEXT NOT NULL, request_digest TEXT NOT NULL,
+ outcome TEXT NOT NULL, result_json TEXT NOT NULL,
+ created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE UNIQUE INDEX IF NOT EXISTS retried
+ ON idempotent_calls(agent_id,tool,idempotency_key);
 """
 SEARCH_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
@@ -1098,8 +1112,10 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
     started = time.monotonic()
     try:
         result = _dispatch(home, actor, tool, args, started)
-    except (BridgeError, sqlite3.OperationalError):
+    except (BridgeError, sqlite3.OperationalError) as exc:
         _observe(home, actor, tool, "error", started, 0)
+        if isinstance(exc, BridgeError):
+            _refused(home, actor, tool, args, exc)
         raise
     if tool in READ_ONLY:
         _observe(
@@ -1114,6 +1130,38 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
         with contextlib.suppress(sqlite3.Error):
             _recipient_warnings(home, actor, args, result)
     return result
+
+
+def _refused(
+    home: Path, actor: dict, tool: str, args: dict, exc: BridgeError
+) -> None:
+    """Records a refusal so a retry is refused identically, never widened.
+
+    A refusal changed nothing, so its transaction has already rolled back and
+    the key is recorded afterwards. An interruption before that record leaves
+    the key absent, and the retry is evaluated again and refused again, so the
+    window costs a repeated evaluation rather than a replayed effect.
+    Authorization decided after the first refusal never reaches a call that
+    carries the refused key, because the recorded refusal answers it.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        tool: Coordination tool that refused the call.
+        args: Arguments the refused call carried.
+        exc: Refusal reported to the caller.
+    """
+    if tool not in RETRIED:
+        return
+    with contextlib.suppress(BridgeError, sqlite3.Error):
+        key = retries.validate(args.get("idempotency_key"))
+        if not key:
+            return
+        fingerprint = retries.digest(
+            tool, {name: args.get(name) for name in RETRIED[tool]}
+        )
+        with connect(home, write=True) as db:
+            _retain(db, actor, tool, key, fingerprint, retries.DENIED, str(exc))
 
 
 def _recipient_warnings(
@@ -1248,6 +1296,64 @@ def held_claim(home: Path, root: str, display: str) -> str:
     return latest[1]
 
 
+def _recorded(
+    db: sqlite3.Connection, actor: dict, tool: str, key: str
+) -> dict | None:
+    """Reads what an earlier call carrying this key from this lane returned."""
+    row = db.execute(
+        "SELECT request_digest,outcome,result_json FROM idempotent_calls "
+        "WHERE agent_id=? AND tool=? AND idempotency_key=?",
+        (actor["id"], tool, key),
+    ).fetchone()
+    return (
+        {
+            "request_digest": row["request_digest"],
+            "outcome": row["outcome"],
+            "result": json.loads(row["result_json"]),
+        }
+        if row
+        else None
+    )
+
+
+def _retain(
+    db: sqlite3.Connection,
+    actor: dict,
+    tool: str,
+    key: str,
+    digest: str,
+    outcome: str,
+    result: object,
+) -> None:
+    """Records one served or refused call inside the transaction that ran it.
+
+    Retention is bounded per participant at `retries.RETAINED_CALLS` keys, so
+    a lane that retries indefinitely cannot grow the store without limit. The
+    oldest keys are discarded first, and a key discarded after its window
+    simply behaves as a first call again.
+    """
+    db.execute(
+        "INSERT OR IGNORE INTO idempotent_calls(project_id,agent_id,tool,"
+        "idempotency_key,request_digest,outcome,result_json) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (
+            actor["project_id"],
+            actor["id"],
+            tool,
+            key,
+            digest,
+            outcome,
+            json.dumps(result, ensure_ascii=False),
+        ),
+    )
+    db.execute(
+        "DELETE FROM idempotent_calls WHERE agent_id=? AND id NOT IN "
+        "(SELECT id FROM idempotent_calls WHERE agent_id=? "
+        "ORDER BY id DESC LIMIT ?)",
+        (actor["id"], actor["id"], retries.RETAINED_CALLS),
+    )
+
+
 def _serve(
     db: sqlite3.Connection,
     actor: dict,
@@ -1257,6 +1363,12 @@ def _serve(
     claim: str = "",
 ) -> dict:
     """Applies one validated coordination tool to the open transaction.
+
+    A writing tool that carries an idempotency key is served once. A repeat
+    from the same lane with the same key returns the first result and writes
+    nothing further, and the key is recorded in this same transaction, so an
+    interruption between the effect and its key cannot leave a replayable
+    call. A key repeated with different arguments is refused by name.
 
     Marking a message read or acknowledged stamps only the timestamp that is
     still unset, so a retry or a later acknowledgement keeps the first reading
@@ -1284,6 +1396,45 @@ def _serve(
             "UPDATE agents SET last_active_ts=CURRENT_TIMESTAMP WHERE id=?",
             (actor["id"],),
         )
+    key = retries.validate(args.get("idempotency_key"))
+    if not key or tool not in RETRIED:
+        return _effect(db, actor, tool, args, declared, claim)
+    fingerprint = retries.digest(
+        tool, {name: args.get(name) for name in RETRIED[tool]}
+    )
+    if recorded := _recorded(db, actor, tool, key):
+        return retries.replayed(recorded, tool, key, fingerprint)
+    result = _effect(db, actor, tool, args, declared, claim)
+    _retain(db, actor, tool, key, fingerprint, retries.SERVED, result)
+    return result
+
+
+def _effect(
+    db: sqlite3.Connection,
+    actor: dict,
+    tool: str,
+    args: dict,
+    declared: frozenset[str] | None,
+    claim: str,
+) -> dict:
+    """Performs the effect of one coordination tool without retry bookkeeping.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        tool: Coordination tool named by the caller.
+        args: Validated tool arguments.
+        declared: Named resources this project declared, or None when it
+            declared none.
+        claim: Claim identifier the calling lane holds, recorded beside the
+            records a tool writes. Empty records no claim.
+
+    Returns:
+        The tool result.
+
+    Raises:
+        BridgeError: If the tool is unknown or its preconditions fail.
+    """
     if tool == "send_message":
         return _send(db, actor, args, claim)
     if tool == "fetch_inbox":

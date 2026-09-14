@@ -8,6 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
+from agent_parley import retries
 from agent_parley.state import BridgeError, lock, write_json
 
 MAX_BLOCKERS = 10
@@ -127,6 +128,25 @@ def snapshot(directory: Path) -> dict:
     )
 
 
+def _refuse(directory: Path, scope: str, fingerprint: str, detail: str) -> None:
+    """Records a refused transition so a retry is refused identically.
+
+    A refusal changed no ownership, so its ledger write never happened and the
+    key is recorded afterwards under the lock again. An interruption before
+    that record leaves the key absent, and the retry is evaluated and refused
+    again, which costs a repeated evaluation rather than a replayed effect.
+    Ownership granted after the refusal never reaches a call carrying the
+    refused key, because the recorded refusal answers it.
+    """
+    with contextlib.suppress(BridgeError, OSError, ValueError):
+        with lock(directory / "issues.lock", timeout=1):
+            state = snapshot(directory)
+            if scope in state.get("retries", {}):
+                return
+            retries.remember(state, scope, fingerprint, retries.DENIED, detail)
+            write_json(directory / "issues.json", state)
+
+
 def change(
     directory: Path,
     agent: str,
@@ -134,6 +154,100 @@ def change(
     issue: str,
     *,
     participants: set[str],
+    key: str = "",
+    to: str | None = None,
+    summary: str = "",
+    offer_id: str | None = None,
+    on: str | None = None,
+    title: str | None = None,
+    within: float | None = None,
+    defaults: dict | None = None,
+) -> dict:
+    """Applies one issue transition once, however often it is retried.
+
+    A transition carrying an idempotency key is applied once. A repeat from
+    the same lane with the same key returns the first result and changes
+    nothing, and a repeat carrying different arguments is refused by name, so
+    a stale retry cannot land on a different issue or recipient.
+
+    Args:
+        directory: Private state directory for the common repository.
+        agent: Acting lane, resolved by the CLI from its worktree.
+        action: Claim, release, offer, accept, decline, cancel, block, or
+            unblock.
+        issue: Positive repository issue number, optionally prefixed with #.
+        participants: Every participant registered for this project.
+        key: Idempotency key. Empty applies the transition without retry
+            bookkeeping, which stays correct for transitions that are already
+            idempotent, such as reclaiming an issue this lane owns.
+        to: Recipient participant for an offer.
+        summary: Peer-provided handoff context.
+        offer_id: Exact current offer required for acceptance or decline.
+        on: Issue this one waits on, for a block or unblock.
+        title: Optional forge-supplied issue title recorded on a claim. It is
+            display context, so it is excluded from the arguments a key is
+            compared against and a changed title never refuses a retry.
+        within: Seconds this claim, offer or acknowledgement is expected to
+            take, recorded as a deadline beside the record.
+        defaults: Project deadline and attempt-budget defaults.
+
+    Returns:
+        The persisted issue record, including transition history.
+
+    Raises:
+        BridgeError: If validation, ownership, offer, retry, or lock checks
+            fail.
+    """
+    transition: dict = {
+        "to": to,
+        "summary": summary,
+        "offer_id": offer_id,
+        "on": on,
+        "within": within,
+    }
+    if not key:
+        return _change(
+            directory,
+            agent,
+            action,
+            issue,
+            participants=participants,
+            title=title,
+            defaults=defaults,
+            **transition,
+        )
+    key = retries.validate(key)
+    fingerprint = retries.digest(
+        action, {"issue": parse_issue(issue), **transition}
+    )
+    scope = retries.scope(agent, action, key)
+    try:
+        return _change(
+            directory,
+            agent,
+            action,
+            issue,
+            participants=participants,
+            scope=scope,
+            fingerprint=fingerprint,
+            title=title,
+            defaults=defaults,
+            **transition,
+        )
+    except BridgeError as exc:
+        _refuse(directory, scope, fingerprint, str(exc))
+        raise
+
+
+def _change(
+    directory: Path,
+    agent: str,
+    action: str,
+    issue: str,
+    *,
+    participants: set[str],
+    scope: str = "",
+    fingerprint: str = "",
     to: str | None = None,
     summary: str = "",
     offer_id: str | None = None,
@@ -151,6 +265,9 @@ def change(
             unblock.
         issue: Positive repository issue number, optionally prefixed with #.
         participants: Every participant registered for this project.
+        scope: Retained key this transition is recorded under. Empty records
+            no key and applies the transition directly.
+        fingerprint: Digest of the arguments the key was issued against.
         to: Recipient participant for an offer.
         summary: Peer-provided handoff context.
         offer_id: Exact current offer required for acceptance or decline.
@@ -178,6 +295,10 @@ def change(
             raise BridgeError("An issue cannot wait on itself.")
     with lock(directory / "issues.lock", timeout=1):
         state = snapshot(directory)
+        if scope and (recorded := state.get("retries", {}).get(scope)):
+            return retries.replayed(
+                recorded, action, scope.rsplit("\x00", 1)[1], fingerprint
+            )
         record = state["issues"].get(issue)
         if action == "claim":
             if record and record["owner"]:
@@ -298,6 +419,8 @@ def change(
             }
         )
         state["issues"][issue] = record
+        if scope:
+            retries.remember(state, scope, fingerprint, retries.SERVED, record)
         state["revision"] += 1
         write_json(directory / "issues.json", state)
     if action == "release":

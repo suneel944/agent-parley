@@ -101,6 +101,37 @@ A dependency is information, not a gate. Nothing prevents work on a waiting
 issue, no transition clears a dependency, and finishing the blocking issue does
 not drop the edge; the owner runs `issue unblock` when the wait is over.
 
+### Retrying a write safely
+
+A command that fails after its change has landed cannot be told apart from one
+that changed nothing, so a retry can apply the change twice. Give the command an
+idempotency key and the retry is the same call:
+
+```sh
+agent-parley issue offer 42 --to codex --summary "commit, checks" \
+  --idempotency-key handoff-42-first
+agent-parley report --state blocked --summary "Waiting on the schema decision" \
+  --remaining "Apply the migration" --idempotency-key blocked-42-first
+```
+
+Rerunning either command with the key it first used prints the first result and
+changes nothing further: one offer, one recorded attempt, one forge comment. The
+same key with different arguments is refused by name, so a stale retry cannot
+release a different issue or hand off to a different lane. A command that was
+refused replays as the same refusal, even if ownership changed in between, so a
+retry never gains authority the first call was denied.
+
+Every `issue` transition and `report` accepts `--idempotency-key`. Over MCP the
+same contract is carried by the optional `idempotency_key` argument on
+`file_reservation_paths`, `release_file_reservations`, `acknowledge_message` and
+`mark_message_read`; `send_message` has always required one. A replayed tool
+result carries `"replayed": true` beside the original fields.
+
+Keys belong to one participant and one operation, so two lanes can use the same
+key text without colliding, and the most recent 500 keys per participant are
+retained. Past that window a repeated key is treated as a first call, which is
+why a key is worth reusing for a retry and not for bookkeeping.
+
 ### Deadlines and attempt budgets
 
 A claim, a handoff offer and an acknowledgement can carry a deadline:

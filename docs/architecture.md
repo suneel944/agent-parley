@@ -22,6 +22,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `views` | Machine-readable rendering of read-only command results |
 | `metrics` | Idle intervals and waiting times derived from retained records |
 | `history` | Read-only ownership history across the ledger, reports and store |
+| `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `state` | Private atomic JSON publication and operation locks |
 
@@ -373,6 +374,31 @@ That distinction lets a reader separate a lane still working on a path from a
 lane that died holding it, without any process deciding on that lane's behalf.
 No time-to-live applies to issue ownership, which changes hands only through
 release, or an explicit offer and acceptance.
+
+A writing call can commit and still fail to answer, so the caller retries what
+already happened. An idempotency key makes the two calls one. The first call
+carrying a key performs the effect and records the key, the digest of the
+arguments that defined it, and the result it returned. A later call from the
+same participant carrying the same key performs nothing further and returns the
+first result, marked `replayed`. A key repeated with different arguments is
+refused by name, so a stale retry cannot land on a different issue, path or
+recipient. Keys are scoped to one participant and one operation, and they are
+retained per participant to the most recent 500 calls; a key discarded past
+that window behaves as a first call.
+
+Each substrate keeps its own keys, because a record in one cannot make a
+mutation in another atomic. Served calls record the key in the `idempotent_calls`
+table inside the transaction that carries the effect, and issue transitions and
+reports record it in the same locked JSON write as the record they change. An
+interruption therefore cannot leave a key without its effect.
+
+A refusal changed nothing, so its transaction has already rolled back and the
+key is recorded afterwards. That ordering costs a repeated evaluation when a
+process dies between the two, and never a replayed effect. A recorded refusal
+is replayed as the same refusal: authorization granted after the first call
+never reaches a retry carrying the refused key, so a replay cannot widen
+authority. Transitions that were already idempotent, such as reclaiming an
+issue this lane owns, stay correct without a key.
 
 Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer

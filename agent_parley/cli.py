@@ -31,6 +31,7 @@ from agent_parley import (
     metrics,
     policy,
     process,
+    retries,
     roster,
     store,
     supervision,
@@ -76,6 +77,11 @@ CHANGE_TYPE = frozenset(
 JSON_HELP = (
     "Print one JSON document on standard output instead of the table. "
     "Field names are documented in docs/operations.md."
+)
+RETRY_HELP = (
+    "Idempotency key. Retry a failed command with the key it first used and "
+    "the repeat returns the first result without applying the change again. "
+    "The same key with different arguments is refused."
 )
 COPILOT_EVENTS = frozenset(
     {
@@ -2206,6 +2212,7 @@ attempt of the recorded budget, which is also only reported.
         summary: str,
         remaining: str,
         evidence: str,
+        key: str = "",
     ) -> None:
         """Records an explicitly reported outcome independently of activity.
 
@@ -2220,9 +2227,12 @@ attempt of the recorded budget, which is also only reported.
             summary: Nonempty account of the result.
             remaining: Required unfinished work for partial or blocked reports.
             evidence: Required verification evidence for ready reports.
+            key: Idempotency key. A retried report carrying the key it first
+                used records no second attempt and posts no second comment.
 
         Raises:
-            BridgeError: If the lane or required report fields are invalid.
+            BridgeError: If the lane or required report fields are invalid, or
+                if the key already names a report with other content.
         """
         if not summary.strip():
             raise BridgeError("Reports require a nonempty --summary.")
@@ -2234,9 +2244,22 @@ attempt of the recorded budget, which is also only reported.
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
             raise BridgeError("Ready-for-review reports require --evidence.")
+        scope = retries.scope(agent, "report", retries.validate(key))
+        fingerprint = retries.digest(
+            "report",
+            {
+                "state": outcome,
+                "summary": summary,
+                "remaining": remaining,
+                "evidence": evidence,
+            },
+        )
         with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
             path = directory / f"{agent}-activity.json"
             state = json.loads(path.read_text()) if path.exists() else {}
+            if key and (recorded := state.get("retries", {}).get(scope)):
+                retries.replayed(recorded, "report", key, fingerprint)
+                return
             arrived = outcome == "ready" and state.get("outcome") != "ready"
             state.update(
                 outcome=outcome,
@@ -2245,6 +2268,14 @@ attempt of the recorded budget, which is also only reported.
                 evidence=evidence,
                 reported_at=time.time(),
             )
+            if key:
+                retries.remember(
+                    state,
+                    scope,
+                    fingerprint,
+                    retries.SERVED,
+                    {"state": outcome},
+                )
             write_json(path, state)
         held = snapshot(directory)["issues"]
         claimed = sorted(
@@ -2355,6 +2386,7 @@ attempt of the recorded budget, which is also only reported.
         offer_id: str | None = None,
         on: str | None = None,
         within: float | None = None,
+        key: str = "",
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -2378,6 +2410,8 @@ attempt of the recorded budget, which is also only reported.
             on: Issue this one waits on, for a block or unblock.
             within: Seconds this claim or offer is expected to take, recorded
                 as a deadline. None takes the project default.
+            key: Idempotency key. A retried command carrying the key it first
+                used returns the first result and transfers nothing further.
 
         Returns:
             The whole ledger for list, or the resulting issue record.
@@ -2402,6 +2436,7 @@ attempt of the recorded budget, which is also only reported.
             action,
             number,
             participants=set(data["participants"]),
+            key=key,
             to=to,
             summary=summary,
             offer_id=offer_id,
@@ -3281,6 +3316,9 @@ def main() -> int:
     report.add_argument("--summary", required=True)
     report.add_argument("--remaining", default="")
     report.add_argument("--evidence", default="")
+    report.add_argument(
+        "--idempotency-key", default="", metavar="KEY", help=RETRY_HELP
+    )
     steer = commands.add_parser(
         "say", help="Send one lane a coordination message as the operator."
     )
@@ -3338,6 +3376,12 @@ def main() -> int:
             command.add_argument("--json", action="store_true", help=JSON_HELP)
         else:
             command.add_argument("number")
+            command.add_argument(
+                "--idempotency-key",
+                default="",
+                metavar="KEY",
+                help=RETRY_HELP,
+            )
         if action in ("claim", "offer", "accept"):
             command.add_argument(
                 "--within",
@@ -3616,6 +3660,7 @@ def main() -> int:
                 args.summary,
                 args.remaining,
                 args.evidence,
+                key=args.idempotency_key,
             )
             print(f"Recorded outcome: {args.state}")
         elif args.command == "say":
@@ -3647,6 +3692,7 @@ def main() -> int:
                 offer_id=getattr(args, "offer_id", None),
                 on=getattr(args, "on", None),
                 within=getattr(args, "within", None),
+                key=getattr(args, "idempotency_key", ""),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))

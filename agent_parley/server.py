@@ -12,7 +12,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent_parley import roster, store
+from agent_parley import retries, roster, store
 from agent_parley.state import BridgeError
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
@@ -43,6 +43,11 @@ def _tool(
 TEXT = {"type": "string"}
 INTEGER = {"type": "integer"}
 FLAG = {"type": "boolean"}
+RETRY_KEY = {
+    "type": "string",
+    "maxLength": retries.KEY_CHARACTERS,
+    "description": "Optional. Reuse on a retry; the repeat changes nothing.",
+}
 TOOLS = [
     _tool(
         "send_message",
@@ -81,13 +86,13 @@ TOOLS = [
     _tool(
         "acknowledge_message",
         "Explicitly acknowledge a reviewed message.",
-        {"message_id": INTEGER},
+        {"message_id": INTEGER, "idempotency_key": RETRY_KEY},
         ["message_id"],
     ),
     _tool(
         "mark_message_read",
         "Mark an ordinary message reviewed; does not ack.",
-        {"message_id": INTEGER},
+        {"message_id": INTEGER, "idempotency_key": RETRY_KEY},
         ["message_id"],
     ),
     _tool(
@@ -122,11 +127,15 @@ TOOLS = [
                 "maxLength": 160,
                 "description": "Declared scope, shown to peers you block.",
             },
+            "idempotency_key": RETRY_KEY,
         },
         ["paths"],
     ),
     _tool(
-        "release_file_reservations", "Release your file reservations.", {}, []
+        "release_file_reservations",
+        "Release your file reservations.",
+        {"idempotency_key": RETRY_KEY},
+        [],
     ),
     _tool(
         "list_participants",
