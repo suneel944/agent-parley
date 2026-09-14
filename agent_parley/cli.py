@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -145,6 +146,75 @@ def duration(text: str) -> float:
     if seconds <= 0:
         raise ValueError(f"{text!r} is not a window; use 45m, 6h or 7d.")
     return seconds
+
+
+def clock(text: str) -> float:
+    """Converts a wall-clock time of day into the next instant it names.
+
+    The time of day is read in the timezone of the machine the operator types
+    on, and the resulting instant is recorded absolutely. A later timezone
+    change, a daylight-saving transition or a service restart therefore moves
+    nothing: the item keeps the instant it was recorded for.
+
+    Args:
+        text: A 24-hour time of day such as ``15:00``.
+
+    Returns:
+        The next instant matching that time of day, today while it is still
+        ahead and tomorrow once it has passed.
+
+    Raises:
+        ValueError: If the text does not name a time of day.
+    """
+    try:
+        moment = datetime.time.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"{text!r} is not a time of day; use 15:00.") from None
+    now = datetime.datetime.now().astimezone()
+    target = datetime.datetime.combine(now.date(), moment, now.tzinfo)
+    if target <= now:
+        target += datetime.timedelta(days=1)
+    return target.timestamp()
+
+
+def repeat_plan(
+    after: float | None,
+    at: float | None,
+    every: float | None,
+    until: float | None,
+) -> tuple[float | None, int]:
+    """Resolves the first delivery instant and how many deliveries follow.
+
+    Args:
+        after: Delay in seconds before the first delivery, or None.
+        at: Absolute instant of the first delivery, or None.
+        every: Repeat interval in seconds, or None for a single delivery.
+        until: Absolute instant after which the repeat stops, or None.
+
+    Returns:
+        The first delivery instant, or None when nothing waits on a clock, and
+        the number of deliveries the repeat is bounded to.
+
+    Raises:
+        BridgeError: If the repeat is unbounded or ends before it starts.
+    """
+    first = (
+        at
+        if at is not None
+        else (time.time() + after if after is not None else None)
+    )
+    if every is None:
+        if until is not None:
+            raise BridgeError("--until bounds a repeat; add --every.")
+        return first, 1
+    if until is None:
+        raise BridgeError(
+            "A repeat must be bounded; add --until, such as --until 18:00."
+        )
+    first = first if first is not None else time.time() + every
+    if until <= first:
+        raise BridgeError("--until must fall after the first delivery.")
+    return first, min(int((until - first) // every) + 1, store.MAX_REPEATS)
 
 
 def operator_key(name: str, subject: str, body: str) -> str:
@@ -2327,6 +2397,13 @@ attempt of the recorded budget, which is also only reported.
         key: str = "",
         ack: bool = False,
         within: float | None = None,
+        *,
+        after: float | None = None,
+        at: float | None = None,
+        when_released: str = "",
+        unless_reported: bool = False,
+        every: float | None = None,
+        until: float | None = None,
     ) -> dict:
         """Writes one operator message into a participant's lane inbox.
 
@@ -2345,15 +2422,25 @@ attempt of the recorded budget, which is also only reported.
             within: Seconds the acknowledgement is expected to take, recorded
                 as a deadline. None takes the project default, and a message
                 that requires no acknowledgement records none.
+            after: Seconds to wait before the message becomes deliverable.
+            at: Absolute instant the message becomes deliverable.
+            when_released: Issue whose explicit release or completion the
+                message waits on.
+            unless_reported: Whether a delayed message is dropped once the
+                lane files a report of its own.
+            every: Repeat interval in seconds, which requires ``until``.
+            until: Absolute instant after which the bounded repeat stops.
 
         Returns:
             The delivered message identifier, carrying ``duplicate`` when this
-            key already named exactly this message.
+            key already named exactly this message. A message carrying a time
+            or a condition is recorded instead, and the mapping names the
+            pending item the supervision poll will deliver.
 
         Raises:
             BridgeError: If the repository has no project, the participant is
-                not in its roster or not registered, or the message fails
-                validation.
+                not in its roster or not registered, the delivery condition is
+                unbounded or contradictory, or the message fails validation.
         """
         _, directory = self.project(repo)
         data = roster.read(directory)
@@ -2368,15 +2455,44 @@ attempt of the recorded budget, which is also only reported.
         expected = (
             within if within is not None else data["deadlines"].get("ack")
         )
-        return store.speak(
+        dedup = key or operator_key(identity, subject, text)
+        condition = (
+            f"released:{parse_issue(when_released)}" if when_released else ""
+        )
+        not_before, repeats = repeat_plan(after, at, every, until)
+        if unless_reported and not_before is None:
+            raise BridgeError(
+                "--unless-reported drops a delayed message; add --after or "
+                "--at."
+            )
+        if not_before is None and not condition:
+            return store.speak(
+                self.home,
+                data["root"],
+                identity,
+                subject,
+                text,
+                dedup,
+                ack=ack,
+                within=expected if ack else None,
+            )
+        return store.schedule(
             self.home,
             data["root"],
-            identity,
-            subject,
-            text,
-            key or operator_key(identity, subject, text),
-            ack=ack,
-            within=expected if ack else None,
+            {
+                "kind": "message",
+                "recipient": name,
+                "subject": subject,
+                "body_md": text,
+                "dedup_key": dedup,
+                "ack_required": ack,
+                "ack_within": expected if ack else None,
+                "not_before": not_before,
+                "condition": condition,
+                "unless_reported": unless_reported,
+                "every_seconds": every,
+                "repeats_left": repeats,
+            },
         )
 
     def issue(
@@ -2391,6 +2507,7 @@ attempt of the recorded budget, which is also only reported.
         on: str | None = None,
         within: float | None = None,
         key: str = "",
+        when_released: str = "",
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -2416,6 +2533,9 @@ attempt of the recorded budget, which is also only reported.
                 as a deadline. None takes the project default.
             key: Idempotency key. A retried command carrying the key it first
                 used returns the first result and transfers nothing further.
+            when_released: Issue whose explicit release or completion an offer
+                waits on. The offer is recorded rather than applied, and the
+                supervision poll applies it once that release is recorded.
 
         Returns:
             The whole ledger for list, or the resulting issue record.
@@ -2429,6 +2549,29 @@ attempt of the recorded budget, which is also only reported.
             return snapshot(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
+        if action == "offer" and when_released:
+            recipient = to or ""
+            if recipient not in data["participants"] or recipient == agent:
+                raise BridgeError(
+                    "Choose another participant in this project; "
+                    "run agent-parley participant list."
+                )
+            if not 1 <= len(summary.strip()) <= 2000:
+                raise BridgeError(
+                    "Handoff summary must contain 1-2000 characters."
+                )
+            return store.schedule(
+                self.home,
+                data["root"],
+                {
+                    "kind": "offer",
+                    "recipient": recipient,
+                    "actor": agent,
+                    "body_md": summary.strip(),
+                    "issue": parse_issue(number),
+                    "condition": f"released:{parse_issue(when_released)}",
+                },
+            )
         title = (
             forge.issue_title(repo, parse_issue(number))
             if action == "claim"
@@ -2559,29 +2702,42 @@ attempt of the recorded budget, which is also only reported.
         query: str = "",
         after: int = 0,
         limit: int = store.MAX_SEARCH_HITS,
+        identifier: int = 0,
     ) -> dict:
-        """Reads a mail thread or searches mail as the lane this runs in.
+        """Reads a mail thread, searches mail, or handles pending items.
 
-        The worktree selects the reader, exactly as it does for reports and
-        issue transitions, so an operator reads a participant's own mail
-        rather than the whole project's.
+        The worktree selects the reader for a thread or a search, exactly as it
+        does for reports and issue transitions, so an operator reads a
+        participant's own mail rather than the whole project's. Pending
+        operator items belong to the project rather than to one lane, so
+        listing and cancelling them need no lane.
+
+        Listing pending items delivers nothing: an item leaves the list only
+        when the supervision poll delivers it or the operator cancels it.
 
         Args:
-            repo: Assigned agent worktree.
-            action: Thread or search.
+            repo: Assigned agent worktree, or any checkout of the repository
+                for pending items.
+            action: Thread, search, pending or cancel.
             thread: Thread identifier for a thread read.
             query: Text to search subjects and bodies for.
             after: Last thread message already read.
             limit: Maximum search hits reported.
+            identifier: Pending item to cancel.
 
         Returns:
-            One thread page, or the matching messages.
+            One thread page, the matching messages, the pending items, or the
+            outcome of a cancellation.
 
         Raises:
             BridgeError: If the lane or its registered identity is unknown.
         """
         _, directory = self.project(repo)
         data = roster.read(directory)
+        if action == "pending":
+            return {"pending": store.schedules(self.home, data["root"])}
+        if action == "cancel":
+            return store.cancel_schedule(self.home, data["root"], identifier)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
         name = data["participants"][agent]["display"]
@@ -2872,10 +3028,15 @@ attempt of the recorded budget, which is also only reported.
             mail = mailbox(
                 self.home, data["root"], name, state.get("cursor", 0)
             )
+            scheduled = sum(
+                item["recipient"] == agent
+                for item in store.schedules(self.home, data["root"])
+            )
         except (sqlite3.Error, BridgeError, OSError) as exc:
             record["mail"] = {"error": str(exc)}
             return record
         record["mail"] = {
+            "pending_operator_items": scheduled,
             "unread": mail["unread"],
             "pending_ack": mail["pending_ack"],
             "reservations": mail["reservations"],
@@ -3056,6 +3217,11 @@ attempt of the recorded budget, which is also only reported.
                         "    Awaiting checkpoint delivery: "
                         f"{mail['awaiting_delivery']} "
                         "(batch capped at 3)"
+                    )
+                if mail["pending_operator_items"]:
+                    print(
+                        "    Pending operator items: "
+                        f"{mail['pending_operator_items']}"
                     )
 
     def launch(
@@ -3563,6 +3729,58 @@ def main() -> int:
             "or acknowledged for the lane."
         ),
     )
+    steer.add_argument(
+        "--after",
+        type=duration,
+        metavar="WINDOW",
+        help=(
+            "Hold the message until this much time has passed, such as 30m. "
+            "The supervision poll delivers it; nothing delivers while the "
+            "service is stopped and nothing is lost."
+        ),
+    )
+    steer.add_argument(
+        "--at",
+        type=clock,
+        metavar="HH:MM",
+        help=(
+            "Hold the message until this time of day in the local timezone, "
+            "today while it is still ahead and tomorrow once it has passed."
+        ),
+    )
+    steer.add_argument(
+        "--when-released",
+        default="",
+        metavar="NUMBER",
+        help=(
+            "Hold the message until this issue is explicitly released or its "
+            "pull request is recorded as ended."
+        ),
+    )
+    steer.add_argument(
+        "--unless-reported",
+        action="store_true",
+        help=(
+            "Drop a delayed message if the lane files a report of its own "
+            "before its time arrives."
+        ),
+    )
+    steer.add_argument(
+        "--every",
+        type=duration,
+        metavar="WINDOW",
+        help=(
+            "Repeat the message on this interval, such as 1h. A repeat must "
+            "be bounded by --until and is capped at "
+            f"{store.MAX_REPEATS} deliveries."
+        ),
+    )
+    steer.add_argument(
+        "--until",
+        type=clock,
+        metavar="HH:MM",
+        help="Stop a repeat at this time of day in the local timezone.",
+    )
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -3604,6 +3822,16 @@ def main() -> int:
         if action == "offer":
             command.add_argument("--to", required=True)
             command.add_argument("--summary", required=True)
+            command.add_argument(
+                "--when-released",
+                default="",
+                metavar="NUMBER",
+                help=(
+                    "Record the offer and apply it once this issue is "
+                    "explicitly released or its pull request is recorded as "
+                    "ended."
+                ),
+            )
         if action in ("accept", "decline"):
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
@@ -3627,7 +3855,8 @@ def main() -> int:
         if action != "apply":
             command.add_argument("--json", action="store_true", help=JSON_HELP)
     mail = commands.add_parser(
-        "mail", help="Read one mail thread or search your own mail."
+        "mail",
+        help="Read mail, or list and cancel pending operator items.",
     )
     letters = mail.add_subparsers(dest="action", required=True)
     reading = letters.add_parser("thread")
@@ -3640,6 +3869,16 @@ def main() -> int:
     finding.add_argument("--repo", type=Path, default=Path.cwd())
     finding.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
     finding.add_argument("--json", action="store_true", help=JSON_HELP)
+    waiting = letters.add_parser(
+        "pending", help="List operator items recorded but not delivered."
+    )
+    waiting.add_argument("--repo", type=Path, default=Path.cwd())
+    waiting.add_argument("--json", action="store_true", help=JSON_HELP)
+    dropping = letters.add_parser(
+        "cancel", help="Remove one recorded operator item before delivery."
+    )
+    dropping.add_argument("item_id", type=int)
+    dropping.add_argument("--repo", type=Path, default=Path.cwd())
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -3945,16 +4184,29 @@ def main() -> int:
                 args.key,
                 args.ack,
                 args.within,
+                after=args.after,
+                at=args.at,
+                when_released=args.when_released,
+                unless_reported=args.unless_reported,
+                every=args.every,
+                until=args.until,
             )
-            state = (
-                "already delivered"
-                if delivered.get("duplicate")
-                else "delivered"
-            )
-            print(
-                f"Operator message {delivered['id']} {state} to "
-                f"{args.participant}."
-            )
+            if "kind" in delivered:
+                print(
+                    f"Operator item {delivered['id']} recorded for "
+                    f"{args.participant}; "
+                    f"{delivered['repeats_left']} delivery(s) pending."
+                )
+            else:
+                state = (
+                    "already delivered"
+                    if delivered.get("duplicate")
+                    else "delivered"
+                )
+                print(
+                    f"Operator message {delivered['id']} {state} to "
+                    f"{args.participant}."
+                )
         elif args.command == "issue":
             result = bridge.issue(
                 args.repo.resolve(),
@@ -3966,6 +4218,7 @@ def main() -> int:
                 on=getattr(args, "on", None),
                 within=getattr(args, "within", None),
                 key=getattr(args, "idempotency_key", ""),
+                when_released=getattr(args, "when_released", ""),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))
@@ -4011,12 +4264,17 @@ def main() -> int:
                 query=getattr(args, "query", ""),
                 after=getattr(args, "after_id", 0),
                 limit=getattr(args, "limit", store.MAX_SEARCH_HITS),
+                identifier=getattr(args, "item_id", 0),
             )
-            print(
-                views.render(f"mail_{args.action}", page)
-                if args.json
-                else json.dumps(page, indent=2)
-            )
+            if args.action == "cancel":
+                state = "cancelled" if page["cancelled"] else "not pending"
+                print(f"Operator item {page['id']}: {state}.")
+            else:
+                print(
+                    views.render(f"mail_{args.action}", page)
+                    if getattr(args, "json", False)
+                    else json.dumps(page, indent=2)
+                )
         elif args.command == "participant":
             repository = args.repo.resolve()
             preview = getattr(args, "preview", False)

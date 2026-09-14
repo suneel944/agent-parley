@@ -134,6 +134,20 @@ participant can be named `operator`, and no MCP tool sends as it, so an agent
 cannot write in its name. Repeating the same message delivers nothing further,
 and `--ack` asks the lane to acknowledge it.
 
+A steer can also wait for the moment it is useful:
+
+```sh
+agent-parley say claude-2 "Pick up 18 next." --when-released 17
+agent-parley say claude-2 "Wrap up for today." --at 18:00
+agent-parley mail pending   # recorded, not delivered yet
+```
+
+The item waits in coordination state and is delivered by the supervision poll
+that already watches every project: no scheduler process, and no read-only view
+ever delivers mail. A stopped service delivers nothing and loses nothing.
+`--after`, `--unless-reported` and a bounded `--every ... --until ...` repeat are
+described in [docs/operations.md](docs/operations.md).
+
 Steer a lane's life without typing into its terminal either:
 
 ```sh
@@ -494,10 +508,11 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
 | `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
+| `say NAME TEXT --after 30m` | Record the message for later; `--at 18:00`, `--when-released N` and `--unless-reported` set the trigger, and `--every 1h --until 18:00` records a bounded repeat. |
 | `issue list` | Show claims, dependencies and handoff offers. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
 | `issue release NUMBER` | Release ownership without closing the GitHub issue. |
-| `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly. |
+| `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly; `--when-released N` records it until that issue is released. |
 | `issue accept NUMBER --offer-id ID` | Accept the current offer addressed to this lane. |
 | `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
@@ -535,6 +550,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `init set COMMAND` | Set that command; an empty string removes it. |
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
+| `mail pending` | List operator messages and offers recorded but not delivered. |
+| `mail cancel ID` | Remove one recorded operator item before it is delivered. |
 | `history issue N` | List every record that touched an issue, with each holding. |
 | `history participant NAME` | List everything one lane filed. |
 | `history claim ID` | Follow one claim to the pull request that ended it. |
@@ -543,7 +560,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 Every read-only command above also accepts `--json` and prints exactly one JSON
 document, so a script, a shell prompt or another agent reads coordination state
 without parsing a table: `status`, `top`, `issue list`, `participant list`,
-`mail thread`, `mail search`, `verify show`, `init show`, `provider list` and
+`mail thread`, `mail search`, `mail pending`, `verify show`, `init show`,
+`provider list` and
 `credentials list`. `top --json` prints one frame and exits. The document
 carries the identifiers the table abbreviates — offer, message and thread IDs —
 with every time in RFC 3339, and no credential value. Field names are

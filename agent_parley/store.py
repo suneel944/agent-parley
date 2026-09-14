@@ -15,7 +15,7 @@ from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SCHEMA_ABSENT = "absent"
 SCHEMA_BEHIND = "needs migration"
 SCHEMA_CURRENT = "ok"
@@ -30,6 +30,27 @@ MAX_EVENT_ROWS = 2000
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
+MAX_REPEATS = 24
+SCHEDULE_FIELDS = (
+    "id",
+    "kind",
+    "recipient",
+    "actor",
+    "subject",
+    "body_md",
+    "issue",
+    "dedup_key",
+    "sequence",
+    "ack_required",
+    "ack_within",
+    "not_before",
+    "condition",
+    "unless_reported",
+    "every_seconds",
+    "repeats_left",
+    "created_ts",
+    "delivered_ts",
+)
 PREVIEW_CHARACTERS = 240
 READ_ONLY = (
     "fetch_inbox",
@@ -97,6 +118,18 @@ CREATE TABLE IF NOT EXISTS idempotent_calls (
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE UNIQUE INDEX IF NOT EXISTS retried
  ON idempotent_calls(agent_id,tool,idempotency_key);
+CREATE TABLE IF NOT EXISTS scheduled_deliveries (
+ id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
+ kind TEXT NOT NULL, recipient TEXT NOT NULL, actor TEXT NOT NULL DEFAULT '',
+ subject TEXT NOT NULL DEFAULT '', body_md TEXT NOT NULL DEFAULT '',
+ issue TEXT NOT NULL DEFAULT '', dedup_key TEXT NOT NULL DEFAULT '',
+ sequence INTEGER NOT NULL DEFAULT 0, ack_required INTEGER NOT NULL DEFAULT 0,
+ ack_within REAL, not_before REAL, condition TEXT NOT NULL DEFAULT '',
+ unless_reported INTEGER NOT NULL DEFAULT 0, every_seconds REAL,
+ repeats_left INTEGER NOT NULL DEFAULT 1, created_ts REAL NOT NULL,
+ delivered_ts REAL, cancelled_ts REAL);
+CREATE INDEX IF NOT EXISTS undelivered ON scheduled_deliveries(project_id)
+ WHERE delivered_ts IS NULL AND cancelled_ts IS NULL;
 """
 SEARCH_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
@@ -1704,6 +1737,296 @@ def speak(
                 "ack_within": within,
             },
         )
+
+
+def _project_id(db: sqlite3.Connection, root: str) -> int:
+    """Returns the registered project identifier for a canonical key."""
+    row = db.execute(
+        "SELECT id FROM projects WHERE human_key=?", (root,)
+    ).fetchone()
+    if not row:
+        raise BridgeError(NO_PROJECT)
+    return int(row[0])
+
+
+def _schedule_row(
+    db: sqlite3.Connection, project_id: int, identifier: int
+) -> sqlite3.Row | None:
+    """Returns one undelivered scheduled item of a project, if it exists."""
+    return db.execute(
+        "SELECT * FROM scheduled_deliveries WHERE id=? AND project_id=? "
+        "AND delivered_ts IS NULL AND cancelled_ts IS NULL",
+        (identifier, project_id),
+    ).fetchone()
+
+
+def _advance_schedule(
+    db: sqlite3.Connection, row: sqlite3.Row, now: float
+) -> None:
+    """Records one delivery and enrolls the next occurrence of a repeat.
+
+    The successor keeps the recording time of the first occurrence, so a
+    condition that compares against when the operator recorded the item reads
+    the same for every occurrence of one repeat. Its sequence number advances,
+    which gives each occurrence its own deduplication key and stops a restart
+    from delivering an occurrence twice.
+    """
+    db.execute(
+        "UPDATE scheduled_deliveries SET delivered_ts=? WHERE id=?",
+        (now, row["id"]),
+    )
+    if row["repeats_left"] <= 1 or not row["every_seconds"]:
+        return
+    db.execute(
+        "INSERT INTO scheduled_deliveries(project_id,kind,recipient,actor,"
+        "subject,body_md,issue,dedup_key,sequence,ack_required,ack_within,"
+        "not_before,condition,unless_reported,every_seconds,repeats_left,"
+        "created_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            row["project_id"],
+            row["kind"],
+            row["recipient"],
+            row["actor"],
+            row["subject"],
+            row["body_md"],
+            row["issue"],
+            row["dedup_key"],
+            row["sequence"] + 1,
+            row["ack_required"],
+            row["ack_within"],
+            (row["not_before"] or now) + row["every_seconds"],
+            row["condition"],
+            row["unless_reported"],
+            row["every_seconds"],
+            row["repeats_left"] - 1,
+            row["created_ts"],
+        ),
+    )
+
+
+def schedule(home: Path, root: str, item: dict) -> dict:
+    """Records one operator message or handoff offer for later delivery.
+
+    Recording delivers nothing. The item waits in the coordination store until
+    the supervision poll finds its time reached or its condition recorded, so a
+    stopped service delivers nothing and loses nothing.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        item: Kind, recipient, acting lane, subject, body, issue number,
+            deduplication key, acknowledgement fields, not-before time,
+            condition text, report opt-out and bounded repeat of the item.
+
+    Returns:
+        The recorded item identifier beside the condition it waits on.
+
+    Raises:
+        BridgeError: If the project is unregistered or the item is invalid.
+    """
+    kind = str(item.get("kind", "message"))
+    recipient = str(item.get("recipient", ""))
+    body = str(item.get("body_md", ""))
+    repeats = int(item.get("repeats_left", 1))
+    if kind not in ("message", "offer"):
+        raise BridgeError("A scheduled item is a message or an offer.")
+    if not recipient:
+        raise BridgeError("A scheduled item needs a recipient.")
+    if len(body.encode()) > MAX_BODY_BYTES:
+        raise BridgeError(f"Body exceeds {MAX_BODY_BYTES} bytes.")
+    if not 1 <= repeats <= MAX_REPEATS:
+        raise BridgeError(
+            f"A repeating message is capped at {MAX_REPEATS} deliveries."
+        )
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        project_id = _project_id(db, root)
+        cursor = db.execute(
+            "INSERT INTO scheduled_deliveries(project_id,kind,recipient,actor,"
+            "subject,body_md,issue,dedup_key,ack_required,ack_within,"
+            "not_before,condition,unless_reported,every_seconds,repeats_left,"
+            "created_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                project_id,
+                kind,
+                recipient,
+                str(item.get("actor", "")),
+                str(item.get("subject", "")),
+                body,
+                str(item.get("issue", "")),
+                str(item.get("dedup_key", "")),
+                int(bool(item.get("ack_required"))),
+                item.get("ack_within"),
+                item.get("not_before"),
+                str(item.get("condition", "")),
+                int(bool(item.get("unless_reported"))),
+                item.get("every_seconds"),
+                repeats,
+                time.time(),
+            ),
+        )
+        return {
+            "id": cursor.lastrowid,
+            "kind": kind,
+            "recipient": recipient,
+            "not_before": item.get("not_before"),
+            "condition": str(item.get("condition", "")),
+            "repeats_left": repeats,
+        }
+
+
+def schedules(home: Path, root: str) -> list[dict]:
+    """Reports every recorded item this project has not delivered yet.
+
+    The reading writes nothing and delivers nothing, so a status view, a
+    dashboard refresh or a script can read pending operator work without
+    releasing any of it into a lane's inbox.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        Undelivered items oldest first, each carrying its recipient, its
+        not-before time, its condition and how many deliveries remain.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home) as db:
+        return [
+            {field: row[field] for field in SCHEDULE_FIELDS}
+            for row in db.execute(
+                "SELECT s.* FROM scheduled_deliveries s "
+                "JOIN projects p ON p.id=s.project_id WHERE p.human_key=? "
+                "AND s.delivered_ts IS NULL AND s.cancelled_ts IS NULL "
+                "ORDER BY s.id",
+                (root,),
+            )
+        ]
+
+
+def cancel_schedule(home: Path, root: str, identifier: int) -> dict:
+    """Removes one undelivered item from a project's pending work.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        identifier: Pending item the operator named.
+
+    Returns:
+        Whether an undelivered item carried that identifier.
+
+    Raises:
+        BridgeError: If the project is not registered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        project_id = _project_id(db, root)
+        row = _schedule_row(db, project_id, identifier)
+        if row is None:
+            return {"id": identifier, "cancelled": False}
+        db.execute(
+            "UPDATE scheduled_deliveries SET cancelled_ts=? WHERE id=?",
+            (time.time(), identifier),
+        )
+        return {"id": identifier, "cancelled": True}
+
+
+def complete_schedule(home: Path, root: str, identifier: int) -> dict:
+    """Marks one item delivered after its own substrate recorded it.
+
+    A handoff offer lives in the issue ledger rather than the mailbox, so the
+    supervisor applies the transition first and then records the delivery here.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        identifier: Pending item that was applied.
+
+    Returns:
+        Whether an undelivered item carried that identifier.
+
+    Raises:
+        BridgeError: If the project is not registered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        project_id = _project_id(db, root)
+        row = _schedule_row(db, project_id, identifier)
+        if row is None:
+            return {"id": identifier, "delivered": False}
+        _advance_schedule(db, row, time.time())
+        return {"id": identifier, "delivered": True}
+
+
+def deliver_schedule(home: Path, root: str, identifier: int, name: str) -> dict:
+    """Delivers one recorded operator message into a lane's inbox.
+
+    The send, the delivery record and the enrollment of the next occurrence of
+    a bounded repeat commit together in one write transaction, so an
+    interrupted poll either delivers the occurrence once or leaves it waiting.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        identifier: Pending item to deliver.
+        name: Registered identity of the addressed participant.
+
+    Returns:
+        Whether the item was delivered and the message identifier it produced.
+        A participant that has not registered with the store yet leaves the
+        item waiting rather than losing it.
+
+    Raises:
+        BridgeError: If the project is not registered or the send is invalid.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        project_id = _project_id(db, root)
+        row = _schedule_row(db, project_id, identifier)
+        if row is None:
+            return {"id": identifier, "delivered": False, "message_id": None}
+        registered = db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND name=?",
+            (project_id, name),
+        ).fetchone()
+        if not registered:
+            return {"id": identifier, "delivered": False, "message_id": None}
+        db.execute(
+            "INSERT INTO agents(project_id,name) VALUES (?,?) "
+            "ON CONFLICT(project_id,name) DO NOTHING",
+            (project_id, OPERATOR),
+        )
+        actor = db.execute(
+            "SELECT id,project_id,name FROM agents "
+            "WHERE project_id=? AND name=?",
+            (project_id, OPERATOR),
+        ).fetchone()
+        key = row["dedup_key"]
+        if row["sequence"]:
+            key = f"{key}-{row['sequence']}"
+        sent = _send(
+            db,
+            dict(actor),
+            {
+                "to": [name],
+                "subject": row["subject"],
+                "body_md": row["body_md"],
+                "idempotency_key": key,
+                "ack_required": bool(row["ack_required"]),
+                "ack_within": row["ack_within"],
+            },
+        )
+        _advance_schedule(db, row, time.time())
+        return {
+            "id": identifier,
+            "delivered": True,
+            "message_id": sent["id"],
+        }
 
 
 def waiting(home: Path, root: str, name: str) -> dict:

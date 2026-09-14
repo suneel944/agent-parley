@@ -605,8 +605,126 @@ def claimed_since(record: dict) -> float:
     )
 
 
+def reported_since(directory: Path, name: str, since: float) -> bool:
+    """Reports whether a lane filed a report after a recorded instant.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose reports are read.
+        since: Unix time the recorded item was written.
+
+    Returns:
+        Whether the lane recorded a report after that instant.
+    """
+    path = directory / f"{name}-activity.json"
+    if not path.exists():
+        return False
+    try:
+        state = json.loads(path.read_text())
+    except ValueError:
+        return False
+    return float(state.get("reported_at") or 0) > since
+
+
+def eligible(item: dict, ledger: dict, now: float) -> bool:
+    """Reports whether a recorded item's time and condition are both met.
+
+    An item carrying both a not-before time and a condition waits for both. A
+    condition is answered from recorded ledger transitions only, so nothing
+    delivers on an inference about branch or pull request history.
+
+    Args:
+        item: Recorded item as the store reports it.
+        ledger: Published issue records of the project.
+        now: Unix time the poll is evaluating.
+
+    Returns:
+        Whether the item is deliverable now.
+    """
+    if item["not_before"] is not None and now < item["not_before"]:
+        return False
+    condition = item["condition"]
+    if condition.startswith("released:"):
+        return issues.released(ledger.get(condition.split(":", 1)[1]) or {})
+    return True
+
+
+def hand_off(home: Path, directory: Path, manifest: dict, item: dict) -> None:
+    """Applies one recorded handoff offer and records it as delivered.
+
+    An offer lives in the issue ledger rather than the mailbox, so a poll
+    interrupted between the two substrates would otherwise retry an offer the
+    ledger already carries. A refused transition whose result is nevertheless
+    the recorded offer is therefore treated as delivered; any other refusal
+    leaves the item waiting, and the operator can cancel it.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        item: Recorded item as the store reports it.
+    """
+    try:
+        issues.change(
+            directory,
+            item["actor"],
+            "offer",
+            item["issue"],
+            participants=set(manifest["participants"]),
+            to=item["recipient"],
+            summary=item["body_md"],
+            defaults=manifest["deadlines"],
+        )
+    except BridgeError:
+        record = issues.snapshot(directory)["issues"].get(item["issue"]) or {}
+        if (record.get("offer") or {}).get("to") != item["recipient"]:
+            return
+    store.complete_schedule(home, manifest["root"], item["id"])
+
+
+def deliveries(home: Path, directory: Path, manifest: dict) -> None:
+    """Delivers the recorded operator items whose trigger has arrived.
+
+    Delivery happens here and nowhere else: a status view, a dashboard refresh
+    or any other read-only path reports pending items and never releases one.
+    A delayed message the lane has already answered with a report is dropped
+    rather than delivered when it was recorded with that opt-out.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    now = time.time()
+    ledger = issues.snapshot(directory)["issues"]
+    for item in store.schedules(home, manifest["root"]):
+        participant = manifest["participants"].get(item["recipient"])
+        if participant is None:
+            continue
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            if item["unless_reported"] and reported_since(
+                directory, item["recipient"], item["created_ts"]
+            ):
+                store.cancel_schedule(home, manifest["root"], item["id"])
+            elif eligible(item, ledger, now):
+                if item["kind"] == "offer":
+                    hand_off(home, directory, manifest, item)
+                else:
+                    store.deliver_schedule(
+                        home,
+                        manifest["root"],
+                        item["id"],
+                        participant["display"],
+                    )
+
+
 def poll(home: Path, directory: Path) -> None:
-    """Refreshes one project's observed presence and outstanding reminders."""
+    """Refreshes presence, delivers due operator items and reminds holders.
+
+    Recorded operator items are delivered here, before reminders and waking,
+    so a message whose time or condition has just arrived is part of the
+    backlog this same poll may wake the lane for.
+    """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
     observations = {
@@ -632,6 +750,7 @@ def poll(home: Path, directory: Path) -> None:
                     participant["display"],
                 ),
             )
+    deliveries(home, directory, manifest)
     if config["prompts"]:
         closed: set[str] = set()
         ledger = issues.snapshot(directory)
