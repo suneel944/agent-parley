@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 
-from agent_parley import copilot, gemini, process, roster
+from agent_parley import copilot, gemini, policy, process, roster
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 from agent_parley.store import DATABASE
@@ -67,6 +67,7 @@ class Reason(StrEnum):
     COORDINATION_UNAVAILABLE = "coordination_unavailable"
     CHECKPOINT_FAILED = "checkpoint_failed"
     WAKE_REQUESTED = "wake_requested"
+    ATTRIBUTION_REFUSED = "attribution_refused"
     OPERATOR_PAUSED = "operator_paused"
     OPERATOR_RESUMED = "operator_resumed"
     OPERATOR_STOPPED = "operator_stopped"
@@ -365,6 +366,28 @@ def shell_segments(command: str) -> list[list[str]]:
     return [segment for segment in segments if segment]
 
 
+def invoked(words: list[str]) -> list[str]:
+    """Strips the wrappers that hide the executable a segment really runs.
+
+    Args:
+        words: Tokenized simple command.
+
+    Returns:
+        The same command without leading environment assignments, the shell's
+        ``command`` builtin, or a token-proxy wrapper, so the executable is the
+        first remaining word.
+    """
+    while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+        words = words[1:]
+    if words[:1] == ["command"]:
+        words = words[1:]
+    if words[:1] == ["rtk"]:
+        words = words[1:]
+        if words[:1] == ["proxy"]:
+            words = words[1:]
+    return words
+
+
 def git_action(
     words: list[str], cwd: Path
 ) -> tuple[Path, str, list[str]] | None:
@@ -378,14 +401,7 @@ def git_action(
         Effective directory, subcommand, and remaining arguments, or ``None``
         when the segment is not a recognized Git invocation.
     """
-    while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
-        words = words[1:]
-    if words[:1] == ["command"]:
-        words = words[1:]
-    if words[:1] == ["rtk"]:
-        words = words[1:]
-        if words[:1] == ["proxy"]:
-            words = words[1:]
+    words = invoked(words)
     if not words:
         return None
     executable = Path(words[0]).name
@@ -452,6 +468,97 @@ def changes_lane_branch(payload: dict, lane: Path) -> bool:
             if len(positional) > 1 and positional[0] == "HEAD":
                 return True
     return False
+
+
+def option_values(args: list[str], options: tuple[str, ...]) -> list[str]:
+    """Collects the text a command's message or title options carry.
+
+    Args:
+        args: Arguments following the subcommand.
+        options: Option names whose value carries publishable text.
+
+    Returns:
+        Every value those options were given, in the order they appear. A
+        value supplied through a file is not collected, because the hook reads
+        the command line rather than the file system; integration still scans
+        the commit that value produced.
+    """
+    values: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        for option in options:
+            if token == option:
+                if index + 1 < len(args):
+                    values.append(args[index + 1])
+                    index += 1
+                break
+            if option.startswith("--") and token.startswith(f"{option}="):
+                values.append(token[len(option) + 1 :])
+                break
+            if (
+                not option.startswith("--")
+                and len(option) == 2
+                and token.startswith(option)
+                and len(token) > 2
+            ):
+                values.append(token[2:])
+                break
+        index += 1
+    return values
+
+
+MESSAGE_OPTIONS = {
+    "commit": ("-m", "--message"),
+    "merge": ("-m", "--message"),
+    "tag": ("-m", "--message"),
+    "revert": ("-m", "--message"),
+}
+PULL_REQUEST_OPTIONS = ("-t", "--title", "-b", "--body")
+
+
+def attributed_command(payload: dict, lane: Path) -> tuple[str, str] | None:
+    """Reports the attribution a native command would publish, if any.
+
+    A lane reaches Git and the forge through its own tools, so the text that
+    would land in a commit, a merge, a tag or a pull request is inspected
+    where the agent asks for it, before anything is written. The check reads
+    the command line only: it runs nothing, writes nothing and never consults
+    the network.
+
+    Args:
+        payload: Native lifecycle hook payload.
+        lane: Assigned bridge worktree.
+
+    Returns:
+        The offending text and the enumerated rule it breaks, or ``None`` when
+        the command publishes no authorship credit.
+    """
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return None
+    command = str(tool_input.get("command", tool_input.get("cmd", "")))
+    cwd = Path(payload.get("cwd", str(lane))).resolve()
+    for segment in shell_segments(command):
+        words = invoked(segment)
+        if not words:
+            continue
+        texts: list[str] = []
+        if Path(words[0]).name == "gh":
+            if words[1:3] == ["pr", "create"] and cwd.is_relative_to(lane):
+                texts = option_values(words[3:], PULL_REQUEST_OPTIONS)
+        else:
+            action = git_action(segment, cwd)
+            if action is None:
+                continue
+            target, subcommand, args = action
+            if subcommand in MESSAGE_OPTIONS and target.is_relative_to(lane):
+                texts = option_values(args, MESSAGE_OPTIONS[subcommand])
+        for text in texts:
+            rule = policy.matched_rule(text)
+            if rule:
+                return text, rule
+    return None
 
 
 def restores_lane_branch(
@@ -902,6 +1009,20 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         return guarded
     if guard_reason is Reason.BRANCH_RESTORE:
         record(directory, agent, payload, guard_reason, None)
+    if event == "PreToolUse" and (
+        attributed := attributed_command(payload, lane)
+    ):
+        refused = {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": policy.refusal(
+                    "This command's message", attributed[1]
+                ),
+            }
+        }
+        record(directory, agent, payload, Reason.ATTRIBUTION_REFUSED, refused)
+        return refused
     if payload.get("agent_id"):
         record(directory, agent, payload, Reason.OBSERVED, None)
         return {}

@@ -250,6 +250,16 @@ status continues to show the drift.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
 </p>
 
+**Your history stays yours.** A lane branch is `parley/PROJECT_KEY/lane-N`: it
+carries no participant, provider or account name, and `agent-parley branch set
+PREFIX` changes the prefix per project. No lane signs its work either. A commit,
+merge, tag or pull request that credits an assistant, names a vendor or model in
+an authorship position, or carries a generator signature is denied before it
+lands, and every commit an integration would carry is scanned again at
+`participant merge` and `participant pr`. There is no flag that skips either
+check, on any repository or for any provider. Which assistant did the work stays
+in coordination state, where `top` and `status` read it.
+
 **Nine scoped MCP tools carry the coordination.** Conflicting reservations
 grant nothing and name the blocking owner with that owner's declared reason.
 Sends need an idempotency key, so a retry returns the original message instead
@@ -380,6 +390,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `credentials list` | List native account profiles. |
 | `credentials add NAME` | Define a config home and environment requirements. |
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
+| `branch show` | Show the prefix new lane branches are created under. |
+| `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `init show` | Show the command every new lane runs before it starts. |

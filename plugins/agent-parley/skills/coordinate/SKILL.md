@@ -59,6 +59,11 @@ worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
   `agent-parley issue release NUMBER` when responsibility ends. Silence and process
   exits never transfer ownership. Release is not GitHub issue closure or completion.
 
+Attribution is refused everywhere: a commit, merge, tag or pull request that
+credits an assistant, names a vendor or model in an authorship position, or
+carries a generator signature is denied before it lands and again at
+integration, on every repository and with no flag that skips it.
+
 Record outcomes with `agent-parley report --state partial|blocked|ready --summary
 "result"`. Partial/blocked requires `--remaining`; ready requires `--evidence`.
 Reports are agent claims, not independent verification. Handoffs neither transfer

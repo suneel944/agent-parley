@@ -404,6 +404,59 @@ refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
 
+### Lane branches and attribution
+
+A lane branch carries no participant, provider or account name. It is created as
+`PREFIX/PROJECT_KEY/lane-N`, where `PREFIX` defaults to `parley`, `PROJECT_KEY`
+is the private project key, and `N` is the next free lane ordinal. Which
+provider drives a lane belongs in coordination state, where `top`, `status` and
+`participant list` read it; it does not belong in your Git history or on your
+forge. The prefix is per project:
+
+```sh
+agent-parley branch show
+agent-parley branch set work
+```
+
+Changing the prefix renames nothing. Lanes created before the neutral scheme
+keep the branch they were created with until they are retired, and the manifest
+records which scheme each lane uses, so `participant merge`, `participant pr`
+and drift detection keep working across the change. A branch name that already
+exists in the repository only moves the ordinal on: nothing is renamed, reused
+or deleted.
+
+Attribution is refused everywhere a lane can publish text, on every repository,
+for every provider, with no flag that turns it off:
+
+- **Denied before it lands.** The same hook that refuses a branch switch inside
+  an assigned lane denies `git commit`, `git commit --amend`, `git merge`,
+  `git tag -m`, `git revert -m` and `gh pr create` whose message, title or body
+  claims assistant authorship: a co-author trailer naming an assistant,
+  "generated", "written", "created", "authored", "assisted" or "powered" by a
+  named assistant, a vendor or model name in an authorship position, or a
+  generator signature. Each denial names the enumerated rule it broke, lands in
+  that lane's event log, and counts under `DENIALS` in `top`.
+- **Refused at integration.** A hook is a tool-level check and a session can
+  reach Git another way, so `participant merge`, `merge --preview` and
+  `participant pr` scan every commit the lane would integrate — subject, body
+  and trailers — and refuse with the offending commit named. `participant pr`
+  refuses before it pushes, so a refusal leaves no remote branch behind. This
+  is the backstop, and it has no skip flag in the same way the verification
+  gate has none.
+- **Clean output from the product itself.** The merge commit names the branch
+  rather than the participant, and the comment a `ready` report posts on a
+  claimed issue reports the result without naming the lane or its provider. The
+  pull-request body carries the lane's own summary, evidence and issue
+  references and no authorship claim.
+
+Detection is textual and deliberately narrow: it matches authorship claims and
+authorship positions, so "fix the codex adapter" is ordinary work while "written
+by" an assistant is refused. A message supplied through a file rather than the
+command line is not visible to the hook; the integration scan still reads the
+commit it produced. Rewriting history you already have is out of scope: a
+pre-existing commit carrying a trailer is reported at merge, never amended for
+you.
+
 `participant merge` integrates one lane's branch into the base checkout. It
 always runs in the repository's main worktree, never inside another lane, and
 always records a merge commit, so the integration stays visible in history. It

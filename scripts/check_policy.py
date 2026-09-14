@@ -3,36 +3,14 @@
 import ast
 import io
 import json
-import re
 import subprocess
 import sys
 import tokenize
 import tomllib
 from pathlib import Path
 
+from agent_parley.policy import has_attribution
 from scripts import release_publish
-
-
-def has_attribution(text: str) -> bool:
-    """Detects assistant credits and generator signatures in contribution text.
-
-    Args:
-        text: File contents, commit message, or public contribution text.
-
-    Returns:
-        Whether the text contains a prohibited authorship credit.
-    """
-    actor = (
-        r"(?:ai\b|claude\b|codex\b|chatgpt\b|copilot\b|openai\b|anthropic\b)"
-    )
-    patterns = (
-        r"\b(?:generated|written|created|authored|assisted|powered)\s+"
-        r"(?:with|by)\s+(?:(?:an?|the)\s+)?" + actor,
-        r"^co-authored-by:\s*[^\n]*" + actor,
-        r"\bthis\s+pr\s+was\s+generated\s+with\b",
-        r"\U0001f916|:robo[t]:|\bbeep\s*\*?\s*boop\b",
-    )
-    return any(re.search(pattern, text, re.I | re.M) for pattern in patterns)
 
 
 def contribution_errors(root: Path) -> list[str]:

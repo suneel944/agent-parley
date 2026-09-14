@@ -15,6 +15,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
+| `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the host forge |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view of every participant |

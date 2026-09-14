@@ -12,6 +12,9 @@ from agent_parley.state import BridgeError, lock, write_json
 
 ADAPTERS = ("claude", "codex", "copilot", "gemini")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
+BRANCH_PREFIX = re.compile(r"[a-z0-9][a-z0-9/_-]{0,38}")
+DEFAULT_PREFIX = "parley"
+SCHEMES = ("participant", "lane")
 VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL")
 OPERATOR = "operator"
@@ -112,6 +115,58 @@ def identifier(value: str, kind: str) -> str:
             "lane cannot shadow a peer's state file."
         )
     return value
+
+
+def branch_prefix(value: str) -> str:
+    """Validates the prefix every new lane branch is created under.
+
+    Args:
+        value: Candidate prefix for this project's lane branches.
+
+    Returns:
+        The accepted prefix.
+
+    Raises:
+        BridgeError: If the prefix is not a usable Git ref path component.
+    """
+    if (
+        not isinstance(value, str)
+        or not BRANCH_PREFIX.fullmatch(value)
+        or value.endswith("/")
+        or "//" in value
+    ):
+        raise BridgeError(
+            "A lane branch prefix must match [a-z0-9][a-z0-9/_-]{0,38}, "
+            "without a trailing or repeated slash."
+        )
+    return value
+
+
+def next_lane_branch(manifest: dict, key: str, taken: set[str]) -> str:
+    """Derives the next neutral branch name for a new lane.
+
+    A lane branch carries no participant, provider or account name, because a
+    participant is usually named after the provider that drives it and that
+    name would otherwise reach the user's Git history and their forge. The name
+    is the project's prefix, the project key, and the next free lane ordinal.
+
+    Args:
+        manifest: Project manifest holding the prefix and existing lanes.
+        key: Project key the private state directory is named after.
+        taken: Branch names that already exist in the repository.
+
+    Returns:
+        A branch name no lane and no existing ref holds.
+    """
+    prefix = manifest.get("branch_prefix") or DEFAULT_PREFIX
+    used = {
+        participant["branch"]
+        for participant in manifest["participants"].values()
+    } | taken
+    ordinal = 1
+    while f"{prefix}/{key}/lane-{ordinal}" in used:
+        ordinal += 1
+    return f"{prefix}/{key}/lane-{ordinal}"
 
 
 def variables(names: list[str]) -> list[str]:
@@ -561,10 +616,19 @@ def normalize(manifest: dict) -> dict:
             raise BridgeError("Participant wake setting must be a boolean.")
         if type(participant.get("paused", False)) is not bool:
             raise BridgeError("Participant paused setting must be a boolean.")
+        if participant.setdefault("scheme", "participant") not in SCHEMES:
+            raise BridgeError(
+                "Participant branch scheme must be one of: "
+                + ", ".join(SCHEMES)
+                + "."
+            )
     return {
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
         "base": manifest["base"],
+        "branch_prefix": branch_prefix(
+            manifest.get("branch_prefix") or DEFAULT_PREFIX
+        ),
         "verify": list(manifest.get("verify") or []),
         "initialize": list(manifest.get("initialize") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
