@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from agent_parley import checkpoints, protocol, store
 from agent_parley.state import write_json
 
@@ -197,6 +199,71 @@ def test_an_ordinary_outage_prescribes_the_status_check(
     reason = details(output)["permissionDecisionReason"]
     assert checkpoints.OUTAGE_CHECK in reason
     assert protocol.MIGRATE not in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "agent-parley status > agent_parley/cli.py",
+        "agent-parley status >agent_parley/cli.py",
+        "agent-parley status >> notes.txt",
+        "agent-parley status &> notes.txt",
+        "agent-parley status < notes.txt",
+        "agent-parley status <<< text",
+        "agent-parley status $(git commit -m done)",
+        "agent-parley status `git commit -m done`",
+        "agent-parley status <(git log)",
+        "agent-parley status\ngit commit -m done",
+    ],
+)
+def test_a_redirected_or_substituted_command_is_denied(
+    bridge, repo, paired, monkeypatch, command
+):
+    output, _ = during_outage(
+        bridge,
+        paired,
+        monkeypatch,
+        {"tool_name": "Bash", "tool_input": {"command": command}},
+    )
+    assert details(output)["permissionDecision"] == "deny"
+
+
+def test_the_documented_repair_is_still_cleared(
+    bridge, repo, paired, monkeypatch
+):
+    output, _ = during_outage(
+        bridge,
+        paired,
+        monkeypatch,
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "agent-parley down && agent-parley up"},
+        },
+    )
+    assert "permissionDecision" not in details(output)
+
+
+def test_a_store_behind_the_code_is_not_reported_ready(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(type(bridge), "server_process", lambda self: True)
+    monkeypatch.setattr(type(bridge), "ready", lambda self: True)
+    assert bridge.status_snapshot()["server"]["ready"] is True
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(f"PRAGMA user_version={store.SCHEMA_VERSION - 1}")
+    assert bridge.status_snapshot()["server"]["ready"] is False
+    monkeypatch.undo()
+
+
+def test_status_names_the_repair_for_an_unusable_store(
+    bridge, repo, paired, capsys
+):
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(f"PRAGMA user_version={store.SCHEMA_VERSION - 1}")
+    bridge.status()
+    printed = capsys.readouterr().out
+    assert "Server: not ready" in printed
+    assert protocol.MIGRATE in printed
 
 
 def test_a_store_state_maps_to_one_remedy():

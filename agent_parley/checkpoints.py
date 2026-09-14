@@ -47,6 +47,7 @@ DIAGNOSTIC_TOOLS = frozenset(
     {"Glob", "Grep", "NotebookRead", "Read", "ToolSearch"}
 )
 BRIDGE_COMMAND = "agent-parley"
+UNCHECKED_SHELL = ("<", ">", "`", "$(", "\n", "\r")
 OUTAGE_CHECK = "Run agent-parley status for the bridge's own report."
 OUTAGE_GUIDANCE = (
     "Reads and agent-parley commands still run; hold edits, commits and "
@@ -602,6 +603,14 @@ def diagnosable(payload: dict) -> bool:
     bridge, so an allowed check chained onto an edit is not laundered through
     the same call.
 
+    Redirection, here-strings, process substitution, command substitution and
+    a line break are not simple-command boundaries: the tokenizer keeps them
+    inside a segment whose first word is still the bridge, so a cleared call
+    could truncate a tracked file or run a second, unchecked program. A
+    command carrying any of them is refused rather than parsed, because a
+    refusal during an outage costs one retype and the alternative costs the
+    file the outage branch promises to protect.
+
     Args:
         payload: Native lifecycle hook payload.
 
@@ -615,6 +624,8 @@ def diagnosable(payload: dict) -> bool:
     if not isinstance(tool_input, dict):
         return False
     command = str(tool_input.get("command", tool_input.get("cmd", "")))
+    if any(construct in command for construct in UNCHECKED_SHELL):
+        return False
     segments = [
         words
         for segment in shell_segments(command)

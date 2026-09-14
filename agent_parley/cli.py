@@ -2906,11 +2906,21 @@ attempt of the recorded budget, which is also only reported.
         document, so a script and an operator never see two different states
         of the same coordination store.
 
+        A live process answering its own readiness probe is not readiness when
+        the store it serves cannot be read by the code around it. Readiness
+        therefore also requires a usable store schema, so the report cannot
+        claim health while every participant is refused against the same
+        store.
+
         Returns:
             Server readiness, the private state directory, and one record per
             registered project holding its issue ledger and its lanes.
         """
-        healthy = bool(self.server_process()) and self.ready()
+        usable = (
+            store.schema_state(store.schema_version(self.home))
+            in store.SCHEMA_USABLE
+        )
+        healthy = usable and bool(self.server_process()) and self.ready()
         projects = []
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
@@ -2939,6 +2949,9 @@ attempt of the recorded budget, which is also only reported.
         }
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
+        schema = store.schema_state(store.schema_version(self.home))
+        if repair := store.remedy(schema):
+            print(f"Store: {schema}; {repair}")
         print(f"State: {report['state_directory']}")
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
