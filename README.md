@@ -527,6 +527,23 @@ agent-parley top --since 6h
 agent-parley events export --since 7d --output enforcement.jsonl
 ```
 
+**One lane can be followed as a stream.** `agent-parley watch NAME` prints
+one line per coordination event as it happens: `claim issue 42`, `denied git
+(branch_switch)`, `mail from codex-2 (thread t12)`, `report ready`, `call
+send_message ok`, `session ended`. It starts from the most recent twenty
+events, follows the store and the event log from there, and stops on `q` or
+on interrupt; `--since 1h` widens the backlog and `--kind` narrows it. When
+standard output is a pipe the lines are plain, and `--json` prints one event
+object per line, so `watch NAME --json | jq` works. It never shows the
+agent's conversation: the stream is coordination only, and the native
+client's transcript stays in that client.
+
+```sh
+agent-parley watch codex-2
+agent-parley watch claude-1 --since 1h --kind claim --kind denied
+agent-parley watch claude-1 --json | jq .description
+```
+
 ## Scrape the numbers
 
 `top` is a screen. `metrics` prints the same counters and gauges as text a
@@ -717,6 +734,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `history participant NAME` | List everything one lane filed. |
 | `history claim ID` | Follow one claim to the pull request that ended it. |
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
+| `watch NAME` | Follow one lane's coordination events as a stream; `--since` widens the backlog, `--kind` narrows it, `--json` prints JSON Lines. The agent's conversation is never shown. |
 
 Every read-only command above also accepts `--json` and prints exactly one JSON
 document, so a script, a shell prompt or another agent reads coordination state
@@ -727,8 +745,8 @@ without parsing a table: `status`, `top`, `issue list`, `participant list`,
 carries the identifiers the table abbreviates — offer, message and thread IDs —
 with every time in RFC 3339, and no credential value. Field names are
 documented in [docs/operations.md](docs/operations.md) and carry the same
-stability promise as the flags. `events export` stays JSON Lines, because it is
-a stream rather than a snapshot.
+stability promise as the flags. `events export` and `watch --json` stay JSON
+Lines, because each is a stream rather than a snapshot.
 
 Removing a definition leaves participant references intact. Redefine that name
 before relaunching a lane that uses it. A removed provider override immediately

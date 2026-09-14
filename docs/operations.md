@@ -815,6 +815,43 @@ as the store does. A record written before this correlation existed carries
 no claim and is reported as `unknown`; nothing is back-filled, because an
 invented correlation is worse than an honest gap.
 
+### Following one lane
+
+`agent-parley watch NAME` sits on one participant and prints its coordination
+events as they happen, one `TIME KIND description` line each:
+
+```sh
+agent-parley watch codex-2
+agent-parley watch claude-1 --since 1h --kind claim --kind handoff
+agent-parley watch claude-1 --json | jq .description
+```
+
+The stream starts from the most recent twenty events, or from every event
+inside `--since`, and then follows the ledger, the report log, the store and
+the lane's hook event log on a short interval, printing only what is new.
+`--kind` takes the history kinds (`claim`, `handoff`, `report`, `approval`,
+`reservation`, `message`) plus `call` for a served coordination call, `denied`
+for a hook denial and `session` for a session boundary. A lane whose session
+ends prints one `session ended` line and the stream keeps following, so a
+restart appears as `session started` in the same stream. `q` or an interrupt
+leaves.
+
+When standard output is a pipe the lines are plain with no cursor control, and
+`--json` prints one JSON object per line rather than one document, so
+`watch NAME --json | jq` works. Each object carries `at` in RFC 3339, `kind`,
+`participant`, `description` and the identifiers the line abbreviates, such
+as `issue`, `claim_id`, `message_id`, `thread_id` and `tool`.
+
+**It reads, only.** The store is opened without a write transaction, the event
+files are read under their shared lock for the bounded lifetime of one read so
+a rotation cannot split the snapshot, and no coordination state is mutated.
+Every record is identified by its content rather than by its position in a
+file, so a rotation between two reads neither drops nor repeats a line.
+
+**It never shows the agent's conversation.** The stream is coordination only.
+The native client's transcript stays in that client; nothing the agent said or
+was told is read or printed.
+
 ### Machine-readable output
 
 Every read-only command also accepts `--json` and prints exactly one JSON
