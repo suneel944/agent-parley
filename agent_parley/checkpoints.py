@@ -20,6 +20,7 @@ from agent_parley.state import BridgeError, lock, write_json
 from agent_parley.store import DATABASE
 
 MAX_CONTEXT_BYTES = 1536
+MAX_CAUSE_BYTES = 200
 MAX_EVENT_LOG_BYTES = 262144
 MAX_EVENT_LOG_AGE = 1209600
 EVENT_LOCK_TIMEOUT = 2.0
@@ -122,6 +123,7 @@ def record(
     reason: Reason,
     output: dict | None,
     activity: str = "",
+    cause: str = "",
 ) -> None:
     """Appends one decision record to the participant event log.
 
@@ -131,6 +133,13 @@ def record(
     Telemetry must not change an enforcement outcome, so a log failure is
     discarded rather than raised into the hook.
 
+    An outage cause is carried here rather than left in live lane state. The
+    live copy is cleared by the first call that succeeds, which is what the
+    remedy for an outage produces, so recovery destroys the only record of
+    what failed. Recording it per event keeps every denial answerable
+    afterwards. The text is bounded, because an exception carrying an entire
+    statement would otherwise set the log's rotation pace.
+
     Args:
         directory: Common project state directory.
         agent: Assigned native lane name.
@@ -138,6 +147,7 @@ def record(
         reason: Enumerated cause of the decision.
         output: Native hook output returned for this event.
         activity: Observed lane activity, when it is already known.
+        cause: Failure that produced this decision, when one did.
     """
     entry = {
         "ts": time.time(),
@@ -146,6 +156,7 @@ def record(
         "tool_name": str(payload.get("tool_name", "")),
         "decision": decision_of(output),
         "reason_class": reason.value,
+        "cause": cause[:MAX_CAUSE_BYTES],
         "injected_bytes": injected_bytes(output),
     }
     path = directory / f"{agent}-events.jsonl"
@@ -733,8 +744,12 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
             Zero counts everything retained.
 
     Returns:
-        Observed event count, denials, injected bytes, and the time and
-        reason class of the most recent record.
+        Observed event count, denials, injected bytes, the time and reason
+        class of the most recent record, and the most recent recorded failure.
+        That last cause is reported even when the lane has since recovered,
+        because an operator reading a run of denials needs to know what
+        produced them and the live copy is cleared by the first call that
+        succeeds.
     """
     try:
         entries = read_events(directory, agent, since)
@@ -745,8 +760,10 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
             "injected_bytes": 0,
             "last_ts": 0.0,
             "last_reason": "unavailable",
+            "last_cause": "",
         }
     last = entries[-1] if entries else {}
+    causes = [str(entry.get("cause", "")) for entry in entries]
     return {
         "events": len(entries),
         "denials": sum(
@@ -757,6 +774,7 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
         ),
         "last_ts": float(last.get("ts", 0) or 0),
         "last_reason": str(last.get("reason_class", "")),
+        "last_cause": next((cause for cause in reversed(causes) if cause), ""),
     }
 
 
@@ -1218,6 +1236,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
             reason,
             output,
             str(state.get("activity", "")),
+            str(state.get("coordination_error", "")),
         )
         if event in ("SessionStart", "SessionEnd"):
             prune(directory, agent)
