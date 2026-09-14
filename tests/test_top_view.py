@@ -45,6 +45,10 @@ def lane(name: str, **changes: object) -> dict:
         "tokens": None,
         "idle_seconds": 0,
         "idle_complete": True,
+        "fit": None,
+        "unfit": "",
+        "work_offer": False,
+        "offer_kind": "",
         "prompt": "",
     }
     return {**row, **changes}

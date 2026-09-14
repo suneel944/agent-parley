@@ -137,7 +137,16 @@ checkpoint and CLI concern rather than a coordination tool.
 ## Participants, providers and accounts
 
 `supervision.py` owns the service's periodic presence observations, advisory
-handoff reminders and bounded wake requests. It reads project manifests to
+handoff reminders, bounded wake requests, and the capacity check that decides
+whether a lane could take more work. Each check is provider specific with a
+null default: the session process from the activity file, a recorded usage
+refusal from `records.py`, the worktree from Git, and owed acknowledgements
+from the store. The result and any work offer are published per lane as
+`<participant>-work.json` beside the other lane state, because the offer is
+about a lane rather than an issue and the ledger records only ownership. The
+checkpoint injects an offer once per identifier and `top` reads the same file,
+so the operator sees exactly what the runtime asked. An offer is advisory: it
+never writes the ledger, and `issue offer` remains the only transfer path. It reads project manifests to
 resolve lane state; this is the explicit bridge from served project identity to
 private launcher state. Its best-effort forge reads run outside store write
 transactions, and observation failures do not fail a committed coordination

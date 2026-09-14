@@ -36,9 +36,15 @@ CLAUDE_FIELDS = (
 )
 DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
 UNSAFE = re.compile(r"[^A-Za-z0-9]")
+MAX_TAIL = 1 << 16
+REFUSAL = re.compile(
+    r"rate[ _-]?limit|usage limit|quota exceed|too many requests",
+    re.IGNORECASE,
+)
 
 Finder = Callable[[Path, Path], "Path | None"]
 Fold = Callable[[dict, dict], None]
+Refusal = Callable[[dict], "float | None"]
 
 
 def _mtime(path: Path) -> float:
@@ -162,6 +168,118 @@ ADAPTERS: dict[str, tuple[Finder, Fold]] = {
     "claude": (_claude_records, _fold_claude),
     "codex": (_codex_records, _fold_codex),
 }
+
+
+def _stamp(value: object) -> float | None:
+    """Parses the ISO 8601 instant a native client wrote on a record."""
+    try:
+        moment = datetime.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.UTC)
+    return moment.timestamp()
+
+
+def _claude_refusal(record: dict) -> float | None:
+    """Reads a Claude transcript record that reports a refused request.
+
+    Claude marks a request its API refused on the transcript record itself and
+    keeps the refusal text in the message content, so the reader looks at that
+    flag before matching the text.
+
+    Args:
+        record: One parsed transcript record.
+
+    Returns:
+        When the refusal was recorded, or None when this record reports no
+        usage-window or rate-limit refusal.
+    """
+    if not record.get("isApiErrorMessage"):
+        return None
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not REFUSAL.search(json.dumps(content if content else "")):
+        return None
+    return _stamp(record.get("timestamp"))
+
+
+def _codex_refusal(record: dict) -> float | None:
+    """Reads a Codex rollout record that reports a refused request.
+
+    Codex wraps each rollout record in a payload naming its own kind, so the
+    reader matches the refusal text only on a payload that reports an error.
+
+    Args:
+        record: One parsed rollout record.
+
+    Returns:
+        When the refusal was recorded, or None when this record reports no
+        usage-window or rate-limit refusal.
+    """
+    payload = record.get("payload")
+    source = payload if isinstance(payload, dict) else record
+    if str(source.get("type", "")) not in ("error", "stream_error"):
+        return None
+    if not REFUSAL.search(str(source.get("message", ""))):
+        return None
+    return _stamp(record.get("timestamp") or source.get("timestamp"))
+
+
+REFUSALS: dict[str, Refusal] = {
+    "claude": _claude_refusal,
+    "codex": _codex_refusal,
+}
+
+
+def reported_refusal(home: Path, participant: dict) -> float | None:
+    """Reports when a lane's own client last recorded a usage refusal.
+
+    The reading comes from the same session records the reported token count
+    is parsed from, so it costs no vendor request, no API key and no account
+    of its own: it states what one client wrote about one session. Only the
+    tail of the record is read, because a refusal that matters is the most
+    recent one rather than one the session has already recovered from.
+
+    Every provider whose client publishes nothing has no reader here and
+    reports None, which a caller must treat as no opinion rather than as a
+    lane in good standing.
+
+    Args:
+        home: Private bridge state root.
+        participant: Manifest entry naming the lane, provider and account.
+
+    Returns:
+        Unix time of the most recent recorded refusal, or None when this
+        provider publishes no such record or none could be read.
+    """
+    try:
+        entry = roster.provider(home, str(participant.get("provider", "")))
+        adapter = str(entry.get("adapter", ""))
+        finder = ADAPTERS[adapter][0]
+        refusal = REFUSALS[adapter]
+        config = _config_home(home, entry, participant.get("credential"))
+        if config is None:
+            return None
+        path = finder(config, Path(str(participant.get("lane", ""))))
+        if path is None:
+            return None
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - MAX_TAIL))
+            chunk = handle.read(MAX_TAIL)
+    except (BridgeError, KeyError, OSError, ValueError):
+        return None
+    latest: float | None = None
+    for line in chunk.split(b"\n")[1 if size > MAX_TAIL else 0 :]:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        at = refusal(record) if isinstance(record, dict) else None
+        if at is not None and (latest is None or at > latest):
+            latest = at
+    return latest
 
 
 def _advance(path: Path, fold: Fold, reading: dict) -> dict:

@@ -45,6 +45,7 @@ COLUMNS = (
     ("CALLS", 9),
     ("TOKENS", 9),
     ("IDLE", 8),
+    ("FIT", 8),
 )
 DROP_ORDER = (
     "PROVIDER",
@@ -54,6 +55,7 @@ DROP_ORDER = (
     "CALLS",
     "TOKENS",
     "LEASES",
+    "FIT",
     "IDLE",
     "ISSUES",
     "DENIALS",
@@ -72,6 +74,7 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "CALLS": lambda row: -row["calls"],
     "TOKENS": lambda row: -(row["tokens"] or 0),
     "IDLE": lambda row: -row["idle_seconds"],
+    "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
 }
 KEYS = (
     ("j, down", "select the next lane, paging when it is past the fold"),
@@ -106,6 +109,11 @@ LEGEND = (
     "turn. A branch marked ! left "
     "its assigned bridge branch. A stale lease is still held; releasing "
     "it is its owner's to do.",
+    "FIT is the last capacity check the runtime read for that lane, with "
+    "+ when an advisory work offer is waiting for it; the line under an "
+    "unfit lane names the check that failed, and no offer names that "
+    "lane. A blank cell means nothing was published for it yet. An offer "
+    "claims nothing and transfers nothing.",
     "A row carrying drift, a stale lease, a rejected call, an overdue "
     "issue or a stopped session is drawn in colour where the terminal "
     "offers it and in bold where it does not. Every one of those also "
@@ -160,6 +168,21 @@ def _tokens(count: int | None) -> str:
     if count < 1000000:
         return f"{count / 1000:.1f}k"
     return f"{count / 1000000:.1f}M"
+
+
+def _fitness(row: dict) -> str:
+    """Formats a lane's fit result and whether a work offer is pending.
+
+    Args:
+        row: Assembled participant row.
+
+    Returns:
+        The fit result, marked when an advisory work offer is waiting for the
+        lane. An empty cell states that nothing was published for this lane
+        rather than that it is unfit.
+    """
+    value = "" if row["fit"] is None else "fit" if row["fit"] else "unfit"
+    return value + ("+" if row["work_offer"] else "")
 
 
 def _fit(value: str, width: int) -> str:
@@ -253,6 +276,7 @@ def _row(
         home, directory, data, agent, context["stalled_after"]
     )
     idle = metrics.idle_intervals(directory, agent, context["since"])
+    published = supervision.published_work(directory, agent)
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -306,6 +330,10 @@ def _row(
         ),
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
+        "fit": published["fit"],
+        "unfit": published["reason"],
+        "work_offer": bool(published["offer"]),
+        "offer_kind": (published["offer"] or {}).get("kind", ""),
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
         ).replace("\n", " ")[:MAX_PROMPT],
@@ -473,6 +501,7 @@ def _cells(row: dict) -> tuple[str, ...]:
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         _tokens(row["tokens"]),
         _age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
+        _fitness(row),
     )
 
 
@@ -681,6 +710,10 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
             ]
             if row["stall"]:
                 lines.append(f"    {row['stall']}")
+            if row["unfit"]:
+                lines.append(f"    {row['unfit']}")
+            if row["work_offer"]:
+                lines.append(f"    {row['offer_kind']} offer pending")
             if row["prompt"]:
                 lines.append(f"    last: {row['prompt']}")
             blocks.append({"root": project["root"], "lines": lines, "row": row})

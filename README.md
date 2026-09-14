@@ -331,6 +331,19 @@ figure comes from records the runtime already keeps, so it reports observed
 coordination inactivity and never claims to know what the native client was
 doing inside a turn.
 
+**No lane waits for a human to give it something to do.** When a lane holds no
+claim, its next checkpoint carries the unclaimed work no dependency blocks —
+the issues other lanes wait on first — and names the peers holding more than
+one claim. When a lane holds several claims and a peer has been idle past the
+stall interval, that lane is told which peer could take one. Every offer is
+checked first against what the host can read without asking a vendor: the
+session process, the lane's own client records for a recent rate-limit or
+usage-window refusal, the worktree, and the acknowledgements it owes. A lane
+that fails a check is reported `unfit` with the failed check named, and no
+offer names it. `top` shows each lane's `FIT` result and whether an offer is
+pending. Nothing is claimed for anyone: `issue offer` stays the only transfer
+path, and the recipient still accepts or declines.
+
 **Ownership history is queryable.** `agent-parley history issue 42` lists every
 claim, handoff, reservation, message and report that touched it, with how long
 each participant held it; `history participant NAME` does the same for one lane,

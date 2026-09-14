@@ -128,6 +128,61 @@ def snapshot(directory: Path) -> dict:
     )
 
 
+def holders(state: dict) -> dict[str, list[str]]:
+    """Maps each lane to the issue numbers the ledger records it owning.
+
+    Args:
+        state: Published issue ledger.
+
+    Returns:
+        Owner name to its owned issue numbers, ordered numerically. A lane
+        that owns nothing is absent rather than present with an empty list.
+    """
+    owned: dict[str, list[str]] = {}
+    for number in sorted(state.get("issues", {}), key=int):
+        owner = state["issues"][number].get("owner")
+        if owner:
+            owned.setdefault(owner, []).append(number)
+    return owned
+
+
+def unclaimed(state: dict) -> list[str]:
+    """Orders the unclaimed ledger issues no recorded dependency blocks.
+
+    An issue is unclaimed when the ledger records neither an owner nor a
+    pending offer for it, and unblocked when it waits on nothing. The ledger
+    records no completion, so an issue that waits on anything is left out
+    rather than guessed to be ready.
+
+    The order puts first the issues that other owned issues wait on, because
+    finishing one of those releases a peer, and falls back to the issue number
+    so the same ledger always produces the same list.
+
+    Args:
+        state: Published issue ledger.
+
+    Returns:
+        Issue numbers a lane could claim, most unblocking first.
+    """
+    issues = state.get("issues", {})
+    waiters: dict[str, int] = {}
+    for record in issues.values():
+        if not record.get("owner"):
+            continue
+        for blocker in record.get("blocked_by", []):
+            waiters[blocker] = waiters.get(blocker, 0) + 1
+    return sorted(
+        (
+            number
+            for number, record in issues.items()
+            if not record.get("owner")
+            and not record.get("offer")
+            and not record.get("blocked_by")
+        ),
+        key=lambda number: (-waiters.get(number, 0), int(number)),
+    )
+
+
 def _refuse(directory: Path, scope: str, fingerprint: str, detail: str) -> None:
     """Records a refused transition so a retry is refused identically.
 
