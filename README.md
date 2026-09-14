@@ -259,6 +259,14 @@ attempt of the recorded budget. Ownership never moves on a timer: an overdue
 claim is still owned, and only an explicit release or an accepted handoff
 transfers it.
 
+**The work order is a file you can review.** Write the issues, the dependencies
+between them and the groups that may run in parallel as TOML, then
+`agent-parley plan apply work-order.toml`. Applying records the same advisory
+dependencies `issue block` records and nothing else — no claim, no assignment, no
+gate. `plan diff` previews the edges first, `plan show` prints the plan as a tree
+with each issue's current owner, and every apply is versioned by the file's
+digest, so an edge added by hand afterwards is reported as exactly that.
+
 **A stalled lane says so.** `top` and `status` mark a lane `idle` when its
 process is alive, no coordination call has been served for it within the
 configured interval, and it holds unread or unacknowledged mail at least that
@@ -417,6 +425,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
+| `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
+| `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
 | `issue ... --idempotency-key KEY` | Retry any transition safely; the repeat returns the first result. |
 | `participant list` | List the project's lanes and their identities. |
 | `participant add NAME` | Create a lane with an optional provider and credential profile. |

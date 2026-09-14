@@ -23,6 +23,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `metrics` | Idle intervals and waiting times derived from retained records |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
+| `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `state` | Private atomic JSON publication and operation locks |
 
@@ -374,6 +375,18 @@ That distinction lets a reader separate a lane still working on a path from a
 lane that died holding it, without any process deciding on that lane's behalf.
 No time-to-live applies to issue ownership, which changes hands only through
 release, or an explicit offer and acceptance.
+
+A work-order plan is one TOML file the operator writes, parsed by the standard
+library. Applying it records the same advisory dependency edges `issue block`
+records and nothing else: no claim, no assignment, no gate. Each apply records a
+version carrying the file's digest and the identity that applied it, bounded to
+the twenty most recent versions in `plan.json` beside the issue ledger. A plan
+is refused before any edge is written when it names a malformed issue, exceeds a
+bound, or describes a cycle, so an operator never has to unpick a half-applied
+order by hand. Applying adds edges and never removes one, so an edge recorded
+after the apply is reported as entered by hand and a narrowed plan shows its
+dropped edges as unlisted until `issue unblock` removes them. Groups are advice
+a later offer or integration path may read; this layer only records them.
 
 A writing call can commit and still fail to answer, so the caller retries what
 already happened. An idempotency key makes the two calls one. The first call

@@ -106,6 +106,51 @@ def offer(value: dict | None) -> dict | None:
     }
 
 
+def work_plan(applied: dict) -> dict:
+    """Reports an applied work-order plan beside current ownership.
+
+    Args:
+        applied: Plan description returned by `plan.describe`.
+
+    Returns:
+        The plan's identity and the operator that applied it, one record per
+        planned issue carrying its owner and the issues it waits on, the
+        groups as an array, and every edge recorded by hand after the apply.
+    """
+    return {
+        "plan": applied["plan"],
+        "digest": applied["digest"],
+        "applied_by": applied["applied_by"],
+        "applied_at": timestamp(applied["applied_at"]),
+        "versions": applied["versions"],
+        "issues": applied["issues"],
+        "groups": [
+            {"group": name, "issues": members}
+            for name, members in sorted(applied["groups"].items())
+        ],
+        "unplanned": [
+            {"issue": issue, "waits_on": blocker}
+            for issue, blocker in applied["unplanned"]
+        ],
+    }
+
+
+def plan_diff(reported: dict) -> dict:
+    """Reports the edges a plan file would add, and those it does not name."""
+    return {
+        "plan": reported["plan"],
+        "digest": reported["digest"],
+        "add": [
+            {"issue": issue, "waits_on": blocker}
+            for issue, blocker in reported["add"]
+        ],
+        "unlisted": [
+            {"issue": issue, "waits_on": blocker}
+            for issue, blocker in reported["unlisted"]
+        ],
+    }
+
+
 def issues(state: dict) -> list[dict]:
     """Reports the issue ledger as an array ordered by issue number.
 

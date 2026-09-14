@@ -29,6 +29,7 @@ from agent_parley import (
     gemini,
     history,
     metrics,
+    plan,
     policy,
     process,
     retries,
@@ -2451,6 +2452,37 @@ attempt of the recorded budget, which is also only reported.
             forge.unassign(repo, parse_issue(number))
         return record
 
+    def work_plan(
+        self, repo: Path, action: str, path: Path | None = None
+    ) -> dict:
+        """Applies, compares or reports the repository's work-order plan.
+
+        A plan records advisory dependencies and nothing else. Applying one
+        claims no issue, assigns no lane and gates no transition, so a plan
+        that turns out to be wrong never blocks anybody.
+
+        Args:
+            repo: Any checkout of the target repository.
+            action: Apply, diff, or show.
+            path: Plan file for apply and diff.
+
+        Returns:
+            The recorded version for apply, the comparison for diff, or the
+            applied plan beside current ownership for show.
+
+        Raises:
+            BridgeError: If the plan file is unusable or the ledger cannot be
+                locked.
+        """
+        _, directory = self.project(repo)
+        if action == "show":
+            return plan.describe(directory)
+        if path is None:
+            raise BridgeError("Name the plan file to apply or compare.")
+        if action == "apply":
+            return plan.apply(directory, path)
+        return plan.diff(directory, path)
+
     def mail(
         self,
         repo: Path,
@@ -3400,6 +3432,19 @@ def main() -> int:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    planning = commands.add_parser(
+        "plan", help="Apply, compare or show the recorded work-order plan."
+    )
+    steps = planning.add_subparsers(dest="action", required=True)
+    for action in ("apply", "diff", "show"):
+        command = steps.add_parser(action)
+        command.add_argument("--repo", type=Path, default=Path.cwd())
+        if action != "show":
+            command.add_argument(
+                "path", type=Path, help="TOML plan file to read."
+            )
+        if action != "apply":
+            command.add_argument("--json", action="store_true", help=JSON_HELP)
     mail = commands.add_parser(
         "mail", help="Read one mail thread or search your own mail."
     )
@@ -3700,6 +3745,28 @@ def main() -> int:
                 print(views.render("issues", views.ledger(result)))
             else:
                 print(describe(result, bridge.liveness(args.repo.resolve())))
+        elif args.command == "plan":
+            applied = bridge.work_plan(
+                args.repo.resolve(), args.action, getattr(args, "path", None)
+            )
+            if args.action == "apply":
+                print(
+                    f"Applied plan {applied['name']} "
+                    f"({applied['digest'][:12]}): "
+                    f"{len(applied['added'])} dependencies recorded."
+                )
+            elif args.action == "show":
+                print(
+                    views.render("plan", views.work_plan(applied))
+                    if args.json
+                    else plan.render(applied)
+                )
+            else:
+                print(
+                    views.render("plan_diff", views.plan_diff(applied))
+                    if args.json
+                    else plan.render_diff(applied)
+                )
         elif args.command == "mail":
             page = bridge.mail(
                 args.repo.resolve(),
