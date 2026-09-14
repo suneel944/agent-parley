@@ -46,6 +46,7 @@ from agent_parley import (
     terminal,
     views,
 )
+from agent_parley import watch as stream
 from agent_parley.checkpoints import (
     EVENTS,
     activity,
@@ -5477,6 +5478,47 @@ def main() -> int:
             "6h or 7d. The whole retained log is counted by default."
         ),
     )
+    follow = commands.add_parser(
+        "watch",
+        help=(
+            "Follow one lane's coordination events as a stream; the agent's "
+            "conversation is never shown."
+        ),
+    )
+    follow.add_argument("participant", help="Participant name to follow.")
+    follow.add_argument("--repo", type=Path, default=Path.cwd())
+    follow.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON Lines, one event object per line.",
+    )
+    follow.add_argument(
+        "--kind",
+        action="append",
+        choices=stream.KINDS,
+        metavar="KIND",
+        help=(
+            "Print only this kind of event: "
+            + ", ".join(stream.KINDS)
+            + ". Repeat the flag to print several."
+        ),
+    )
+    follow.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Start from every event inside this window, such as 45m or 1h, "
+            "instead of the most recent twenty."
+        ),
+    )
+    follow.add_argument(
+        "--interval",
+        type=float,
+        default=stream.INTERVAL,
+        help="Seconds between reads of the store and the event log.",
+    )
     past = commands.add_parser(
         "history",
         help="Read the recorded history of an issue, a lane or a claim.",
@@ -6161,6 +6203,18 @@ def main() -> int:
                     if not args.every:
                         break
                     time.sleep(args.every)
+        elif args.command == "watch":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            stream.run(
+                bridge.home,
+                directory,
+                roster.read(directory),
+                args.participant,
+                since=args.since,
+                kinds=tuple(args.kind or ()),
+                json_lines=args.json,
+                interval=args.interval,
+            )
         elif args.command == "history":
             if args.subject is None:
                 parser.error("history takes issue, participant or claim.")
