@@ -10,7 +10,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from agent_parley import metrics, records, roster, store, supervision
+from agent_parley import (
+    metrics,
+    process,
+    records,
+    roster,
+    store,
+    supervision,
+    views,
+)
 from agent_parley.checkpoints import (
     activity,
     event_summary,
@@ -248,6 +256,9 @@ def _row(
     return {
         "participant": agent,
         "provider_name": participant["provider"],
+        "alive": process.alive(
+            state.get("session_pid"), state.get("session_ticks")
+        ),
         "provider": (
             f"{participant['provider']}/"
             f"{participant['credential'] or 'default'}"
@@ -272,6 +283,7 @@ def _row(
         "branch": branch,
         "drift": branch != participant["branch"],
         "owned": owned,
+        "issues_held": len(owned),
         "overdue": overdue,
         "issues": ",".join(
             f"#{number}" + ("!" if number in overdue else "")
@@ -402,6 +414,36 @@ def collect(
         "providers": list(providers),
         "window": window,
     }
+
+
+def export(
+    home: Path,
+    running: bool,
+    providers: tuple[str, ...] = (),
+    window: float = 0.0,
+    document: bool = False,
+) -> str:
+    """Reads one metrics frame of every registered project.
+
+    The frame reads the records the live view reads, holds no lock and writes
+    no state, so exporting on an interval never competes with coordination.
+
+    Args:
+        home: Private bridge state root.
+        running: Whether the recorded coordination server process is alive.
+        providers: Provider names to report; every provider when empty.
+        window: Seconds of enforcement history each count covers; the whole
+            retained log when zero.
+        document: Whether to report one JSON document instead of the
+            Prometheus text exposition format.
+
+    Returns:
+        The frame as text ending in a newline.
+    """
+    view = collect(home, running, {}, providers, window)
+    if document:
+        return views.render("metrics", views.measurements(view)) + "\n"
+    return views.exposition(view)
 
 
 def _cells(row: dict) -> tuple[str, ...]:

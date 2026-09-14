@@ -119,6 +119,7 @@ Then watch the work:
 ```sh
 agent-parley status   # ownership, activity and reported results
 agent-parley top      # every lane live, including what enforcement denied
+agent-parley metrics  # the same numbers as Prometheus text, or --json
 ```
 
 Steer one lane without taking over its terminal:
@@ -350,6 +351,26 @@ agent-parley top --since 6h
 agent-parley events export --since 7d --output enforcement.jsonl
 ```
 
+## Scrape the numbers
+
+`top` is a screen. `metrics` prints the same counters and gauges as text a
+monitoring stack reads: the Prometheus text exposition format by default,
+labelled by project, participant and provider, and `--json` for scripts.
+`--provider` and `--since` narrow it exactly as they narrow the table:
+
+```sh
+agent-parley metrics
+agent-parley metrics --json
+agent-parley metrics --output /var/lib/node_exporter/parley.prom --every 30
+```
+
+`--output` writes the frame by atomic rename, so the textfile collector of
+`node_exporter` never reads a partial one, and `--every` rewrites it on that
+interval until you interrupt it. There is no HTTP endpoint and no new port: the
+file is the interface. The command reads the records `top` reads, holds no lock
+and writes no coordination state, and its `tokens` counter is what the native
+client counted rather than billed spend, exactly as the `TOKENS` column is.
+
 ## Watch one provider
 
 With a dozen lanes open, the whole table is rarely what you want. `--provider`
@@ -457,6 +478,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--project`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
+| `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
 | `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
 | `issue list` | Show claims, dependencies and handoff offers. |
