@@ -1,5 +1,6 @@
 """Checks the protocol contract, its refusals, and the doctor report."""
 
+import importlib.metadata
 import json
 import re
 import subprocess
@@ -47,9 +48,7 @@ def test_an_installed_package_without_a_project_file_keeps_its_metadata(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(protocol, "package_root", lambda: tmp_path)
-    monkeypatch.setattr(
-        protocol.importlib.metadata, "version", lambda name: "9.9.9"
-    )
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.9.9")
     assert protocol.launcher_version() == "9.9.9"
 
 
@@ -58,9 +57,7 @@ def test_an_unreadable_project_file_keeps_the_recorded_metadata(
 ):
     (tmp_path / "pyproject.toml").write_text("not = [toml")
     monkeypatch.setattr(protocol, "package_root", lambda: tmp_path)
-    monkeypatch.setattr(
-        protocol.importlib.metadata, "version", lambda name: "9.9.9"
-    )
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.9.9")
     assert protocol.launcher_version() == "9.9.9"
 
 

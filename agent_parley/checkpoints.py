@@ -1,6 +1,5 @@
 """Observes native checkpoints and reads coordination without model calls."""
 
-import argparse
 import contextlib
 import fcntl
 import json
@@ -13,16 +12,9 @@ import time
 from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
+from types import ModuleType
 
-from agent_parley import (
-    copilot,
-    gemini,
-    policy,
-    process,
-    protocol,
-    roster,
-    store,
-)
+from agent_parley import policy, process, protocol, roster, store
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
@@ -1391,7 +1383,14 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
 
 
 def main() -> int:
-    """Handles native hook input without replaying completed side effects."""
+    """Handles native hook input without replaying completed side effects.
+
+    The argument parser and the non-native adapters are imported here so the
+    module import that every native tool call pays stays as small as the
+    hook's own work; only the adapter a lane selected is loaded.
+    """
+    import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--directory", type=Path, required=True)
@@ -1415,17 +1414,18 @@ def main() -> int:
         payload = json.loads(sys.stdin.read(1_000_001))
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object")
+        adapter: ModuleType | None = None
         if args.adapter == "gemini":
-            payload = gemini.payload(payload)
+            from agent_parley import gemini as adapter
         elif args.adapter == "copilot":
-            payload = copilot.payload(payload)
+            from agent_parley import copilot as adapter
+        if adapter is not None:
+            payload = adapter.payload(payload)
         output = checkpoint(
             args.home, args.directory, args.participant, payload
         )
-        if args.adapter == "gemini":
-            output = gemini.response(output)
-        elif args.adapter == "copilot":
-            output = copilot.response(output)
+        if adapter is not None:
+            output = adapter.response(output)
         print(json.dumps(output))
         return 0
     except (OSError, ValueError, KeyError, BridgeError) as exc:
