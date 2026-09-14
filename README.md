@@ -210,6 +210,40 @@ part way through stops the run, leaves the earlier merge commits in place and
 reports what was integrated, what refused and what was not attempted. Nothing is
 reset or reverted.
 
+With eight lanes, ending the day should not be eight commands. `say`,
+`participant stop`, `participant pause`, `participant resume`,
+`participant merge`, `participant pr` and `issue assign` take a lane selector in
+place of the positional name:
+
+```sh
+agent-parley say "Wrap up for today." --all
+agent-parley participant stop --provider claude
+agent-parley participant merge --outcome ready --yes
+agent-parley participant resume --idle
+agent-parley participant pr --drifted
+```
+
+`--all` selects every lane and the other filters narrow it, so they combine.
+Each filter reads the same lane facts `status` reports: the provider driving a
+lane, the lane's own latest reported outcome, whether its checkout sits on the
+branch it was assigned, and whether supervision reads it as stalled. A
+positional name and a selector together are refused.
+
+Every bulk run prints the lanes it matched and what will happen to each, then
+asks once for the whole set; `--yes` skips that one question. A selector that
+matches nothing does nothing and says so. Independent operations continue past
+a lane that refuses, printing its refusal beside it, and the closing tally names
+what was done and what refused. Integration is different: it keeps the ordered
+stop-on-failure contract above, so the first refusal leaves every later lane
+unattempted. The exit status is non-zero when any lane refused or failed.
+
+A bulk merge only ever considers lanes that report ready, and its plan names
+the prerequisites that lie outside the selected set with the ledger's account
+of each, because narrowing a selection never lifts a recorded dependency.
+`issue assign` carries one offer, so a selector stands in for its lane only
+while it matches a single lane; a wider match is refused and names what it
+matched.
+
 Groups whose every member is reported ready are marked by `plan show` and
 `status`, and counted in the `top` header, so you learn a set is integrable
 without asking each lane. A reported state is a lane's own account, never review
@@ -563,6 +597,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `participant restart NAME` | Start a stopped lane again from a clean worktree. |
 | `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
+| `... --all --provider N --outcome S --drifted --idle` | Select several lanes for one `say`, `issue assign`, `participant stop/pause/resume/pr/merge`; one plan and one confirmation, `--yes` to skip it. |
 | `provider list` | List built-in presets and local overrides. |
 | `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
 | `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |

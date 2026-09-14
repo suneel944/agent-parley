@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from agent_parley import (
@@ -817,10 +817,443 @@ def unattempted(name: str, waits: dict[str, list[str]], stopped: str) -> str:
     )
 
 
+def outside_prerequisites(
+    state: dict, candidates: dict[str, list[str]]
+) -> list[str]:
+    """Names the prerequisites of a selection that lie outside it.
+
+    A selection narrows what a run attempts; it never lifts a recorded
+    dependency. Every issue a selected lane holds is read for the issues it
+    waits on, and each one that no selected lane holds is named here. The
+    ledger records no completion, so a prerequisite nobody holds is reported
+    as released rather than as finished work.
+
+    Args:
+        state: Published issue ledger.
+        candidates: Selected participants mapped to the issues each holds.
+
+    Returns:
+        One line per prerequisite outside the selection, ordered by issue.
+    """
+    held = {issue for issues in candidates.values() for issue in issues}
+    waited = {
+        blocker
+        for issues in candidates.values()
+        for number in issues
+        for blocker in state["issues"].get(number, {}).get("blocked_by", [])
+        if blocker not in held
+    }
+    lines = []
+    for issue in sorted(waited, key=int):
+        owner = state["issues"].get(issue, {}).get("owner", "")
+        satisfied = (
+            f"held by {owner}, so it is not satisfied here"
+            if owner
+            else "released, so no lane still holds it"
+        )
+        lines.append(
+            f"#{issue} is a prerequisite outside this selection, {satisfied}."
+        )
+    return lines
+
+
+def add_selector(
+    command: argparse.ArgumentParser, *, everything: bool = True
+) -> None:
+    """Adds the shared lane selector and its one confirmation to a command.
+
+    The filters read the same lane facts `status` reports, and a lane matches
+    when every given filter holds, so they narrow rather than widen.
+
+    Args:
+        command: Subcommand that otherwise acts on one named participant.
+        everything: Whether to add ``--all``. A command that already declares
+            it in a scope group of its own passes False.
+    """
+    selection = command.add_argument_group(
+        "lane selection",
+        "Act on several lanes instead of one. The command prints the lanes "
+        "it matched, asks once for the whole set, and reports each lane.",
+    )
+    if everything:
+        selection.add_argument(
+            "--all",
+            action="store_true",
+            help="Select every lane the other filters leave.",
+        )
+    selection.add_argument(
+        "--provider",
+        default="",
+        metavar="NAME",
+        help="Select only the lanes a named provider drives.",
+    )
+    selection.add_argument(
+        "--outcome",
+        default="",
+        metavar="STATE",
+        help=(
+            "Select only the lanes whose own latest report is this state. A "
+            "reported state is the lane's account, never a review."
+        ),
+    )
+    selection.add_argument(
+        "--drifted",
+        action="store_true",
+        help="Select only the lanes sitting off the branch they were given.",
+    )
+    selection.add_argument(
+        "--idle",
+        action="store_true",
+        help="Select only the lanes supervision currently reads as stalled.",
+    )
+    selection.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the single confirmation covering the whole selected set.",
+    )
+
+
+def selected(args: argparse.Namespace) -> bool:
+    """Reports whether the command line carries any lane selector."""
+    return bool(
+        args.all or args.provider or args.outcome or args.drifted or args.idle
+    )
+
+
+def matching_lanes(
+    home: Path, directory: Path, data: dict, args: argparse.Namespace
+) -> list[str]:
+    """Names every participant the command line's lane selector matched.
+
+    The filters read the provider that drives a lane, the lane's own latest
+    reported outcome, whether its checkout sits on the branch it was assigned
+    and whether supervision currently reads it as stalled. `--all` adds no
+    filter of its own, so it selects whatever the others leave.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the roster.
+        args: Parsed arguments carrying the selector flags.
+
+    Returns:
+        The matched participants in roster order.
+    """
+    stalled_after = supervision.configuration(home, data)["stalled_after"]
+    names = []
+    for name in sorted(data["participants"]):
+        participant = data["participants"][name]
+        if args.provider and participant["provider"] != args.provider:
+            continue
+        reported = activity(directory, name).get("outcome", "unknown")
+        if args.outcome and reported != args.outcome:
+            continue
+        branch = lane_branch(Path(participant["lane"]))
+        if args.drifted and branch == participant["branch"]:
+            continue
+        stalled = supervision.stall(home, directory, data, name, stalled_after)
+        if args.idle and not stalled["stalled"]:
+            continue
+        names.append(name)
+    return names
+
+
+def selection_plan(
+    action: str, names: Sequence[str], notes: Sequence[str] = ()
+) -> str:
+    """Lists the lanes a selector matched and what the command will do.
+
+    Args:
+        action: What happens to each matched lane, in the infinitive.
+        names: Matched participants in the order they will be acted on.
+        notes: Extra lines reported before the confirmation, such as the
+            prerequisites that lie outside the selected set.
+
+    Returns:
+        The plan an operator reads before the single confirmation.
+    """
+    if not names:
+        return "Selector matched no lane, so nothing was done."
+    plural = "" if len(names) == 1 else "s"
+    lines = [f"Plan: {action} {len(names)} lane{plural}."]
+    lines += [f"- {name}: {action}" for name in names]
+    lines += list(notes)
+    return "\n".join(lines)
+
+
+def confirmed(proposal: str, assume_yes: bool) -> bool:
+    """Prints one plan and asks once for the whole selected set.
+
+    Args:
+        proposal: The plan the operator reads before answering.
+        assume_yes: Whether `--yes` already confirmed the whole set.
+
+    Returns:
+        Whether the operator confirmed. A closed or empty answer declines.
+    """
+    print(proposal)
+    if assume_yes:
+        return True
+    try:
+        answer = input("Proceed with these lanes? [y/N]: ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def bulk_lanes(
+    action: str,
+    names: Sequence[str],
+    step: Callable[[str], str],
+    *,
+    assume_yes: bool = False,
+    notes: Sequence[str] = (),
+) -> int:
+    """Runs one operator action over a selected set after one confirmation.
+
+    Independent operations continue past a lane that refuses: the refusal is
+    printed beside its lane and every remaining lane is still attempted. The
+    closing tally names what was done and what refused. Integration does not
+    take this path, because an ordered merge run stops at the first refusal
+    and leaves the lanes that wait on it unattempted.
+
+    Args:
+        action: What happens to each matched lane, in the infinitive.
+        names: Matched participants in the order they are acted on.
+        step: Runs the action for one lane and returns that lane's account.
+        assume_yes: Whether `--yes` already confirmed the whole set.
+        notes: Extra lines the plan reports before the confirmation.
+
+    Returns:
+        0 when every matched lane was done, when nothing matched, or when the
+        operator declined; 1 when any lane refused or failed.
+    """
+    proposal = selection_plan(action, names, notes)
+    if not names:
+        print(proposal)
+        return 0
+    if not confirmed(proposal, assume_yes):
+        print("Declined: nothing was done.")
+        return 0
+    done: list[str] = []
+    refused: list[str] = []
+    for name in names:
+        try:
+            print(f"- {name}: {step(name)}")
+            done.append(name)
+        except (
+            BridgeError,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+        ) as failure:
+            print(f"- {name}: refused. {failure}")
+            refused.append(name)
+    tally = f"Done {len(done)} of {len(names)}: " + (", ".join(done) or "none")
+    if refused:
+        tally += f". Refused or failed: {', '.join(refused)}"
+    print(f"{tally}.")
+    return 1 if refused else 0
+
+
+def operator_message(delivered: dict, name: str) -> str:
+    """Reports what one operator message did for one lane.
+
+    Args:
+        delivered: Result of the send, either delivered or recorded.
+        name: Lane the message was addressed to.
+
+    Returns:
+        The account an operator reads for that lane.
+    """
+    if "kind" in delivered:
+        return (
+            f"Operator item {delivered['id']} recorded for {name}; "
+            f"{delivered['repeats_left']} delivery(s) pending."
+        )
+    state = "already delivered" if delivered.get("duplicate") else "delivered"
+    return f"Operator message {delivered['id']} {state} to {name}."
+
+
+def lane_roster(bridge: Bridge, repo: Path) -> tuple[Path, dict]:
+    """Reads the private state directory and roster a selector resolves in."""
+    _, directory = bridge.project(repo, create=False)
+    return directory, roster.read(directory)
+
+
+def spoken_lanes(bridge: Bridge, repo: Path, args: argparse.Namespace) -> int:
+    """Sends one operator message to every lane a selector matched.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `say` arguments carrying the selector.
+
+    Returns:
+        0 when every matched lane received the message, 1 otherwise.
+
+    Raises:
+        BridgeError: If a participant name and a selector are both given, if
+            the message text is missing, or if one idempotency key is offered
+            for several lanes.
+    """
+    if args.participant and args.text:
+        raise BridgeError(
+            "`say` addresses one named lane or a selected set, never both. "
+            "Drop the participant name to message a set."
+        )
+    text = args.text or args.participant
+    if not text:
+        raise BridgeError("`say` needs the message text to send.")
+    if args.key:
+        raise BridgeError(
+            "--key names one message, so it cannot cover several lanes. The "
+            "default key already distinguishes each lane's own copy."
+        )
+    directory, data = lane_roster(bridge, repo)
+    return bulk_lanes(
+        "send an operator message to",
+        matching_lanes(bridge.home, directory, data, args),
+        lambda name: operator_message(
+            bridge.say(
+                repo,
+                name,
+                text,
+                args.subject,
+                "",
+                args.ack,
+                args.within,
+                after=args.after,
+                at=args.at,
+                when_released=args.when_released,
+                unless_reported=args.unless_reported,
+                every=args.every,
+                until=args.until,
+            ),
+            name,
+        ),
+        assume_yes=args.yes,
+    )
+
+
+BULK_PARTICIPANT = {
+    "stop": "stop",
+    "pause": "pause",
+    "resume": "resume",
+    "pr": "open a pull request from",
+}
+
+
+def participant_lanes(
+    bridge: Bridge, repo: Path, args: argparse.Namespace
+) -> int:
+    """Runs one participant action over every lane a selector matched.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `participant` arguments carrying the selector.
+
+    Returns:
+        0 when every matched lane was done, 1 when any refused or failed.
+
+    Raises:
+        BridgeError: If a participant name and a selector are both given.
+    """
+    if args.name:
+        raise BridgeError(
+            f"`participant {args.action}` acts on one named lane or on a "
+            "selected set, never both. Drop the participant name to act on "
+            "a set."
+        )
+    steps: dict[str, Callable[[str], str]] = {
+        "stop": lambda name: bridge.stop(repo, name),
+        "pause": lambda name: bridge.pause(repo, name),
+        "resume": lambda name: bridge.pause(repo, name, resume=True),
+        "pr": lambda name: bridge.pull_request(repo, name),
+    }
+    directory, data = lane_roster(bridge, repo)
+    return bulk_lanes(
+        BULK_PARTICIPANT[args.action],
+        matching_lanes(bridge.home, directory, data, args),
+        steps[args.action],
+        assume_yes=args.yes,
+    )
+
+
+def assigned_lanes(
+    bridge: Bridge, repo: Path, args: argparse.Namespace
+) -> list[str]:
+    """Resolves a lane selector to the one lane an issue is offered to.
+
+    One issue carries one offer, so a selector stands in for a lane's name
+    only while it matches a single lane. A wider match is refused and every
+    matched lane is named, because choosing among them is the operator's
+    decision and never this command's.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `issue assign` arguments carrying the selector.
+
+    Returns:
+        The single matched lane, or nothing when the selector matched nobody.
+
+    Raises:
+        BridgeError: If a lane name or ``--unassign`` accompanies a selector,
+            or if the selector matched more than one lane.
+    """
+    if args.name:
+        raise BridgeError(
+            "`issue assign` offers an issue to one named lane or to the one "
+            "lane a selector matches, never both."
+        )
+    if args.unassign:
+        raise BridgeError(
+            "--unassign withdraws the offer recorded on one issue, so it "
+            "takes no lane selector."
+        )
+    directory, data = lane_roster(bridge, repo)
+    names = matching_lanes(bridge.home, directory, data, args)
+    if len(names) > 1:
+        raise BridgeError(
+            f"Selector matched {len(names)} lanes: {', '.join(names)}. One "
+            "issue is offered to one lane, so narrow the selector."
+        )
+    return names
+
+
+def assigned_selection(
+    bridge: Bridge, repo: Path, args: argparse.Namespace
+) -> int:
+    """Offers one issue to the single lane a selector matched.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        repo: Repository the command was given.
+        args: Parsed `issue assign` arguments carrying the selector.
+
+    Returns:
+        0 when the offer or request was recorded, 1 when it was refused.
+    """
+    return bulk_lanes(
+        f"offer #{args.number} to",
+        assigned_lanes(bridge, repo, args),
+        lambda name: assignment(
+            bridge.issue_assign(repo, args.number, name, reason=args.reason)
+        ),
+        assume_yes=args.yes,
+    )
+
+
 def merged_lanes(
     bridge: Bridge, repo: Path, args: argparse.Namespace, preview: bool
 ) -> str:
     """Runs the merge the command line selected, one lane or a set.
+
+    A selected set is ordered, planned and confirmed once before anything is
+    merged. The filters narrow the lanes that report ready, because bulk
+    integration only ever considers lanes whose own report is ready.
 
     Args:
         bridge: Launcher holding the private coordination state.
@@ -832,20 +1265,41 @@ def merged_lanes(
         The account the selected merge produced.
 
     Raises:
-        BridgeError: If the selection is ambiguous or names nothing.
+        BridgeError: If the selection is ambiguous or names nothing, or if
+            the ordered run stops on a refusal or a failure.
     """
-    if args.all or args.group:
+    narrowing = bool(args.provider or args.outcome or args.drifted or args.idle)
+    if selected(args) or args.group:
         if args.name:
             raise BridgeError(
                 "`participant merge` integrates one named lane, every ready "
-                "lane with --all, or one group with --group NAME. Drop the "
-                "participant name to integrate a set."
+                "lane with --all, a selected set, or one group with --group "
+                "NAME. Drop the participant name to integrate a set."
             )
-        return bridge.integrate(repo, group=args.group, preview=preview)
+        names: list[str] = []
+        if narrowing:
+            directory, data = lane_roster(bridge, repo)
+            names = matching_lanes(bridge.home, directory, data, args)
+        if preview:
+            return bridge.integrate(
+                repo, group=args.group, preview=True, lanes=names
+            )
+        proposed = bridge.integration_plan(repo, group=args.group, lanes=names)
+        if not proposed["sequence"]:
+            subject = proposed["subject"]
+            return f"{subject}: no lane to integrate, so nothing merged."
+        if not confirmed(
+            selection_plan(
+                "integrate", proposed["sequence"], proposed["outside"]
+            ),
+            args.yes,
+        ):
+            return "Declined: nothing was merged."
+        return bridge.integrate(repo, group=args.group, lanes=names)
     if not args.name:
         raise BridgeError(
-            "`participant merge` needs a participant name, --all or "
-            "--group NAME."
+            "`participant merge` needs a participant name, --all, a "
+            "selector or --group NAME."
         )
     return (
         bridge.preview_merge(repo, args.name)
@@ -2242,13 +2696,93 @@ class Bridge:
             session,
         )
 
+    def _integration_candidates(
+        self,
+        directory: Path,
+        data: dict,
+        state: dict,
+        group: str,
+        lanes: Sequence[str],
+    ) -> tuple[str, dict[str, list[str]]]:
+        """Names the lanes one bulk merge considers and what it reports under.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding the roster.
+            state: Published issue ledger.
+            group: Group of the applied plan; every ready lane when empty.
+            lanes: Lanes a selector matched; unrestricted when empty.
+
+        Returns:
+            The subject the run reports under and the candidate lanes mapped
+            to the issues each one holds.
+
+        Raises:
+            BridgeError: If a named group holds a member no participant owns.
+        """
+        if group:
+            return f"Group {group}", group_lanes(
+                data, state, group, plan.members(directory, group)
+            )
+        ready = ready_lanes(directory, data, state)
+        if not lanes:
+            return "Ready lanes", ready
+        chosen = set(lanes)
+        return "Selected ready lanes", {
+            name: issues for name, issues in ready.items() if name in chosen
+        }
+
+    def integration_plan(
+        self, repo: Path, group: str = "", lanes: Sequence[str] = ()
+    ) -> dict:
+        """Orders the lanes a bulk merge would attempt and names its waits.
+
+        The order is the one the run itself uses, read from the same advisory
+        dependency edges, so the plan an operator confirms is the run that
+        follows. Prerequisites outside the selected set are named with the
+        ledger's account of them, because narrowing a selection never lifts a
+        recorded dependency.
+
+        Args:
+            repo: Any checkout of the target repository.
+            group: Group of the applied plan; every ready lane when empty.
+            lanes: Lanes a selector matched; unrestricted when empty.
+
+        Returns:
+            The subject the run reports under, the candidate lanes in
+            dependency order, and one line per prerequisite outside the set.
+
+        Raises:
+            BridgeError: If the repository has no project, a group member is
+                unheld, or the candidates form a dependency cycle.
+        """
+        _, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        state = snapshot(directory)
+        subject, candidates = self._integration_candidates(
+            directory, data, state, group, lanes
+        )
+        return {
+            "subject": subject,
+            "sequence": plan.order(
+                lane_dependencies(state, candidates), "Lane dependencies"
+            ),
+            "outside": outside_prerequisites(state, candidates),
+        }
+
     def integrate(
-        self, repo: Path, group: str = "", preview: bool = False
+        self,
+        repo: Path,
+        group: str = "",
+        preview: bool = False,
+        lanes: Sequence[str] = (),
     ) -> str:
         """Integrates several lanes in the order their dependencies imply.
 
-        Candidates are every lane whose latest report is ready, or the lanes
-        holding the members of one group of the applied plan. They are ordered
+        Candidates are every lane whose latest report is ready, the subset of
+        those a lane selector matched, or the lanes holding the members of one
+        group of the applied plan. A selector narrows the ready lanes and
+        never admits a lane on easier terms. They are ordered
         from the advisory dependency edges the ledger already records, so a
         lane whose issue waits on another is merged after the lane holding
         that issue. A cycle among the candidates is refused and named; it is
@@ -2270,6 +2804,8 @@ class Bridge:
                 when empty.
             preview: Whether to report the plan and every candidate's preview
                 without merging anything.
+            lanes: Lanes a selector matched, narrowing the ready lanes an
+                ungrouped run considers; unrestricted when empty.
 
         Returns:
             The ordered plan when previewing, otherwise an account of every
@@ -2284,12 +2820,9 @@ class Bridge:
         with lock(directory / "setup.lock"):
             data = roster.read(directory)
             state = snapshot(directory)
-            candidates = (
-                group_lanes(data, state, group, plan.members(directory, group))
-                if group
-                else ready_lanes(directory, data, state)
+            subject, candidates = self._integration_candidates(
+                directory, data, state, group, lanes
             )
-            subject = f"Group {group}" if group else "Ready lanes"
             if not candidates:
                 return f"{subject}: no lane to integrate, so nothing merged."
             waits = lane_dependencies(state, candidates)
@@ -4300,9 +4833,20 @@ def main() -> int:
         "say", help="Send one lane a coordination message as the operator."
     )
     steer.add_argument(
-        "participant", help="Participant whose inbox receives the message."
+        "participant",
+        nargs="?",
+        default="",
+        help=(
+            "Participant whose inbox receives the message. A lane selector "
+            "replaces it, and the message text is then the only positional."
+        ),
     )
-    steer.add_argument("text", help="Message body the participant reads.")
+    steer.add_argument(
+        "text",
+        nargs="?",
+        default="",
+        help="Message body the participant reads.",
+    )
     steer.add_argument("--repo", type=Path, default=Path.cwd())
     steer.add_argument(
         "--subject",
@@ -4384,6 +4928,7 @@ def main() -> int:
         metavar="HH:MM",
         help="Stop a repeat at this time of day in the local timezone.",
     )
+    add_selector(steer)
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -4468,6 +5013,7 @@ def main() -> int:
             "was accepted is refused, naming the lane that holds the issue."
         ),
     )
+    add_selector(assigning)
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -4534,7 +5080,7 @@ def main() -> int:
         "restart",
     ):
         command = roles.add_parser(action)
-        if action == "merge":
+        if action in BULK_PARTICIPANT or action == "merge":
             command.add_argument("name", nargs="?", default="")
         else:
             command.add_argument("name")
@@ -4561,6 +5107,9 @@ def main() -> int:
                     "atomic, and stops at the first refusal or failure."
                 ),
             )
+            add_selector(command, everything=False)
+        elif action in BULK_PARTICIPANT:
+            add_selector(command)
         if action == "restart":
             command.add_argument("--task", default="")
     gate = commands.add_parser(
@@ -4830,7 +5379,14 @@ def main() -> int:
                 key=args.idempotency_key,
             )
             print(f"Recorded outcome: {args.state}")
+        elif args.command == "say" and selected(args):
+            return spoken_lanes(bridge, args.repo.resolve(), args)
         elif args.command == "say":
+            if not args.participant or not args.text:
+                parser.error(
+                    "say needs a participant and a message, or a lane "
+                    "selector and a message."
+                )
             delivered = bridge.say(
                 args.repo.resolve(),
                 args.participant,
@@ -4846,22 +5402,13 @@ def main() -> int:
                 every=args.every,
                 until=args.until,
             )
-            if "kind" in delivered:
-                print(
-                    f"Operator item {delivered['id']} recorded for "
-                    f"{args.participant}; "
-                    f"{delivered['repeats_left']} delivery(s) pending."
-                )
-            else:
-                state = (
-                    "already delivered"
-                    if delivered.get("duplicate")
-                    else "delivered"
-                )
-                print(
-                    f"Operator message {delivered['id']} {state} to "
-                    f"{args.participant}."
-                )
+            print(operator_message(delivered, args.participant))
+        elif (
+            args.command == "issue"
+            and args.action == "assign"
+            and selected(args)
+        ):
+            return assigned_selection(bridge, args.repo.resolve(), args)
         elif args.command == "issue" and args.action == "assign":
             if args.unassign and args.name:
                 parser.error("issue assign takes a lane or --unassign.")
@@ -4949,6 +5496,13 @@ def main() -> int:
         elif args.command == "participant":
             repository = args.repo.resolve()
             preview = getattr(args, "preview", False)
+            if args.action in BULK_PARTICIPANT and selected(args):
+                return participant_lanes(bridge, repository, args)
+            if args.action in BULK_PARTICIPANT and not args.name:
+                parser.error(
+                    f"participant {args.action} needs a participant name or "
+                    "a lane selector."
+                )
             if args.action == "add":
                 bridge.add_participant(
                     repository, args.name, args.provider, args.credentials

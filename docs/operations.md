@@ -267,6 +267,50 @@ the `top` header counts those groups, so an integrable set is visible before
 anyone merges. A reported state is the lane's own account of its work, never
 review or independent verification.
 
+### Selecting several lanes for one command
+
+```sh
+agent-parley say "Wrap up for today." --all
+agent-parley participant stop --provider claude --yes
+agent-parley participant resume --idle
+agent-parley participant merge --outcome ready
+agent-parley issue assign 42 --idle --provider codex
+```
+
+`say`, `issue assign`, `participant stop`, `participant pause`,
+`participant resume`, `participant pr` and `participant merge` take a lane
+selector where they otherwise take a positional name. `--all` selects every
+lane; `--provider NAME`, `--outcome STATE`, `--drifted` and `--idle` narrow the
+selection, and a lane matches only when every given filter holds. The filters
+read the same facts `status` reports. A positional name and a selector together
+are refused, because a command that means two things is a command that loses a
+lane.
+
+Every bulk run prints the lanes it matched and what will happen to each, then
+asks once for the whole set. `--yes` answers that one question in advance.
+A selector matching nothing does nothing and says so.
+
+Non-integration operations are independent, so a lane's refusal is printed
+beside that lane and the remaining lanes are still attempted. The closing tally
+names what was done and what refused, and the exit status is non-zero when any
+lane refused or failed. Integration keeps its ordered contract instead: the run
+stops at the first refusal or failure and leaves every later lane unattempted,
+including the lanes that wait on the one that stopped.
+
+A bulk merge considers only lanes whose own report is ready, so a selector
+narrows that set rather than widening it, and its plan names every prerequisite
+that lies outside the selected set: held by a lane that is not selected, and so
+not satisfied here, or released and held by nobody. Narrowing a selection never
+lifts a recorded dependency and never admits a lane on easier terms than the
+single-lane merge would.
+
+One issue carries one offer, so `issue assign` accepts a selector only while it
+matches a single lane. A wider match is refused and names every lane it matched,
+because choosing between them is the operator's decision. `--unassign`
+withdraws the offer recorded on one issue and takes no selector. `say --key`
+names one message and is refused with a selector, because the default key
+already gives each lane its own copy.
+
 ### Retrying a write safely
 
 A command that fails after its change has landed cannot be told apart from one
