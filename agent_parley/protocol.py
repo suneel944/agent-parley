@@ -29,7 +29,11 @@ HEADER = "Agent-Parley-Protocol"
 PROTOCOL = 1
 SUPPORTED = (1,)
 UPDATE = "agent-parley setup PATH reinstalls the plugin for this repository."
+MIGRATE = "agent-parley down, then agent-parley up, migrates the store."
+UPGRADE = "A newer agent-parley wrote this store; install that version."
 UNKNOWN = -1
+OK = "ok"
+MISMATCH = "mismatch"
 
 
 def manifests(root: Path) -> dict[str, Path]:
@@ -104,23 +108,54 @@ def render(reported: dict) -> str:
 
     Returns:
         One line per component carrying its version, the protocol it speaks
-        and whether this build accepts it, then one verdict line. No path
-        inside a credential profile and no credential is printed.
+        and the state this build puts it in, then one verdict line naming
+        every command the reported drift needs. A state this build does not
+        accept is printed in upper case, so an operator scanning the report
+        sees which line to read. No path inside a credential profile and no
+        credential is printed.
     """
     lines = []
     for component in reported["components"]:
         number = component["protocol"]
         speaks = "no protocol" if number == UNKNOWN else f"protocol {number}"
+        state = component["state"]
         lines.append(
             f"{component['component']:<16}"
             f"{component['version'] or '-':<12}"
             f"{speaks:<14}"
-            f"{'ok' if component['compatible'] else 'MISMATCH'}"
+            f"{state if component['compatible'] else state.upper()}"
         )
-    lines.append(
-        "Consistent." if reported["consistent"] else f"Mismatch. {UPDATE}"
-    )
+    lines.append(verdict(reported["components"]))
     return "\n".join(lines)
+
+
+def verdict(components: list[dict]) -> str:
+    """Names the drift and every command that resolves it.
+
+    A store behind this build and an installed plugin speaking another
+    protocol need different commands, and reporting one remedy for both sends
+    an operator to reinstall a plugin that is already correct.
+
+    Each component carries the command its own state needs, because the
+    launcher that classified it is the only place that knows which one
+    applies. A component that names none falls back to reinstalling the
+    plugin, which is the drift this report was first written for.
+
+    Args:
+        components: Component records the launcher reported.
+
+    Returns:
+        A single sentence for a consistent set, or a refusal naming each
+        distinct command once, in the order the components are reported.
+    """
+    remedies = [
+        component.get("remedy") or UPDATE
+        for component in components
+        if not component["compatible"]
+    ]
+    if not remedies:
+        return "Consistent."
+    return "Mismatch. " + " ".join(dict.fromkeys(remedies))
 
 
 def mismatch(component: str, other: int) -> str:

@@ -169,6 +169,62 @@ def test_doctor_reports_every_component(bridge, repo, paired):
     assert str(bridge.home) not in text
 
 
+def store_schema(bridge, schema):
+    store.initialize(bridge.home)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(f"PRAGMA user_version={schema}")
+
+
+def reported_store(bridge):
+    return [
+        entry
+        for entry in bridge.doctor()["components"]
+        if entry["component"] == "store"
+    ][0]
+
+
+def test_a_store_behind_this_build_breaks_consistency(bridge, repo, paired):
+    store_schema(bridge, store.SCHEMA_VERSION - 1)
+    reported = bridge.doctor()
+    assert reported_store(bridge)["state"] == store.SCHEMA_BEHIND
+    assert reported["consistent"] is False
+    text = protocol.render(reported)
+    assert "NEEDS MIGRATION" in text
+    assert protocol.MIGRATE in text
+    assert protocol.UPDATE not in text
+
+
+def test_a_store_ahead_of_this_build_names_the_upgrade(bridge, repo, paired):
+    store_schema(bridge, store.SCHEMA_VERSION + 1)
+    reported = bridge.doctor()
+    assert reported_store(bridge)["state"] == store.SCHEMA_UNSUPPORTED
+    assert reported["consistent"] is False
+    assert protocol.UPGRADE in protocol.render(reported)
+
+
+def test_a_store_not_yet_created_is_consistent(bridge, repo, paired):
+    assert reported_store(bridge)["state"] == store.SCHEMA_ABSENT
+    assert bridge.doctor()["consistent"] is True
+
+
+def test_a_behind_store_exits_non_zero(bridge, repo, paired, monkeypatch):
+    store_schema(bridge, store.SCHEMA_VERSION - 1)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "doctor"],
+    )
+    assert cli.main() == 1
+
+
+def test_two_causes_name_two_commands(bridge, repo, paired, monkeypatch):
+    store_schema(bridge, store.SCHEMA_VERSION - 1)
+    monkeypatch.setattr(protocol, "SUPPORTED", (99,))
+    text = protocol.render(bridge.doctor())
+    assert protocol.MIGRATE in text
+    assert protocol.UPDATE in text
+
+
 def test_doctor_exits_non_zero_on_a_mismatch(
     bridge, repo, paired, monkeypatch, capsys
 ):

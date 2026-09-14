@@ -2466,13 +2466,19 @@ attempt of the recorded budget, which is also only reported.
             The launcher's package version and wire protocol, the protocol each
             shipped plugin manifest declares, the store's schema version
             against the schema this build writes, and whether the whole set is
-            consistent.
+            consistent. Each component carries the state this build puts it in
+            and the one command that state needs. A store behind this build is
+            not consistent: every process running this code queries columns it
+            does not have, so reporting it as compatible would describe a
+            healthy system while every lane is denied.
         """
         components = [
             {
                 "component": "launcher",
                 "version": protocol.launcher_version(),
                 "protocol": protocol.PROTOCOL,
+                "state": protocol.OK,
+                "remedy": "",
                 "compatible": True,
             }
         ]
@@ -2480,21 +2486,31 @@ attempt of the recorded budget, which is also only reported.
             protocol.package_root()
         ).items():
             declared = protocol.installed(manifest)
+            accepted = protocol.compatible(declared)
             components.append(
                 {
                     "component": f"{client} plugin",
                     "version": "",
                     "protocol": declared,
-                    "compatible": protocol.compatible(declared),
+                    "state": protocol.OK if accepted else protocol.MISMATCH,
+                    "remedy": "" if accepted else protocol.UPDATE,
+                    "compatible": accepted,
                 }
             )
         schema = store.schema_version(self.home)
+        state = store.schema_state(schema)
+        remedies = {
+            store.SCHEMA_BEHIND: protocol.MIGRATE,
+            store.SCHEMA_UNSUPPORTED: protocol.UPGRADE,
+        }
         components.append(
             {
                 "component": "store",
                 "version": f"schema {schema}",
                 "protocol": protocol.PROTOCOL,
-                "compatible": schema <= store.SCHEMA_VERSION,
+                "state": state,
+                "remedy": remedies.get(state, ""),
+                "compatible": state in store.SCHEMA_USABLE,
             }
         )
         return {
