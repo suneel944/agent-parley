@@ -10,8 +10,14 @@ from agent_parley.state import write_json
 
 @pytest.fixture(autouse=True)
 def native_config_homes(tmp_path, monkeypatch):
-    """Keeps native session-record reads inside each test's own directory."""
-    for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+    """Keeps every state read inside each test's own directory.
+
+    The command line falls back to ``AGENT_PARLEY_HOME`` when a test drives
+    ``cli.main()`` without ``--home``, so that variable is pinned as well;
+    otherwise such a test reads the developer's live store and fails
+    whenever that store is behind the checked-out code.
+    """
+    for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_PARLEY_HOME"):
         monkeypatch.setenv(variable, str(tmp_path / variable.lower()))
 
 
