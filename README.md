@@ -169,6 +169,24 @@ reporting the exit status. It runs as an argument list, never through a shell, a
 skips it. It reports the base checkout as it stands before the merge, which is
 not a claim about the merged result.
 
+A new lane starts as a bare worktree, so every agent would otherwise spend its
+first turns installing dependencies or copying an untracked file. Record that
+setup once instead:
+
+```sh
+agent-parley init set 'uv sync --locked'   # run it in every new lane
+agent-parley init show                     # report what runs
+agent-parley init set ''                   # remove it
+```
+
+The command runs in the new worktree after it is created and before the native
+CLI starts, as an argument list, never through a shell, and no flag skips it. It
+runs only when a lane is created, never on a resume, and `participant add` runs
+it as well. `AGENT_PARLEY_BASE` names the base checkout while it runs, so the
+command can copy a file Git does not track. A non-zero exit refuses the launch
+and reports the exit status with the tail of the output; the worktree is left in
+place so you can see what happened.
+
 Or send it for review instead:
 
 ```sh
@@ -341,6 +359,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
+| `init show` | Show the command every new lane runs before it starts. |
+| `init set COMMAND` | Set that command; an empty string removes it. |
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |

@@ -44,6 +44,7 @@ from agent_parley.issues import change, describe, parse_issue, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
 VERIFY_TIMEOUT = 1800
+INIT_OUTPUT_LINES = 20
 CHANGE_TYPE = frozenset(
     {
         "bug",
@@ -504,6 +505,60 @@ def verify_base(root: Path, command: list[str]) -> None:
     )
 
 
+def initialize_lane(lane: Path, command: list[str], base: Path) -> None:
+    """Prepares a newly created lane before its native client starts.
+
+    Every real repository needs more than a bare checkout before an agent can
+    work in it: dependencies installed, an untracked environment file copied,
+    a database migrated. Doing that once here costs the same setup once per
+    lane instead of spending the first turns of every session on it, and makes
+    every lane start from the same state.
+
+    The command runs as an argument list without a shell, exactly as the
+    verification gate does, and no flag skips it. It runs only when a lane is
+    created, never on a resume. The base checkout is offered through
+    AGENT_PARLEY_BASE so a command can copy a file Git does not track. A
+    non-zero exit refuses the launch and leaves the worktree in place, because
+    an operator needs to look at what the command did before it failed.
+
+    Args:
+        lane: Freshly created worktree the command runs in.
+        command: Argument tokens recorded in the project manifest.
+        base: Common repository root the lane was created from.
+
+    Raises:
+        BridgeError: If the command cannot run, or if it exits non-zero.
+        subprocess.TimeoutExpired: If initialization exceeds its timeout.
+    """
+    quoted = shlex.join(command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=lane,
+            env={**os.environ, "AGENT_PARLEY_BASE": str(base)},
+            capture_output=True,
+            text=True,
+            timeout=VERIFY_TIMEOUT,
+            check=False,
+        )
+    except OSError as exc:
+        raise BridgeError(
+            f"The lane initialization command could not run in {lane}: {exc}. "
+            "Correct it with `agent-parley init set`, then rerun. The "
+            "worktree is left in place for inspection."
+        ) from None
+    if not result.returncode:
+        return
+    tail = "\n".join(
+        (result.stdout + result.stderr).splitlines()[-INIT_OUTPUT_LINES:]
+    )
+    raise BridgeError(
+        f"Lane initialization failed in {lane}: `{quoted}` exited "
+        f"{result.returncode}, so the lane was not started. The worktree is "
+        "left in place for inspection. Last output:\n" + tail
+    )
+
+
 def gh(cwd: Path, *args: str) -> str:
     """Runs the operator's GitHub CLI and returns stripped stdout.
 
@@ -946,6 +1001,7 @@ class Bridge:
             "root": str(root),
             "base": git(root, "rev-parse", "--verify", "HEAD"),
             "verify": [],
+            "initialize": [],
             "participants": {},
         }
         write_json(path, data)
@@ -1021,6 +1077,8 @@ class Bridge:
                     "Choose an unused KEEP_NAME."
                 )
             git(root, "worktree", "add", "-b", branch, str(lane), data["base"])
+            if data.get("initialize"):
+                initialize_lane(lane, data["initialize"], root)
             participants[name] = {
                 "provider": provider,
                 "display": name,
@@ -1209,6 +1267,48 @@ class Bridge:
         return (
             f"{root} runs `{shlex.join(configured)}` in the base checkout "
             "before every `participant merge`."
+        )
+
+    def initialization(self, repo: Path, command: str | None = None) -> str:
+        """Reports or records the command every new lane runs before starting.
+
+        The command lives in coordination state rather than in the repository,
+        so configuring it commits nothing to the target project.
+
+        Args:
+            repo: Any checkout of the target repository.
+            command: Command line to run in every new lane, an empty string to
+                remove it, or None to report the current setting without
+                changing it.
+
+        Returns:
+            An account of the configured command.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or the command
+                is not a usable argument list.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if command is None:
+            configured = data["initialize"]
+        else:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["initialize"] = roster.verify_command(
+                    command, "Lane initialization command"
+                )
+                write_json(directory / "project.json", data)
+                configured = data["initialize"]
+        if not configured:
+            return (
+                f"{root} has no lane initialization command; a new lane "
+                "starts from a bare worktree."
+            )
+        return (
+            f"{root} runs `{shlex.join(configured)}` in every new lane "
+            "before its agent starts. AGENT_PARLEY_BASE names the base "
+            "checkout while it runs."
         )
 
     def merge(self, repo: Path, name: str) -> str:
@@ -2399,6 +2499,24 @@ def main() -> int:
         ),
     )
     setting.add_argument("--repo", type=Path, default=Path.cwd())
+    preparation = commands.add_parser(
+        "init",
+        help="Show or set the command every new lane runs before it starts.",
+    )
+    preparations = preparation.add_subparsers(dest="action", required=True)
+    reporting = preparations.add_parser("show")
+    reporting.add_argument("--repo", type=Path, default=Path.cwd())
+    recording = preparations.add_parser("set")
+    recording.add_argument(
+        "command_line",
+        metavar="COMMAND",
+        help=(
+            "Command run in every new lane before its agent starts; pass an "
+            "empty string to remove it. AGENT_PARLEY_BASE names the base "
+            "checkout while it runs. No flag skips it."
+        ),
+    )
+    recording.add_argument("--repo", type=Path, default=Path.cwd())
     provider = commands.add_parser(
         "provider", help="Inspect or define providers that drive a native CLI."
     )
@@ -2546,6 +2664,13 @@ def main() -> int:
         elif args.command == "verify":
             print(
                 bridge.verification(
+                    args.repo.resolve(),
+                    getattr(args, "command_line", None),
+                )
+            )
+        elif args.command == "init":
+            print(
+                bridge.initialization(
                     args.repo.resolve(),
                     getattr(args, "command_line", None),
                 )
