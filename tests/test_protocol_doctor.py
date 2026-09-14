@@ -235,7 +235,11 @@ def test_doctor_exits_non_zero_on_a_mismatch(
 
 
 def test_doctor_reports_one_document(bridge, repo, paired, monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["agent-parley", "doctor", "--json"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "doctor", "--json"],
+    )
     assert cli.main() == 0
     document = json.loads(capsys.readouterr().out)
     assert document["schema"] == views.SCHEMA
