@@ -153,6 +153,15 @@ transactions, and observation failures do not fail a committed coordination
 call. `participant_presence` is an additive table initialized with the store.
 The issue ledger retains reminders; only explicit issue transitions own claims.
 
+The same poll delivers the operator items recorded in `scheduled_deliveries`,
+an additive table whose rows carry a not-before instant, a condition and a
+bounded repeat. Recording an item and delivering it are separate: `store.py`
+owns the rows and performs the send, the delivery record and the enrollment of
+the next occurrence in one write transaction, and `supervision.py` decides only
+whether a trigger has arrived. Conditions are answered from recorded ledger
+transitions, never from branch or pull request inference, and no read-only path
+delivers. There is no scheduler process and no additional thread.
+
 `terminal.py` owns a native pseudo-terminal and a private control socket under
 the existing session lock. `gemini.py` translates the additional native hook
 contract. `evidence.py` collects retained claim-window measurements and writes
@@ -619,7 +628,10 @@ keeps the deadline it was taken with, so a long-abandoned lease reports as
 stale rather than being released for its owner. No coordination value is
 rewritten, each step is skipped once its result is present, and the schema
 version publishes in the same transaction as the change it describes. A store
-written by a newer schema is refused rather than downgraded.
+written by a newer schema is refused rather than downgraded. `scheduled_deliveries`
+upgrades the same way: the table is created for an existing store on the first
+initialization that carries it, no stored row is rewritten, and a store that
+predates recorded operator items simply carries none.
 
 A store written before threads and search upgrades in place the same way.
 Every stored message that carries no thread is given its own identifier,

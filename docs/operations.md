@@ -111,7 +111,7 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
-| 0.6.0 | 1 | 7 |
+| 0.6.0 | 1 | 8 |
 <!-- compatibility:end -->
 
 The release path rewrites that table from the constants in
@@ -274,6 +274,59 @@ runtime records one bounded notice per breach, addressed to the owner and to any
 lane waiting on that issue through a recorded dependency, so a peer can decide
 whether to ask for a handoff; the notice reaches them through the checkpoint
 delivery that already carries ledger changes.
+
+### Delivering a message or an offer later
+
+An operator message and a handoff offer can carry a delivery condition, so a
+steer recorded now reaches the lane when it is useful rather than when it was
+typed:
+
+```sh
+agent-parley say codex "Rebase onto main" --after 30m
+agent-parley say codex "Wrap up for today" --at 18:00
+agent-parley say codex "Pick up 18 next" --when-released 17
+agent-parley say codex "Still nothing?" --after 30m --unless-reported
+agent-parley say codex "Status, please" --every 1h --until 18:00
+agent-parley issue offer 21 --to codex --summary "commit, checks" \
+  --when-released 22
+agent-parley mail pending
+agent-parley mail cancel 3
+```
+
+**Recording is not delivering.** The item waits in the coordination store and is
+delivered by the supervision poll that already observes every project. There is
+no scheduler process and no extra thread. `status`, `top`, `mail pending` and
+every other read-only path report pending items and deliver none, so a stopped
+service delivers nothing and loses nothing: the item waits and is delivered on
+the first poll after the service returns.
+
+`--at` and `--until` read a 24-hour time of day in the timezone of the machine
+the command is typed on, and resolve to today while that time is still ahead and
+to tomorrow once it has passed. The instant is then recorded absolutely, so a
+later timezone change, a daylight-saving transition or a restart never moves a
+recorded item. A time that passed while the service was stopped delivers on the
+next poll rather than being skipped.
+
+`--when-released` is answered from recorded ledger transitions only: an explicit
+release of that issue, or supervision's own record that the pull request of the
+current ownership generation ended. An issue that was released and claimed again
+reads as held, and an old pull request on a reused lane branch never answers for
+a later claim. An item carrying both a time and a condition waits for both.
+
+`--unless-reported` applies to a delayed message and drops it once the lane files
+a report of its own, which is the answer the reminder was going to ask for.
+
+**A repeat is bounded and there is no cron syntax.** `--every` requires
+`--until`, and the repeat is capped at 24 deliveries however wide that window
+is. Each occurrence carries its own deduplication key, so a restart delivers an
+occurrence once; a repeat that fell behind while the service was stopped catches
+up one delivery per poll. Each occurrence keeps the time it was planned for
+beside the time it was actually delivered, so the two are compared rather than
+conflated.
+
+`mail pending` lists every recorded item with its recipient, its time, its
+condition and the deliveries it has left; `mail cancel ID` removes one before it
+is delivered. `status` counts a lane's pending operator items.
 
 `agent-parley top` watches every participant live: session state, event age,
 branch with a `!` when a lane left its assigned branch, issues owned and

@@ -61,6 +61,29 @@ def offer_state(offer: dict | None, now: float = 0.0) -> dict:
     }
 
 
+def released(record: dict) -> bool:
+    """Reports whether an issue carries an explicit release or completion.
+
+    The reading uses recorded transitions only. An issue reads as released
+    when its own history ends in a release, or when supervision recorded that
+    the pull request of the current ownership generation ended. An issue that
+    was released and claimed again reads as held, because its history no
+    longer ends in a release, and an old pull request on a reused lane branch
+    never answers for a later claim.
+
+    Args:
+        record: Published ledger record for one issue, or an empty mapping.
+
+    Returns:
+        Whether the issue is explicitly released or completed.
+    """
+    history = record.get("history") or []
+    if history and history[-1].get("action") == "release":
+        return True
+    prompt = record.get("handoff_prompt") or {}
+    return prompt.get("trigger") == "pull request ended"
+
+
 def attempt(directory: Path, agent: str, numbers: list[str]) -> dict:
     """Records one more attempt on every issue a lane still holds.
 
