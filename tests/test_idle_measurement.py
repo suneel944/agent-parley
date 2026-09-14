@@ -215,3 +215,22 @@ def test_status_and_export_carry_the_figures(bridge, repo, paired, capsys):
         entry for entry in exported if entry["record"] == "idle_interval"
     )
     assert interval["seconds"] == 600
+
+
+def test_the_report_log_is_trimmed_once_it_passes_its_ceiling(
+    bridge, repo, paired, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    monkeypatch.setattr(metrics, "MAX_REPORT_RECORDS", 3)
+    monkeypatch.setattr(metrics, "MAX_REPORT_LOG_BYTES", 400)
+    for number in range(8):
+        metrics.record_report(
+            directory, "claude", {"kind": "report", "state": str(number)}
+        )
+    path = directory / "claude-reports.jsonl"
+    assert path.stat().st_size < 400
+    states = [
+        record["state"]
+        for record in metrics.report_records(directory, "claude")
+    ]
+    assert states == ["5", "6", "7"]

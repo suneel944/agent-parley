@@ -23,11 +23,12 @@ import uuid
 from pathlib import Path
 
 from agent_parley import checkpoints, issues, process, store
-from agent_parley.state import BridgeError
+from agent_parley.state import BridgeError, lock, write_text
 
 TURN_END = frozenset({"Stop", "SessionEnd"})
 REPORTS = "reports.jsonl"
 MAX_REPORT_RECORDS = 2000
+MAX_REPORT_LOG_BYTES = 262144
 MAX_WAITS = 64
 
 
@@ -55,6 +56,15 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
     is best effort: a failed append never fails the report or the merge it
     describes.
 
+    The log is bounded the way the lane's event log is bounded. Once it
+    passes `MAX_REPORT_LOG_BYTES` it is rewritten atomically with only the
+    newest `MAX_REPORT_RECORDS` records, which is every record a reader
+    would return anyway, so a lane that reports on every turn never leaves
+    a file that grows for the life of the project. The append and the
+    rewrite share one short lock so a concurrent append is never dropped by
+    the rewrite; when that lock is busy the record is appended without it
+    and the rewrite waits for a later, uncontended append.
+
     Args:
         directory: Private state directory for the common repository.
         name: Participant that owns the lane.
@@ -66,9 +76,20 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
     """
     record = {"id": uuid.uuid4().hex[:16], "at": time.time(), **entry}
     path = report_path(directory, name)
+    line = json.dumps(record) + "\n"
     try:
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record) + "\n")
+        try:
+            with lock(directory / f"{name}-reports.lock", timeout=0.2):
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(line)
+                if path.stat().st_size >= MAX_REPORT_LOG_BYTES:
+                    kept = path.read_text(errors="ignore").splitlines()
+                    write_text(
+                        path, "\n".join(kept[-MAX_REPORT_RECORDS:]) + "\n"
+                    )
+        except BridgeError:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(line)
     except OSError:
         return record
     return record
