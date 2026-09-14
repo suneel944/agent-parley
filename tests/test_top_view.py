@@ -127,10 +127,11 @@ class Screen:
         return self.typed.pop(0) if self.typed else b""
 
 
-class Tty:
-    """Collects printed output while reporting that it is a terminal."""
+class Sink:
+    """Collects printed output and answers for itself whether it is a tty."""
 
-    def __init__(self) -> None:
+    def __init__(self, terminal: bool) -> None:
+        self.terminal = terminal
         self.printed = ""
 
     def write(self, value: str) -> int:
@@ -141,7 +142,7 @@ class Tty:
         return None
 
     def isatty(self) -> bool:
-        return True
+        return self.terminal
 
 
 def test_a_column_is_as_wide_as_its_widest_value_in_the_frame():
@@ -291,20 +292,26 @@ def test_the_key_map_names_every_key_and_holds_the_legend():
     assert dashboard.LEGEND[-1] in lines
 
 
-def test_a_snapshot_to_a_pipe_keeps_every_column(monkeypatch, capsys):
+def test_a_snapshot_to_a_pipe_keeps_every_column(monkeypatch):
     view = snapshot(("/repo", [lane("codex", branch="release/candidate-77")]))
+    pipe = Sink(False)
     monkeypatch.setattr(dashboard, "collect", lambda *a, **k: view)
+    monkeypatch.setattr(sys, "stdout", pipe)
+    monkeypatch.setattr(
+        dashboard.shutil,
+        "get_terminal_size",
+        lambda: os.terminal_size((40, 24)),
+    )
     dashboard.run(HOME, lambda: True, once=True)
-    printed = capsys.readouterr().out
-    assert "release/candidate-77" in printed
-    assert "Hidden columns:" not in printed
+    assert "release/candidate-77" in pipe.printed
+    assert "Hidden columns:" not in pipe.printed
     for name, _ in dashboard.COLUMNS:
-        assert name in printed
+        assert name in pipe.printed
 
 
 def test_a_snapshot_to_a_terminal_fits_its_width(monkeypatch):
     view = snapshot(("/repo", [lane("codex")]))
-    terminal = Tty()
+    terminal = Sink(True)
     monkeypatch.setattr(dashboard, "collect", lambda *a, **k: view)
     monkeypatch.setattr(sys, "stdout", terminal)
     monkeypatch.setattr(
