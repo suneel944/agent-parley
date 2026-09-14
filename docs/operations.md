@@ -958,6 +958,19 @@ Both plugins provide `coordinate`; the launcher supplies MCP and native hooks.
 Avoid installing the same skill from both personal and repo marketplaces. Start
 a new native session after updates.
 
+`make check` runs `claude plugin validate plugins/agent-parley --json` as part
+of the policy gate and refuses any reported error, so a declared component path
+the runtime loader cannot resolve fails here rather than at install time. The
+gate is not run with `--strict`, because the manifest declares the `protocol`
+field that the compatibility contract reads and the client reports every field
+it does not recognise as a warning. Exactly one warning path, `protocol`, is
+tolerated; a second unknown field fails. A machine without the Claude client
+installed reports the step as skipped rather than passing it silently.
+
+The validator reports commands but never lists skills, so the same gate checks
+separately that every directory under `plugins/agent-parley/skills` carries a
+`SKILL.md` declaring both a name and a description.
+
 Repository installation does not imply public directory approval. For Claude,
 validate `plugins/agent-parley` with `claude plugin validate`, then use the
 [community submission form](https://platform.claude.com/plugins/submit).

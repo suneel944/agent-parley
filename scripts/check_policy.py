@@ -3,6 +3,7 @@
 import ast
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tokenize
@@ -11,6 +12,10 @@ from pathlib import Path
 
 from agent_parley.policy import has_attribution
 from scripts import codex_bundle, release_publish
+
+TOLERATED_WARNINGS = frozenset({"protocol"})
+
+VALIDATOR_FAILED = 2
 
 
 def contribution_errors(root: Path) -> list[str]:
@@ -53,6 +58,135 @@ def contribution_errors(root: Path) -> list[str]:
     for index in range(0, len(history) - 1, 2):
         if has_attribution(history[index + 1]):
             errors.append(f"Commit {history[index].strip()}: prohibited credit")
+    return errors
+
+
+def frontmatter(text: str) -> dict[str, str]:
+    """Returns the scalar fields of a leading document block.
+
+    Args:
+        text: Document whose optional leading block is read.
+
+    Returns:
+        The block's top level fields, empty when the document opens with
+        something other than a block delimiter.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fields = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        key, separator, value = line.partition(":")
+        if separator and key == key.lstrip():
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def skill_errors(plugin: Path) -> list[str]:
+    """Checks that every shipped skill directory registers a usable skill.
+
+    The plugin validator reports commands but never lists skills, so a
+    skills-only plugin validates with an empty component list and a missing or
+    undeclared skill document passes unseen. This covers locally what the
+    validator leaves out.
+
+    Args:
+        plugin: Plugin directory holding the optional skills tree.
+
+    Returns:
+        One message per skill directory without a readable document declaring
+        both a name and a description.
+    """
+    errors = []
+    directories = sorted(
+        path for path in (plugin / "skills").glob("*") if path.is_dir()
+    )
+    for directory in directories:
+        document = directory / "SKILL.md"
+        try:
+            declared = frontmatter(document.read_text())
+        except OSError:
+            errors.append(f"{directory.name}: skill has no readable SKILL.md")
+            continue
+        missing = [
+            field
+            for field in ("name", "description")
+            if not declared.get(field)
+        ]
+        if missing:
+            errors.append(
+                f"{directory.name}: skill declares no {' or '.join(missing)}"
+            )
+    return errors
+
+
+def reported_errors(section: dict) -> list[str]:
+    """Returns one validated section's errors and unexpected warnings.
+
+    Args:
+        section: Manifest or component report the validator produced.
+
+    Returns:
+        Every reported error, and every warning whose path is outside the
+        tolerated set.
+    """
+    where = section.get("file") or "plugin"
+    entries = list(section.get("errors") or [])
+    entries += [
+        warning
+        for warning in section.get("warnings") or []
+        if warning.get("path") not in TOLERATED_WARNINGS
+    ]
+    return [f"{where}: {entry.get('message', entry)}" for entry in entries]
+
+
+def plugin_validation_errors(root: Path) -> list[str]:
+    """Reports what the plugin runtime loader would refuse to load.
+
+    The validator runs without ``--strict`` and its warnings are judged here,
+    because the manifest declares the ``protocol`` field that the
+    compatibility contract reads and the client reports every field it does
+    not recognise as a warning. Tolerating exactly that one path keeps a
+    second unknown field a failure rather than an inherited allowance. A
+    machine without the client installed skips the step with a message
+    instead of passing silently, and a validation run that itself fails is
+    reported separately from a plugin that fails.
+
+    Args:
+        root: Repository root holding the plugin directory.
+
+    Returns:
+        One message per reported error, per warning outside the tolerated
+        set, and per skill directory without a usable document.
+    """
+    plugin = root / "plugins/agent-parley"
+    errors = skill_errors(plugin)
+    executable = shutil.which("claude")
+    if not executable:
+        print("Policy: plugin validation skipped, no claude client")
+        return errors
+    try:
+        result = subprocess.run(
+            [executable, "plugin", "validate", str(plugin), "--json"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return [*errors, f"Plugin validation could not run: {error}"]
+    if result.returncode == VALIDATOR_FAILED:
+        detail = result.stderr.strip() or "no detail reported"
+        return [*errors, f"Plugin validation did not complete: {detail}"]
+    try:
+        report = json.loads(result.stdout)
+    except ValueError:
+        return [*errors, "Plugin validation returned no readable report"]
+    sections = [report.get("manifest") or {}, *(report.get("contents") or [])]
+    for section in sections:
+        errors.extend(reported_errors(section))
     return errors
 
 
@@ -106,6 +240,7 @@ def main() -> None:
         if json.loads(path.read_text())["version"] != metadata["version"]:
             errors.append(f"{client} plugin version differs from package")
     errors.extend(codex_bundle.manifest_errors(root))
+    errors.extend(plugin_validation_errors(root))
     marketplace = json.loads(
         (root / ".claude-plugin/marketplace.json").read_text()
     )
