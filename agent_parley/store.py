@@ -10,12 +10,12 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
-from agent_parley import roster
+from agent_parley import issues, roster
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BUSY_TIMEOUT = 5.0
 MAX_BODY_BYTES = 4096
 MAX_RESULT_BYTES = 8192
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS messages (
  sender_id INTEGER NOT NULL REFERENCES agents(id), thread_id TEXT DEFAULT '',
  subject TEXT NOT NULL, body_md TEXT NOT NULL, ack_required INTEGER DEFAULT 0,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
- ack_deadline_ts TEXT, UNIQUE(sender_id,dedup_key));
+ ack_deadline_ts TEXT, claim_id TEXT, UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS file_reservations (
  agent_id INTEGER NOT NULL REFERENCES agents(id), path_pattern TEXT NOT NULL,
  exclusive INTEGER NOT NULL, reason TEXT DEFAULT '',
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- expires_ts TEXT, released_ts TEXT);
+ expires_ts TEXT, released_ts TEXT, claim_id TEXT);
 CREATE INDEX IF NOT EXISTS leases ON file_reservations(project_id,expires_ts)
  WHERE released_ts IS NULL;
 CREATE TABLE IF NOT EXISTS events (
@@ -185,6 +185,7 @@ def initialize(home: Path) -> None:
                 if version == 1:
                     _add_reservation_created(db)
                 _rebuild_reservations(db)
+                _add_claim_correlation(db)
                 _add_message_search(db)
                 legacy = home / "mail.sqlite3"
                 if version == 0 and legacy.exists():
@@ -210,6 +211,24 @@ def _add_ack_deadline(db: sqlite3.Connection) -> None:
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
     if "ack_deadline_ts" not in columns:
         db.execute("ALTER TABLE messages ADD COLUMN ack_deadline_ts TEXT")
+
+
+def _add_claim_correlation(db: sqlite3.Connection) -> None:
+    """Adds the claim identifier a record was made under, where it is missing.
+
+    The column is additive and nullable. A message or a reservation written
+    before the upgrade keeps every value it had and simply carries no claim,
+    which history reports as unknown rather than inventing a correlation that
+    was never recorded.
+
+    It runs after the reservation table has been rebuilt into its current
+    shape, because that rebuild copies a fixed column list and would otherwise
+    drop a column added before it.
+    """
+    for table in ("messages", "file_reservations"):
+        columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if "claim_id" not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN claim_id TEXT")
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -504,7 +523,9 @@ def _answered_thread(db: sqlite3.Connection, actor: dict, value: object) -> str:
     return row[0]
 
 
-def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
+def _send(
+    db: sqlite3.Connection, actor: dict, args: dict, claim: str = ""
+) -> dict:
     """Atomically delivers an idempotent message to authorized recipients.
 
     A send naming ``reply_to`` joins the thread of the message it answers. A
@@ -573,8 +594,8 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         }
     cursor = db.execute(
         "INSERT INTO messages(project_id,sender_id,subject,body_md,"
-        "thread_id,ack_required,dedup_key,ack_deadline_ts) "
-        "VALUES (?,?,?,?,?,?,?,datetime('now',?))",
+        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id) "
+        "VALUES (?,?,?,?,?,?,?,datetime('now',?),?)",
         (
             actor["project_id"],
             actor["id"],
@@ -584,6 +605,7 @@ def _send(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
             ack,
             key,
             None if within is None else f"+{int(within)} seconds",
+            claim or None,
         ),
     )
     message_id = cursor.lastrowid
@@ -840,6 +862,7 @@ def _reserve(
     actor: dict,
     args: dict,
     declared: frozenset[str] | None = None,
+    claim: str = "",
 ) -> dict:
     """Grants all requested leases or none; two globs conservatively overlap.
 
@@ -871,6 +894,8 @@ def _reserve(
         args: Validated tool arguments.
         declared: Resources this project declared, or None when it declared
             none and any well-formed name is acceptable.
+        claim: Claim identifier the lane holds, recorded beside each lease so
+            history can follow one piece of work. Empty records no claim.
 
     Returns:
         The granted leases, or the conflicts that granted nothing.
@@ -980,8 +1005,8 @@ def _reserve(
         )
         cursor = db.execute(
             "INSERT INTO file_reservations(project_id,agent_id,path_pattern,"
-            "exclusive,reason,expires_ts) VALUES (?,?,?,?,?,"
-            "datetime('now',?))",
+            "exclusive,reason,expires_ts,claim_id) VALUES (?,?,?,?,?,"
+            "datetime('now',?),?)",
             (
                 actor["project_id"],
                 actor["id"],
@@ -989,6 +1014,7 @@ def _reserve(
                 exclusive,
                 reason,
                 None if ttl is None else f"+{ttl} seconds",
+                claim or None,
             ),
         )
         granted.append({"id": cursor.lastrowid, "path": pattern})
@@ -1130,8 +1156,13 @@ def _dispatch(
         if tool == "file_reservation_paths"
         else None
     )
+    claim = (
+        held_claim(home, str(actor.get("project", "")), actor["name"])
+        if tool in ("file_reservation_paths", "send_message")
+        else ""
+    )
     with connect(home, write=tool not in READ_ONLY) as db:
-        result = _serve(db, actor, tool, args, declared)
+        result = _serve(db, actor, tool, args, declared, claim)
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -1166,12 +1197,64 @@ def declared_resources(home: Path, root: str) -> frozenset[str] | None:
     return frozenset(resources) if resources else None
 
 
+def held_claim(home: Path, root: str, display: str) -> str:
+    """Returns the claim identifier a lane currently works under.
+
+    Every record a lane makes while it holds a claim carries that claim's
+    identifier, so a later reading can follow one piece of work from the claim
+    through its reservations, messages and reports to the pull request that
+    ended it. A lane holding several claims is correlated to its most recent
+    one, and a lane holding none records no correlation at all rather than a
+    guessed one.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        display: Registered identity behind the served call.
+
+    Returns:
+        The claim identifier, or an empty string when the lane holds no claim
+        or the project state cannot be read.
+    """
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        return ""
+    try:
+        manifest = roster.read(directory)
+        ledger = issues.snapshot(directory)
+    except (BridgeError, OSError, ValueError):
+        return ""
+    names = [
+        name
+        for name, participant in manifest["participants"].items()
+        if participant["display"] == display
+    ]
+    if not names:
+        return ""
+    latest = (0.0, "")
+    for record in ledger["issues"].values():
+        if record.get("owner") not in names or not record.get("claim_id"):
+            continue
+        started = max(
+            (
+                float(entry.get("at", 0) or 0)
+                for entry in record.get("history", [])
+                if entry.get("claim_id") == record["claim_id"]
+            ),
+            default=0.0,
+        )
+        if started >= latest[0]:
+            latest = (started, str(record["claim_id"]))
+    return latest[1]
+
+
 def _serve(
     db: sqlite3.Connection,
     actor: dict,
     tool: str,
     args: dict,
     declared: frozenset[str] | None = None,
+    claim: str = "",
 ) -> dict:
     """Applies one validated coordination tool to the open transaction.
 
@@ -1187,6 +1270,8 @@ def _serve(
         args: Validated tool arguments.
         declared: Named resources this project declared, or None when it
             declared none.
+        claim: Claim identifier the calling lane holds, recorded beside the
+            records a tool writes. Empty records no claim.
 
     Returns:
         The tool result.
@@ -1200,7 +1285,7 @@ def _serve(
             (actor["id"],),
         )
     if tool == "send_message":
-        return _send(db, actor, args)
+        return _send(db, actor, args, claim)
     if tool == "fetch_inbox":
         return _inbox(db, actor, args)
     if tool == "list_participants":
@@ -1210,7 +1295,7 @@ def _serve(
     if tool == "search_messages":
         return _search(db, actor, args)
     if tool == "file_reservation_paths":
-        return _reserve(db, actor, args, declared)
+        return _reserve(db, actor, args, declared, claim)
     if tool == "release_file_reservations":
         result = db.execute(
             "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "

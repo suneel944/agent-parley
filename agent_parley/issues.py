@@ -197,6 +197,7 @@ def change(
                 "deadline": time.time() + expected if expected else None,
                 "attempts": 0,
                 "budget": budget or None,
+                "claim_id": uuid.uuid4().hex[:16],
             }
             resolved = title if title else previous.get("title")
             if resolved:
@@ -223,6 +224,7 @@ def change(
                         deadline=(time.time() + expected if expected else None),
                         attempts=0,
                         budget=budgets.get("attempts") or None,
+                        claim_id=uuid.uuid4().hex[:16],
                     )
                 record["offer"] = None
             else:
@@ -292,6 +294,7 @@ def change(
                 "owner": record["owner"],
                 "offer": record["offer"],
                 "offer_id": offer_id,
+                "claim_id": record.get("claim_id"),
             }
         )
         state["issues"][issue] = record
