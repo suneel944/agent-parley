@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 MINOR_THRESHOLD = 10
-MAJOR_THRESHOLD = 100
 RETIREMENT_LIMIT = 100
 PACKAGE_PATHS = ("agent_parley", "plugins/agent-parley")
 MANIFEST_PATH = ".release-manifest.json"
@@ -29,7 +28,7 @@ CHANGELOG_SECTIONS = (
     ("fix", "Bug fixes"),
     ("perf", "Performance"),
 )
-RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?!?:")
+RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?(!?):")
 ISSUE_REFERENCE = re.compile(
     r"\b(?:refs?|fix(?:es)?|clos(?:e[sd]?)|resolv(?:e[sd]?))"
     r"\s+#([1-9][0-9]*)\b",
@@ -315,7 +314,9 @@ def available_version(
     raise ValueError(f"No {kind} version is available after {approved}.")
 
 
-def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
+def product_units(
+    root: Path, baseline: str
+) -> tuple[set[str], set[str], bool, bool]:
     """Measures delivered product work between the approved release and HEAD.
 
     A commit contributes only when a releasing conventional type introduces
@@ -323,13 +324,15 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
     script, test and documentation commits are therefore structurally
     incapable of raising a version. Issue references collapse repeated pull
     requests for one issue into a single unit, and a qualifying commit that
-    names no issue counts as one unit of its own. Reviewed history metadata
-    can recover references lost during squash merging, but only for an exact
-    qualifying commit in this range. Recovered references replace the fallback
-    commit unit and share normal deduplication. Measurement remains local.
-    Records and fields are separated with control bytes that can appear in
-    neither a commit message nor a path, so a crafted message cannot forge
-    a commit boundary.
+    names no issue counts as one unit of its own. A breaking-change marker is
+    read from a qualifying commit only, so a breaking change confined to
+    tooling cannot raise a version any more than tooling itself can. Reviewed
+    history metadata can recover references lost during squash merging, but
+    only for an exact qualifying commit in this range. Recovered references
+    replace the fallback commit unit and share normal deduplication.
+    Measurement remains local. Records and fields are separated with control
+    bytes that can appear in neither a commit message nor a path, so a crafted
+    message cannot forge a commit boundary.
 
     Args:
         root: Checkout containing the release baseline and HEAD.
@@ -337,7 +340,8 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
 
     Returns:
         Distinct units from every releasing type, the units introduced by
-        feature commits, and whether an urgent fix requests a patch release.
+        feature commits, whether a commit declares a breaking change, and
+        whether an urgent fix requests a patch release.
 
     Raises:
         subprocess.CalledProcessError: If Git cannot read the commit range.
@@ -354,6 +358,7 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
     _, _, references = release_history(root)
     issues: set[str] = set()
     features: set[str] = set()
+    breaking = False
     urgent = False
     for record in log.split("\x00")[1:]:
         commit, message, names = record.split("\x01")
@@ -371,19 +376,23 @@ def product_units(root: Path, baseline: str) -> tuple[set[str], set[str], bool]:
         issues |= units
         if subject[1] == "feat":
             features |= units
+        breaking = breaking or subject[3] == "!"
         urgent = urgent or (subject[1] == "fix" and subject[2] == "urgent")
-    return issues, features, urgent
+    return issues, features, breaking, urgent
 
 
 def release_candidate(root: Path) -> tuple[str, int, int]:
     """Returns the version the measured product changes propose, with counts.
 
     Eligibility is measured rather than judged so preparation can run
-    unattended. A hundred product features propose the next major version, ten
-    product issues propose the next minor version, and a single commit
-    titled fix(urgent) is the only mechanical marker that proposes a patch
-    version. Nothing else raises a version. The proposal then looks ahead
-    for a version that is genuinely free.
+    unattended. A product commit marked breaking with an exclamation mark
+    proposes the next major version, ten product issues propose the next minor
+    version, and a single commit titled fix(urgent) proposes a patch version.
+    Those three markers are the only ones that raise a version. Volume is
+    deliberately not a major-release marker: every feature is also an issue, so
+    any feature count above the minor threshold would be unreachable, because
+    the minor release fires first and moves the baseline the count is measured
+    from. The proposal then looks ahead for a version that is genuinely free.
 
     Args:
         root: Checkout containing the version manifest and release history.
@@ -402,8 +411,8 @@ def release_candidate(root: Path) -> tuple[str, int, int]:
         raise ValueError("Approved version must be MAJOR.MINOR.PATCH.")
     tag = f"v{approved}"
     baseline = release_baseline(root, tag, validate_tag(root, tag))
-    issues, features, urgent = product_units(root, baseline)
-    if len(features) >= MAJOR_THRESHOLD:
+    issues, features, breaking, urgent = product_units(root, baseline)
+    if breaking:
         kind = "major"
     elif len(issues) >= MINOR_THRESHOLD:
         kind = "minor"
@@ -826,9 +835,8 @@ def main() -> None:
         )
         if not version:
             print(
-                f"{measured}; {MINOR_THRESHOLD} issues or "
-                f"{MAJOR_THRESHOLD} features or one fix(urgent) commit "
-                "are required."
+                f"{measured}; {MINOR_THRESHOLD} issues or one breaking "
+                "commit or one fix(urgent) commit are required."
             )
         elif not changed:
             print(f"{measured}; no package changes since the approved release.")

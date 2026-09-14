@@ -139,7 +139,7 @@ removed it and the workflow's approval/merge code.
 What prevents the replay today is the measurement, not a human step. A `fix:`
 title on build tooling contributes nothing, because a commit counts only when
 it also touches `agent_parley/` or `plugins/agent-parley/`, and a version is
-proposed only when the measured work crosses a threshold and the package
+proposed only when the measured work reaches a release marker and the package
 differs from the approved release. Commit `436c2b5` measures zero under every
 one of those conditions. Removing the proposal pull request therefore removed a
 review step that was never what stopped the incident; the guard that did is
@@ -171,23 +171,28 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    between the approved
    release and `main`, and a commit counts only when both of these hold: its
    title uses a releasing conventional type, `feat`, `fix` or `perf`, with or
-   without a scope or `!`; and it touches at least one path under
+   without a scope; and it touches at least one path under
    `agent_parley/` or `plugins/agent-parley/`. Workflow, script, test and
    documentation commits are therefore structurally incapable of counting, even
    with a releasing title, because they change nothing the package distributes.
    Each counted commit contributes the distinct issues its message names
    through `Refs`, `Fixes`, `Closes` or `Resolves`, so one issue delivered by
    three pull requests counts once; a counted commit that names no issue counts
-   as one unit of its own. A hundred product features propose the next major
-   version, ten product issues propose the next minor version, and a single
-   commit titled `fix(urgent):` proposes the next patch version. That scope is
-   the only mechanical marker for a patch release; nothing else reaches that
-   rung. Below all three thresholds nothing is proposed and the step reports
-   the counts it measured. Counting is local and repeatable: it reads Git
-   history; selecting an available version additionally queries the release
-   services described below. `python3 -m scripts.release_publish candidate`
-   performs those checks before any merge. Every push to `main` runs it,
-   and a push below all three thresholds ends there.
+   as one unit of its own. A counted commit whose type carries the breaking
+   marker `!`, as in `feat!:` or `feat(lane)!:`, proposes the next major
+   version; ten product issues propose the next minor version; and a single
+   commit titled `fix(urgent):` proposes the next patch version. Each marker is
+   the only mechanical route to its rung, and the major marker outranks the
+   issue count when both hold. Volume is deliberately not a major-release
+   marker: every feature is also an issue, so any feature threshold above ten
+   could never be reached, because the minor release would fire first and move
+   the baseline the count is measured from. Below all three markers nothing is
+   proposed and the step reports the counts it measured. Counting is local and
+   repeatable: it reads Git history; selecting an available version
+   additionally queries the release services described below.
+   `python3 -m scripts.release_publish candidate` performs those checks before
+   any merge. Every push to `main` runs it, and a push that reaches no marker
+   ends there.
 2. The chosen number must be free. Previously consumed versions cannot be
    reused, including a deleted or yanked 0.1.2. A release that lands on an
    unavailable version advances to the next free version of the same kind
@@ -270,6 +275,6 @@ published curated branch using read-only GitHub requests and the proposed scan
 boundary. It stopped at the mapped release and built zero release proposals.
 That audit is historical: versioning no longer runs Release Please, and the
 equivalent check today is `python3 -m scripts.release_publish candidate`, which
-counts local Git history and checks version availability when a threshold is
-met. It does not open pull requests, tag commits, dispatch workflows, or upload
-packages.
+counts local Git history and checks version availability when a release marker
+is reached. It does not open pull requests, tag commits, dispatch workflows,
+or upload packages.
