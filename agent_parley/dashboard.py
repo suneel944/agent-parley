@@ -166,7 +166,9 @@ def _row(
             f"{participant['credential'] or 'default'}"
         ),
         "state": (
-            "running; no hooks"
+            f"paused; {liveness}"
+            if participant.get("paused", False)
+            else "running; no hooks"
             if "checkpoints unavailable" in liveness
             else liveness
         ),

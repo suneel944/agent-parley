@@ -12,7 +12,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent_parley import store
+from agent_parley import roster, store
 from agent_parley.state import BridgeError
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
@@ -366,6 +366,8 @@ class Handler(BaseHTTPRequestHandler):
                 schema["required"]
             ) - set(args):
                 raise BridgeError("Unexpected or missing tool arguments.")
+            if roster.paused(self.server.home, actor["project"], actor["name"]):
+                raise BridgeError(roster.PAUSED_REASON)
             result = store.call(self.server.home, actor, tool["name"], args)
             return {
                 "content": [

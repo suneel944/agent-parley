@@ -200,6 +200,63 @@ def verify_command(
     return parsed
 
 
+PAUSED_REASON = (
+    "This lane is paused by the operator. Coordination calls and tool use "
+    "stay refused until `agent-parley participant resume` runs in the base "
+    "checkout. Claims, reservations and the session are all still held."
+)
+
+
+def locate(home: Path, root: str) -> Path | None:
+    """Finds the private state directory a project root was registered under.
+
+    A project directory is keyed by the repository's common Git directory,
+    which only a checkout can resolve. A served call names its project by the
+    canonical root instead, so the registered manifests are matched on that
+    root rather than the key being recomputed without a checkout.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key recorded in the manifest.
+
+    Returns:
+        The project state directory, or None when no manifest names that root.
+    """
+    for path in (home / "projects").glob("*/project.json"):
+        try:
+            if json.loads(path.read_text()).get("root") == root:
+                return path.parent
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def paused(home: Path, root: str, display: str) -> bool:
+    """Reports whether the operator paused the lane behind a served call.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key recorded in the manifest.
+        display: Registered identity the call authenticated as.
+
+    Returns:
+        Whether that participant is currently paused. An unreadable or absent
+        manifest reports False, because a pause must be recorded to apply.
+    """
+    directory = locate(home, root)
+    if directory is None:
+        return False
+    try:
+        participants = read(directory)["participants"]
+    except (BridgeError, OSError, ValueError):
+        return False
+    return any(
+        entry.get("paused", False)
+        for entry in participants.values()
+        if entry.get("display") == display
+    )
+
+
 def _registry(home: Path, filename: str, presets: dict) -> dict:
     """Merges built-in presets with locally defined entries."""
     path = home / filename
@@ -502,6 +559,8 @@ def normalize(manifest: dict) -> dict:
     for participant in participants.values():
         if type(participant.get("wake", True)) is not bool:
             raise BridgeError("Participant wake setting must be a boolean.")
+        if type(participant.get("paused", False)) is not bool:
+            raise BridgeError("Participant paused setting must be a boolean.")
     return {
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
