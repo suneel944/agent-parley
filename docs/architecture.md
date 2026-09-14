@@ -28,6 +28,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
+| `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
 | `state` | Private atomic JSON and text publication and operation locks |
 
 Enforcement and telemetry share one substrate, on purpose, in two places. Hook

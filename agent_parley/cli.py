@@ -26,6 +26,7 @@ from pathlib import Path
 from agent_parley import (
     approvals,
     checkpoints,
+    completion,
     dashboard,
     evidence,
     forge,
@@ -5049,6 +5050,13 @@ def main() -> int:
         help="Private state directory (or AGENT_PARLEY_HOME).",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    completing = commands.add_parser(
+        "completion",
+        help="Print a shell completion script for this command.",
+    )
+    completing.add_argument("shell", choices=completion.SHELLS)
+    candidates = commands.add_parser("__complete", help=argparse.SUPPRESS)
+    candidates.add_argument("kind", choices=completion.KINDS)
     commands.add_parser(
         "up", help="Start the local coordination server in the background."
     )
@@ -5816,6 +5824,13 @@ def main() -> int:
     profile.add_argument("--env", action="append", default=[])
     profile.add_argument("--require-env", action="append", default=[])
     args = parser.parse_args()
+    home = args.home.expanduser()
+    if args.command == "completion":
+        print(completion.script(parser, args.shell), end="")
+        return 0
+    if args.command == "__complete":
+        print("\n".join(completion.candidates(home, args.kind)))
+        return 0
     try:
         bridge = Bridge(args.home)
         if args.command == "up":

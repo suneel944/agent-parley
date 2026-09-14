@@ -90,6 +90,22 @@ through.
 For a pinned, checksummed install, take a wheel from
 [Releases](https://github.com/suneel944/agent-parley/releases) instead.
 
+Shell completion is generated from the command tree itself, so it offers the
+commands and flags the installed version actually has. Install it where your
+shell looks, then reload the shell:
+
+```sh
+agent-parley completion bash > ~/.local/share/bash-completion/completions/agent-parley
+agent-parley completion zsh  > "${fpath[1]}/_agent-parley"
+agent-parley completion fish > ~/.config/fish/completions/agent-parley.fish
+```
+
+Rerun the command for your shell after an upgrade to regenerate the script.
+Participant names, providers, credential profiles, project roots and issue
+numbers complete from local coordination state; that lookup reads published
+files without taking the operation lock, so a busy store never stalls the
+shell.
+
 ## Run it
 
 From a committed, clean checkout, one terminal per agent:
@@ -613,6 +629,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | --- | --- |
 | `up` | Start the local coordination server. |
 | `down` | Stop the server while retaining state and worktrees. |
+| `completion SHELL` | Print a `bash`, `zsh` or `fish` completion script generated from the installed command tree. |
 | `status` | Show server health and one table per project; `NAME` reports one lane in full, and `--project`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since` and `--issue` narrow the rows. |
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
