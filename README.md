@@ -311,6 +311,15 @@ figure comes from records the runtime already keeps, so it reports observed
 coordination inactivity and never claims to know what the native client was
 doing inside a turn.
 
+**Ownership history is queryable.** `agent-parley history issue 42` lists every
+claim, handoff, reservation, message and report that touched it, with how long
+each participant held it; `history participant NAME` does the same for one lane,
+and `history claim ID` follows one claim through to the pull request that ended
+it. Every claim carries its own identifier, minted again on each claim and each
+accepted handoff, and every record made while it is held carries that identifier.
+It reads only: no lock, no rewrite, and a record older than the correlation
+reports `unknown` rather than being given an invented one.
+
 That history is bounded, and it can leave the state directory. A lane keeps two
 event files and discards records older than fourteen days, so `top` reports
 recent enforcement rather than the whole project. `--since` narrows any count
@@ -432,6 +441,9 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `init set COMMAND` | Set that command; an empty string removes it. |
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
+| `history issue N` | List every record that touched an issue, with each holding. |
+| `history participant NAME` | List everything one lane filed. |
+| `history claim ID` | Follow one claim to the pull request that ended it. |
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
 
 Every read-only command above also accepts `--json` and prints exactly one JSON

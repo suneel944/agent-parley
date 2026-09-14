@@ -27,6 +27,7 @@ from agent_parley import (
     evidence,
     forge,
     gemini,
+    history,
     metrics,
     policy,
     process,
@@ -492,6 +493,32 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         f"commits from {name}. The lane and its branch are unchanged; retire "
         f"{name} separately when the lane is no longer needed."
     )
+
+
+def held_claim(directory: Path, name: str) -> dict:
+    """Names the claim a lane's integration record belongs to.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The issue and claim identifier the lane currently holds, or empty
+        fields when it holds none. A record with no claim is reported as
+        unknown by history rather than being attached to a guessed one.
+    """
+    owned = sorted(
+        (
+            (number, record)
+            for number, record in snapshot(directory)["issues"].items()
+            if record["owner"] == name
+        ),
+        key=lambda item: int(item[0]),
+    )
+    if not owned:
+        return {"issue": None, "claim_id": None}
+    number, record = owned[0]
+    return {"issue": int(number), "claim_id": record.get("claim_id")}
 
 
 def report_comment(summary: str, evidence: str) -> str:
@@ -1275,7 +1302,13 @@ class Bridge:
                         note = f"Branch {branch} deleted; it added no commits."
                 store.revoke(self.home, data["root"], participant["display"])
                 metrics.record_report(
-                    directory, name, {"kind": "integration", "action": "retire"}
+                    directory,
+                    name,
+                    {
+                        "kind": "integration",
+                        "action": "retire",
+                        **held_claim(directory, name),
+                    },
                 )
                 with lock(directory / f"{name}-checkpoint.lock", timeout=1):
                     for suffix in (
@@ -1765,7 +1798,11 @@ class Bridge:
                 metrics.record_report(
                     directory,
                     name,
-                    {"kind": "integration", "action": "merge"},
+                    {
+                        "kind": "integration",
+                        "action": "merge",
+                        **held_claim(directory, name),
+                    },
                 )
                 return merged
 
@@ -2022,7 +2059,14 @@ class Bridge:
         created = gh(root, *arguments)
         opened = created.splitlines()[-1] if created else "a pull request"
         metrics.record_report(
-            directory, name, {"kind": "integration", "action": "pull_request"}
+            directory,
+            name,
+            {
+                "kind": "integration",
+                "action": "pull_request",
+                "pull_request": opened,
+                **held_claim(directory, name),
+            },
         )
         return f"Pushed {branch} and opened {opened}"
 
@@ -2202,8 +2246,26 @@ attempt of the recorded budget, which is also only reported.
                 reported_at=time.time(),
             )
             write_json(path, state)
+        held = snapshot(directory)["issues"]
+        claimed = sorted(
+            (
+                number
+                for number, record in held.items()
+                if record["owner"] == agent
+            ),
+            key=int,
+        )
         metrics.record_report(
-            directory, agent, {"kind": "report", "state": outcome}
+            directory,
+            agent,
+            {
+                "kind": "report",
+                "state": outcome,
+                "issue": int(claimed[0]) if claimed else None,
+                "claim_id": (
+                    held[claimed[0]].get("claim_id") if claimed else None
+                ),
+            },
         )
         owned = sorted(
             (
@@ -2484,6 +2546,77 @@ attempt of the recorded budget, which is also only reported.
             f"Exported {len(lines)} records from {len(selected)} participants "
             f"covering {covered} to {destination}."
         )
+
+    def history(
+        self,
+        repo: Path,
+        subject: str = "",
+        value: str = "",
+        *,
+        kinds: tuple[str, ...] = (),
+        participant: str = "",
+        provider: str = "",
+        issue: str = "",
+        window: float = 0.0,
+    ) -> dict:
+        """Reads ownership history for one issue, lane or claim.
+
+        The store is opened read-only, no lock is taken and no record is
+        rewritten, so a history query is safe beside running lanes. Retention
+        follows the substrate each record lives in: the issue ledger and the
+        report log keep their records until the project is removed, while mail
+        and reservations keep theirs for as long as the store does.
+
+        Args:
+            repo: Any checkout of the target repository.
+            subject: Issue, participant or claim.
+            value: The issue number, participant name or claim identifier.
+            kinds: Record kinds to report; every kind when empty.
+            participant: Lane filter applied to every listing.
+            provider: Provider filter applied to every listing.
+            issue: Issue filter applied to every listing.
+            window: Seconds of history to report; everything when zero.
+
+        Returns:
+            The matching records, with the ownership generations of an issue
+            listing.
+
+        Raises:
+            BridgeError: If the subject is unknown or the project has none.
+        """
+        _, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        since = time.time() - window if window else 0.0
+        claim = ""
+        held: list[dict] = []
+        if subject == "issue":
+            issue = parse_issue(value)
+            held = history.holdings(directory, issue)
+        elif subject == "participant":
+            if value not in data["participants"]:
+                raise BridgeError(
+                    f"{value} is not a participant in this project; "
+                    "run agent-parley participant list."
+                )
+            participant = value
+        elif subject == "claim":
+            claim = value
+        return {
+            "subject": subject or "project",
+            "value": value,
+            "holdings": held,
+            "records": history.records(
+                self.home,
+                directory,
+                data,
+                kinds=kinds,
+                participant=participant,
+                provider=provider,
+                issue=issue,
+                claim=claim,
+                since=since,
+            ),
+        }
 
     def liveness(self, repo: Path) -> dict[str, str]:
         """Reports every participant's session state for one repository.
@@ -3046,6 +3179,44 @@ def main() -> int:
             "6h or 7d. The whole retained log is counted by default."
         ),
     )
+    past = commands.add_parser(
+        "history",
+        help="Read the recorded history of an issue, a lane or a claim.",
+    )
+    subjects = past.add_subparsers(dest="subject")
+    for subject, argument in (
+        ("issue", "number"),
+        ("participant", "name"),
+        ("claim", "claim_id"),
+    ):
+        listing = subjects.add_parser(subject)
+        listing.add_argument(argument)
+        listing.add_argument("--repo", type=Path, default=Path.cwd())
+        listing.add_argument("--json", action="store_true", help=JSON_HELP)
+        listing.add_argument(
+            "--kind",
+            action="append",
+            choices=history.KINDS,
+            metavar="KIND",
+            help=(
+                "Report only this kind of record: "
+                + ", ".join(history.KINDS)
+                + ". Repeat the flag to report several."
+            ),
+        )
+        listing.add_argument("--participant", default="")
+        listing.add_argument("--provider", default="")
+        listing.add_argument("--issue", default="")
+        listing.add_argument(
+            "--since",
+            type=duration,
+            default=0.0,
+            metavar="WINDOW",
+            help=(
+                "Report only records inside this window, such as 45m, 6h or "
+                "7d. Everything recorded is reported by default."
+            ),
+        )
     events = commands.add_parser(
         "events", help="Export retained enforcement history for a repository."
     )
@@ -3396,6 +3567,26 @@ def main() -> int:
                     tuple(args.provider or ()),
                     args.since,
                 )
+        elif args.command == "history":
+            if args.subject is None:
+                parser.error("history takes issue, participant or claim.")
+            reported = bridge.history(
+                args.repo.resolve(),
+                args.subject,
+                getattr(args, "number", "")
+                or getattr(args, "name", "")
+                or getattr(args, "claim_id", ""),
+                kinds=tuple(args.kind or ()),
+                participant=args.participant,
+                provider=args.provider,
+                issue=args.issue,
+                window=args.since,
+            )
+            print(
+                views.render("history", views.history(reported))
+                if args.json
+                else history.describe(reported["records"], reported["holdings"])
+            )
         elif args.command == "events":
             message = bridge.export_events(
                 args.repo.resolve(),

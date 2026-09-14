@@ -21,6 +21,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `dashboard` | Read-only live operator view of every participant |
 | `views` | Machine-readable rendering of read-only command results |
 | `metrics` | Idle intervals and waiting times derived from retained records |
+| `history` | Read-only ownership history across the ledger, reports and store |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `state` | Private atomic JSON publication and operation locks |
 

@@ -292,6 +292,44 @@ exported by default. `--since` takes the same windows as `top`. Export reads
 state and never writes it, and it is the supported way to keep enforcement
 history beyond what the state directory retains.
 
+### Ownership history
+
+`agent-parley history` answers over the ledger, the per-lane report log and the
+store:
+
+```sh
+agent-parley history issue 42
+agent-parley history participant claude-1 --since 7d
+agent-parley history claim CLAIM_ID --json
+agent-parley history issue 42 --kind claim --kind handoff
+```
+
+`history issue 42` lists every claim, release, handoff, dependency change,
+reservation, message and report that touched it, in order, and heads the listing
+with each ownership generation and how long it was held. `history participant
+NAME` lists the same for one lane, and `history claim ID` prints the whole chain
+from a claim to the pull request that ended it.
+
+`--kind claim|handoff|report|reservation|message`, `--participant`,
+`--provider`, `--issue` and `--since` combine on any listing, and `--json`
+prints one document with a `records` array, consistent with the snapshot
+contract below.
+
+**A correlation key follows the work.** Every claim carries its own identifier,
+minted again on each claim and each accepted handoff, so releasing and
+reclaiming an issue produces two distinct generations rather than one blurred
+one. Every record made while a claim is held carries that identifier:
+reservations and messages in the store, reports and integrations in the lane's
+report log, and the pull request that ended the claim.
+
+**It reads, only.** The store is opened read-only, no lock is taken and no
+record is rewritten, so a history query is safe beside running lanes. Retention
+follows each substrate: the issue ledger and the report log keep their records
+until the project is removed, while mail and reservations keep theirs for as
+long as the store does. A record written before this correlation existed carries
+no claim and is reported as `unknown`; nothing is back-filled, because an
+invented correlation is worse than an honest gap.
+
 ### Machine-readable output
 
 Every read-only command also accepts `--json` and prints exactly one JSON
@@ -321,7 +359,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `issues`, `participants`, `mail_thread`, `mail_search`, `verify`, `init`, `providers` or `credentials`. |
+| `kind` | The command reported: `status`, `top`, `issues`, `participants`, `history`, `mail_thread`, `mail_search`, `verify`, `init`, `resources`, `providers` or `credentials`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -362,6 +400,13 @@ carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
 lane's own session records could not be read, and `unread` and `pending_ack`
 are null when its mailbox could not be read: null states that nothing was read,
 never that the count is zero.
+
+`history` reports the `subject` and `value` queried, a `holdings` array of
+ownership generations with `participant`, `claim_id`, `started_at`, `ended_at`
+and `seconds`, and a `records` array whose entries carry `kind`, `action`, `at`,
+`participant`, `provider`, `issue`, `claim_id` and `detail`, plus the
+identifiers their kind adds: `path` for a reservation, `message_id` and
+`thread_id` for a message, `report_id` for a report.
 
 `issues` reports `revision` and an `issues` array whose records carry `issue`,
 `owner`, `title`, `deadline_at`, `overdue`, `overdue_seconds`, `attempts`,

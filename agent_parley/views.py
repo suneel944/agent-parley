@@ -154,6 +154,36 @@ def issues(state: dict) -> list[dict]:
     return reported
 
 
+def history(reported: dict) -> dict:
+    """Reports recorded history as arrays with RFC 3339 instants.
+
+    Args:
+        reported: Reading produced by the history command.
+
+    Returns:
+        The subject queried, each ownership generation of an issue, and one
+        record per matching coordination event. A record that carries no claim
+        identifier reports null: the correlation was never recorded, and
+        history does not invent one.
+    """
+    return {
+        "subject": reported["subject"],
+        "value": reported["value"],
+        "holdings": [
+            {
+                **generation,
+                "started_at": timestamp(generation["started"]),
+                "ended_at": timestamp(generation["ended"]),
+            }
+            for generation in reported["holdings"]
+        ],
+        "records": [
+            {**record, "at": timestamp(record["at"])}
+            for record in reported["records"]
+        ],
+    }
+
+
 def ledger(state: dict) -> dict:
     """Reports the whole issue ledger with the revision it was read at."""
     return {"revision": state["revision"], "issues": issues(state)}
