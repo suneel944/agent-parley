@@ -752,9 +752,10 @@ report log, and the pull request that ended the claim.
 
 **It reads, only.** The store is opened read-only, no lock is taken and no
 record is rewritten, so a history query is safe beside running lanes. Retention
-follows each substrate: the issue ledger and the report log keep their records
-until the project is removed, while mail and reservations keep theirs for as
-long as the store does. A record written before this correlation existed carries
+follows each substrate: the issue ledger keeps its records until the project is
+removed, the report log keeps the newest 2000 records and is rewritten in
+place once it passes 256 KB, and mail and reservations keep theirs for as long
+as the store does. A record written before this correlation existed carries
 no claim and is reported as `unknown`; nothing is back-filled, because an
 invented correlation is worse than an honest gap.
 
