@@ -184,6 +184,39 @@ than fourteen days are discarded at the next session start or session end, so a
 long-running lane reports recent enforcement, not project history; served-call
 counts cover the most recent 2000 events per project.
 
+`IDLE` is how long that lane went without coordination activity inside the
+window. An idle interval opens when a turn ends, which the native client
+reports as a `Stop` or `SessionEnd` checkpoint, and closes at the lane's next
+recorded activity; the interval still open when the view is drawn counts only
+while the recorded session process is alive, because a stopped lane is stopped
+rather than idle. The header carries the project total and the lane holding the
+largest share. A `+` after the figure means the window reaches past what
+retention kept, so the number understates the truth rather than pretending to
+be exact.
+
+The figure is derived from coordination state and is honest about it: it says
+how long a lane went without coordination activity, and it does not claim to
+know what the native client was doing inside a turn. A lane can be thinking
+hard and still show idle time here.
+
+`status` prints the same figure per lane and, under it, every pending item with
+the seconds it has already waited, so an offer that has waited eleven minutes
+reads as eleven minutes rather than as a bare offer ID. Four waits are
+measured: a message from delivery to its first read, an `ack_required` message
+to its acknowledgement, a handoff offer to its acceptance or decline, and a
+`ready` report to the merge, pull request or retirement that ended it. Each
+wait reports whether it has ended, so a pending wait is never read as an
+answered one. Report and integration records are kept per lane beside the event
+log, which is what makes the last of those four a subtraction rather than a
+guess; they survive `participant retire`, because history about finished work is
+still history.
+
+`events export` carries all of it. Every line names its kind in `record`:
+`event` for a hook decision, `idle_interval` for a measured stretch of
+inactivity, and `wait` for one of the four waits. The intervals and waits leave
+with the records, so they can be compared across sessions, providers and
+accounts after retention has discarded the events they were derived from.
+
 `TOKENS` is what that lane's own native client recorded for its session, read
 from the session records the client already keeps on disk: no vendor request,
 no API key, no price. Treat it as a relative signal between refreshes of the
@@ -270,11 +303,13 @@ project holding
 participant carries `participant`, `identity`, `provider`, `credential`,
 `session`, `availability`, `branch`, `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
-`report_age_seconds`, `injected_bytes`, `injections`, `idle`, `wake` and
-`mail`, whose `named_resources` array lists the named resources that lane
-holds. `idle` carries `stalled`, the waiting item's `kind`, `message_id`,
-`sender` and `age_seconds`, the `served_age_seconds` since the last served
-call, and the same `marker` the table prints. A
+`report_age_seconds`, `injected_bytes`, `injections`, `idle`, `idle_seconds`,
+`idle_complete`, `waiting`, `wake` and `mail`, whose `named_resources` array
+lists the named resources that lane holds. `idle` carries `stalled`, the
+waiting item's `kind`, `message_id`, `sender` and `age_seconds`, the
+`served_age_seconds` since the last served call, and the same `marker` the
+table prints. `waiting` carries one record per pending wait, longest first,
+each with its `kind`, its item and `seconds`. A
 mailbox that cannot be read reports `{"error": "..."}` in `mail` rather than
 failing the document, exactly as the table reports coordination as unavailable.
 
@@ -284,7 +319,8 @@ carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
 `stalled`, `stall`, `branch`, `drift`, `issues`, `offers`, `unread`,
 `pending_ack`, `leases`,
 `stale_leases`, `lease_age_seconds`, `injected_bytes`, `hook_events`,
-`denials`, `calls`, `errors`, `tokens` and `prompt`. `tokens` is null when that
+`denials`, `calls`, `errors`, `tokens`, `idle_seconds`, `idle_complete` and
+`prompt`. `tokens` is null when that
 lane's own session records could not be read, and `unread` and `pending_ack`
 are null when its mailbox could not be read: null states that nothing was read,
 never that the count is zero.

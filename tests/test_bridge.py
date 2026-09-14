@@ -998,15 +998,15 @@ def test_top_reports_tokens_each_native_client_recorded(
     output = capsys.readouterr().out
     lines = output.splitlines()
     assert any(
-        line.startswith("PARTICIPANT") and line.endswith("TOKENS")
+        line.startswith("PARTICIPANT") and line.endswith("IDLE")
         for line in lines
     )
     assert (
-        next(line for line in lines if line.startswith("claude ")).split()[-1]
+        next(line for line in lines if line.startswith("claude ")).split()[-2]
         == "150"
     )
     assert (
-        next(line for line in lines if line.startswith("codex ")).split()[-1]
+        next(line for line in lines if line.startswith("codex ")).split()[-2]
         == "2.5k"
     )
     assert "not billed spend" in output
@@ -1022,13 +1022,11 @@ def test_top_leaves_tokens_blank_without_readable_session_records(
     dashboard.run(bridge.home, lambda: False, once=True)
     lines = capsys.readouterr().out.splitlines()
     assert any(
-        line.startswith("PARTICIPANT") and line.endswith("TOKENS")
+        line.startswith("PARTICIPANT") and line.endswith("IDLE")
         for line in lines
     )
-    assert (
-        next(line for line in lines if line.startswith("claude ")).split()[-1]
-        == "0"
-    )
+    row = next(line for line in lines if line.startswith("claude "))
+    assert row.split()[-2:] == ["0", "0s+"]
 
 
 def test_token_reading_survives_a_malformed_session_record(
