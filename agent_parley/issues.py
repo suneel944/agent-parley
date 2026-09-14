@@ -1,7 +1,9 @@
 """Local, repository-scoped issue ownership and explicit handoffs."""
 
+import contextlib
 import json
 import re
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -9,6 +11,7 @@ from pathlib import Path
 from agent_parley.state import BridgeError, lock, write_json
 
 MAX_BLOCKERS = 10
+SUPERVISION_ERROR = "supervision-error.json"
 
 
 def parse_issue(value: str, label: str = "Issue") -> str:
@@ -191,12 +194,36 @@ def change(
     if action == "release":
         from agent_parley import roster, supervision
 
-        manifest = roster.read(directory)
-        if supervision.configuration(directory.parent.parent, manifest)[
-            "prompts"
-        ]:
-            supervision.reminders(directory, manifest, set())
+        try:
+            manifest = roster.read(directory)
+            if supervision.configuration(directory.parent.parent, manifest)[
+                "prompts"
+            ]:
+                supervision.reminders(directory, manifest, set())
+        except (BridgeError, OSError, ValueError, sqlite3.Error) as exc:
+            note_supervision_error(directory, f"release #{issue}: {exc}")
     return record
+
+
+def note_supervision_error(directory: Path, detail: str) -> None:
+    """Records an optional supervision failure beside the issue ledger.
+
+    Reminder generation runs after the ownership transaction has committed and
+    released its lock, so its failure cannot undo the transition and must not
+    be reported as one. The diagnostic is written where an operator and the
+    supervisor can both see it, and the supervisor clears it once a later poll
+    regenerates reminders successfully. Writing the diagnostic is itself best
+    effort: failing to record a note must not fail a committed release.
+
+    Args:
+        directory: Private state directory for the common repository.
+        detail: Operation and failure text to retain for an operator.
+    """
+    with contextlib.suppress(OSError):
+        write_json(
+            directory / SUPERVISION_ERROR,
+            {"at": time.time(), "detail": detail},
+        )
 
 
 def describe(state: dict, liveness: dict[str, str] | None = None) -> str:

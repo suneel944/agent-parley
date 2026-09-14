@@ -216,6 +216,8 @@ def poll(home: Path, directory: Path) -> None:
                 if completion[1] >= since
             )
         reminders(directory, manifest, closed)
+        with contextlib.suppress(OSError):
+            (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
         observe_responses(home, directory, manifest)
     if config["wake"]:
         for name, participant in manifest["participants"].items():
