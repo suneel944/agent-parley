@@ -4,7 +4,19 @@ import json
 import multiprocessing
 import time
 
+import pytest
+
 from agent_parley import checkpoints
+from agent_parley.state import BridgeError
+
+
+def rotate_log(directory, ready, go):
+    ready.set()
+    assert go.wait(10)
+    with checkpoints.event_lock(directory, "lane", exclusive=True):
+        (directory / "lane-events.jsonl").replace(
+            directory / "lane-events.1.jsonl"
+        )
 
 
 def append_events(directory, ready, go, count):
@@ -72,6 +84,51 @@ def test_prune_excludes_append_until_atomic_replacement(tmp_path):
         if child.is_alive():
             child.kill()
         child.join(10)
+
+
+def test_a_rotation_cannot_split_an_event_snapshot(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    (tmp_path / "lane-events.1.jsonl").write_text(json.dumps({"ts": 1}) + "\n")
+    (tmp_path / "lane-events.jsonl").write_text(json.dumps({"ts": 2}) + "\n")
+    ready, go = context.Event(), context.Event()
+    child = context.Process(target=rotate_log, args=(tmp_path, ready, go))
+    try:
+        with checkpoints.event_lock(tmp_path, "lane"):
+            child.start()
+            assert ready.wait(10)
+            go.set()
+            child.join(0.2)
+            assert child.is_alive()
+            snapshot = checkpoints.read_events(tmp_path, "lane")
+        child.join(10)
+        assert child.exitcode == 0
+        assert [entry["ts"] for entry in snapshot] == [1, 2]
+    finally:
+        if child.is_alive():
+            child.kill()
+        child.join(10)
+
+
+def test_a_held_maintenance_lock_reports_the_log_unavailable(tmp_path):
+    (tmp_path / "lane-events.jsonl").write_text(json.dumps({"ts": 1}) + "\n")
+    with checkpoints.event_lock(tmp_path, "lane", exclusive=True):
+        with pytest.raises(BridgeError, match="stayed locked"):
+            checkpoints.read_events(tmp_path, "lane", timeout=0.05)
+        summary = checkpoints.event_summary(tmp_path, "lane")
+    assert summary == {
+        "events": 0,
+        "denials": 0,
+        "injected_bytes": 0,
+        "last_ts": 0.0,
+        "last_reason": "unavailable",
+    }
+    assert checkpoints.read_events(tmp_path, "lane") == [{"ts": 1}]
+
+
+def test_a_lane_without_a_log_reports_no_events_and_writes_nothing(tmp_path):
+    assert checkpoints.read_events(tmp_path / "absent", "lane") == []
+    assert checkpoints.read_events(tmp_path, "lane") == []
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_prune_removes_orphans_and_malformed_events(tmp_path):
