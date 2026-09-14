@@ -23,7 +23,15 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agent_parley import checkpoints, dashboard, forge, process, roster, store
+from agent_parley import (
+    checkpoints,
+    dashboard,
+    evidence,
+    forge,
+    process,
+    roster,
+    store,
+)
 from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
@@ -2583,6 +2591,17 @@ if [ "$2" = "list" ]; then
   cat "$GH_OPEN"
   exit 0
 fi
+if [ "$2" = "edit" ]; then
+  : > "$GH_EDIT"
+  for argument in "$@"; do
+    printf '%s\\0' "$argument" >> "$GH_EDIT"
+  done
+  if [ -n "$GH_EDIT_FAILS" ]; then
+    echo "the forge refused the edit" >&2
+    exit 1
+  fi
+  exit 0
+fi
 : > "$GH_CREATE"
 for argument in "$@"; do
   printf '%s\\0' "$argument" >> "$GH_CREATE"
@@ -2601,6 +2620,7 @@ def stub_github_cli(tmp_path, monkeypatch):
     listed = tmp_path / "open-pull-requests.json"
     listed.write_text("[]")
     created = tmp_path / "created-arguments"
+    edited = tmp_path / "edited-arguments"
     issue = tmp_path / "issue-metadata.json"
     issue.write_text(
         json.dumps(
@@ -2613,9 +2633,16 @@ def stub_github_cli(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("GH_OPEN", str(listed))
     monkeypatch.setenv("GH_CREATE", str(created))
+    monkeypatch.setenv("GH_EDIT", str(edited))
     monkeypatch.setenv("GH_ISSUE", str(issue))
     monkeypatch.setattr(forge, "slug", lambda repo: "example/agent-parley")
-    return listed, created, issue
+    return listed, created, issue, edited
+
+
+def edited_body(edited):
+    """Reads the body the stubbed GitHub CLI was asked to edit a PR with."""
+    arguments = edited.read_text().split("\0")[:-1]
+    return arguments[arguments.index("--body") + 1]
 
 
 def created_options(created):
@@ -2639,7 +2666,7 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
     remote = tmp_path / "origin.git"
     git(repo, "init", "--bare", str(remote))
     git(repo, "remote", "add", "origin", str(remote))
-    listed, created, issue = stub_github_cli(tmp_path, monkeypatch)
+    listed, created, issue, edited = stub_github_cli(tmp_path, monkeypatch)
 
     with pytest.raises(BridgeError, match="not a participant"):
         bridge.pull_request(repo, "absent")
@@ -2657,6 +2684,7 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
         bridge.pull_request(repo, "codex")
     bridge.issue(lane, "claim", "42")
 
+    head = git(repo, "rev-parse", branch)
     message = bridge.pull_request(repo, "codex")
     assert "https://github.com/example/agent-parley/pull/7" in message
     assert git(remote, "log", "-1", "--pretty=%s", branch) == (
@@ -2688,12 +2716,45 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
         == []
     )
 
+    first_body = options["--body"]
+    assert evidence.SECTION_START in first_body
+    assert evidence.SECTION_END in first_body
     created.unlink()
+
+    reviewed = first_body + "\n\n## Reviewer notes\n\nCheck the parser.\n"
     listed.write_text(
-        json.dumps([{"url": "https://github.com/example/agent-parley/pull/7"}])
+        json.dumps(
+            [
+                {
+                    "url": "https://github.com/example/agent-parley/pull/7",
+                    "number": 7,
+                    "body": reviewed,
+                }
+            ]
+        )
     )
-    repeated = bridge.pull_request(repo, "codex")
-    assert "already open" in repeated
+    (lane / "feature.txt").write_text("more lane work\n")
+    commit(lane, "feat: extend the lane feature")
+    advanced = git(repo, "rev-parse", branch)
+    refreshed = bridge.pull_request(repo, "codex")
+    assert "refreshed the recorded evidence" in refreshed
+    assert advanced in refreshed
+    assert not created.exists()
+
+    updated = edited_body(edited)
+    assert advanced in updated
+    assert head not in updated
+    assert "## Reviewer notes" in updated
+    assert "Check the parser." in updated
+    assert updated.count(evidence.SECTION_START) == 1
+    assert updated.count(evidence.SECTION_HEADING) == 1
+
+    monkeypatch.setenv("GH_EDIT_FAILS", "1")
+    (lane / "feature.txt").write_text("third lane change\n")
+    commit(lane, "feat: revise the lane feature")
+    reported = bridge.pull_request(repo, "codex")
+    assert "still describes an earlier commit" in reported
+    assert "no second pull request is opened" in reported.lower()
     assert not created.exists()
 
 
@@ -2705,7 +2766,7 @@ def test_pull_request_takes_its_classification_from_the_claimed_issue(
     remote = tmp_path / "origin.git"
     git(repo, "init", "--bare", str(remote))
     git(repo, "remote", "add", "origin", str(remote))
-    _, created, issue = stub_github_cli(tmp_path, monkeypatch)
+    _, created, issue, _ = stub_github_cli(tmp_path, monkeypatch)
     bridge.report(lane, "ready", "Lane result", "", "make check: 181 passed")
     (lane / "feature.txt").write_text("lane work\n")
     commit(lane, "feat: add the lane feature")

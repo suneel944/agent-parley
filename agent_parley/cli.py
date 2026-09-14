@@ -1418,7 +1418,13 @@ class Bridge:
         recording a report or reading status never reaches a remote. The
         title is the first commit the lane added, which already follows the
         target repository's own commit rules. An open pull request for the
-        branch is reported rather than replaced by a second one.
+        branch is refreshed rather than replaced by a second one: the branch
+        advances, so its delimited evidence section is rewritten for the exact
+        commit that was just pushed while every human edit around it survives.
+        Old verification is never left presented as verification of a new
+        head. A refresh that the forge refuses is reported as such after the
+        successful push, and rerunning the command retries it without opening
+        a second pull request.
 
         The pull request also opens owned and classified. The operator's own
         GitHub account becomes its assignee, and its change-type labels and
@@ -1530,14 +1536,32 @@ class Bridge:
                 "--state",
                 "open",
                 "--json",
-                "url",
+                "url,number,body",
             )
             or "[]"
         )
         if listed:
+            existing = listed[0]
+            try:
+                gh(
+                    root,
+                    "pr",
+                    "edit",
+                    str(existing["number"]),
+                    "--body",
+                    evidence.refresh(existing.get("body") or "", recorded),
+                )
+            except (BridgeError, subprocess.TimeoutExpired) as exc:
+                return (
+                    f"Pushed {branch} at {head}. A pull request is already "
+                    f"open for it: {existing['url']}. Its recorded evidence "
+                    f"still describes an earlier commit, because updating it "
+                    f"failed: {exc}. Rerun this command to retry; no second "
+                    "pull request is opened."
+                )
             return (
-                f"Pushed {branch}. A pull request is already open for it: "
-                f"{listed[0]['url']}"
+                f"Pushed {branch} and refreshed the recorded evidence of "
+                f"{existing['url']} for {head}."
             )
         title = git(
             root,
@@ -1556,7 +1580,9 @@ class Bridge:
             "--title",
             title,
             "--body",
-            pull_request_body(state, claimed, template) + "\n" + recorded,
+            pull_request_body(state, claimed, template)
+            + "\n"
+            + evidence.section(recorded),
             "--assignee",
             "@me",
         ]
