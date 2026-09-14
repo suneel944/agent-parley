@@ -410,6 +410,19 @@ attempt of the recorded budget. Ownership never moves on a timer: an overdue
 claim is still owned, and only an explicit release or an accepted handoff
 transfers it.
 
+**A budget informs; it does not gate.** `participant budget NAME --tokens
+2000000 --calls 5000 --hours 8` records advisory limits on a lane; the same
+flags on `provider budget NAME` and `budget set` give every lane of a provider
+or a project defaults to inherit, participant over provider over project, field
+by field, and any limit may stay unset. Consumption comes from what is already
+read: tokens as the `TOKENS` column counts them, calls from the served-call
+records, hours from the recorded session. No vendor is asked and no price is
+applied, so a token budget is a count and not spend. Past a limit `top` and
+`status` mark the lane `over budget` with the share consumed, the lane receives
+one bounded notice naming the crossed limit, and `--over-budget` selects such
+lanes, so `participant pause --over-budget` is one command. Nothing is stopped,
+revoked or refused: the operator decides.
+
 **An out-of-date install says so before it costs a turn.** The launcher, the
 plugin and the store each state a protocol number, and a mismatch is refused at
 the boundary with both numbers and the one command that fixes it — when a lane
@@ -639,7 +652,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `up` | Start the local coordination server. |
 | `down` | Stop the server while retaining state and worktrees. |
 | `completion SHELL` | Print a `bash`, `zsh` or `fish` completion script generated from the installed command tree. |
-| `status` | Show server health and one table per project; `NAME` reports one lane in full, and `--project`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since` and `--issue` narrow the rows. |
+| `status` | Show server health and one table per project; `NAME` reports one lane in full, and `--project`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since`, `--over-budget` and `--issue` narrow the rows. |
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | Watch lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--project`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
@@ -671,7 +684,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `participant restart NAME` | Start a stopped lane again from a clean worktree. |
 | `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
-| `... --all --provider N --outcome S --drifted --idle` | Select several lanes for one `say`, `issue assign`, `participant stop/pause/resume/pr/merge`; one plan and one confirmation, `--yes` to skip it. |
+| `participant budget NAME` | Show or set the lane's advisory `--tokens`, `--calls` and `--hours` limits; `0` removes one. Crossing a limit marks the lane and stops nothing. |
+| `... --all --provider N --outcome S --drifted --idle --over-budget` | Select several lanes for one `say`, `issue assign`, `participant stop/pause/resume/pr/merge`; one plan and one confirmation, `--yes` to skip it. |
 | `approve NAME` | Record your approval of a lane's current ready report. |
 | `reject NAME REASON` | Record a rejection and deliver the reason to the lane. |
 | `approval show` | Show which steps require a recorded approval first. |
@@ -679,6 +693,7 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `provider list` | List built-in presets and local overrides. |
 | `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
 | `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |
+| `provider budget NAME` | Show or set the advisory limits every lane on that provider inherits. |
 | `credentials list` | List native account profiles. |
 | `credentials add NAME` | Define a config home and environment requirements. |
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
@@ -688,6 +703,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `resources set NAMES` | Declare them; an empty string accepts any well-formed name. |
 | `deadlines show` | Show this project's deadline and attempt defaults. |
 | `deadlines set` | Set `--claim`, `--offer`, `--ack` windows and `--attempts`. |
+| `budget show` | Show the advisory token, call and hour limits every lane of this project inherits. |
+| `budget set` | Set `--tokens`, `--calls` and `--hours` project defaults; a budget informs and does not gate. |
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `init show` | Show the command every new lane runs before it starts. |
