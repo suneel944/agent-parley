@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import socket
@@ -13,7 +14,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, hook, protocol, server, store
+from agent_parley import (
+    checkpoints,
+    cli,
+    hook,
+    process,
+    protocol,
+    server,
+    store,
+)
 from agent_parley.state import write_json
 
 ALLOW = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {}}
@@ -272,11 +281,36 @@ def test_doctor_reports_a_current_service_as_consistent(
     assert reported["consistent"] is True
 
 
-def test_doctor_reports_a_stopped_service_as_no_drift(bridge, repo, paired):
+def test_doctor_reports_a_stopped_service_with_lanes_as_an_outage(
+    bridge, repo, paired
+):
     store.initialize(bridge.home)
     reported = bridge.doctor()
     named = {entry["component"]: entry for entry in reported["components"]}
     assert named["service"]["state"] == protocol.STOPPED
+    assert named["service"]["remedy"] == protocol.START
+    assert named["service"]["compatible"] is False
+    assert reported["consistent"] is False
+    assert protocol.START in protocol.render(reported)
+
+
+def test_doctor_exits_non_zero_when_lanes_have_no_service(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    monkeypatch.setattr(
+        sys, "argv", ["agent-parley", "--home", str(bridge.home), "doctor"]
+    )
+    assert cli.main() == 1
+    assert protocol.START in capsys.readouterr().out
+
+
+def test_doctor_stays_consistent_with_no_lane_registered(bridge):
+    store.initialize(bridge.home)
+    reported = bridge.doctor()
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["service"]["state"] == protocol.STOPPED
+    assert named["service"]["remedy"] == ""
     assert named["service"]["compatible"] is True
     assert reported["consistent"] is True
 
@@ -655,3 +689,65 @@ def test_main_still_answers_a_direct_call(bridge, repo, paired, monkeypatch):
     assert "Participants" in json.dumps(json.loads(local.stdout))
     assert events(lane.parent)[-1]["reason_class"] == "coordination_pending"
     assert checkpoints.Reason.SERVICE_FALLBACK.value == "service_fallback"
+
+
+def gone(bridge):
+    """Publishes the record a reboot or a drift exit leaves behind."""
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    write_json(
+        bridge.home / "server.json", {"pid": child.pid, "start_ticks": "1"}
+    )
+
+
+def requests(monkeypatch):
+    """Collects the relaunch requests instead of starting a service."""
+    asked = []
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *args, **named: asked.append(args)
+    )
+    return asked
+
+
+def test_an_outage_brings_the_service_back_on_the_next_hook(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    gone(bridge)
+    decided = run_hook(
+        bridge, lane.parent, {**ALLOW, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert decided.returncode == 0, decided.stderr
+    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and bridge.server_process() is None:
+        time.sleep(0.2)
+    assert bridge.server_process() is not None
+    assert bridge.ready()
+
+
+def test_one_relaunch_is_asked_for_within_the_interval(bridge, monkeypatch):
+    gone(bridge)
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    past = time.time() - hook.RELAUNCH_INTERVAL - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 2
+
+
+def test_no_relaunch_is_asked_for_without_a_recorded_service(
+    bridge, monkeypatch
+):
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    write_json(
+        bridge.home / "server.json",
+        {"pid": os.getpid(), "start_ticks": process.start_ticks(os.getpid())},
+    )
+    hook.relaunch(str(bridge.home))
+    assert asked == []
+    assert not (bridge.home / hook.RELAUNCH_STAMP).exists()

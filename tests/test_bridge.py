@@ -200,6 +200,26 @@ def test_occupied_port_fails_without_killing_owner(bridge):
         assert sock.getsockname()[1] == bridge.config["port"]
 
 
+def test_a_failed_start_publishes_no_server_record(bridge, monkeypatch):
+    write_json(
+        bridge.home / "server.json", {"pid": os.getpid(), "start_ticks": "1"}
+    )
+
+    class Exited:
+        """Stands in for a child that dies before it answers."""
+
+        pid = os.getpid()
+
+        def poll(self):
+            """Reports the status such a child already left behind."""
+            return 1
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **named: Exited())
+    with pytest.raises(BridgeError, match="failed to start"):
+        bridge.up()
+    assert not (bridge.home / "server.json").exists()
+
+
 def test_stale_pid_record_cannot_stop_an_unrelated_process(bridge):
     pid = os.getpid()
     write_json(
