@@ -1896,9 +1896,7 @@ def test_every_shipped_preset_rides_one_of_the_native_contracts():
     """Keeps presets on a CLI that accepts the configuration we emit."""
     for name, entry in roster.PRESETS.items():
         assert entry["adapter"] in roster.ADAPTERS, name
-        assert entry["command"] in ("claude", "codex", "copilot", "gemini"), (
-            name
-        )
+        assert entry["command"] in roster.ADAPTERS, name
 
 
 def test_gemini_preset_runs_native_cli_with_private_settings(

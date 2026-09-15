@@ -660,9 +660,9 @@ exactly the same.
 ## Providers and accounts
 
 A provider states which native CLI drives a participant and how that CLI reaches
-a model. Every provider names one of four adapters, and the adapter decides how
+a model. Every provider names one of five adapters, and the adapter decides how
 that CLI is handed its MCP server, its coordination prompt and its hooks. Two of
-the four take a published plugin, which is why two plugin installations cover
+the five take a published plugin, which is why two plugin installations cover
 every model-endpoint preset:
 
 | Provider | Native CLI it drives | Plugin that carries `coordinate` |
@@ -671,10 +671,17 @@ every model-endpoint preset:
 | `codex` | `codex` | Codex |
 | `copilot` | `copilot` | none; the launcher writes that lane's files |
 | `gemini` | `gemini` | none; the launcher writes a private settings overlay |
+| `opencode` | `opencode` | none; the launcher writes a private config directory and plugin |
 | `deepseek`, `kimi`, `grok` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
-`claude`, `codex` and `gemini` use their native accounts. The `deepseek`, `kimi`
+`agent-parley provider list` prints each definition with `unavailable_hooks`,
+the lifecycle events that CLI cannot deliver: `PermissionRequest` for
+`gemini`, `SessionEnd` for `opencode`, none for the others. A launch refuses an
+adapter that cannot deliver `SessionStart`, `PreToolUse` or `Stop` instead of
+running without those guards.
+
+`claude`, `codex`, `gemini` and `opencode` use their native accounts. The `deepseek`, `kimi`
 and `grok` presets carry no endpoint, so their base URL and key must be exported in
 the launching shell; the launcher refuses to start when a required variable is
 unset rather than falling back to another account. Coordination state records
@@ -682,7 +689,18 @@ variable names and config directories, never credential values.
 
 `agent-parley run gemini` starts Gemini CLI with a lane-private MCP and hook
 overlay while preserving native system settings and authentication. Existing
-explicit provider definitions keep their adapter until you update them.
+explicit provider definitions keep their adapter until you update them: a
+local `gemini` definition that rides `claude` or `codex` through a vendor
+endpoint shadows the preset and keeps working unchanged, and `provider remove
+gemini` reveals the native preset again.
+
+`agent-parley run opencode` starts OpenCode with a lane-private copy of its
+configuration directory, selected with `OPENCODE_CONFIG_DIR`, that adds the
+MCP server under `mcp` and one plugin under `plugin/` that runs the checkpoint
+hook command for each supported plugin event. The launch path is verified
+against a stub executable and the exact hook command; a live OpenCode session
+has not been exercised, see
+[Operations](docs/operations.md#other-agent-clis).
 
 Credential profiles point a provider's config-home variable at a separate
 directory, so one provider can run under several logins. Up to 32 participants
@@ -690,18 +708,21 @@ per project.
 
 ### Other agent CLIs
 
-Four adapters cover the native configuration contracts. `claude` and
+Five adapters cover the native configuration contracts. `claude` and
 `codex` take MCP servers, the coordination prompt and lifecycle hooks as
 command-line arguments. `copilot` reads them from files instead, so Agent
 Parley writes `mcp-config.json` and `settings.json` into that lane's own
 Copilot configuration directory; a `copilot` lane therefore requires a
 credential profile, and the launcher refuses without one rather than writing
-hooks into the configuration directory your own sessions use.
+hooks into the configuration directory your own sessions use. `gemini` and
+`opencode` each receive a lane-private copy of their native configuration
+that lives in Agent Parley's state directory, never in the repository, and is
+rebuilt on every launch and removed by `participant retire`.
 
-OpenCode and Amp remain recipes. OpenCode runs plugins rather than hook
-commands; Amp accepts no system-prompt argument.
-[Operations](docs/operations.md#other-agent-clis) records what each one
-supports and where its MCP and hook configuration lives.
+Amp remains a recipe: it accepts no system-prompt argument.
+[Operations](docs/operations.md#other-agent-clis) records what each CLI
+supports, where its MCP and hook configuration lives, and which behaviour is
+verified against a stub rather than a live session.
 
 ## Command reference
 

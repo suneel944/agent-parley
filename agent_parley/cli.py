@@ -38,6 +38,7 @@ from agent_parley import (
     gemini,
     history,
     metrics,
+    opencode,
     plan,
     policy,
     problems,
@@ -2085,6 +2086,81 @@ def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
             write_json(path, data)
 
 
+def release_copilot(home: Path, participant: dict, name: str) -> None:
+    """Removes one retired lane's hooks from its Copilot profile directory.
+
+    Only entries whose command names this participant are removed, so other
+    lanes sharing the profile and the operator's own hooks are untouched. The
+    ``agent_parley`` MCP server entry is removed once no lane hook remains.
+    A profile that no longer resolves, or files that were never written,
+    leave nothing to do.
+
+    Args:
+        home: Private bridge state root.
+        participant: Recorded participant entry naming provider and profile.
+        name: Participant name the hook command carries.
+    """
+    try:
+        entry = roster.provider(home, participant["provider"])
+        account = roster.launch_environment(
+            home, entry, participant.get("credential")
+        )
+    except BridgeError:
+        return
+    config_home = account.get(entry.get("home_env", ""))
+    if entry["adapter"] != "copilot" or not config_home:
+        return
+    settings_path = Path(config_home) / "settings.json"
+    servers_path = Path(config_home) / "mcp-config.json"
+    with lock(Path(config_home) / "agent-parley-config.lock"):
+        try:
+            settings = json.loads(settings_path.read_text())
+        except (OSError, ValueError):
+            return
+        hooks = settings.get("hooks")
+        if not isinstance(hooks, dict):
+            return
+        remaining = 0
+        for event, commands in hooks.items():
+            if isinstance(commands, list):
+                hooks[event] = [
+                    command
+                    for command in commands
+                    if not owned_hook(command, name)
+                ]
+                remaining += sum(
+                    "agent_parley.hook" in str(command.get("bash", ""))
+                    for command in hooks[event]
+                    if isinstance(command, dict)
+                )
+        write_json(settings_path, settings)
+        if remaining or not servers_path.exists():
+            return
+        try:
+            servers = json.loads(servers_path.read_text())
+        except ValueError:
+            return
+        if isinstance(servers, dict) and isinstance(
+            servers.get("mcpServers"), dict
+        ):
+            servers["mcpServers"].pop("agent_parley", None)
+            write_json(servers_path, servers)
+
+
+def owned_hook(command: object, name: str) -> bool:
+    """Reports whether a Copilot hook entry runs this participant's hook."""
+    if not isinstance(command, dict):
+        return False
+    try:
+        words = shlex.split(str(command.get("bash", "")))
+    except ValueError:
+        return False
+    return "agent_parley.hook" in words and any(
+        words[index : index + 2] == ["--participant", name]
+        for index in range(len(words) - 1)
+    )
+
+
 class Bridge:
     """Coordinates native agent worktrees using one private local state root.
 
@@ -2586,8 +2662,13 @@ class Bridge:
                         "events.1.jsonl",
                         "events.jsonl.tmp",
                         "events.1.jsonl.tmp",
+                        "gemini-settings.json",
                     ):
                         (directory / f"{name}-{suffix}").unlink(missing_ok=True)
+                    shutil.rmtree(
+                        directory / f"{name}-opencode", ignore_errors=True
+                    )
+                    release_copilot(self.home, participant, name)
                 del data["participants"][name]
                 write_json(directory / "project.json", data)
             (directory / f"{name}-checkpoint.lock").unlink(missing_ok=True)
@@ -5332,6 +5413,18 @@ attempt of the recorded budget, which is also only reported.
                 raise BridgeError(
                     protocol.mismatch("installed plugin", declared)
                 )
+        missing = [
+            event
+            for event in roster.REQUIRED_HOOKS
+            if event in roster.unavailable_hooks(entry["adapter"])
+        ]
+        if missing:
+            raise BridgeError(
+                f"The {entry['adapter']!r} adapter cannot deliver "
+                f"{', '.join(missing)}, so its lanes would run without the "
+                "coordination guards those events carry; launch refused "
+                "rather than claiming enforcement it cannot provide."
+            )
         lane = Path(participant["lane"])
         with lock(lane.parent / f"{agent}.session.lock"):
             self.up()
@@ -5387,6 +5480,21 @@ attempt of the recorded budget, which is also only reported.
                 command = [
                     executable,
                     "--prompt-interactive",
+                    prompt + "\nUser task:\n" + task,
+                ]
+            elif entry["adapter"] == "opencode":
+                env["OPENCODE_CONFIG_DIR"] = str(
+                    opencode.configure(
+                        lane.parent,
+                        agent,
+                        self.url + "/mcp/",
+                        hooks,
+                        env.get("OPENCODE_CONFIG_DIR"),
+                    )
+                )
+                command = [
+                    executable,
+                    "--prompt",
                     prompt + "\nUser task:\n" + task,
                 ]
             elif entry["adapter"] == "copilot":
@@ -5473,6 +5581,8 @@ attempt of the recorded budget, which is also only reported.
                     )
                 if entry["adapter"] == "codex":
                     command[1:1] = ["resume", session]
+                elif entry["adapter"] == "opencode":
+                    command[1:1] = ["--session", session]
                 else:
                     command[1:1] = ["--resume", session]
             previous.update(
@@ -6973,7 +7083,7 @@ def main() -> int:
                     )
                 )
                 return 0
-            defined = roster.providers(bridge.home)
+            defined = roster.inspect(bridge.home)
             print(
                 views.render(
                     "providers",
