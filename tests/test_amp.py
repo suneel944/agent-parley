@@ -144,7 +144,7 @@ def test_user_settings_are_carried_into_a_private_overlay(
 
 def test_every_supported_event_runs_the_configured_hook_command(lane):
     assert lane["command"][-2:] == ["--adapter", "amp"]
-    assert lane["command"][1:3] == ["-m", "agent_parley.hook"]
+    assert cli.bridge_hook(" ".join(lane["command"]))
     events = [entry["event"] for entry in lane["settings"]["amp.hooks"][1:]]
     assert events == list(amp.EVENTS)
     assert roster.unavailable_hooks("amp") == list(AVAILABLE)

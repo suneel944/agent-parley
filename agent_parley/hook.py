@@ -13,8 +13,144 @@ import sys
 
 CONNECT_TIMEOUT = 0.25
 REPLY_TIMEOUT = 2.0
+SHELL_TIMEOUT = int(REPLY_TIMEOUT) + (REPLY_TIMEOUT % 1 > 0)
 MAX_INPUT_BYTES = 1_000_001
 PATH = "/hook/"
+RAW_REPLY = "application/vnd.agent-parley.hook+raw"
+STATUS_HEADER = "X-Parley-Status"
+STDOUT_HEADER = "X-Parley-Stdout-Bytes"
+CLIENT_NAME = "hook-client.sh"
+
+CLIENT_SCRIPT = r"""#!/usr/bin/env bash
+export LC_ALL=C
+set -u
+
+arguments=("$@")
+home=""
+directory=""
+participant=""
+protocol=""
+adapter=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --home) home="${2-}"; shift 2 || exit 1 ;;
+    --directory) directory="${2-}"; shift 2 || exit 1 ;;
+    --participant) participant="${2-}"; shift 2 || exit 1 ;;
+    --protocol) protocol="${2-}"; shift 2 || exit 1 ;;
+    --adapter) adapter="${2-}"; shift 2 || exit 1 ;;
+    *) shift ;;
+  esac
+done
+
+payload=""
+IFS= read -r -d '' payload || true
+
+decide_in_process() {
+  printf '%s' "$payload" | "@PYTHON@" -m agent_parley.hook "${arguments[@]}"
+  exit "$?"
+}
+
+quote() {
+  local text="$1"
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
+  printf '"%s"' "$text"
+}
+
+read_file() {
+  local content=""
+  IFS= read -r -d '' content < "$1" || true
+  printf '%s' "$content"
+}
+
+identity="$(read_file "$directory/$participant-identity.json" 2>/dev/null)"
+[[ $identity =~ \"registration_token\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] \
+  || decide_in_process
+token="${BASH_REMATCH[1]}"
+
+configuration="$(read_file "$home/config.json" 2>/dev/null)"
+[[ $configuration =~ \"port\"[[:space:]]*:[[:space:]]*([0-9]+) ]] \
+  || decide_in_process
+port="${BASH_REMATCH[1]}"
+
+body="{\"directory\":$(quote "$directory")"
+body="$body,\"participant\":$(quote "$participant")"
+[ -n "$adapter" ] && body="$body,\"adapter\":$(quote "$adapter")"
+[ -n "$protocol" ] && body="$body,\"protocol\":$(quote "$protocol")"
+body="$body,\"payload\":$payload}"
+
+{ exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || decide_in_process
+printf 'POST @PATH@ HTTP/1.1\r\nHost: 127.0.0.1:%s\r\n'\
+'Authorization: Bearer %s\r\nContent-Type: application/json\r\n'\
+'Accept: @ACCEPT@\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+  "$port" "$token" "${#body}" "$body" >&3 2>/dev/null || decide_in_process
+
+line=""
+IFS= read -r -t @TIMEOUT@ line <&3 || decide_in_process
+[[ $line =~ ^HTTP/1\.[01][[:space:]]+200 ]] || decide_in_process
+
+status=""
+stdout_bytes=""
+while IFS= read -r -t @TIMEOUT@ line <&3; do
+  line="${line%$'\r'}"
+  [ -z "$line" ] && break
+  case $line in
+    "@status_header@: "*) status="${line#*: }" ;;
+    "@stdout_header@: "*) stdout_bytes="${line#*: }" ;;
+  esac
+done
+[[ $status =~ ^[0-9]+$ ]] || decide_in_process
+[[ $stdout_bytes =~ ^[0-9]+$ ]] || decide_in_process
+
+reply=""
+IFS= read -r -t @TIMEOUT@ -d '' reply <&3
+result=$?
+[ "$result" -gt 128 ] && decide_in_process
+exec 3<&- 3>&-
+printf '%s' "${reply:0:stdout_bytes}"
+printf '%s' "${reply:stdout_bytes}" >&2
+exit "$status"
+"""
+
+
+def write_client(home: str, python: str) -> str:
+    """Writes the shell hook client this installation runs, and names it.
+
+    Every native tool call spawns one hook process, and the interpreter is
+    the whole bill: an empty Python process costs some sixty milliseconds
+    against a shell process under one. The client therefore asks the running
+    service over a loopback connection the shell opens itself, and starts
+    Python only when that does not produce an answer, which is the outage
+    path this module already treats as the slower case.
+
+    The client is written for the oldest Bash it can be asked to run on.
+    macOS ships 3.2 as ``/bin/bash``, which rejects a fractional ``read``
+    timeout, so the reply timeout is expressed in whole seconds. A rejected
+    timeout is not a slow service: the read fails at once, after the request
+    was already sent and served, and the fallback then asks a second time for
+    a decision the service has already recorded as delivered.
+
+    Args:
+        home: Private bridge state root the client is written into.
+        python: Interpreter the client runs on its fallback path.
+
+    Returns:
+        The path of the written client, which the launcher configures as the
+        native hook command.
+    """
+    path = os.path.join(home, CLIENT_NAME)
+    script = (
+        CLIENT_SCRIPT.replace("@PYTHON@", python)
+        .replace("@PATH@", PATH)
+        .replace("@ACCEPT@", RAW_REPLY)
+        .replace("@TIMEOUT@", str(SHELL_TIMEOUT))
+        .replace("@status_header@", STATUS_HEADER)
+        .replace("@stdout_header@", STDOUT_HEADER)
+    )
+    with open(path, "w") as stream:
+        stream.write(script)
+    os.chmod(path, 0o755)
+    return path
 
 
 def options(argv: list[str]) -> dict:

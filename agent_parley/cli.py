@@ -2130,7 +2130,7 @@ def release_copilot(home: Path, participant: dict, name: str) -> None:
                     if not owned_hook(command, name)
                 ]
                 remaining += sum(
-                    "agent_parley.hook" in str(command.get("bash", ""))
+                    bridge_hook(str(command.get("bash", "")))
                     for command in hooks[event]
                     if isinstance(command, dict)
                 )
@@ -2148,6 +2148,24 @@ def release_copilot(home: Path, participant: dict, name: str) -> None:
             write_json(servers_path, servers)
 
 
+def bridge_hook(text: str) -> bool:
+    """Reports whether a recorded command runs this project's hook.
+
+    The launcher configures the shell client when a Bash interpreter is
+    available and the Python module when it is not, so ownership is decided
+    by either name rather than by the one that happens to be current.
+
+    Args:
+        text: Command line recorded in a native settings file.
+
+    Returns:
+        Whether the command runs the served client or the in-process hook.
+    """
+    from agent_parley import hook as hook_client
+
+    return "agent_parley.hook" in text or hook_client.CLIENT_NAME in text
+
+
 def owned_hook(command: object, name: str) -> bool:
     """Reports whether a Copilot hook entry runs this participant's hook."""
     if not isinstance(command, dict):
@@ -2156,7 +2174,7 @@ def owned_hook(command: object, name: str) -> bool:
         words = shlex.split(str(command.get("bash", "")))
     except ValueError:
         return False
-    return "agent_parley.hook" in words and any(
+    return any(bridge_hook(word) for word in words) and any(
         words[index : index + 2] == ["--participant", name]
         for index in range(len(words) - 1)
     )
@@ -4089,22 +4107,35 @@ attempt of the recorded budget, which is also only reported.
 """
 
     def hooks(self, agent: str, directory: Path) -> dict:
-        """Builds native lifecycle hook definitions for a lane."""
-        command = shlex.join(
-            [
-                sys.executable,
-                "-m",
-                "agent_parley.hook",
-                "--home",
-                str(self.home),
-                "--directory",
-                str(directory),
-                "--participant",
-                agent,
-                "--protocol",
-                str(protocol.PROTOCOL),
-            ]
-        )
+        """Builds native lifecycle hook definitions for a lane.
+
+        The shell client answers a served call without starting Python and
+        falls back to this module's command when the service does not answer.
+        It needs a Bash interpreter for the loopback connection it opens
+        itself; without one the Python command is configured directly, because
+        a hook command that cannot run is a lane running with no coordination
+        guards at all.
+        """
+        from agent_parley import hook as hook_client
+
+        arguments = [
+            "--home",
+            str(self.home),
+            "--directory",
+            str(directory),
+            "--participant",
+            agent,
+            "--protocol",
+            str(protocol.PROTOCOL),
+        ]
+        interpreter = shutil.which("bash")
+        if interpreter:
+            client = hook_client.write_client(str(self.home), sys.executable)
+            command = shlex.join([interpreter, client, *arguments])
+        else:
+            command = shlex.join(
+                [sys.executable, "-m", "agent_parley.hook", *arguments]
+            )
         return {
             event: [
                 {

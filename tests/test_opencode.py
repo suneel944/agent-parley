@@ -128,7 +128,7 @@ def test_user_configuration_is_carried_into_a_private_overlay(
 
 def test_every_supported_event_runs_the_configured_hook_command(lane):
     assert lane["command"][-2:] == ["--adapter", "opencode"]
-    assert lane["command"][1:3] == ["-m", "agent_parley.hook"]
+    assert cli.bridge_hook(" ".join(lane["command"]))
     for event in opencode.EVENTS:
         assert f'"{event}"' in lane["plugin"]
     assert roster.unavailable_hooks("opencode") == ["SessionEnd"]
