@@ -440,7 +440,8 @@ by name and counted where every other denial is counted; a call that declares
 nothing is served, because the header was added after the first protocol.
 `store.initialize` still refuses a newer schema and `roster.normalize` still
 refuses a newer manifest; neither is replaced by a weaker check and neither
-migrates downwards. `agent-parley doctor` reports all three and exits non-zero
+migrates downwards. `agent-parley doctor` reports all three, and the build the
+running service is serving as its `service` component, and exits non-zero
 on a mismatch without opening a lane, writing configuration, or printing a
 credential.
 
@@ -484,15 +485,20 @@ issue this lane owns, stay correct without a key.
 Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer
 ID. Cancellation invalidates that ID. No timeout or process exit transfers
-ownership. The operator directs work through the same table rather than beside
+ownership. An offer records the offering lane's head commit, the reservations it
+holds for that issue and its remaining work, and acceptance reassigns those
+reservations to the acceptor in the same locked write that moves the issue, so
+the two never disagree. Mail is not part of that move: an acknowledgement stays
+owed by the lane that received the message. The operator directs work through the same table rather than beside
 it: `issue assign` records an offer carrying `operator` as its source on an
 unheld issue, and on a held one records a request its owner answers, whose
 acceptance is what creates the offer to the named lane. Neither path writes an
 owner, so the command line cannot take work from a lane that has not agreed to
 give it up. Reported `ready` outcomes do not establish verified completion.
 Ownership listings report each owner's session state and the age of its last
-observed checkpoint. That report is for an operator; silence, an idle session
-and a stopped session all leave ownership where it is. `agent-parley top`
+observed checkpoint, as `active`, `idle` or `unreachable`. That report is for an
+operator; silence, an idle session and an unreachable one all leave ownership
+where it is. `agent-parley top`
 renders the same state continuously, adding branch drift, denial counts and
 served calls; it reads state and never writes it.
 
