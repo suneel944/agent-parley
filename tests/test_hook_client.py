@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, hook, server, store
+from agent_parley import checkpoints, cli, hook, protocol, server, store
 from agent_parley.state import write_json
 
 ALLOW = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {}}
@@ -195,6 +195,93 @@ def test_a_failure_inside_the_served_decision_answers_500(
     assert recorded[0]["reason_class"] == "service_fallback"
     assert "service answered 500" in recorded[0]["cause"]
     assert "cannot import name 'budgets'" in capsys.readouterr().err
+
+
+def moved_sources(monkeypatch):
+    """Makes the running service read a source tree that has moved on."""
+    monkeypatch.setattr(server, "REVISION_SECONDS", 0.0)
+    monkeypatch.setattr(server.protocol, "revision", lambda: "moved")
+
+
+def test_a_stale_service_answers_the_hook_with_a_fallback_status(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    moved_sources(monkeypatch)
+    lane = Path(paired["lanes"]["codex"])
+    cwd = {"cwd": str(lane), "session_id": "s1"}
+    served = run_hook(bridge, lane.parent, {**DENY, **cwd})
+    assert served.returncode == 0, served.stderr
+    decision = json.loads(served.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    recorded = events(lane.parent)
+    assert recorded[0]["reason_class"] == "service_fallback"
+    assert "service answered 503" in recorded[0]["cause"]
+    logged = capsys.readouterr()
+    assert "Traceback" not in logged.out + logged.err
+    assert logged.out.count(server.DRIFTED) == 1
+    assert service.stopping.is_set()
+
+
+def test_a_stale_service_reads_as_degraded_in_the_status_document(
+    bridge, repo, paired, service, monkeypatch
+):
+    moved_sources(monkeypatch)
+    reading = bridge.status_snapshot()
+    assert reading["server"] == {"ready": False, "state": protocol.STALE}
+    assert service.stopping.is_set()
+
+
+def test_status_names_the_drift_a_stale_service_reports(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    moved_sources(monkeypatch)
+    bridge.status()
+    printed = capsys.readouterr().out
+    assert "Server: not ready" in printed
+    assert f"Code: {protocol.STALE}" in printed
+    assert protocol.RELAUNCH in printed
+
+
+def test_doctor_reports_a_stale_service_as_inconsistent(
+    bridge, repo, paired, service, monkeypatch
+):
+    moved_sources(monkeypatch)
+    reported = bridge.doctor()
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["service"]["state"] == protocol.STALE
+    assert named["service"]["remedy"] == protocol.RELAUNCH
+    assert named["service"]["compatible"] is False
+    assert reported["consistent"] is False
+    assert protocol.RELAUNCH in protocol.render(reported)
+
+
+def test_doctor_reports_a_current_service_as_consistent(
+    bridge, repo, paired, service
+):
+    store.initialize(bridge.home)
+    reported = bridge.doctor()
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["service"]["state"] == protocol.OK
+    assert named["service"]["version"] == protocol.launcher_version()
+    assert reported["consistent"] is True
+
+
+def test_doctor_reports_a_stopped_service_as_no_drift(bridge, repo, paired):
+    store.initialize(bridge.home)
+    reported = bridge.doctor()
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["service"]["state"] == protocol.STOPPED
+    assert named["service"]["compatible"] is True
+    assert reported["consistent"] is True
+
+
+def test_a_service_reads_its_own_sources_as_unchanged(
+    bridge, service, monkeypatch
+):
+    monkeypatch.setattr(server, "REVISION_SECONDS", 0.0)
+    assert protocol.revision() == service.revision
+    assert service.drifted() is False
+    assert not service.stopping.is_set()
 
 
 def test_a_wrong_credential_is_refused_and_falls_back(

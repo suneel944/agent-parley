@@ -1,11 +1,12 @@
 """Checks the status table, its filters and the gate they drive."""
 
+import asyncio
 import json
 import sys
 
 import pytest
 
-from agent_parley import cli
+from agent_parley import checkpoints, cli, store
 from agent_parley.state import write_json
 
 
@@ -203,6 +204,44 @@ def test_a_narrow_terminal_drops_columns_and_says_so(
     assert "PARTICIPANT" in table[0]
     if width < 100:
         assert any(line.startswith("Hidden columns:") for line in lines)
+
+
+def test_a_harness_notification_leaves_the_operator_task_standing(
+    bridge, repo, paired, capsys
+):
+    directory = bridge.project(repo)[1]
+    store.initialize(bridge.home)
+    store.authenticate(
+        bridge.home,
+        asyncio.run(bridge.identity("claude", paired))["registration_token"],
+    )
+    notification = (
+        "<task-notification> <task-id>b6zl98ow2</task-id> "
+        "<output-file>/tmp/claude-1000/task.log</output-file>"
+    )
+    for prompt in ("Wire the dashboard", notification):
+        checkpoints.checkpoint(
+            bridge.home,
+            directory,
+            "claude",
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "test",
+                "cwd": paired["lanes"]["claude"],
+                "prompt": prompt,
+            },
+        )
+    bridge.status(width=None)
+    row = next(
+        line for line in rows_of(printed(capsys)) if line.startswith("claude")
+    )
+    assert "Wire the dashboard" in row
+    assert "task-notification" not in row
+
+
+def test_a_quoted_harness_tag_still_reads_as_an_operator_prompt():
+    assert not checkpoints.operator_prompt("  <system-reminder> hold edits")
+    assert checkpoints.operator_prompt("Explain <system-reminder> to me")
 
 
 def test_an_unbounded_table_keeps_every_column(bridge, repo, paired, capsys):

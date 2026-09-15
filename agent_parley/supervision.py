@@ -29,6 +29,10 @@ DEFAULTS = {
     "wake": True,
 }
 
+ACTIVE = "active"
+IDLE = "idle"
+STOPPED = "stopped"
+
 
 def settings(value: dict) -> dict:
     """Validates supervision settings stored outside the repository."""
@@ -53,19 +57,30 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     A live but quiet session is distinguishable from a dead launcher. No
     heartbeat from the participant is required, and no ownership is inferred.
 
+    A lane between turns and a lane whose launcher exited are different
+    situations with different remedies, so they are never given the same word.
+    Collapsing them told peers and operators that a healthy lane was gone.
+
     Args:
         directory: Private project state directory.
         name: Participant name.
-        inactive_after: Checkpoint age after which a live lane is unreachable.
+        inactive_after: Checkpoint age after which a live lane reads as idle.
 
     Returns:
         State, process liveness, last native activity time and observed age.
+        The state is `ACTIVE` while the recorded session process is alive and
+        its latest native checkpoint is no older than the threshold, `IDLE`
+        once that checkpoint has aged past the threshold while the process is
+        still alive, and `STOPPED` when the recorded session process is gone.
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
     alive = process.alive(value.get("session_pid"), value.get("session_ticks"))
     age = max(0, time.time() - value.get("updated", 0))
-    state = "active" if alive and age <= inactive_after else "unreachable"
+    if not alive:
+        state = STOPPED
+    else:
+        state = ACTIVE if age <= inactive_after else IDLE
     return {
         "state": state,
         "process_alive": alive,
@@ -938,7 +953,10 @@ def wake(
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
     offer carries a new identifier, which resets the bounded attempt count
-    rather than extending the old one.
+    rather than extending the old one. A request the launcher refuses as busy
+    is spaced like any other but does not count against the bound, because
+    the lane never received a turn to decline; it is asked again once it is
+    idle.
 
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
@@ -1025,7 +1043,7 @@ def wake(
             {
                 "at": time.time(),
                 "backlog": backlog,
-                "attempts": attempts + 1,
+                "attempts": attempts + (result != "busy"),
                 "result": result,
             },
         )

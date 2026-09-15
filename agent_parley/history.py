@@ -288,6 +288,20 @@ def records(
     return sorted(selected, key=lambda record: record["at"])
 
 
+def _claim(claim_id: str | None) -> str:
+    """Formats the claim suffix a history line carries.
+
+    Args:
+        claim_id: Identifier correlating the row with a claim, if any.
+
+    Returns:
+        The rendered suffix, or an empty string when the row names no
+        claim, so that message and reservation rows do not report an
+        unknown claim they never had.
+    """
+    return f"; claim {claim_id}" if claim_id else ""
+
+
 def describe(reported: list[dict], held: list[dict] | None = None) -> str:
     """Formats history for a terminal, oldest first.
 
@@ -304,15 +318,15 @@ def describe(reported: list[dict], held: list[dict] | None = None) -> str:
         ended = "still held" if generation["ended"] is None else "released"
         lines.append(
             f"{generation['participant']} held it for "
-            f"{generation['seconds']}s ({ended}); "
-            f"claim {generation['claim_id'] or 'unknown'}"
+            f"{generation['seconds']}s ({ended})"
+            f"{_claim(generation['claim_id'])}"
         )
     for record in reported:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(record["at"]))
         issue = f" #{record['issue']}" if record["issue"] else ""
         lines.append(
             f"{stamp} {record['kind']}{issue} "
-            f"{record['participant'] or 'unknown'}: {record['detail']}; "
-            f"claim {record['claim_id'] or 'unknown'}"
+            f"{record['participant'] or 'unknown'}: {record['detail']}"
+            f"{_claim(record['claim_id'])}"
         )
     return "\n".join(lines) or "No matching history."

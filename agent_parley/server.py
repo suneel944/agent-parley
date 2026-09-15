@@ -8,6 +8,7 @@ import socket
 import socketserver
 import sqlite3
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,12 @@ VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 MAX_REQUEST_BYTES = 16384
 MAX_HOOK_BYTES = 1_048_576
 HOOK_PATH = "/hook/"
+REVISION_SECONDS = 2.0
+DRIFTED = (
+    "Sources changed under the running service; it is answering from a "
+    "module set the checkout no longer holds and is stopping. "
+    + protocol.RELAUNCH
+)
 
 
 def _tool(
@@ -183,11 +190,70 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, home: Path, config: dict) -> None:
-        """Binds only the configured loopback port."""
+        """Binds only the configured loopback port.
+
+        The version and the source fingerprint of the code being served are
+        read here, once, so every later reading is a comparison against what
+        this process actually started with.
+        """
         self.home = home
         self.token = config["token"]
         self.slots = threading.BoundedSemaphore(16)
+        self.version = protocol.launcher_version()
+        self.revision = protocol.revision()
+        self.checked = time.monotonic()
+        self.reading = threading.Lock()
+        self.stopping = threading.Event()
         super().__init__(("127.0.0.1", config["port"]), Handler)
+
+    def drifted(self) -> bool:
+        """Reports whether the served modules left the sources on disk.
+
+        The fingerprint is re-read at most once every `REVISION_SECONDS`,
+        because the caller is a hook decision whose whole budget is a few
+        milliseconds and a merge is not an event worth paying for on every
+        request. The first reading that differs from the one taken at start
+        is final: it is logged once as a single line, the service stops
+        accepting connections so in-flight requests finish and the process
+        exits, and every request until then is answered as stale rather than
+        with a traceback from a module that is no longer importable.
+
+        Returns:
+            Whether the service is serving code the checkout has moved past.
+        """
+        if self.stopping.is_set():
+            return True
+        with self.reading:
+            if self.stopping.is_set():
+                return True
+            now = time.monotonic()
+            if now - self.checked < REVISION_SECONDS:
+                return False
+            self.checked = now
+            if protocol.revision() == self.revision:
+                return False
+            self.stopping.set()
+        print(DRIFTED, flush=True)
+        threading.Thread(target=self.shutdown, daemon=True).start()
+        return True
+
+    def health(self) -> dict:
+        """Describes the code this service is answering from.
+
+        Returns:
+            The readiness document, naming the package version the service
+            started with and whether the sources still match it. A stale
+            service names the command that replaces it, so an operator reads
+            the drift from `status` and `doctor` instead of from a log.
+        """
+        document = {
+            "status": "ready",
+            "engine": "agent-parley",
+            "version": self.version,
+        }
+        if self.drifted():
+            return {**document, "status": protocol.STALE, "detail": DRIFTED}
+        return document
 
     def server_bind(self) -> None:
         """Binds loopback without HTTPServer's unnecessary reverse DNS lookup.
@@ -293,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
         """Reports authenticated health without opening SSE streams."""
         if self._authorize() is not None:
             if self.path == "/health/readiness":
-                self._reply(200, {"status": "ready", "engine": "agent-parley"})
+                self._reply(200, self.server.health())
             else:
                 self._reply(405)
 
@@ -303,9 +369,19 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(405)
 
     def do_POST(self) -> None:
-        """Authenticates and handles one size-limited JSON-RPC request."""
+        """Authenticates and handles one size-limited JSON-RPC request.
+
+        A service whose sources have moved refuses before it reaches the code
+        that would import them. The refusal is the status a client already
+        treats as an outage, so a hook decides in-process on the same path a
+        stopped service sends it down, and one log line replaces a traceback
+        for every request the drift would otherwise break.
+        """
         actor = self._authorize()
         if actor is None:
+            return
+        if self.server.drifted():
+            self._reply(503, {"status": protocol.STALE, "detail": DRIFTED})
             return
         if self.path == HOOK_PATH:
             self._hook(actor)

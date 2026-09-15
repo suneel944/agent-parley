@@ -67,6 +67,11 @@ READ_ONLY = (
     "search_messages",
 )
 ATTACHED = ("send_message", "read_attachment")
+PRESENCE_WARNINGS = {
+    "idle": ("idle", "idle; wake requested"),
+    "stopped": ("unreachable", "unreachable"),
+    "unreachable": ("unreachable", "unreachable"),
+}
 RETRIED = {
     "acknowledge_message": ("message_id",),
     "mark_message_read": ("message_id",),
@@ -1405,7 +1410,21 @@ def _refused(
 def _recipient_warnings(
     home: Path, actor: dict, args: dict, result: dict
 ) -> None:
-    """Adds observed availability without failing an already committed send."""
+    """Adds observed availability without failing an already committed send.
+
+    A recipient whose launcher is alive but between turns is reported as idle
+    and its summary says a wake was requested, because the supervision poll
+    asks an idle lane with a backlog to take its turn. Only a recipient whose
+    recorded session process is gone is called unreachable, so a peer reading
+    the result never treats a live lane as absent. A presence row written by
+    an earlier build, before idle existed, still reads as unreachable.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: Arguments the committed send carried.
+        result: Send result the warnings are added to.
+    """
     with connect(home) as db:
         warnings = []
         for name in args["to"]:
@@ -1415,11 +1434,14 @@ def _recipient_warnings(
                 "WHERE a.project_id=? AND a.name=?",
                 (actor["project_id"], name),
             ).fetchone()
-            if row and row["state"] == "unreachable":
+            observed = PRESENCE_WARNINGS.get(row["state"]) if row else None
+            if observed:
+                state, detail = observed
                 warnings.append(
                     {
                         "recipient": name,
-                        "state": "unreachable",
+                        "state": state,
+                        "summary": f"queued for {name} ({detail})",
                         "observed_ts": row["observed_ts"],
                     }
                 )
@@ -2361,6 +2383,85 @@ def usage(
                 lease_age=max(0, row["lease_age"] or 0),
             )
     return report
+
+
+def transfer_reservations(
+    home: Path,
+    root: str,
+    source: str,
+    target: str,
+    keys: list[str],
+    claim: str = "",
+) -> list[str]:
+    """Moves advisory reservations between lanes in one store transaction.
+
+    Reservations are advisory. They record which lane declared an intent to
+    edit a path or hold a named resource; nothing in the file system enforces
+    them. Moving them when a handoff is accepted keeps that declaration
+    truthful, because the lane that now owns the work is the lane a peer reads
+    on the key.
+
+    The release and the grant run inside one SQLite transaction, so no reader
+    observes both lanes holding a key, and none observes neither holding it. A
+    key the source no longer holds is skipped rather than invented for the
+    target, and a key the target already holds is superseded by the moved
+    lease so one lane never accumulates two live records of one key.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        source: Registered identity handing the work on.
+        target: Registered identity accepting it.
+        keys: Reservation keys the accepted handoff named.
+        claim: Claim identifier the accepting lane now works under, recorded
+            beside each moved lease. Empty records no claim.
+
+    Returns:
+        The keys that moved, in sorted order.
+
+    Raises:
+        BridgeError: If no store exists or either identity is unregistered.
+    """
+    if not keys:
+        return []
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    wanted = sorted(set(keys))
+    moved: list[str] = []
+    with connect(home, write=True) as db:
+        holder = _identify(db, root, source)
+        receiver = _identify(db, root, target)
+        held = db.execute(
+            "SELECT id,path_pattern,exclusive,reason,expires_ts "
+            "FROM file_reservations WHERE project_id=? AND agent_id=? "
+            "AND released_ts IS NULL AND path_pattern IN ("
+            + ",".join("?" * len(wanted))
+            + ") ORDER BY path_pattern",
+            (holder["project_id"], holder["id"], *wanted),
+        ).fetchall()
+        for lease in held:
+            db.execute(
+                "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+                "WHERE id=? OR (agent_id=? AND path_pattern=? "
+                "AND released_ts IS NULL)",
+                (lease["id"], receiver["id"], lease["path_pattern"]),
+            )
+            db.execute(
+                "INSERT INTO file_reservations(project_id,agent_id,"
+                "path_pattern,exclusive,reason,expires_ts,claim_id) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    receiver["project_id"],
+                    receiver["id"],
+                    lease["path_pattern"],
+                    lease["exclusive"],
+                    lease["reason"],
+                    lease["expires_ts"],
+                    claim or None,
+                ),
+            )
+            moved.append(lease["path_pattern"])
+    return moved
 
 
 def active_reservations(home: Path, root: str) -> dict[str, list[str]]:

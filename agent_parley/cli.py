@@ -71,6 +71,7 @@ from agent_parley.issues import (
     change,
     deadline_state,
     describe,
+    handoff_fields,
     offer_state,
     parse_issue,
     snapshot,
@@ -2219,8 +2220,17 @@ class Bridge:
         data = json.loads(record.read_text())
         return process.identify(data, self.home)
 
-    def ready(self) -> bool:
-        """Checks authenticated readiness without routing through proxies."""
+    def health(self) -> dict:
+        """Reads the service's own account of itself, without a proxy.
+
+        The service answers what code it started on and whether the checkout
+        has moved past it, so a reading here reports drift the launcher
+        cannot see from its own process.
+
+        Returns:
+            The readiness document, or an empty mapping when nothing answers
+            on the configured port.
+        """
         import urllib.error
         import urllib.request
 
@@ -2231,9 +2241,14 @@ class Bridge:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             with opener.open(request, timeout=1) as response:
-                return json.load(response).get("status") == "ready"
+                document = json.load(response)
         except (OSError, urllib.error.URLError, ValueError):
-            return False
+            return {}
+        return document if isinstance(document, dict) else {}
+
+    def ready(self) -> bool:
+        """Checks authenticated readiness without routing through proxies."""
+        return self.health().get("status") == "ready"
 
     def up(self) -> None:
         """Starts the mail server with bounded readiness checking.
@@ -4399,6 +4414,7 @@ attempt of the recorded budget, which is also only reported.
         within: float | None = None,
         key: str = "",
         when_released: str = "",
+        remaining: list[str] | None = None,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -4417,6 +4433,13 @@ attempt of the recorded budget, which is also only reported.
         The forecast is returned as ``forecast`` beside the record, advisory
         only, and omitted when nothing is likely or no forge is configured.
 
+        An offer records the work state beside its summary: the lane's head
+        commit, the reservation keys it holds, the remaining work it states,
+        and the diff against the project base when that diff fits the
+        attachment cap. An acceptance then moves those reservations from the
+        offering lane to the accepting one, so the advisory declaration on
+        each key names the lane that now owns the work.
+
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
             action: List, claim, release, offer, accept, decline, cancel,
@@ -4433,9 +4456,12 @@ attempt of the recorded budget, which is also only reported.
             when_released: Issue whose explicit release or completion an offer
                 waits on. The offer is recorded rather than applied, and the
                 supervision poll applies it once that release is recorded.
+            remaining: Work the offering lane states as still to do, one item
+                per entry, recorded beside the summary.
 
         Returns:
-            The whole ledger for list, or the resulting issue record.
+            The whole ledger for list, or the resulting issue record. An
+            acceptance additionally reports the reservation keys that moved.
 
         Raises:
             BridgeError: If lane, ownership, or transition checks fail.
@@ -4475,21 +4501,33 @@ attempt of the recorded budget, which is also only reported.
             if action == "claim"
             else None
         )
-        record = change(
-            directory,
-            agent,
-            action,
-            number,
-            participants=set(data["participants"]),
-            key=key,
-            to=to,
-            summary=summary,
-            offer_id=offer_id,
-            on=on,
-            title=title,
-            within=within,
-            defaults=data["deadlines"],
+        carried = (
+            self._carry(repo, directory, data, agent, to or "", remaining)
+            if action == "offer"
+            else {}
         )
+        try:
+            record = change(
+                directory,
+                agent,
+                action,
+                number,
+                participants=set(data["participants"]),
+                key=key,
+                to=to,
+                summary=summary,
+                offer_id=offer_id,
+                on=on,
+                title=title,
+                within=within,
+                defaults=data["deadlines"],
+                carried=carried,
+            )
+        except BridgeError:
+            attachments.remove(directory, carried.get("diff", ""))
+            raise
+        if action == "accept":
+            return self._inherit(data, agent, record)
         if action == "claim":
             forge.assign(repo, parse_issue(number))
             likely = self._claim_forecast(
@@ -4500,6 +4538,107 @@ attempt of the recorded budget, which is also only reported.
         elif action == "release":
             forge.unassign(repo, parse_issue(number))
         return record
+
+    def _carry(
+        self,
+        repo: Path,
+        directory: Path,
+        data: dict,
+        agent: str,
+        recipient: str,
+        remaining: list[str] | None,
+    ) -> dict:
+        """Reads the work state an offer transfers beside its summary.
+
+        Every field is read best effort. A lane without a readable Git head,
+        without a reachable store, or whose diff exceeds the attachment cap
+        offers exactly what it can state, because a handoff that refuses to be
+        recorded is worse than one that carries less.
+
+        Args:
+            repo: Assigned worktree the offer is made from.
+            directory: Private project state directory.
+            data: Project manifest.
+            agent: Offering participant.
+            recipient: Participant the offer names.
+            remaining: Work the offering lane states as still to do.
+
+        Returns:
+            The commit, reservation keys, remaining work and, where one was
+            attached, the diff reference and its byte count.
+        """
+        import sqlite3
+
+        carried: dict = {"remaining": list(remaining or [])}
+        with contextlib.suppress(BridgeError, subprocess.TimeoutExpired):
+            carried["commit"] = git(repo, "rev-parse", "HEAD")
+        own = data["participants"][agent]["display"]
+        try:
+            held = store.active_reservations(self.home, data["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            held = {}
+        carried["reservations"] = held.get(own, [])
+        text = ""
+        with contextlib.suppress(BridgeError, subprocess.TimeoutExpired):
+            text = git(repo, "diff", data["base"], "HEAD")
+        if not text or len(text.encode()) > attachments.MAX_ATTACHMENT_BYTES:
+            return carried
+        with contextlib.suppress(BridgeError, OSError):
+            carried["diff"] = attachments.keep(
+                directory,
+                "offer",
+                uuid.uuid4().hex,
+                text,
+                agent,
+                [recipient],
+            )
+            carried["diff_bytes"] = len(text.encode())
+        return carried
+
+    def _inherit(self, data: dict, agent: str, record: dict) -> dict:
+        """Moves an accepted handoff's reservations to the accepting lane.
+
+        Reservations are advisory declarations of intent, never enforced file
+        system locks. The release and the grant share one store transaction,
+        so a peer reading the keys sees them held by the offering lane or by
+        the accepting one, never by both and never by neither.
+
+        A store that cannot answer leaves every key with the offering lane,
+        which is the state a declined handoff leaves, and reports why beside
+        the record rather than reversing a committed transfer of ownership.
+
+        Args:
+            data: Project manifest.
+            agent: Participant that accepted the handoff.
+            record: Persisted record the acceptance produced.
+
+        Returns:
+            The record with the reservation keys that moved, and the reason
+            none did where the store refused.
+        """
+        import sqlite3
+
+        inherited = record.get("handoff") or {}
+        keys = list(inherited.get("reservations") or [])
+        offerer = inherited.get("from")
+        if not keys or offerer not in data["participants"]:
+            return record
+        try:
+            moved = store.transfer_reservations(
+                self.home,
+                data["root"],
+                data["participants"][offerer]["display"],
+                data["participants"][agent]["display"],
+                keys,
+                record.get("claim_id", ""),
+            )
+        except (BridgeError, OSError, sqlite3.Error) as exc:
+            return {
+                **record,
+                "reservations_moved": [],
+                "reservations_error": str(exc),
+            }
+        return {**record, "reservations_moved": moved}
 
     def _claim_forecast(
         self, repo: Path, directory: Path, data: dict, agent: str, number: str
@@ -4662,18 +4801,24 @@ attempt of the recorded budget, which is also only reported.
         return {"delivered": True, "detail": ""}
 
     def doctor(self) -> dict:
-        """Reports the launcher, plugin and store versions and their fit.
+        """Reports the launcher, plugin, store and service fit.
 
         The command reads. It opens no lane, writes no configuration and
         repairs nothing, so it stays safe to run while lanes are working, and
         it reports no credential, token or path inside a credential profile.
+        It does ask a running service what code it is answering from, which
+        is a reading the launcher cannot take from its own process.
 
         Returns:
             The launcher's package version and wire protocol, the protocol each
             shipped plugin manifest declares, the store's schema version
-            against the schema this build writes, and whether the whole set is
-            consistent. Each component carries the state this build puts it in
-            and the one command that state needs. A store behind this build is
+            against the schema this build writes, the code a running service
+            is answering from, and whether the whole set is consistent. A
+            service that started before the sources moved is reported stale,
+            because it answers from modules the checkout no longer holds; a
+            service that is not running is no drift at all. Each component
+            carries the state this build puts it in and the one command that
+            state needs. A store behind this build is
             not consistent: every process running this code queries columns it
             does not have, so reporting it as compatible would describe a
             healthy system while every lane is denied. The report also names
@@ -4716,6 +4861,19 @@ attempt of the recorded budget, which is also only reported.
                 "state": state,
                 "remedy": store.remedy(state),
                 "compatible": state in store.SCHEMA_USABLE,
+            }
+        )
+        served = self.health()
+        serving = served.get("status") or protocol.STOPPED
+        stale = serving == protocol.STALE
+        components.append(
+            {
+                "component": "service",
+                "version": str(served.get("version", "")),
+                "protocol": protocol.PROTOCOL,
+                "state": protocol.OK if serving == "ready" else serving,
+                "remedy": protocol.RELAUNCH if stale else "",
+                "compatible": not stale,
             }
         )
         return {
@@ -5290,6 +5448,9 @@ attempt of the recorded budget, which is also only reported.
                         deadline_state(record)["deadline"]
                     ),
                     "offer": offer_state(record.get("offer")),
+                    "handoff": handoff_fields(
+                        record.get("offer") or record.get("handoff")
+                    ),
                 }
                 for number, record in sorted(
                     ledger["issues"].items(), key=lambda i: int(i[0])
@@ -5385,14 +5546,18 @@ attempt of the recorded budget, which is also only reported.
         store.
 
         Returns:
-            Server readiness, the private state directory, and one record per
-            registered project holding its issue ledger and its lanes.
+            Server readiness and the state the service reports itself in, the
+            private state directory, and one record per registered project
+            holding its issue ledger and its lanes. A service that reports
+            itself stale is not ready, and the state names why.
         """
         usable = (
             store.schema_state(store.schema_version(self.home))
             in store.SCHEMA_USABLE
         )
-        healthy = usable and bool(self.server_process()) and self.ready()
+        served = self.health()
+        state = served.get("status") or "not ready"
+        healthy = usable and bool(self.server_process()) and state == "ready"
         projects = []
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
@@ -5421,7 +5586,7 @@ attempt of the recorded budget, which is also only reported.
                     }
                 )
         return {
-            "server": {"ready": healthy},
+            "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
             "projects": projects,
         }
@@ -5449,6 +5614,8 @@ attempt of the recorded budget, which is also only reported.
         kept = {project["root"]: project for project in report["projects"]}
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
+        if report["server"].get("state") == protocol.STALE:
+            print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             print(f"Store: {schema}; {repair}")
@@ -6336,6 +6503,18 @@ def main() -> int:
             command.add_argument("--to", required=True)
             command.add_argument("--summary", required=True)
             command.add_argument(
+                "--remaining",
+                action="append",
+                default=[],
+                metavar="ITEM",
+                help=(
+                    "One item of work still to do, repeatable. It is recorded "
+                    "beside the head commit, the reservations this lane holds "
+                    "and the diff against the project base, so the receiver "
+                    "reads the transfer instead of re-deriving it."
+                ),
+            )
+            command.add_argument(
                 "--when-released",
                 default="",
                 metavar="NUMBER",
@@ -6959,6 +7138,7 @@ def main() -> int:
                 within=getattr(args, "within", None),
                 key=getattr(args, "idempotency_key", ""),
                 when_released=getattr(args, "when_released", ""),
+                remaining=getattr(args, "remaining", None),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))

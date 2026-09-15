@@ -17,9 +17,16 @@ three without changing anything.
 A hook never reaches the network to learn a version. The launcher writes its
 protocol into the hook command it configures, so the hook boundary is checked
 locally, and the HTTP boundary is checked where calls actually cross it.
+
+A fourth surface moves without any number changing: the modules a detached
+service already loaded against the sources now on disk. `revision` fingerprints
+those sources so the service can notice that it is answering from a module set
+the checkout no longer holds, rather than failing one lazily imported call at a
+time.
 """
 
 import json
+import os
 from pathlib import Path
 
 CLIENTS = ("claude", "codex")
@@ -29,9 +36,12 @@ SUPPORTED = (1,)
 UPDATE = "agent-parley setup PATH reinstalls the plugin for this repository."
 MIGRATE = "agent-parley down, then agent-parley up, migrates the store."
 UPGRADE = "A newer agent-parley wrote this store; install that version."
+RELAUNCH = "agent-parley up starts a service on the code in the checkout."
 UNKNOWN = -1
 OK = "ok"
 MISMATCH = "mismatch"
+STALE = "stale"
+STOPPED = "not running"
 
 
 def manifests(root: Path) -> dict[str, Path]:
@@ -79,6 +89,38 @@ def launcher_version() -> str:
     if isinstance(declared, str):
         return declared
     return importlib.metadata.version("agent-parley")
+
+
+def revision() -> str:
+    """Fingerprints the package sources a process loads its modules from.
+
+    A long-lived process imports lazily, so a merge that adds a module and a
+    lazy import of it leaves the process able to answer some calls and unable
+    to answer others. The fingerprint is what turns that into one detectable
+    fact: it is read once at start and compared later, and any difference
+    means the modules on disk are no longer the ones the process began with.
+
+    The reading is one directory scan of a flat package, without opening a
+    file, because it sits behind a latency-sensitive path and is only ever
+    compared against itself.
+
+    Returns:
+        Text that changes when a module beside this one is added, removed,
+        or written, and stays equal otherwise. An unreadable package
+        directory yields its own value, which compares unequal to any
+        reading taken while the directory was readable.
+    """
+    newest = 0
+    modules = 0
+    try:
+        with os.scandir(Path(__file__).resolve().parent) as entries:
+            for entry in entries:
+                if entry.name.endswith(".py"):
+                    modules += 1
+                    newest = max(newest, entry.stat().st_mtime_ns)
+    except OSError:
+        return "unreadable"
+    return f"{modules}:{newest}"
 
 
 def installed(path: Path) -> int:
