@@ -553,6 +553,26 @@ agent-parley top --since 6h
 agent-parley events export --since 7d --output enforcement.jsonl
 ```
 
+**The whole state directory can leave the machine as one archive.**
+`agent-parley state export --output PATH` snapshots the store through the
+SQLite backup interface while the project locks are held briefly and packs it
+with the manifests, ledgers, activity files, retained event and report logs
+and attachments; the manifest names the schema, the export time and a SHA-256
+digest per member. Registration tokens, credential profiles and native MCP
+configurations are never archived. `state show PATH` lists what an archive
+holds, and `state import PATH` restores it into an empty state directory,
+validating every member first and refusing traversal, links and a newer
+schema; `--merge` adds projects beside existing ones and refuses a collision.
+Imported participants register again on their next `run`, and the import
+lists every lane path that does not exist here so the operator can recreate
+the worktree.
+
+```sh
+agent-parley state export --output parley.tar.gz --project ~/src/app
+agent-parley state show parley.tar.gz
+agent-parley state import parley.tar.gz --merge
+```
+
 **One lane can be followed as a stream.** `agent-parley watch NAME` prints
 one line per coordination event as it happens: `claim issue 42`, `denied git
 (branch_switch)`, `mail from codex-2 (thread t12)`, `report ready`, `call
@@ -763,6 +783,9 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `history participant NAME` | List everything one lane filed. |
 | `history claim ID` | Follow one claim to the pull request that ended it. |
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
+| `state export --output PATH` | Write the whole state directory, or one `--project ROOT`, as one tar archive with a hashed manifest and no credentials. |
+| `state show PATH` | List an archive's projects, participants, issue counts and export time without importing it. |
+| `state import PATH` | Restore an archive into an empty state directory; `--merge` adds projects beside existing ones and refuses a collision. |
 | `watch NAME` | Follow one lane's coordination events as a stream; `--since` widens the backlog, `--kind` narrows it, `--json` prints JSON Lines. The agent's conversation is never shown. |
 
 Every read-only command above also accepts `--json` and prints exactly one JSON

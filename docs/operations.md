@@ -1264,6 +1264,51 @@ refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
 
+### Exporting and importing the state directory
+
+```sh
+agent-parley state export --output parley-2026-09-15.tar.gz
+agent-parley state export --output one-project.tar.gz --project ~/src/app
+agent-parley state show parley-2026-09-15.tar.gz
+agent-parley state import parley-2026-09-15.tar.gz
+agent-parley state import one-project.tar.gz --merge --project ~/src/app
+```
+
+`state export` writes the coordination state as one tar archive. The store is
+copied through the SQLite backup interface while the setup and ledger locks of
+every exported project are held for at most two seconds, so the snapshot, the
+project manifests, the issue ledgers, the activity files, the retained event
+and report logs and the attachments describe one moment; an export that cannot
+take those locks in time is refused rather than written inconsistently.
+`--project ROOT` exports one registered project alone, including only its rows
+of the store. The archive manifest names the store schema, the export time,
+the SHA-256 digest of every member, the projects and their participants.
+
+Credentials never leave the state directory. Registration tokens are stripped
+from the identity records, their digests are cleared in the exported store,
+and credential profiles and native MCP configurations are not archived; the
+manifest states the omission. `state show PATH` prints the projects,
+participants, issue counts and export time from that manifest without
+restoring anything.
+
+`state import PATH` restores into an empty state directory and refuses one
+that already holds a store or a project unless `--merge` is given. Before it
+writes, it validates every member against the manifest digests, refuses an
+absolute path, a `..` component, a symbolic link or a hard link, and refuses
+an archive written at a newer store schema than this build reads. The archive
+is unpacked into a temporary directory inside the state root, migrated to
+this build's schema there, and moved into place only after that validation.
+With `--merge`, a project the directory does not hold is added beside the
+existing ones; a project that already exists is a collision, so the import
+refuses it and leaves the directory as it was. `--project ROOT` restores one
+archived project alone.
+
+Every imported participant registers again on its next `run`, because the
+archive carries no credential. The import then lists every participant whose
+lane path does not exist on this machine. Those lanes are not recreated: the
+operator adds the worktree again, on the recorded branch, before launching
+that participant.
+
 ### Lane branches and attribution
 
 A lane branch carries no participant, provider or account name. It is created as
