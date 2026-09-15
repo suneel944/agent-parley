@@ -1022,14 +1022,40 @@ document on standard output:
 ```sh
 agent-parley status --json
 agent-parley top --json
+agent-parley version --json
 agent-parley issue list --json
+agent-parley issue show 42 --json
 agent-parley participant list --json
+agent-parley participant show claude --json
 agent-parley mail thread THREAD_ID --json
 agent-parley mail search "reservation conflict" --json
+agent-parley mail list --json
+agent-parley approval show --json
 agent-parley verify show --json
 agent-parley init show --json
+agent-parley branch show --json
+agent-parley forge show --json
+agent-parley state show ARCHIVE --json
 agent-parley provider list --json
+agent-parley provider show claude --json
 agent-parley credentials list --json
+agent-parley credentials show work --json
+```
+
+The commands that change something report their outcome the same way, so a
+skill parses one document instead of scraping a sentence:
+
+```sh
+agent-parley up --json
+agent-parley down --json
+agent-parley setup PATH --json
+agent-parley run claude --json
+agent-parley say claude "Rebase first" --json
+agent-parley mail send claude "Rebase first" --json
+agent-parley mail cancel ITEM_ID --json
+agent-parley approve claude --json
+agent-parley reject claude "Rebase first" --json
+agent-parley problems ack MESSAGE_ID --json
 ```
 
 `top --json` prints one frame and exits rather than drawing the live view;
@@ -1043,7 +1069,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `issues`, `participants`, `history`, `mail_thread`, `mail_search`, `verify`, `init`, `resources`, `providers` or `credentials`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `participants`, `participant`, `history`, `mail_thread`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `approval`, `verify`, `init`, `branch`, `forge`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `resources`, `providers`, `provider`, `credentials` or `credentials_show`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -1053,6 +1079,23 @@ carries the identifiers the table abbreviates: offer IDs on `issues`, message
 and thread IDs on `mail_thread` and `mail_search`, participant names, registered
 identities and branch names everywhere they apply. It carries no credential
 value; a credential profile is named, never its contents.
+
+`version --json` reports `version` and `state_directory`. `issue show --json`
+reports the `issue` asked for, the ledger `revision`, its `record` as the
+`issues` array shapes one entry or null where the ledger never recorded it,
+the advisory `reservations` its owner holds, and the same `history` document
+`history issue N --json` prints. `participant show --json` reports every field
+a `status` participant carries, plus the `worktree` the lane lives in, the
+advisory `budget_limits` the manifest records and `wake_enabled`.
+`mail list --json` reports `limit`, `messages` newest first and `has_more`.
+`approval show --json` reports `root`, the `approval` steps and `required`;
+`branch show --json` reports `root` and `prefix`; `forge show --json` reports
+`root` and `forge`; `state show --json` reports the `archive` path and its
+`manifest`. `provider show --json` reports the definition beside its
+`provider` name, and `credentials show --json` reports `credential`,
+`config_home`, `env` as `NAME=<redacted>` entries and `require_env`: no
+recorded value is printed. `problems ack --json` reports the message `id` and
+the `participants` the acknowledgement was recorded for.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory` and one entry per

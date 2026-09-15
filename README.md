@@ -116,6 +116,13 @@ agent-parley problems # only what needs you now, oldest first
 agent-parley say claude-2 "Rebase onto main before you open the pull request."
 ```
 
+`agent-parley` on its own prints the grouped command list, `agent-parley
+--version` prints the installed version, and `agent-parley version` adds the
+state directory in use. One thing at a time reads through a `show` verb —
+`issue show 42`, `participant show claude-2`, `provider show claude`,
+`credentials show work` — and `mail list` prints the inbox without a search
+query. Every one of them accepts `--json`.
+
 When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
 
