@@ -203,6 +203,32 @@ def connect(
         db.close()
 
 
+@contextlib.contextmanager
+def reading(
+    home: Path, db: sqlite3.Connection | None = None
+) -> Iterator[sqlite3.Connection]:
+    """Yields a caller's read transaction, or opens and closes its own.
+
+    A caller that answers several questions about one project in a single
+    frame opens one transaction and passes it in, so every answer describes
+    the same instant and the frame pays one connection instead of one per
+    question. A caller with nothing to share passes nothing and keeps the
+    previous bounded read.
+
+    Args:
+        home: Private bridge state root.
+        db: Open read transaction to reuse, or ``None`` to open one.
+
+    Yields:
+        The connection the caller's statements run on.
+    """
+    if db is not None:
+        yield db
+        return
+    with connect(home) as own:
+        yield own
+
+
 def initialize(home: Path) -> None:
     """Creates or upgrades the store and imports a legacy service once.
 
@@ -2057,7 +2083,9 @@ def schedule(home: Path, root: str, item: dict) -> dict:
         }
 
 
-def schedules(home: Path, root: str) -> list[dict]:
+def schedules(
+    home: Path, root: str, *, db: sqlite3.Connection | None = None
+) -> list[dict]:
     """Reports every recorded item this project has not delivered yet.
 
     The reading writes nothing and delivers nothing, so a status view, a
@@ -2067,14 +2095,15 @@ def schedules(home: Path, root: str) -> list[dict]:
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
+        db: Open read transaction to answer from, or ``None`` to open one.
 
     Returns:
         Undelivered items oldest first, each carrying its recipient, its
         not-before time, its condition and how many deliveries remain.
     """
-    if not (home / DATABASE).exists():
+    if db is None and not (home / DATABASE).exists():
         return []
-    with connect(home) as db:
+    with reading(home, db) as db:
         return [
             {field: row[field] for field in SCHEDULE_FIELDS}
             for row in db.execute(
@@ -2278,12 +2307,15 @@ def waiting(home: Path, root: str, name: str) -> dict:
     return report
 
 
-def usage(home: Path, root: str) -> dict[str, dict]:
+def usage(
+    home: Path, root: str, *, db: sqlite3.Connection | None = None
+) -> dict[str, dict]:
     """Reports retained tool events and held leases for one project.
 
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
+        db: Open read transaction to answer from, or ``None`` to open one.
 
     Returns:
         Mapping of registered identity to served calls, rejected calls,
@@ -2293,10 +2325,10 @@ def usage(home: Path, root: str) -> dict[str, dict]:
         owner's behalf. Counts cover retained events only; older events are
         retired.
     """
-    if not (home / DATABASE).exists():
+    if db is None and not (home / DATABASE).exists():
         return {}
     report: dict[str, dict] = {}
-    with connect(home) as db:
+    with reading(home, db) as db:
         for row in db.execute(
             "SELECT a.name AS name,count(e.id) AS calls,"
             "coalesce(sum(e.outcome='error'),0) AS errors,"

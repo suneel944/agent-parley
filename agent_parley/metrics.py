@@ -215,13 +215,17 @@ def idle_intervals(
 
 
 def _mail_waits(
-    home: Path, root: str, display: str, since: float
+    home: Path,
+    root: str,
+    display: str,
+    since: float,
+    db: sqlite3.Connection | None = None,
 ) -> list[dict]:
     """Reports how long each message waited to be read and acknowledged."""
-    if not (home / store.DATABASE).exists():
+    if db is None and not (home / store.DATABASE).exists():
         return []
     waits: list[dict] = []
-    with store.connect(home) as db:
+    with store.reading(home, db) as db:
         agent = db.execute(
             "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
             "WHERE p.human_key=? AND a.name=?",
@@ -263,11 +267,15 @@ def _mail_waits(
     return waits
 
 
-def _offer_waits(directory: Path, name: str, since: float) -> list[dict]:
+def _offer_waits(
+    directory: Path, name: str, since: float, ledger: dict | None = None
+) -> list[dict]:
     """Reports how long each handoff offer waited to be answered."""
     waits = []
     stamp = time.time()
-    for number, record in issues.snapshot(directory)["issues"].items():
+    if ledger is None:
+        ledger = issues.snapshot(directory)
+    for number, record in ledger["issues"].items():
         opened = 0.0
         for entry in record.get("history", []):
             at = float(entry.get("at", 0) or 0)
@@ -334,7 +342,14 @@ def _report_waits(directory: Path, name: str, since: float) -> list[dict]:
 
 
 def waits(
-    home: Path, directory: Path, manifest: dict, name: str, since: float = 0.0
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    since: float = 0.0,
+    *,
+    db: sqlite3.Connection | None = None,
+    ledger: dict | None = None,
 ) -> list[dict]:
     """Reports every recorded wait for one lane inside a window.
 
@@ -345,6 +360,10 @@ def waits(
         name: Participant that owns the lane.
         since: Unix time floor for the window. Zero covers everything
             retained.
+        db: Open read transaction to answer mail waits from, or ``None`` to
+            open one.
+        ledger: Issue snapshot already read for this project, or ``None`` to
+            read one.
 
     Returns:
         One record per wait, each naming its kind, the item it belongs to, the
@@ -354,12 +373,12 @@ def waits(
     """
     display = manifest["participants"][name]["display"]
     try:
-        mail = _mail_waits(home, manifest["root"], display, since)
+        mail = _mail_waits(home, manifest["root"], display, since, db)
     except (BridgeError, OSError, sqlite3.Error):
         mail = []
     return [
         *mail,
-        *_offer_waits(directory, name, since),
+        *_offer_waits(directory, name, since, ledger),
         *_report_waits(directory, name, since),
     ]
 
