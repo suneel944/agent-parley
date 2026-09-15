@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import dataclasses
 import datetime
@@ -18,8 +17,6 @@ import string
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -32,7 +29,6 @@ from agent_parley import (
     budgets,
     checkpoints,
     completion,
-    dashboard,
     evidence,
     forecast,
     forge,
@@ -2203,6 +2199,9 @@ class Bridge:
 
     def ready(self) -> bool:
         """Checks authenticated readiness without routing through proxies."""
+        import urllib.error
+        import urllib.request
+
         request = urllib.request.Request(
             self.url + "/health/readiness",
             headers={"Authorization": f"Bearer {self.config['token']}"},
@@ -5427,6 +5426,8 @@ attempt of the recorded budget, which is also only reported.
                 "coordination guards those events carry; launch refused "
                 "rather than claiming enforcement it cannot provide."
             )
+        import asyncio
+
         lane = Path(participant["lane"])
         with lock(lane.parent / f"{agent}.session.lock"):
             self.up()
@@ -6621,6 +6622,8 @@ def main() -> int:
                 "Coordination server stopped. Worktrees and messages retained."
             )
         elif args.command == "top":
+            from agent_parley import dashboard
+
             names = tuple(
                 name.strip().upper()
                 for name in (args.columns or "").replace(",", " ").split()
@@ -6677,6 +6680,8 @@ def main() -> int:
                     lambda: problems.lines(bridge.problems()),
                 )
         elif args.command == "metrics":
+            from agent_parley import dashboard
+
             if args.every and not args.output:
                 parser.error("--every needs --output.")
             with contextlib.suppress(KeyboardInterrupt):
