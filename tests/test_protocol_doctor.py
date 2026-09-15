@@ -16,6 +16,23 @@ from agent_parley.state import BridgeError
 ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture
+def answering(monkeypatch):
+    """Answers readiness as a service on this build would.
+
+    A stopped service is an outage wherever a lane is registered, so a
+    report expected to read consistent needs a service that answers.
+    """
+    monkeypatch.setattr(
+        cli.Bridge,
+        "health",
+        lambda self: {
+            "status": "ready",
+            "version": protocol.launcher_version(),
+        },
+    )
+
+
 def test_every_shipped_plugin_declares_this_protocol():
     for client, manifest in protocol.manifests(ROOT).items():
         declared = json.loads(manifest.read_text()).get("protocol")
@@ -153,7 +170,7 @@ def test_a_served_call_without_the_header_is_still_served(bridge, repo, paired):
     assert "isError" not in call(bridge, actor, "list_participants", {})
 
 
-def test_doctor_reports_every_component(bridge, repo, paired):
+def test_doctor_reports_every_component(bridge, repo, paired, answering):
     store.initialize(bridge.home)
     reported = bridge.doctor()
     assert reported["consistent"] is True
@@ -205,7 +222,7 @@ def test_a_store_ahead_of_this_build_names_the_upgrade(bridge, repo, paired):
     assert protocol.UPGRADE in protocol.render(reported)
 
 
-def test_a_store_not_yet_created_is_consistent(bridge, repo, paired):
+def test_a_store_not_yet_created_is_consistent(bridge, repo, paired, answering):
     assert reported_store(bridge)["state"] == store.SCHEMA_ABSENT
     assert bridge.doctor()["consistent"] is True
 
@@ -237,7 +254,9 @@ def test_doctor_exits_non_zero_on_a_mismatch(
     assert "MISMATCH" in capsys.readouterr().out
 
 
-def test_doctor_reports_one_document(bridge, repo, paired, monkeypatch, capsys):
+def test_doctor_reports_one_document(
+    bridge, repo, paired, answering, monkeypatch, capsys
+):
     monkeypatch.setattr(
         sys,
         "argv",

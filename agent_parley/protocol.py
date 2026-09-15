@@ -37,6 +37,7 @@ UPDATE = "agent-parley setup PATH reinstalls the plugin for this repository."
 MIGRATE = "agent-parley down, then agent-parley up, migrates the store."
 UPGRADE = "A newer agent-parley wrote this store; install that version."
 RELAUNCH = "agent-parley up starts a service on the code in the checkout."
+START = "agent-parley up starts the coordination service these lanes need."
 UNKNOWN = -1
 OK = "ok"
 MISMATCH = "mismatch"
