@@ -8,6 +8,7 @@ import socket
 import socketserver
 import sqlite3
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -408,7 +409,11 @@ class Handler(BaseHTTPRequestHandler):
         to one registered identity, and the identity file in the named
         directory must hold that same credential, so a token cannot decide
         for a lane it was not registered for. The reply is the hook process's
-        own contract, produced by the code the in-process path runs.
+        own contract, produced by the code the in-process path runs. A
+        failure inside that code answers 500 with its traceback in the
+        service log, so the hook process decides in-process rather than
+        parsing a connection that closed without a status line, as it did
+        when a reinstall removed modules from under a running service.
 
         Args:
             actor: Registered identity the bearer credential resolved to.
@@ -443,7 +448,13 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._reply(403)
             return
-        self._reply(200, checkpoints.serve(self.server.home, request))
+        try:
+            served = checkpoints.serve(self.server.home, request)
+        except Exception:
+            traceback.print_exc()
+            self._reply(500)
+            return
+        self._reply(200, served)
 
     def _declared_protocol(self) -> int:
         """Returns the wire protocol this caller declared, or this build's.

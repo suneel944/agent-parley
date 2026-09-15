@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -144,6 +145,54 @@ def test_a_down_service_falls_back_in_process(bridge, repo, paired):
     assert recorded[0]["reason_class"] == "service_fallback"
     assert "ConnectionRefusedError" in recorded[0]["cause"]
     assert recorded[-1]["decision"] == "deny"
+
+
+def test_a_reply_without_a_status_line_falls_back_in_process(
+    bridge, repo, paired
+):
+    listener = socket.create_server(("127.0.0.1", bridge.config["port"]))
+    listener.settimeout(10)
+
+    def close_without_answering():
+        accepted, _ = listener.accept()
+        accepted.recv(65536)
+        accepted.close()
+
+    thread = threading.Thread(target=close_without_answering, daemon=True)
+    thread.start()
+    try:
+        lane = Path(paired["lanes"]["codex"])
+        cwd = {"cwd": str(lane), "session_id": "s1"}
+        served = run_hook(bridge, lane.parent, {**DENY, **cwd})
+    finally:
+        thread.join(timeout=10)
+        listener.close()
+    assert served.returncode == 0, served.stderr
+    assert "Traceback" not in served.stderr
+    decision = json.loads(served.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    recorded = events(lane.parent)
+    assert recorded[0]["reason_class"] == "service_fallback"
+    assert "ValueError: reply has no status line" in recorded[0]["cause"]
+
+
+def test_a_failure_inside_the_served_decision_answers_500(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    def broken(home, request):
+        raise ImportError("cannot import name 'budgets'")
+
+    monkeypatch.setattr(server.checkpoints, "serve", broken)
+    lane = Path(paired["lanes"]["codex"])
+    cwd = {"cwd": str(lane), "session_id": "s1"}
+    served = run_hook(bridge, lane.parent, {**DENY, **cwd})
+    assert served.returncode == 0, served.stderr
+    decision = json.loads(served.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    recorded = events(lane.parent)
+    assert recorded[0]["reason_class"] == "service_fallback"
+    assert "service answered 500" in recorded[0]["cause"]
+    assert "cannot import name 'budgets'" in capsys.readouterr().err
 
 
 def test_a_wrong_credential_is_refused_and_falls_back(
