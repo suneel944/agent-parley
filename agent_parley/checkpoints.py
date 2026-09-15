@@ -101,6 +101,7 @@ class Reason(StrEnum):
     OPERATOR_STOPPED = "operator_stopped"
     OPERATOR_RESTARTED = "operator_restarted"
     PAUSED = "paused"
+    POLLED_DELIVERY = "polled_delivery"
     SERVICE_FALLBACK = "service_fallback"
 
 

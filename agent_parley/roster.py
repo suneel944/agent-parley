@@ -36,6 +36,9 @@ UNAVAILABLE_HOOKS: dict[str, tuple[str, ...]] = {
     ),
 }
 REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
+DELIVERY_HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+HOOK_DELIVERY = "hooks"
+POLLED_DELIVERY = "polled"
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
 BRANCH_PREFIX = re.compile(r"[a-z0-9][a-z0-9/_-]{0,38}")
 DEFAULT_PREFIX = "parley"
@@ -550,6 +553,26 @@ def unavailable_hooks(adapter: str) -> list[str]:
     return [event for event in HOOK_EVENTS if event in missing]
 
 
+def delivery_path(adapter: str) -> str:
+    """Names how coordination reaches a lane driven by one adapter.
+
+    Coordination is delivered at a native turn boundary whenever the CLI
+    raises the events that carry it. An adapter missing any of those events
+    cannot be told mid-session by a hook, so the launcher polls the mailbox
+    for it instead. The distinction belongs to the adapter's event surface,
+    never to a vendor.
+
+    Args:
+        adapter: One of ``ADAPTERS``.
+
+    Returns:
+        ``HOOK_DELIVERY`` when every event in ``DELIVERY_HOOKS`` is
+        available, ``POLLED_DELIVERY`` otherwise.
+    """
+    missing = set(unavailable_hooks(adapter))
+    return POLLED_DELIVERY if missing & set(DELIVERY_HOOKS) else HOOK_DELIVERY
+
+
 def inspect(home: Path) -> dict:
     """Returns every provider definition with its hook availability.
 
@@ -558,12 +581,14 @@ def inspect(home: Path) -> dict:
 
     Returns:
         Every definition ``providers`` returns, each carrying
-        ``unavailable_hooks`` for the adapter it names.
+        ``unavailable_hooks`` and the ``delivery`` path in use for the
+        adapter it names.
     """
     return {
         name: {
             **entry,
             "unavailable_hooks": unavailable_hooks(entry["adapter"]),
+            "delivery": delivery_path(entry["adapter"]),
         }
         for name, entry in providers(home).items()
     }

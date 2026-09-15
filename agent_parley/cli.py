@@ -33,6 +33,7 @@ from agent_parley import (
     budgets,
     checkpoints,
     completion,
+    delivery,
     evidence,
     forecast,
     forge,
@@ -4147,7 +4148,7 @@ A claim, an offer and an acknowledgement can carry a deadline: `issue claim N
 deadline a claim reads overdue and states the seconds over. Nothing is revoked
 and no ownership moves; a blocked report on work you still hold spends one
 attempt of the recorded budget, which is also only reported.
-"""
+{delivery.instructions(self.home, agent, data)}"""
 
     def hooks(self, agent: str, directory: Path) -> dict:
         """Builds native lifecycle hook definitions for a lane.
@@ -5950,11 +5951,18 @@ attempt of the recorded budget, which is also only reported.
             previous.pop("last_prompt", None)
             write_json(activity_path, previous)
             try:
-                if sys.stdin.isatty() or resume:
-                    return terminal.run(
-                        command, lane, env, agent, attached=sys.stdin.isatty()
-                    )
-                return subprocess.call(command, cwd=lane, env=env)
+                with delivery.polling(
+                    self.home, lane.parent, agent, entry["adapter"]
+                ):
+                    if sys.stdin.isatty() or resume:
+                        return terminal.run(
+                            command,
+                            lane,
+                            env,
+                            agent,
+                            attached=sys.stdin.isatty(),
+                        )
+                    return subprocess.call(command, cwd=lane, env=env)
             finally:
                 with lock(lane.parent / f"{agent}-checkpoint.lock", timeout=1):
                     state = json.loads(activity_path.read_text())

@@ -25,6 +25,18 @@ for `amp`, none for the others. A launch refuses an adapter that cannot deliver
 `SessionStart`, `PreToolUse` or `Stop` instead of running without those guards;
 today that refuses `amp` in one sentence naming the missing events.
 
+The same listing prints `delivery`, the path coordination takes into a lane on
+that provider.
+
+| `delivery` | How a lane is told | Which adapters | What it cannot do |
+| --- | --- | --- | --- |
+| `hooks` | a native lifecycle event returns bounded context at a turn boundary | `claude`, `codex`, `copilot`, `gemini`, `opencode` and every preset built on them | nothing further; this is the full path |
+| `polled` | a launcher-owned thread reads the mailbox on an interval and publishes it to `STATE/PROJECT/NAME-delivery.md`, which the lane's prompt tells it to read each turn | any adapter missing `SessionStart`, `UserPromptSubmit`, `PreToolUse` or `Stop`; `amp` today | deny a tool call, hold a turn open, or guarantee the lane reads the file; budget threshold notices are not carried, and a missing required guard still refuses the launch |
+
+`AGENT_PARLEY_DELIVERY_SECONDS` sets the interval for a polled lane, 20s by
+default. Delivery is recorded in that lane's event log like a served
+checkpoint, so `agent-parley top` reports its delivered context in `CONTEXT`.
+
 ## Accounts
 
 `claude`, `codex`, `gemini`, `opencode` and `amp` use their native accounts. The
