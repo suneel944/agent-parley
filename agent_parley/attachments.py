@@ -138,6 +138,64 @@ def used(directory: Path, writer: str) -> int:
     return total
 
 
+def keep(
+    directory: Path,
+    kind: str,
+    identifier: object,
+    text: str,
+    writer: str,
+    readers: list[str],
+) -> str:
+    """Stores one body whole beside the record that refers to it.
+
+    A handoff payload such as a diff is kept in full rather than clipped,
+    because the record refers to it instead of carrying it. The caller decides
+    whether a body is worth keeping; this function only bounds it against the
+    attachment cap and the writer's allowance.
+
+    Args:
+        directory: Private state directory for the common repository.
+        kind: Record kind, one of message, report or offer.
+        identifier: Identifier the attachment is keyed by.
+        text: Full body to retain.
+        writer: Participant that wrote the body.
+        readers: Participants allowed to read it.
+
+    Returns:
+        The reference the record refers to the stored body by.
+
+    Raises:
+        BridgeError: If the body exceeds the attachment cap or the writer's
+            total attachment allowance.
+    """
+    size = len(text.encode())
+    if size > MAX_ATTACHMENT_BYTES:
+        raise BridgeError(
+            f"{kind} body is {size} bytes; an attachment is capped at "
+            f"{MAX_ATTACHMENT_BYTES} bytes."
+        )
+    if used(directory, writer) + size > MAX_LANE_BYTES:
+        raise BridgeError(
+            f"{writer} holds its {MAX_LANE_BYTES}-byte attachment "
+            "allowance; wait for older records to be pruned."
+        )
+    ref = reference(kind, identifier)
+    home = folder(directory)
+    home.mkdir(parents=True, exist_ok=True)
+    write_text(_path(home, ref, "md"), text)
+    write_json(
+        _path(home, ref, "json"),
+        {
+            "reference": ref,
+            "kind": kind,
+            "bytes": size,
+            "writer": writer,
+            "readers": sorted(set(readers)),
+        },
+    )
+    return ref
+
+
 def spill(
     directory: Path,
     kind: str,
@@ -171,33 +229,9 @@ def spill(
         BridgeError: If the body exceeds the attachment cap or the writer's
             total attachment allowance.
     """
-    size = len(text.encode())
-    if size <= cap:
+    if len(text.encode()) <= cap:
         return text, ""
-    if size > MAX_ATTACHMENT_BYTES:
-        raise BridgeError(
-            f"{kind} body is {size} bytes; an attachment is capped at "
-            f"{MAX_ATTACHMENT_BYTES} bytes."
-        )
-    if used(directory, writer) + size > MAX_LANE_BYTES:
-        raise BridgeError(
-            f"{writer} holds its {MAX_LANE_BYTES}-byte attachment "
-            "allowance; wait for older records to be pruned."
-        )
-    ref = reference(kind, identifier)
-    home = folder(directory)
-    home.mkdir(parents=True, exist_ok=True)
-    write_text(_path(home, ref, "md"), text)
-    write_json(
-        _path(home, ref, "json"),
-        {
-            "reference": ref,
-            "kind": kind,
-            "bytes": size,
-            "writer": writer,
-            "readers": sorted(set(readers)),
-        },
-    )
+    ref = keep(directory, kind, identifier, text, writer, readers)
     return bounded(kind, identifier, text, cap), ref
 
 

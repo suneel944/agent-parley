@@ -217,7 +217,12 @@ def render(kind: str, payload: dict) -> str:
 
 
 def offer(value: dict | None) -> dict | None:
-    """Reports one pending handoff offer with its identifier and deadline."""
+    """Reports one pending handoff offer with its identifier and deadline.
+
+    The structured work state travels beside the summary, so one document
+    carries the commit, the reservation keys, the remaining work and the
+    attached diff along with the identifier the recipient answers.
+    """
     if not value:
         return None
     waiting = issues_state.offer_state(value)
@@ -230,6 +235,26 @@ def offer(value: dict | None) -> dict | None:
         "deadline_at": timestamp(waiting["deadline"]),
         "overdue": waiting["overdue"],
         "overdue_seconds": waiting["overdue_seconds"],
+        **issues_state.handoff_fields(value),
+    }
+
+
+def handoff(value: dict | None) -> dict | None:
+    """Reports the work state an accepted handoff moved onto a record.
+
+    Args:
+        value: Accepted handoff recorded on an issue, or None.
+
+    Returns:
+        The lane the work came from, the instant it was accepted and the
+        structured fields it carried, or None for an issue never handed over.
+    """
+    if not value:
+        return None
+    return {
+        "from": value.get("from"),
+        "accepted_at": timestamp(value.get("at")),
+        **issues_state.handoff_fields(value),
     }
 
 
@@ -332,8 +357,9 @@ def issues(state: dict) -> list[dict]:
     Returns:
         One record per issue, carrying its owner, any recorded forge title,
         the issues it waits on, its pending offer with that offer's
-        identifier and source, any unanswered operator request to its owner,
-        and any unanswered completion reminder.
+        identifier, source and structured work state, the handoff it was last
+        accepted through, any unanswered operator request to its owner, and
+        any unanswered completion reminder.
     """
     reported = []
     for number, record in sorted(
@@ -356,6 +382,7 @@ def issues(state: dict) -> list[dict]:
                     int(other) for other in record.get("blocked_by", [])
                 ],
                 "offer": offer(record.get("offer")),
+                "handoff": handoff(record.get("handoff")),
                 "request": request(record.get("request")),
                 "reminder": (
                     {

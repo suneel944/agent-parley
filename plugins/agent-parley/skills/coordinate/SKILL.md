@@ -54,12 +54,28 @@ worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
   `acknowledge_message` and `mark_message_read` all accept one. The same key with
   different arguments is refused, and a refused call replays as the same refusal.
 - To hand off, stop editing the issue and run `agent-parley issue offer NUMBER
-  --to PARTICIPANT --summary "commit, checks, remaining"`.
-  The owner stays paused while the offer is pending.
+  --to PARTICIPANT --summary "what was decided" --remaining "next step"`.
+  Repeat `--remaining` once per item. The owner stays paused while the offer
+  is pending.
+- An offer records the transfer as fields, not only as prose. Beside the
+  summary it carries `commit` (the lane's head), `reservations` (the advisory
+  keys that lane holds), `remaining` (the items given above) and, when the
+  diff against the project base fits the 65,536-byte attachment cap, `diff`
+  and `diff_bytes` naming an attachment to read with `read_attachment`. Each
+  field is best effort: an unreadable head, an unreachable store or an
+  oversized diff records that field empty rather than failing the offer.
+  Read them from `agent-parley issue list --json` or `status --json`; do not
+  re-derive them from the summary.
 - The named recipient reviews the handoff and runs
   `agent-parley issue accept NUMBER --offer-id ID` before starting, or
   `agent-parley issue decline NUMBER --offer-id ID`. Get the current ID from
   `issue list`; cancelled or replaced offers must not be accepted.
+- An acceptance moves those advisory reservations from the offering lane to
+  the accepting one in one store transaction, and reports the keys that moved
+  as `reservations_moved`. The accepted fields stay on the record as
+  `handoff`, naming the lane the work came from. Do not re-reserve a key the
+  acceptance already moved. A decline or a cancel moves nothing: every key
+  stays with the lane that offered.
 - The owner can `agent-parley issue cancel NUMBER` to retain responsibility or
   `agent-parley issue release NUMBER` when responsibility ends. Silence and process
   exits never transfer ownership. Release is not GitHub issue closure or completion.
@@ -77,10 +93,11 @@ that retries with the key it first used records one attempt, not two.
 `agent-parley plan show` prints the recorded work order as a tree: which issues
 wait on which, and who owns each. Read it before choosing work. The edges are
 advisory, so a waiting issue is information, not a gate.
-Reports are agent claims, not independent verification. Handoffs neither transfer
-file reservations nor acknowledge mail. Acknowledge reviewed messages explicitly
-through MCP. Coordinate integration separately; do not infer merge/push authority
-from issue ownership.
+Reports are agent claims, not independent verification. An accepted handoff
+transfers the offering lane's advisory reservations; it never acknowledges
+mail. Acknowledge reviewed messages explicitly through MCP. Coordinate
+integration separately; do not infer merge/push authority from issue
+ownership.
 
 ## Read mail and inspect evidence
 
