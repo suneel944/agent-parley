@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -68,6 +70,25 @@ def test_presence_separates_an_idle_lane_from_a_stopped_one(tmp_path):
     stopped = supervision.presence(tmp_path, "lane")
     assert stopped["state"] == supervision.STOPPED
     assert not stopped["process_alive"]
+
+
+def test_presence_reports_no_age_before_the_first_checkpoint(tmp_path):
+    absent = supervision.presence(tmp_path, "lane")
+    assert absent["state"] == supervision.STOPPED
+    assert absent["last_active"] is None
+    assert absent["age_seconds"] is None
+    write_json(
+        tmp_path / "lane-activity.json",
+        {
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+            "activity": "working",
+        },
+    )
+    started = supervision.presence(tmp_path, "lane", 30)
+    assert started["state"] == supervision.ACTIVE
+    assert started["process_alive"]
+    assert started["age_seconds"] is None
 
 
 def test_send_reports_unreachable_and_status_lists_ack_age(
@@ -327,3 +348,51 @@ def test_stopped_resume_keeps_native_interactive_permissions(
         "bypass" in argument or "skip-permission" in argument
         for argument in captured[0]
     )
+
+
+def test_reaping_collects_an_exited_launcher_without_blocking():
+    exited = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    running = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        supervision.track_launcher(exited)
+        supervision.track_launcher(running)
+        exited.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while supervision.reap_launchers() > 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert exited.returncode == 0
+        assert running.poll() is None
+        assert not zombies_of(os.getpid())
+    finally:
+        running.kill()
+        running.wait(timeout=10)
+        supervision.reap_launchers()
+
+
+def zombies_of(parent):
+    found = []
+    if not Path("/proc").is_dir():
+        return found
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[0] == "Z" and fields[1] == str(parent):
+            found.append(int(entry.name))
+    return found

@@ -33,6 +33,36 @@ ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
 
+_LAUNCHERS: list[subprocess.Popen[bytes]] = []
+_LAUNCHERS_LOCK = threading.Lock()
+
+
+def track_launcher(child: subprocess.Popen[bytes]) -> None:
+    """Records a launcher a wake attempt started so it can be reaped.
+
+    The service is the parent of every launcher it starts, so an exited
+    launcher stays a zombie until its status is collected.
+
+    Args:
+        child: The launcher process to reap on a later sweep.
+    """
+    with _LAUNCHERS_LOCK:
+        _LAUNCHERS.append(child)
+
+
+def reap_launchers() -> int:
+    """Collects the launchers that exited since the previous sweep.
+
+    The sweep never blocks: each launcher is polled once and a running
+    launcher is kept for the next sweep.
+
+    Returns:
+        The number of tracked launchers still running.
+    """
+    with _LAUNCHERS_LOCK:
+        _LAUNCHERS[:] = [child for child in _LAUNCHERS if child.poll() is None]
+        return len(_LAUNCHERS)
+
 
 def settings(value: dict) -> dict:
     """Validates supervision settings stored outside the repository."""
@@ -72,20 +102,28 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         its latest native checkpoint is no older than the threshold, `IDLE`
         once that checkpoint has aged past the threshold while the process is
         still alive, and `STOPPED` when the recorded session process is gone.
+        A lane that has recorded no native activity yet reports `last_active`
+        and `age_seconds` as `None` rather than an age measured from the Unix
+        epoch, and reads as `ACTIVE` while its process is alive, because a
+        lane that has never checked in has not been quiet for any span a
+        threshold can be compared against.
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
     alive = process.alive(value.get("session_pid"), value.get("session_ticks"))
-    age = max(0, time.time() - value.get("updated", 0))
+    recorded = value.get("updated")
+    age = None if recorded is None else max(0.0, time.time() - recorded)
     if not alive:
         state = STOPPED
+    elif age is None or age <= inactive_after:
+        state = ACTIVE
     else:
-        state = ACTIVE if age <= inactive_after else IDLE
+        state = IDLE
     return {
         "state": state,
         "process_alive": alive,
-        "last_active": value.get("updated"),
-        "age_seconds": int(age),
+        "last_active": recorded,
+        "age_seconds": None if age is None else int(age),
     }
 
 
@@ -968,9 +1006,9 @@ def wake(
     state = json.loads(path.read_text()) if path.exists() else {}
     if state.get("activity") not in {"idle", "stopped"}:
         return
-    if (
-        observed["process_alive"]
-        and observed["age_seconds"] < config["inactive_after"]
+    if observed["process_alive"] and (
+        observed["age_seconds"] is None
+        or observed["age_seconds"] < config["inactive_after"]
     ):
         return
     with store.connect(home) as db:
@@ -1037,6 +1075,7 @@ def wake(
                         stderr=output,
                         start_new_session=True,
                     )
+                track_launcher(child)
                 result = f"resume requested (launcher {child.pid})"
         write_json(
             wake_path,
@@ -1080,4 +1119,5 @@ def run(home: Path, stopped: threading.Event) -> None:
                 interval = configuration(home, manifest)["interval"]
                 poll(home, path.parent)
             deadlines[path] = time.monotonic() + interval
+        reap_launchers()
         stopped.wait(1)
