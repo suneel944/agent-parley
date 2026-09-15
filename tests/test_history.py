@@ -134,7 +134,9 @@ def test_history_of_a_claim_follows_one_piece_of_work(bridge, repo, paired):
     assert first != second
 
 
-def test_records_without_a_recorded_claim_report_unknown(bridge, repo, paired):
+def test_records_without_a_recorded_claim_carry_no_claim_suffix(
+    bridge, repo, paired
+):
     actor = registered(bridge, paired, "claude")
     registered(bridge, paired, "codex")
     store.call(
@@ -153,7 +155,17 @@ def test_records_without_a_recorded_claim_report_unknown(bridge, repo, paired):
         record for record in reported["records"] if record["kind"] == "message"
     )
     assert message["claim_id"] is None
-    assert "claim unknown" in history.describe([message])
+    rendered = history.describe([message])
+    assert "; claim" not in rendered
+    held = [
+        {
+            "participant": "claude",
+            "seconds": 12,
+            "ended": None,
+            "claim_id": "c-1",
+        }
+    ]
+    assert "; claim c-1" in history.describe([], held)
 
 
 def test_filters_and_windows_narrow_the_listing(bridge, repo, paired):

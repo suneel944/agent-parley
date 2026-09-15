@@ -8,10 +8,16 @@ the repository owner can carry out.
 
 Repository installation does not imply public directory approval. The Codex
 listing went live on 2026-09-14 at
-`https://chatgpt.com/plugins/plugins_6aa7c91c25008191ad715f14756e5deb`; the
-Claude submission was made the same day and is awaiting review.
+`https://chatgpt.com/plugins/plugins_6aa7c91c25008191ad715f14756e5deb`, and
+the submission archive has been attached to the v0.6.0, v0.7.0 and v0.8.0
+releases; each new version still needs a manual portal upload, because neither
+catalog offers a publishing API. The Claude submission was made on 2026-09-14
+and was still awaiting review on 2026-09-15; the plugin does not yet appear in
+`claude-plugins-official`.
 Nothing in this document submits a listing, and continuous integration builds
-artifacts rather than filling review forms.
+artifacts rather than filling review forms. Restate the two paragraphs above
+whenever the listing state changes; a stale status here is the defect this
+section keeps producing.
 See the `## Plugins` section of `docs/operations.md` for the installation path
 this listing would describe.
 
@@ -92,6 +98,12 @@ confirm the stated expectation before opening either form.
   `uv run --locked python scripts/check_policy.py`
 - The Codex submission archive builds from the repository.
   `make codex-bundle`
+- The published release carries that archive as an asset, so the portal upload
+  starts from a released artifact rather than a local build.
+  `gh release view vVERSION --json assets`
+- Neither manifest passes `claude plugin validate --strict`; the single
+  `protocol` warning is expected and the gate runs without `--strict`.
+  `uv run --locked python scripts/check_policy.py`
 - The `coordinate` skill carries YAML frontmatter with `name` and
   `description`.
   `head -5 plugins/agent-parley/skills/coordinate/SKILL.md`
@@ -135,8 +147,25 @@ Validating marketplace manifest: /home/dev/agent-parley/.claude-plugin/marketpla
 ✔ Validation passed
 ```
 
-Both commands exited zero with no warnings, and both still pass under
-`--strict`, which turns unrecognized manifest fields into errors.
+Both commands exited zero with no warnings. Neither passes under `--strict`.
+
+`--strict` turns an unrecognized manifest field into an error, and the
+compatibility contract added a `protocol` field to
+`.claude-plugin/plugin.json` after the evidence above was captured. Checked
+on 2026-09-15 with the installed client:
+
+```text
+$ claude plugin validate --strict --json plugins/agent-parley
+"success": false ... "Unknown field 'protocol'. Claude Code ignores it at load time."
+$ claude plugin validate --strict --json .
+"success": false ... same warning through plugins[0]
+```
+
+The field is deliberate and the client ignores it at load time, so the policy
+gate runs the validator without `--strict` and tolerates exactly that one
+warning. The `## Plugins` section of `docs/operations.md` records why the
+field is carried. Do not add `--strict` to the gate to make this section
+read better; the field is the contract.
 
 ## Listing metadata
 
