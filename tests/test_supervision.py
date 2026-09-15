@@ -162,6 +162,42 @@ def test_live_idle_wakes_are_bounded_without_acknowledging(
     )
 
 
+def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    write_json(
+        lane.parent / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+    answers = iter(["busy"] * 4 + ["accepted"] * 5)
+    calls = []
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda *args: calls.append(args) or next(answers),
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(lane.parent, "codex", 1)
+    path = lane.parent / "codex-wake.json"
+    for _ in range(9):
+        supervision.wake(
+            bridge.home, lane.parent, paired, "codex", observed, config
+        )
+        record = json.loads(path.read_text())
+        record["at"] = 0
+        write_json(path, record)
+    assert len(calls) == 7
+    assert json.loads(path.read_text())["attempts"] == 3
+
+
 def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
     registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent
