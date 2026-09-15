@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import threading
 from pathlib import Path
 
 from agent_parley.forge import FORGES
@@ -462,6 +463,50 @@ PAUSED_REASON = (
 )
 
 
+_LOCATIONS: dict[tuple[str, str], tuple[Path, tuple[int, int]]] = {}
+_LOCATIONS_LOCK = threading.Lock()
+
+
+def _manifest_stamp(path: Path) -> tuple[int, int] | None:
+    """Returns a change stamp for a manifest, or None when it is gone.
+
+    Args:
+        path: Manifest file to stamp.
+
+    Returns:
+        Modification time in nanoseconds and size, or None when the manifest
+        cannot be stated.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _index_projects(home: Path) -> dict[str, tuple[Path, tuple[int, int]]]:
+    """Reads every registered manifest under a home and keys it by root.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        Mapping of canonical project root to its state directory and stamp.
+    """
+    index: dict[str, tuple[Path, tuple[int, int]]] = {}
+    for path in (home / "projects").glob("*/project.json"):
+        stamp = _manifest_stamp(path)
+        if stamp is None:
+            continue
+        try:
+            root = json.loads(path.read_text()).get("root")
+        except (OSError, ValueError):
+            continue
+        if isinstance(root, str):
+            index[root] = (path.parent, stamp)
+    return index
+
+
 def locate(home: Path, root: str) -> Path | None:
     """Finds the private state directory a project root was registered under.
 
@@ -470,6 +515,11 @@ def locate(home: Path, root: str) -> Path | None:
     canonical root instead, so the registered manifests are matched on that
     root rather than the key being recomputed without a checkout.
 
+    The match is cached per home and root and confirmed with a single stat of
+    the matched manifest. A manifest that was rewritten, renamed or removed
+    fails that confirmation and the manifests are read again, so a project
+    registered or unregistered while the service runs is still resolved.
+
     Args:
         home: Private bridge state root.
         root: Canonical project key recorded in the manifest.
@@ -477,13 +527,21 @@ def locate(home: Path, root: str) -> Path | None:
     Returns:
         The project state directory, or None when no manifest names that root.
     """
-    for path in (home / "projects").glob("*/project.json"):
-        try:
-            if json.loads(path.read_text()).get("root") == root:
-                return path.parent
-        except (OSError, ValueError):
-            continue
-    return None
+    key = (str(home), root)
+    with _LOCATIONS_LOCK:
+        cached = _LOCATIONS.get(key)
+    if cached is not None:
+        directory, stamp = cached
+        if _manifest_stamp(directory / "project.json") == stamp:
+            return directory
+    index = _index_projects(home)
+    with _LOCATIONS_LOCK:
+        for known in [entry for entry in _LOCATIONS if entry[0] == key[0]]:
+            del _LOCATIONS[known]
+        for found_root, entry in index.items():
+            _LOCATIONS[(key[0], found_root)] = entry
+    located = index.get(root)
+    return located[0] if located else None
 
 
 def paused(home: Path, root: str, display: str) -> bool:

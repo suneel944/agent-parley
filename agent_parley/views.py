@@ -462,6 +462,93 @@ def participants(manifest: dict) -> list[dict]:
     ]
 
 
+def issue_detail(
+    state: dict, number: int, reservations: list[str], reported: dict
+) -> dict:
+    """Reports one issue with its ownership, its blockers and its history.
+
+    Args:
+        state: Published issue ledger.
+        number: Issue the reading was taken for.
+        reservations: Advisory reservation keys the current owner holds.
+        reported: History reading for the same issue.
+
+    Returns:
+        The ledger record for that issue, or None where the ledger has never
+        recorded it, beside the reservations its owner holds and every
+        recorded record and ownership generation.
+    """
+    records = issues(state)
+    found = [record for record in records if record["issue"] == number]
+    return {
+        "issue": number,
+        "revision": state["revision"],
+        "record": found[0] if found else None,
+        "reservations": list(reservations),
+        "history": history(reported),
+    }
+
+
+def participant_detail(record: dict, participant: dict) -> dict:
+    """Reports one lane's reading beside the roster entry that defines it.
+
+    Args:
+        record: One lane record from the status reading.
+        participant: Roster entry for the same participant.
+
+    Returns:
+        Every field the status reading carries for that lane, with the
+        worktree, the advisory limits and the wake setting the manifest
+        records. No credential value is reported; a profile name is not a
+        credential.
+    """
+    return {
+        **record,
+        "worktree": participant["lane"],
+        "budget_limits": participant.get("budget") or {},
+        "wake_enabled": participant.get("wake", True),
+    }
+
+
+def provider_detail(name: str, entry: dict) -> dict:
+    """Reports one provider definition with the name it is selected by."""
+    return {"provider": name, **entry}
+
+
+def redacted(values: dict) -> list[str]:
+    """Reports environment overrides by name, never by value.
+
+    Args:
+        values: Recorded overrides, keyed by environment variable name.
+
+    Returns:
+        One ``NAME=<redacted>`` entry per override in name order, so a
+        profile can be read on a shared terminal without printing what it
+        carries.
+    """
+    return [f"{name}=<redacted>" for name in sorted(values)]
+
+
+def credential_detail(name: str, entry: dict) -> dict:
+    """Reports one account profile with every recorded value redacted.
+
+    Args:
+        name: Profile name used by ``run --credentials``.
+        entry: Stored profile.
+
+    Returns:
+        The config home the native CLI signs in under, the override names the
+        launcher sets, and the variables it requires from the caller's shell.
+        No recorded value is reported.
+    """
+    return {
+        "credential": name,
+        "config_home": entry.get("home", ""),
+        "env": redacted(entry.get("env") or {}),
+        "require_env": list(entry.get("require_env") or []),
+    }
+
+
 def _count(value: object) -> int | None:
     """Reports a mail count, or None where the mailbox could not be read."""
     return value if isinstance(value, int) else None

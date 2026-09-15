@@ -116,6 +116,13 @@ agent-parley problems # only what needs you now, oldest first
 agent-parley say claude-2 "Rebase onto main before you open the pull request."
 ```
 
+`agent-parley` on its own prints the grouped command list, `agent-parley
+--version` prints the installed version, and `agent-parley version` adds the
+state directory in use. One thing at a time reads through a `show` verb —
+`issue show 42`, `participant show claude-2`, `provider show claude`,
+`credentials show work` — and `mail list` prints the inbox without a search
+query. Every one of them accepts `--json`.
+
 When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
 
@@ -142,6 +149,10 @@ and the setup command every new lane runs.
   gate. Both mark the lane and stop nothing.
 - **Reservations are advisory.** Conflicts name the blocking owner and that
   owner's declared reason; nothing on disk is locked.
+- **Mail stays private; a decision does not.** Only a message a lane marks as a
+  decision, or one an operator records with `agent-parley decide`, enters the
+  project-wide log every lane can search, so a third lane stops repeating a
+  settled question.
 - **Your history stays yours.** No lane signs its work, and a commit, merge,
   tag or pull request that credits an assistant is denied before it lands, with
   no flag that skips the check.

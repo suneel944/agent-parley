@@ -89,6 +89,18 @@ def test_a_clear_estate_prints_one_line_and_exits_zero(
     assert out.startswith("No problems")
 
 
+def test_a_lane_that_never_checked_in_carries_no_age_and_no_row(
+    bridge, repo, paired, served
+):
+    lanes = bridge.status_snapshot()["projects"][0]["participants"]
+    assert lanes
+    for record in lanes:
+        assert record["availability"]["last_active_at"] is None
+        assert record["availability"]["age_seconds"] is None
+    assert not rows(bridge, problems.INACTIVE)
+    assert not bridge.problems()
+
+
 def test_a_stopped_service_is_a_row_that_exits_one(
     bridge, repo, paired, monkeypatch, capsys
 ):
