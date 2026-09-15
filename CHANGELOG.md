@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.1](https://github.com/suneel944/agent-parley/compare/v0.9.0...v0.9.1) (2026-09-15)
+
+
+### Bug fixes
+
+* bring the coordination service back after a reboot or a drift exit (#307) ([#298](https://github.com/suneel944/agent-parley/issues/298))
+* make the service report its lifecycle and bound a served decision (#308) ([#299](https://github.com/suneel944/agent-parley/issues/299)) ([#300](https://github.com/suneel944/agent-parley/issues/300))
+* ship the plugin manifests inside the wheel so doctor reads a protocol (#306) ([#297](https://github.com/suneel944/agent-parley/issues/297))
+
 ## [0.9.0](https://github.com/suneel944/agent-parley/compare/v0.8.0...v0.9.0) (2026-09-15)
 
 

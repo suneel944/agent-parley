@@ -225,6 +225,7 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
+| 0.9.1 | 1 | 8 |
 | 0.9.0 | 1 | 8 |
 | 0.8.0 | 1 | 8 |
 | 0.7.0 | 1 | 8 |
