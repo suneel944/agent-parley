@@ -20,6 +20,9 @@ runs `participant merge`, and never on an agent's behalf.
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
+| `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
+| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
+| `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
@@ -176,8 +179,8 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. `gemini.py` translates the additional native hook
-contract. `evidence.py` collects retained claim-window measurements and writes
+the existing session lock. `gemini.py`, `copilot.py` and `opencode.py`
+translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in
 the launch and forge paths.
@@ -247,7 +250,7 @@ unpinned numeric PID.
 
 A provider states which native CLI drives a participant and how that CLI reaches
 a model. Coordination needs an MCP server, a system prompt and lifecycle hooks,
-and four contracts implement that, so every provider names one of the four
+and five contracts implement that, so every provider names one of the five
 adapters and its executable must accept that contract in full. `claude` and
 `codex` take all three as command-line arguments of the session the launcher
 starts, so nothing is written into a configuration file the operator also owns
@@ -266,11 +269,22 @@ than that vendor's own agent CLI. The `deepseek`, `kimi` and `grok` presets carr
 `agent-parley provider add` defines further providers locally.
 
 Gemini CLI uses a lane-private system settings overlay that preserves native
-system policy, with translated hook input and output in `gemini.py`.
-OpenCode extends sessions through JavaScript plugins rather than hook commands, and Amp
-accepts no system-prompt argument. None of them is a preset and none is drivable
-by naming it as a provider executable; `docs/operations.md` records each one's
-configuration surface.
+system policy, with translated hook input and output in `gemini.py`. OpenCode
+extends sessions through JavaScript plugins rather than hook commands, so
+`opencode.py` copies the user's configuration directory into a lane-private
+one, adds the MCP server, and writes one plugin that spawns the configured
+hook command for each native plugin event; its results are translated back
+into the plugin's fields. Both overlays live under the private state root,
+are rebuilt from the native source on every launch, so a crashed or edited
+overlay never carries into the next session, and are removed by
+`participant retire`, which also strips a retired `copilot` lane's hooks from
+its profile directory. No adapter shares a settings-file abstraction because
+no two of these CLIs share a stable file contract. Each adapter declares the
+lifecycle events its CLI cannot raise; `provider list` reports them as
+`unavailable_hooks`, and the launcher refuses an adapter that lacks a required
+guard rather than claiming enforcement. Amp accepts no system-prompt argument,
+is not a preset and is not drivable by naming it as a provider executable;
+`docs/operations.md` records its configuration surface.
 
 A credential profile selects one account by pointing the CLI's config-home
 variable at a separate directory, so the same provider can run twice under

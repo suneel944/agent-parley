@@ -11,7 +11,24 @@ from pathlib import Path
 from agent_parley.forge import FORGES
 from agent_parley.state import BridgeError, lock, write_json
 
-ADAPTERS = ("claude", "codex", "copilot", "gemini")
+ADAPTERS = ("claude", "codex", "copilot", "gemini", "opencode")
+HOOK_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+    "SessionEnd",
+)
+UNAVAILABLE_HOOKS: dict[str, tuple[str, ...]] = {
+    "claude": (),
+    "codex": (),
+    "copilot": (),
+    "gemini": ("PermissionRequest",),
+    "opencode": ("SessionEnd",),
+}
+REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
 BRANCH_PREFIX = re.compile(r"[a-z0-9][a-z0-9/_-]{0,38}")
 DEFAULT_PREFIX = "parley"
@@ -86,6 +103,13 @@ PRESETS: dict[str, dict] = {
         "adapter": "gemini",
         "command": "gemini",
         "home_env": "GEMINI_CLI_HOME",
+        "env": {},
+        "require_env": [],
+    },
+    "opencode": {
+        "adapter": "opencode",
+        "command": "opencode",
+        "home_env": "OPENCODE_CONFIG_DIR",
         "env": {},
         "require_env": [],
     },
@@ -497,6 +521,40 @@ def providers(home: Path) -> dict:
     return _registry(home, PROVIDERS, PRESETS)
 
 
+def unavailable_hooks(adapter: str) -> list[str]:
+    """Names the lifecycle events an adapter's native CLI cannot deliver.
+
+    Args:
+        adapter: One of ``ADAPTERS``.
+
+    Returns:
+        Shared checkpoint event names in ``HOOK_EVENTS`` order that no hook
+        of that adapter can raise, so inspection shows the gap rather than
+        implying every guard is enforced.
+    """
+    missing = UNAVAILABLE_HOOKS.get(adapter, HOOK_EVENTS)
+    return [event for event in HOOK_EVENTS if event in missing]
+
+
+def inspect(home: Path) -> dict:
+    """Returns every provider definition with its hook availability.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        Every definition ``providers`` returns, each carrying
+        ``unavailable_hooks`` for the adapter it names.
+    """
+    return {
+        name: {
+            **entry,
+            "unavailable_hooks": unavailable_hooks(entry["adapter"]),
+        }
+        for name, entry in providers(home).items()
+    }
+
+
 def remove(home: Path, kind: str, name: str) -> None:
     """Removes a local definition while preserving native account files.
 
@@ -562,7 +620,7 @@ def define_provider(
     Args:
         home: Private bridge state root.
         name: Provider name used by `agent-parley run --provider`.
-        adapter: Native CLI contract, claude or codex.
+        adapter: Native CLI contract, one of ``ADAPTERS``.
         command: Executable resolved on PATH at launch.
         home_env: Variable that points the CLI at a per-account config home.
         require_env: Variables the launcher requires from the caller's shell.
@@ -577,9 +635,9 @@ def define_provider(
     identifier(name, "Provider name")
     if adapter not in ADAPTERS:
         raise BridgeError(
-            "Agent Parley supplies MCP configuration and lifecycle hooks as "
-            "native command-line arguments, which only these invocation "
-            f"contracts accept; adapter must be one of: {', '.join(ADAPTERS)}."
+            "Agent Parley supplies MCP configuration and lifecycle hooks "
+            "through one native configuration contract per CLI; adapter "
+            f"must be one of: {', '.join(ADAPTERS)}."
         )
     if not command.strip() or "\x00" in command or len(command) > 240:
         raise BridgeError("Provider command must be an executable name.")

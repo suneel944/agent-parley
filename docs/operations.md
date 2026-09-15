@@ -1172,9 +1172,55 @@ checkpoint hooks, and selects that overlay with
 `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Native user/project settings and authentication
 remain in effect. Credential profiles may select `GEMINI_CLI_HOME`, whose
 `.gemini` subdirectory holds that account's native configuration. Existing
-explicit provider definitions are preserved. The integration follows Gemini's
-[configuration](https://geminicli.com/docs/reference/configuration/) and
-[hook contracts](https://geminicli.com/docs/hooks/reference/).
+explicit provider definitions are preserved: a local definition named `gemini`
+that rides the `claude` or `codex` adapter through a vendor endpoint shadows
+the native preset and keeps working unchanged, `provider list` prints the
+definition that is in force, and `provider remove gemini` reveals the native
+preset again. Nothing rewrites such a definition. The integration follows
+Gemini's [configuration](https://geminicli.com/docs/reference/configuration/)
+and [hook contracts](https://geminicli.com/docs/hooks/reference/). Gemini has
+no `PermissionRequest` hook, so `provider list` reports it under
+`unavailable_hooks`; approval prompts remain Gemini's own.
+
+The overlay is written under the private state root as
+`<participant>-gemini-settings.json`, never into the repository or the native
+directories, and is rebuilt from the native policy on every launch, so a
+corrupt or stale overlay left by a crash is replaced rather than reused.
+`participant retire` deletes it. A native policy that disables hooks refuses
+the launch with that reason instead of starting an unguarded session.
+
+The `opencode` preset starts the native OpenCode CLI. OpenCode reads
+`opencode.json` from the directory `OPENCODE_CONFIG_DIR` names and loads
+JavaScript plugins from `plugin/` beside it; it has no hook command contract.
+The launcher copies that directory's `opencode.json` into a lane-private
+directory `<participant>-opencode/` under the private state root, adds the
+lane's server under `mcp` as a `remote` entry whose bearer header is
+`{env:AGENT_PARLEY_TOKEN}`, writes `plugin/agent-parley.js`, and points
+`OPENCODE_CONFIG_DIR` at the copy for that launch only. Every other key is
+carried unchanged and the source directory is never written. OpenCode keeps
+its credentials in its own data directory, outside the configuration
+directory, so authentication is untouched; a credential profile may select
+`OPENCODE_CONFIG_DIR` to choose the configuration that is copied. A
+configuration that already defines `agent_parley`, or that exists only as
+`opencode.jsonc`, refuses the launch with the fix named. The overlay is rebuilt
+on every launch and removed by `participant retire`.
+
+The plugin maps OpenCode's plugin events onto the shared checkpoint events:
+`session.created` to `SessionStart`, `chat.message` to `UserPromptSubmit`,
+`tool.execute.before` to `PreToolUse`, `tool.execute.after` to `PostToolUse`,
+`permission.ask` to `PermissionRequest` and `session.idle` to `Stop`. For each
+it spawns the configured hook command with `--adapter opencode`, and
+`opencode.py` translates the event and the `agent_parley_*` tool names for the
+shared parser and flattens the result to `decision`, `reason` and `context`.
+A denied `tool.execute.before` is raised as an error inside the plugin, which
+is how an OpenCode plugin refuses a tool call; a blocked `session.idle` posts
+the reason back into the session as the next prompt; `context` is appended to
+the user's message parts. The plugin never sets a `permission.ask` status, so
+OpenCode's own approval prompt is left to the user. OpenCode raises no end of
+session event, so `SessionEnd` is reported under `unavailable_hooks`. Resume
+passes the recorded session as `--session ID`. Plugins in the user's global
+`plugin/` directory are not carried into the overlay; project `.opencode/`
+configuration still applies because OpenCode reads it from the worktree.
 
 Credential profiles point a provider's config-home variable at a separate
 directory so one provider can run under several accounts. Define one profile per
@@ -1187,7 +1233,7 @@ names look like credentials.
 ## Other agent CLIs
 
 Agent Parley hands the native CLI its MCP server, the coordination prompt and
-its lifecycle hooks at launch. Three contracts implement that, and `--adapter`
+its lifecycle hooks at launch. Five contracts implement that, and `--adapter`
 names the one to use:
 
 | Adapter | MCP server | Coordination prompt | Hooks |
@@ -1195,6 +1241,14 @@ names the one to use:
 | `claude` | `--mcp-config FILE` | `--append-system-prompt TEXT` | `--settings '{"hooks":…}'` |
 | `codex` | `-c mcp_servers.agent_parley.url=…` | appended to the prompt argument | `-c hooks.EVENT=…` |
 | `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-p` argument | `hooks` in `settings.json` there |
+| `gemini` | `mcpServers` in the lane-private system settings overlay | prepended to `--prompt-interactive` | `hooks` in that overlay, `--adapter gemini` |
+| `opencode` | `mcp` in the lane-private `opencode.json` | prepended to `--prompt` | `plugin/agent-parley.js` in the lane-private directory, `--adapter opencode` |
+
+`agent-parley provider list` prints `unavailable_hooks` for every definition,
+naming the shared events that adapter's CLI cannot raise. A launch refuses an
+adapter that cannot deliver `SessionStart`, `PreToolUse` or `Stop`, with the
+missing events named, rather than starting a lane whose branch, claim and
+turn guards would silently never run.
 
 A provider's `--executable` therefore has to accept every argument of the
 contract its adapter names. The `copilot` adapter is the file-configured one:
@@ -1219,14 +1273,38 @@ result rather than inside `hookSpecificOutput`, so the adapter flattens the
 shared output into those fields. It never answers a native approval prompt and
 never grants a permission Copilot refused.
 
-The launch path and the hook wire contract were exercised against a stub
-executable and by running the exact configured hook command with native
-payloads, not against a live Copilot session, so argument handling, file
-handling and hook translation are verified while live model behavior is not.
+A relaunch appends no duplicate hook; `participant retire` removes only that
+lane's hook entries from the profile's `settings.json`, leaves the operator's
+own and other lanes' entries in place, and drops the `agent_parley` server
+from `mcp-config.json` once no lane hook remains. A lane that crashed leaves
+its entries until it is relaunched or retired; they point only at that lane's
+private state.
 
-OpenCode and Amp remain uncovered, each for a different reason
-recorded below. `agent-parley provider add` will store a definition naming one
-of them, because the command is only resolved on `PATH` at launch, but the
+### Stub verification and live trials
+
+Every adapter's launch path and hook wire contract is verified by tests that
+run the real launcher against a stub executable, read the configuration the
+launcher generated, register through the local MCP service and run the exact
+configured hook command with native-format payloads, covering session
+identity, denial output, approval requests and resume without a recorded
+session. That verifies argument handling, file handling and hook translation.
+It does not verify live model behaviour, and the following points need a live
+trial with the native CLI installed and signed in:
+
+| CLI | Verified against a stub | Needs a live trial |
+| --- | --- | --- |
+| Gemini CLI | overlay contents, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` selection, every `hooks` event runs the command, denial and context schema | that Gemini honours `decision: deny` from a `BeforeTool` hook in a system overlay, and `--resume ID` |
+| Copilot CLI | `mcp-config.json` and `settings.json` merge, PascalCase event payloads, flat result schema, retire cleanup | that a `PreToolUse` `permissionDecision: deny` stops the tool, and `--resume ID`; #173 tracks the payload contract |
+| OpenCode | `opencode.json` copy and `mcp` entry, plugin file and its embedded command, event and tool-name translation, `--session ID` on resume | that OpenCode loads `plugin/agent-parley.js` from `OPENCODE_CONFIG_DIR`, that `{env:AGENT_PARLEY_TOKEN}` is substituted in `headers`, that a thrown error in `tool.execute.before` refuses the call, and that `client.session.prompt` delivers a blocked-stop reason |
+
+Record the outcome of a live trial in the issue that requested it, with the
+CLI version, and file a gap as its own issue. Operator recovery after a lane
+loses its session is #153 and saved-session recovery is #175; both apply to
+every adapter, since each one records the native session identifier the same
+way through `SessionStart`.
+
+Amp remains uncovered. `agent-parley provider add` will store a definition
+naming it, because the command is only resolved on `PATH` at launch, but the
 resulting session fails inside the native CLI. There is no flag that makes it
 work and none should be added.
 
@@ -1234,15 +1312,13 @@ work and none should be added.
 | --- | --- | --- | --- |
 | Gemini CLI | lane-private system settings overlay | translated native hooks | `GEMINI_CLI_HOME` |
 | Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `hooks` in `$COPILOT_HOME/settings.json` | `COPILOT_HOME` |
-| OpenCode | `mcp` in `opencode.json`, or `opencode mcp add` | JavaScript plugins only | `OPENCODE_CONFIG_DIR` |
+| OpenCode | `mcp` in the lane-private `opencode.json` | `plugin/agent-parley.js` spawning the hook command | `OPENCODE_CONFIG_DIR` |
 | Amp | `--mcp-config`, or `amp.mcpServers` in its settings file | `amp.hooks` in its settings file | `--settings-file`, `AMP_SETTINGS_FILE` |
 
-Copilot CLI and Gemini CLI have native adapters. The other two do not.
-Amp accepts `--mcp-config`, but it has no `--append-system-prompt`, and its
+Copilot CLI, Gemini CLI and OpenCode have native adapters. Amp does not:
+it accepts `--mcp-config`, but it has no `--append-system-prompt`, and its
 settings arrive through `--settings-file` rather than `--settings`, so two
-thirds of the `claude` contract is rejected. OpenCode extends sessions through
-JavaScript plugins rather than hook commands, so lane checkpoints and the
-enforcement record would have no way to run.
+thirds of the `claude` contract is rejected.
 
 ## Recovery and teardown
 

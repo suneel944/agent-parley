@@ -11,6 +11,7 @@ import pytest
 
 from agent_parley import copilot, roster, store
 from agent_parley.cli import COPILOT_EVENTS, main
+from agent_parley.state import BridgeError
 
 STUB = (
     "#!/usr/bin/env python3\n"
@@ -173,3 +174,42 @@ def test_shared_output_is_flattened_into_copilot_fields():
         {"decision": "block", "reason": "Restore branch"}
     ) == {"decision": "block", "reason": "Restore branch"}
     assert copilot.response({}) == {}
+
+
+def test_resume_without_a_recorded_session_is_refused(lane, bridge, repo):
+    with pytest.raises(BridgeError, match="No usable native session"):
+        bridge.launch(
+            "helper", repo, "Continue", "copilot", "work", resume=True
+        )
+
+
+def test_a_relaunch_adds_no_duplicate_hooks_and_retire_removes_them(
+    lane, bridge, repo, tmp_path
+):
+    account = tmp_path / "copilot-account"
+    settings_path = account / "settings.json"
+    before = json.loads(settings_path.read_text())
+    before["hooks"]["PreToolUse"].insert(
+        0, {"type": "command", "bash": "operator-policy", "timeoutSec": 1}
+    )
+    settings_path.write_text(json.dumps(before))
+    assert bridge.launch("helper", repo, "Coordinate", "copilot", "work") == 0
+    after = json.loads(settings_path.read_text())
+    assert after["hooks"] == before["hooks"]
+    assert bridge.launch("second", repo, "Coordinate", "copilot", "work") == 0
+    bridge.retire(repo, "helper")
+    settings = json.loads(settings_path.read_text())
+    assert settings["hooks"]["PreToolUse"][0]["bash"] == "operator-policy"
+    assert all(
+        "--participant second" in entry["bash"]
+        for entry in settings["hooks"]["PreToolUse"][1:]
+    )
+    servers = json.loads((account / "mcp-config.json").read_text())
+    assert "agent_parley" in servers["mcpServers"]
+    bridge.retire(repo, "second")
+    settings = json.loads(settings_path.read_text())
+    assert settings["hooks"]["PreToolUse"] == [
+        {"type": "command", "bash": "operator-policy", "timeoutSec": 1}
+    ]
+    servers = json.loads((account / "mcp-config.json").read_text())
+    assert "agent_parley" not in servers["mcpServers"]
