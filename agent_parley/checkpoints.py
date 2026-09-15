@@ -799,6 +799,42 @@ def branch_head(repo: Path, branch: str) -> str:
     return "" if result.returncode else result.stdout.strip()
 
 
+def recorded_branch(lane: Path) -> str:
+    """Reads a lane's branch from its checkout metadata without running Git.
+
+    A bridge lane is a linked worktree whose ``.git`` entry is a file naming
+    the administrative directory that holds this checkout's ``HEAD``. A plain
+    checkout keeps ``HEAD`` inside its own ``.git`` directory. Both are read
+    here so a status frame costs one small file read per lane instead of a
+    process spawn.
+
+    Args:
+        lane: Assigned bridge worktree.
+
+    Returns:
+        The branch name, a detached-HEAD marker, or an empty string when the
+        metadata is missing or is not in the documented format, which leaves
+        the decision to the caller.
+    """
+    marker = lane / ".git"
+    try:
+        if marker.is_file():
+            pointer = marker.read_text().strip()
+            if not pointer.startswith("gitdir:"):
+                return ""
+            directory = Path(pointer.removeprefix("gitdir:").strip())
+            if not directory.is_absolute():
+                directory = lane / directory
+        else:
+            directory = marker
+        head = (directory / "HEAD").read_text().strip()
+    except (OSError, ValueError):
+        return ""
+    if head.startswith("ref: refs/heads/"):
+        return head.removeprefix("ref: refs/heads/") or ""
+    return "<detached HEAD>" if re.fullmatch(r"[0-9a-f]{7,64}", head) else ""
+
+
 def lane_branch(lane: Path) -> str:
     """Reports a lane's branch without failing on an unusable worktree.
 
@@ -808,6 +844,9 @@ def lane_branch(lane: Path) -> str:
     Returns:
         The branch name, a detached-HEAD marker, or an unavailable marker.
     """
+    recorded = recorded_branch(lane)
+    if recorded:
+        return recorded
     try:
         return current_branch(lane)
     except (BridgeError, OSError, subprocess.TimeoutExpired):
