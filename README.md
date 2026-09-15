@@ -144,6 +144,9 @@ and the setup command every new lane runs.
 - **Ownership changes only through explicit claims and accepted handoffs.** No
   timeout and no process exit moves an issue, and a recorded dependency informs
   rather than gates.
+- **Choosing work is a reading, not a guess.** `agent-parley issue next` ranks
+  the unclaimed, unblocked issues a lane could take, with the reason for each
+  place, and claims nothing.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
   updates only when coordination state actually changes.

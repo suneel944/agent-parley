@@ -38,6 +38,12 @@ worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
 
 ## Claim, work, and hand off
 
+- Before choosing an issue, run `agent-parley issue next`, or call the
+  `next_issues` MCP tool. It ranks the unclaimed, unblocked issues this lane
+  could take and gives the reason for each: the plan group already under way,
+  the issues it unblocks, the peer reservations and forecast collisions its
+  likely paths run into, and the provider it declares. It claims nothing, so
+  the claim below is still required and a peer can still take the same issue.
 - Before working on a numbered issue, run `agent-parley issue claim NUMBER`.
   Another owner's claim means choose other authorized work or negotiate a handoff.
   A lock-busy error requires a fresh issue-list check before retrying.

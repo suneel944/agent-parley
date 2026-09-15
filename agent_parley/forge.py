@@ -24,6 +24,8 @@ from pathlib import Path
 
 MAX_TITLE = 200
 MAX_PATHS = 200
+MAX_OPEN_ISSUES = 100
+PROVIDER_LABEL = "provider:"
 FORGES = ("github", "beads", "null")
 DEFAULT_FORGE = "github"
 
@@ -297,6 +299,62 @@ def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
     except (ValueError, TypeError, AttributeError):
         return []
     return sorted(paths)[:MAX_PATHS]
+
+
+def issue_providers(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, str]:
+    """Reads the provider each open issue declares through a label.
+
+    An issue that must be worked by one assistant says so on the forge with a
+    ``provider:NAME`` label, which is the operator's own labelling rather than
+    anything this project writes. The whole open list is read in one bounded
+    call, because a per-issue lookup would cost one client call per candidate.
+    Absence is the normal answer: a forge that is missing, slow or unwilling
+    declares no provider for anything and the reading lane ranks without it.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        limit: Most open issues to read in the one call.
+
+    Returns:
+        Bare issue number to the lowercased provider name it declares. An
+        issue carrying no such label, or several, is absent.
+    """
+    if _implementation(repo) != "github":
+        return {}
+    project = _reachable(repo)
+    if project is None:
+        return {}
+    output = _run(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            project,
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            "number,labels",
+        ],
+        15,
+    )
+    if output is None:
+        return {}
+    declared: dict[str, str] = {}
+    try:
+        for record in json.loads(output):
+            names = [
+                str(label["name"])[len(PROVIDER_LABEL) :].strip().lower()
+                for label in record.get("labels") or []
+                if str(label.get("name", "")).startswith(PROVIDER_LABEL)
+            ]
+            if len(names) == 1 and names[0]:
+                declared[str(int(record["number"]))] = names[0]
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    return declared
 
 
 def assign(repo: Path, number: str) -> bool:

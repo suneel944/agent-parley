@@ -15,6 +15,7 @@ from agent_parley import (
     forecast,
     issues,
     protocol,
+    recommend,
     retries,
     roster,
 )
@@ -62,6 +63,7 @@ PREVIEW_CHARACTERS = 240
 READ_ONLY = (
     "fetch_inbox",
     "list_participants",
+    "next_issues",
     "read_attachment",
     "read_thread",
     "search_decisions",
@@ -1596,7 +1598,13 @@ def _dispatch(
     tool rather than looked up inside the transaction. The co-change history
     a reservation is forecast against is read the same way, before the
     transaction, so a Git read never holds the store's write lock.
+
+    A recommendation reads the ledger, the recorded plan and, best effort, the
+    forge. It writes nothing and its slowest reading is another process, so it
+    is answered entirely outside the transaction for the same reason.
     """
+    if tool == "next_issues":
+        return _recommended(home, actor, args)
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool == "file_reservation_paths"
@@ -1631,6 +1639,65 @@ def _dispatch(
                 len(json.dumps(result, ensure_ascii=False).encode()),
             )
         return result
+
+
+def _lane_provider(directory: Path, display: str) -> str:
+    """Names the provider driving the lane a served call authenticated as."""
+    try:
+        participants = roster.read(directory)["participants"]
+    except (BridgeError, OSError, ValueError):
+        return ""
+    return next(
+        (
+            str(entry.get("provider", ""))
+            for entry in participants.values()
+            if entry.get("display") == display
+        ),
+        "",
+    )
+
+
+def _recommended(home: Path, actor: dict, args: dict) -> dict:
+    """Ranks the unclaimed issues the calling lane could take next.
+
+    The recommendation is advice. It claims nothing, offers nothing and
+    reserves nothing, so a lane still takes the issue it chooses through the
+    explicit claim and still races a peer that chose the same one.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: Validated tool arguments.
+
+    Returns:
+        The lane's provider, whether the forge answered with any paths, and
+        the ranked candidates with the reasons for their order.
+
+    Raises:
+        BridgeError: If the project keeps no registered state directory, or
+            the requested limit is out of bounds.
+    """
+    root = str(actor.get("project", ""))
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        raise BridgeError("This project keeps no issue ledger.")
+    limit = _number(
+        args.get("limit", recommend.MAX_SHORTLIST),
+        "limit",
+        1,
+        recommend.MAX_SHORTLIST,
+    )
+    held = active_reservations(home, root)
+    held.pop(actor["name"], None)
+    return recommend.shortlist(
+        directory,
+        root,
+        Path(root),
+        _lane_provider(directory, actor["name"]),
+        held,
+        overlapping,
+        limit,
+    )
 
 
 def declared_resources(home: Path, root: str) -> frozenset[str] | None:

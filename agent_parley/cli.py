@@ -47,6 +47,7 @@ from agent_parley import (
     problems,
     process,
     protocol,
+    recommend,
     retries,
     roster,
     store,
@@ -4706,6 +4707,56 @@ attempt of the recorded budget, which is also only reported.
         held.pop(own, None)
         return forecast.collisions(counts, held, store.overlapping)
 
+    def issue_next(
+        self, repo: Path, limit: int = recommend.MAX_SHORTLIST
+    ) -> dict:
+        """Ranks the unclaimed issues this lane could take next, claiming none.
+
+        One reading answers what `issue list`, `plan show` and `status` are
+        read together for: which recorded issues are free, unblocked, part of
+        a plan group already under way, clear of the paths peers reserve, and
+        declared for this lane's provider. It is advice and nothing else. No
+        ledger entry is written, no offer is made and no reservation is taken,
+        so the lane still claims the issue it chooses through `issue claim`
+        and still races any peer that chose the same one.
+
+        Args:
+            repo: Assigned worktree, which names the lane doing the reading.
+            limit: Most candidates to return.
+
+        Returns:
+            The lane, its provider, whether the forge answered with any paths,
+            and the ranked candidates with the reasons for their order.
+
+        Raises:
+            BridgeError: If the worktree belongs to no registered lane.
+        """
+        import sqlite3
+
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        participant = data["participants"][agent]
+        forge.select(repo, data)
+        try:
+            held = store.active_reservations(self.home, data["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            held = {}
+        held.pop(participant["display"], None)
+        return {
+            "participant": agent,
+            **recommend.shortlist(
+                directory,
+                data["root"],
+                repo,
+                participant["provider"],
+                held,
+                store.overlapping,
+                limit,
+            ),
+        }
+
     def issue_assign(
         self,
         repo: Path,
@@ -7086,6 +7137,22 @@ def main() -> int:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    choosing = actions.add_parser(
+        "next",
+        help=(
+            "Rank the unclaimed issues this lane could take next, with the "
+            "reason for each; it claims nothing."
+        ),
+    )
+    choosing.add_argument("--repo", type=Path, default=Path.cwd())
+    choosing.add_argument("--json", action="store_true", help=JSON_HELP)
+    choosing.add_argument(
+        "--limit",
+        type=int,
+        default=recommend.MAX_SHORTLIST,
+        metavar="COUNT",
+        help="Most candidates to list; five when omitted.",
+    )
     assigning = actions.add_parser(
         "assign",
         help="Offer an issue to a lane as the operator, or withdraw it.",
@@ -7855,6 +7922,13 @@ def main() -> int:
             and selected(args)
         ):
             return assigned_selection(bridge, args.repo.resolve(), args)
+        elif args.command == "issue" and args.action == "next":
+            ranked = bridge.issue_next(args.repo.resolve(), args.limit)
+            print(
+                views.render("issue_next", ranked)
+                if args.json
+                else recommend.render(ranked)
+            )
         elif args.command == "issue" and args.action == "assign":
             if args.unassign and args.name:
                 parser.error("issue assign takes a lane or --unassign.")
