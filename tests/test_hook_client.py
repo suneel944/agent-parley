@@ -387,6 +387,48 @@ def free_slots(instance):
     return taken
 
 
+def test_a_stalled_decision_is_answered_and_frees_its_slot(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    token = identity["registration_token"]
+    body = json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**ALLOW, "cwd": str(lane), "session_id": "s1"},
+        }
+    ).encode()
+    deciding = checkpoints.serve
+    release = threading.Event()
+
+    def stalling(home, request):
+        release.wait(20)
+        return deciding(home, request)
+
+    monkeypatch.setattr(server, "DECISION_SECONDS", 0.2)
+    monkeypatch.setattr(server.checkpoints, "serve", stalling)
+    status, reply = hook.request(bridge.config["port"], token, body)
+    assert status == 503
+    assert json.loads(reply)["status"] == protocol.STALE
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and free_slots(service) < server.WORKERS:
+        time.sleep(0.05)
+    assert free_slots(service) == server.WORKERS
+    entry = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " expired " in line
+    )
+    assert STAMP.match(entry)
+    assert f"{hook.PATH} codex undecided" in entry
+    assert token not in entry
+    monkeypatch.setattr(server.checkpoints, "serve", deciding)
+    release.set()
+    assert hook.request(bridge.config["port"], token, body)[0] == 200
+
+
 def test_the_connection_past_the_worker_cap_is_refused_in_the_log(
     bridge, service, capsys
 ):

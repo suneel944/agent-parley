@@ -25,6 +25,7 @@ HOOK_PATH = "/hook/"
 REVISION_SECONDS = 2.0
 LOG_NAME = "server.log"
 WORKERS = 16
+DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
 REFUSAL_SECONDS = 5.0
 SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 DRIFTED = (
@@ -610,20 +611,65 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._reply(403)
             return
-        try:
-            served = checkpoints.serve(self.server.home, request)
-        except Exception:
-            log(
-                self.server.home,
-                "failed",
-                f"{self.path} {actor['name']}\n{traceback.format_exc()}",
-            )
-            self._reply(500)
+        served = self._decide(request, actor["name"])
+        if served is None:
             return
         if self.headers.get("Accept") == hook.RAW_REPLY:
             self._raw_hook(served)
             return
         self._reply(200, served)
+
+    def _decide(self, request: dict, participant: str) -> dict | None:
+        """Produces one hook decision under a deadline of its own.
+
+        The client stops reading after `hook.REPLY_TIMEOUT` and decides in
+        process, so a decision still running shortly before that is worth
+        nothing to it. A checkpoint that stalls on a Git subprocess or a busy
+        store is therefore answered with the status a stopped service already
+        sends, which is the fallback path the client handles, and the worker
+        slot is released with the reply rather than held for as long as the
+        stall lasts. The stalled decision finishes on its own thread, where
+        it holds nothing this service counts.
+
+        Args:
+            request: Hook request the credential was accepted for.
+            participant: Registered identity the credential resolved to.
+
+        Returns:
+            The decision, or None once the client has been answered because
+            the decision failed or ran past its deadline.
+        """
+        outcome: dict = {}
+
+        def decide() -> None:
+            """Records the decision or the failure that ended it."""
+            try:
+                outcome["served"] = checkpoints.serve(self.server.home, request)
+            except Exception:
+                outcome["failed"] = traceback.format_exc()
+
+        worker = threading.Thread(target=decide, daemon=True)
+        worker.start()
+        worker.join(DECISION_SECONDS)
+        served = outcome.get("served")
+        if isinstance(served, dict):
+            return served
+        if "failed" in outcome:
+            log(
+                self.server.home,
+                "failed",
+                f"{self.path} {participant}\n{outcome['failed']}",
+            )
+            self._reply(500)
+            return None
+        log(
+            self.server.home,
+            "expired",
+            f"{self.path} {participant} undecided after "
+            f"{DECISION_SECONDS} seconds; answered as unavailable",
+        )
+        self._reply(503, {"status": protocol.STALE, "detail": DRIFTED})
+        return None
 
     def _raw_hook(self, served: dict) -> None:
         """Answers a hook decision without a reply a client must decode.
