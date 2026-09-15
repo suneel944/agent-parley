@@ -17,6 +17,11 @@ OPERATOR = "operator"
 PEER = "peer"
 MAX_REASON = 2000
 MAX_SUMMARY_BYTES = 2048
+MAX_REMAINING = 12
+MAX_REMAINING_BYTES = 200
+MAX_RESERVATIONS = 32
+MAX_RESERVATION_BYTES = 240
+COMMIT = re.compile(r"[0-9a-f]{7,40}")
 
 
 def deadline_state(record: dict, now: float = 0.0) -> dict:
@@ -100,6 +105,86 @@ def offer_source(offer: dict | None) -> str:
         before offers carried a source.
     """
     return (offer or {}).get("source") or PEER
+
+
+def handoff_payload(carried: dict | None) -> dict:
+    """Validates the structured work state one handoff transfers.
+
+    A summary is prose a reader interprets. These fields are the same transfer
+    stated once, in a shape a receiver can act on without re-deriving it: the
+    commit the work stands on, the reservation keys its owner holds, the work
+    it states as remaining, and the reference to the diff kept beside the
+    offer. Every field is optional, because a lane may know none of them, and
+    an absent field is recorded as empty rather than guessed.
+
+    Args:
+        carried: Structured fields the command line derived for this offer.
+
+    Returns:
+        The fields the offer records, with reservation keys deduplicated and
+        ordered so the same holding always reads the same way.
+
+    Raises:
+        BridgeError: If the commit is not a Git object name, or the
+            reservation or remaining-work lists exceed their bounds.
+    """
+    carried = carried or {}
+    commit = str(carried.get("commit") or "")
+    if commit and not COMMIT.fullmatch(commit):
+        raise BridgeError(
+            "Handoff commit must be a Git object name of 7 to 40 hex digits."
+        )
+    held = [str(key) for key in carried.get("reservations") or []]
+    if len(held) > MAX_RESERVATIONS or any(
+        len(key.encode()) > MAX_RESERVATION_BYTES for key in held
+    ):
+        raise BridgeError(
+            f"A handoff carries at most {MAX_RESERVATIONS} reservation keys "
+            f"of {MAX_RESERVATION_BYTES} bytes each."
+        )
+    left = [
+        stripped
+        for item in carried.get("remaining") or []
+        if (stripped := str(item).strip())
+    ]
+    if len(left) > MAX_REMAINING or any(
+        len(item.encode()) > MAX_REMAINING_BYTES for item in left
+    ):
+        raise BridgeError(
+            f"A handoff carries at most {MAX_REMAINING} remaining-work items "
+            f"of {MAX_REMAINING_BYTES} bytes each."
+        )
+    fields: dict = {
+        "commit": commit,
+        "reservations": sorted(set(held)),
+        "remaining": left,
+    }
+    if diff := str(carried.get("diff") or ""):
+        fields["diff"] = attachments.validate(diff)
+        fields["diff_bytes"] = int(carried.get("diff_bytes", 0) or 0)
+    return fields
+
+
+def handoff_fields(source: dict | None) -> dict:
+    """Reports the structured work state an offer or accepted handoff carries.
+
+    Args:
+        source: Pending offer, accepted handoff, or None.
+
+    Returns:
+        The commit, reservation keys, remaining work and diff reference, each
+        empty where the record carries none. An operator offer and every offer
+        recorded before handoffs carried structure read as empty rather than
+        absent, so one shape answers for all of them.
+    """
+    source = source or {}
+    return {
+        "commit": source.get("commit", ""),
+        "reservations": list(source.get("reservations") or []),
+        "remaining": list(source.get("remaining") or []),
+        "diff": source.get("diff", ""),
+        "diff_bytes": int(source.get("diff_bytes", 0) or 0),
+    }
 
 
 def attempt(directory: Path, agent: str, numbers: list[str]) -> dict:
@@ -258,6 +343,7 @@ def change(
     title: str | None = None,
     within: float | None = None,
     defaults: dict | None = None,
+    carried: dict | None = None,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -288,6 +374,10 @@ def change(
         within: Seconds this claim, offer or acknowledgement is expected to
             take, recorded as a deadline beside the record.
         defaults: Project deadline and attempt-budget defaults.
+        carried: Structured work state an offer transfers beside its summary.
+            It is read from the lane at the moment the offer is made, so like
+            a title it is excluded from the arguments a key is compared
+            against and a changed diff never refuses a retry.
 
     Returns:
         The persisted issue record, including transition history.
@@ -312,6 +402,7 @@ def change(
             participants=participants,
             title=title,
             defaults=defaults,
+            carried=carried,
             **transition,
         )
     key = retries.validate(key)
@@ -330,6 +421,7 @@ def change(
             fingerprint=fingerprint,
             title=title,
             defaults=defaults,
+            carried=carried,
             **transition,
         )
     except BridgeError as exc:
@@ -338,15 +430,19 @@ def change(
 
 
 def _drop_offer(directory: Path, record: dict) -> None:
-    """Removes the attachment of a pending offer that is leaving the record.
+    """Removes the attachments of an offer that is leaving the record.
+
+    A declined or cancelled offer takes its spilled summary and its attached
+    diff with it, so an answered handoff leaves no unreferenced body behind.
 
     Args:
         directory: Private state directory for the common repository.
         record: Ledger record whose pending offer is being cleared.
     """
     offer = record.get("offer") or {}
-    if offer.get("attachment"):
-        attachments.remove(directory, str(offer["attachment"]))
+    for field in ("attachment", "diff"):
+        if offer.get(field):
+            attachments.remove(directory, str(offer[field]))
 
 
 def _unseen() -> dict:
@@ -527,6 +623,7 @@ def _change(
     title: str | None = None,
     within: float | None = None,
     defaults: dict | None = None,
+    carried: dict | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -553,6 +650,10 @@ def _change(
             take, recorded as a deadline beside the record. None takes the
             project default, and a project without one records no deadline.
         defaults: Project deadline and attempt-budget defaults.
+        carried: Structured work state an offer transfers beside its summary.
+            An acceptance moves those fields onto the record as the accepted
+            handoff, so the receiver reads the commit, the reservation keys
+            and the remaining work it inherited without re-deriving them.
 
     Returns:
         The persisted issue record, including transition history.
@@ -634,6 +735,11 @@ def _change(
                     expected = (
                         within if within is not None else budgets.get("claim")
                     )
+                    inherited = {
+                        **handoff_fields(offer),
+                        "from": record["owner"],
+                        "at": time.time(),
+                    }
                     record.update(
                         owner=agent,
                         request=None,
@@ -644,6 +750,7 @@ def _change(
                     )
                     if offer.get("attachment"):
                         record["attachment"] = offer["attachment"]
+                    record["handoff"] = inherited
                 else:
                     _drop_offer(directory, record)
                 record["offer"] = None
@@ -670,6 +777,7 @@ def _change(
                             "A handoff is pending; "
                             "cancel it before replacing it."
                         )
+                    structured = handoff_payload(carried)
                     answer = (
                         within if within is not None else budgets.get("offer")
                     )
@@ -689,6 +797,7 @@ def _change(
                         "summary": summary,
                         "created": time.time(),
                         "deadline": time.time() + answer if answer else None,
+                        **structured,
                     }
                     if attached:
                         record["offer"]["attachment"] = attached
@@ -700,6 +809,8 @@ def _change(
                 elif action == "release":
                     attachments.remove(directory, record.get("attachment", ""))
                     record.pop("attachment", None)
+                    inherited = record.pop("handoff", None) or {}
+                    attachments.remove(directory, inherited.get("diff", ""))
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
@@ -776,6 +887,30 @@ def note_supervision_error(directory: Path, detail: str) -> None:
         )
 
 
+def _carried(source: dict) -> str:
+    """Formats the structured work state one handoff carries, if any.
+
+    Args:
+        source: Pending offer or accepted handoff.
+
+    Returns:
+        One indented line per recorded field, and an empty string when the
+        handoff carries none, so a record without structure reads exactly as
+        it did before handoffs carried any.
+    """
+    fields = handoff_fields(source)
+    lines = []
+    if fields["commit"]:
+        lines.append(f"  Commit: {fields['commit']}")
+    if fields["reservations"]:
+        lines.append("  Reservations: " + ", ".join(fields["reservations"]))
+    for item in fields["remaining"]:
+        lines.append(f"  Remaining: {item}")
+    if fields["diff"]:
+        lines.append(f"  Diff: {fields['diff']} ({fields['diff_bytes']} bytes)")
+    return "".join(f"\n{line}" for line in lines)
+
+
 def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
     """Formats active ownership and pending offers without changing state.
 
@@ -842,6 +977,10 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
                 else "Peer-provided summary"
             )
             line += f"\n  {note}: " + json.dumps(offer["summary"])
+            line += _carried(offer)
+        if inherited := record.get("handoff"):
+            line += f"\n  Accepted from {inherited.get('from') or 'a peer'}"
+            line += _carried(inherited)
         if request := record.get("request"):
             age = max(0, int(time.time() - request["created"]))
             line += (
