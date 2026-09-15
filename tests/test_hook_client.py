@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -447,6 +448,13 @@ def test_the_shell_client_forwards_both_served_streams_and_the_status(
         '{"ok": true}\n',
         "warned\n",
     )
+
+
+def test_the_shell_client_asks_for_a_timeout_bash_3_2_accepts(bridge):
+    script = Path(hook.write_client(str(bridge.home), sys.executable))
+    timeouts = re.findall(r"read[^\n]*?-t (\S+)", script.read_text())
+    assert timeouts
+    assert all(value.isdigit() and int(value) > 0 for value in timeouts)
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")

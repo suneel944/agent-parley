@@ -13,6 +13,7 @@ import sys
 
 CONNECT_TIMEOUT = 0.25
 REPLY_TIMEOUT = 2.0
+SHELL_TIMEOUT = int(REPLY_TIMEOUT) + (REPLY_TIMEOUT % 1 > 0)
 MAX_INPUT_BYTES = 1_000_001
 PATH = "/hook/"
 RAW_REPLY = "application/vnd.agent-parley.hook+raw"
@@ -122,6 +123,13 @@ def write_client(home: str, python: str) -> str:
     Python only when that does not produce an answer, which is the outage
     path this module already treats as the slower case.
 
+    The client is written for the oldest Bash it can be asked to run on.
+    macOS ships 3.2 as ``/bin/bash``, which rejects a fractional ``read``
+    timeout, so the reply timeout is expressed in whole seconds. A rejected
+    timeout is not a slow service: the read fails at once, after the request
+    was already sent and served, and the fallback then asks a second time for
+    a decision the service has already recorded as delivered.
+
     Args:
         home: Private bridge state root the client is written into.
         python: Interpreter the client runs on its fallback path.
@@ -135,7 +143,7 @@ def write_client(home: str, python: str) -> str:
         CLIENT_SCRIPT.replace("@PYTHON@", python)
         .replace("@PATH@", PATH)
         .replace("@ACCEPT@", RAW_REPLY)
-        .replace("@TIMEOUT@", str(REPLY_TIMEOUT))
+        .replace("@TIMEOUT@", str(SHELL_TIMEOUT))
         .replace("@status_header@", STATUS_HEADER)
         .replace("@stdout_header@", STDOUT_HEADER)
     )
