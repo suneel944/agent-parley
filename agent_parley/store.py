@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
-from agent_parley import issues, protocol, retries, roster
+from agent_parley import forecast, issues, protocol, retries, roster
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
@@ -946,6 +946,7 @@ def _reserve(
     args: dict,
     declared: frozenset[str] | None = None,
     claim: str = "",
+    commits: list[list[str]] | None = None,
 ) -> dict:
     """Grants all requested leases or none; two globs conservatively overlap.
 
@@ -979,9 +980,15 @@ def _reserve(
             none and any well-formed name is acceptable.
         claim: Claim identifier the lane holds, recorded beside each lease so
             history can follow one piece of work. Empty records no claim.
+        commits: Files per recent commit of the base checkout, read before
+            the transaction opened, or None when no history is available.
 
     Returns:
-        The granted leases, or the conflicts that granted nothing.
+        The granted leases, or the conflicts that granted nothing. A grant
+        carries ``forecast`` when a file that habitually changes together
+        with a granted path is held by a peer: each entry names the path,
+        the peer and the shared commit count. The forecast is advisory and
+        bounded like the conflicts; it never withholds a grant.
 
     Raises:
         BridgeError: If a key is malformed, names an undeclared resource, or
@@ -1090,7 +1097,25 @@ def _reserve(
             ),
         )
         granted.append({"id": cursor.lastrowid, "path": pattern})
-    return {"granted": granted, "conflicts": []}
+    result = {"granted": granted, "conflicts": []}
+    held: dict[str, list[str]] = {}
+    for lease in leases:
+        held.setdefault(lease["name"], []).append(lease["path_pattern"])
+    likely = forecast.collisions(
+        forecast.cochanges(commits or [], paths, overlapping), held, overlapping
+    )
+    advisory: list[dict] = []
+    for entry in likely:
+        candidate = {**result, "forecast": [*advisory, entry]}
+        if (
+            len(json.dumps(candidate, ensure_ascii=False).encode())
+            > MAX_RESULT_BYTES
+        ):
+            break
+        advisory.append(entry)
+    if advisory:
+        result["forecast"] = advisory
+    return result
 
 
 def _event(
@@ -1337,7 +1362,9 @@ def _dispatch(
     A reservation is validated against the resources its project declared.
     That declaration lives in the project manifest beside the roster, which
     only a state directory can resolve, so it is read here and handed to the
-    tool rather than looked up inside the transaction.
+    tool rather than looked up inside the transaction. The co-change history
+    a reservation is forecast against is read the same way, before the
+    transaction, so a Git read never holds the store's write lock.
     """
     declared = (
         declared_resources(home, str(actor.get("project", "")))
@@ -1349,8 +1376,13 @@ def _dispatch(
         if tool in ("file_reservation_paths", "send_message")
         else ""
     )
+    commits = (
+        cochange_history(home, str(actor.get("project", "")))
+        if tool == "file_reservation_paths"
+        else None
+    )
     with connect(home, write=tool not in READ_ONLY) as db:
-        result = _serve(db, actor, tool, args, declared, claim)
+        result = _serve(db, actor, tool, args, declared, claim, commits)
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -1383,6 +1415,23 @@ def declared_resources(home: Path, root: str) -> frozenset[str] | None:
     except (BridgeError, OSError, ValueError):
         return None
     return frozenset(resources) if resources else None
+
+
+def cochange_history(home: Path, root: str) -> list[list[str]]:
+    """Reads the recent commit history a reservation is forecast against.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key, which is the base checkout's path.
+
+    Returns:
+        Files per recent commit of the base checkout, or an empty list when
+        the project is not registered or Git cannot answer in time.
+    """
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        return []
+    return forecast.history(root, directory)
 
 
 def held_claim(home: Path, root: str, display: str) -> str:
@@ -1501,6 +1550,7 @@ def _serve(
     args: dict,
     declared: frozenset[str] | None = None,
     claim: str = "",
+    commits: list[list[str]] | None = None,
 ) -> dict:
     """Applies one validated coordination tool to the open transaction.
 
@@ -1524,6 +1574,8 @@ def _serve(
             declared none.
         claim: Claim identifier the calling lane holds, recorded beside the
             records a tool writes. Empty records no claim.
+        commits: Files per recent commit of the base checkout for a
+            reservation forecast, or None when none was read.
 
     Returns:
         The tool result.
@@ -1538,13 +1590,13 @@ def _serve(
         )
     key = retries.validate(args.get("idempotency_key"))
     if not key or tool not in RETRIED:
-        return _effect(db, actor, tool, args, declared, claim)
+        return _effect(db, actor, tool, args, declared, claim, commits)
     fingerprint = retries.digest(
         tool, {name: args.get(name) for name in RETRIED[tool]}
     )
     if recorded := _recorded(db, actor, tool, key):
         return retries.replayed(recorded, tool, key, fingerprint)
-    result = _effect(db, actor, tool, args, declared, claim)
+    result = _effect(db, actor, tool, args, declared, claim, commits)
     _retain(db, actor, tool, key, fingerprint, retries.SERVED, result)
     return result
 
@@ -1556,6 +1608,7 @@ def _effect(
     args: dict,
     declared: frozenset[str] | None,
     claim: str,
+    commits: list[list[str]] | None = None,
 ) -> dict:
     """Performs the effect of one coordination tool without retry bookkeeping.
 
@@ -1568,6 +1621,8 @@ def _effect(
             declared none.
         claim: Claim identifier the calling lane holds, recorded beside the
             records a tool writes. Empty records no claim.
+        commits: Files per recent commit of the base checkout for a
+            reservation forecast, or None when none was read.
 
     Returns:
         The tool result.
@@ -1586,7 +1641,7 @@ def _effect(
     if tool == "search_messages":
         return _search(db, actor, args)
     if tool == "file_reservation_paths":
-        return _reserve(db, actor, args, declared, claim)
+        return _reserve(db, actor, args, declared, claim, commits)
     if tool == "release_file_reservations":
         result = db.execute(
             "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "

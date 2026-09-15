@@ -30,6 +30,7 @@ from agent_parley import (
     completion,
     dashboard,
     evidence,
+    forecast,
     forge,
     gemini,
     history,
@@ -4195,6 +4196,12 @@ attempt of the recorded budget, which is also only reported.
         ledger is written first and the mirror never reverses it: a forge that
         is missing, offline or unwilling leaves the transition in force.
 
+        A claim with a reachable forge also reads the paths the issue's earlier
+        pull requests touched and forecasts, from the base checkout's recent
+        co-change history, which peer-reserved files are likely to collide.
+        The forecast is returned as ``forecast`` beside the record, advisory
+        only, and omitted when nothing is likely or no forge is configured.
+
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
             action: List, claim, release, offer, accept, decline, cancel,
@@ -4269,9 +4276,50 @@ attempt of the recorded budget, which is also only reported.
         )
         if action == "claim":
             forge.assign(repo, parse_issue(number))
+            likely = self._claim_forecast(
+                repo, directory, data, agent, parse_issue(number)
+            )
+            if likely:
+                record = {**record, "forecast": likely}
         elif action == "release":
             forge.unassign(repo, parse_issue(number))
         return record
+
+    def _claim_forecast(
+        self, repo: Path, directory: Path, data: dict, agent: str, number: str
+    ) -> list[dict]:
+        """Forecasts collisions for a claim from its earlier pull requests.
+
+        The paths the issue's earlier pull requests touched stand in for the
+        reservation the lane has not filed yet. Without a configured forge
+        there is nothing to read and the claim is reported unchanged.
+
+        Args:
+            repo: Assigned worktree that selects the forge project.
+            directory: Private project state directory holding the cache.
+            data: Project manifest.
+            agent: Claiming participant.
+            number: Bare repository issue number.
+
+        Returns:
+            Forecast records naming path, peer and count, or an empty list.
+        """
+        import sqlite3
+
+        touched = forge.issue_pull_request_paths(repo, number)
+        if not touched:
+            return []
+        commits = forecast.history(data["root"], directory)
+        counts = forecast.cochanges(commits, touched, store.overlapping)
+        if not counts:
+            return []
+        own = data["participants"][agent]["display"]
+        try:
+            held = store.active_reservations(self.home, data["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            return []
+        held.pop(own, None)
+        return forecast.collisions(counts, held, store.overlapping)
 
     def issue_assign(
         self,
