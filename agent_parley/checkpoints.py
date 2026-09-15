@@ -39,6 +39,7 @@ DIAGNOSTIC_TOOLS = frozenset(
     {"Glob", "Grep", "NotebookRead", "Read", "ToolSearch"}
 )
 BRIDGE_COMMAND = "agent-parley"
+HARNESS_PROMPT_TAGS = ("<task-notification>", "<system-reminder>")
 UNCHECKED_SHELL = ("<", ">", "`", "$(", "\n", "\r")
 OUTAGE_CHECK = "Run agent-parley status for the bridge's own report."
 OUTAGE_GUIDANCE = (
@@ -50,6 +51,23 @@ OUTAGE_GUIDANCE = (
 def clip(text: str, budget: int) -> str:
     """Truncates UTF-8 text without splitting a multibyte character."""
     return text.encode()[:budget].decode(errors="ignore")
+
+
+def operator_prompt(prompt: str) -> bool:
+    """Reports whether a submitted prompt came from the operator.
+
+    A harness injects its own submissions through the same prompt event an
+    operator uses, so a background task notification would otherwise become
+    the lane's reported task. Such a submission opens with a harness tag,
+    while a prompt that merely quotes one further along is the operator's.
+
+    Args:
+        prompt: Prompt text carried by a prompt submission event.
+
+    Returns:
+        False when the text opens with a harness tag, True otherwise.
+    """
+    return not prompt.lstrip().startswith(HARNESS_PROMPT_TAGS)
 
 
 EVENTS = (
@@ -1291,7 +1309,9 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                 "testing (command observed)" if testing else "working"
             )
         if event == "UserPromptSubmit":
-            state["last_prompt"] = str(payload.get("prompt", ""))[:240]
+            prompt = str(payload.get("prompt", ""))
+            if operator_prompt(prompt):
+                state["last_prompt"] = prompt[:240]
         output: dict = {}
         reason = Reason.OBSERVED
         if event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
