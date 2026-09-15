@@ -431,6 +431,25 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_shell_client_forwards_both_served_streams_and_the_status(
+    bridge, repo, paired, service, monkeypatch
+):
+    def loud(home, request):
+        return {"stdout": '{"ok": true}\n', "stderr": "warned\n", "status": 2}
+
+    monkeypatch.setattr(server.checkpoints, "serve", loud)
+    lane = Path(paired["lanes"]["codex"])
+    shell = run_shell(
+        bridge, lane.parent, {**ALLOW, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert (shell.returncode, shell.stdout, shell.stderr) == (
+        2,
+        '{"ok": true}\n',
+        "warned\n",
+    )
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
 def test_the_launcher_configures_the_shell_client(bridge, repo, paired):
     lane = Path(paired["lanes"]["codex"])
     command = bridge.hooks("codex", lane.parent)["PreToolUse"][0]["hooks"][0]

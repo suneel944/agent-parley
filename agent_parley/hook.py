@@ -78,7 +78,7 @@ body="$body,\"participant\":$(quote "$participant")"
 [ -n "$protocol" ] && body="$body,\"protocol\":$(quote "$protocol")"
 body="$body,\"payload\":$payload}"
 
-exec 3<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null || decide_in_process
+{ exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || decide_in_process
 printf 'POST @PATH@ HTTP/1.1\r\nHost: 127.0.0.1:%s\r\n'\
 'Authorization: Bearer %s\r\nContent-Type: application/json\r\n'\
 'Accept: @ACCEPT@\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
