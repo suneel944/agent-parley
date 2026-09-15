@@ -20,6 +20,10 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import sqlite3
 
 from agent_parley import (
     amp,
@@ -5098,12 +5102,80 @@ attempt of the recorded budget, which is also only reported.
             "detail": reviewed["detail"],
         }
 
+    @contextlib.contextmanager
+    def _project_reading(self) -> Iterator[sqlite3.Connection | None]:
+        """Holds one read transaction for the questions of a single frame.
+
+        The store runs in write-ahead logging mode, so a held read never
+        delays a writer. A store that does not exist yet, or that refuses the
+        transaction, yields nothing and leaves each reading to open its own
+        connection and report its own failure as before.
+        """
+        import sqlite3
+
+        if not (self.home / store.DATABASE).exists():
+            yield None
+            return
+        try:
+            transaction = store.connect(self.home)
+        except sqlite3.Error:
+            yield None
+            return
+        with transaction as db:
+            yield db
+
+    def _project_context(
+        self,
+        directory: Path,
+        data: dict,
+        db: sqlite3.Connection | None = None,
+    ) -> dict:
+        """Takes the readings a status frame needs once for a whole project.
+
+        The issue ledger, the supervision configuration, project usage and
+        pending scheduled items describe the project rather than any one lane,
+        so reading them per lane repeated the same file and the same query for
+        every participant and could describe two different instants inside one
+        frame.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding every participant.
+            db: Open read transaction to answer store questions from.
+
+        Returns:
+            The shared readings, the transaction they came from, and any store
+            failure that must still be reported against each lane's mail.
+        """
+        import sqlite3
+
+        try:
+            usage = store.usage(self.home, data["root"], db=db)
+        except sqlite3.Error:
+            usage = {}
+        schedules: list[dict] = []
+        failure: Exception | None = None
+        try:
+            schedules = store.schedules(self.home, data["root"], db=db)
+        except (sqlite3.Error, BridgeError, OSError) as exc:
+            failure = exc
+        return {
+            "ledger": snapshot(directory),
+            "configuration": supervision.configuration(self.home, data),
+            "usage": usage,
+            "schedules": schedules,
+            "schedules_error": failure,
+            "db": db,
+        }
+
     def _lane_status(
         self,
         directory: Path,
         data: dict,
         agent: str,
         edited: Sequence[str] = (),
+        *,
+        context: dict | None = None,
     ) -> dict:
         """Reads one lane's reported state, ownership context and mailbox.
 
@@ -5113,6 +5185,11 @@ attempt of the recorded budget, which is also only reported.
             agent: Participant that owns the lane.
             edited: Reserved paths an operator changed in the base checkout,
                 read once per project by the caller.
+            context: Project-wide readings the caller already took for this
+                frame, holding the issue ledger, the supervision
+                configuration, project usage, pending scheduled items and the
+                open read transaction they were answered from. Absent, this
+                lane takes each reading for itself.
 
         Returns:
             The lane's session, availability, branch, reported outcome and
@@ -5121,13 +5198,18 @@ attempt of the recorded budget, which is also only reported.
         """
         import sqlite3
 
+        frame = (
+            context
+            if context is not None
+            else self._project_context(directory, data)
+        )
+        ledger = frame["ledger"]
+        configuration = frame["configuration"]
         participant = data["participants"][agent]
         name = participant["display"]
         state = activity(directory, agent)
         observed = supervision.presence(
-            directory,
-            agent,
-            supervision.configuration(self.home, data)["inactive_after"],
+            directory, agent, configuration["inactive_after"]
         )
         branch = lane_branch(Path(participant["lane"]))
         reported_at = state.get("reported_at")
@@ -5136,14 +5218,12 @@ attempt of the recorded budget, which is also only reported.
             directory,
             data,
             agent,
-            supervision.configuration(self.home, data)["stalled_after"],
+            configuration["stalled_after"],
         )
         idle = metrics.idle_intervals(directory, agent)
-        try:
-            usage = store.usage(self.home, data["root"])
-        except sqlite3.Error:
-            usage = {}
-        budget = budgets.report(self.home, directory, data, agent, usage)
+        budget = budgets.report(
+            self.home, directory, data, agent, frame["usage"]
+        )
         record = {
             "participant": agent,
             "identity": name,
@@ -5181,8 +5261,7 @@ attempt of the recorded budget, which is also only reported.
                     "offer": offer_state(record.get("offer")),
                 }
                 for number, record in sorted(
-                    snapshot(directory)["issues"].items(),
-                    key=lambda i: int(i[0]),
+                    ledger["issues"].items(), key=lambda i: int(i[0])
                 )
                 if record.get("owner") == agent
             ],
@@ -5203,7 +5282,14 @@ attempt of the recorded budget, which is also only reported.
                 "marker": budgets.marker(budget),
             },
             "waiting": metrics.pending(
-                metrics.waits(self.home, directory, data, agent)
+                metrics.waits(
+                    self.home,
+                    directory,
+                    data,
+                    agent,
+                    db=frame["db"],
+                    ledger=ledger,
+                )
             ),
             "wake": None,
             "mail": None,
@@ -5221,9 +5307,10 @@ attempt of the recorded budget, which is also only reported.
             mail = mailbox(
                 self.home, data["root"], name, state.get("cursor", 0)
             )
+            if frame["schedules_error"]:
+                raise frame["schedules_error"]
             scheduled = sum(
-                item["recipient"] == agent
-                for item in store.schedules(self.home, data["root"])
+                item["recipient"] == agent for item in frame["schedules"]
             )
         except (sqlite3.Error, BridgeError, OSError) as exc:
             record["mail"] = {"error": str(exc)}
@@ -5279,23 +5366,29 @@ attempt of the recorded budget, which is also only reported.
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
             edits = supervision.operator_edits(self.home, data)
-            projects.append(
-                {
-                    "root": data["root"],
-                    **views.ledger(snapshot(path.parent)),
-                    "ready_groups": plan.ready_groups(
-                        plan.groups(path.parent),
-                        snapshot(path.parent),
-                        reported_ready(path.parent),
-                    ),
-                    "participants": [
-                        self._lane_status(
-                            path.parent, data, agent, edits.get(agent, [])
-                        )
-                        for agent in sorted(data["participants"])
-                    ],
-                }
-            )
+            with self._project_reading() as db:
+                context = self._project_context(path.parent, data, db)
+                projects.append(
+                    {
+                        "root": data["root"],
+                        **views.ledger(context["ledger"]),
+                        "ready_groups": plan.ready_groups(
+                            plan.groups(path.parent),
+                            context["ledger"],
+                            reported_ready(path.parent),
+                        ),
+                        "participants": [
+                            self._lane_status(
+                                path.parent,
+                                data,
+                                agent,
+                                edits.get(agent, []),
+                                context=context,
+                            )
+                            for agent in sorted(data["participants"])
+                        ],
+                    }
+                )
         return {
             "server": {"ready": healthy},
             "state_directory": str(self.home),
