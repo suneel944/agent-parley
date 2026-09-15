@@ -5076,6 +5076,81 @@ attempt of the recorded budget, which is also only reported.
             self.home, data["root"], name, query, limit
         )
 
+    def decide(
+        self, repo: Path, text: str, subject: str = "", key: str = ""
+    ) -> dict:
+        """Records one decision every registered lane of the project can read.
+
+        The decision is recorded against the project rather than sent to an
+        inbox, so a lane that joins later, or that was never party to the
+        discussion, still finds it by searching the log. Ordinary mail keeps
+        the scope it always had.
+
+        Args:
+            repo: Any checkout of the repository the project covers.
+            text: Decision text every participant can read.
+            subject: Subject line the decision is found under.
+            key: Idempotency key. Without one the key follows the text, so
+                recording the same decision twice records it once.
+
+        Returns:
+            The recorded decision identifier, carrying ``duplicate`` when this
+            key already named exactly this decision.
+
+        Raises:
+            BridgeError: If the repository has no project or the decision
+                fails validation.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        heading = subject or "Operator decision"
+        return store.decide(
+            self.home,
+            data["root"],
+            heading,
+            text,
+            key or operator_key("decision", heading, text),
+        )
+
+    def decisions(
+        self,
+        repo: Path,
+        query: str = "",
+        limit: int = store.MAX_SEARCH_HITS,
+        window: float = 0.0,
+    ) -> dict:
+        """Lists or searches the decisions recorded for this project.
+
+        The worktree selects the reading participant exactly as a mail search
+        does, but the log it reads belongs to the project, so the reader sees
+        decisions it neither sent nor received.
+
+        Args:
+            repo: Assigned agent worktree.
+            query: Text to match, or empty to list the newest decisions.
+            limit: Maximum decisions reported.
+            window: Seconds back the page may reach, or zero for the whole
+                log.
+
+        Returns:
+            Matching decisions newest first, naming the index that answered.
+
+        Raises:
+            BridgeError: If the lane or its registered identity is unknown.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        return store.search_decisions(
+            self.home,
+            data["root"],
+            data["participants"][agent]["display"],
+            query,
+            limit,
+            int(window),
+        )
+
     def export_events(
         self,
         repo: Path,
@@ -6667,6 +6742,49 @@ def main() -> int:
     )
     dropping.add_argument("item_id", type=int)
     dropping.add_argument("--repo", type=Path, default=Path.cwd())
+    deciding = commands.add_parser(
+        "decide", help="Record one decision every lane of the project reads."
+    )
+    deciding.add_argument("text", help="Decision text participants read.")
+    deciding.add_argument("--repo", type=Path, default=Path.cwd())
+    deciding.add_argument(
+        "--subject", default="", help="Subject the decision is found under."
+    )
+    deciding.add_argument(
+        "--key",
+        default="",
+        help=(
+            "Idempotency key. Without one the key follows the text, so "
+            "recording the same decision again records nothing further."
+        ),
+    )
+    deciding.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision = commands.add_parser(
+        "decision", help="Read the decisions recorded for this project."
+    )
+    decision_actions = decision.add_subparsers(dest="action", required=True)
+    decision_list = decision_actions.add_parser("list")
+    decision_list.add_argument(
+        "query",
+        nargs="?",
+        default="",
+        help="Text to match; without it the newest decisions are listed.",
+    )
+    decision_list.add_argument("--repo", type=Path, default=Path.cwd())
+    decision_list.add_argument(
+        "--limit", type=int, default=store.MAX_SEARCH_HITS
+    )
+    decision_list.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Age a reported decision may reach, such as 45m, 6h or 7d. The "
+            "whole log is read by default."
+        ),
+    )
+    decision_list.add_argument("--json", action="store_true", help=JSON_HELP)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -7245,6 +7363,24 @@ def main() -> int:
                     if getattr(args, "json", False)
                     else json.dumps(page, indent=2)
                 )
+        elif args.command == "decide":
+            recorded = bridge.decide(
+                args.repo.resolve(), args.text, args.subject, args.key
+            )
+            print(
+                views.render("decide", recorded)
+                if args.json
+                else f"Recorded decision {recorded['id']}."
+            )
+        elif args.command == "decision":
+            decisions = bridge.decisions(
+                args.repo.resolve(), args.query, args.limit, args.since
+            )
+            print(
+                views.render("decision_list", decisions)
+                if args.json
+                else json.dumps(decisions, indent=2)
+            )
         elif args.command == "participant":
             repository = args.repo.resolve()
             preview = getattr(args, "preview", False)
