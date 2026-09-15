@@ -9,6 +9,9 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+MAX_LOG_BYTES = 262144
+MAX_LOG_RECORDS = 2000
+
 
 class BridgeError(Exception):
     """An actionable operational failure."""
@@ -55,6 +58,57 @@ def write_text(path: Path, text: str) -> None:
             os.close(directory)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def trim_log(
+    path: Path,
+    ceiling: int = MAX_LOG_BYTES,
+    records: int = MAX_LOG_RECORDS,
+) -> list[str]:
+    """Keeps a line log bounded by dropping its oldest lines in place.
+
+    One rotation serves every line log the runtime keeps, so a lane's report
+    log and the service log are bounded by the same reading and the same
+    ceiling. The rewrite happens in the file rather than through an atomic
+    replacement, because the service writes its log through a descriptor its
+    launcher opened for appending: replacing the file would leave that
+    descriptor writing to an unlinked one, and the log would silently stop.
+    A caller that needs the two appends around a rewrite to be ordered holds
+    its own lock, as the lane report log does.
+
+    The rewrite keeps the newest lines that fit under both the count and the
+    ceiling, and always keeps the newest line, so a log of long lines is
+    bounded by the same number of bytes as a log of short ones. Lines long
+    enough to fill the ceiling on their own are cut back to half of it, so a
+    log at its bound is not rewritten again on the next line.
+
+    Args:
+        path: Line log to bound; a missing or unreadable file is left alone.
+        ceiling: Size in bytes above which the log is rewritten, and under
+            which the rewrite leaves it.
+        records: Number of newest lines the rewrite may keep.
+
+    Returns:
+        The lines the rewrite dropped, oldest first, so a caller can release
+        whatever they referenced.
+    """
+    try:
+        if path.stat().st_size < ceiling:
+            return []
+        lines = path.read_text(errors="ignore").splitlines()
+        sizes = [len(line.encode()) + 1 for line in lines]
+        start = max(len(lines) - records, 0)
+        total = sum(sizes[start:])
+        target = ceiling if total <= ceiling else ceiling // 2
+        while start < len(lines) - 1 and total > target:
+            total -= sizes[start]
+            start += 1
+        with path.open("r+", encoding="utf-8") as stream:
+            stream.write("\n".join(lines[start:]) + "\n")
+            stream.truncate()
+    except OSError:
+        return []
+    return lines[:start]
 
 
 @contextlib.contextmanager
