@@ -2964,6 +2964,28 @@ def test_mail_commands_read_the_lane_participants_own_thread_and_search(
     assert bridge.mail(lane, "search", query="unrelated")["messages"] == []
     with pytest.raises(BridgeError, match="assigned agent worktree"):
         bridge.mail(repo, "thread", thread=sent["thread_id"])
+    before = mailbox(bridge.home, paired["root"], identities["codex"])["unread"]
+    named = bridge.mail(
+        repo, "thread", thread=sent["thread_id"], participant="codex"
+    )
+    assert [row["id"] for row in named["messages"]] == [sent["id"]]
+    shown = bridge.mail(
+        repo, "show", identifier=sent["id"], participant="codex"
+    )
+    assert shown["id"] == sent["id"]
+    assert bridge.mail(repo, "list", participant="codex")["messages"]
+    assert [
+        row["id"]
+        for row in bridge.mail(
+            repo, "search", query="reservation", participant="codex"
+        )["messages"]
+    ] == [sent["id"]]
+    assert (
+        mailbox(bridge.home, paired["root"], identities["codex"])["unread"]
+        == before
+    )
+    with pytest.raises(BridgeError, match="not a participant"):
+        bridge.mail(repo, "list", participant="gemini")
 
 
 def operator_lane(bridge, repo, name="claude"):

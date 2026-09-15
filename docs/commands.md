@@ -95,6 +95,7 @@ on standard output and export to a file.
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
 | `mail list` | List this lane's mail newest first, with the same `--limit` as a search and no query to write. |
+| `mail ... --as NAME` | Read `mail show`, `mail thread`, `mail search` and `mail list` for one lane from the main checkout, so an operator opens a message `problems` cites without changing directory. It reads only: nothing is sent, acknowledged or marked read for that lane. |
 | `mail send NAME TEXT` | The same command as `say`, under `mail` with the other mail verbs; every `say` flag applies. |
 | `decide TEXT` | Record one decision every registered lane can read; `--subject` names it and `--key` deduplicates it. |
 | `decision list [QUERY]` | List or search the decisions recorded for this project; `--since` bounds their age and `--limit` the page. |
