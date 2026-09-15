@@ -190,6 +190,15 @@ narrows a search. Where SQLite was built without the full-text index a search
 matches the query as a literal case-insensitive substring rather than as
 indexed terms, and every result names which of the two answered it.
 
+`--as NAME` names the lane to read instead of taking it from the worktree, so
+`mail show`, `mail thread`, `mail search` and `mail list` answer from the main
+checkout. It exists because `problems` cites message identifiers from the main
+checkout that the operator then has to open, and changing directory into a lane
+worktree to read one is the wrong price. The flag selects a reader and nothing
+more: no message is sent, acknowledged or marked read for that lane, and the
+write verbs keep the lane identity path they always had. A name that is not a
+participant of this project is refused.
+
 `issue list` prints each owner's session state and the age of its last
 checkpoint, so a quiet lane is visible. Reclaiming that work still needs the
 owner to release it, or an explicit offer and accept.
