@@ -260,12 +260,14 @@ def doctor(reported: dict) -> dict:
         output can report the cause rather than only the verdict. The store
         schema is reported as `store_schema`, because `schema` already names
         the document's own schema identifier. No credential and no profile
-        path is included.
+        path is included. The platform record names the kernel release, the
+        WSL generation or `none`, and whether `pidfd_open` is available.
     """
     return {
         "protocol": reported["protocol"],
         "supported": reported["supported"],
         "store_schema": reported["schema"],
+        "platform": reported["platform"],
         "components": reported["components"],
         "consistent": reported["consistent"],
     }

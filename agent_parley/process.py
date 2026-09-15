@@ -376,6 +376,110 @@ def platform_for(system: str) -> Platform:
 
 PLATFORM = platform_for(sys.platform)
 
+OSRELEASE = Path("/proc/sys/kernel/osrelease")
+
+MOUNTED_DRIVE = (
+    "Git worktrees and locks on a mounted Windows drive are not supported; "
+    "the repository must live in the Linux file system."
+)
+
+
+def kernel_release(path: Path = OSRELEASE) -> str:
+    """Reads the running kernel's release string.
+
+    Args:
+        path: Kernel release file; tests supply a file of their own.
+
+    Returns:
+        The release string, or an empty string where the file is absent, as
+        on macOS.
+    """
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def wsl_version(release: str) -> str:
+    """Names the Windows Subsystem for Linux generation a kernel belongs to.
+
+    Both generations put ``microsoft`` in the release string; only the
+    second names itself ``WSL2`` there.
+
+    Args:
+        release: Kernel release string, as ``kernel_release`` reads it.
+
+    Returns:
+        ``"2"``, ``"1"``, or ``"none"`` outside WSL.
+    """
+    lowered = release.lower()
+    if "microsoft" not in lowered:
+        return "none"
+    return "2" if "wsl2" in lowered else "1"
+
+
+def pidfd_available() -> bool:
+    """Reports whether the host can open a pidfd for a process.
+
+    A kernel without the call, as under WSL1, and a build whose libc lacks
+    it both answer no.
+
+    Returns:
+        Whether ``pidfd_open`` succeeded for this process.
+    """
+    try:
+        fd = (
+            os.pidfd_open(os.getpid())
+            if hasattr(os, "pidfd_open")
+            else libc_pidfd("pidfd_open", os.getpid(), 0)
+        )
+    except (OSError, BridgeError):
+        return False
+    os.close(fd)
+    return True
+
+
+def host_report(release: str | None = None) -> dict:
+    """Describes the kernel a ``doctor`` run found.
+
+    Args:
+        release: Kernel release string; read from the host when omitted.
+
+    Returns:
+        The kernel release, the WSL generation or ``"none"``, and whether
+        ``pidfd_open`` is available.
+    """
+    if release is None:
+        release = kernel_release()
+    return {
+        "kernel": release,
+        "wsl": wsl_version(release),
+        "pidfd_open": pidfd_available(),
+    }
+
+
+def check_repository_host(repo: Path, release: str | None = None) -> None:
+    """Refuses a repository on a mounted Windows drive under WSL.
+
+    Git worktree locks and the coordination locks do not hold across the
+    9p and drvfs mounts under ``/mnt``, so a lane there would corrupt the
+    checkout it shares with the operator.
+
+    Args:
+        repo: Target repository path.
+        release: Kernel release string; read from the host when omitted.
+
+    Raises:
+        BridgeError: If the host is WSL and the repository lies under
+            ``/mnt/``.
+    """
+    if release is None:
+        release = kernel_release()
+    if wsl_version(release) == "none":
+        return
+    if repo.resolve().is_relative_to("/mnt"):
+        raise BridgeError(MOUNTED_DRIVE)
+
 
 def start_ticks(pid: int) -> str:
     """Reads a process's creation identity on the running platform.

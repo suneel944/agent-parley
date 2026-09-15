@@ -68,7 +68,8 @@ state and project paths are shortened.
 
 ## Install
 
-Linux or macOS, Git, and [uv](https://docs.astral.sh/uv/). No clone.
+Linux, macOS or WSL2 with the repository in the Linux file system, Git, and
+[uv](https://docs.astral.sh/uv/). No clone.
 The wheel needs no third-party runtime packages.
 
 ```sh

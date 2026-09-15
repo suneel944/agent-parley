@@ -26,6 +26,19 @@ Upgrading needs no action: the store upgrades in place on first use, keeping
 every message, claim and lease. Stop running sessions first, and do not point an
 older installation at an upgraded state directory afterwards.
 
+## Platforms
+
+Linux and macOS are supported. WSL2 is supported for repositories that live in
+the Linux file system, such as under `$HOME`. `run` refuses a repository under
+`/mnt/`: Git worktrees and the coordination locks do not hold on a mounted
+Windows drive, so the repository must be cloned into the Linux file system
+first. Native CLIs installed on the Windows side are out of scope: a lane is a
+Linux process driving a Linux install, and the loopback mail server is not
+reachable across the boundary. `doctor` names the kernel release, the WSL
+generation (`1`, `2` or `none`) and whether `pidfd_open` is available, so a
+platform gap is read before a lane starts. CI runs the behaviour suite inside
+WSL on a Windows runner as an advisory job; it never blocks a merge.
+
 ## Daily use
 
 ```sh
