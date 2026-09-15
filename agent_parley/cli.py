@@ -26,6 +26,7 @@ from pathlib import Path
 
 from agent_parley import (
     approvals,
+    archive,
     attachments,
     budgets,
     checkpoints,
@@ -4798,6 +4799,56 @@ attempt of the recorded budget, which is also only reported.
             f"covering {covered} to {destination}."
         )
 
+    def state_archive(self, args: argparse.Namespace) -> str:
+        """Exports, inspects or imports the state archive the operator named.
+
+        An export names its archive and what it covers; an import names the
+        projects restored and every participant whose lane path does not
+        exist on this machine. Those lanes are not recreated: the operator
+        recreates the worktree, and `run` then registers the participant
+        again, because the archive carries no credential.
+
+        Args:
+            args: Parsed `state` command line.
+
+        Returns:
+            An account of what was written, read or restored.
+
+        Raises:
+            BridgeError: If the archive or the state directory refuses the
+                operation.
+        """
+        if args.action == "show":
+            return archive.describe(archive.read_manifest(args.archive))
+        if args.action == "export":
+            directory = None
+            if args.project is not None:
+                _, directory = self.project(
+                    args.project.resolve(), create=False
+                )
+            manifest = archive.export(self.home, args.output, directory)
+            names = ", ".join(entry["root"] for entry in manifest["projects"])
+            return (
+                f"Exported {len(manifest['projects'])} projects "
+                f"({names or 'none'}) at schema {manifest['schema']} to "
+                f"{args.output}; credentials excluded."
+            )
+        root = str(args.project.resolve()) if args.project else None
+        result = archive.import_archive(
+            self.home, args.archive, root, args.merge
+        )
+        lines = [
+            f"Imported {len(result['projects'])} projects into {self.home}; "
+            "every participant registers again on its next run."
+        ]
+        for entry in result["missing_lanes"]:
+            lines.append(
+                f"Lane missing for {entry['name']} in {entry['project']}: "
+                f"{entry['lane'] or 'no path recorded'}; recreate the "
+                "worktree before launching it."
+            )
+        return "\n".join(lines)
+
     def history(
         self,
         repo: Path,
@@ -5750,6 +5801,42 @@ def main() -> int:
         type=Path,
         help="Destination file; JSON Lines go to standard output otherwise.",
     )
+    archived = commands.add_parser(
+        "state",
+        help="Export, inspect or import the coordination state as one archive.",
+    )
+    archives = archived.add_subparsers(dest="action", required=True)
+    exporting = archives.add_parser(
+        "export", help="Write the state, or one project, as a tar archive."
+    )
+    exporting.add_argument(
+        "--output", type=Path, required=True, help="Archive path to create."
+    )
+    exporting.add_argument(
+        "--project",
+        type=Path,
+        metavar="ROOT",
+        help="Export only the project registered for this checkout.",
+    )
+    showing = archives.add_parser(
+        "show", help="List what an archive holds without importing it."
+    )
+    showing.add_argument("archive", type=Path)
+    importing = archives.add_parser(
+        "import", help="Restore an archive into the state directory."
+    )
+    importing.add_argument("archive", type=Path)
+    importing.add_argument(
+        "--project",
+        type=Path,
+        metavar="ROOT",
+        help="Restore only the archived project registered for this root.",
+    )
+    importing.add_argument(
+        "--merge",
+        action="store_true",
+        help="Add archived projects beside existing state.",
+    )
     setup = commands.add_parser(
         "setup",
         help="Register a repository for coordination from committed HEAD.",
@@ -6448,6 +6535,8 @@ def main() -> int:
                 message,
                 file=sys.stdout if args.output else sys.stderr,
             )
+        elif args.command == "state":
+            print(bridge.state_archive(args))
         elif args.command == "setup":
             print(json.dumps(bridge.setup(args.repo.resolve()), indent=2))
         elif args.command == "run":
