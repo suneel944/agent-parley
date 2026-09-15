@@ -68,6 +68,7 @@ READ_ONLY = (
     "read_thread",
     "search_decisions",
     "search_messages",
+    "wait_for_message",
 )
 ATTACHED = ("send_message", "read_attachment")
 PRESENCE_WARNINGS = {
@@ -804,13 +805,16 @@ def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     """Pages metadata and legacy bodies within a bounded response budget.
 
     Each message reports the thread it belongs to, so a recipient can read
-    that thread or answer into it without a further lookup.
+    that thread or answer into it without a further lookup. Naming a thread
+    narrows the page to that conversation, so a recipient expecting one
+    answer does not page past unrelated mail to find it.
     """
     after = _number(args.get("after_id", 0), "after_id", 0, 2**63 - 1)
     limit = _number(args.get("limit", 5), "limit", 1, 5)
     bodies = _flag(args.get("include_bodies", False), "include_bodies")
     unread = _flag(args.get("unread", False), "unread")
     unacknowledged = _flag(args.get("unacknowledged", False), "unacknowledged")
+    thread = _text(args.get("thread_id", ""), "thread_id", 80, empty=True)
     offset = _number(args.get("body_offset", 0), "body_offset", 0, 10**9)
     rows = db.execute(
         "SELECT m.id,a.name AS sender,m.thread_id,m.subject,m.body_md,"
@@ -820,8 +824,9 @@ def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         "WHERE r.agent_id=? AND m.id>? "
         "AND (?=0 OR r.read_ts IS NULL) "
         "AND (?=0 OR (m.ack_required=1 AND r.ack_ts IS NULL)) "
+        "AND (?='' OR m.thread_id=?) "
         "ORDER BY m.id LIMIT ?",
-        (actor["id"], after, unread, unacknowledged, limit + 1),
+        (actor["id"], after, unread, unacknowledged, thread, thread, limit + 1),
     ).fetchall()
     result: dict = {"messages": [], "next_after_id": after, "has_more": False}
     for row in rows[:limit]:
@@ -848,6 +853,37 @@ def _inbox(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         result["next_after_id"] = row["id"]
     result["has_more"] = len(rows) > len(result["messages"])
     return result
+
+
+def peek_inbox(home: Path, actor: dict, args: dict) -> dict | None:
+    """Reads one inbox page for a caller that repeats the read while waiting.
+
+    The page is exactly what `fetch_inbox` reports, read in its own bounded
+    read transaction, but no tool event is recorded: a lane waiting for mail
+    would otherwise write one event per read and bury the calls an operator
+    reads the log for. The send that delivers the mail is recorded as it
+    always was.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane, whose own inbox is read.
+        args: Inbox filters, as `fetch_inbox` accepts them.
+
+    Returns:
+        The inbox page, or None once this lane holds no active registration,
+        so a revoked credential ends a repeated read instead of serving it.
+
+    Raises:
+        BridgeError: If a filter is invalid.
+    """
+    with connect(home) as db:
+        registered = db.execute(
+            "SELECT 1 FROM agents WHERE id=? AND token_digest IS NOT NULL",
+            (actor["id"],),
+        ).fetchone()
+        if registered is None:
+            return None
+        return _inbox(db, actor, args)
 
 
 MAIL_COLUMNS = (
