@@ -182,6 +182,40 @@ def test_network_git_operations_have_no_kill_timeout(
     assert calls[1]["timeout"] == 30
 
 
+def test_a_merge_that_outlives_its_timeout_is_stopped_with_a_remedy(
+    bridge, repo, paired, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    cli.git(repo, "config", "user.name", "Bridge Test")
+    cli.git(repo, "config", "user.email", "test@example.com")
+    (lane / "feature.txt").write_text("lane work\n")
+    cli.git(lane, "add", "--all")
+    cli.git(
+        lane,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Lane work",
+    )
+    running = cli.subprocess.run
+
+    def run(command, **kwargs):
+        if "merge" in command:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return running(command, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    with pytest.raises(BridgeError) as failure:
+        cli.merge_branch(repo, lane, "codex", branch)
+    assert f"after {cli.GIT_SECONDS} seconds" in str(failure.value)
+    assert "participant merge codex" in str(failure.value)
+    assert not (repo / "feature.txt").exists()
+
+
 @pytest.mark.parametrize("width", [40, 80, 120, 200])
 def test_dashboard_fits_terminal_and_names_hidden_participants(
     bridge, paired, width

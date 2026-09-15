@@ -4,6 +4,7 @@ import argparse
 import hmac
 import json
 import os
+import signal
 import socket
 import socketserver
 import sqlite3
@@ -12,20 +13,54 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import FrameType
 
 from agent_parley import checkpoints, hook, protocol, retries, roster, store
-from agent_parley.state import BridgeError
+from agent_parley.state import BridgeError, trim_log
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 MAX_REQUEST_BYTES = 16384
 MAX_HOOK_BYTES = 1_048_576
 HOOK_PATH = "/hook/"
 REVISION_SECONDS = 2.0
+LOG_NAME = "server.log"
+WORKERS = 16
+DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
+REFUSAL_SECONDS = 5.0
+SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 DRIFTED = (
     "Sources changed under the running service; it is answering from a "
     "module set the checkout no longer holds and is stopping. "
     + protocol.RELAUNCH
 )
+
+
+def log(home: Path, event: str, detail: str = "") -> None:
+    """Writes one timestamped lifecycle entry to the service log.
+
+    The launcher gives this process the service log as its output streams, so
+    printing is what writes the log. Every entry starts with a local
+    timestamp and a single event word, and an ordinary event fits one line, so
+    an operator reading the tail of a service that died can see when it bound
+    its port, when it stopped and what refused work in between. A failure
+    carries its traceback after that first line. Entries name paths,
+    participants and counts, never a credential and never peer content.
+
+    The log is bounded by the rotation every line log here shares, so a
+    long-lived service on a shared machine does not grow the file without
+    end. A log that cannot be written or bounded never fails a request.
+
+    Args:
+        home: Private bridge state root holding the service log.
+        event: Single word naming what happened, such as ``bound``.
+        detail: Remainder of the entry, already free of credentials.
+    """
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        print(f"{stamp} {event} {detail}".rstrip(), flush=True)
+    except OSError:
+        return
+    trim_log(home / LOG_NAME)
 
 
 def _tool(
@@ -194,17 +229,28 @@ class Server(ThreadingHTTPServer):
 
         The version and the source fingerprint of the code being served are
         read here, once, so every later reading is a comparison against what
-        this process actually started with.
+        this process actually started with. A successful bind is recorded as
+        one log entry, because a service that later dies leaves that entry as
+        the only evidence of when it started and what it was serving.
         """
         self.home = home
         self.token = config["token"]
-        self.slots = threading.BoundedSemaphore(16)
+        self.slots = threading.BoundedSemaphore(WORKERS)
         self.version = protocol.launcher_version()
         self.revision = protocol.revision()
         self.checked = time.monotonic()
         self.reading = threading.Lock()
         self.stopping = threading.Event()
+        self.counting = threading.Lock()
+        self.refusals = 0
+        self.reported: float | None = None
         super().__init__(("127.0.0.1", config["port"]), Handler)
+        log(
+            home,
+            "bound",
+            f"127.0.0.1:{self.server_port} version {self.version} "
+            f"pid {os.getpid()} workers {WORKERS}",
+        )
 
     def drifted(self) -> bool:
         """Reports whether the served modules left the sources on disk.
@@ -233,7 +279,7 @@ class Server(ThreadingHTTPServer):
             if protocol.revision() == self.revision:
                 return False
             self.stopping.set()
-        print(DRIFTED, flush=True)
+        log(self.home, "drifted", DRIFTED)
         threading.Thread(target=self.shutdown, daemon=True).start()
         return True
 
@@ -274,6 +320,7 @@ class Server(ThreadingHTTPServer):
         """Rejects overload rather than creating unbounded worker threads."""
         if not self.slots.acquire(blocking=False):
             self.shutdown_request(request)
+            self.refuse()
             return
         try:
             super().process_request(request, client_address)
@@ -291,6 +338,46 @@ class Server(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self.slots.release()
+
+    def refuse(self) -> None:
+        """Records that a connection was closed with every worker slot busy.
+
+        A refused connection used to be a silent close: the client saw no
+        status line, fell back to its own decision, and readiness still read
+        as ready, so the overload left no trace anywhere. It is recorded as
+        one entry naming how many connections were refused and how many
+        worker slots the service has. Refusals arrive in bursts, so one entry
+        covers a window rather than a connection and a burst cannot fill the
+        log it is reported in.
+        """
+        with self.counting:
+            self.refusals += 1
+            now = time.monotonic()
+            if (
+                self.reported is not None
+                and now - self.reported < REFUSAL_SECONDS
+            ):
+                return
+            refused, self.refusals, self.reported = self.refusals, 0, now
+        log(
+            self.home,
+            "refused",
+            f"{refused} connection(s) closed unanswered with all "
+            f"{WORKERS} worker slots busy",
+        )
+
+    def handle_error(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: tuple,
+    ) -> None:
+        """Records an unexpected request failure as one timestamped entry.
+
+        Args:
+            request: Connection whose handling raised; never logged.
+            client_address: Loopback peer, which identifies nothing here.
+        """
+        log(self.home, "failed", "request handling\n" + traceback.format_exc())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -524,16 +611,65 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._reply(403)
             return
-        try:
-            served = checkpoints.serve(self.server.home, request)
-        except Exception:
-            traceback.print_exc()
-            self._reply(500)
+        served = self._decide(request, actor["name"])
+        if served is None:
             return
         if self.headers.get("Accept") == hook.RAW_REPLY:
             self._raw_hook(served)
             return
         self._reply(200, served)
+
+    def _decide(self, request: dict, participant: str) -> dict | None:
+        """Produces one hook decision under a deadline of its own.
+
+        The client stops reading after `hook.REPLY_TIMEOUT` and decides in
+        process, so a decision still running shortly before that is worth
+        nothing to it. A checkpoint that stalls on a Git subprocess or a busy
+        store is therefore answered with the status a stopped service already
+        sends, which is the fallback path the client handles, and the worker
+        slot is released with the reply rather than held for as long as the
+        stall lasts. The stalled decision finishes on its own thread, where
+        it holds nothing this service counts.
+
+        Args:
+            request: Hook request the credential was accepted for.
+            participant: Registered identity the credential resolved to.
+
+        Returns:
+            The decision, or None once the client has been answered because
+            the decision failed or ran past its deadline.
+        """
+        outcome: dict = {}
+
+        def decide() -> None:
+            """Records the decision or the failure that ended it."""
+            try:
+                outcome["served"] = checkpoints.serve(self.server.home, request)
+            except Exception:
+                outcome["failed"] = traceback.format_exc()
+
+        worker = threading.Thread(target=decide, daemon=True)
+        worker.start()
+        worker.join(DECISION_SECONDS)
+        served = outcome.get("served")
+        if isinstance(served, dict):
+            return served
+        if "failed" in outcome:
+            log(
+                self.server.home,
+                "failed",
+                f"{self.path} {participant}\n{outcome['failed']}",
+            )
+            self._reply(500)
+            return None
+        log(
+            self.server.home,
+            "expired",
+            f"{self.path} {participant} undecided after "
+            f"{DECISION_SECONDS} seconds; answered as unavailable",
+        )
+        self._reply(503, {"status": protocol.STALE, "detail": DRIFTED})
+        return None
 
     def _raw_hook(self, served: dict) -> None:
         """Answers a hook decision without a reply a client must decode.
@@ -635,6 +771,38 @@ class Handler(BaseHTTPRequestHandler):
             }
 
 
+def stop_on_signal(home: Path, service: Server) -> None:
+    """Records a terminating signal and stops the service it names.
+
+    A service that was signalled used to leave nothing behind, so an operator
+    finding a dead process could not tell a stop from a kill. Each handled
+    signal is recorded as one entry and then stops the service the way a
+    clean stop does, on a separate thread because the serving thread is the
+    one that has to return.
+
+    Args:
+        home: Private bridge state root holding the service log.
+        service: Running service to stop when a signal arrives.
+    """
+
+    def received(number: int, frame: FrameType | None) -> None:
+        """Records the signal and starts a clean stop for it.
+
+        Args:
+            number: Signal the process was sent.
+            frame: Interrupted stack frame, which is not inspected.
+        """
+        log(
+            home,
+            "signalled",
+            f"{signal.Signals(number).name}; stopping",
+        )
+        threading.Thread(target=service.shutdown, daemon=True).start()
+
+    for number in SIGNALS:
+        signal.signal(number, received)
+
+
 def main() -> None:
     """Runs the detached coordination service using its private config."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -652,7 +820,9 @@ def main() -> None:
     observer.start()
     try:
         with Server(args.home, config) as server:
+            stop_on_signal(args.home, server)
             server.serve_forever(poll_interval=0.2)
+            log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
         observer.join(timeout=2)

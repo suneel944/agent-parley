@@ -20,6 +20,8 @@ RAW_REPLY = "application/vnd.agent-parley.hook+raw"
 STATUS_HEADER = "X-Parley-Status"
 STDOUT_HEADER = "X-Parley-Stdout-Bytes"
 CLIENT_NAME = "hook-client.sh"
+RELAUNCH_STAMP = "relaunch.stamp"
+RELAUNCH_INTERVAL = 60.0
 
 CLIENT_SCRIPT = r"""#!/usr/bin/env bash
 export LC_ALL=C
@@ -224,12 +226,61 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
     return int(parts[1]), reply
 
 
-def fallback(raw: str, cause: str) -> int:
+def relaunch(home: str) -> None:
+    """Asks for a new service when the recorded one is no longer there.
+
+    A reboot and a drift exit both leave a published record naming a
+    process that is gone, and every native tool call then pays the
+    in-process decision until an operator notices. This asks for a
+    service once such a record is read, and asks again no sooner than
+    ``RELAUNCH_INTERVAL`` seconds later, so a start that keeps failing
+    costs one detached process a minute rather than one per hook.
+
+    A home with no record is left alone: nothing claimed to serve it, and
+    the first start belongs to the lane launch or to the operator. The
+    request is detached and never waited on, so the hook that made it
+    returns its decision on its own budget, and any failure to make it
+    leaves that decision untouched.
+
+    Args:
+        home: Private bridge state root this hook was given.
+    """
+    import subprocess
+    import time
+
+    from agent_parley import process
+
+    try:
+        with open(os.path.join(home, "server.json")) as stream:
+            record = json.load(stream)
+        if process.alive(record.get("pid"), record.get("start_ticks")):
+            return
+        stamp = os.path.join(home, RELAUNCH_STAMP)
+        if os.path.exists(stamp):
+            if time.time() - os.stat(stamp).st_mtime < RELAUNCH_INTERVAL:
+                return
+        with open(stamp, "w"):
+            pass
+        subprocess.Popen(
+            [sys.executable, "-m", "agent_parley", "--home", home, "up"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError, TypeError):
+        return
+
+
+def fallback(raw: str, cause: str, home: str = "") -> int:
     """Decides in-process, recording why the service was not used.
 
     Args:
         raw: Native hook input exactly as it was read from standard input.
         cause: Bounded text naming the failure that skipped the service.
+        home: Private bridge state root, when the command line named one,
+            so an outage can ask for the service back while this call is
+            decided here.
 
     Returns:
         The hook process exit status.
@@ -238,6 +289,8 @@ def fallback(raw: str, cause: str) -> int:
 
     from agent_parley import checkpoints
 
+    if home:
+        relaunch(home)
     sys.stdin = io.StringIO(raw)
     return checkpoints.main(fallback=cause)
 
@@ -249,11 +302,13 @@ def main() -> int:
     credential; nothing secret travels on the command line. Any failure to
     obtain a served decision, from a missing file to a refused credential
     to a non-200 reply, falls back to the in-process path so the decision
-    and its recorded cause are the same ones an outage produced before.
+    and its recorded cause are the same ones an outage produced before. That
+    path also asks for the service back when the recorded one is gone, so an
+    outage heals on the next native tool call.
     """
     raw = sys.stdin.read(MAX_INPUT_BYTES)
+    selected = options(sys.argv[1:])
     try:
-        selected = options(sys.argv[1:])
         directory = selected["directory"]
         participant = selected["participant"]
         with open(
@@ -278,7 +333,11 @@ def main() -> int:
         sys.stderr.write(served["stderr"])
         return int(served["status"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        return fallback(raw, f"{type(exc).__name__}: {exc}")
+        return fallback(
+            raw,
+            f"{type(exc).__name__}: {exc}",
+            selected.get("home", ""),
+        )
 
 
 if __name__ == "__main__":

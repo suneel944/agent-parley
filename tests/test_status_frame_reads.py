@@ -65,6 +65,18 @@ def test_an_unreadable_schedule_still_reports_against_each_lane(
         )
 
 
+VOLATILE = {"report_age_seconds", "idle_seconds", "age_seconds"}
+
+
+def steady(record):
+    """Drops every field a second of wall clock changes between two reads."""
+    return {
+        key: steady(value) if isinstance(value, dict) else value
+        for key, value in record.items()
+        if key not in VOLATILE
+    }
+
+
 def test_a_lane_read_on_its_own_still_answers_without_a_shared_frame(
     bridge, registered
 ):
@@ -78,7 +90,4 @@ def test_a_lane_read_on_its_own_still_answers_without_a_shared_frame(
         ]
         if participant["participant"] == "claude"
     )
-    volatile = {"report_age_seconds", "idle_seconds"}
-    assert {k: v for k, v in alone.items() if k not in volatile} == {
-        k: v for k, v in shared.items() if k not in volatile
-    }
+    assert steady(alone) == steady(shared)
