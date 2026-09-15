@@ -3961,7 +3961,7 @@ attempt of the recorded budget, which is also only reported.
             [
                 sys.executable,
                 "-m",
-                "agent_parley.checkpoints",
+                "agent_parley.hook",
                 "--home",
                 str(self.home),
                 "--directory",
