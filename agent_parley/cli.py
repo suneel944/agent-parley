@@ -4460,7 +4460,10 @@ attempt of the recorded budget, which is also only reported.
             and the one command that state needs. A store behind this build is
             not consistent: every process running this code queries columns it
             does not have, so reporting it as compatible would describe a
-            healthy system while every lane is denied.
+            healthy system while every lane is denied. The report also names
+            the kernel release, the WSL generation or ``none``, and whether
+            ``pidfd_open`` is available, so a platform gap is read here
+            before a lane is started.
         """
         components = [
             {
@@ -4503,6 +4506,7 @@ attempt of the recorded budget, which is also only reported.
             "protocol": protocol.PROTOCOL,
             "supported": list(protocol.SUPPORTED),
             "schema": store.SCHEMA_VERSION,
+            "platform": process.host_report(),
             "components": components,
             "consistent": all(
                 component["compatible"] for component in components
@@ -5107,8 +5111,10 @@ attempt of the recorded budget, which is also only reported.
 
         Raises:
             BridgeError: If the provider, account, or lane cannot be used, or
-                the participant already has a launcher.
+                the participant already has a launcher, or the repository
+                lies on a mounted Windows drive under WSL.
         """
+        process.check_repository_host(repo)
         data = self.add_participant(repo, agent, provider, credential)
         participant = data["participants"][agent]
         entry = roster.provider(self.home, participant["provider"])

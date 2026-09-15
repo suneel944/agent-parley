@@ -117,7 +117,8 @@ def render(reported: dict) -> str:
         every command the reported drift needs. A state this build does not
         accept is printed in upper case, so an operator scanning the report
         sees which line to read. No path inside a credential profile and no
-        credential is printed.
+        credential is printed. One platform line names the kernel release,
+        the WSL generation and whether ``pidfd_open`` is available.
     """
     lines = []
     for component in reported["components"]:
@@ -130,6 +131,12 @@ def render(reported: dict) -> str:
             f"{speaks:<14}"
             f"{state if component['compatible'] else state.upper()}"
         )
+    host = reported["platform"]
+    pidfd = "available" if host["pidfd_open"] else "unavailable"
+    lines.append(
+        f"{'platform':<16}kernel {host['kernel'] or '-'}, wsl {host['wsl']}, "
+        f"pidfd_open {pidfd}"
+    )
     lines.append(verdict(reported["components"]))
     return "\n".join(lines)
 

@@ -37,6 +37,30 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: make check
+  wsl:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: git python3 curl ca-certificates
+      - name: Run the behaviour suite inside the Linux file system
+        shell: wsl-bash {0}
+        run: |
+          set -eu
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          cp -r "$PWD" "$HOME/checkout"
+          cd "$HOME/checkout"
+          uv python install 3.12
+          uv sync --locked
+          uv run --locked pytest -q
   secrets:
     runs-on: ubuntu-latest
     timeout-minutes: 5
