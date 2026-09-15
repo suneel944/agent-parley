@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.0](https://github.com/suneel944/agent-parley/compare/v0.7.0...v0.8.0) (2026-09-15)
+
+
+### Features
+
+* complete the 0.8.0 milestone with WSL checks, a selectable forge, state archives, a served hook client and OpenCode and Amp adapters (#249) ([#142](https://github.com/suneel944/agent-parley/issues/142)) ([#166](https://github.com/suneel944/agent-parley/issues/166)) ([#171](https://github.com/suneel944/agent-parley/issues/171)) ([#172](https://github.com/suneel944/agent-parley/issues/172)) ([#184](https://github.com/suneel944/agent-parley/issues/184)) ([#235](https://github.com/suneel944/agent-parley/issues/235))
+* follow one lane's coordination events as a stream (#245) ([#164](https://github.com/suneel944/agent-parley/issues/164))
+* forecast a reservation collision from co-change history before a lane starts (#248) ([#233](https://github.com/suneel944/agent-parley/issues/233))
+* generate shell completion for commands, participants, providers and issues (#240) ([#163](https://github.com/suneel944/agent-parley/issues/163))
+* list every lane, claim and store problem on one triage screen (#246) ([#234](https://github.com/suneel944/agent-parley/issues/234))
+* record an advisory token, call and hour budget per lane and mark it when crossed (#244) ([#170](https://github.com/suneel944/agent-parley/issues/170))
+* spill an oversized report, message or offer to an attachment and pass a reference (#247) ([#167](https://github.com/suneel944/agent-parley/issues/167))
+* warn a lane when an operator edit lands on a path it has reserved (#243) ([#232](https://github.com/suneel944/agent-parley/issues/232))
+
+### Bug fixes
+
+* rotate a lane's durable report log instead of growing it without bound (#237) ([#230](https://github.com/suneel944/agent-parley/issues/230))
+
+### Performance
+
+* cut the lifecycle hook's import cost so every tool call clears faster (#238) ([#229](https://github.com/suneel944/agent-parley/issues/229))
+
 ## [0.7.0](https://github.com/suneel944/agent-parley/compare/v0.6.0...v0.7.0) (2026-09-14)
 
 
