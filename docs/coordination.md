@@ -126,6 +126,20 @@ agent-parley mail thread t12
 agent-parley mail search "reservation conflict"
 ```
 
+Mail is private to the lanes it names, which loses an agreement the moment a
+third lane needs it. A lane that marks a send as a decision, and an operator
+running `agent-parley decide`, records it in one project-wide log instead, and
+every registered lane reads that log by text, by recency or over `search_decisions`:
+
+```sh
+agent-parley decide "Reservations stay advisory; no lane blocks on one."
+agent-parley decision list "advisory" --since 7d
+```
+
+Only a marked message is shared. Ordinary mail keeps the scope it always had,
+and a decision is capped, deduplicated and spilled to an attachment by the same
+rules as any other message.
+
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
 </p>

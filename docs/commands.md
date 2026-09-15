@@ -74,6 +74,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `init set COMMAND` | Set that command; an empty string removes it. |
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
+| `decide TEXT` | Record one decision every registered lane can read; `--subject` names it and `--key` deduplicates it. |
+| `decision list [QUERY]` | List or search the decisions recorded for this project; `--since` bounds their age and `--limit` the page. |
 | `mail pending` | List operator messages and offers recorded but not delivered. |
 | `mail cancel ID` | Remove one recorded operator item before it is delivered. |
 | `history issue N` | List every record that touched an issue, with each holding. |
@@ -90,7 +92,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 Every read-only command above also accepts `--json` and prints exactly one JSON
 document, so a script, a shell prompt or another agent reads coordination state
 without parsing a table: `status`, `top`, `issue list`, `participant list`,
-`mail thread`, `mail search`, `mail pending`, `verify show`, `init show`,
+`mail thread`, `mail search`, `mail pending`, `decision list`, `verify show`,
+`init show`,
 `provider list` and `credentials list`. `top --json` prints one frame and exits.
 The document carries the identifiers the table abbreviates — offer, message and
 thread IDs — with every time in RFC 3339, and no credential value. A pending
@@ -117,7 +120,15 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `list_participants` | Discover addressable identities, tasks and last coordination times. |
 | `read_thread` | Page messages this lane sent or received in one thread. |
 | `search_messages` | Search only messages this lane sent or received. |
+| `search_decisions` | Search decisions any lane recorded for this project, whoever sent or received them; an empty query lists the newest and `since` bounds their age. |
 | `read_attachment` | Page an attachment a message, report or offer named; only its writer and its addressees may read it. |
+
+`send_message` also takes a `decision` flag. A message marked that way is
+additionally recorded in the project's decision log, which every registered
+lane searches with `search_decisions`, so a third lane learns an agreement it
+was never addressed in. Nothing else widens: mail without the flag stays
+readable by its sender and its recipients alone, and a decision obeys the same
+body cap and attachment rules as any other message.
 
 Inbox rows include `read_ts` and `ack_ts`. Fetching changes neither. Both
 filters can be combined; `unacknowledged` selects messages that requested an
