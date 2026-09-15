@@ -97,7 +97,11 @@ decisions. Both are scoped to mail this lane sent or received. Replies can use
 reservations. They are not filesystem locks. Reserve a named resource instead
 of a path when the contested thing is not a file — `port:5432`, `db:local`,
 `suite:integration`, `device:android-1` — because a worktree isolates none of
-those and a named resource conflicts on an exact match. `list_participants` discovers
+those and a named resource conflicts on an exact match. A granted reservation
+may carry `forecast`: files that habitually change together with a reserved
+path and that a peer holds now, each with `path`, `peer` and `count`. It is
+advisory; message the peer to sequence the work rather than editing the
+forecast path. `list_participants` discovers
 current identities; do not guess who is addressable.
 
 `agent-parley top --once` prints a snapshot; `top --provider NAME --since 6h`

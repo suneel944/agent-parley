@@ -677,6 +677,20 @@ only its owner releases it. Reading `!` as "an agent died holding this" is the
 point; acting on it is the operator's decision, exactly as with a stalled
 issue owner.
 
+A reservation is also forecast against the base checkout's co-change history.
+When a lane files reservations, the store reads `git log --name-only` over the
+last 500 commits of the base checkout once per project, bounded by a timeout
+and cached as `cochanges.json` in the project state directory keyed by the
+head commit, so the read repeats only when the base moves and never runs
+inside the store's write transaction. Every file that changed in the same
+commit as a newly reserved path at least three times, and that a peer holds
+right now, is reported in the grant as `forecast`, with `path`, `peer` and
+`count`, bounded like `conflicts`. `issue claim` carries the same forecast
+from the paths the issue's earlier pull requests touched, read through `gh pr
+list --search "closes #N"` when a forge is configured, and stays silent
+otherwise. The forecast is advisory: nothing is withheld, and a history Git
+cannot read in time is no forecast rather than a failed call.
+
 A person editing the base checkout is the one writer reservations never saw.
 Each `top` and `status` frame runs `git status --porcelain` once for the base
 checkout of every project and compares the dirty paths against each lane's

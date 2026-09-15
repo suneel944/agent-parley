@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 MAX_TITLE = 200
+MAX_PATHS = 200
 
 GITHUB_REMOTE = re.compile(
     r"^(?:https://|ssh://git@|git@)github\.com[:/]"
@@ -165,6 +166,57 @@ def issue_title(repo: Path, number: str) -> str | None:
     except (ValueError, TypeError, KeyError, IndexError):
         return None
     return title[:MAX_TITLE] if isinstance(title, str) else None
+
+
+def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
+    """Lists the files the pull requests that closed an issue touched.
+
+    A claimed issue that already had pull requests names, through those pull
+    requests, the paths the work tends to touch. The reading is best effort
+    and read only: it is skipped without a GitHub origin or the ``gh`` client,
+    and a slow or refusing forge reports nothing rather than raising.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        number: Bare repository issue number.
+
+    Returns:
+        Sorted unique repository-relative paths, at most ``MAX_PATHS``, or an
+        empty list when the forge is unavailable or no pull request refers to
+        the issue.
+    """
+    project = _reachable(repo)
+    if project is None:
+        return []
+    output = _run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            project,
+            "--search",
+            f"closes #{number}",
+            "--state",
+            "all",
+            "--limit",
+            "10",
+            "--json",
+            "files",
+        ],
+        15,
+    )
+    if output is None:
+        return []
+    paths: set[str] = set()
+    try:
+        for record in json.loads(output):
+            for entry in record.get("files") or []:
+                if isinstance(entry.get("path"), str):
+                    paths.add(entry["path"])
+    except (ValueError, TypeError, AttributeError):
+        return []
+    return sorted(paths)[:MAX_PATHS]
 
 
 def assign(repo: Path, number: str) -> bool:

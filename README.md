@@ -472,7 +472,13 @@ grant nothing and name the blocking owner with that owner's declared reason. A
 reservation can name something that is not a file — `port:5432`, `db:local`,
 `suite:integration`, `device:android-1` — because a worktree isolates none of
 those; a named resource conflicts on an exact match, and
-`agent-parley resources set` declares which ones exist.
+`agent-parley resources set` declares which ones exist. A granted reservation
+also carries a `forecast`: the files that changed together with a reserved
+path in at least three of the base checkout's last 500 commits and that a peer
+holds right now, each with the peer and the count, so the lane can renegotiate
+or sequence before it edits. `issue claim` reports the same forecast from the
+paths the issue's earlier pull requests touched when a forge is configured.
+The forecast is advisory and never withholds a grant or a claim.
 Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Every other write takes one too — reservations, releases,
 acknowledgements, issue transitions and reports — so a retried call returns the
