@@ -48,7 +48,7 @@ def send(bridge, actor, recipient, key="pending"):
     )
 
 
-def test_presence_distinguishes_quiet_live_process_from_stopped(tmp_path):
+def test_presence_separates_an_idle_lane_from_a_stopped_one(tmp_path):
     write_json(
         tmp_path / "lane-activity.json",
         {
@@ -58,11 +58,16 @@ def test_presence_distinguishes_quiet_live_process_from_stopped(tmp_path):
             "activity": "working",
         },
     )
-    assert supervision.presence(tmp_path, "lane", 100)["state"] == "active"
+    assert (
+        supervision.presence(tmp_path, "lane", 100)["state"]
+        == supervision.ACTIVE
+    )
     quiet = supervision.presence(tmp_path, "lane", 30)
-    assert quiet["state"] == "unreachable" and quiet["process_alive"]
+    assert quiet["state"] == supervision.IDLE and quiet["process_alive"]
     write_json(tmp_path / "lane-activity.json", {"updated": time.time()})
-    assert not supervision.presence(tmp_path, "lane")["process_alive"]
+    stopped = supervision.presence(tmp_path, "lane")
+    assert stopped["state"] == supervision.STOPPED
+    assert not stopped["process_alive"]
 
 
 def test_send_reports_unreachable_and_status_lists_ack_age(
@@ -72,12 +77,42 @@ def test_send_reports_unreachable_and_status_lists_ack_age(
     directory = Path(paired["lanes"]["claude"]).parent
     supervision.poll(bridge.home, directory)
     message = send(bridge, actors["claude"], "codex")
-    assert message["recipient_warnings"][0]["recipient"] == "codex"
+    warning = message["recipient_warnings"][0]
+    assert warning["recipient"] == "codex"
+    assert warning["state"] == "unreachable"
+    assert warning["summary"] == "queued for codex (unreachable)"
     pending = mailbox(bridge.home, paired["root"], "codex")["outstanding_ack"]
     assert pending[0]["id"] == message["id"]
     assert pending[0]["age_seconds"] >= 0
     bridge.status(cli.Selection(participant="codex"))
     assert "Awaiting acknowledgement: message" in capsys.readouterr().out
+
+
+def test_send_reports_a_quiet_live_recipient_as_idle_not_unreachable(
+    bridge, paired
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    supervision.poll(bridge.home, directory)
+    lanes = bridge.status_snapshot()["projects"][0]["participants"]
+    observed = {
+        record["participant"]: record["availability"] for record in lanes
+    }
+    assert observed["codex"]["state"] == "idle"
+    assert observed["codex"]["process_alive"]
+    assert observed["claude"]["state"] == "stopped"
+    warning = send(bridge, actors["claude"], "codex")["recipient_warnings"][0]
+    assert warning["state"] == "idle"
+    assert warning["summary"] == "queued for codex (idle; wake requested)"
 
 
 def test_release_reminds_waiter_without_transferring_work(bridge, paired):

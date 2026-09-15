@@ -67,6 +67,11 @@ READ_ONLY = (
     "search_messages",
 )
 ATTACHED = ("send_message", "read_attachment")
+PRESENCE_WARNINGS = {
+    "idle": ("idle", "idle; wake requested"),
+    "stopped": ("unreachable", "unreachable"),
+    "unreachable": ("unreachable", "unreachable"),
+}
 RETRIED = {
     "acknowledge_message": ("message_id",),
     "mark_message_read": ("message_id",),
@@ -1405,7 +1410,21 @@ def _refused(
 def _recipient_warnings(
     home: Path, actor: dict, args: dict, result: dict
 ) -> None:
-    """Adds observed availability without failing an already committed send."""
+    """Adds observed availability without failing an already committed send.
+
+    A recipient whose launcher is alive but between turns is reported as idle
+    and its summary says a wake was requested, because the supervision poll
+    asks an idle lane with a backlog to take its turn. Only a recipient whose
+    recorded session process is gone is called unreachable, so a peer reading
+    the result never treats a live lane as absent. A presence row written by
+    an earlier build, before idle existed, still reads as unreachable.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: Arguments the committed send carried.
+        result: Send result the warnings are added to.
+    """
     with connect(home) as db:
         warnings = []
         for name in args["to"]:
@@ -1415,11 +1434,14 @@ def _recipient_warnings(
                 "WHERE a.project_id=? AND a.name=?",
                 (actor["project_id"], name),
             ).fetchone()
-            if row and row["state"] == "unreachable":
+            observed = PRESENCE_WARNINGS.get(row["state"]) if row else None
+            if observed:
+                state, detail = observed
                 warnings.append(
                     {
                         "recipient": name,
-                        "state": "unreachable",
+                        "state": state,
+                        "summary": f"queued for {name} ({detail})",
                         "observed_ts": row["observed_ts"],
                     }
                 )

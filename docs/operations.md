@@ -1105,11 +1105,22 @@ same records `top` reads, takes no lock and writes no coordination state.
 ### Availability, reminders and waking
 
 The local service observes each launcher's process identity and native checkpoint
-age. `status` distinguishes a stopped process from a live but quiet lane and
-lists outstanding acknowledgement IDs, senders and ages. Sending an
-`ack_required` message returns an availability warning when the latest runtime
-observation marks its recipient unreachable. Observed availability is separate
-from last coordination and never changes claims.
+age. Observed availability is one of three states. `active` is a live launcher
+whose latest checkpoint is younger than `inactive_after`; `idle` is a live
+launcher whose checkpoint has aged past it, which is what a lane between turns
+looks like; `stopped` is a launcher whose recorded session process is gone. A
+lane that is only idle is never reported with the word a dead launcher gets.
+`status` reports that state beside process liveness and lists outstanding
+acknowledgement IDs, senders and ages.
+
+Sending an `ack_required` message returns an availability warning when the
+latest runtime observation puts its recipient in either non-active state. An
+idle recipient reports `state` `idle` with the summary
+`queued for NAME (idle; wake requested)`, because the next supervision poll
+asks an idle lane holding a backlog to take its turn. A recipient whose
+process is gone reports `state` `unreachable` with the summary
+`queued for NAME (unreachable)`. Observed availability is separate from last
+coordination and never changes claims.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
