@@ -36,6 +36,7 @@ from agent_parley import (
     metrics,
     plan,
     policy,
+    problems,
     process,
     protocol,
     retries,
@@ -4460,6 +4461,23 @@ attempt of the recorded budget, which is also only reported.
             ),
         }
 
+    def problems(self, ack_after: float = 0.0) -> list[dict]:
+        """Lists every condition an operator should act on, oldest first.
+
+        The rows are derived from the same status reading `status` and
+        `top` print, so a lane reads the same on every surface. The command
+        reads: it wakes nobody, releases nothing and moves no ownership.
+
+        Args:
+            ack_after: Seconds a message may await acknowledgement before it
+                is listed; each project's stall interval when zero.
+
+        Returns:
+            One row per condition, naming the lane, the condition, how long
+            it has held and the command that clears it.
+        """
+        return problems.derive(self.home, self.status_snapshot(), ack_after)
+
     def work_plan(
         self, repo: Path, action: str, path: Path | None = None
     ) -> dict:
@@ -5814,6 +5832,23 @@ def main() -> int:
         help="Report launcher, plugin and store versions and their fit.",
     )
     checking.add_argument("--json", action="store_true", help=JSON_HELP)
+    triaging = commands.add_parser(
+        "problems",
+        help=(
+            "List every lane, claim and store condition that needs an "
+            "operator, oldest first; exit 1 when there is any."
+        ),
+    )
+    triaging.add_argument("--json", action="store_true", help=JSON_HELP)
+    triaging.add_argument(
+        "--ack-after",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds a message may await acknowledgement before it is "
+            "listed; the project's stalled_after when omitted."
+        ),
+    )
     planning = commands.add_parser(
         "plan", help="Apply, compare or show the recorded work-order plan."
     )
@@ -6183,6 +6218,7 @@ def main() -> int:
                     tuple(args.participant or ()),
                     names,
                     not args.no_operator_edits,
+                    lambda: problems.lines(bridge.problems()),
                 )
         elif args.command == "metrics":
             if args.every and not args.output:
@@ -6340,6 +6376,14 @@ def main() -> int:
                 else protocol.render(reported)
             )
             return 0 if reported["consistent"] else 1
+        elif args.command == "problems":
+            found = bridge.problems(args.ack_after)
+            print(
+                views.render("problems", problems.rendered(found))
+                if args.json
+                else "\n".join(problems.lines(found))
+            )
+            return 1 if found else 0
         elif args.command == "plan":
             applied = bridge.work_plan(
                 args.repo.resolve(), args.action, getattr(args, "path", None)

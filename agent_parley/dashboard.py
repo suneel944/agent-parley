@@ -90,6 +90,7 @@ KEYS = (
     ("f", "narrow to participants, comma separated; empty clears"),
     ("o", "narrow to projects, comma separated; empty clears"),
     ("c", "show these columns, comma separated; empty shows all"),
+    ("P", "every lane, claim and store problem, oldest first, in place"),
     ("?", "this key map and the column legend"),
     ("q", "leave; this view never writes state"),
 )
@@ -1103,6 +1104,7 @@ def _loop(
     window: float,
     choices: dict,
     operator_edits: bool = True,
+    problems: Callable[[], list[str]] | None = None,
 ) -> None:
     """Redraws the snapshot until the operator quits; never writes state."""
     branches: dict = {}
@@ -1164,6 +1166,10 @@ def _loop(
             _overlay(screen, detail(rows[min(cursor, len(rows) - 1)]), interval)
         elif key == ord("?"):
             _overlay(screen, keymap(), interval)
+        elif key == ord("P") and problems is not None:
+            _overlay(
+                screen, ["agent-parley problems", "", *problems()], interval
+            )
         elif key == ord("s"):
             names = list(SORT_KEYS)
             shaping["sort"] = names[
@@ -1196,6 +1202,7 @@ def run(
     participants: tuple[str, ...] = (),
     columns: tuple[str, ...] = (),
     operator_edits: bool = True,
+    problems: Callable[[], list[str]] | None = None,
 ) -> None:
     """Shows the dashboard, printing a plain snapshot when it cannot draw.
 
@@ -1214,6 +1221,8 @@ def run(
         columns: Column names to show; all of them when empty.
         operator_edits: Whether each frame reads the base checkout for
             dirty paths that overlap a lane's reservation.
+        problems: Produces the problem lines the ``P`` key shows in place
+            of the table; the key does nothing when None.
 
     A snapshot is printed at the width of the terminal when one is
     attached and at the full width of the table when the output is a pipe,
@@ -1258,4 +1267,5 @@ def run(
         window,
         shaping,
         operator_edits,
+        problems,
     )
