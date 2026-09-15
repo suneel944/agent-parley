@@ -2115,6 +2115,105 @@ def decide(home: Path, root: str, subject: str, body: str, key: str) -> dict:
         )
 
 
+def list_messages(
+    home: Path, root: str, name: str, limit: int = MAX_SEARCH_HITS
+) -> dict:
+    """Lists a registered participant's own mail, newest first.
+
+    The listing answers the same question a search answers without a query
+    to write, so an operator reads what is waiting in a lane's inbox without
+    knowing the search syntax. It reads only: nothing is marked read,
+    acknowledged or delivered by listing it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own mail is listed.
+        limit: Maximum messages reported.
+
+    Returns:
+        The most recent messages this participant sent or received, newest
+        first, and whether more were held back by the limit or the result
+        budget.
+
+    Raises:
+        BridgeError: If no store exists or the participant is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home) as db:
+        actor = _identify(db, root, name)
+        bounded = _number(limit, "limit", 1, MAX_SEARCH_HITS)
+        rows = db.execute(
+            MAIL_COLUMNS
+            + "FROM messages m "
+            + MAIL_SCOPE
+            + "ORDER BY m.id DESC LIMIT ?",
+            (
+                PREVIEW_CHARACTERS,
+                actor["id"],
+                actor["project_id"],
+                actor["id"],
+                bounded + 1,
+            ),
+        ).fetchall()
+        result: dict = {"limit": bounded}
+        messages = _bounded(result, rows[:bounded])
+        result["messages"] = messages
+        result["has_more"] = len(rows) > len(messages)
+        return result
+
+
+def acknowledge(home: Path, root: str, identifier: int) -> dict:
+    """Records the supervising operator's acknowledgement of one message.
+
+    A message that requires an acknowledgement is answered by the lane that
+    holds it. Where that lane cannot answer, the condition stays on the
+    problem list with no control to clear it, so the operator records the
+    acknowledgement instead. Nothing else moves: no ownership changes, no
+    reservation is released and no lane is woken.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        identifier: Message awaiting an acknowledgement.
+
+    Returns:
+        The message identifier and the registered identities the
+        acknowledgement was recorded for.
+
+    Raises:
+        BridgeError: If no store exists, or that message is not awaiting an
+            acknowledgement in this project.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        rows = db.execute(
+            "SELECT a.name AS name FROM message_recipients r "
+            "JOIN messages m ON m.id=r.message_id "
+            "JOIN agents a ON a.id=r.agent_id "
+            "JOIN projects p ON p.id=m.project_id "
+            "WHERE p.human_key=? AND m.id=? AND m.ack_required=1 "
+            "AND r.ack_ts IS NULL ORDER BY a.name",
+            (root, identifier),
+        ).fetchall()
+        if not rows:
+            raise BridgeError(
+                f"Message {identifier} awaits no acknowledgement here."
+            )
+        db.execute(
+            "UPDATE message_recipients SET "
+            "read_ts=COALESCE(read_ts,CURRENT_TIMESTAMP),"
+            "ack_ts=CURRENT_TIMESTAMP WHERE message_id=? AND ack_ts IS NULL",
+            (identifier,),
+        )
+        return {
+            "id": identifier,
+            "participants": [row["name"] for row in rows],
+        }
+
+
 def speak(
     home: Path,
     root: str,
