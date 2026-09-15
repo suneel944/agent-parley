@@ -240,6 +240,13 @@ agent-parley doctor
 agent-parley doctor --json
 ```
 
+The plugin lines read the manifest of each client from wherever the plugin tree
+was installed. A wheel carries that tree inside the package directory, at
+`agent_parley/plugins/agent-parley`, because a wheel is unpacked into an
+environment that holds nothing else of this project. A checkout keeps it at the
+top level, where the client directories read it. Both layouts therefore report
+the same protocol.
+
 The launcher version reported here is the version of the code that is running.
 An editable install, which `make install-dev` creates, records its version once
 at install time and keeps reporting it after the checkout has moved on, so the

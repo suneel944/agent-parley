@@ -1581,6 +1581,12 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     assert wheel.exists(), "Run make build before the installed-package test."
     with zipfile.ZipFile(wheel) as archive:
         assert "agent_parley/__main__.py" in archive.namelist()
+        for client in ("claude", "codex"):
+            manifest = archive.read(
+                f"agent_parley/plugins/agent-parley/"
+                f".{client}-plugin/plugin.json"
+            )
+            assert json.loads(manifest)["version"] == version
         package_metadata = archive.read(
             f"{stem}-{version}.dist-info/METADATA"
         ).decode()
@@ -1672,6 +1678,19 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             timeout=10,
         )
         assert "Server: ready" in health.stdout
+        report = subprocess.run(
+            [str(executable), "doctor"],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        assert report.returncode == 0, report.stdout
+        assert "MISMATCH" not in report.stdout
+        for client in ("claude", "codex"):
+            assert f"{client} plugin" in report.stdout
     finally:
         subprocess.run(
             [str(executable), "down"],
