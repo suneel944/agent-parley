@@ -1233,7 +1233,7 @@ names look like credentials.
 ## Other agent CLIs
 
 Agent Parley hands the native CLI its MCP server, the coordination prompt and
-its lifecycle hooks at launch. Five contracts implement that, and `--adapter`
+its lifecycle hooks at launch. Six contracts implement that, and `--adapter`
 names the one to use:
 
 | Adapter | MCP server | Coordination prompt | Hooks |
@@ -1243,6 +1243,7 @@ names the one to use:
 | `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-p` argument | `hooks` in `settings.json` there |
 | `gemini` | `mcpServers` in the lane-private system settings overlay | prepended to `--prompt-interactive` | `hooks` in that overlay, `--adapter gemini` |
 | `opencode` | `mcp` in the lane-private `opencode.json` | prepended to `--prompt` | `plugin/agent-parley.js` in the lane-private directory, `--adapter opencode` |
+| `amp` | `amp.mcpServers` in the lane-private `settings.json` | prepended to the prompt argument after `--settings-file` | `amp.hooks` in that file, `--adapter amp` |
 
 `agent-parley provider list` prints `unavailable_hooks` for every definition,
 naming the shared events that adapter's CLI cannot raise. A launch refuses an
@@ -1296,29 +1297,56 @@ trial with the native CLI installed and signed in:
 | Gemini CLI | overlay contents, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` selection, every `hooks` event runs the command, denial and context schema | that Gemini honours `decision: deny` from a `BeforeTool` hook in a system overlay, and `--resume ID` |
 | Copilot CLI | `mcp-config.json` and `settings.json` merge, PascalCase event payloads, flat result schema, retire cleanup | that a `PreToolUse` `permissionDecision: deny` stops the tool, and `--resume ID`; #173 tracks the payload contract |
 | OpenCode | `opencode.json` copy and `mcp` entry, plugin file and its embedded command, event and tool-name translation, `--session ID` on resume | that OpenCode loads `plugin/agent-parley.js` from `OPENCODE_CONFIG_DIR`, that `{env:AGENT_PARLEY_TOKEN}` is substituted in `headers`, that a thrown error in `tool.execute.before` refuses the call, and that `client.session.prompt` delivers a blocked-stop reason |
+| Amp | `settings.json` copy, `amp.mcpServers` entry with the literal bearer token, one `amp.hooks` entry per tool event and its command, field and event translation, `reject` on refusal, `threads continue ID` on resume, retire cleanup, the required-guard refusal | that Amp accepts `--settings-file` with a prompt argument, that `amp.hooks` entries with `event`, `command` and `args` run around tool calls and read `{"action":"reject","reason":…}` from stdout, the input field names for the tool, its input and the thread, that a remote `amp.mcpServers` entry honours `headers`, and that no thread start or idle hook exists; the `amp` lane stays refused until that last point is disproved |
 
 Record the outcome of a live trial in the issue that requested it, with the
 CLI version, and file a gap as its own issue. Operator recovery after a lane
 loses its session is #153 and saved-session recovery is #175; both apply to
 every adapter, since each one records the native session identifier the same
-way through `SessionStart`.
+way through `SessionStart`, or through the first tool hook for `amp`, whose
+thread identifier arrives with every tool event.
 
-Amp remains uncovered. `agent-parley provider add` will store a definition
-naming it, because the command is only resolved on `PATH` at launch, but the
-resulting session fails inside the native CLI. There is no flag that makes it
-work and none should be added.
+The `amp` preset starts the native Amp CLI. Amp reads one `settings.json`,
+from `~/.config/amp` or the file `AMP_SETTINGS_FILE` or `--settings-file`
+names, holding MCP servers under `amp.mcpServers` and hook commands under
+`amp.hooks`; a credential profile may point `AMP_SETTINGS_FILE` at the file,
+or the directory holding it, that is copied. The launcher copies it to
+`<participant>-amp-settings.json` under the private state root, adds the
+lane's server with its bearer header written literally, since Amp substitutes
+no environment references in settings and the identity file beside it already
+holds the token, appends one hook per supported event, and passes the copy
+with `--settings-file` for that launch only. Every other key is carried
+unchanged and the source file is never written; Amp keeps its credentials in
+its own store, so authentication is untouched. Settings that already define
+`agent_parley` refuse the launch. The overlay is rebuilt on every launch and
+removed by `participant retire`, so a stale copy left by a crash is replaced.
+
+Amp's hooks fire around tool execution only: `tool:pre-execute` maps to
+`PreToolUse` and `tool:post-execute` to `PostToolUse`, each spawning the hook
+command with `--adapter amp`. `amp.py` reads the tool name, input, result
+and thread identifier under Amp's field names and flattens a refusal to
+`{"action": "reject", "reason": …}`; any other result is an empty object, so
+the hook never allows a call on the lane's behalf and Amp's own approval
+prompt decides. Amp raises no thread start, prompt, approval, idle or end
+event, so `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop` and
+`SessionEnd` are reported under `unavailable_hooks`, and because two of
+those are required guards, `agent-parley run amp` is refused with one
+sentence naming them rather than started without branch and turn guards.
+Resume passes the recorded thread as `threads continue ID`; the thread is
+recorded from the first tool hook, so a lane that never reached a tool call
+has no session to resume and the launcher says so.
 
 | Agent CLI | MCP configuration | Lifecycle hooks | Per-account config home |
 | --- | --- | --- | --- |
 | Gemini CLI | lane-private system settings overlay | translated native hooks | `GEMINI_CLI_HOME` |
 | Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `hooks` in `$COPILOT_HOME/settings.json` | `COPILOT_HOME` |
 | OpenCode | `mcp` in the lane-private `opencode.json` | `plugin/agent-parley.js` spawning the hook command | `OPENCODE_CONFIG_DIR` |
-| Amp | `--mcp-config`, or `amp.mcpServers` in its settings file | `amp.hooks` in its settings file | `--settings-file`, `AMP_SETTINGS_FILE` |
+| Amp | `amp.mcpServers` in the lane-private `settings.json` | `amp.hooks` in that file, tool events only | `AMP_SETTINGS_FILE` |
 
-Copilot CLI, Gemini CLI and OpenCode have native adapters. Amp does not:
-it accepts `--mcp-config`, but it has no `--append-system-prompt`, and its
-settings arrive through `--settings-file` rather than `--settings`, so two
-thirds of the `claude` contract is rejected.
+Copilot CLI, Gemini CLI, OpenCode and Amp have native adapters. Amp does
+not accept `--append-system-prompt`, and its settings arrive through
+`--settings-file` rather than `--settings`, so naming it as a `claude`
+provider executable still fails; use the `amp` preset.
 
 ## Recovery and teardown
 

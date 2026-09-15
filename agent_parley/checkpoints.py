@@ -1513,6 +1513,8 @@ def serve(home: Path, request: dict) -> dict:
             from agent_parley import copilot as adapter
         elif request.get("adapter") == "opencode":
             from agent_parley import opencode as adapter
+        elif request.get("adapter") == "amp":
+            from agent_parley import amp as adapter
         if adapter is not None:
             payload = adapter.payload(payload)
         output = checkpoint(home, directory, participant, payload)
@@ -1549,7 +1551,7 @@ def main(fallback: str = "") -> int:
     parser.add_argument("--participant", "--agent", required=True)
     parser.add_argument(
         "--adapter",
-        choices=("native", "gemini", "copilot", "opencode"),
+        choices=("native", "gemini", "copilot", "opencode", "amp"),
         default="native",
     )
     parser.add_argument("--protocol", type=int, default=protocol.PROTOCOL)
