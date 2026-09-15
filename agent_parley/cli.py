@@ -2317,6 +2317,7 @@ class Bridge:
             "base": git(root, "rev-parse", "--verify", "HEAD"),
             "verify": [],
             "initialize": [],
+            "forge": forge.select(root),
             "participants": {},
         }
         write_json(path, data)
@@ -2776,6 +2777,45 @@ class Bridge:
             f"{configured}/{directory.name}/lane-N. A lane branch carries no "
             "participant, provider or account name. Existing lanes keep the "
             "branch they were created with."
+        )
+
+    def tracker(self, repo: Path, name: str | None = None) -> str:
+        """Reports or records the forge a project coordinates over.
+
+        The forge is per project and lives in the manifest beside the roster.
+        It changes nothing about ownership: every forge exchange stays best
+        effort, and the ledger decides who owns an issue whichever tracker
+        mirrors it. Only the GitHub forge opens pull requests.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Forge to record, or None to report the current choice.
+
+        Returns:
+            An account of the forge in use and what it can do.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or the name is
+                not a known forge.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if name is not None:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["forge"] = roster.forge_choice(name)
+                write_json(directory / "project.json", data)
+        chosen = forge.select(root, data)
+        origin = "recorded" if data.get("forge") else "detected"
+        ability = (
+            "opens pull requests through gh"
+            if chosen == "github"
+            else "opens no pull requests"
+        )
+        return (
+            f"{root} coordinates over the {chosen} forge ({origin}), which "
+            f"{ability}. Every forge exchange is best effort; the ledger "
+            "decides ownership."
         )
 
     def resources(self, repo: Path, declared: str | None = None) -> str:
@@ -3690,6 +3730,12 @@ class Bridge:
         directory, data, participant = self._lane(repo, name)
         root = Path(data["root"])
         branch = participant["branch"]
+        chosen = forge.select(root, data)
+        if chosen != "github":
+            raise BridgeError(
+                f"{root} coordinates over the {chosen} forge, which opens no "
+                "pull requests, so nothing was pushed."
+            )
         self._require_approval(directory, data, name, "pr")
         path = directory / f"{name}-activity.json"
         state = json.loads(path.read_text()) if path.exists() else {}
@@ -4110,6 +4156,7 @@ attempt of the recorded budget, which is also only reported.
             change_attempt(directory, agent, owned)
         if arrived:
             body = report_comment(summary, evidence)
+            forge.select(repo, data)
             for issue, record in snapshot(directory)["issues"].items():
                 if record["owner"] == agent:
                     forge.comment(repo, issue, body)
@@ -4304,6 +4351,7 @@ attempt of the recorded budget, which is also only reported.
                     "condition": f"released:{parse_issue(when_released)}",
                 },
             )
+        forge.select(repo, data)
         title = (
             forge.issue_title(repo, parse_issue(number))
             if action == "claim"
@@ -6211,6 +6259,24 @@ def main() -> int:
         ),
     )
     naming_set.add_argument("--repo", type=Path, default=Path.cwd())
+    tracker = commands.add_parser(
+        "forge",
+        help="Show or set the issue tracker this project coordinates over.",
+    )
+    trackers = tracker.add_subparsers(dest="action", required=True)
+    tracker_show = trackers.add_parser("show")
+    tracker_show.add_argument("--repo", type=Path, default=Path.cwd())
+    tracker_set = trackers.add_parser("set")
+    tracker_set.add_argument(
+        "name",
+        metavar="NAME",
+        choices=forge.FORGES,
+        help=(
+            "github speaks through gh, beads through bd when the repository "
+            "carries a .beads/ ledger, and null keeps issue numbers bare."
+        ),
+    )
+    tracker_set.add_argument("--repo", type=Path, default=Path.cwd())
     budgets = commands.add_parser(
         "deadlines",
         help="Show or set this project's deadline and attempt defaults.",
@@ -6670,6 +6736,10 @@ def main() -> int:
                 bridge.branch_naming(
                     args.repo.resolve(), getattr(args, "prefix", None)
                 )
+            )
+        elif args.command == "forge":
+            print(
+                bridge.tracker(args.repo.resolve(), getattr(args, "name", None))
             )
         elif args.command == "deadlines":
             repository = args.repo.resolve()

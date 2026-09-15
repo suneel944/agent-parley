@@ -479,6 +479,13 @@ holds right now, each with the peer and the count, so the lane can renegotiate
 or sequence before it edits. `issue claim` reports the same forecast from the
 paths the issue's earlier pull requests touched when a forge is configured.
 The forecast is advisory and never withholds a grant or a claim.
+
+**The forge is selectable per project.** `github` speaks through `gh` and is
+the default; `beads` speaks through the `bd` CLI and is detected when the
+repository carries a `.beads/` ledger; `null` keeps issue numbers bare and
+calls nothing. `agent-parley forge set NAME` overrides detection. Every forge
+exchange is best effort and never decides ownership, and `participant pr`
+refuses in one sentence under a forge that opens no pull requests.
 Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Every other write takes one too — reservations, releases,
 acknowledgements, issue transitions and reports — so a retried call returns the
@@ -735,6 +742,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
 | `branch show` | Show the prefix new lane branches are created under. |
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
+| `forge show` | Show the issue tracker this project coordinates over. |
+| `forge set NAME` | Select `github`, `beads` or `null`; only `github` opens pull requests. |
 | `resources show` | Show the named resources lanes may reserve. |
 | `resources set NAMES` | Declare them; an empty string accepts any well-formed name. |
 | `deadlines show` | Show this project's deadline and attempt defaults. |

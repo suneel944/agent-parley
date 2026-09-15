@@ -1272,6 +1272,28 @@ and drift detection keep working across the change. A branch name that already
 exists in the repository only moves the ordinal on: nothing is renamed, reused
 or deleted.
 
+### Selecting the forge
+
+Issue titles, assignee mirrors and report comments go to the forge the project
+manifest records. Registration detects it: a repository carrying a Beads ledger
+in `.beads/` selects `beads`, any other selects `github`. The choice is per
+project and can be set by hand:
+
+```sh
+agent-parley forge show
+agent-parley forge set beads
+agent-parley forge set null
+```
+
+`github` speaks through your own `gh` login. `beads` speaks through the `bd`
+CLI: `bd show ID --json` for titles, `bd update ID --assignee` for the claim
+and release mirrors, and `bd comment` for reports. `null` keeps issue numbers
+bare, calls nothing and never fails. Every forge exchange stays best effort:
+the ledger is written first and decides ownership, and a forge that is missing,
+offline or unwilling changes nothing. Only `github` opens pull requests, so
+`participant pr` refuses in one sentence under `beads` or `null` before it
+pushes anything.
+
 Attribution is refused everywhere a lane can publish text, on every repository,
 for every provider, with no flag that turns it off:
 
