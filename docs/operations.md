@@ -1387,6 +1387,30 @@ adapter that cannot deliver `SessionStart`, `PreToolUse` or `Stop`, with the
 missing events named, rather than starting a lane whose branch, claim and
 turn guards would silently never run.
 
+The same listing prints `delivery`, naming how coordination reaches a lane
+driven by that adapter. `hooks` means a native lifecycle event carries mail,
+handoff notices, operator edits and reservation state into the session at a
+turn boundary, which is every adapter that raises `SessionStart`,
+`UserPromptSubmit`, `PreToolUse` and `Stop`. `polled` means the adapter is
+missing at least one of those, so the launcher runs a delivery thread beside
+that session instead: it reads the same mailbox the served checkpoint reads,
+on the interval `AGENT_PARLEY_DELIVERY_SECONDS` sets (20s by default, clamped
+to 0.05s-600s), and publishes what is undelivered into
+`STATE/PROJECT/NAME-delivery.md`, which is lane-private and outside the
+target repository. The lane's coordination prompt names that file and tells
+it to read it at every turn; a file that cannot be written falls back to a
+notice on the launcher's terminal. Each delivery is written to the same
+participant event log a served checkpoint records into, under the reason
+class `polled_delivery`, so `agent-parley top` counts its bytes in `CONTEXT`
+like any other lane's.
+
+Polled delivery is delivery, never enforcement. It cannot deny a tool call,
+cannot hold a turn open, and reaches the lane only as text that lane has to
+read, so an adapter missing a required guard is still refused at launch. It
+carries no budget threshold notice, it never advances a paused lane's mail,
+and it is bounded by the same context budget the hook path uses, so a large
+batch of mail arrives over several intervals.
+
 A provider's `--executable` therefore has to accept every argument of the
 contract its adapter names. The `copilot` adapter is the file-configured one:
 Copilot CLI reads MCP servers and hooks from its configuration directory rather
@@ -1467,7 +1491,10 @@ prompt decides. Amp raises no thread start, prompt, approval, idle or end
 event, so `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop` and
 `SessionEnd` are reported under `unavailable_hooks`, and because two of
 those are required guards, `agent-parley run amp` is refused with one
-sentence naming them rather than started without branch and turn guards.
+sentence naming them rather than started without branch and turn guards. Its
+`delivery` therefore reads `polled`: the moment Amp raises those two events,
+that lane launches and its mail arrives on the delivery interval rather than
+at a turn boundary, because the events that would carry it are still absent.
 Resume passes the recorded thread as `threads continue ID`; the thread is
 recorded from the first tool hook, so a lane that never reached a tool call
 has no session to resume and the launcher says so.

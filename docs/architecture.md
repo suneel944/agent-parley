@@ -19,6 +19,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
 | `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
@@ -304,6 +305,19 @@ event, and translates those inputs and results; Amp raises no thread start or
 idle event, so `SessionStart` and `Stop` are unavailable and the launcher
 refuses an `amp` lane today. `docs/operations.md` records that surface and
 what only a live trial can verify.
+
+An adapter whose CLI raises no event able to carry context is served by
+`delivery.py` instead, which `provider list` reports as the `polled` delivery
+path against the `hooks` one. It is launcher-owned, never a served path: the
+launcher starts one daemon thread for the life of that native session, and
+the thread reads the same mailbox `checkpoints.mailbox` reads, composes the
+same bounded notice the checkpoint composes, publishes it to a lane-private
+file under the state root that the coordination prompt tells the lane to read
+each turn, and records the delivery through `checkpoints.record` so a polled
+lane's delivered context is counted where every other lane's is. A read that
+fails is retried on the next interval rather than raised, because losing
+delivery must never end a native session, and delivery decides nothing: a
+missing guard still refuses the launch.
 
 A credential profile selects one account by pointing the CLI's config-home
 variable at a separate directory, so the same provider can run twice under
