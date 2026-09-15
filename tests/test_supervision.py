@@ -70,6 +70,25 @@ def test_presence_separates_an_idle_lane_from_a_stopped_one(tmp_path):
     assert not stopped["process_alive"]
 
 
+def test_presence_reports_no_age_before_the_first_checkpoint(tmp_path):
+    absent = supervision.presence(tmp_path, "lane")
+    assert absent["state"] == supervision.STOPPED
+    assert absent["last_active"] is None
+    assert absent["age_seconds"] is None
+    write_json(
+        tmp_path / "lane-activity.json",
+        {
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+            "activity": "working",
+        },
+    )
+    started = supervision.presence(tmp_path, "lane", 30)
+    assert started["state"] == supervision.ACTIVE
+    assert started["process_alive"]
+    assert started["age_seconds"] is None
+
+
 def test_send_reports_unreachable_and_status_lists_ack_age(
     bridge, paired, capsys
 ):
