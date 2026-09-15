@@ -50,7 +50,10 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
 
     Returns:
         The response status and body; the service closes the connection
-        after one response, so the body ends at end of stream.
+        after one response, so the body ends at end of stream. A service
+        that answers from the headers alone, as it does for an oversized
+        body, may close its side before the body is fully written; the
+        reply it already sent is still read and returned.
 
     Raises:
         OSError: If the connection is refused or a timeout passes.
@@ -69,9 +72,13 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
         ("127.0.0.1", port), timeout=CONNECT_TIMEOUT
     ) as sock:
         sock.settimeout(REPLY_TIMEOUT)
-        sock.sendall(head + body)
-        while chunk := sock.recv(65536):
-            chunks.append(chunk)
+        try:
+            sock.sendall(head + body)
+            while chunk := sock.recv(65536):
+                chunks.append(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            if not chunks:
+                raise
     header, _, reply = b"".join(chunks).partition(b"\r\n\r\n")
     return int(header.split(b" ", 2)[1]), reply
 

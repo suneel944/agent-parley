@@ -374,7 +374,10 @@ class Handler(BaseHTTPRequestHandler):
 
         Returns:
             The decoded JSON value, ``_INVALID`` when the body was not JSON,
-            or ``_REFUSED`` after a refusal has already been written.
+            or ``_REFUSED`` after a refusal has already been written. A body
+            over the limit but under twice it is drained before the refusal,
+            so a peer still writing it reads the reply instead of seeing its
+            connection reset; anything larger is refused unread.
         """
         if self.headers.get_content_type() != "application/json":
             self._reply(415)
@@ -385,6 +388,10 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(400)
             return _REFUSED
         if not 0 < length <= limit or self.headers.get("Transfer-Encoding"):
+            if 0 < length <= 2 * limit and not self.headers.get(
+                "Transfer-Encoding"
+            ):
+                self.rfile.read(length)
             self._reply(413)
             return _REFUSED
         try:

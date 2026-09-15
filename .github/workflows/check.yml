@@ -60,6 +60,7 @@ jobs:
           cd "$HOME/checkout"
           uv python install 3.12
           uv sync --locked
+          uv build --no-sources
           uv run --locked pytest -q
   secrets:
     runs-on: ubuntu-latest
