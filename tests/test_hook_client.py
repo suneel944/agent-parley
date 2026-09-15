@@ -701,11 +701,23 @@ def gone(bridge):
 
 
 def requests(monkeypatch):
-    """Collects the relaunch requests instead of starting a service."""
+    """Collects the relaunch requests instead of starting a service.
+
+    Only a request to start this package is collected. Every other spawn
+    reaches the real one, because reading a process's creation identity
+    runs an external command on a platform without `/proc`, and answering
+    that call with a recorder breaks the relaunch decision under test.
+    """
     asked = []
-    monkeypatch.setattr(
-        subprocess, "Popen", lambda *args, **named: asked.append(args)
-    )
+    spawn = subprocess.Popen
+
+    def collect(*args, **named):
+        if args and "agent_parley" in " ".join(str(part) for part in args[0]):
+            asked.append(args)
+            return None
+        return spawn(*args, **named)
+
+    monkeypatch.setattr(subprocess, "Popen", collect)
     return asked
 
 

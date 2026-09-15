@@ -214,7 +214,17 @@ def test_a_failed_start_publishes_no_server_record(bridge, monkeypatch):
             """Reports the status such a child already left behind."""
             return 1
 
-    monkeypatch.setattr(subprocess, "Popen", lambda *args, **named: Exited())
+    spawn = subprocess.Popen
+
+    def start(*args, **named):
+        """Answers only the service start; every other spawn is real."""
+        if args and "agent_parley.server" in " ".join(
+            str(part) for part in args[0]
+        ):
+            return Exited()
+        return spawn(*args, **named)
+
+    monkeypatch.setattr(subprocess, "Popen", start)
     with pytest.raises(BridgeError, match="failed to start"):
         bridge.up()
     assert not (bridge.home / "server.json").exists()
