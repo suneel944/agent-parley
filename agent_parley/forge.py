@@ -1,12 +1,20 @@
-"""Optional best-effort exchanges with the repository's host forge.
+"""Optional best-effort exchanges with the repository's issue tracker.
 
 Every call here is optional context, never authority. The local ledger decides
 ownership and is written first; a forge lookup or mirror runs afterwards
-through the operator's own ``gh`` installation, adds no flag that bypasses a
-repository rule, and reports failure instead of raising. Coordination must
-keep working with no network, no ``gh`` client and no GitHub remote.
+through the operator's own client, adds no flag that bypasses a repository
+rule, and reports failure instead of raising. Coordination must keep working
+with no network, no client and no remote.
+
+The forge is selected per project. ``github`` speaks through ``gh`` and is the
+shipped default. ``beads`` speaks through the ``bd`` client when the
+repository carries a Beads ledger in ``.beads/``. ``null`` keeps issue numbers
+bare, calls nothing and never fails. :func:`select` names the implementation
+from the project manifest, falling back to detection, and every public
+function routes through that choice.
 """
 
+import getpass
 import json
 import re
 import shutil
@@ -16,11 +24,50 @@ from pathlib import Path
 
 MAX_TITLE = 200
 MAX_PATHS = 200
+FORGES = ("github", "beads", "null")
+DEFAULT_FORGE = "github"
 
 GITHUB_REMOTE = re.compile(
     r"^(?:https://|ssh://git@|git@)github\.com[:/]"
     r"(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$"
 )
+
+_selected: dict[str, str] = {}
+
+
+def select(repo: Path, manifest: dict | None = None) -> str:
+    """Names the forge implementation that applies to a checkout.
+
+    A value recorded in the project manifest wins. Without one, a checkout
+    carrying a Beads ledger selects ``beads`` and any other selects
+    ``github``. The choice is remembered for the checkout path, because the
+    lookups and mirrors below receive only that path and must route through
+    the same implementation the caller resolved.
+
+    Args:
+        repo: Repository or assigned worktree the forge is asked about.
+        manifest: Project manifest, or None to rely on detection alone.
+
+    Returns:
+        One of ``github``, ``beads`` or ``null``.
+    """
+    recorded = (manifest or {}).get("forge")
+    if recorded in FORGES:
+        name = str(recorded)
+    else:
+        root = Path((manifest or {}).get("root") or repo)
+        name = (
+            "beads"
+            if (repo / ".beads").is_dir() or (root / ".beads").is_dir()
+            else DEFAULT_FORGE
+        )
+    _selected[str(repo)] = name
+    return name
+
+
+def _implementation(repo: Path) -> str:
+    """Returns the forge remembered for a checkout, detecting it if needed."""
+    return _selected.get(str(repo)) or select(repo)
 
 
 def slug(repo: Path) -> str | None:
@@ -60,6 +107,11 @@ def _reachable(repo: Path) -> str | None:
     return project if project and shutil.which("gh") else None
 
 
+def _beads_reachable() -> bool:
+    """Reports whether the ``bd`` client is installed."""
+    return shutil.which("bd") is not None
+
+
 def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
     """Reports the newest pull request opened from a lane branch.
 
@@ -68,6 +120,8 @@ def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
     request describes the current use of the branch; an older merged or closed
     one belongs to a finished generation and must not speak for it. The caller
     correlates the reported creation time with the claim it is asking about.
+    Only the GitHub forge opens pull requests, so every other forge reports
+    None.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
@@ -78,6 +132,8 @@ def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
         None when the forge is unavailable, the branch has no pull request, or
         the response cannot be read.
     """
+    if _implementation(repo) != "github":
+        return None
     project = _reachable(repo)
     if not project:
         return None
@@ -121,7 +177,7 @@ def _epoch(value: str) -> float:
 
 
 def _run(args: list[str], timeout: int) -> str | None:
-    """Runs the GitHub CLI, reporting absence instead of raising."""
+    """Runs a forge client, reporting absence instead of raising."""
     try:
         result = subprocess.run(
             args,
@@ -136,13 +192,14 @@ def _run(args: list[str], timeout: int) -> str | None:
 
 
 def issue_title(repo: Path, number: str) -> str | None:
-    """Returns the host forge's title for an issue, when one is reachable.
+    """Returns the forge's title for an issue, when one is reachable.
 
     The lookup is best effort and read only. It is skipped entirely without a
-    GitHub origin or without the ``gh`` client, and any failure of the client,
-    its authentication, or its output reports absence. A resolved title is
-    peer-supplied display context; it never decides ownership, so coordination
-    must keep working with no network, no ``gh``, and no GitHub remote.
+    reachable client, and any failure of the client, its authentication, or
+    its output reports absence. A resolved title is peer-supplied display
+    context; it never decides ownership, so coordination must keep working
+    with no network, no client, and no remote. The null forge always reports
+    absence, so the ledger shows bare numbers.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
@@ -152,6 +209,11 @@ def issue_title(repo: Path, number: str) -> str | None:
         The issue title, clipped to 200 characters, or None when the forge is
         unavailable, refuses the request, or reports no usable title.
     """
+    chosen = _implementation(repo)
+    if chosen == "beads":
+        return _beads_title(number)
+    if chosen != "github":
+        return None
     project = _reachable(repo)
     if project is None:
         return None
@@ -159,13 +221,28 @@ def issue_title(repo: Path, number: str) -> str | None:
         ["gh", "issue", "view", number, "--repo", project, "--json", "title"],
         15,
     )
+    return _title_of(output)
+
+
+def _title_of(output: str | None) -> str | None:
+    """Reads a clipped title from a client's JSON reply, or None."""
     if output is None:
         return None
     try:
-        title = json.loads(output)["title"]
+        record = json.loads(output)
+        if isinstance(record, list):
+            record = record[0]
+        title = record["title"]
     except (ValueError, TypeError, KeyError, IndexError):
         return None
     return title[:MAX_TITLE] if isinstance(title, str) else None
+
+
+def _beads_title(number: str) -> str | None:
+    """Reads one issue's title from the Beads ledger through ``bd``."""
+    if not _beads_reachable():
+        return None
+    return _title_of(_run(["bd", "show", number, "--json"], 15))
 
 
 def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
@@ -174,7 +251,8 @@ def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
     A claimed issue that already had pull requests names, through those pull
     requests, the paths the work tends to touch. The reading is best effort
     and read only: it is skipped without a GitHub origin or the ``gh`` client,
-    and a slow or refusing forge reports nothing rather than raising.
+    and a slow or refusing forge reports nothing rather than raising. Only
+    the GitHub forge has pull requests, so every other forge reports nothing.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
@@ -185,6 +263,8 @@ def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
         empty list when the forge is unavailable or no pull request refers to
         the issue.
     """
+    if _implementation(repo) != "github":
+        return []
     project = _reachable(repo)
     if project is None:
         return []
@@ -223,10 +303,10 @@ def assign(repo: Path, number: str) -> bool:
     """Records the operator's forge account as an issue's assignee.
 
     A claim is recorded in the local ledger first; this mirrors it onto the
-    host forge so a reader outside Agent Parley can see that the issue is
-    being worked. The mirror is best effort and carries no authority: the
-    ledger stays correct with no network, no ``gh`` and no GitHub remote, and
-    a rejected write changes no coordination state.
+    forge so a reader outside Agent Parley can see that the issue is being
+    worked. The mirror is best effort and carries no authority: the ledger
+    stays correct with no network, no client and no remote, and a rejected
+    write changes no coordination state. The null forge accepts nothing.
 
     The forge sees one assignee, the operator's own account, because every
     lane runs under that account. A handoff between participants therefore
@@ -240,6 +320,11 @@ def assign(repo: Path, number: str) -> bool:
         True when the forge accepted the assignment, False when the forge is
         unavailable or refused it.
     """
+    chosen = _implementation(repo)
+    if chosen == "beads":
+        return _beads_update(number, _operator())
+    if chosen != "github":
+        return False
     project = _reachable(repo)
     if project is None:
         return False
@@ -276,6 +361,11 @@ def unassign(repo: Path, number: str) -> bool:
         True when the forge accepted the removal, False when the forge is
         unavailable or refused it.
     """
+    chosen = _implementation(repo)
+    if chosen == "beads":
+        return _beads_update(number, "")
+    if chosen != "github":
+        return False
     project = _reachable(repo)
     if project is None:
         return False
@@ -297,13 +387,30 @@ def unassign(repo: Path, number: str) -> bool:
     )
 
 
+def _operator() -> str:
+    """Names the operator account a Beads assignment records."""
+    try:
+        return getpass.getuser()
+    except OSError:
+        return "agent-parley"
+
+
+def _beads_update(number: str, assignee: str) -> bool:
+    """Sets one Beads issue's assignee through ``bd``, best effort."""
+    if not _beads_reachable():
+        return False
+    return (
+        _run(["bd", "update", number, "--assignee", assignee], 20) is not None
+    )
+
+
 def comment(repo: Path, number: str, body: str) -> bool:
-    """Adds one comment to an issue on the host forge.
+    """Adds one comment to an issue on the forge.
 
     The comment reproduces what a participant reported and states that a
     reported state is the participant's own account rather than review. It is
     best effort: an unreachable forge leaves the report recorded locally and
-    unchanged.
+    unchanged, and the null forge records nothing.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
@@ -314,6 +421,13 @@ def comment(repo: Path, number: str, body: str) -> bool:
         True when the forge accepted the comment, False when the forge is
         unavailable or refused it.
     """
+    chosen = _implementation(repo)
+    if chosen == "beads":
+        if not _beads_reachable():
+            return False
+        return _run(["bd", "comment", number, body], 20) is not None
+    if chosen != "github":
+        return False
     project = _reachable(repo)
     if project is None:
         return False

@@ -26,6 +26,19 @@ Upgrading needs no action: the store upgrades in place on first use, keeping
 every message, claim and lease. Stop running sessions first, and do not point an
 older installation at an upgraded state directory afterwards.
 
+## Platforms
+
+Linux and macOS are supported. WSL2 is supported for repositories that live in
+the Linux file system, such as under `$HOME`. `run` refuses a repository under
+`/mnt/`: Git worktrees and the coordination locks do not hold on a mounted
+Windows drive, so the repository must be cloned into the Linux file system
+first. Native CLIs installed on the Windows side are out of scope: a lane is a
+Linux process driving a Linux install, and the loopback mail server is not
+reachable across the boundary. `doctor` names the kernel release, the WSL
+generation (`1`, `2` or `none`) and whether `pidfd_open` is available, so a
+platform gap is read before a lane starts. CI runs the behaviour suite inside
+WSL on a Windows runner as an advisory job; it never blocks a merge.
+
 ## Daily use
 
 ```sh
@@ -1159,9 +1172,55 @@ checkpoint hooks, and selects that overlay with
 `GEMINI_CLI_SYSTEM_SETTINGS_PATH`. Native user/project settings and authentication
 remain in effect. Credential profiles may select `GEMINI_CLI_HOME`, whose
 `.gemini` subdirectory holds that account's native configuration. Existing
-explicit provider definitions are preserved. The integration follows Gemini's
-[configuration](https://geminicli.com/docs/reference/configuration/) and
-[hook contracts](https://geminicli.com/docs/hooks/reference/).
+explicit provider definitions are preserved: a local definition named `gemini`
+that rides the `claude` or `codex` adapter through a vendor endpoint shadows
+the native preset and keeps working unchanged, `provider list` prints the
+definition that is in force, and `provider remove gemini` reveals the native
+preset again. Nothing rewrites such a definition. The integration follows
+Gemini's [configuration](https://geminicli.com/docs/reference/configuration/)
+and [hook contracts](https://geminicli.com/docs/hooks/reference/). Gemini has
+no `PermissionRequest` hook, so `provider list` reports it under
+`unavailable_hooks`; approval prompts remain Gemini's own.
+
+The overlay is written under the private state root as
+`<participant>-gemini-settings.json`, never into the repository or the native
+directories, and is rebuilt from the native policy on every launch, so a
+corrupt or stale overlay left by a crash is replaced rather than reused.
+`participant retire` deletes it. A native policy that disables hooks refuses
+the launch with that reason instead of starting an unguarded session.
+
+The `opencode` preset starts the native OpenCode CLI. OpenCode reads
+`opencode.json` from the directory `OPENCODE_CONFIG_DIR` names and loads
+JavaScript plugins from `plugin/` beside it; it has no hook command contract.
+The launcher copies that directory's `opencode.json` into a lane-private
+directory `<participant>-opencode/` under the private state root, adds the
+lane's server under `mcp` as a `remote` entry whose bearer header is
+`{env:AGENT_PARLEY_TOKEN}`, writes `plugin/agent-parley.js`, and points
+`OPENCODE_CONFIG_DIR` at the copy for that launch only. Every other key is
+carried unchanged and the source directory is never written. OpenCode keeps
+its credentials in its own data directory, outside the configuration
+directory, so authentication is untouched; a credential profile may select
+`OPENCODE_CONFIG_DIR` to choose the configuration that is copied. A
+configuration that already defines `agent_parley`, or that exists only as
+`opencode.jsonc`, refuses the launch with the fix named. The overlay is rebuilt
+on every launch and removed by `participant retire`.
+
+The plugin maps OpenCode's plugin events onto the shared checkpoint events:
+`session.created` to `SessionStart`, `chat.message` to `UserPromptSubmit`,
+`tool.execute.before` to `PreToolUse`, `tool.execute.after` to `PostToolUse`,
+`permission.ask` to `PermissionRequest` and `session.idle` to `Stop`. For each
+it spawns the configured hook command with `--adapter opencode`, and
+`opencode.py` translates the event and the `agent_parley_*` tool names for the
+shared parser and flattens the result to `decision`, `reason` and `context`.
+A denied `tool.execute.before` is raised as an error inside the plugin, which
+is how an OpenCode plugin refuses a tool call; a blocked `session.idle` posts
+the reason back into the session as the next prompt; `context` is appended to
+the user's message parts. The plugin never sets a `permission.ask` status, so
+OpenCode's own approval prompt is left to the user. OpenCode raises no end of
+session event, so `SessionEnd` is reported under `unavailable_hooks`. Resume
+passes the recorded session as `--session ID`. Plugins in the user's global
+`plugin/` directory are not carried into the overlay; project `.opencode/`
+configuration still applies because OpenCode reads it from the worktree.
 
 Credential profiles point a provider's config-home variable at a separate
 directory so one provider can run under several accounts. Define one profile per
@@ -1174,7 +1233,7 @@ names look like credentials.
 ## Other agent CLIs
 
 Agent Parley hands the native CLI its MCP server, the coordination prompt and
-its lifecycle hooks at launch. Three contracts implement that, and `--adapter`
+its lifecycle hooks at launch. Six contracts implement that, and `--adapter`
 names the one to use:
 
 | Adapter | MCP server | Coordination prompt | Hooks |
@@ -1182,6 +1241,15 @@ names the one to use:
 | `claude` | `--mcp-config FILE` | `--append-system-prompt TEXT` | `--settings '{"hooks":…}'` |
 | `codex` | `-c mcp_servers.agent_parley.url=…` | appended to the prompt argument | `-c hooks.EVENT=…` |
 | `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-p` argument | `hooks` in `settings.json` there |
+| `gemini` | `mcpServers` in the lane-private system settings overlay | prepended to `--prompt-interactive` | `hooks` in that overlay, `--adapter gemini` |
+| `opencode` | `mcp` in the lane-private `opencode.json` | prepended to `--prompt` | `plugin/agent-parley.js` in the lane-private directory, `--adapter opencode` |
+| `amp` | `amp.mcpServers` in the lane-private `settings.json` | prepended to the prompt argument after `--settings-file` | `amp.hooks` in that file, `--adapter amp` |
+
+`agent-parley provider list` prints `unavailable_hooks` for every definition,
+naming the shared events that adapter's CLI cannot raise. A launch refuses an
+adapter that cannot deliver `SessionStart`, `PreToolUse` or `Stop`, with the
+missing events named, rather than starting a lane whose branch, claim and
+turn guards would silently never run.
 
 A provider's `--executable` therefore has to accept every argument of the
 contract its adapter names. The `copilot` adapter is the file-configured one:
@@ -1206,30 +1274,79 @@ result rather than inside `hookSpecificOutput`, so the adapter flattens the
 shared output into those fields. It never answers a native approval prompt and
 never grants a permission Copilot refused.
 
-The launch path and the hook wire contract were exercised against a stub
-executable and by running the exact configured hook command with native
-payloads, not against a live Copilot session, so argument handling, file
-handling and hook translation are verified while live model behavior is not.
+A relaunch appends no duplicate hook; `participant retire` removes only that
+lane's hook entries from the profile's `settings.json`, leaves the operator's
+own and other lanes' entries in place, and drops the `agent_parley` server
+from `mcp-config.json` once no lane hook remains. A lane that crashed leaves
+its entries until it is relaunched or retired; they point only at that lane's
+private state.
 
-OpenCode and Amp remain uncovered, each for a different reason
-recorded below. `agent-parley provider add` will store a definition naming one
-of them, because the command is only resolved on `PATH` at launch, but the
-resulting session fails inside the native CLI. There is no flag that makes it
-work and none should be added.
+### Stub verification and live trials
+
+Every adapter's launch path and hook wire contract is verified by tests that
+run the real launcher against a stub executable, read the configuration the
+launcher generated, register through the local MCP service and run the exact
+configured hook command with native-format payloads, covering session
+identity, denial output, approval requests and resume without a recorded
+session. That verifies argument handling, file handling and hook translation.
+It does not verify live model behaviour, and the following points need a live
+trial with the native CLI installed and signed in:
+
+| CLI | Verified against a stub | Needs a live trial |
+| --- | --- | --- |
+| Gemini CLI | overlay contents, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` selection, every `hooks` event runs the command, denial and context schema | that Gemini honours `decision: deny` from a `BeforeTool` hook in a system overlay, and `--resume ID` |
+| Copilot CLI | `mcp-config.json` and `settings.json` merge, PascalCase event payloads, flat result schema, retire cleanup | that a `PreToolUse` `permissionDecision: deny` stops the tool, and `--resume ID`; #173 tracks the payload contract |
+| OpenCode | `opencode.json` copy and `mcp` entry, plugin file and its embedded command, event and tool-name translation, `--session ID` on resume | that OpenCode loads `plugin/agent-parley.js` from `OPENCODE_CONFIG_DIR`, that `{env:AGENT_PARLEY_TOKEN}` is substituted in `headers`, that a thrown error in `tool.execute.before` refuses the call, and that `client.session.prompt` delivers a blocked-stop reason |
+| Amp | `settings.json` copy, `amp.mcpServers` entry with the literal bearer token, one `amp.hooks` entry per tool event and its command, field and event translation, `reject` on refusal, `threads continue ID` on resume, retire cleanup, the required-guard refusal | that Amp accepts `--settings-file` with a prompt argument, that `amp.hooks` entries with `event`, `command` and `args` run around tool calls and read `{"action":"reject","reason":…}` from stdout, the input field names for the tool, its input and the thread, that a remote `amp.mcpServers` entry honours `headers`, and that no thread start or idle hook exists; the `amp` lane stays refused until that last point is disproved |
+
+Record the outcome of a live trial in the issue that requested it, with the
+CLI version, and file a gap as its own issue. Operator recovery after a lane
+loses its session is #153 and saved-session recovery is #175; both apply to
+every adapter, since each one records the native session identifier the same
+way through `SessionStart`, or through the first tool hook for `amp`, whose
+thread identifier arrives with every tool event.
+
+The `amp` preset starts the native Amp CLI. Amp reads one `settings.json`,
+from `~/.config/amp` or the file `AMP_SETTINGS_FILE` or `--settings-file`
+names, holding MCP servers under `amp.mcpServers` and hook commands under
+`amp.hooks`; a credential profile may point `AMP_SETTINGS_FILE` at the file,
+or the directory holding it, that is copied. The launcher copies it to
+`<participant>-amp-settings.json` under the private state root, adds the
+lane's server with its bearer header written literally, since Amp substitutes
+no environment references in settings and the identity file beside it already
+holds the token, appends one hook per supported event, and passes the copy
+with `--settings-file` for that launch only. Every other key is carried
+unchanged and the source file is never written; Amp keeps its credentials in
+its own store, so authentication is untouched. Settings that already define
+`agent_parley` refuse the launch. The overlay is rebuilt on every launch and
+removed by `participant retire`, so a stale copy left by a crash is replaced.
+
+Amp's hooks fire around tool execution only: `tool:pre-execute` maps to
+`PreToolUse` and `tool:post-execute` to `PostToolUse`, each spawning the hook
+command with `--adapter amp`. `amp.py` reads the tool name, input, result
+and thread identifier under Amp's field names and flattens a refusal to
+`{"action": "reject", "reason": …}`; any other result is an empty object, so
+the hook never allows a call on the lane's behalf and Amp's own approval
+prompt decides. Amp raises no thread start, prompt, approval, idle or end
+event, so `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop` and
+`SessionEnd` are reported under `unavailable_hooks`, and because two of
+those are required guards, `agent-parley run amp` is refused with one
+sentence naming them rather than started without branch and turn guards.
+Resume passes the recorded thread as `threads continue ID`; the thread is
+recorded from the first tool hook, so a lane that never reached a tool call
+has no session to resume and the launcher says so.
 
 | Agent CLI | MCP configuration | Lifecycle hooks | Per-account config home |
 | --- | --- | --- | --- |
 | Gemini CLI | lane-private system settings overlay | translated native hooks | `GEMINI_CLI_HOME` |
 | Copilot CLI | `$COPILOT_HOME/mcp-config.json`, or `copilot mcp` | `hooks` in `$COPILOT_HOME/settings.json` | `COPILOT_HOME` |
-| OpenCode | `mcp` in `opencode.json`, or `opencode mcp add` | JavaScript plugins only | `OPENCODE_CONFIG_DIR` |
-| Amp | `--mcp-config`, or `amp.mcpServers` in its settings file | `amp.hooks` in its settings file | `--settings-file`, `AMP_SETTINGS_FILE` |
+| OpenCode | `mcp` in the lane-private `opencode.json` | `plugin/agent-parley.js` spawning the hook command | `OPENCODE_CONFIG_DIR` |
+| Amp | `amp.mcpServers` in the lane-private `settings.json` | `amp.hooks` in that file, tool events only | `AMP_SETTINGS_FILE` |
 
-Copilot CLI and Gemini CLI have native adapters. The other two do not.
-Amp accepts `--mcp-config`, but it has no `--append-system-prompt`, and its
-settings arrive through `--settings-file` rather than `--settings`, so two
-thirds of the `claude` contract is rejected. OpenCode extends sessions through
-JavaScript plugins rather than hook commands, so lane checkpoints and the
-enforcement record would have no way to run.
+Copilot CLI, Gemini CLI, OpenCode and Amp have native adapters. Amp does
+not accept `--append-system-prompt`, and its settings arrive through
+`--settings-file` rather than `--settings`, so naming it as a `claude`
+provider executable still fails; use the `amp` preset.
 
 ## Recovery and teardown
 
@@ -1251,6 +1368,51 @@ refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
 
+### Exporting and importing the state directory
+
+```sh
+agent-parley state export --output parley-2026-09-15.tar.gz
+agent-parley state export --output one-project.tar.gz --project ~/src/app
+agent-parley state show parley-2026-09-15.tar.gz
+agent-parley state import parley-2026-09-15.tar.gz
+agent-parley state import one-project.tar.gz --merge --project ~/src/app
+```
+
+`state export` writes the coordination state as one tar archive. The store is
+copied through the SQLite backup interface while the setup and ledger locks of
+every exported project are held for at most two seconds, so the snapshot, the
+project manifests, the issue ledgers, the activity files, the retained event
+and report logs and the attachments describe one moment; an export that cannot
+take those locks in time is refused rather than written inconsistently.
+`--project ROOT` exports one registered project alone, including only its rows
+of the store. The archive manifest names the store schema, the export time,
+the SHA-256 digest of every member, the projects and their participants.
+
+Credentials never leave the state directory. Registration tokens are stripped
+from the identity records, their digests are cleared in the exported store,
+and credential profiles and native MCP configurations are not archived; the
+manifest states the omission. `state show PATH` prints the projects,
+participants, issue counts and export time from that manifest without
+restoring anything.
+
+`state import PATH` restores into an empty state directory and refuses one
+that already holds a store or a project unless `--merge` is given. Before it
+writes, it validates every member against the manifest digests, refuses an
+absolute path, a `..` component, a symbolic link or a hard link, and refuses
+an archive written at a newer store schema than this build reads. The archive
+is unpacked into a temporary directory inside the state root, migrated to
+this build's schema there, and moved into place only after that validation.
+With `--merge`, a project the directory does not hold is added beside the
+existing ones; a project that already exists is a collision, so the import
+refuses it and leaves the directory as it was. `--project ROOT` restores one
+archived project alone.
+
+Every imported participant registers again on its next `run`, because the
+archive carries no credential. The import then lists every participant whose
+lane path does not exist on this machine. Those lanes are not recreated: the
+operator adds the worktree again, on the recorded branch, before launching
+that participant.
+
 ### Lane branches and attribution
 
 A lane branch carries no participant, provider or account name. It is created as
@@ -1271,6 +1433,28 @@ records which scheme each lane uses, so `participant merge`, `participant pr`
 and drift detection keep working across the change. A branch name that already
 exists in the repository only moves the ordinal on: nothing is renamed, reused
 or deleted.
+
+### Selecting the forge
+
+Issue titles, assignee mirrors and report comments go to the forge the project
+manifest records. Registration detects it: a repository carrying a Beads ledger
+in `.beads/` selects `beads`, any other selects `github`. The choice is per
+project and can be set by hand:
+
+```sh
+agent-parley forge show
+agent-parley forge set beads
+agent-parley forge set null
+```
+
+`github` speaks through your own `gh` login. `beads` speaks through the `bd`
+CLI: `bd show ID --json` for titles, `bd update ID --assignee` for the claim
+and release mirrors, and `bd comment` for reports. `null` keeps issue numbers
+bare, calls nothing and never fails. Every forge exchange stays best effort:
+the ledger is written first and decides ownership, and a forge that is missing,
+offline or unwilling changes nothing. Only `github` opens pull requests, so
+`participant pr` refuses in one sentence under `beads` or `null` before it
+pushes anything.
 
 Attribution is refused everywhere a lane can publish text, on every repository,
 for every provider, with no flag that turns it off:

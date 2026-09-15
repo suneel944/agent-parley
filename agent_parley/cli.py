@@ -25,7 +25,9 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from agent_parley import (
+    amp,
     approvals,
+    archive,
     attachments,
     budgets,
     checkpoints,
@@ -37,6 +39,7 @@ from agent_parley import (
     gemini,
     history,
     metrics,
+    opencode,
     plan,
     policy,
     problems,
@@ -2084,6 +2087,81 @@ def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
             write_json(path, data)
 
 
+def release_copilot(home: Path, participant: dict, name: str) -> None:
+    """Removes one retired lane's hooks from its Copilot profile directory.
+
+    Only entries whose command names this participant are removed, so other
+    lanes sharing the profile and the operator's own hooks are untouched. The
+    ``agent_parley`` MCP server entry is removed once no lane hook remains.
+    A profile that no longer resolves, or files that were never written,
+    leave nothing to do.
+
+    Args:
+        home: Private bridge state root.
+        participant: Recorded participant entry naming provider and profile.
+        name: Participant name the hook command carries.
+    """
+    try:
+        entry = roster.provider(home, participant["provider"])
+        account = roster.launch_environment(
+            home, entry, participant.get("credential")
+        )
+    except BridgeError:
+        return
+    config_home = account.get(entry.get("home_env", ""))
+    if entry["adapter"] != "copilot" or not config_home:
+        return
+    settings_path = Path(config_home) / "settings.json"
+    servers_path = Path(config_home) / "mcp-config.json"
+    with lock(Path(config_home) / "agent-parley-config.lock"):
+        try:
+            settings = json.loads(settings_path.read_text())
+        except (OSError, ValueError):
+            return
+        hooks = settings.get("hooks")
+        if not isinstance(hooks, dict):
+            return
+        remaining = 0
+        for event, commands in hooks.items():
+            if isinstance(commands, list):
+                hooks[event] = [
+                    command
+                    for command in commands
+                    if not owned_hook(command, name)
+                ]
+                remaining += sum(
+                    "agent_parley.hook" in str(command.get("bash", ""))
+                    for command in hooks[event]
+                    if isinstance(command, dict)
+                )
+        write_json(settings_path, settings)
+        if remaining or not servers_path.exists():
+            return
+        try:
+            servers = json.loads(servers_path.read_text())
+        except ValueError:
+            return
+        if isinstance(servers, dict) and isinstance(
+            servers.get("mcpServers"), dict
+        ):
+            servers["mcpServers"].pop("agent_parley", None)
+            write_json(servers_path, servers)
+
+
+def owned_hook(command: object, name: str) -> bool:
+    """Reports whether a Copilot hook entry runs this participant's hook."""
+    if not isinstance(command, dict):
+        return False
+    try:
+        words = shlex.split(str(command.get("bash", "")))
+    except ValueError:
+        return False
+    return "agent_parley.hook" in words and any(
+        words[index : index + 2] == ["--participant", name]
+        for index in range(len(words) - 1)
+    )
+
+
 class Bridge:
     """Coordinates native agent worktrees using one private local state root.
 
@@ -2317,6 +2395,7 @@ class Bridge:
             "base": git(root, "rev-parse", "--verify", "HEAD"),
             "verify": [],
             "initialize": [],
+            "forge": forge.select(root),
             "participants": {},
         }
         write_json(path, data)
@@ -2584,8 +2663,14 @@ class Bridge:
                         "events.1.jsonl",
                         "events.jsonl.tmp",
                         "events.1.jsonl.tmp",
+                        "gemini-settings.json",
+                        "amp-settings.json",
                     ):
                         (directory / f"{name}-{suffix}").unlink(missing_ok=True)
+                    shutil.rmtree(
+                        directory / f"{name}-opencode", ignore_errors=True
+                    )
+                    release_copilot(self.home, participant, name)
                 del data["participants"][name]
                 write_json(directory / "project.json", data)
             (directory / f"{name}-checkpoint.lock").unlink(missing_ok=True)
@@ -2776,6 +2861,45 @@ class Bridge:
             f"{configured}/{directory.name}/lane-N. A lane branch carries no "
             "participant, provider or account name. Existing lanes keep the "
             "branch they were created with."
+        )
+
+    def tracker(self, repo: Path, name: str | None = None) -> str:
+        """Reports or records the forge a project coordinates over.
+
+        The forge is per project and lives in the manifest beside the roster.
+        It changes nothing about ownership: every forge exchange stays best
+        effort, and the ledger decides who owns an issue whichever tracker
+        mirrors it. Only the GitHub forge opens pull requests.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Forge to record, or None to report the current choice.
+
+        Returns:
+            An account of the forge in use and what it can do.
+
+        Raises:
+            BridgeError: If the repository has no project yet, or the name is
+                not a known forge.
+        """
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if name is not None:
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["forge"] = roster.forge_choice(name)
+                write_json(directory / "project.json", data)
+        chosen = forge.select(root, data)
+        origin = "recorded" if data.get("forge") else "detected"
+        ability = (
+            "opens pull requests through gh"
+            if chosen == "github"
+            else "opens no pull requests"
+        )
+        return (
+            f"{root} coordinates over the {chosen} forge ({origin}), which "
+            f"{ability}. Every forge exchange is best effort; the ledger "
+            "decides ownership."
         )
 
     def resources(self, repo: Path, declared: str | None = None) -> str:
@@ -3690,6 +3814,12 @@ class Bridge:
         directory, data, participant = self._lane(repo, name)
         root = Path(data["root"])
         branch = participant["branch"]
+        chosen = forge.select(root, data)
+        if chosen != "github":
+            raise BridgeError(
+                f"{root} coordinates over the {chosen} forge, which opens no "
+                "pull requests, so nothing was pushed."
+            )
         self._require_approval(directory, data, name, "pr")
         path = directory / f"{name}-activity.json"
         state = json.loads(path.read_text()) if path.exists() else {}
@@ -3961,7 +4091,7 @@ attempt of the recorded budget, which is also only reported.
             [
                 sys.executable,
                 "-m",
-                "agent_parley.checkpoints",
+                "agent_parley.hook",
                 "--home",
                 str(self.home),
                 "--directory",
@@ -4110,6 +4240,7 @@ attempt of the recorded budget, which is also only reported.
             change_attempt(directory, agent, owned)
         if arrived:
             body = report_comment(summary, evidence)
+            forge.select(repo, data)
             for issue, record in snapshot(directory)["issues"].items():
                 if record["owner"] == agent:
                     forge.comment(repo, issue, body)
@@ -4304,6 +4435,7 @@ attempt of the recorded budget, which is also only reported.
                     "condition": f"released:{parse_issue(when_released)}",
                 },
             )
+        forge.select(repo, data)
         title = (
             forge.issue_title(repo, parse_issue(number))
             if action == "claim"
@@ -4510,7 +4642,10 @@ attempt of the recorded budget, which is also only reported.
             and the one command that state needs. A store behind this build is
             not consistent: every process running this code queries columns it
             does not have, so reporting it as compatible would describe a
-            healthy system while every lane is denied.
+            healthy system while every lane is denied. The report also names
+            the kernel release, the WSL generation or ``none``, and whether
+            ``pidfd_open`` is available, so a platform gap is read here
+            before a lane is started.
         """
         components = [
             {
@@ -4553,6 +4688,7 @@ attempt of the recorded budget, which is also only reported.
             "protocol": protocol.PROTOCOL,
             "supported": list(protocol.SUPPORTED),
             "schema": store.SCHEMA_VERSION,
+            "platform": process.host_report(),
             "components": components,
             "consistent": all(
                 component["compatible"] for component in components
@@ -4797,6 +4933,56 @@ attempt of the recorded budget, which is also only reported.
             f"Exported {len(lines)} records from {len(selected)} participants "
             f"covering {covered} to {destination}."
         )
+
+    def state_archive(self, args: argparse.Namespace) -> str:
+        """Exports, inspects or imports the state archive the operator named.
+
+        An export names its archive and what it covers; an import names the
+        projects restored and every participant whose lane path does not
+        exist on this machine. Those lanes are not recreated: the operator
+        recreates the worktree, and `run` then registers the participant
+        again, because the archive carries no credential.
+
+        Args:
+            args: Parsed `state` command line.
+
+        Returns:
+            An account of what was written, read or restored.
+
+        Raises:
+            BridgeError: If the archive or the state directory refuses the
+                operation.
+        """
+        if args.action == "show":
+            return archive.describe(archive.read_manifest(args.archive))
+        if args.action == "export":
+            directory = None
+            if args.project is not None:
+                _, directory = self.project(
+                    args.project.resolve(), create=False
+                )
+            manifest = archive.export(self.home, args.output, directory)
+            names = ", ".join(entry["root"] for entry in manifest["projects"])
+            return (
+                f"Exported {len(manifest['projects'])} projects "
+                f"({names or 'none'}) at schema {manifest['schema']} to "
+                f"{args.output}; credentials excluded."
+            )
+        root = str(args.project.resolve()) if args.project else None
+        result = archive.import_archive(
+            self.home, args.archive, root, args.merge
+        )
+        lines = [
+            f"Imported {len(result['projects'])} projects into {self.home}; "
+            "every participant registers again on its next run."
+        ]
+        for entry in result["missing_lanes"]:
+            lines.append(
+                f"Lane missing for {entry['name']} in {entry['project']}: "
+                f"{entry['lane'] or 'no path recorded'}; recreate the "
+                "worktree before launching it."
+            )
+        return "\n".join(lines)
 
     def history(
         self,
@@ -5204,8 +5390,10 @@ attempt of the recorded budget, which is also only reported.
 
         Raises:
             BridgeError: If the provider, account, or lane cannot be used, or
-                the participant already has a launcher.
+                the participant already has a launcher, or the repository
+                lies on a mounted Windows drive under WSL.
         """
+        process.check_repository_host(repo)
         data = self.add_participant(repo, agent, provider, credential)
         participant = data["participants"][agent]
         entry = roster.provider(self.home, participant["provider"])
@@ -5227,6 +5415,18 @@ attempt of the recorded budget, which is also only reported.
                 raise BridgeError(
                     protocol.mismatch("installed plugin", declared)
                 )
+        missing = [
+            event
+            for event in roster.REQUIRED_HOOKS
+            if event in roster.unavailable_hooks(entry["adapter"])
+        ]
+        if missing:
+            raise BridgeError(
+                f"The {entry['adapter']!r} adapter cannot deliver "
+                f"{', '.join(missing)}, so its lanes would run without the "
+                "coordination guards those events carry; launch refused "
+                "rather than claiming enforcement it cannot provide."
+            )
         lane = Path(participant["lane"])
         with lock(lane.parent / f"{agent}.session.lock"):
             self.up()
@@ -5282,6 +5482,38 @@ attempt of the recorded budget, which is also only reported.
                 command = [
                     executable,
                     "--prompt-interactive",
+                    prompt + "\nUser task:\n" + task,
+                ]
+            elif entry["adapter"] == "opencode":
+                env["OPENCODE_CONFIG_DIR"] = str(
+                    opencode.configure(
+                        lane.parent,
+                        agent,
+                        self.url + "/mcp/",
+                        hooks,
+                        env.get("OPENCODE_CONFIG_DIR"),
+                    )
+                )
+                command = [
+                    executable,
+                    "--prompt",
+                    prompt + "\nUser task:\n" + task,
+                ]
+            elif entry["adapter"] == "amp":
+                env["AMP_SETTINGS_FILE"] = str(
+                    amp.configure(
+                        lane.parent,
+                        agent,
+                        self.url + "/mcp/",
+                        identity["registration_token"],
+                        hooks,
+                        env.get("AMP_SETTINGS_FILE"),
+                    )
+                )
+                command = [
+                    executable,
+                    "--settings-file",
+                    env["AMP_SETTINGS_FILE"],
                     prompt + "\nUser task:\n" + task,
                 ]
             elif entry["adapter"] == "copilot":
@@ -5368,6 +5600,10 @@ attempt of the recorded budget, which is also only reported.
                     )
                 if entry["adapter"] == "codex":
                     command[1:1] = ["resume", session]
+                elif entry["adapter"] == "opencode":
+                    command[1:1] = ["--session", session]
+                elif entry["adapter"] == "amp":
+                    command[1:1] = ["threads", "continue", session]
                 else:
                     command[1:1] = ["--resume", session]
             previous.update(
@@ -5749,6 +5985,42 @@ def main() -> int:
         "--output",
         type=Path,
         help="Destination file; JSON Lines go to standard output otherwise.",
+    )
+    archived = commands.add_parser(
+        "state",
+        help="Export, inspect or import the coordination state as one archive.",
+    )
+    archives = archived.add_subparsers(dest="action", required=True)
+    exporting = archives.add_parser(
+        "export", help="Write the state, or one project, as a tar archive."
+    )
+    exporting.add_argument(
+        "--output", type=Path, required=True, help="Archive path to create."
+    )
+    exporting.add_argument(
+        "--project",
+        type=Path,
+        metavar="ROOT",
+        help="Export only the project registered for this checkout.",
+    )
+    showing = archives.add_parser(
+        "show", help="List what an archive holds without importing it."
+    )
+    showing.add_argument("archive", type=Path)
+    importing = archives.add_parser(
+        "import", help="Restore an archive into the state directory."
+    )
+    importing.add_argument("archive", type=Path)
+    importing.add_argument(
+        "--project",
+        type=Path,
+        metavar="ROOT",
+        help="Restore only the archived project registered for this root.",
+    )
+    importing.add_argument(
+        "--merge",
+        action="store_true",
+        help="Add archived projects beside existing state.",
     )
     setup = commands.add_parser(
         "setup",
@@ -6211,6 +6483,24 @@ def main() -> int:
         ),
     )
     naming_set.add_argument("--repo", type=Path, default=Path.cwd())
+    tracker = commands.add_parser(
+        "forge",
+        help="Show or set the issue tracker this project coordinates over.",
+    )
+    trackers = tracker.add_subparsers(dest="action", required=True)
+    tracker_show = trackers.add_parser("show")
+    tracker_show.add_argument("--repo", type=Path, default=Path.cwd())
+    tracker_set = trackers.add_parser("set")
+    tracker_set.add_argument(
+        "name",
+        metavar="NAME",
+        choices=forge.FORGES,
+        help=(
+            "github speaks through gh, beads through bd when the repository "
+            "carries a .beads/ ledger, and null keeps issue numbers bare."
+        ),
+    )
+    tracker_set.add_argument("--repo", type=Path, default=Path.cwd())
     budgets = commands.add_parser(
         "deadlines",
         help="Show or set this project's deadline and attempt defaults.",
@@ -6448,6 +6738,8 @@ def main() -> int:
                 message,
                 file=sys.stdout if args.output else sys.stderr,
             )
+        elif args.command == "state":
+            print(bridge.state_archive(args))
         elif args.command == "setup":
             print(json.dumps(bridge.setup(args.repo.resolve()), indent=2))
         elif args.command == "run":
@@ -6671,6 +6963,10 @@ def main() -> int:
                     args.repo.resolve(), getattr(args, "prefix", None)
                 )
             )
+        elif args.command == "forge":
+            print(
+                bridge.tracker(args.repo.resolve(), getattr(args, "name", None))
+            )
         elif args.command == "deadlines":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -6808,7 +7104,7 @@ def main() -> int:
                     )
                 )
                 return 0
-            defined = roster.providers(bridge.home)
+            defined = roster.inspect(bridge.home)
             print(
                 views.render(
                     "providers",

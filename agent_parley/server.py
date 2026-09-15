@@ -11,11 +11,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent_parley import protocol, retries, roster, store
+from agent_parley import checkpoints, protocol, retries, roster, store
 from agent_parley.state import BridgeError
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 MAX_REQUEST_BYTES = 16384
+MAX_HOOK_BYTES = 1_048_576
+HOOK_PATH = "/hook/"
 
 
 def _tool(
@@ -39,6 +41,8 @@ def _tool(
     }
 
 
+_REFUSED = object()
+_INVALID = object()
 TEXT = {"type": "string"}
 INTEGER = {"type": "integer"}
 FLAG = {"type": "boolean"}
@@ -273,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health/readiness":
             if hmac.compare_digest(token.encode(), self.server.token.encode()):
                 return {"health": True}
-        elif self.path == "/mcp/":
+        elif self.path in ("/mcp/", HOOK_PATH):
             try:
                 actor = store.authenticate(self.server.home, token)
             except sqlite3.Error:
@@ -302,6 +306,9 @@ class Handler(BaseHTTPRequestHandler):
         actor = self._authorize()
         if actor is None:
             return
+        if self.path == HOOK_PATH:
+            self._hook(actor)
+            return
         if self.path != "/mcp/":
             self._reply(405)
             return
@@ -309,22 +316,10 @@ class Handler(BaseHTTPRequestHandler):
         if version not in VERSIONS:
             self._reply(400)
             return
-        if self.headers.get_content_type() != "application/json":
-            self._reply(415)
+        message = self._body(MAX_REQUEST_BYTES)
+        if message is _REFUSED:
             return
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._reply(400)
-            return
-        if not 0 < length <= MAX_REQUEST_BYTES or self.headers.get(
-            "Transfer-Encoding"
-        ):
-            self._reply(413)
-            return
-        try:
-            message = json.loads(self.rfile.read(length))
-        except (ValueError, RecursionError):
+        if message is _INVALID:
             self._reply(
                 400,
                 {
@@ -370,6 +365,85 @@ class Handler(BaseHTTPRequestHandler):
         else:
             response["error"] = {"code": -32601, "message": "Method not found"}
         self._reply(200, response)
+
+    def _body(self, limit: int) -> object:
+        """Reads one bounded JSON body, or replies and returns ``_REFUSED``.
+
+        Args:
+            limit: Largest body accepted on this path, in bytes.
+
+        Returns:
+            The decoded JSON value, ``_INVALID`` when the body was not JSON,
+            or ``_REFUSED`` after a refusal has already been written. A body
+            over the limit but under twice it is drained before the refusal,
+            so a peer still writing it reads the reply instead of seeing its
+            connection reset; anything larger is refused unread.
+        """
+        if self.headers.get_content_type() != "application/json":
+            self._reply(415)
+            return _REFUSED
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._reply(400)
+            return _REFUSED
+        if not 0 < length <= limit or self.headers.get("Transfer-Encoding"):
+            if 0 < length <= 2 * limit and not self.headers.get(
+                "Transfer-Encoding"
+            ):
+                self.rfile.read(length)
+            self._reply(413)
+            return _REFUSED
+        try:
+            return json.loads(self.rfile.read(length))
+        except (ValueError, RecursionError):
+            return _INVALID
+
+    def _hook(self, actor: dict) -> None:
+        """Serves one lifecycle hook decision for the lane the credential names.
+
+        The request carries what the hook command line carries: the lane's
+        state directory, its participant name, the adapter and protocol it
+        was configured with, and the native payload. The credential resolves
+        to one registered identity, and the identity file in the named
+        directory must hold that same credential, so a token cannot decide
+        for a lane it was not registered for. The reply is the hook process's
+        own contract, produced by the code the in-process path runs.
+
+        Args:
+            actor: Registered identity the bearer credential resolved to.
+        """
+        request = self._body(MAX_HOOK_BYTES)
+        if request is _REFUSED:
+            return
+        if (
+            not isinstance(request, dict)
+            or not isinstance(request.get("directory"), str)
+            or not isinstance(request.get("participant"), str)
+            or "payload" not in request
+        ):
+            self._reply(400)
+            return
+        token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        path = Path(request["directory"])
+        try:
+            identity = json.loads(
+                (path / f"{request['participant']}-identity.json").read_text()
+            )
+        except (OSError, ValueError):
+            self._reply(403)
+            return
+        if (
+            not isinstance(identity, dict)
+            or identity.get("name") != actor["name"]
+            or not hmac.compare_digest(
+                str(identity.get("registration_token", "")).encode(),
+                token.encode(),
+            )
+        ):
+            self._reply(403)
+            return
+        self._reply(200, checkpoints.serve(self.server.home, request))
 
     def _declared_protocol(self) -> int:
         """Returns the wire protocol this caller declared, or this build's.

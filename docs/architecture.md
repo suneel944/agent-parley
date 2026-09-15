@@ -16,9 +16,15 @@ runs `participant merge`, and never on an agent's behalf.
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
-| `forge` | Optional best-effort issue lookups and mirrors on the host forge |
+| `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
+| `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
+| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
+| `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
+| `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
+| `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text |
@@ -174,8 +180,8 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. `gemini.py` translates the additional native hook
-contract. `evidence.py` collects retained claim-window measurements and writes
+the existing session lock. `gemini.py`, `copilot.py`, `opencode.py` and
+`amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in
 the launch and forge paths.
@@ -245,7 +251,7 @@ unpinned numeric PID.
 
 A provider states which native CLI drives a participant and how that CLI reaches
 a model. Coordination needs an MCP server, a system prompt and lifecycle hooks,
-and four contracts implement that, so every provider names one of the four
+and five contracts implement that, so every provider names one of the five
 adapters and its executable must accept that contract in full. `claude` and
 `codex` take all three as command-line arguments of the session the launcher
 starts, so nothing is written into a configuration file the operator also owns
@@ -264,11 +270,25 @@ than that vendor's own agent CLI. The `deepseek`, `kimi` and `grok` presets carr
 `agent-parley provider add` defines further providers locally.
 
 Gemini CLI uses a lane-private system settings overlay that preserves native
-system policy, with translated hook input and output in `gemini.py`.
-OpenCode extends sessions through JavaScript plugins rather than hook commands, and Amp
-accepts no system-prompt argument. None of them is a preset and none is drivable
-by naming it as a provider executable; `docs/operations.md` records each one's
-configuration surface.
+system policy, with translated hook input and output in `gemini.py`. OpenCode
+extends sessions through JavaScript plugins rather than hook commands, so
+`opencode.py` copies the user's configuration directory into a lane-private
+one, adds the MCP server, and writes one plugin that spawns the configured
+hook command for each native plugin event; its results are translated back
+into the plugin's fields. Both overlays live under the private state root,
+are rebuilt from the native source on every launch, so a crashed or edited
+overlay never carries into the next session, and are removed by
+`participant retire`, which also strips a retired `copilot` lane's hooks from
+its profile directory. No adapter shares a settings-file abstraction because
+no two of these CLIs share a stable file contract. Each adapter declares the
+lifecycle events its CLI cannot raise; `provider list` reports them as
+`unavailable_hooks`, and the launcher refuses an adapter that lacks a required
+guard rather than claiming enforcement. `amp.py` copies Amp's settings file
+into a lane-private one with the MCP server and one `amp.hooks` entry per tool
+event, and translates those inputs and results; Amp raises no thread start or
+idle event, so `SessionStart` and `Stop` are unavailable and the launcher
+refuses an `amp` lane today. `docs/operations.md` records that surface and
+what only a live trial can verify.
 
 A credential profile selects one account by pointing the CLI's config-home
 variable at a separate directory, so the same provider can run twice under
@@ -581,7 +601,20 @@ Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refet
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.
 Stored legacy text is not discarded to satisfy response budgets.
 
-Hooks read local state without network requests or model calls. They reject
+The configured hook command is `python -m agent_parley.hook`. It imports only
+what one request needs, reads the lane's registration credential from its
+identity file, and asks the running service for the decision over loopback at
+`POST /hook/` with the credential in the `Authorization` header and nothing
+secret on the command line. The service resolves the credential to one
+registered identity, checks that the named lane's identity file holds that
+same credential, and runs the same `checkpoints.serve` the in-process path
+runs, so a served decision and a local one cannot differ. A refused
+connection, a 250 ms connect timeout, a refused credential or any non-200
+reply falls back to `checkpoints.main` in the hook process, which records the
+cause as a `service_fallback` event before deciding; `python -m
+agent_parley.checkpoints` remains a valid hook command.
+
+Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,
 and block the first completion attempt while the lane is off its assigned
 branch. A repeated Stop carrying `stop_hook_active` is allowed while drift

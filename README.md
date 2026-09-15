@@ -68,7 +68,8 @@ state and project paths are shortened.
 
 ## Install
 
-Linux or macOS, Git, and [uv](https://docs.astral.sh/uv/). No clone.
+Linux, macOS or WSL2 with the repository in the Linux file system, Git, and
+[uv](https://docs.astral.sh/uv/). No clone.
 The wheel needs no third-party runtime packages.
 
 ```sh
@@ -479,6 +480,13 @@ holds right now, each with the peer and the count, so the lane can renegotiate
 or sequence before it edits. `issue claim` reports the same forecast from the
 paths the issue's earlier pull requests touched when a forge is configured.
 The forecast is advisory and never withholds a grant or a claim.
+
+**The forge is selectable per project.** `github` speaks through `gh` and is
+the default; `beads` speaks through the `bd` CLI and is detected when the
+repository carries a `.beads/` ledger; `null` keeps issue numbers bare and
+calls nothing. `agent-parley forge set NAME` overrides detection. Every forge
+exchange is best effort and never decides ownership, and `participant pr`
+refuses in one sentence under a forge that opens no pull requests.
 Sends need an idempotency key, so a retry returns the original message instead
 of a duplicate. Every other write takes one too — reservations, releases,
 acknowledgements, issue transitions and reports — so a retried call returns the
@@ -543,6 +551,26 @@ can keep for as long as you need:
 ```sh
 agent-parley top --since 6h
 agent-parley events export --since 7d --output enforcement.jsonl
+```
+
+**The whole state directory can leave the machine as one archive.**
+`agent-parley state export --output PATH` snapshots the store through the
+SQLite backup interface while the project locks are held briefly and packs it
+with the manifests, ledgers, activity files, retained event and report logs
+and attachments; the manifest names the schema, the export time and a SHA-256
+digest per member. Registration tokens, credential profiles and native MCP
+configurations are never archived. `state show PATH` lists what an archive
+holds, and `state import PATH` restores it into an empty state directory,
+validating every member first and refusing traversal, links and a newer
+schema; `--merge` adds projects beside existing ones and refuses a collision.
+Imported participants register again on their next `run`, and the import
+lists every lane path that does not exist here so the operator can recreate
+the worktree.
+
+```sh
+agent-parley state export --output parley.tar.gz --project ~/src/app
+agent-parley state show parley.tar.gz
+agent-parley state import parley.tar.gz --merge
 ```
 
 **One lane can be followed as a stream.** `agent-parley watch NAME` prints
@@ -632,9 +660,9 @@ exactly the same.
 ## Providers and accounts
 
 A provider states which native CLI drives a participant and how that CLI reaches
-a model. Every provider names one of four adapters, and the adapter decides how
+a model. Every provider names one of five adapters, and the adapter decides how
 that CLI is handed its MCP server, its coordination prompt and its hooks. Two of
-the four take a published plugin, which is why two plugin installations cover
+the five take a published plugin, which is why two plugin installations cover
 every model-endpoint preset:
 
 | Provider | Native CLI it drives | Plugin that carries `coordinate` |
@@ -643,10 +671,20 @@ every model-endpoint preset:
 | `codex` | `codex` | Codex |
 | `copilot` | `copilot` | none; the launcher writes that lane's files |
 | `gemini` | `gemini` | none; the launcher writes a private settings overlay |
+| `opencode` | `opencode` | none; the launcher writes a private config directory and plugin |
+| `amp` | `amp` | none; the launcher writes a private settings file, and refuses to launch until Amp raises thread start and idle events |
 | `deepseek`, `kimi`, `grok` | `claude` or `codex`, vendor endpoint | that adapter's plugin |
 | your own, via `agent-parley provider add` | the adapter you name | that adapter's plugin |
 
-`claude`, `codex` and `gemini` use their native accounts. The `deepseek`, `kimi`
+`agent-parley provider list` prints each definition with `unavailable_hooks`,
+the lifecycle events that CLI cannot deliver: `PermissionRequest` for
+`gemini`, `SessionEnd` for `opencode`, every event except `PreToolUse` and
+`PostToolUse` for `amp`, none for the others. A launch refuses an adapter that
+cannot deliver `SessionStart`, `PreToolUse` or `Stop` instead of running
+without those guards; today that refuses `amp` in one sentence naming the
+missing events.
+
+`claude`, `codex`, `gemini`, `opencode` and `amp` use their native accounts. The `deepseek`, `kimi`
 and `grok` presets carry no endpoint, so their base URL and key must be exported in
 the launching shell; the launcher refuses to start when a required variable is
 unset rather than falling back to another account. Coordination state records
@@ -654,7 +692,27 @@ variable names and config directories, never credential values.
 
 `agent-parley run gemini` starts Gemini CLI with a lane-private MCP and hook
 overlay while preserving native system settings and authentication. Existing
-explicit provider definitions keep their adapter until you update them.
+explicit provider definitions keep their adapter until you update them: a
+local `gemini` definition that rides `claude` or `codex` through a vendor
+endpoint shadows the preset and keeps working unchanged, and `provider remove
+gemini` reveals the native preset again.
+
+`agent-parley run opencode` starts OpenCode with a lane-private copy of its
+configuration directory, selected with `OPENCODE_CONFIG_DIR`, that adds the
+MCP server under `mcp` and one plugin under `plugin/` that runs the checkpoint
+hook command for each supported plugin event. The launch path is verified
+against a stub executable and the exact hook command; a live OpenCode session
+has not been exercised, see
+[Operations](docs/operations.md#other-agent-clis).
+
+`agent-parley run amp` builds a lane-private copy of Amp's `settings.json`,
+selected with `AMP_SETTINGS_FILE` and `--settings-file`, that adds the MCP
+server under `amp.mcpServers` and one `amp.hooks` entry per tool event that
+runs the checkpoint hook command. Amp raises no thread start or idle event,
+so `SessionStart` and `Stop` cannot run and the launch is refused rather
+than started unguarded; the overlay, hook translation and `threads continue
+ID` resume are verified against a stub executable only, see
+[Operations](docs/operations.md#other-agent-clis).
 
 Credential profiles point a provider's config-home variable at a separate
 directory, so one provider can run under several logins. Up to 32 participants
@@ -662,18 +720,20 @@ per project.
 
 ### Other agent CLIs
 
-Four adapters cover the native configuration contracts. `claude` and
+Six adapters cover the native configuration contracts. `claude` and
 `codex` take MCP servers, the coordination prompt and lifecycle hooks as
 command-line arguments. `copilot` reads them from files instead, so Agent
 Parley writes `mcp-config.json` and `settings.json` into that lane's own
 Copilot configuration directory; a `copilot` lane therefore requires a
 credential profile, and the launcher refuses without one rather than writing
-hooks into the configuration directory your own sessions use.
-
-OpenCode and Amp remain recipes. OpenCode runs plugins rather than hook
-commands; Amp accepts no system-prompt argument.
-[Operations](docs/operations.md#other-agent-clis) records what each one
-supports and where its MCP and hook configuration lives.
+hooks into the configuration directory your own sessions use. `gemini`,
+`opencode` and `amp` each receive a lane-private copy of their native
+configuration that lives in Agent Parley's state directory, never in the
+repository, and is rebuilt on every launch and removed by `participant
+retire`. `amp` is refused at launch until Amp can raise the required guards.
+[Operations](docs/operations.md#other-agent-clis) records what each CLI
+supports, where its MCP and hook configuration lives, and which behaviour is
+verified against a stub rather than a live session.
 
 ## Command reference
 
@@ -735,6 +795,8 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
 | `branch show` | Show the prefix new lane branches are created under. |
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
+| `forge show` | Show the issue tracker this project coordinates over. |
+| `forge set NAME` | Select `github`, `beads` or `null`; only `github` opens pull requests. |
 | `resources show` | Show the named resources lanes may reserve. |
 | `resources set NAMES` | Declare them; an empty string accepts any well-formed name. |
 | `deadlines show` | Show this project's deadline and attempt defaults. |
@@ -753,6 +815,9 @@ Issue mutations, reports and lane mail resolve identity from the current lane.
 | `history participant NAME` | List everything one lane filed. |
 | `history claim ID` | Follow one claim to the pull request that ended it. |
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
+| `state export --output PATH` | Write the whole state directory, or one `--project ROOT`, as one tar archive with a hashed manifest and no credentials. |
+| `state show PATH` | List an archive's projects, participants, issue counts and export time without importing it. |
+| `state import PATH` | Restore an archive into an empty state directory; `--merge` adds projects beside existing ones and refuses a collision. |
 | `watch NAME` | Follow one lane's coordination events as a stream; `--since` widens the backlog, `--kind` narrows it, `--json` prints JSON Lines. The agent's conversation is never shown. |
 
 Every read-only command above also accepts `--json` and prints exactly one JSON
