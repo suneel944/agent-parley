@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/suneel944/agent-parley/compare/v0.8.0...v0.9.0) (2026-09-15)
+
+
+### Bug fixes
+
+* complete the 0.9.0 stability milestone with a matching command surface and documentation (#291) ([#251](https://github.com/suneel944/agent-parley/issues/251)) ([#253](https://github.com/suneel944/agent-parley/issues/253)) ([#261](https://github.com/suneel944/agent-parley/issues/261)) ([#280](https://github.com/suneel944/agent-parley/issues/280)) ([#281](https://github.com/suneel944/agent-parley/issues/281)) ([#282](https://github.com/suneel944/agent-parley/issues/282)) ([#284](https://github.com/suneel944/agent-parley/issues/284)) ([#285](https://github.com/suneel944/agent-parley/issues/285)) ([#289](https://github.com/suneel944/agent-parley/issues/289))
+* fall back in-process when the service answers without a status line (#272) ([#271](https://github.com/suneel944/agent-parley/issues/271))
+
+### Performance
+
+* answer a served hook call from a shell client and start Python only on the fallback path (#278) ([#256](https://github.com/suneel944/agent-parley/issues/256))
+* build a status frame from one store connection and one issue snapshot per project (#277) ([#258](https://github.com/suneel944/agent-parley/issues/258))
+* import asyncio, curses and the dashboard only on the commands that use them (#275) ([#259](https://github.com/suneel944/agent-parley/issues/259))
+* read a lane's branch from the worktree HEAD file instead of a git subprocess (#276) ([#257](https://github.com/suneel944/agent-parley/issues/257))
+
 ## [0.8.0](https://github.com/suneel944/agent-parley/compare/v0.7.0...v0.8.0) (2026-09-15)
 
 
