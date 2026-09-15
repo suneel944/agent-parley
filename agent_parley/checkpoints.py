@@ -83,6 +83,7 @@ class Reason(StrEnum):
     OPERATOR_STOPPED = "operator_stopped"
     OPERATOR_RESTARTED = "operator_restarted"
     PAUSED = "paused"
+    SERVICE_FALLBACK = "service_fallback"
 
 
 def decision_of(output: dict | None) -> str:
@@ -1458,12 +1459,85 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         return output
 
 
-def main() -> int:
+def serve(home: Path, request: dict) -> dict:
+    """Decides one hook event and returns the hook process's contract.
+
+    The same code answers the in-process hook and the service's loopback
+    endpoint, so a served decision and a fallback decision cannot differ.
+    The non-native adapters are imported here so only the adapter a lane
+    selected is loaded.
+
+    Args:
+        home: Private bridge state root.
+        request: ``directory``, ``participant`` and ``payload`` as the hook
+            received them, an optional ``adapter``, an optional declared
+            ``protocol``, and an optional ``fallback`` cause naming why the
+            hook process could not use the service.
+
+    Returns:
+        ``status``, ``stdout`` and ``stderr`` for the hook process to emit.
+    """
+    directory = Path(str(request.get("directory", "")))
+    participant = str(request.get("participant", ""))
+    declared = request.get("protocol", protocol.PROTOCOL)
+    try:
+        declared = int(declared)
+    except (TypeError, ValueError):
+        declared = protocol.UNKNOWN
+    if not protocol.compatible(declared):
+        return {
+            "status": 2,
+            "stdout": "",
+            "stderr": "Agent Parley checkpoint refused: "
+            + protocol.mismatch("lane's configured hook", declared)
+            + "\n",
+        }
+    payload = request.get("payload")
+    try:
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a hook object")
+        if request.get("fallback"):
+            record(
+                directory,
+                participant,
+                payload,
+                Reason.SERVICE_FALLBACK,
+                None,
+                "",
+                str(request["fallback"]),
+            )
+        adapter: ModuleType | None = None
+        if request.get("adapter") == "gemini":
+            from agent_parley import gemini as adapter
+        elif request.get("adapter") == "copilot":
+            from agent_parley import copilot as adapter
+        if adapter is not None:
+            payload = adapter.payload(payload)
+        output = checkpoint(home, directory, participant, payload)
+        if adapter is not None:
+            output = adapter.response(output)
+        return {"status": 0, "stdout": json.dumps(output) + "\n", "stderr": ""}
+    except (OSError, ValueError, KeyError, BridgeError) as exc:
+        stderr = f"Agent Parley checkpoint failed: {exc}\n"
+        if isinstance(payload, dict) and payload.get("hook_event_name") in (
+            "PostToolUse",
+            "PermissionRequest",
+            "Stop",
+            "SessionEnd",
+        ):
+            return {"status": 0, "stdout": "{}\n", "stderr": stderr}
+        return {"status": 2, "stdout": "", "stderr": stderr}
+
+
+def main(fallback: str = "") -> int:
     """Handles native hook input without replaying completed side effects.
 
-    The argument parser and the non-native adapters are imported here so the
-    module import that every native tool call pays stays as small as the
-    hook's own work; only the adapter a lane selected is loaded.
+    The argument parser is imported here so the module import that every
+    native tool call pays stays as small as the hook's own work.
+
+    Args:
+        fallback: Cause recorded when the hook client could not reach the
+            service and decided here instead; empty for a direct call.
     """
     import argparse
 
@@ -1485,36 +1559,26 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
-    payload = {}
+    raw = sys.stdin.read(1_000_001)
     try:
-        payload = json.loads(sys.stdin.read(1_000_001))
-        if not isinstance(payload, dict):
-            raise ValueError("Expected a hook object")
-        adapter: ModuleType | None = None
-        if args.adapter == "gemini":
-            from agent_parley import gemini as adapter
-        elif args.adapter == "copilot":
-            from agent_parley import copilot as adapter
-        if adapter is not None:
-            payload = adapter.payload(payload)
-        output = checkpoint(
-            args.home, args.directory, args.participant, payload
-        )
-        if adapter is not None:
-            output = adapter.response(output)
-        print(json.dumps(output))
-        return 0
-    except (OSError, ValueError, KeyError, BridgeError) as exc:
+        payload = json.loads(raw)
+    except ValueError as exc:
         print(f"Agent Parley checkpoint failed: {exc}", file=sys.stderr)
-        if isinstance(payload, dict) and payload.get("hook_event_name") in (
-            "PostToolUse",
-            "PermissionRequest",
-            "Stop",
-            "SessionEnd",
-        ):
-            print("{}")
-            return 0
         return 2
+    served = serve(
+        args.home,
+        {
+            "directory": str(args.directory),
+            "participant": args.participant,
+            "adapter": args.adapter,
+            "protocol": args.protocol,
+            "payload": payload,
+            "fallback": fallback,
+        },
+    )
+    sys.stdout.write(served["stdout"])
+    sys.stderr.write(served["stderr"])
+    return served["status"]
 
 
 if __name__ == "__main__":

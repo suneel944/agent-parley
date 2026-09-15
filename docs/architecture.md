@@ -19,6 +19,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
@@ -582,7 +583,20 @@ Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refet
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.
 Stored legacy text is not discarded to satisfy response budgets.
 
-Hooks read local state without network requests or model calls. They reject
+The configured hook command is `python -m agent_parley.hook`. It imports only
+what one request needs, reads the lane's registration credential from its
+identity file, and asks the running service for the decision over loopback at
+`POST /hook/` with the credential in the `Authorization` header and nothing
+secret on the command line. The service resolves the credential to one
+registered identity, checks that the named lane's identity file holds that
+same credential, and runs the same `checkpoints.serve` the in-process path
+runs, so a served decision and a local one cannot differ. A refused
+connection, a 250 ms connect timeout, a refused credential or any non-200
+reply falls back to `checkpoints.main` in the hook process, which records the
+cause as a `service_fallback` event before deciding; `python -m
+agent_parley.checkpoints` remains a valid hook command.
+
+Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,
 and block the first completion attempt while the lane is off its assigned
 branch. A repeated Stop carrying `stop_hook_active` is allowed while drift
