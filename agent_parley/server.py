@@ -12,7 +12,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agent_parley import checkpoints, protocol, retries, roster, store
+from agent_parley import checkpoints, hook, protocol, retries, roster, store
 from agent_parley.state import BridgeError
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
@@ -454,7 +454,35 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._reply(500)
             return
+        if self.headers.get("Accept") == hook.RAW_REPLY:
+            self._raw_hook(served)
+            return
         self._reply(200, served)
+
+    def _raw_hook(self, served: dict) -> None:
+        """Answers a hook decision without a reply a client must decode.
+
+        A shell client can frame bytes by length and read an integer header,
+        but decoding JSON string escapes in a shell is where a wrong byte
+        would quietly change what a hook injects or what status it exits
+        with. The decision is therefore carried as its own two streams: the
+        exit status and the length of the standard-output stream travel in
+        headers, and the body is that stream followed by standard error.
+
+        Args:
+            served: Decision the in-process path produced, holding the hook's
+                standard output, standard error and exit status.
+        """
+        out = str(served.get("stdout", "")).encode()
+        err = str(served.get("stderr", "")).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header(hook.STATUS_HEADER, str(int(served.get("status", 0))))
+        self.send_header(hook.STDOUT_HEADER, str(len(out)))
+        self.send_header("Content-Length", str(len(out) + len(err)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(out + err)
 
     def _declared_protocol(self) -> int:
         """Returns the wire protocol this caller declared, or this build's.

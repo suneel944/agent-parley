@@ -601,18 +601,33 @@ Inbox pages return `next_after_id` and `has_more`. For `next_body_offset`, refet
 with `after_id=message_id-1`, `limit=1`, and that `body_offset` before advancing.
 Stored legacy text is not discarded to satisfy response budgets.
 
-The configured hook command is `python -m agent_parley.hook`. It imports only
-what one request needs, reads the lane's registration credential from its
-identity file, and asks the running service for the decision over loopback at
-`POST /hook/` with the credential in the `Authorization` header and nothing
-secret on the command line. The service resolves the credential to one
-registered identity, checks that the named lane's identity file holds that
-same credential, and runs the same `checkpoints.serve` the in-process path
-runs, so a served decision and a local one cannot differ. A refused
-connection, a 250 ms connect timeout, a refused credential or any non-200
-reply falls back to `checkpoints.main` in the hook process, which records the
-cause as a `service_fallback` event before deciding; `python -m
-agent_parley.checkpoints` remains a valid hook command.
+The configured hook command is the generated shell client `hook-client.sh`,
+which the launcher writes into the state root when a Bash interpreter is
+available, and `python -m agent_parley.hook` when none is. Every native tool
+call spawns one hook process, and the interpreter is the whole bill, so the
+client opens the loopback connection from the shell and starts Python only
+when the service does not answer.
+
+Both clients read the lane's registration credential from its identity file
+and ask the running service for the decision over loopback at `POST /hook/`
+with the credential in the `Authorization` header and nothing secret on the
+command line. The service resolves the credential to one registered identity,
+checks that the named lane's identity file holds that same credential, and
+runs the same `checkpoints.serve` the in-process path runs, so a served
+decision and a local one cannot differ.
+
+The shell client sends `Accept: application/vnd.agent-parley.hook+raw` and is
+answered with the decision's two streams framed by length: the exit status in
+`X-Parley-Status`, the length of standard output in `X-Parley-Stdout-Bytes`,
+and a body of standard output followed by standard error. Decoding JSON string
+escapes in a shell is where a wrong byte would quietly change what a hook
+injects or what status it exits with, so the shell never decodes one. A client
+that sends no such `Accept` header is answered with the original JSON reply.
+
+A refused connection, a timeout, a refused credential, any non-200 reply or a
+reply the client cannot frame falls back to `checkpoints.main` in the hook
+process, which records the cause as a `service_fallback` event before
+deciding; `python -m agent_parley.checkpoints` remains a valid hook command.
 
 Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,

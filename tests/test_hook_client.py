@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, hook, server, store
+from agent_parley import checkpoints, cli, hook, server, store
 from agent_parley.state import write_json
 
 ALLOW = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {}}
@@ -311,6 +312,105 @@ def test_the_client_reads_the_agent_spelling_of_the_lane_option():
         "participant": "codex",
         "home": "/h",
     }
+
+
+def run_shell(bridge, directory, payload):
+    """Runs the generated shell client exactly as the launcher configures it."""
+    client = hook.write_client(str(bridge.home), sys.executable)
+    return subprocess.run(
+        [
+            shutil.which("bash") or "bash",
+            client,
+            "--home",
+            str(bridge.home),
+            "--directory",
+            str(directory),
+            "--participant",
+            "codex",
+        ],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+@pytest.mark.parametrize("payload", [ALLOW, DENY, STOP, START])
+def test_the_shell_client_serves_the_decision_the_module_serves(
+    bridge, repo, paired, service, payload
+):
+    lane = Path(paired["lanes"]["codex"])
+    cwd = {"cwd": str(lane), "session_id": "s1"}
+    shell = run_shell(bridge, lane.parent, {**payload, **cwd})
+    (lane.parent / "codex-activity.json").unlink(missing_ok=True)
+    served = run_hook(bridge, lane.parent, {**payload, **cwd})
+    assert (shell.returncode, shell.stdout, shell.stderr) == (
+        served.returncode,
+        served.stdout,
+        served.stderr,
+    )
+    assert not any(
+        entry["reason_class"] == "service_fallback"
+        for entry in events(lane.parent)
+    )
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_shell_client_starts_python_when_the_service_is_down(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    cwd = {"cwd": str(lane), "session_id": "s1"}
+    shell = run_shell(bridge, lane.parent, {**DENY, **cwd})
+    assert shell.returncode == 0, shell.stderr
+    decision = json.loads(shell.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_shell_client_starts_python_when_the_service_fails(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    def broken(home, request):
+        raise ImportError("cannot import name 'budgets'")
+
+    monkeypatch.setattr(server.checkpoints, "serve", broken)
+    lane = Path(paired["lanes"]["codex"])
+    cwd = {"cwd": str(lane), "session_id": "s1"}
+    shell = run_shell(bridge, lane.parent, {**DENY, **cwd})
+    assert shell.returncode == 0, shell.stderr
+    decision = json.loads(shell.stdout)["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    recorded = events(lane.parent)
+    assert recorded[0]["reason_class"] == "service_fallback"
+    assert "service answered 500" in recorded[0]["cause"]
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_shell_client_falls_back_on_a_forged_credential(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    path = lane.parent / "codex-identity.json"
+    identity = json.loads(path.read_text())
+    write_json(path, {**identity, "registration_token": "forged"})
+    cwd = {"cwd": str(lane), "session_id": "s1"}
+    shell = run_shell(bridge, lane.parent, {**ALLOW, **cwd})
+    assert shell.returncode == 0, shell.stderr
+    assert "Participants" in json.dumps(json.loads(shell.stdout))
+    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_launcher_configures_the_shell_client(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    command = bridge.hooks("codex", lane.parent)["PreToolUse"][0]["hooks"][0]
+    assert hook.CLIENT_NAME in command["command"]
+    assert cli.owned_hook({"bash": command["command"]}, "codex")
+    assert not cli.owned_hook({"bash": command["command"]}, "claude")
 
 
 def test_main_still_answers_a_direct_call(bridge, repo, paired, monkeypatch):

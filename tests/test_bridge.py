@@ -46,6 +46,7 @@ from agent_parley.cli import (
     Bridge,
     BridgeError,
     Selection,
+    bridge_hook,
     git,
     lock,
     main,
@@ -1850,7 +1851,7 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     hook = settings["hooks"]["SessionStart"][0]
     assert hook["type"] == "command"
     assert hook["timeoutSec"] == 3
-    assert "agent_parley.hook" in hook["bash"]
+    assert bridge_hook(hook["bash"])
     assert hook["bash"].endswith("--adapter copilot")
 
 
