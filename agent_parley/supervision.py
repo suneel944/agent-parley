@@ -33,6 +33,36 @@ ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
 
+_LAUNCHERS: list[subprocess.Popen[bytes]] = []
+_LAUNCHERS_LOCK = threading.Lock()
+
+
+def track_launcher(child: subprocess.Popen[bytes]) -> None:
+    """Records a launcher a wake attempt started so it can be reaped.
+
+    The service is the parent of every launcher it starts, so an exited
+    launcher stays a zombie until its status is collected.
+
+    Args:
+        child: The launcher process to reap on a later sweep.
+    """
+    with _LAUNCHERS_LOCK:
+        _LAUNCHERS.append(child)
+
+
+def reap_launchers() -> int:
+    """Collects the launchers that exited since the previous sweep.
+
+    The sweep never blocks: each launcher is polled once and a running
+    launcher is kept for the next sweep.
+
+    Returns:
+        The number of tracked launchers still running.
+    """
+    with _LAUNCHERS_LOCK:
+        _LAUNCHERS[:] = [child for child in _LAUNCHERS if child.poll() is None]
+        return len(_LAUNCHERS)
+
 
 def settings(value: dict) -> dict:
     """Validates supervision settings stored outside the repository."""
@@ -1045,6 +1075,7 @@ def wake(
                         stderr=output,
                         start_new_session=True,
                     )
+                track_launcher(child)
                 result = f"resume requested (launcher {child.pid})"
         write_json(
             wake_path,
@@ -1088,4 +1119,5 @@ def run(home: Path, stopped: threading.Event) -> None:
                 interval = configuration(home, manifest)["interval"]
                 poll(home, path.parent)
             deadlines[path] = time.monotonic() + interval
+        reap_launchers()
         stopped.wait(1)

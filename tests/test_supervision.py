@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -346,3 +348,51 @@ def test_stopped_resume_keeps_native_interactive_permissions(
         "bypass" in argument or "skip-permission" in argument
         for argument in captured[0]
     )
+
+
+def test_reaping_collects_an_exited_launcher_without_blocking():
+    exited = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    running = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        supervision.track_launcher(exited)
+        supervision.track_launcher(running)
+        exited.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while supervision.reap_launchers() > 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert exited.returncode == 0
+        assert running.poll() is None
+        assert not zombies_of(os.getpid())
+    finally:
+        running.kill()
+        running.wait(timeout=10)
+        supervision.reap_launchers()
+
+
+def zombies_of(parent):
+    found = []
+    if not Path("/proc").is_dir():
+        return found
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if fields[0] == "Z" and fields[1] == str(parent):
+            found.append(int(entry.name))
+    return found
