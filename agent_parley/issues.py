@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_parley import retries
+from agent_parley import attachments, retries
 from agent_parley.state import BridgeError, lock, write_json
 
 MAX_BLOCKERS = 10
@@ -16,6 +16,7 @@ SUPERVISION_ERROR = "supervision-error.json"
 OPERATOR = "operator"
 PEER = "peer"
 MAX_REASON = 2000
+MAX_SUMMARY_BYTES = 2048
 
 
 def deadline_state(record: dict, now: float = 0.0) -> dict:
@@ -336,6 +337,18 @@ def change(
         raise
 
 
+def _drop_offer(directory: Path, record: dict) -> None:
+    """Removes the attachment of a pending offer that is leaving the record.
+
+    Args:
+        directory: Private state directory for the common repository.
+        record: Ledger record whose pending offer is being cleared.
+    """
+    offer = record.get("offer") or {}
+    if offer.get("attachment"):
+        attachments.remove(directory, str(offer["attachment"]))
+
+
 def _unseen() -> dict:
     """Returns an empty record for an issue the ledger has not seen yet."""
     return {
@@ -387,9 +400,9 @@ def _assign(
             "Choose a participant in this project; "
             "run agent-parley participant list."
         )
-    if len(reason) > MAX_REASON:
+    if len(reason.encode()) > MAX_REASON:
         raise BridgeError(
-            f"Assignment reason must be at most {MAX_REASON} characters."
+            f"Assignment reason must be at most {MAX_REASON} bytes."
         )
     record = record or _unseen()
     if record["owner"] == recipient:
@@ -629,6 +642,10 @@ def _change(
                         budget=budgets.get("attempts") or None,
                         claim_id=uuid.uuid4().hex[:16],
                     )
+                    if offer.get("attachment"):
+                        record["attachment"] = offer["attachment"]
+                else:
+                    _drop_offer(directory, record)
                 record["offer"] = None
             else:
                 if record["owner"] != agent:
@@ -643,9 +660,10 @@ def _change(
                             "Choose another participant in this project; "
                             "run agent-parley participant list."
                         )
-                    if not summary or len(summary) > 2000:
+                    if not summary:
                         raise BridgeError(
-                            "Handoff summary must contain 1–2000 characters."
+                            "Handoff summary must contain at least one "
+                            "character."
                         )
                     if record["offer"]:
                         raise BridgeError(
@@ -655,18 +673,33 @@ def _change(
                     answer = (
                         within if within is not None else budgets.get("offer")
                     )
+                    offered = uuid.uuid4().hex
+                    summary, attached = attachments.spill(
+                        directory,
+                        "offer",
+                        offered,
+                        summary,
+                        MAX_SUMMARY_BYTES,
+                        agent,
+                        [recipient],
+                    )
                     record["offer"] = {
-                        "id": uuid.uuid4().hex,
+                        "id": offered,
                         "to": recipient,
                         "summary": summary,
                         "created": time.time(),
                         "deadline": time.time() + answer if answer else None,
                     }
+                    if attached:
+                        record["offer"]["attachment"] = attached
                 elif action == "cancel":
                     if not record["offer"]:
                         raise BridgeError("No handoff is pending.")
+                    _drop_offer(directory, record)
                     record["offer"] = None
                 elif action == "release":
+                    attachments.remove(directory, record.get("attachment", ""))
+                    record.pop("attachment", None)
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )

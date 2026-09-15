@@ -88,16 +88,22 @@ acknowledgement, and is read back beside peer traffic. Its sender row is created
 on first use and never carries a credential digest, so no bearer token resolves
 to it and no served session can write in its name. The name `operator` is
 reserved, so no participant, provider or credential profile can claim it. No
-tool is added for this: the served surface stays the nine tools below.
+tool is added for this: the served surface stays the ten tools below.
 
 The server binds `127.0.0.1`, checks Host and Origin, rejects unauthenticated
 requests, and avoids credential/body logging. It supports stateless JSON responses
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent
 official MCP SDK exercises initialization and calls in CI.
 
-Nine tools cover sending, fetching, acknowledging, marking read, reserving
-files, releasing reservations, listing participants, reading one thread, and
-searching mail. Unknown arguments fail. Sends require an idempotency
+Ten tools cover sending, fetching, acknowledging, marking read, reserving
+files, releasing reservations, listing participants, reading one thread,
+searching mail, and paging an attachment. Unknown arguments fail. A body
+above its cap is spilled whole to `attachments/` under the project state
+directory by `agent_parley/attachments.py`, keyed by an opaque
+`kind-identifier` reference that is validated by pattern and resolved only
+inside that folder; the record keeps a bounded slice ending with the
+reference, and `read_attachment` serves it only to its writer and its
+addressees. Sends require an idempotency
 key: identical retries return the original message ID; changed retries fail.
 Fetching never marks a message read or acknowledges it.
 

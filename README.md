@@ -467,7 +467,7 @@ lands, and every commit an integration would carry is scanned again at
 check, on any repository or for any provider. Which assistant did the work stays
 in coordination state, where `top` and `status` read it.
 
-**Nine scoped MCP tools carry the coordination.** Conflicting reservations
+**Ten scoped MCP tools carry the coordination.** Conflicting reservations
 grant nothing and name the blocking owner with that owner's declared reason. A
 reservation can name something that is not a file — `port:5432`, `db:local`,
 `suite:integration`, `device:android-1` — because a worktree isolates none of
@@ -791,10 +791,23 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `list_participants` | Discover addressable identities, tasks and last coordination times. |
 | `read_thread` | Page messages this lane sent or received in one thread. |
 | `search_messages` | Search only messages this lane sent or received. |
+| `read_attachment` | Page an attachment a message, report or offer named; only its writer and its addressees may read it. |
 
 Inbox rows include `read_ts` and `ack_ts`. Fetching changes neither. Both filters
 can be combined; `unacknowledged` selects messages that requested an acknowledgement
 and have not received it. The result budget is 8,192 UTF-8 bytes.
+
+A message body above 4,096 UTF-8 bytes, a report `--evidence` above 4,096 or
+a handoff summary above 2,048 is neither refused nor truncated: the whole
+body is kept as an attachment under the private state directory and the
+record carries the first bounded slice ending with
+`[attachment message-12: 20480 bytes]`. The peer's checkpoint notice stays
+within its 1,536-byte budget and ends with that reference. Nothing is
+delivered whole automatically; the reader calls `read_attachment` for 2,048
+characters at a time, or prints it with `agent-parley mail show ID --full`
+and `agent-parley report show ID --full`. One attachment is capped at 65,536
+bytes, a lane holds at most 1 MiB of them, and an attachment is removed when
+its record is pruned or its offer is declined, cancelled or released.
 
 ## How it fits together
 
@@ -803,8 +816,8 @@ flowchart TD
     Repo[Your repository] --> Launcher[Agent Parley launcher]
     Launcher --> Claude[Participant · own worktree]
     Launcher --> Codex[Participant · own worktree]
-    Claude <-->|Nine scoped MCP tools| Server[Local coordination service]
-    Codex <-->|Nine scoped MCP tools| Server
+    Claude <-->|Ten scoped MCP tools| Server[Local coordination service]
+    Codex <-->|Ten scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]
     Claude --> Claims[Atomic issue claims and handoffs]
     Codex --> Claims

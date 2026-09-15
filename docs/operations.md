@@ -555,6 +555,41 @@ conflated.
 condition and the deliveries it has left; `mail cancel ID` removes one before it
 is delivered. `status` counts a lane's pending operator items.
 
+### Attaching what does not fit
+
+Every coordination payload has an explicit UTF-8 byte cap: a message body
+4,096, report `--evidence` 4,096, a handoff summary 2,048, and report
+`--summary` and `--remaining` 4,096 each, which are refused above it. A
+body above its cap is not refused and not truncated. It is written whole to
+`attachments/` under the project's private state directory, keyed by the
+record it belongs to, and the record keeps the first bounded slice ending
+with a line such as `[attachment message-12: 20480 bytes]`. The recipient's
+checkpoint notice stays within its 1,536-byte budget and ends with that
+reference; for a handoff the reference is restated after the clipped issue
+notice. Nothing is delivered whole into a context automatically.
+
+```sh
+agent-parley mail show 12 --full
+agent-parley report show 3f9a1c2e4b5d6e7f --full
+```
+
+Over MCP, `read_attachment` takes the reference and an optional character
+`offset` and returns 2,048 characters per page beside the full byte count.
+A reference is an opaque `kind-identifier` token, never a path: it is
+validated by pattern before it reaches the file system and resolved only
+inside the attachment folder. Only the participant that wrote an attachment
+and the participants its record was addressed to can read it; a report's
+attachment is readable by its own lane.
+
+One attachment is capped at 65,536 bytes and a lane holds at most 1 MiB of
+attachments in total; a body past either cap is refused with the cap named.
+A message attachment lives as long as its message; a report attachment is
+removed when the report log rotates past that record; an offer attachment is
+removed when the offer is declined, cancelled or replaced, and an accepted
+offer keeps it until the issue is released. `top` and `status` count as
+`CONTEXT` only the bytes coordination injected, never an attachment's size,
+and the `top` legend says so.
+
 `agent-parley top` watches every participant live: session state, event age,
 branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
