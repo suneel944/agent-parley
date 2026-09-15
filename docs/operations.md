@@ -85,7 +85,8 @@ lane that holds the issue, because only that lane can hand it on.
 
 ### Reading status
 
-`status` prints the server line, the state directory, and then one table per
+`status` prints the server line, the code line, the state directory, and then
+one table per
 project with a row per participant: `PARTICIPANT`, `PROVIDER`, `ACCOUNT`,
 `SESSION`, `BRANCH` with `!` when the lane left its assigned branch, `OUTCOME`,
 `ISSUES` held with `!` on an issue past its deadline or attempt budget and `+N`
@@ -97,6 +98,24 @@ zero. Column widths follow the widest value and then the terminal, by the rule
 named under the table, and `TASK` takes whatever width is left. A pipe or a
 file receives the whole table, because no width is imposed on a stream that is
 not a terminal.
+
+The code line reports the build the running service is serving against the code
+installed here. `Code: ok` says they match; `Code: stale` says the service is up
+and answering but was started from an older build, so the frame is read through
+that build until `agent-parley down && agent-parley up` restarts it. A service
+running behind the checkout is therefore visible in the reading rather than
+reported as ready, and `doctor` reports the same comparison as its `service`
+component.
+
+`SESSION` carries the lane's presence, which has three states. `active` is a
+lane that served a coordination call inside the configured interval. `idle` is a
+live session process that served none inside the inactivity threshold: it is a
+quiet lane, not a lost one. `stopped` is a lane whose recorded session
+process is gone. A live lane past the threshold therefore never reads
+`stopped`, and presence only reports: no claim is released and no ownership
+moves on any of the three. A send result keeps the older operator wording for
+the dead case and summarises a message to a `stopped` lane as
+`queued for NAME (unreachable)`.
 
 Appending a participant name reports that lane as the whole reading —
 availability, drift, waiting items, claims, reported outcome, mail counters and
@@ -116,7 +135,8 @@ agent-parley status --issue 42
 `--pending` reports a lane holding unread mail, an unanswered acknowledgement,
 an offer, or a reservation past its declared time to live. `--idle` reports a
 live lane that served no coordination call inside `--since`, or inside the
-project's configured interval when no window is given; it measures
+project's configured interval when no window is given — the lanes reading
+`idle`, never the stopped ones; it measures
 coordination inactivity, not what a native client was doing inside a turn.
 `--over-budget` reports the lanes over any of their advisory token, call or
 hour limits and exits non-zero when one matches; the budget informs and does
@@ -171,8 +191,16 @@ matches the query as a literal case-insensitive substring rather than as
 indexed terms, and every result names which of the two answered it.
 
 `issue list` prints each owner's session state and the age of its last
-checkpoint, so a stalled lane is visible. Reclaiming that work still needs the
+checkpoint, so a quiet lane is visible. Reclaiming that work still needs the
 owner to release it, or an explicit offer and accept.
+
+A pending offer is listed with the state a peer needs to take the work over: the
+offering lane's head commit, the reservations it holds for that issue, and the
+remaining work from its last report. `status --json` carries the same three
+fields on the offer record. Accepting moves those reservations to the acceptor
+with the issue, so the paths the work needs are not reserved twice and a
+released offer strands nothing. Mail does not move: an acknowledgement stays
+owed by the lane that received the message.
 
 `issue block NUMBER --on OTHER` records that one issue waits on another. Only
 the current owner of NUMBER can add or drop a dependency, and an issue records
@@ -188,7 +216,9 @@ not drop the edge; the owner runs `issue unblock` when the wait is over.
 ### Compatibility and `doctor`
 
 Three numbers move independently: the launcher's package version, the wire
-protocol a hook or served call speaks, and the store schema on disk. Several
+protocol a hook or served call speaks, and the store schema on disk. A fourth
+reading, the build the running service is serving, moves with none of them,
+because a service keeps serving the code it started from. Several
 package versions normally share one protocol, so equal package versions are not
 the only compatible combination.
 
@@ -217,13 +247,13 @@ metadata is used only for a package installed without one.
 
 `doctor` prints the launcher version and protocol, the protocol each shipped
 plugin manifest declares, the store's schema against the schema this build
-writes, and the code a running service is answering from, then a verdict line.
-Each line carries the state this build puts that component in, printed in upper
-case when the build does not accept it.
+writes, and the `service` component naming the code a running service answers
+from, then a verdict line. Each line carries the state this build puts that
+component in, printed in upper case when the build does not accept it.
 
-The service has three states. `not running` means nothing answered on the
-configured port, which is no drift. `ok` means the service is answering from
-the sources on disk. `stale` means the checkout moved after the service
+The `service` component has three states. `not running` means nothing answered
+on the configured port, which is no drift. `ok` means the service is answering
+from the sources on disk. `stale` means the checkout moved after the service
 started, so it is answering from modules the tree no longer holds, and a module
 a merge added is missing from that process for as long as it runs. A service
 that reads itself stale logs one line, refuses further calls with the status
@@ -282,8 +312,8 @@ condition, its age and the one command that clears it:
 | Condition | When | Clears with |
 | --- | --- | --- |
 | `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
-| `service` | The coordination server is not ready. | `agent-parley up` |
-| `stalled` | A live lane holds mail older than `stalled_after` and served no call inside it. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
+| `service` | The coordination server is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
+| `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
 | `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
 | `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
 | `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
@@ -1014,9 +1044,12 @@ value; a credential profile is named, never its contents.
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory` and one entry per
 project holding
-`root`, the issue ledger as `revision` and `issues`, and `participants`. Each
+`root`, the issue ledger as `revision` and `issues`, and `participants`. `server`
+carries the service reading the `Code:` line prints, so a stale service is
+readable without parsing text. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
-`session`, `availability`, `branch`, `assigned_branch`, `drift`, `paused`,
+`session`, `availability` as `active`, `idle` or `stopped`, `branch`,
+`assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
 `idle_seconds`, `idle_complete`, `waiting`, `wake` and `mail`, whose
@@ -1052,7 +1085,10 @@ identifiers their kind adds: `path` for a reservation, `message_id` and
 `issues` reports `revision` and an `issues` array whose records carry `issue`,
 `owner`, `title`, `deadline_at`, `overdue`, `overdue_seconds`, `attempts`,
 `attempt_budget`, `budget_exceeded`, `blocked_by`, `offer` and `reminder`; an
-`offer` additionally carries `deadline_at`, `overdue` and `overdue_seconds`.
+`offer` additionally carries `deadline_at`, `overdue`, `overdue_seconds`, the
+offering lane's `head` commit, the `reservations` array that moves to the
+acceptor, and the `remaining` work from its last report. The same `offer`
+record appears on the `status` document.
 `deadlines show --json` reports `root` and the recorded `deadlines` defaults.
 `budget show --json` reports `root` and the recorded `budget` defaults. `participants` reports
 `root` and a `participants` array carrying `participant`, `identity`,
@@ -1138,8 +1174,9 @@ idle recipient reports `state` `idle` with the summary
 `queued for NAME (idle; wake requested)`, because the next supervision poll
 asks an idle lane holding a backlog to take its turn. A recipient whose
 process is gone reports `state` `unreachable` with the summary
-`queued for NAME (unreachable)`. Observed availability is separate from last
-coordination and never changes claims.
+`queued for NAME (unreachable)`. A presence row written before this release
+still carries `unreachable` and is read as `stopped`. Observed availability is
+separate from last coordination and never changes claims.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
@@ -1166,9 +1203,12 @@ authentication and permission prompts remain in force. Environment-only vendor
 accounts that cannot be reconstructed safely require manual attention.
 
 Wake attempts are separated by the inactivity interval and capped at three for
-each unchanged backlog; a request refused as busy is spaced but not counted.
-Terminal control replies such as cursor position reports and focus events do
-not count as partially entered operator input. Results appear in `status`, the retained event log and
+each unchanged backlog. A `busy` answer is not one of the three: a lane that was
+mid-turn is asked again on a later poll, so a working lane never spends the
+budget that a lane with nothing to read would. Terminal control replies such as
+cursor position reports and focus events do not count as partially entered
+operator input, so they no longer refuse the wake either.
+Results appear in `status`, the retained event log and
 private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
 Lanes launched before wake sockets were introduced require relaunching. An
 unavailable adapter or socket is reported for manual attention. Waking never

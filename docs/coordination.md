@@ -1,0 +1,218 @@
+# Coordination
+
+What the runtime enforces between lanes, and what it only reports. Every rule
+here is recorded: the commands below read and write coordination state, never
+the repository. [Running lanes](lanes.md) covers the operator side, and
+[Operations](operations.md) is the full reference.
+
+## Ownership changes only through explicit claims and accepted handoffs
+
+No timeout and no process exit moves an issue. `agent-parley status` reports who
+owns what, which handoff is waiting on an offer ID, and any lane that left its
+assigned branch. An owner can record that one issue waits on another with
+`agent-parley issue block 42 --on 17`; the listing then names who holds the
+blocking issue, and every lane sees the change at its next checkpoint. A
+recorded dependency informs, it does not gate.
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-issues.svg" width="880" alt="agent-parley issue list showing an issue that waits on another, the participant holding it, and a pending handoff with its offer ID">
+</p>
+
+## What travels with a handoff
+
+An offer carries the state a peer needs to take the work over rather than a
+sentence about it. `issue list` and `status --json` report, for every pending
+offer, the offering lane's head commit, the reservations it holds against that
+issue, and the remaining work from its last report. The receiving lane reads
+those before it answers, so accepting is a decision rather than a guess.
+
+Accepting moves the named reservations to the acceptor with the issue, so the
+paths the work needs do not have to be reserved again and a released offer
+leaves nothing stranded. Mail is not transferred: acknowledgements stay owed by
+the lane that received the message, and each lane still acknowledges its own.
+
+```sh
+agent-parley issue offer 42 --to codex --summary "commit, checks, remaining work"
+agent-parley issue accept 42 --offer-id CURRENT_OFFER_ID
+agent-parley issue decline 42 --offer-id CURRENT_OFFER_ID
+```
+
+`issue assign NUMBER NAME` lets an operator put work in front of a lane from any
+checkout, and it offers rather than takes; the detail is in
+[Operations](operations.md#directing-work-to-a-lane).
+
+## Native hooks decide before the tool runs
+
+They block branch changes inside an assigned lane, catch drift after any bypass,
+and deliver short updates only when coordination state actually changes. Each
+notice is capped at 1,536 UTF-8 bytes; an unchanged checkpoint adds no context
+at all. If a rename removed the assigned branch, the hook names the exact
+repair. Branch drift blocks completion once; a Stop retry can end the session
+while status continues to show the drift.
+
+Enforcement is recorded, not discarded. Every hook decision carries an
+enumerated reason and lands in that participant's event log; every served call
+is recorded inside the transaction that carried its effect. That is why `top`
+can show what was denied, to whom, and how often.
+
+## A deadline reports; it never transfers
+
+`issue claim 42 --within 2h`, `issue offer ... --within 30m` and
+`say ... --ack --within 15m` record a deadline, and `agent-parley deadlines set`
+gives a project defaults to inherit. Past its deadline a claim reads `overdue`
+with the seconds over, `top` marks the issue `#42!`, and a lane that reports
+`blocked` on work it still holds spends one attempt of the recorded budget.
+Ownership never moves on a timer: an overdue claim is still owned, and only an
+explicit release or an accepted handoff transfers it.
+
+## A budget informs; it does not gate
+
+`participant budget NAME --tokens 2000000 --calls 5000 --hours 8` records
+advisory limits on a lane; the same flags on `provider budget NAME` and
+`budget set` give every lane of a provider or a project defaults to inherit,
+participant over provider over project, field by field, and any limit may stay
+unset. Consumption comes from what is already read: tokens as the `TOKENS`
+column counts them, calls from the served-call records, hours from the recorded
+session. No vendor is asked and no price is applied, so a token budget is a
+count and not spend. Past a limit `top` and `status` mark the lane
+`over budget` with the share consumed, the lane receives one bounded notice
+naming the crossed limit, and `--over-budget` selects such lanes, so
+`participant pause --over-budget` is one command. Nothing is stopped, revoked or
+refused: the operator decides.
+
+## Reservations are advisory
+
+Conflicting reservations grant nothing and name the blocking owner with that
+owner's declared reason. Nothing on disk is locked: a reservation is a record
+other lanes read, not a filesystem lock.
+
+A reservation can name something that is not a file — `port:5432`, `db:local`,
+`suite:integration`, `device:android-1` — because a worktree isolates none of
+those; a named resource conflicts on an exact match, and
+`agent-parley resources set` declares which ones exist. A granted reservation
+also carries a `forecast`: the files that changed together with a reserved path
+in at least three of the base checkout's last 500 commits and that a peer holds
+right now, each with the peer and the count, so the lane can renegotiate or
+sequence before it edits. `issue claim` reports the same forecast from the paths
+the issue's earlier pull requests touched when a forge is configured. The
+forecast is advisory and never withholds a grant or a claim.
+
+A reservation that declared a time to live is counted with `!` once that
+deadline passes, so a lane that died holding a path reads differently from one
+still working on it; nothing is revoked, and releasing it stays its owner's
+decision.
+
+An operator editing the base checkout is otherwise invisible to a lane until the
+merge conflicts. Every `top` and `status` frame reads `git status` of the base
+checkout once per project and matches the dirty paths against each lane's active
+reservations with the same rule a competing reservation is judged by. A match is
+printed under the lane's row, and the lane receives one advisory notice naming
+the path, repeated only when the set of paths changes. Nothing pauses, reverts
+or locks; reservations stay advisory. `--no-operator-edits` skips the reading
+for a repository whose base checkout is always dirty.
+
+## Mail is scoped, deduplicated and threaded
+
+Sends need an idempotency key, so a retry returns the original message instead
+of a duplicate. Every other write takes one too — reservations, releases,
+acknowledgements, issue transitions and reports — so a retried call returns the
+first result and changes nothing further, and the same key with different
+arguments is refused rather than applied. Fetching an inbox never marks a
+message read. A send can answer another message, which puts both in one thread,
+and a participant can read a thread in order or search its own mail:
+
+```sh
+agent-parley mail thread t12
+agent-parley mail search "reservation conflict"
+```
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
+</p>
+
+## The work order is a file you can review
+
+Write the issues, the dependencies between them and the groups that may run in
+parallel as TOML, then `agent-parley plan apply work-order.toml`. Applying
+records the same advisory dependencies `issue block` records and nothing else —
+no claim, no assignment, no gate. `plan diff` previews the edges first,
+`plan show` prints the plan as a tree with each issue's current owner, and every
+apply is versioned by the file's digest, so an edge added by hand afterwards is
+reported as exactly that.
+
+## No lane waits for a human to give it something to do
+
+When a lane holds no claim, its next checkpoint carries the unclaimed work no
+dependency blocks — the issues other lanes wait on first — and names the peers
+holding more than one claim. When a lane holds several claims and a peer reads
+`idle` past the inactivity threshold, that lane is told which peer could take
+one. Every offer is checked first against what the host can read without asking
+a vendor: the session process, the lane's own client records for a recent
+rate-limit or usage-window refusal, the worktree, and the acknowledgements it
+owes. A lane that fails a check is reported `unfit` with the failed check named,
+and no offer names it. `top` shows each lane's `FIT` result and whether an offer
+is pending. Nothing is claimed for anyone: `issue offer` stays the only transfer
+path, and the recipient still accepts or declines.
+
+## The forge is selectable per project
+
+`github` speaks through `gh` and is the default; `beads` speaks through the `bd`
+CLI and is detected when the repository carries a `.beads/` ledger; `null` keeps
+issue numbers bare and calls nothing. `agent-parley forge set NAME` overrides
+detection. Every forge exchange is best effort and never decides ownership, and
+`participant pr` refuses in one sentence under a forge that opens no pull
+requests.
+
+## Your history stays yours
+
+A lane branch is `parley/PROJECT_KEY/lane-N`: it carries no participant,
+provider or account name, and `agent-parley branch set PREFIX` changes the
+prefix per project. No lane signs its work either. A commit, merge, tag or pull
+request that credits an assistant, names a vendor or model in an authorship
+position, or carries a generator signature is denied before it lands, and every
+commit an integration would carry is scanned again at `participant merge` and
+`participant pr`. There is no flag that skips either check, on any repository or
+for any provider. Which assistant did the work stays in coordination state,
+where `top` and `status` read it.
+
+## Ownership history is queryable
+
+`agent-parley history issue 42` lists every claim, handoff, reservation, message
+and report that touched it, with how long each participant held it;
+`history participant NAME` does the same for one lane, and `history claim ID`
+follows one claim through to the pull request that ended it. Every claim carries
+its own identifier, minted again on each claim and each accepted handoff, and
+every record made while it is held carries that identifier. It reads only: no
+lock, no rewrite, and a record older than the correlation reports `unknown`
+rather than being given an invented one.
+
+That history is bounded, and it can leave the state directory. A lane keeps two
+event files and discards records older than fourteen days, so `top` reports
+recent enforcement rather than the whole project. `--since` narrows any count to
+a window, and `events export` writes the retained records as JSON Lines you can
+keep for as long as you need:
+
+```sh
+agent-parley top --since 6h
+agent-parley events export --since 7d --output enforcement.jsonl
+```
+
+## The whole state directory can leave the machine
+
+`agent-parley state export --output PATH` snapshots the store through the SQLite
+backup interface while the project locks are held briefly and packs it with the
+manifests, ledgers, activity files, retained event and report logs and
+attachments; the manifest names the schema, the export time and a SHA-256 digest
+per member. Registration tokens, credential profiles and native MCP
+configurations are never archived. `state show PATH` lists what an archive
+holds, and `state import PATH` restores it into an empty state directory,
+validating every member first and refusing traversal, links and a newer schema;
+`--merge` adds projects beside existing ones and refuses a collision. Imported
+participants register again on their next `run`, and the import lists every lane
+path that does not exist here so the operator can recreate the worktree.
+
+```sh
+agent-parley state export --output parley.tar.gz --project ~/src/app
+agent-parley state show parley.tar.gz
+agent-parley state import parley.tar.gz --merge
+```

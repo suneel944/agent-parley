@@ -93,11 +93,12 @@ that retries with the key it first used records one attempt, not two.
 `agent-parley plan show` prints the recorded work order as a tree: which issues
 wait on which, and who owns each. Read it before choosing work. The edges are
 advisory, so a waiting issue is information, not a gate.
-Reports are agent claims, not independent verification. An accepted handoff
-transfers the offering lane's advisory reservations; it never acknowledges
-mail. Acknowledge reviewed messages explicitly through MCP. Coordinate
-integration separately; do not infer merge/push authority from issue
-ownership.
+Reports are agent claims, not independent verification. An offer carries the
+offering lane's head commit, the advisory file reservations held for that
+issue and the remaining work; accepting moves those reservations to you with
+the issue. Handoffs never acknowledge mail: acknowledge reviewed messages
+explicitly through MCP. Coordinate integration separately; do not infer
+merge or push authority from issue ownership.
 
 ## Read mail and inspect evidence
 
