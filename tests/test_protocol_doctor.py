@@ -160,7 +160,13 @@ def test_doctor_reports_every_component(bridge, repo, paired):
     assert reported["protocol"] == protocol.PROTOCOL
     assert reported["schema"] == store.SCHEMA_VERSION
     named = {entry["component"] for entry in reported["components"]}
-    assert named == {"launcher", "claude plugin", "codex plugin", "store"}
+    assert named == {
+        "launcher",
+        "claude plugin",
+        "codex plugin",
+        "store",
+        "service",
+    }
     text = protocol.render(reported)
     assert "Consistent." in text
     assert str(bridge.home) not in text

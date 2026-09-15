@@ -247,7 +247,9 @@ def test_a_store_behind_the_code_is_not_reported_ready(
     bridge, repo, paired, monkeypatch
 ):
     monkeypatch.setattr(type(bridge), "server_process", lambda self: True)
-    monkeypatch.setattr(type(bridge), "ready", lambda self: True)
+    monkeypatch.setattr(
+        type(bridge), "health", lambda self: {"status": "ready"}
+    )
     assert bridge.status_snapshot()["server"]["ready"] is True
     with store.connect(bridge.home, write=True) as db:
         db.execute(f"PRAGMA user_version={store.SCHEMA_VERSION - 1}")
