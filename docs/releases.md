@@ -224,9 +224,27 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    complete only after the wheel and source archive on PyPI match the verified
    GitHub artifacts.
 
-Dispatching `Auto version` by hand runs the same measurement on demand and
-reaches the same conclusion. Dispatching `Release` by hand with an existing tag
-is the retry and republication route; it never creates a version.
+Dispatching `Auto version` by hand with the default `kind` of `measured` runs
+the same measurement on demand and reaches the same conclusion. Dispatching it
+with `kind` set to `patch`, `minor` or `major` is the on-demand route: the
+candidate step proposes the next free version of that kind and skips the
+markers and the issue count, but everything after it is the push path
+unchanged, so the version is still checked for availability, the markers are
+still raised and gated, and `Release` is still dispatched for the tag. The
+request refuses when `main` holds no commit past the approved release, so it
+cannot republish an unchanged tree. Use it when the published package is
+broken by something measurement cannot see, such as the README the index
+renders, or when a repair landed as a plain `fix:` and must not wait for a
+tenth issue:
+
+```bash
+gh workflow run release-version.yml --ref main --field kind=patch
+```
+
+When the request counts no product commit, the changelog entry lists every
+commit the release ships under `Changes` instead of the typed sections.
+Dispatching `Release` by hand with an existing tag is the retry and
+republication route; it never creates a version.
 
 Publication does not comment on or close tracking issues or milestones. After
 verifying a release, the maintainer closes completed issues, moves unfinished

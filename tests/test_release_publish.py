@@ -652,6 +652,122 @@ def test_candidate_phase_reports_measured_eligibility(
 
 
 @pytest.mark.parametrize(
+    ("kind", "version"),
+    [("patch", "0.1.2"), ("minor", "0.2.0"), ("major", "1.0.0")],
+)
+def test_a_requested_kind_releases_a_change_outside_the_package(
+    counted_repo, local, kind, version
+):
+    product_commit(
+        counted_repo, "docs: make every README link absolute", path="README.md"
+    )
+    assert release.release_candidate(counted_repo) == ("", 0, 0)
+    assert release.release_candidate(counted_repo, kind) == (version, 0, 0)
+
+
+def test_a_requested_kind_still_skips_an_unavailable_version(
+    counted_repo, local
+):
+    product_commit(
+        counted_repo, "docs: repair the index page", path="README.md"
+    )
+    release.command("git", "tag", "v0.1.2", cwd=counted_repo)
+    assert release.release_candidate(counted_repo, "patch")[0] == "0.1.3"
+
+
+def test_a_requested_kind_refuses_an_unchanged_tree(counted_repo, local):
+    assert release.release_candidate(counted_repo, "patch") == ("", 0, 0)
+
+
+def test_a_requested_kind_must_be_one_this_module_raises(counted_repo, local):
+    with pytest.raises(ValueError, match="major, minor, patch"):
+        release.release_candidate(counted_repo, "hotfix")
+
+
+def test_a_requested_kind_never_touches_the_measured_path(counted_repo, local):
+    product_commit(counted_repo, "fix: a quiet repair", body="Refs #3")
+    assert release.release_candidate(counted_repo, "") == ("", 1, 0)
+    assert release.release_candidate(counted_repo, "patch") == ("0.1.2", 1, 0)
+
+
+@pytest.mark.parametrize("kind", ["", "measured", "patch"])
+def test_candidate_phase_honours_a_requested_kind(
+    counted_repo, local, capsys, kind
+):
+    product_commit(
+        counted_repo, "docs: repair the index page", path="README.md"
+    )
+    output = counted_repo / ".git/candidate-output"
+    local.setenv("GITHUB_OUTPUT", str(output))
+    local.setenv("RELEASE_KIND", kind)
+    local.chdir(counted_repo)
+    local.setattr(sys, "argv", ["release_publish", "candidate"])
+    release.main()
+    printed = capsys.readouterr().out.strip()
+    emitted = dict(
+        line.split("=", 1) for line in output.read_text().splitlines()
+    )
+    if kind == "patch":
+        assert emitted["eligible"] == "true"
+        assert emitted["version"] == "0.1.2"
+        assert printed == (
+            "0 product issues and 0 product features since v0.1.1; "
+            "a patch release was requested, proposing 0.1.2."
+        )
+    else:
+        assert emitted["eligible"] == "false"
+        assert emitted["version"] == ""
+
+
+def test_candidate_phase_reports_a_requested_kind_on_an_unchanged_tree(
+    counted_repo, local, capsys
+):
+    output = counted_repo / ".git/candidate-output"
+    local.setenv("GITHUB_OUTPUT", str(output))
+    local.setenv("RELEASE_KIND", "patch")
+    local.chdir(counted_repo)
+    local.setattr(sys, "argv", ["release_publish", "candidate"])
+    release.main()
+    printed = capsys.readouterr().out.strip()
+    emitted = dict(
+        line.split("=", 1) for line in output.read_text().splitlines()
+    )
+    assert emitted["eligible"] == "false"
+    assert printed == (
+        "0 product issues and 0 product features since v0.1.1; a patch "
+        "release was requested but main holds no commit past the approved "
+        "release."
+    )
+
+
+def test_changelog_lists_shipped_commits_when_nothing_counted(
+    counted_repo, local
+):
+    product_commit(
+        counted_repo, "docs: repair the index page", path="README.md"
+    )
+    product_commit(counted_repo, "ci: pin an action", path=".github/x.yml")
+    changelog = release.changelog_entry(counted_repo, TAG, VERSION, "0.1.2")
+    assert "### Changes" in changelog
+    assert "* docs: repair the index page" in changelog
+    assert "* ci: pin an action" in changelog
+    assert "### Bug fixes" not in changelog
+
+
+def test_changelog_keeps_typed_sections_when_anything_counted(
+    counted_repo, local
+):
+    product_commit(
+        counted_repo, "docs: repair the index page", path="README.md"
+    )
+    product_commit(counted_repo, "fix: a real repair", body="Refs #3")
+    changelog = release.changelog_entry(counted_repo, TAG, VERSION, "0.1.2")
+    assert "### Bug fixes" in changelog
+    assert "### Changes" not in changelog
+    assert "docs: repair" not in changelog
+
+
+@pytest.mark.parametrize(
     ("path", "eligible"),
     [
         (".github/workflows/release.yml", False),

@@ -28,6 +28,8 @@ CHANGELOG_SECTIONS = (
     ("fix", "Bug fixes"),
     ("perf", "Performance"),
 )
+RELEASE_KINDS = ("major", "minor", "patch")
+MEASURED = "measured"
 RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?(!?):")
 ISSUE_REFERENCE = re.compile(
     r"\b(?:refs?|fix(?:es)?|clos(?:e[sd]?)|resolv(?:e[sd]?))"
@@ -381,38 +383,60 @@ def product_units(
     return issues, features, breaking, urgent
 
 
-def release_candidate(root: Path) -> tuple[str, int, int]:
+def release_candidate(root: Path, requested: str = "") -> tuple[str, int, int]:
     """Returns the version the measured product changes propose, with counts.
 
     Eligibility is measured rather than judged so preparation can run
     unattended. A product commit marked breaking with an exclamation mark
     proposes the next major version, ten product issues propose the next minor
     version, and a single commit titled fix(urgent) proposes a patch version.
-    Those three markers are the only ones that raise a version. Volume is
-    deliberately not a major-release marker: every feature is also an issue, so
-    any feature count above the minor threshold would be unreachable, because
-    the minor release fires first and moves the baseline the count is measured
-    from. The proposal then looks ahead for a version that is genuinely free.
+    Those three markers are the only ones that raise a version on a push.
+    Volume is deliberately not a major-release marker: every feature is also
+    an issue, so any feature count above the minor threshold would be
+    unreachable, because the minor release fires first and moves the baseline
+    the count is measured from. The proposal then looks ahead for a version
+    that is genuinely free.
+
+    A maintainer can name the kind instead. That request exists for the case
+    measurement cannot see: a published package repaired by a change outside
+    the package, such as the README the index renders, or a repair that landed
+    as a plain fix and must ship before a tenth issue. The requested kind
+    replaces the markers and the count, and nothing else: the version must
+    still be free, and the tree must still hold at least one commit past the
+    approved release, so a request never republishes an unchanged tree.
 
     Args:
         root: Checkout containing the version manifest and release history.
+        requested: Release kind a maintainer asked for, or empty to measure.
 
     Returns:
         The proposed version, empty when nothing is proposed, with the
         distinct issue count and the distinct feature count.
 
     Raises:
-        ValueError: If the approved version is not MAJOR.MINOR.PATCH, or no
-            version of the proposed kind is available.
+        ValueError: If the approved version is not MAJOR.MINOR.PATCH, the
+            requested kind is not one this module raises, or no version of
+            the proposed kind is available.
         subprocess.CalledProcessError: If Git cannot resolve the baseline.
     """
+    if requested and requested not in RELEASE_KINDS:
+        raise ValueError(
+            f"Requested release kind must be one of {', '.join(RELEASE_KINDS)}."
+        )
     approved = json.loads((root / MANIFEST_PATH).read_text())["."]
     if not re.fullmatch(r"\d+\.\d+\.\d+", approved):
         raise ValueError("Approved version must be MAJOR.MINOR.PATCH.")
     tag = f"v{approved}"
     baseline = release_baseline(root, tag, validate_tag(root, tag))
     issues, features, breaking, urgent = product_units(root, baseline)
-    if breaking:
+    if requested:
+        kind = requested
+        if (
+            command("git", "rev-list", "--count", f"{baseline}..HEAD", cwd=root)
+            == "0"
+        ):
+            return "", len(issues), len(features)
+    elif breaking:
         kind = "major"
     elif len(issues) >= MINOR_THRESHOLD:
         kind = "minor"
@@ -461,7 +485,10 @@ def changelog_entry(
     """Renders the changelog section describing what a release delivers.
 
     Only the commits the eligibility measurement counts appear here, so the
-    published notes and the decision to release describe the same work.
+    published notes and the decision to release describe the same work. A
+    release a maintainer requested may count nothing, because the change that
+    justified it lives outside the package; its notes then list every commit
+    the release ships instead, so the published entry is never empty.
 
     Args:
         root: Checkout holding the release history.
@@ -486,8 +513,10 @@ def changelog_entry(
     )
     _, _, references = release_history(root)
     sections: dict[str, set[str]] = {}
+    shipped: list[str] = []
     for record in log.split("\x00")[1:]:
         commit, message, names = record.split("\x01")
+        shipped.append(f"* {message.splitlines()[0].strip()}")
         subject = RELEASING_SUBJECT.match(message)
         if not subject or not any(
             name == path or name.startswith(f"{path}/")
@@ -511,6 +540,8 @@ def changelog_entry(
     for kind, title in CHANGELOG_SECTIONS:
         if kind in sections:
             lines += ["", f"### {title}", "", *sorted(sections[kind])]
+    if not sections and shipped:
+        lines += ["", "### Changes", "", *shipped]
     return "\n".join(lines) + "\n\n"
 
 
@@ -822,8 +853,11 @@ def main() -> None:
         if errors:
             raise ValueError("\n".join(errors))
         approved = json.loads((root / MANIFEST_PATH).read_text())["."]
-        version, issues, features = release_candidate(root)
-        changed = has_package_changes(root)
+        requested = os.environ.get("RELEASE_KIND", "").strip()
+        if requested == MEASURED:
+            requested = ""
+        version, issues, features = release_candidate(root, requested)
+        changed = bool(requested) or has_package_changes(root)
         eligible = bool(version) and changed
         emit("eligible", str(eligible).lower())
         emit("version", version)
@@ -833,7 +867,17 @@ def main() -> None:
             f"{issues} product issues and {features} product features "
             f"since v{approved}"
         )
-        if not version:
+        if requested and not version:
+            print(
+                f"{measured}; a {requested} release was requested but main "
+                "holds no commit past the approved release."
+            )
+        elif requested:
+            print(
+                f"{measured}; a {requested} release was requested, "
+                f"proposing {version}."
+            )
+        elif not version:
             print(
                 f"{measured}; {MINOR_THRESHOLD} issues or one breaking "
                 "commit or one fix(urgent) commit are required."

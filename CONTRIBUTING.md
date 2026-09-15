@@ -128,6 +128,13 @@ commit subject is the loop guard, so a release cannot trigger another release.
 No pull request is involved, and nothing approves or merges on your behalf.
 Independent approval continues to apply to every human pull request.
 
+A maintainer can also dispatch Auto version with a `kind` of `patch`, `minor`
+or `major` to release what is on `main` now without waiting for a marker. The
+request replaces only the measurement; availability, the policy gate, the
+release commit and the Release dispatch are unchanged, and it refuses an
+unchanged tree. Reach for it when a published package is broken by a change
+measurement cannot count, such as the README the index renders.
+
 Publication is a separate Release workflow for an existing version tag, which
 Auto version dispatches and a maintainer can dispatch again to retry.
 The tag must resolve to a commit in main history or an explicitly recorded
