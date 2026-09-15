@@ -36,6 +36,7 @@ on standard output and export to a file.
 | `say NAME TEXT --after 30m` | Record the message for later; `--at 18:00`, `--when-released N` and `--unless-reported` set the trigger, and `--every 1h --until 18:00` records a bounded repeat. |
 | `issue list` | Show claims, dependencies and handoff offers; each offer carries the offering lane's head commit, the reservations that move with it and its remaining work. |
 | `issue show NUMBER` | Show one issue: its owner, deadline, attempts, blockers, pending offer, the reservations its owner holds and its recorded history. |
+| `issue next` | Rank the unclaimed, unblocked issues this lane could take next, each with the reason for its place: the plan group already under way, the issues it unblocks, the peer reservations and forecast collisions its likely paths run into, and the provider it declares. It claims nothing; `--limit` bounds the list. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
 | `issue release NUMBER` | Release ownership without closing the GitHub issue. |
 | `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly; `--when-released N` records it until that issue is released. |
@@ -114,7 +115,7 @@ on standard output and export to a file.
 Every read-only command above also accepts `--json` and prints exactly one JSON
 document, so a script, a shell prompt or another agent reads coordination state
 without parsing a table: `status`, `top`, `version`, `issue list`,
-`issue show`, `participant list`, `participant show`, `mail thread`,
+`issue show`, `issue next`, `participant list`, `participant show`, `mail thread`,
 `mail search`, `mail list`, `mail pending`, `decision list`, `approval show`,
 `verify show`, `init show`, `branch show`, `forge show`, `state show`,
 `provider list`, `provider show`, `credentials list` and `credentials show`.
@@ -149,6 +150,7 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `search_messages` | Search only messages this lane sent or received. |
 | `search_decisions` | Search decisions any lane recorded for this project, whoever sent or received them; an empty query lists the newest and `since` bounds their age. |
 | `read_attachment` | Page an attachment a message, report or offer named; only its writer and its addressees may read it. |
+| `next_issues` | Rank the unclaimed, unblocked issues this lane could take next, with the reason for each; `limit` bounds the list. It claims nothing, so the chosen issue is still taken by an explicit claim. |
 
 `send_message` also takes a `decision` flag. A message marked that way is
 additionally recorded in the project's decision log, which every registered

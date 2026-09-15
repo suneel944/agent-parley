@@ -1,4 +1,4 @@
-"""Serves nine bounded coordination tools over authenticated local MCP HTTP."""
+"""Serves the bounded coordination tools over authenticated local MCP HTTP."""
 
 import argparse
 import hmac
@@ -15,7 +15,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
 
-from agent_parley import checkpoints, hook, protocol, retries, roster, store
+from agent_parley import (
+    checkpoints,
+    hook,
+    protocol,
+    recommend,
+    retries,
+    roster,
+    store,
+)
 from agent_parley.state import BridgeError, trim_log
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
@@ -231,6 +239,19 @@ TOOLS = [
                 "maximum": store.MAX_SEARCH_HITS,
             },
             "since": {**INTEGER, "minimum": 0},
+        },
+        [],
+    ),
+    _tool(
+        "next_issues",
+        "Rank unclaimed issues you could take next, with the reason for "
+        "each. Read this before claiming; it claims nothing.",
+        {
+            "limit": {
+                **INTEGER,
+                "minimum": 1,
+                "maximum": recommend.MAX_SHORTLIST,
+            }
         },
         [],
     ),

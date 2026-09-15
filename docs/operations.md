@@ -46,6 +46,7 @@ agent-parley status
 agent-parley top
 agent-parley participant list
 agent-parley issue list
+agent-parley issue next
 agent-parley issue claim 42
 agent-parley issue offer 42 --to codex --summary "commit, checks, remaining work"
 agent-parley issue accept 42 --offer-id CURRENT_OFFER_ID
@@ -1025,6 +1026,7 @@ agent-parley top --json
 agent-parley version --json
 agent-parley issue list --json
 agent-parley issue show 42 --json
+agent-parley issue next --json
 agent-parley participant list --json
 agent-parley participant show claude --json
 agent-parley mail thread THREAD_ID --json
@@ -1069,7 +1071,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `participants`, `participant`, `history`, `mail_thread`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `approval`, `verify`, `init`, `branch`, `forge`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `resources`, `providers`, `provider`, `credentials` or `credentials_show`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `participants`, `participant`, `history`, `mail_thread`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `approval`, `verify`, `init`, `branch`, `forge`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `resources`, `providers`, `provider`, `credentials` or `credentials_show`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -1096,6 +1098,14 @@ advisory `budget_limits` the manifest records and `wake_enabled`.
 `config_home`, `env` as `NAME=<redacted>` entries and `require_env`: no
 recorded value is printed. `problems ack --json` reports the message `id` and
 the `participants` the acknowledgement was recorded for.
+
+`issue next --json` reports the reading lane as `participant`, its `provider`,
+`forge_paths` stating whether the forge answered with any paths at all, and
+`candidates`. Each candidate carries `issue`, the recorded `title`, its plan
+`group` and whether that group is `group_underway`, the owned issues it
+`unblocks`, the `provider` it declares, the peer `overlaps` and forecast
+`collisions` its likely paths run into, and the ordered `reasons` for its
+place.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory` and one entry per
