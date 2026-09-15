@@ -272,6 +272,29 @@ def holders(state: dict) -> dict[str, list[str]]:
     return owned
 
 
+def waiters(state: dict) -> dict[str, list[str]]:
+    """Maps each blocking issue to the owned issues recorded as waiting on it.
+
+    Only owned issues are counted, because finishing a blocker matters when a
+    lane is actually held up by it and an unowned waiter is nobody's wait.
+
+    Args:
+        state: Published issue ledger.
+
+    Returns:
+        Blocker number to the issue numbers waiting on it, ordered
+        numerically. An issue nothing waits on is absent.
+    """
+    waiting: dict[str, list[str]] = {}
+    issues = state.get("issues", {})
+    for number in sorted(issues, key=int):
+        if not issues[number].get("owner"):
+            continue
+        for blocker in issues[number].get("blocked_by", []):
+            waiting.setdefault(blocker, []).append(number)
+    return waiting
+
+
 def unclaimed(state: dict) -> list[str]:
     """Orders the unclaimed ledger issues no recorded dependency blocks.
 
@@ -291,12 +314,7 @@ def unclaimed(state: dict) -> list[str]:
         Issue numbers a lane could claim, most unblocking first.
     """
     issues = state.get("issues", {})
-    waiters: dict[str, int] = {}
-    for record in issues.values():
-        if not record.get("owner"):
-            continue
-        for blocker in record.get("blocked_by", []):
-            waiters[blocker] = waiters.get(blocker, 0) + 1
+    waiting = waiters(state)
     return sorted(
         (
             number
@@ -305,7 +323,7 @@ def unclaimed(state: dict) -> list[str]:
             and not record.get("offer")
             and not record.get("blocked_by")
         ),
-        key=lambda number: (-waiters.get(number, 0), int(number)),
+        key=lambda number: (-len(waiting.get(number, [])), int(number)),
     )
 
 

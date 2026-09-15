@@ -18,6 +18,26 @@ recorded dependency informs, it does not gate.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-issues.svg" width="880" alt="agent-parley issue list showing an issue that waits on another, the participant holding it, and a pending handoff with its offer ID">
 </p>
 
+## Choosing the next issue is one reading, not a guess
+
+`agent-parley issue next` ranks the unclaimed, unblocked issues the ledger
+records and states why each one sits where it does: the plan group peers have
+already started, the owned issues it would unblock, the peer reservations and
+forecast collisions its likely paths run into, and the provider it declares
+where the forge carries a `provider:NAME` label. The forge reading is best
+effort and bounded, so a lane with no network still gets the ledger's and the
+plan's own order.
+
+It recommends and nothing else. No ledger entry is written, no offer is made
+and no path is reserved, so the lane still takes the issue it chose with
+`issue claim` and still races a peer that chose the same one. Lanes read the
+same shortlist over the `next_issues` MCP tool.
+
+```sh
+agent-parley issue next --limit 3
+agent-parley issue claim 42
+```
+
 ## What travels with a handoff
 
 An offer carries the state a peer needs to take the work over rather than a
