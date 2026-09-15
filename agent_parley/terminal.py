@@ -44,6 +44,28 @@ def request(directory: Path, name: str) -> str:
             return "unavailable"
 
 
+def pending(entered: bytes, previous: bool) -> bool:
+    """Decides whether the operator holds a partially entered line.
+
+    Terminal control traffic shares the operator's input descriptor: cursor
+    position reports answering the native client's own query, focus events,
+    arrow keys and a bare Escape all arrive as sequences that begin with ESC
+    and never end in a line terminator. They are not operator text, so they
+    leave the pending state as it was rather than marking the line as held
+    until the next Enter, which would refuse every wake in between.
+
+    Args:
+        entered: Bytes read from the operator's terminal in one call.
+        previous: Pending state before this read.
+
+    Returns:
+        True while the operator has typed text without submitting it.
+    """
+    if entered.startswith(b"\x1b"):
+        return previous
+    return not entered.endswith((b"\r", b"\n", b"\x03"))
+
+
 def run(
     command: list[str],
     lane: Path,
@@ -106,9 +128,7 @@ def run(
                     entered = os.read(0, 4096)
                     if not entered:
                         break
-                    pending_input = not entered.endswith(
-                        (b"\r", b"\n", b"\x03")
-                    )
+                    pending_input = pending(entered, pending_input)
                     os.write(master, entered)
                 if master in ready:
                     try:

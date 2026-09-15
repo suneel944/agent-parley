@@ -953,7 +953,10 @@ def wake(
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
     offer carries a new identifier, which resets the bounded attempt count
-    rather than extending the old one.
+    rather than extending the old one. A request the launcher refuses as busy
+    is spaced like any other but does not count against the bound, because
+    the lane never received a turn to decline; it is asked again once it is
+    idle.
 
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
@@ -1040,7 +1043,7 @@ def wake(
             {
                 "at": time.time(),
                 "backlog": backlog,
-                "attempts": attempts + 1,
+                "attempts": attempts + (result != "busy"),
                 "result": result,
             },
         )

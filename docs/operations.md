@@ -1147,7 +1147,9 @@ authentication and permission prompts remain in force. Environment-only vendor
 accounts that cannot be reconstructed safely require manual attention.
 
 Wake attempts are separated by the inactivity interval and capped at three for
-each unchanged backlog. Results appear in `status`, the retained event log and
+each unchanged backlog; a request refused as busy is spaced but not counted.
+Terminal control replies such as cursor position reports and focus events do
+not count as partially entered operator input. Results appear in `status`, the retained event log and
 private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
 Lanes launched before wake sockets were introduced require relaunching. An
 unavailable adapter or socket is reported for manual attention. Waking never
