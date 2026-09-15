@@ -15,18 +15,18 @@
   <a href="https://github.com/suneel944/agent-parley/releases"><img src="https://img.shields.io/github/v/release/suneel944/agent-parley?style=flat&color=blue" alt="Release"></a>
   <a href="#install"><img src="https://img.shields.io/badge/runtime_dependencies-0-brightgreen?style=flat" alt="Zero runtime dependencies"></a>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=flat" alt="Python 3.12+"></a>
-  <a href="docs/providers.md"><img src="https://img.shields.io/badge/native_CLIs-claude_%2B_codex-orange?style=flat" alt="claude and codex"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat" alt="MIT license"></a>
+  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/providers.md"><img src="https://img.shields.io/badge/native_CLIs-claude_%2B_codex-orange?style=flat" alt="claude and codex"></a>
+  <a href="https://github.com/suneel944/agent-parley/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat" alt="MIT license"></a>
 </p>
 
 <p align="center">
   <a href="#see-it">See it</a> ·
   <a href="#install">Install</a> ·
   <a href="#run-it">Run</a> ·
-  <a href="docs/coordination.md">Coordination</a> ·
-  <a href="docs/monitoring.md">Monitoring</a> ·
-  <a href="docs/providers.md">Providers</a> ·
-  <a href="docs/commands.md">Commands</a> ·
+  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/coordination.md">Coordination</a> ·
+  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md">Monitoring</a> ·
+  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/providers.md">Providers</a> ·
+  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/commands.md">Commands</a> ·
   <a href="#what-it-does-not-do">Limits</a>
 </p>
 
@@ -49,7 +49,8 @@ recorded session process is gone. A quiet lane is not a lost one. Every frame
 on this page is real command output from a demo project; only the state and
 project paths are shortened.
 
-[Monitoring](docs/monitoring.md) covers the whole view: the columns, the keys,
+[Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md)
+covers the whole view: the columns, the keys,
 the filters, `problems`, `metrics` and `watch`.
 
 ## Install
@@ -86,7 +87,7 @@ coordinate through.
 For a pinned, checksummed install, take a wheel from
 [Releases](https://github.com/suneel944/agent-parley/releases) instead. Shell
 completion, upgrades and the supported platforms are in
-[Operations](docs/operations.md#install-and-upgrade).
+[Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md#install-and-upgrade).
 
 ## Run it
 
@@ -123,7 +124,8 @@ agent-parley participant merge claude-2
 agent-parley participant pr claude-2
 ```
 
-[Running lanes](docs/lanes.md) covers the rest of the operator surface:
+[Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md)
+covers the rest of the operator surface:
 deferred and bulk steering, pausing, stopping and restarting a lane, the
 merge plan for several lanes at once, the pre-merge gate, recorded approvals,
 and the setup command every new lane runs.
@@ -148,7 +150,8 @@ and the setup command every new lane runs.
   mismatch is refused at the boundary with the command that fixes it.
 
 Each of these is documented in full, with the commands and the recorded
-evidence, in [Coordination](docs/coordination.md).
+evidence, in
+[Coordination](https://github.com/suneel944/agent-parley/blob/main/docs/coordination.md).
 
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-hooks.svg" width="820" alt="Two hook denials with their reasons, and the bounded briefing a session start receives">
@@ -191,19 +194,22 @@ billed spend or a claim about a token-saving percentage.
 
 | Page | What it covers |
 | --- | --- |
-| [Running lanes](docs/lanes.md) | Launching, steering, pausing, merging, pull requests, gates and approvals. |
-| [Coordination](docs/coordination.md) | Claims, handoffs, reservations, mail, hooks, deadlines, budgets and history. |
-| [Monitoring](docs/monitoring.md) | `status`, `top`, `problems`, `metrics`, `watch` and the three presence states. |
-| [Providers](docs/providers.md) | Which native CLI drives a lane, adapters, accounts and credential profiles. |
-| [Commands](docs/commands.md) | The whole command surface, the MCP tools and the `--json` contract. |
-| [Operations](docs/operations.md) | The operator reference: install, platforms, recovery, plugins and releases. |
-| [Architecture](docs/architecture.md) | Module boundaries, protocol, persistence and stated limits. |
+| [Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md) | Launching, steering, pausing, merging, pull requests, gates and approvals. |
+| [Coordination](https://github.com/suneel944/agent-parley/blob/main/docs/coordination.md) | Claims, handoffs, reservations, mail, hooks, deadlines, budgets and history. |
+| [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md) | `status`, `top`, `problems`, `metrics`, `watch` and the three presence states. |
+| [Providers](https://github.com/suneel944/agent-parley/blob/main/docs/providers.md) | Which native CLI drives a lane, adapters, accounts and credential profiles. |
+| [Commands](https://github.com/suneel944/agent-parley/blob/main/docs/commands.md) | The whole command surface, the MCP tools and the `--json` contract. |
+| [Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md) | The operator reference: install, platforms, recovery, plugins and releases. |
+| [Architecture](https://github.com/suneel944/agent-parley/blob/main/docs/architecture.md) | Module boundaries, protocol, persistence and stated limits. |
 
 ## Contributing
 
 Run `make check` before opening a PR. It checks formatting, lint, typing,
 documentation rules, package builds, and behavior tests.
 
-[Contributing](CONTRIBUTING.md) · [Architecture](docs/architecture.md) ·
-[Operations](docs/operations.md) · [Security](SECURITY.md) ·
-[Code of Conduct](CODE_OF_CONDUCT.md) · [MIT license](LICENSE)
+[Contributing](https://github.com/suneel944/agent-parley/blob/main/CONTRIBUTING.md) ·
+[Architecture](https://github.com/suneel944/agent-parley/blob/main/docs/architecture.md) ·
+[Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md) ·
+[Security](https://github.com/suneel944/agent-parley/blob/main/SECURITY.md) ·
+[Code of Conduct](https://github.com/suneel944/agent-parley/blob/main/CODE_OF_CONDUCT.md) ·
+[MIT license](https://github.com/suneel944/agent-parley/blob/main/LICENSE)
