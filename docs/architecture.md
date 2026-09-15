@@ -16,7 +16,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
-| `forge` | Optional best-effort issue lookups and mirrors on the host forge |
+| `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `dashboard` | Read-only live operator view and metrics frames of every participant |

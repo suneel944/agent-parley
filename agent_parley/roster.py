@@ -8,6 +8,7 @@ import re
 import shlex
 from pathlib import Path
 
+from agent_parley.forge import FORGES
 from agent_parley.state import BridgeError, lock, write_json
 
 ADAPTERS = ("claude", "codex", "copilot", "gemini")
@@ -820,11 +821,34 @@ def normalize(manifest: dict) -> dict:
         "resources": resources(list(manifest.get("resources") or [])),
         "deadlines": deadlines(dict(manifest.get("deadlines") or {})),
         "budget": budget(dict(manifest.get("budget") or {})),
+        "forge": forge_choice(manifest.get("forge")),
         "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "supervision": dict(manifest.get("supervision", {})),
         "participants": participants,
     }
+
+
+def forge_choice(value: object) -> str | None:
+    """Validates the forge a project coordinates over.
+
+    Args:
+        value: Recorded forge name, or None when the project relies on
+            detection at each use.
+
+    Returns:
+        The forge name, or None.
+
+    Raises:
+        BridgeError: If the value names no known forge.
+    """
+    if value is None:
+        return None
+    if value not in FORGES:
+        raise BridgeError(
+            "The project forge must be one of: " + ", ".join(FORGES) + "."
+        )
+    return str(value)
 
 
 def approval_steps(value: object) -> list[str]:
