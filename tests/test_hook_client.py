@@ -314,12 +314,14 @@ def test_the_client_reads_the_agent_spelling_of_the_lane_option():
     }
 
 
-def run_shell(bridge, directory, payload):
+def run_shell(bridge, directory, payload, trace=False):
     """Runs the generated shell client exactly as the launcher configures it."""
     client = hook.write_client(str(bridge.home), sys.executable)
+    interpreter = shutil.which("bash") or "bash"
     return subprocess.run(
         [
-            shutil.which("bash") or "bash",
+            interpreter,
+            *(["-x"] if trace else []),
             client,
             "--home",
             str(bridge.home),
@@ -333,6 +335,30 @@ def run_shell(bridge, directory, payload):
         text=True,
         timeout=30,
         check=False,
+    )
+
+
+def shell_diagnosis(bridge, directory, payload):
+    """Reports the interpreter and an execution trace for a wrong decision.
+
+    A shell client that answers with the wrong decision and no diagnostics is
+    unanswerable from a build log, and the interpreters this client runs on
+    differ by platform. The trace names the statement that produced the
+    answer, so a platform-specific failure is read rather than guessed at.
+    """
+    interpreter = shutil.which("bash") or "bash"
+    version = subprocess.run(
+        [interpreter, "--version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    ).stdout.splitlines()[:1]
+    traced = run_shell(bridge, directory, payload, trace=True)
+    return (
+        f"interpreter {interpreter}: {version}\n"
+        f"exit {traced.returncode}\nstdout {traced.stdout!r}\n"
+        f"trace {traced.stderr[-4000:]}"
     )
 
 
@@ -350,7 +376,7 @@ def test_the_shell_client_serves_the_decision_the_module_serves(
         served.returncode,
         served.stdout,
         served.stderr,
-    )
+    ), shell_diagnosis(bridge, lane.parent, {**payload, **cwd})
     assert not any(
         entry["reason_class"] == "service_fallback"
         for entry in events(lane.parent)

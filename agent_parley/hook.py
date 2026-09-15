@@ -90,24 +90,21 @@ IFS= read -r -t @TIMEOUT@ line <&3 || decide_in_process
 
 status=""
 stdout_bytes=""
-length=""
 while IFS= read -r -t @TIMEOUT@ line <&3; do
   line="${line%$'\r'}"
   [ -z "$line" ] && break
-  case "${line,,}" in
+  case $line in
     "@status_header@: "*) status="${line#*: }" ;;
     "@stdout_header@: "*) stdout_bytes="${line#*: }" ;;
-    "content-length: "*) length="${line#*: }" ;;
   esac
 done
 [[ $status =~ ^[0-9]+$ ]] || decide_in_process
 [[ $stdout_bytes =~ ^[0-9]+$ ]] || decide_in_process
-[[ $length =~ ^[0-9]+$ ]] || decide_in_process
 
 reply=""
-if [ "$length" -gt 0 ]; then
-  IFS= read -r -t @TIMEOUT@ -N "$length" reply <&3 || decide_in_process
-fi
+IFS= read -r -t @TIMEOUT@ -d '' reply <&3
+result=$?
+[ "$result" -gt 128 ] && decide_in_process
 exec 3<&- 3>&-
 printf '%s' "${reply:0:stdout_bytes}"
 printf '%s' "${reply:stdout_bytes}" >&2
@@ -139,8 +136,8 @@ def write_client(home: str, python: str) -> str:
         .replace("@PATH@", PATH)
         .replace("@ACCEPT@", RAW_REPLY)
         .replace("@TIMEOUT@", str(REPLY_TIMEOUT))
-        .replace("@status_header@", STATUS_HEADER.lower())
-        .replace("@stdout_header@", STDOUT_HEADER.lower())
+        .replace("@status_header@", STATUS_HEADER)
+        .replace("@stdout_header@", STDOUT_HEADER)
     )
     with open(path, "w") as stream:
         stream.write(script)
