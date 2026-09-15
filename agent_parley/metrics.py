@@ -23,12 +23,18 @@ import uuid
 from pathlib import Path
 
 from agent_parley import attachments, checkpoints, issues, process, store
-from agent_parley.state import BridgeError, lock, write_text
+from agent_parley.state import (
+    MAX_LOG_BYTES,
+    MAX_LOG_RECORDS,
+    BridgeError,
+    lock,
+    trim_log,
+)
 
 TURN_END = frozenset({"Stop", "SessionEnd"})
 REPORTS = "reports.jsonl"
-MAX_REPORT_RECORDS = 2000
-MAX_REPORT_LOG_BYTES = 262144
+MAX_REPORT_RECORDS = MAX_LOG_RECORDS
+MAX_REPORT_LOG_BYTES = MAX_LOG_BYTES
 MAX_REPORT_BYTES = 4096
 MAX_WAITS = 64
 
@@ -57,9 +63,9 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
     is best effort: a failed append never fails the report or the merge it
     describes.
 
-    The log is bounded the way the lane's event log is bounded. Once it
-    passes `MAX_REPORT_LOG_BYTES` it is rewritten atomically with only the
-    newest `MAX_REPORT_RECORDS` records, which is every record a reader
+    The log is bounded the way every line log the runtime keeps is bounded.
+    Once it passes `MAX_REPORT_LOG_BYTES` it is rewritten in place with only
+    the newest `MAX_REPORT_RECORDS` records, which is every record a reader
     would return anyway, so a lane that reports on every turn never leaves
     a file that grows for the life of the project. The append and the
     rewrite share one short lock so a concurrent append is never dropped by
@@ -83,13 +89,10 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
             with lock(directory / f"{name}-reports.lock", timeout=0.2):
                 with path.open("a", encoding="utf-8") as stream:
                     stream.write(line)
-                if path.stat().st_size >= MAX_REPORT_LOG_BYTES:
-                    kept = path.read_text(errors="ignore").splitlines()
-                    write_text(
-                        path, "\n".join(kept[-MAX_REPORT_RECORDS:]) + "\n"
-                    )
-                    for dropped in kept[:-MAX_REPORT_RECORDS]:
-                        _drop_attachment(directory, dropped)
+                for dropped in trim_log(
+                    path, MAX_REPORT_LOG_BYTES, MAX_REPORT_RECORDS
+                ):
+                    _drop_attachment(directory, dropped)
         except BridgeError:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line)

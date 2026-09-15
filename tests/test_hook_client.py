@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ DENY = {
 }
 STOP = {"hook_event_name": "Stop", "stop_hook_active": False}
 START = {"hook_event_name": "SessionStart", "session_id": "s1"}
+STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} ")
 
 
 def events(directory, agent="codex"):
@@ -194,7 +196,11 @@ def test_a_failure_inside_the_served_decision_answers_500(
     recorded = events(lane.parent)
     assert recorded[0]["reason_class"] == "service_fallback"
     assert "service answered 500" in recorded[0]["cause"]
-    assert "cannot import name 'budgets'" in capsys.readouterr().err
+    logged = capsys.readouterr().out
+    entry = next(line for line in logged.splitlines() if " failed " in line)
+    assert STAMP.match(entry)
+    assert entry.endswith(f"failed {hook.PATH} codex")
+    assert "cannot import name 'budgets'" in logged
 
 
 def moved_sources(monkeypatch):
@@ -368,6 +374,90 @@ def test_the_service_rejects_a_malformed_hook_request(
             bridge.config["port"], token, b"x" * (server.MAX_HOOK_BYTES + 1)
         )[0]
         == 413
+    )
+
+
+def free_slots(instance):
+    """Counts the worker slots the service currently has available."""
+    taken = 0
+    while instance.slots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        instance.slots.release()
+    return taken
+
+
+def test_a_stalled_decision_is_answered_and_frees_its_slot(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    token = identity["registration_token"]
+    body = json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**ALLOW, "cwd": str(lane), "session_id": "s1"},
+        }
+    ).encode()
+    deciding = checkpoints.serve
+    release = threading.Event()
+
+    def stalling(home, request):
+        release.wait(20)
+        return deciding(home, request)
+
+    monkeypatch.setattr(server, "DECISION_SECONDS", 0.2)
+    monkeypatch.setattr(server.checkpoints, "serve", stalling)
+    status, reply = hook.request(bridge.config["port"], token, body)
+    assert status == 503
+    assert json.loads(reply)["status"] == protocol.STALE
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and free_slots(service) < server.WORKERS:
+        time.sleep(0.05)
+    assert free_slots(service) == server.WORKERS
+    entry = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " expired " in line
+    )
+    assert STAMP.match(entry)
+    assert f"{hook.PATH} codex undecided" in entry
+    assert token not in entry
+    monkeypatch.setattr(server.checkpoints, "serve", deciding)
+    release.set()
+    assert hook.request(bridge.config["port"], token, body)[0] == 200
+
+
+def test_the_connection_past_the_worker_cap_is_refused_in_the_log(
+    bridge, service, capsys
+):
+    port = bridge.config["port"]
+    holding = []
+    try:
+        for _ in range(server.WORKERS):
+            holding.append(
+                socket.create_connection(("127.0.0.1", port), timeout=5)
+            )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and free_slots(service):
+            time.sleep(0.01)
+        assert free_slots(service) == 0
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as extra:
+            assert extra.recv(64) == b""
+    finally:
+        for held in holding:
+            held.close()
+    refused = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " refused " in line
+    ]
+    assert len(refused) == 1
+    assert STAMP.match(refused[0])
+    assert (
+        f"closed unanswered with all {server.WORKERS} worker slots busy"
+        in refused[0]
     )
 
 

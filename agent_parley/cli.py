@@ -114,6 +114,9 @@ COPILOT_EVENTS = frozenset(
 )
 
 
+GIT_SECONDS = 30
+
+
 def git(repo: Path, *args: str) -> str:
     """Runs Git in a repository and returns stripped stdout.
 
@@ -132,7 +135,11 @@ def git(repo: Path, *args: str) -> str:
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
-        timeout=None if args and args[0] in {"push", "pull", "fetch"} else 30,
+        timeout=(
+            None
+            if args and args[0] in {"push", "pull", "fetch"}
+            else GIT_SECONDS
+        ),
         check=False,
     )
     if result.returncode:
@@ -888,6 +895,10 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     the lane's work. It never resets, cleans, stashes or force-switches, and
     a conflict is left in the working tree for the operator to resolve.
 
+    The merge itself is bounded by the same timeout every other Git call
+    here carries, so a merge hook or a prompt that never returns stops the
+    merge instead of pinning the command that asked for it.
+
     Args:
         root: Common repository root, which is always the base checkout.
         lane: Assigned bridge worktree belonging to the participant.
@@ -898,8 +909,9 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         An account of what was merged.
 
     Raises:
-        BridgeError: If either checkout cannot be merged from, or if the
-            merge stopped on conflicts that only the operator can resolve.
+        BridgeError: If either checkout cannot be merged from, if the merge
+            stopped on conflicts that only the operator can resolve, or if
+            the merge ran past its timeout and was stopped.
         subprocess.TimeoutExpired: If a preliminary read exceeds its timeout.
     """
     blocker = next(merge_blockers(root, lane, name, branch), "")
@@ -913,21 +925,32 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     pending = git(root, "log", "--oneline", f"HEAD..{branch}")
     if not pending:
         return f"{base} already contains every commit on {branch}."
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "merge",
-            "--no-ff",
-            "-m",
-            f"Merge lane branch {branch}",
-            branch,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "merge",
+                "--no-ff",
+                "-m",
+                f"Merge lane branch {branch}",
+                branch,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise BridgeError(
+            f"Merging {branch} into {base} was still running after "
+            f"{GIT_SECONDS} seconds and was stopped, so the command did not "
+            f"wait for it. A merge hook or a prompt in {root} is the usual "
+            f"cause. Check `git -C {quoted} status`, finish or abort whatever "
+            f"the merge left, then run `agent-parley participant merge "
+            f"{name}` again."
+        ) from None
     if result.returncode:
         if not (git_dir / "MERGE_HEAD").exists():
             raise BridgeError(
