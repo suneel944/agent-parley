@@ -54,8 +54,29 @@ def manifests(root: Path) -> dict[str, Path]:
 
 
 def package_root() -> Path:
-    """Returns the directory the plugin manifests are shipped beside."""
+    """Returns the directory the project file is read from."""
     return Path(__file__).resolve().parent.parent
+
+
+def plugin_root() -> Path:
+    """Returns the directory the installed plugin tree sits under.
+
+    A wheel carries the plugin tree inside the package directory, because a
+    wheel is unpacked into an environment that holds nothing else of this
+    project. A checkout keeps it at the top level, where the client
+    directories read it, and installs the package from the same checkout. The
+    two layouts therefore disagree on where a manifest is, and a lookup fixed
+    to either one reports drift that is not there on the other.
+
+    Returns:
+        The package directory when the plugin tree was installed beside the
+        modules, and the directory the package sits in otherwise, which is
+        the checkout for a path install.
+    """
+    package = Path(__file__).resolve().parent
+    if (package / "plugins/agent-parley").is_dir():
+        return package
+    return package.parent
 
 
 def launcher_version() -> str:

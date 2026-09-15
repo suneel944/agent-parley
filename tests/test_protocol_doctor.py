@@ -39,6 +39,20 @@ def test_every_shipped_plugin_declares_this_protocol():
         assert declared == protocol.PROTOCOL, client
 
 
+def test_the_manifest_lookup_resolves_where_the_plugins_were_installed():
+    for client, manifest in protocol.manifests(protocol.plugin_root()).items():
+        assert manifest.exists(), client
+
+
+def test_a_package_carrying_the_plugins_resolves_them_beside_its_modules(
+    tmp_path, monkeypatch
+):
+    package = tmp_path / "site-packages" / "agent_parley"
+    (package / "plugins/agent-parley/.claude-plugin").mkdir(parents=True)
+    monkeypatch.setattr(protocol, "__file__", str(package / "protocol.py"))
+    assert protocol.plugin_root() == package
+
+
 def test_the_documented_table_matches_the_code_constants():
     text = (ROOT / "docs/operations.md").read_text()
     block = text.split("<!-- compatibility:start -->")[1].split(

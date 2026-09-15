@@ -4870,7 +4870,7 @@ attempt of the recorded budget, which is also only reported.
             }
         ]
         for client, manifest in protocol.manifests(
-            protocol.package_root()
+            protocol.plugin_root()
         ).items():
             declared = protocol.installed(manifest)
             accepted = protocol.compatible(declared)
@@ -5734,7 +5734,7 @@ attempt of the recorded budget, which is also only reported.
                 f"Install and sign in to the native {entry['command']} CLI "
                 "first."
             )
-        manifest = protocol.manifests(protocol.package_root()).get(
+        manifest = protocol.manifests(protocol.plugin_root()).get(
             entry["adapter"]
         )
         if manifest is not None and manifest.exists():
