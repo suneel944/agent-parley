@@ -1,6 +1,7 @@
-"""Serves nine bounded coordination tools over authenticated local MCP HTTP."""
+"""Serves ten bounded coordination tools over authenticated local MCP HTTP."""
 
 import argparse
+import contextlib
 import hmac
 import json
 import os
@@ -11,11 +12,20 @@ import sqlite3
 import threading
 import time
 import traceback
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
 
-from agent_parley import checkpoints, hook, protocol, retries, roster, store
+from agent_parley import (
+    checkpoints,
+    hook,
+    protocol,
+    retries,
+    roster,
+    store,
+    waits,
+)
 from agent_parley.state import BridgeError, trim_log
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
@@ -128,6 +138,24 @@ TOOLS = [
             "limit": {**INTEGER, "minimum": 1, "maximum": 5},
             "include_bodies": FLAG,
             "body_offset": INTEGER,
+            "unread": FLAG,
+            "unacknowledged": FLAG,
+        },
+        [],
+    ),
+    _tool(
+        waits.TOOL,
+        "Await your next matching mail instead of polling or ending your "
+        "turn. Filters as fetch_inbox; an expired wait returns nothing.",
+        {
+            "timeout_seconds": {
+                **INTEGER,
+                "minimum": 0,
+                "maximum": int(waits.MAX_SECONDS),
+            },
+            "thread_id": {**TEXT, "maxLength": 80},
+            "after_id": INTEGER,
+            "include_bodies": FLAG,
             "unread": FLAG,
             "unacknowledged": FLAG,
         },
@@ -254,6 +282,7 @@ class Server(ThreadingHTTPServer):
         self.home = home
         self.token = config["token"]
         self.slots = threading.BoundedSemaphore(WORKERS)
+        self.waiters = threading.BoundedSemaphore(waits.MAX_WAITERS)
         self.version = protocol.launcher_version()
         self.revision = protocol.revision()
         self.checked = time.monotonic()
@@ -300,6 +329,33 @@ class Server(ThreadingHTTPServer):
         log(self.home, "drifted", DRIFTED)
         threading.Thread(target=self.shutdown, daemon=True).start()
         return True
+
+    @contextlib.contextmanager
+    def waiting(self) -> Iterator[float]:
+        """Lends this request's worker slot back while it waits for mail.
+
+        A wait spends nearly all of its time asleep, so holding one of the
+        sixteen worker slots for it would let a handful of lanes waiting on
+        their peers exhaust the service for every other call, including the
+        sends they are waiting for. The slot is returned for the duration of
+        the wait and taken again before the reply is written, so the number
+        of requests doing work is bounded exactly as before while the number
+        of lanes waiting is bounded separately.
+
+        Yields:
+            The longest wait to serve: the ordinary ceiling, or zero once as
+            many waits are already held as this service admits, which reads
+            the inbox once and answers rather than refusing the call.
+        """
+        if not self.waiters.acquire(blocking=False):
+            yield 0.0
+            return
+        self.slots.release()
+        try:
+            yield waits.MAX_SECONDS
+        finally:
+            self.slots.acquire()
+            self.waiters.release()
 
     def health(self) -> dict:
         """Describes the code this service is answering from.
@@ -731,7 +787,14 @@ class Handler(BaseHTTPRequestHandler):
             return protocol.UNKNOWN
 
     def _call(self, actor: dict, params: dict) -> dict:
-        """Validates the tool envelope and contains expected domain failures."""
+        """Validates the tool envelope and contains expected domain failures.
+
+        A wait is served beside the store rather than inside a transaction,
+        so it holds no lock while it sleeps, and it is told how long this
+        service is willing to hold it open. Every other tool is the served
+        call it has always been, and a delivered message wakes the lanes
+        waiting for one before the sender is answered.
+        """
         try:
             declared = self._declared_protocol()
             if not protocol.compatible(declared):
@@ -752,7 +815,19 @@ class Handler(BaseHTTPRequestHandler):
                 raise BridgeError("Unexpected or missing tool arguments.")
             if roster.paused(self.server.home, actor["project"], actor["name"]):
                 raise BridgeError(roster.PAUSED_REASON)
-            result = store.call(self.server.home, actor, tool["name"], args)
+            if tool["name"] == waits.TOOL:
+                with self.server.waiting() as ceiling:
+                    result = waits.wait(
+                        self.server.home,
+                        actor,
+                        args,
+                        self.server.stopping,
+                        ceiling,
+                    )
+            else:
+                result = store.call(self.server.home, actor, tool["name"], args)
+                if tool["name"] == "send_message":
+                    waits.delivered()
             return {
                 "content": [
                     {

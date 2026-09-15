@@ -140,6 +140,7 @@ participant or project. Reservations are advisory, not filesystem locks.
 | --- | --- |
 | `send_message` | Send to peers using an idempotency key; optionally join a thread or require acknowledgement. |
 | `fetch_inbox` | Page inbox metadata and optional bodies; filter with `unread` or `unacknowledged`. |
+| `wait_for_message` | Wait up to `timeout_seconds` for the next mail matching the same filters, plus `thread_id`; an expired wait is empty. |
 | `mark_message_read` | Explicitly mark a received message read; takes an optional `idempotency_key`. |
 | `acknowledge_message` | Explicitly acknowledge a reviewed message; takes an optional `idempotency_key`. |
 | `file_reservation_paths` | Reserve advisory path patterns and report conflicts; takes an optional `idempotency_key`. |
@@ -161,6 +162,15 @@ Inbox rows include `read_ts` and `ack_ts`. Fetching changes neither. Both
 filters can be combined; `unacknowledged` selects messages that requested an
 acknowledgement and have not received it. The result budget is 8,192 UTF-8
 bytes.
+
+`wait_for_message` returns that same page as soon as one message matches, so a
+lane that asked a peer a question can hold its turn instead of polling. The
+requested `timeout_seconds` is clamped to a 120-second service ceiling, and the
+result reports the wait actually held and whether it expired. An expired wait
+returns an empty page: no error, no event and no receipt changed. A wait
+occupies no worker slot while it sleeps, so waiting lanes cannot starve the
+service of the sends they are waiting for; a pause, a revoked registration or a
+stopping service ends a wait at once.
 
 ## What does not fit in a message
 
