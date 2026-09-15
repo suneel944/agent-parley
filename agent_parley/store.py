@@ -22,7 +22,7 @@ from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 SCHEMA_ABSENT = "absent"
 SCHEMA_BEHIND = "needs migration"
 SCHEMA_CURRENT = "ok"
@@ -64,6 +64,7 @@ READ_ONLY = (
     "list_participants",
     "read_attachment",
     "read_thread",
+    "search_decisions",
     "search_messages",
 )
 ATTACHED = ("send_message", "read_attachment")
@@ -95,7 +96,8 @@ CREATE TABLE IF NOT EXISTS messages (
  sender_id INTEGER NOT NULL REFERENCES agents(id), thread_id TEXT DEFAULT '',
  subject TEXT NOT NULL, body_md TEXT NOT NULL, ack_required INTEGER DEFAULT 0,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
- ack_deadline_ts TEXT, claim_id TEXT, UNIQUE(sender_id,dedup_key));
+ ack_deadline_ts TEXT, claim_id TEXT, decision INTEGER NOT NULL DEFAULT 0,
+ UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -253,6 +255,10 @@ def initialize(home: Path) -> None:
     every existing lease keeps the deadline it was taken with. No coordination
     value is rewritten, and each step is skipped once its result is already
     present, so an interrupted upgrade safely retries.
+
+    Upgrading a store written before the decision log marks every stored
+    message as ordinary mail, so nothing a lane sent in private becomes
+    project-wide by being upgraded.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -274,6 +280,7 @@ def initialize(home: Path) -> None:
                     _add_message_search(db)
                     return
                 _add_ack_deadline(db)
+                _add_decision_flag(db)
                 if version == 1:
                     _add_reservation_created(db)
                 _rebuild_reservations(db)
@@ -303,6 +310,26 @@ def _add_ack_deadline(db: sqlite3.Connection) -> None:
     columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
     if "ack_deadline_ts" not in columns:
         db.execute("ALTER TABLE messages ADD COLUMN ack_deadline_ts TEXT")
+
+
+def _add_decision_flag(db: sqlite3.Connection) -> None:
+    """Adds the decision marker and its index to an older store.
+
+    The column is additive and defaults to zero, so every message stored
+    before the upgrade stays ordinary mail that only its sender and its
+    recipients can read. The partial index covers the decision log alone, so
+    the far larger body of private mail costs nothing to keep out of it.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+    if "decision" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN decision "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS decisions ON messages(project_id,id) "
+        "WHERE decision=1"
+    )
 
 
 def _add_claim_correlation(db: sqlite3.Connection) -> None:
@@ -632,6 +659,13 @@ def _send(
     by the message identifier, and the stored body is the bounded slice
     ending with that reference and the byte count, so a recipient's inbox
     and checkpoint previews stay exactly as bounded as before.
+
+    A send marked ``decision`` is additionally recorded in the project-wide
+    decision log, which every registered participant can search. Only that
+    marking widens what a message reveals; ordinary mail stays readable by
+    its sender and its recipients alone. A decision addresses recipients
+    like any other message, and may address none, which records the decision
+    without putting it in an inbox.
     """
     subject = _text(args.get("subject"), "subject", 160)
     body = _text(
@@ -646,6 +680,7 @@ def _send(
     thread = _text(args.get("thread_id", ""), "thread_id", 80, empty=True)
     key = _text(args.get("idempotency_key"), "idempotency_key", 80)
     ack = _flag(args.get("ack_required", False), "ack_required")
+    decision = _flag(args.get("decision", False), "decision")
     within = args.get("ack_within")
     if within is not None:
         within = _number(within, "ack_within", 1, 86400 * 30)
@@ -654,13 +689,15 @@ def _send(
             raise BridgeError("Answer with reply_to or thread_id, not both.")
         thread = _answered_thread(db, actor, args["reply_to"])
     thread = thread or _opened_thread(actor, key)
-    recipients = args.get("to")
+    recipients = args.get("to", [] if decision else None)
+    lowest = 0 if decision else 1
     if (
         not isinstance(recipients, list)
-        or not 1 <= len(recipients) <= MAX_RECIPIENTS
+        or not lowest <= len(recipients) <= MAX_RECIPIENTS
     ):
         raise BridgeError(
-            f"to must contain 1..{MAX_RECIPIENTS} registered participants."
+            f"to must contain {lowest}..{MAX_RECIPIENTS} registered "
+            "participants."
         )
     ids = []
     for recipient in recipients:
@@ -699,7 +736,8 @@ def _send(
             existing["body_md"],
             existing["thread_id"],
             existing["ack_required"],
-        ) != (subject, stored, thread, ack) or previous != set(ids):
+            bool(existing["decision"]),
+        ) != (subject, stored, thread, ack, decision) or previous != set(ids):
             raise BridgeError("Idempotency key already names another message.")
         return {
             "id": existing["id"],
@@ -708,8 +746,8 @@ def _send(
         }
     cursor = db.execute(
         "INSERT INTO messages(project_id,sender_id,subject,body_md,"
-        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id) "
-        "VALUES (?,?,?,?,?,?,?,datetime('now',?),?)",
+        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id,decision) "
+        "VALUES (?,?,?,?,?,?,?,datetime('now',?),?,?)",
         (
             actor["project_id"],
             actor["id"],
@@ -720,6 +758,7 @@ def _send(
             key,
             None if within is None else f"+{int(within)} seconds",
             claim or None,
+            decision,
         ),
     )
     message_id = cursor.lastrowid
@@ -728,6 +767,8 @@ def _send(
         [(message_id, recipient) for recipient in set(ids)],
     )
     result = {"id": message_id, "thread_id": thread}
+    if decision:
+        result["decision"] = True
     if oversized and directory is not None:
         stored, ref = attachments.spill(
             directory,
@@ -963,6 +1004,101 @@ def _search(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     result: dict = {
         "query": query,
         "index": "fts5" if indexed else "substring",
+    }
+    messages = _bounded(result, rows[:limit])
+    result["messages"] = messages
+    result["has_more"] = len(rows) > len(messages)
+    return result
+
+
+DECISION_SCOPE = (
+    "JOIN agents a ON a.id=m.sender_id WHERE m.project_id=? "
+    "AND m.decision=1 AND (?=0 OR m.created_ts>=datetime('now',?)) "
+)
+DECISION_INDEX = (
+    "FROM message_search JOIN messages m ON m.id=message_search.rowid "
+)
+
+
+def _decision_rows(
+    db: sqlite3.Connection,
+    project_id: int,
+    query: str,
+    window: int,
+    limit: int,
+    indexed: bool,
+) -> list[sqlite3.Row]:
+    """Reads one page of a project's decision log, newest first.
+
+    Args:
+        db: Open transaction owned by the caller.
+        project_id: Project whose decision log is read.
+        query: Text to match, or empty to read the newest decisions.
+        window: Seconds back the page may reach, or zero for the whole log.
+        limit: Maximum decisions reported.
+        indexed: Whether a full-text index can answer this query.
+
+    Returns:
+        Candidate rows, one beyond the limit where further ones exist.
+    """
+    scope = (PREVIEW_CHARACTERS, project_id, window, f"-{window} seconds")
+    if not query:
+        return db.execute(
+            MAIL_COLUMNS
+            + "FROM messages m "
+            + DECISION_SCOPE
+            + "ORDER BY m.id DESC LIMIT ?",
+            (*scope, limit + 1),
+        ).fetchall()
+    if indexed:
+        return db.execute(
+            MAIL_COLUMNS
+            + DECISION_INDEX
+            + DECISION_SCOPE
+            + "AND message_search MATCH ? ORDER BY m.id DESC LIMIT ?",
+            (*scope, _phrase(query), limit + 1),
+        ).fetchall()
+    pattern = f"%{_wildcards(query)}%"
+    return db.execute(
+        MAIL_COLUMNS
+        + "FROM messages m "
+        + DECISION_SCOPE
+        + "AND (m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\') "
+        "ORDER BY m.id DESC LIMIT ?",
+        (*scope, pattern, pattern, limit + 1),
+    ).fetchall()
+
+
+def _decisions(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
+    """Reads this project's decision log, newest decision first.
+
+    Every registered participant of the project reads the same log, because a
+    decision is recorded precisely so a lane that was neither sender nor
+    recipient stops repeating or contradicting it. Ordinary mail is untouched
+    by this scope and stays private to its sender and its recipients.
+
+    An empty query lists the newest decisions rather than matching text, and
+    ``since`` bounds the page to decisions recorded within that many seconds.
+    Where the SQLite build provides no full-text index a query is matched as
+    a literal substring, exactly as ordinary mail search degrades.
+    """
+    query = _text(args.get("query", ""), "query", MAX_QUERY_BYTES, empty=True)
+    window = _number(args.get("since", 0), "since", 0, 10**9)
+    limit = _number(
+        args.get("limit", MAX_SEARCH_HITS), "limit", 1, MAX_SEARCH_HITS
+    )
+    indexed = bool(query) and _searchable(db)
+    if not query:
+        index = "recent"
+    else:
+        index = "fts5" if indexed else "substring"
+    rows = _decision_rows(
+        db, actor["project_id"], query, window, limit, indexed
+    )
+    result: dict = {
+        "query": query,
+        "since_seconds": window,
+        "index": index,
     }
     messages = _bounded(result, rows[:limit])
     result["messages"] = messages
@@ -1759,6 +1895,8 @@ def _effect(
         return _thread(db, actor, args)
     if tool == "search_messages":
         return _search(db, actor, args)
+    if tool == "search_decisions":
+        return _decisions(db, actor, args)
     if tool == "file_reservation_paths":
         return _reserve(db, actor, args, declared, claim, commits)
     if tool == "release_file_reservations":
@@ -1887,6 +2025,94 @@ def search_messages(
     with connect(home) as db:
         actor = _identify(db, root, name)
         return _search(db, actor, {"query": query, "limit": limit})
+
+
+def search_decisions(
+    home: Path,
+    root: str,
+    name: str,
+    query: str = "",
+    limit: int = MAX_SEARCH_HITS,
+    since: int = 0,
+) -> dict:
+    """Reads the project-wide decision log as a registered participant.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity reading the log, which every registered
+            participant may do regardless of who sent the decision.
+        query: Text to match against subjects and bodies, or empty to read
+            the newest decisions.
+        limit: Maximum decisions reported.
+        since: Seconds back the page may reach, or zero for the whole log.
+
+    Returns:
+        Matching decisions newest first, naming the index that answered.
+
+    Raises:
+        BridgeError: If no store exists or the reader is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home) as db:
+        actor = _identify(db, root, name)
+        return _decisions(
+            db, actor, {"query": query, "limit": limit, "since": since}
+        )
+
+
+def decide(home: Path, root: str, subject: str, body: str, key: str) -> dict:
+    """Records one supervising operator's decision for the whole project.
+
+    The decision takes the ordinary send path, so it is deduplicated by its
+    key and bounded by the same body and attachment rules as mail. It
+    addresses no inbox: every registered participant reads it by searching
+    the decision log instead.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        subject: Subject line the decision is found under.
+        body: Decision text every participant can read.
+        key: Idempotency key; an identical record returns the original.
+
+    Returns:
+        The recorded decision identifier, carrying ``duplicate`` when this key
+        already named exactly this decision.
+
+    Raises:
+        BridgeError: If the project is not registered or the decision fails
+            validation.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError(NO_PROJECT)
+    with connect(home, write=True) as db:
+        project = db.execute(
+            "SELECT id FROM projects WHERE human_key=?", (root,)
+        ).fetchone()
+        if not project:
+            raise BridgeError(NO_PROJECT)
+        db.execute(
+            "INSERT INTO agents(project_id,name) VALUES (?,?) "
+            "ON CONFLICT(project_id,name) DO NOTHING",
+            (project[0], OPERATOR),
+        )
+        actor = db.execute(
+            "SELECT id,project_id,name FROM agents "
+            "WHERE project_id=? AND name=?",
+            (project[0], OPERATOR),
+        ).fetchone()
+        return _send(
+            db,
+            dict(actor),
+            {
+                "subject": subject,
+                "body_md": body,
+                "idempotency_key": key,
+                "decision": True,
+            },
+        )
 
 
 def list_messages(

@@ -94,16 +94,19 @@ acknowledgement, and is read back beside peer traffic. Its sender row is created
 on first use and never carries a credential digest, so no bearer token resolves
 to it and no served session can write in its name. The name `operator` is
 reserved, so no participant, provider or credential profile can claim it. No
-tool is added for this: the served surface stays the ten tools below.
+tool is added for this: the served surface stays the eleven tools below.
+`agent-parley decide` records a decision on the same path and addresses no
+inbox, and `agent-parley decision list` reads the log back.
 
 The server binds `127.0.0.1`, checks Host and Origin, rejects unauthenticated
 requests, and avoids credential/body logging. It supports stateless JSON responses
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent
 official MCP SDK exercises initialization and calls in CI.
 
-Ten tools cover sending, fetching, acknowledging, marking read, reserving
+Eleven tools cover sending, fetching, acknowledging, marking read, reserving
 files, releasing reservations, listing participants, reading one thread,
-searching mail, and paging an attachment. Unknown arguments fail. A body
+searching mail, searching decisions, and paging an attachment. Unknown
+arguments fail. A body
 above its cap is spilled whole to `attachments/` under the project state
 directory by `agent_parley/attachments.py`, keyed by an opaque
 `kind-identifier` reference that is validated by pattern and resolved only
@@ -127,6 +130,18 @@ searching mail are scoped to what the caller already sees, so neither widens
 a lane's view of the project. Their queries take no write lock; served MCP
 reads then attempt the nonwaiting telemetry write described above. Operator
 thread and search commands record no tool event and take no write lock.
+
+A send marked `decision` is additionally recorded in the project's decision
+log. The mark is a column on the message rather than a second substrate, so a
+decision is deduplicated, threaded, bounded and spilled to an attachment by
+exactly the rules that govern mail, and `search_decisions` reads it back for
+every registered participant of the project, sender and recipient or not. Only
+that mark widens a scope: unmarked mail keeps the sender-and-recipients scope
+described above, and the upgrade that adds the column marks every stored
+message as ordinary. A decision may address no recipient, which records it
+without putting it in an inbox; an attachment a decision spills stays readable
+by its writer and its addressees alone, so the log reveals the bounded record
+and never more than the message did.
 
 The addressable roster omits the operator and revoked credentials before
 applying its 32-participant limit. Sending to either is refused with an

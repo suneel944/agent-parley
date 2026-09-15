@@ -79,7 +79,9 @@ def _lane_rows(
         now: Unix time the reading is compared against.
 
     Returns:
-        Zero or more rows, one per condition the record shows.
+        Zero or more rows, one per condition the record shows. A lane that has
+        recorded no native activity carries no age on the rows that report one,
+        because the span it has been quiet for is unknown rather than long.
     """
     name = record["participant"]
     repo = f"--repo {root}"

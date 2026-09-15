@@ -225,7 +225,7 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
-| 0.9.1 | 1 | 8 |
+| 0.9.1 | 1 | 9 |
 | 0.9.0 | 1 | 8 |
 | 0.8.0 | 1 | 8 |
 | 0.7.0 | 1 | 8 |
@@ -1223,6 +1223,13 @@ looks like; `stopped` is a launcher whose recorded session process is gone. A
 lane that is only idle is never reported with the word a dead launcher gets.
 `status` reports that state beside process liveness and lists outstanding
 acknowledgement IDs, senders and ages.
+
+A lane that has recorded no native activity yet has no age to report, so
+`last_active_at` and `age_seconds` are both `null` rather than an age measured
+from the Unix epoch, a live launcher without a checkpoint reads as `active`
+instead of ageing into `idle` on its first poll, and a `problems` row for such
+a lane prints `-` in the age column and sorts below every row whose age is
+known.
 
 Sending an `ack_required` message returns an availability warning when the
 latest runtime observation puts its recipient in either non-active state. An

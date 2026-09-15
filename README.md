@@ -149,6 +149,10 @@ and the setup command every new lane runs.
   gate. Both mark the lane and stop nothing.
 - **Reservations are advisory.** Conflicts name the blocking owner and that
   owner's declared reason; nothing on disk is locked.
+- **Mail stays private; a decision does not.** Only a message a lane marks as a
+  decision, or one an operator records with `agent-parley decide`, enters the
+  project-wide log every lane can search, so a third lane stops repeating a
+  settled question.
 - **Your history stays yours.** No lane signs its work, and a commit, merge,
   tag or pull request that credits an assistant is denied before it lands, with
   no flag that skips the check.

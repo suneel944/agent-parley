@@ -113,6 +113,10 @@ TOOLS = [
                 "description": "Message answered; joins its thread.",
             },
             "ack_required": FLAG,
+            "decision": {
+                **FLAG,
+                "description": "Also record in the shared decision log.",
+            },
         },
         ["to", "subject", "body_md", "idempotency_key"],
     ),
@@ -215,6 +219,20 @@ TOOLS = [
             },
         },
         ["query"],
+    ),
+    _tool(
+        "search_decisions",
+        "Search decisions any lane recorded. Empty query lists the newest.",
+        {
+            "query": {**TEXT, "maxLength": store.MAX_QUERY_BYTES},
+            "limit": {
+                **INTEGER,
+                "minimum": 1,
+                "maximum": store.MAX_SEARCH_HITS,
+            },
+            "since": {**INTEGER, "minimum": 0},
+        },
+        [],
     ),
 ]
 
