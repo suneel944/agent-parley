@@ -38,7 +38,7 @@ def test_status_reports_projects_lanes_and_ownership(
         ),
         "status",
     )
-    assert document["server"] == {"ready": False}
+    assert document["server"] == {"ready": False, "state": "not ready"}
     assert document["state_directory"] == str(bridge.home)
     project = document["projects"][0]
     assert project["root"] == paired["root"]

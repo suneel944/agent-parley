@@ -2219,8 +2219,17 @@ class Bridge:
         data = json.loads(record.read_text())
         return process.identify(data, self.home)
 
-    def ready(self) -> bool:
-        """Checks authenticated readiness without routing through proxies."""
+    def health(self) -> dict:
+        """Reads the service's own account of itself, without a proxy.
+
+        The service answers what code it started on and whether the checkout
+        has moved past it, so a reading here reports drift the launcher
+        cannot see from its own process.
+
+        Returns:
+            The readiness document, or an empty mapping when nothing answers
+            on the configured port.
+        """
         import urllib.error
         import urllib.request
 
@@ -2231,9 +2240,14 @@ class Bridge:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             with opener.open(request, timeout=1) as response:
-                return json.load(response).get("status") == "ready"
+                document = json.load(response)
         except (OSError, urllib.error.URLError, ValueError):
-            return False
+            return {}
+        return document if isinstance(document, dict) else {}
+
+    def ready(self) -> bool:
+        """Checks authenticated readiness without routing through proxies."""
+        return self.health().get("status") == "ready"
 
     def up(self) -> None:
         """Starts the mail server with bounded readiness checking.
@@ -4662,18 +4676,24 @@ attempt of the recorded budget, which is also only reported.
         return {"delivered": True, "detail": ""}
 
     def doctor(self) -> dict:
-        """Reports the launcher, plugin and store versions and their fit.
+        """Reports the launcher, plugin, store and service fit.
 
         The command reads. It opens no lane, writes no configuration and
         repairs nothing, so it stays safe to run while lanes are working, and
         it reports no credential, token or path inside a credential profile.
+        It does ask a running service what code it is answering from, which
+        is a reading the launcher cannot take from its own process.
 
         Returns:
             The launcher's package version and wire protocol, the protocol each
             shipped plugin manifest declares, the store's schema version
-            against the schema this build writes, and whether the whole set is
-            consistent. Each component carries the state this build puts it in
-            and the one command that state needs. A store behind this build is
+            against the schema this build writes, the code a running service
+            is answering from, and whether the whole set is consistent. A
+            service that started before the sources moved is reported stale,
+            because it answers from modules the checkout no longer holds; a
+            service that is not running is no drift at all. Each component
+            carries the state this build puts it in and the one command that
+            state needs. A store behind this build is
             not consistent: every process running this code queries columns it
             does not have, so reporting it as compatible would describe a
             healthy system while every lane is denied. The report also names
@@ -4716,6 +4736,19 @@ attempt of the recorded budget, which is also only reported.
                 "state": state,
                 "remedy": store.remedy(state),
                 "compatible": state in store.SCHEMA_USABLE,
+            }
+        )
+        served = self.health()
+        serving = served.get("status") or protocol.STOPPED
+        stale = serving == protocol.STALE
+        components.append(
+            {
+                "component": "service",
+                "version": str(served.get("version", "")),
+                "protocol": protocol.PROTOCOL,
+                "state": protocol.OK if serving == "ready" else serving,
+                "remedy": protocol.RELAUNCH if stale else "",
+                "compatible": not stale,
             }
         )
         return {
@@ -5385,14 +5418,18 @@ attempt of the recorded budget, which is also only reported.
         store.
 
         Returns:
-            Server readiness, the private state directory, and one record per
-            registered project holding its issue ledger and its lanes.
+            Server readiness and the state the service reports itself in, the
+            private state directory, and one record per registered project
+            holding its issue ledger and its lanes. A service that reports
+            itself stale is not ready, and the state names why.
         """
         usable = (
             store.schema_state(store.schema_version(self.home))
             in store.SCHEMA_USABLE
         )
-        healthy = usable and bool(self.server_process()) and self.ready()
+        served = self.health()
+        state = served.get("status") or "not ready"
+        healthy = usable and bool(self.server_process()) and state == "ready"
         projects = []
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
@@ -5421,7 +5458,7 @@ attempt of the recorded budget, which is also only reported.
                     }
                 )
         return {
-            "server": {"ready": healthy},
+            "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
             "projects": projects,
         }
@@ -5449,6 +5486,8 @@ attempt of the recorded budget, which is also only reported.
         kept = {project["root"]: project for project in report["projects"]}
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
+        if report["server"].get("state") == protocol.STALE:
+            print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             print(f"Store: {schema}; {repair}")

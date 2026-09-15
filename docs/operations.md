@@ -216,9 +216,21 @@ project file beside the package is read wherever it exists and installation
 metadata is used only for a package installed without one.
 
 `doctor` prints the launcher version and protocol, the protocol each shipped
-plugin manifest declares, and the store's schema against the schema this build
-writes, then a verdict line. Each line carries the state this build puts that
-component in, printed in upper case when the build does not accept it.
+plugin manifest declares, the store's schema against the schema this build
+writes, and the code a running service is answering from, then a verdict line.
+Each line carries the state this build puts that component in, printed in upper
+case when the build does not accept it.
+
+The service has three states. `not running` means nothing answered on the
+configured port, which is no drift. `ok` means the service is answering from
+the sources on disk. `stale` means the checkout moved after the service
+started, so it is answering from modules the tree no longer holds, and a module
+a merge added is missing from that process for as long as it runs. A service
+that reads itself stale logs one line, refuses further calls with the status
+its clients already treat as an outage, so hooks decide in-process, and stops
+once its in-flight calls finish. `status` prints the same drift as a
+`Code: stale` line, and `agent-parley up` then starts a service on the code in
+the checkout.
 
 The store has four states. `absent` means no store has been created yet, which
 is consistent because the service writes it at the current schema. `ok` means
