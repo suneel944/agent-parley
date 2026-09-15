@@ -23,6 +23,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
 | `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
 | `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
+| `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
@@ -179,8 +180,8 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. `gemini.py`, `copilot.py` and `opencode.py`
-translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
+the existing session lock. `gemini.py`, `copilot.py`, `opencode.py` and
+`amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in
 the launch and forge paths.
@@ -282,9 +283,12 @@ its profile directory. No adapter shares a settings-file abstraction because
 no two of these CLIs share a stable file contract. Each adapter declares the
 lifecycle events its CLI cannot raise; `provider list` reports them as
 `unavailable_hooks`, and the launcher refuses an adapter that lacks a required
-guard rather than claiming enforcement. Amp accepts no system-prompt argument,
-is not a preset and is not drivable by naming it as a provider executable;
-`docs/operations.md` records its configuration surface.
+guard rather than claiming enforcement. `amp.py` copies Amp's settings file
+into a lane-private one with the MCP server and one `amp.hooks` entry per tool
+event, and translates those inputs and results; Amp raises no thread start or
+idle event, so `SessionStart` and `Stop` are unavailable and the launcher
+refuses an `amp` lane today. `docs/operations.md` records that surface and
+what only a live trial can verify.
 
 A credential profile selects one account by pointing the CLI's config-home
 variable at a separate directory, so the same provider can run twice under

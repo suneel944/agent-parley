@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from agent_parley import (
+    amp,
     approvals,
     archive,
     attachments,
@@ -2663,6 +2664,7 @@ class Bridge:
                         "events.jsonl.tmp",
                         "events.1.jsonl.tmp",
                         "gemini-settings.json",
+                        "amp-settings.json",
                     ):
                         (directory / f"{name}-{suffix}").unlink(missing_ok=True)
                     shutil.rmtree(
@@ -5497,6 +5499,23 @@ attempt of the recorded budget, which is also only reported.
                     "--prompt",
                     prompt + "\nUser task:\n" + task,
                 ]
+            elif entry["adapter"] == "amp":
+                env["AMP_SETTINGS_FILE"] = str(
+                    amp.configure(
+                        lane.parent,
+                        agent,
+                        self.url + "/mcp/",
+                        identity["registration_token"],
+                        hooks,
+                        env.get("AMP_SETTINGS_FILE"),
+                    )
+                )
+                command = [
+                    executable,
+                    "--settings-file",
+                    env["AMP_SETTINGS_FILE"],
+                    prompt + "\nUser task:\n" + task,
+                ]
             elif entry["adapter"] == "copilot":
                 config_home = account.get(entry.get("home_env", ""))
                 if not config_home:
@@ -5583,6 +5602,8 @@ attempt of the recorded budget, which is also only reported.
                     command[1:1] = ["resume", session]
                 elif entry["adapter"] == "opencode":
                     command[1:1] = ["--session", session]
+                elif entry["adapter"] == "amp":
+                    command[1:1] = ["threads", "continue", session]
                 else:
                     command[1:1] = ["--resume", session]
             previous.update(

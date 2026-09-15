@@ -11,7 +11,7 @@ from pathlib import Path
 from agent_parley.forge import FORGES
 from agent_parley.state import BridgeError, lock, write_json
 
-ADAPTERS = ("claude", "codex", "copilot", "gemini", "opencode")
+ADAPTERS = ("claude", "codex", "copilot", "gemini", "opencode", "amp")
 HOOK_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -27,6 +27,13 @@ UNAVAILABLE_HOOKS: dict[str, tuple[str, ...]] = {
     "copilot": (),
     "gemini": ("PermissionRequest",),
     "opencode": ("SessionEnd",),
+    "amp": (
+        "SessionStart",
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "Stop",
+        "SessionEnd",
+    ),
 }
 REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
@@ -110,6 +117,13 @@ PRESETS: dict[str, dict] = {
         "adapter": "opencode",
         "command": "opencode",
         "home_env": "OPENCODE_CONFIG_DIR",
+        "env": {},
+        "require_env": [],
+    },
+    "amp": {
+        "adapter": "amp",
+        "command": "amp",
+        "home_env": "AMP_SETTINGS_FILE",
         "env": {},
         "require_env": [],
     },
