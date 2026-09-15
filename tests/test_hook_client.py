@@ -2,17 +2,27 @@
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, hook, protocol, server, store
+from agent_parley import (
+    checkpoints,
+    cli,
+    hook,
+    process,
+    protocol,
+    server,
+    store,
+)
 from agent_parley.state import write_json
 
 ALLOW = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {}}
@@ -23,6 +33,7 @@ DENY = {
 }
 STOP = {"hook_event_name": "Stop", "stop_hook_active": False}
 START = {"hook_event_name": "SessionStart", "session_id": "s1"}
+STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} ")
 
 
 def events(directory, agent="codex"):
@@ -194,7 +205,11 @@ def test_a_failure_inside_the_served_decision_answers_500(
     recorded = events(lane.parent)
     assert recorded[0]["reason_class"] == "service_fallback"
     assert "service answered 500" in recorded[0]["cause"]
-    assert "cannot import name 'budgets'" in capsys.readouterr().err
+    logged = capsys.readouterr().out
+    entry = next(line for line in logged.splitlines() if " failed " in line)
+    assert STAMP.match(entry)
+    assert entry.endswith(f"failed {hook.PATH} codex")
+    assert "cannot import name 'budgets'" in logged
 
 
 def moved_sources(monkeypatch):
@@ -266,11 +281,36 @@ def test_doctor_reports_a_current_service_as_consistent(
     assert reported["consistent"] is True
 
 
-def test_doctor_reports_a_stopped_service_as_no_drift(bridge, repo, paired):
+def test_doctor_reports_a_stopped_service_with_lanes_as_an_outage(
+    bridge, repo, paired
+):
     store.initialize(bridge.home)
     reported = bridge.doctor()
     named = {entry["component"]: entry for entry in reported["components"]}
     assert named["service"]["state"] == protocol.STOPPED
+    assert named["service"]["remedy"] == protocol.START
+    assert named["service"]["compatible"] is False
+    assert reported["consistent"] is False
+    assert protocol.START in protocol.render(reported)
+
+
+def test_doctor_exits_non_zero_when_lanes_have_no_service(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    monkeypatch.setattr(
+        sys, "argv", ["agent-parley", "--home", str(bridge.home), "doctor"]
+    )
+    assert cli.main() == 1
+    assert protocol.START in capsys.readouterr().out
+
+
+def test_doctor_stays_consistent_with_no_lane_registered(bridge):
+    store.initialize(bridge.home)
+    reported = bridge.doctor()
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["service"]["state"] == protocol.STOPPED
+    assert named["service"]["remedy"] == ""
     assert named["service"]["compatible"] is True
     assert reported["consistent"] is True
 
@@ -368,6 +408,90 @@ def test_the_service_rejects_a_malformed_hook_request(
             bridge.config["port"], token, b"x" * (server.MAX_HOOK_BYTES + 1)
         )[0]
         == 413
+    )
+
+
+def free_slots(instance):
+    """Counts the worker slots the service currently has available."""
+    taken = 0
+    while instance.slots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        instance.slots.release()
+    return taken
+
+
+def test_a_stalled_decision_is_answered_and_frees_its_slot(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    token = identity["registration_token"]
+    body = json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**ALLOW, "cwd": str(lane), "session_id": "s1"},
+        }
+    ).encode()
+    deciding = checkpoints.serve
+    release = threading.Event()
+
+    def stalling(home, request):
+        release.wait(20)
+        return deciding(home, request)
+
+    monkeypatch.setattr(server, "DECISION_SECONDS", 0.2)
+    monkeypatch.setattr(server.checkpoints, "serve", stalling)
+    status, reply = hook.request(bridge.config["port"], token, body)
+    assert status == 503
+    assert json.loads(reply)["status"] == protocol.STALE
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and free_slots(service) < server.WORKERS:
+        time.sleep(0.05)
+    assert free_slots(service) == server.WORKERS
+    entry = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " expired " in line
+    )
+    assert STAMP.match(entry)
+    assert f"{hook.PATH} codex undecided" in entry
+    assert token not in entry
+    monkeypatch.setattr(server.checkpoints, "serve", deciding)
+    release.set()
+    assert hook.request(bridge.config["port"], token, body)[0] == 200
+
+
+def test_the_connection_past_the_worker_cap_is_refused_in_the_log(
+    bridge, service, capsys
+):
+    port = bridge.config["port"]
+    holding = []
+    try:
+        for _ in range(server.WORKERS):
+            holding.append(
+                socket.create_connection(("127.0.0.1", port), timeout=5)
+            )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and free_slots(service):
+            time.sleep(0.01)
+        assert free_slots(service) == 0
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as extra:
+            assert extra.recv(64) == b""
+    finally:
+        for held in holding:
+            held.close()
+    refused = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " refused " in line
+    ]
+    assert len(refused) == 1
+    assert STAMP.match(refused[0])
+    assert (
+        f"closed unanswered with all {server.WORKERS} worker slots busy"
+        in refused[0]
     )
 
 
@@ -565,3 +689,77 @@ def test_main_still_answers_a_direct_call(bridge, repo, paired, monkeypatch):
     assert "Participants" in json.dumps(json.loads(local.stdout))
     assert events(lane.parent)[-1]["reason_class"] == "coordination_pending"
     assert checkpoints.Reason.SERVICE_FALLBACK.value == "service_fallback"
+
+
+def gone(bridge):
+    """Publishes the record a reboot or a drift exit leaves behind."""
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    write_json(
+        bridge.home / "server.json", {"pid": child.pid, "start_ticks": "1"}
+    )
+
+
+def requests(monkeypatch):
+    """Collects the relaunch requests instead of starting a service.
+
+    Only a request to start this package is collected. Every other spawn
+    reaches the real one, because reading a process's creation identity
+    runs an external command on a platform without `/proc`, and answering
+    that call with a recorder breaks the relaunch decision under test.
+    """
+    asked = []
+    spawn = subprocess.Popen
+
+    def collect(*args, **named):
+        if args and "agent_parley" in " ".join(str(part) for part in args[0]):
+            asked.append(args)
+            return None
+        return spawn(*args, **named)
+
+    monkeypatch.setattr(subprocess, "Popen", collect)
+    return asked
+
+
+def test_an_outage_brings_the_service_back_on_the_next_hook(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    gone(bridge)
+    decided = run_hook(
+        bridge, lane.parent, {**ALLOW, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert decided.returncode == 0, decided.stderr
+    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and bridge.server_process() is None:
+        time.sleep(0.2)
+    assert bridge.server_process() is not None
+    assert bridge.ready()
+
+
+def test_one_relaunch_is_asked_for_within_the_interval(bridge, monkeypatch):
+    gone(bridge)
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    past = time.time() - hook.RELAUNCH_INTERVAL - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 2
+
+
+def test_no_relaunch_is_asked_for_without_a_recorded_service(
+    bridge, monkeypatch
+):
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    write_json(
+        bridge.home / "server.json",
+        {"pid": os.getpid(), "start_ticks": process.start_ticks(os.getpid())},
+    )
+    hook.relaunch(str(bridge.home))
+    assert asked == []
+    assert not (bridge.home / hook.RELAUNCH_STAMP).exists()

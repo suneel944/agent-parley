@@ -114,6 +114,9 @@ COPILOT_EVENTS = frozenset(
 )
 
 
+GIT_SECONDS = 30
+
+
 def git(repo: Path, *args: str) -> str:
     """Runs Git in a repository and returns stripped stdout.
 
@@ -132,7 +135,11 @@ def git(repo: Path, *args: str) -> str:
         ["git", "-C", str(repo), *args],
         capture_output=True,
         text=True,
-        timeout=None if args and args[0] in {"push", "pull", "fetch"} else 30,
+        timeout=(
+            None
+            if args and args[0] in {"push", "pull", "fetch"}
+            else GIT_SECONDS
+        ),
         check=False,
     )
     if result.returncode:
@@ -888,6 +895,10 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     the lane's work. It never resets, cleans, stashes or force-switches, and
     a conflict is left in the working tree for the operator to resolve.
 
+    The merge itself is bounded by the same timeout every other Git call
+    here carries, so a merge hook or a prompt that never returns stops the
+    merge instead of pinning the command that asked for it.
+
     Args:
         root: Common repository root, which is always the base checkout.
         lane: Assigned bridge worktree belonging to the participant.
@@ -898,8 +909,9 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         An account of what was merged.
 
     Raises:
-        BridgeError: If either checkout cannot be merged from, or if the
-            merge stopped on conflicts that only the operator can resolve.
+        BridgeError: If either checkout cannot be merged from, if the merge
+            stopped on conflicts that only the operator can resolve, or if
+            the merge ran past its timeout and was stopped.
         subprocess.TimeoutExpired: If a preliminary read exceeds its timeout.
     """
     blocker = next(merge_blockers(root, lane, name, branch), "")
@@ -913,21 +925,32 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
     pending = git(root, "log", "--oneline", f"HEAD..{branch}")
     if not pending:
         return f"{base} already contains every commit on {branch}."
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "merge",
-            "--no-ff",
-            "-m",
-            f"Merge lane branch {branch}",
-            branch,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "merge",
+                "--no-ff",
+                "-m",
+                f"Merge lane branch {branch}",
+                branch,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise BridgeError(
+            f"Merging {branch} into {base} was still running after "
+            f"{GIT_SECONDS} seconds and was stopped, so the command did not "
+            f"wait for it. A merge hook or a prompt in {root} is the usual "
+            f"cause. Check `git -C {quoted} status`, finish or abort whatever "
+            f"the merge left, then run `agent-parley participant merge "
+            f"{name}` again."
+        ) from None
     if result.returncode:
         if not (git_dir / "MERGE_HEAD").exists():
             raise BridgeError(
@@ -2253,13 +2276,19 @@ class Bridge:
     def up(self) -> None:
         """Starts the mail server with bounded readiness checking.
 
+        The published record names a service that answered. A process that
+        is spawned and never becomes ready leaves none, and a record found
+        naming a process that is gone, as a reboot or a drift exit leaves
+        behind, is removed before the new service is started. Every reader
+        of the record therefore learns of a service only once it serves.
+
         Raises:
             BridgeError: If the port is occupied or startup fails.
         """
         with lock(self.home / "server.lock"):
-            legacy_record = self.home / "server.json"
-            if legacy_record.exists():
-                record = json.loads(legacy_record.read_text())
+            published = self.home / "server.json"
+            if published.exists():
+                record = json.loads(published.read_text())
                 legacy = "start_ticks" not in record
                 if legacy and process.running(record["pid"]):
                     raise BridgeError(
@@ -2275,6 +2304,7 @@ class Bridge:
                         f"Inspect {self.home}/server.log"
                     )
                 return
+            published.unlink(missing_ok=True)
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
@@ -2300,18 +2330,16 @@ class Bridge:
                     stderr=log,
                     start_new_session=True,
                 )
-            write_json(
-                self.home / "server.json",
-                {
-                    "pid": child.pid,
-                    "start_ticks": process.start_ticks(child.pid),
-                },
-            )
+            identity = {
+                "pid": child.pid,
+                "start_ticks": process.start_ticks(child.pid),
+            }
             deadline = time.monotonic() + 25
             while time.monotonic() < deadline:
                 if child.poll() is not None:
                     break
                 if self.ready():
+                    write_json(published, identity)
                     return
                 time.sleep(0.2)
             if child.poll() is None:
@@ -4815,8 +4843,13 @@ attempt of the recorded budget, which is also only reported.
             against the schema this build writes, the code a running service
             is answering from, and whether the whole set is consistent. A
             service that started before the sources moved is reported stale,
-            because it answers from modules the checkout no longer holds; a
-            service that is not running is no drift at all. Each component
+            because it answers from modules the checkout no longer holds. A
+            service that is not running is no drift either, but on a machine
+            that holds a registered lane it is an outage: every hook on that
+            machine pays the in-process decision, so the state carries the
+            command that starts a service and the set is not consistent. A
+            machine with no lane registered has nothing to serve and stays
+            consistent with no service running. Each component
             carries the state this build puts it in and the one command that
             state needs. A store behind this build is
             not consistent: every process running this code queries columns it
@@ -4866,14 +4899,19 @@ attempt of the recorded budget, which is also only reported.
         served = self.health()
         serving = served.get("status") or protocol.STOPPED
         stale = serving == protocol.STALE
+        stopped = serving == protocol.STOPPED and any(
+            json.loads(path.read_text()).get("participants")
+            for path in (self.home / "projects").glob("*/project.json")
+        )
+        remedy = protocol.RELAUNCH if stale else ""
         components.append(
             {
                 "component": "service",
                 "version": str(served.get("version", "")),
                 "protocol": protocol.PROTOCOL,
                 "state": protocol.OK if serving == "ready" else serving,
-                "remedy": protocol.RELAUNCH if stale else "",
-                "compatible": not stale,
+                "remedy": protocol.START if stopped else remedy,
+                "compatible": not stale and not stopped,
             }
         )
         return {

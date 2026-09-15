@@ -3,6 +3,7 @@
 import ast
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,10 @@ from scripts import codex_bundle, release_publish
 TOLERATED_WARNINGS = frozenset({"protocol"})
 
 VALIDATOR_FAILED = 2
+
+README_BLOB_PREFIX = "https://github.com/suneel944/agent-parley/blob/main/"
+
+README_LINK = re.compile(r"\]\(([^)\s]+)\)|href=\"([^\"]+)\"")
 
 
 def contribution_errors(root: Path) -> list[str]:
@@ -58,6 +63,43 @@ def contribution_errors(root: Path) -> list[str]:
     for index in range(0, len(history) - 1, 2):
         if has_attribution(history[index + 1]):
             errors.append(f"Commit {history[index].strip()}: prohibited credit")
+    return errors
+
+
+def readme_link_errors(root: Path) -> list[str]:
+    """Checks that every README link also resolves off GitHub.
+
+    PyPI renders README.md as the project description and resolves a
+    relative target against pypi.org, so a repository-relative link is a
+    dead link there. Only absolute URLs and in-page anchors survive both
+    renderings, and an absolute link into this repository must still name
+    a file that exists.
+
+    Args:
+        root: Repository root holding README.md.
+
+    Returns:
+        One message per link target that PyPI cannot resolve.
+    """
+    errors = []
+    for line, text in enumerate(
+        (root / "README.md").read_text().splitlines(), 1
+    ):
+        for markdown, html in README_LINK.findall(text):
+            target = markdown or html
+            if target.startswith(("#", "mailto:")):
+                continue
+            if not target.startswith(("https://", "http://")):
+                errors.append(
+                    f"README.md:{line}: relative link {target!r} breaks on "
+                    "PyPI; use an absolute URL"
+                )
+            elif target.startswith(README_BLOB_PREFIX):
+                path = target[len(README_BLOB_PREFIX) :].split("#")[0]
+                if not (root / path).exists():
+                    errors.append(
+                        f"README.md:{line}: link target {path!r} does not exist"
+                    )
     return errors
 
 
@@ -194,7 +236,7 @@ def main() -> None:
     """Rejects undocumented code, inline comments and runtime dependencies."""
     root = Path(__file__).resolve().parents[1]
     metadata = tomllib.loads((root / "pyproject.toml").read_text())["project"]
-    errors = contribution_errors(root)
+    errors = contribution_errors(root) + readme_link_errors(root)
     for message in sys.argv[1:]:
         if has_attribution(Path(message).read_text()):
             errors.append("Commit message contains prohibited attribution.")
@@ -267,8 +309,8 @@ def main() -> None:
     if errors:
         raise SystemExit("\n".join(errors))
     print(
-        "Policy: documented code, no inline comments, "
-        "stdlib runtime, aligned versions, directory-ready manifests"
+        "Policy: documented code, no inline comments, stdlib runtime, "
+        "aligned versions, directory-ready manifests, portable README links"
     )
 
 

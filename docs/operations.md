@@ -253,7 +253,11 @@ from, then a verdict line. Each line carries the state this build puts that
 component in, printed in upper case when the build does not accept it.
 
 The `service` component has three states. `not running` means nothing answered
-on the configured port, which is no drift. `ok` means the service is answering
+on the configured port, which is no drift. It is still an outage wherever a
+lane is registered, because every hook on that machine then pays the in-process
+decision, so the report names `agent-parley up` and the verdict is not
+consistent; a machine with no lane registered has nothing to serve and stays
+consistent with no service running. `ok` means the service is answering
 from the sources on disk. `stale` means the checkout moved after the service
 started, so it is answering from modules the tree no longer holds, and a module
 a merge added is missing from that process for as long as it runs. A service
@@ -1792,6 +1796,53 @@ blocked reports require `--remaining` instead of `--evidence`.
 state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in
 `server.log`. Set `AGENT_PARLEY_HOME` or pass `--home` for another private root.
 Set `AGENT_PARLEY_PORT` before first initialization to override port 8876.
+
+`server.json` names a service that answered: `up` publishes it only once the
+new process reports itself ready, removes a record left by a process that is
+gone, and leaves none behind when a start fails. A lane launch runs `up` first,
+so a lane never starts against a service that is not there, and a hook that
+falls back to the in-process decision asks for the service back when the
+recorded one has gone, at most once a minute and never waiting for the answer.
+A machine that has never started a service is left alone: the first start
+belongs to the launch or to the operator.
+
+### Keeping the service across reboots
+
+The service is a user process and does not survive a reboot. Where the machine
+should bring it back without a launch, a user-level systemd unit does it.
+Write `~/.config/systemd/user/agent-parley.service`:
+
+```ini
+[Unit]
+Description=Agent Parley coordination service
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/agent-parley up
+ExecStop=%h/.local/bin/agent-parley down
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable it, and allow it to run while nobody is logged in:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now agent-parley.service
+sudo loginctl enable-linger "$USER"
+```
+
+The unit is optional. `up` returns once the service answers and the process it
+started is detached, which is why the unit is a `oneshot` that remains after
+exit. It starts the same command an operator runs, so the state directory, the
+port and the logs are unchanged, and `agent-parley down` still stops the
+service by hand. Adjust `ExecStart` to the path `which
+agent-parley` reports when the installation is not in `~/.local/bin`, and set
+`Environment=AGENT_PARLEY_HOME=...` in the `[Service]` section for a private
+root other than the default.
 
 Worktrees start at a captured commit and persist. Ignored environment files,
 dependencies and untracked configuration are not copied. Set up each worktree
