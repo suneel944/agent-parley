@@ -6115,6 +6115,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "issue",
             "mail",
             "say",
+            "decide",
+            "decision",
             "report",
             "participant",
             "approve",
