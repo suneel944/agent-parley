@@ -78,6 +78,12 @@ archived copy. The archive lands at
 manifest, `skills/` and `assets/`. `scripts/check_policy.py` fails the gate if
 either manifest drifts from the shape its directory reads.
 
+That archive is attached to the published release, so a portal upload starts
+from a released artifact rather than a local build; it is present on v0.6.0,
+v0.7.0 and v0.8.0. Neither catalog exposes a publishing API, so each new
+version still needs a manual upload through the portal. Claude mirrors pushes
+once a listing is live; Codex does not.
+
 Both forms change over time. Re-read them at submission time and treat the
 lists above as a preparation aid, not as a transcription of the current form
 fields.
