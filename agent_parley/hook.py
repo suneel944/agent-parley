@@ -57,7 +57,9 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
 
     Raises:
         OSError: If the connection is refused or a timeout passes.
-        ValueError: If the reply does not start with a status line.
+        ValueError: If the reply does not start with a status line, as
+            when a service at its concurrency cap closes the accepted
+            connection without answering.
     """
     head = (
         f"POST {PATH} HTTP/1.1\r\n"
@@ -80,7 +82,10 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
             if not chunks:
                 raise
     header, _, reply = b"".join(chunks).partition(b"\r\n\r\n")
-    return int(header.split(b" ", 2)[1]), reply
+    parts = header.split(b" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError("reply has no status line")
+    return int(parts[1]), reply
 
 
 def fallback(raw: str, cause: str) -> int:
