@@ -45,6 +45,27 @@ def _row(
     }
 
 
+def _wake(name: str, repo: str, availability: dict) -> str:
+    """Names the remedy that fits the lane's recorded session process.
+
+    A lane between turns and a lane whose launcher exited need opposite
+    commands. Resuming a lane whose launcher is still running collides with
+    the session lock that launcher holds, so a live lane is woken through its
+    inbox or its terminal and only a stopped lane is resumed.
+
+    Args:
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        availability: The lane's presence reading.
+
+    Returns:
+        The wake a live launcher takes, or the resume a stopped lane takes.
+    """
+    if availability["state"] == supervision.STOPPED:
+        return f"agent-parley run {name} --resume {repo}"
+    return f'agent-parley say {name} "<text>" {repo}'
+
+
 def _lane_rows(
     record: dict, participant: dict, root: str, ack_after: float, now: float
 ) -> list[dict]:
@@ -71,7 +92,7 @@ def _lane_rows(
             _row(
                 STALLED,
                 supervision.stall_marker(idle),
-                f"agent-parley run {name} --resume {repo}",
+                _wake(name, repo, availability),
                 int(idle["age_seconds"]),
                 name,
                 root,
@@ -82,7 +103,7 @@ def _lane_rows(
             _row(
                 INACTIVE,
                 "alive but no native activity past the inactive threshold",
-                f"agent-parley run {name} --resume {repo}",
+                _wake(name, repo, availability),
                 availability["age_seconds"],
                 name,
                 root,
@@ -107,7 +128,7 @@ def _lane_rows(
                     ACK,
                     f"message {pending['message_id']} from "
                     f"{pending['sender']} awaits acknowledgement",
-                    f"agent-parley run {name} --resume {repo}",
+                    _wake(name, repo, availability),
                     pending["age_seconds"],
                     name,
                     root,

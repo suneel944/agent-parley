@@ -283,14 +283,21 @@ condition, its age and the one command that clears it:
 | --- | --- | --- |
 | `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
 | `service` | The coordination server is not ready. | `agent-parley up` |
-| `stalled` | A live lane holds mail older than `stalled_after` and served no call inside it. | `agent-parley run NAME --resume` |
-| `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley run NAME --resume` |
+| `stalled` | A live lane holds mail older than `stalled_after` and served no call inside it. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
+| `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
 | `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
 | `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
-| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. | `agent-parley run NAME --resume` |
+| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
 | `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
+
+A lane row's command follows the lane's presence state. While the recorded
+session process is alive the row names a wake, because `run NAME --resume`
+would collide with the session lock the running launcher holds; once the
+process is gone the same row names the resume. The printed command is
+therefore how an operator tells a lane between turns from a lane whose
+launcher exited.
 
 An empty list prints one line saying so and exits zero; any row exits 1, so a
 shell or a cron can gate on it. `--json` prints the same rows inside the shared

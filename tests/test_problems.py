@@ -28,6 +28,14 @@ def alive(directory, name, **extra):
     )
 
 
+def stopped(directory, name):
+    """Records a lane whose session process is gone."""
+    write_json(
+        directory / f"{name}-activity.json",
+        {"activity": "idle", "updated": 0},
+    )
+
+
 def deliver(bridge, repo, paired, *, ack=False, aged=0):
     """Delivers one operator message and ages it in the store."""
     store.initialize(bridge.home)
@@ -112,8 +120,23 @@ def test_a_stalled_lane_names_the_waiting_item_and_the_resume(
     assert row["detail"].startswith("idle; message")
     assert row["seconds"] >= 1800
     assert row["command"] == (
+        f'agent-parley say claude "<text>" --repo {paired["root"]}'
+    )
+    assert "--resume" not in row["command"]
+    assert not rows(bridge, problems.INACTIVE)
+
+
+def test_a_stopped_lane_awaiting_acknowledgement_names_the_resume(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    stopped(directory, "claude")
+    deliver(bridge, repo, paired, ack=True, aged=1800)
+    [row] = rows(bridge, problems.ACK, ack_after=600)
+    assert row["command"] == (
         f"agent-parley run claude --resume --repo {paired['root']}"
     )
+    assert not rows(bridge, problems.STALLED)
     assert not rows(bridge, problems.INACTIVE)
 
 
@@ -123,7 +146,7 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     alive(bridge.project(repo)[1], "claude")
     [row] = rows(bridge, problems.INACTIVE)
     assert row["participant"] == "claude"
-    assert row["command"].startswith("agent-parley run claude --resume")
+    assert row["command"].startswith('agent-parley say claude "<text>"')
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
 
 
@@ -173,7 +196,7 @@ def test_a_message_awaiting_acknowledgement_past_the_age_is_a_row(
     [row] = rows(bridge, problems.ACK, ack_after=600)
     assert f"message {delivered['id']} from operator" in row["detail"]
     assert row["seconds"] >= 1800
-    assert row["command"].startswith("agent-parley run claude --resume")
+    assert row["command"].startswith('agent-parley say claude "<text>"')
 
 
 def test_a_drifted_lane_names_the_restore(bridge, repo, paired, served):
