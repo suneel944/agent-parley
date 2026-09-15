@@ -110,10 +110,12 @@ component.
 `SESSION` carries the lane's presence, which has three states. `active` is a
 lane that served a coordination call inside the configured interval. `idle` is a
 live session process that served none inside the inactivity threshold: it is a
-quiet lane, not a lost one. `unreachable` is a lane whose recorded session
+quiet lane, not a lost one. `stopped` is a lane whose recorded session
 process is gone. A live lane past the threshold therefore never reads
-`unreachable`, and presence only reports: no claim is released and no ownership
-moves on any of the three.
+`stopped`, and presence only reports: no claim is released and no ownership
+moves on any of the three. A send result keeps the older operator wording for
+the dead case and summarises a message to a `stopped` lane as
+`queued for NAME (unreachable)`.
 
 Appending a participant name reports that lane as the whole reading —
 availability, drift, waiting items, claims, reported outcome, mail counters and
@@ -134,7 +136,7 @@ agent-parley status --issue 42
 an offer, or a reservation past its declared time to live. `--idle` reports a
 live lane that served no coordination call inside `--since`, or inside the
 project's configured interval when no window is given — the lanes reading
-`idle`, never the unreachable ones; it measures
+`idle`, never the stopped ones; it measures
 coordination inactivity, not what a native client was doing inside a turn.
 `--over-budget` reports the lanes over any of their advisory token, call or
 hour limits and exits non-zero when one matches; the budget informs and does
@@ -1035,7 +1037,7 @@ project holding
 carries the service reading the `Code:` line prints, so a stale service is
 readable without parsing text. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
-`session`, `availability` as `active`, `idle` or `unreachable`, `branch`,
+`session`, `availability` as `active`, `idle` or `stopped`, `branch`,
 `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
@@ -1149,14 +1151,16 @@ same records `top` reads, takes no lock and writes no coordination state.
 The local service observes each launcher's process identity and native
 checkpoint age, and reports one of three states. `active` is a lane that served
 a coordination call inside the configured interval; `idle` is a live session
-process quiet past the inactivity threshold; `unreachable` is a lane whose
+process quiet past the inactivity threshold; `stopped` is a lane whose
 recorded session process is gone. A quiet lane and a lost lane are therefore
 different readings, and passing the threshold never makes a running lane
-unreachable. `status` lists outstanding acknowledgement IDs, senders and ages
+stopped. `status` lists outstanding acknowledgement IDs, senders and ages
 beside the state. Sending an `ack_required` message returns an availability
-warning only when the latest runtime observation marks its recipient
-unreachable, not when it reads `idle`. Observed availability is separate from
-last coordination and never changes claims.
+warning for both non-active states, and the two read differently: a `stopped`
+recipient is summarised as `queued for NAME (unreachable)`, an `idle` one as
+`queued for NAME (idle; wake requested)`. A presence row written before this
+release still carries `unreachable` and is read as `stopped`. Observed
+availability is separate from last coordination and never changes claims.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).

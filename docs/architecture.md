@@ -496,8 +496,8 @@ acceptance is what creates the offer to the named lane. Neither path writes an
 owner, so the command line cannot take work from a lane that has not agreed to
 give it up. Reported `ready` outcomes do not establish verified completion.
 Ownership listings report each owner's session state and the age of its last
-observed checkpoint, as `active`, `idle` or `unreachable`. That report is for an
-operator; silence, an idle session and an unreachable one all leave ownership
+observed checkpoint, as `active`, `idle` or `stopped`. That report is for an
+operator; silence, an idle session and a stopped one all leave ownership
 where it is. `agent-parley top`
 renders the same state continuously, adding branch drift, denial counts and
 served calls; it reads state and never writes it.

@@ -44,7 +44,7 @@ model call, `q` quits.
 </p>
 
 A lane reads `active` while it is serving coordination calls, `idle` once a
-live lane passes the inactivity threshold, and `unreachable` only when its
+live lane passes the inactivity threshold, and `stopped` only when its
 recorded session process is gone. A quiet lane is not a lost one. Every frame
 on this page is real command output from a demo project; only the state and
 project paths are shortened.

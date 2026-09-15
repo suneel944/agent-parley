@@ -12,13 +12,19 @@ A lane is reported in one of three states, and they are not interchangeable:
 | --- | --- | --- |
 | `active` | The lane served a coordination call inside the configured interval. | — |
 | `idle` | The session process is alive, but nothing was served inside the inactivity threshold. | Not a lost lane, and not an error. |
-| `unreachable` | The recorded session process is gone. | Not merely a quiet lane. |
+| `stopped` | The recorded session process is gone. | Not merely a quiet lane. |
 
 A live lane past the inactivity threshold therefore reads `idle`; only a dead
-process reads `unreachable`. The distinction is what lets `problems`, the wake
+process reads `stopped`. The distinction is what lets `problems`, the wake
 path and the fitness check tell a lane that is thinking from a lane that is no
 longer there. Every state only reports: nothing is revoked, no claim is released
 and no ownership moves.
+
+The send result keeps the older operator wording for the dead case. A message
+addressed to a `stopped` lane is summarised as `queued for NAME (unreachable)`,
+and one addressed to an `idle` lane as `queued for NAME (idle; wake
+requested)`. A presence row written before this release still carries
+`unreachable` and is read as `stopped`.
 
 `idle` names the oldest waiting item and how long it has waited, so a lane that
 is quiet with an empty inbox reads differently from one sitting on unread mail.
