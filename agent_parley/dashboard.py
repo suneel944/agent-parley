@@ -42,6 +42,7 @@ COLUMNS = (
     ("STATE", 22),
     ("EVENT", 6),
     ("BRANCH", 18),
+    ("REVIEW", 8),
     ("ISSUES", 10),
     ("MAIL", 9),
     ("LEASES", 9),
@@ -62,6 +63,7 @@ DROP_ORDER = (
     "LEASES",
     "FIT",
     "IDLE",
+    "REVIEW",
     "ISSUES",
     "DENIALS",
 )
@@ -71,6 +73,7 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "STATE": lambda row: row["state"],
     "EVENT": lambda row: -row["last_event_ts"],
     "BRANCH": lambda row: row["branch"],
+    "REVIEW": lambda row: row["review"],
     "ISSUES": lambda row: -len(row["owned"]),
     "MAIL": lambda row: -_number(row["unread"]),
     "LEASES": lambda row: -row["leases"],
@@ -130,6 +133,11 @@ LEGEND = (
     "unfit lane names the check that failed, and no offer names that "
     "lane. A blank cell means nothing was published for it yet. An offer "
     "claims nothing and transfers nothing.",
+    "REVIEW is the latest verdict a peer recorded against that lane's "
+    "report; the reviewer and the report it judges are in the lane detail. "
+    "A verdict is the reviewing lane's own claim about work it did not do: "
+    "it is neither an operator approval nor independent verification, and it "
+    "gates no integration.",
     "CONTEXT counts only the bytes coordination injected into a lane's "
     "context. A message, report or offer above its cap is kept whole as "
     "an attachment and its record carries a reference; the attachment's "
@@ -300,6 +308,7 @@ def _row(
     budget = budgets.report(
         home, directory, data, agent, context["usage"], context["records"]
     )
+    review = metrics.latest_review(directory, agent) or {}
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -332,6 +341,9 @@ def _row(
         "last_event_ts": events["last_ts"],
         "branch": branch,
         "drift": branch != participant["branch"],
+        "review": str(review.get("verdict", "")),
+        "reviewer": str(review.get("reviewer", "")),
+        "reviewed_report": str(review.get("report_id", "")),
         "owned": owned,
         "issues_held": len(owned),
         "overdue": overdue,
@@ -562,6 +574,7 @@ def _cells(row: dict) -> tuple[str, ...]:
         row["state"],
         row["event_age"],
         row["branch"] + ("!" if row["drift"] else ""),
+        row["review"] or "-",
         row["issues"] + (f"+{row['offers']}" if row["offers"] else ""),
         f"{row['unread']}/{row['pending_ack']}",
         f"{row['leases']}"

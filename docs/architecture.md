@@ -30,7 +30,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text |
-| `metrics` | Idle intervals and waiting times derived from retained records |
+| `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |

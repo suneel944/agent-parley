@@ -32,6 +32,8 @@ on standard output and export to a file.
 | `top` | The dashboard of every lane; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
 | `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
+| `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
+| `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
 | `say NAME TEXT --after 30m` | Record the message for later; `--at 18:00`, `--when-released N` and `--unless-reported` set the trigger, and `--every 1h --until 18:00` records a bounded repeat. |
 | `issue list` | Show claims, dependencies and handoff offers; each offer carries the offering lane's head commit, the reservations that move with it and its remaining work. |
@@ -158,6 +160,7 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `search_decisions` | Search decisions any lane recorded for this project, whoever sent or received them; an empty query lists the newest and `since` bounds their age. |
 | `read_attachment` | Page an attachment a message, report or offer named; only its writer and its addressees may read it. |
 | `next_issues` | Rank the unclaimed, unblocked issues this lane could take next, with the reason for each; `limit` bounds the list. It claims nothing, so the chosen issue is still taken by an explicit claim. |
+| `review_report` | Record this lane's `verdict` of `pass` or `fail` on the peer report named by `report_id`, with the `evidence` it checked. The report's own author is refused. A verdict is that lane's own claim about work it did not do: it is not independent verification, it approves nothing and it gates no integration. |
 
 `send_message` also takes a `decision` flag. A message marked that way is
 additionally recorded in the project's decision log, which every registered
@@ -182,7 +185,8 @@ stopping service ends a wait at once.
 
 ## What does not fit in a message
 
-A message body above 4,096 UTF-8 bytes, a report `--evidence` above 4,096 or a
+A message body above 4,096 UTF-8 bytes, a report or review `--evidence` above
+4,096 or a
 handoff summary above 2,048 is neither refused nor truncated: the whole body is
 kept as an attachment under the private state directory and the record carries
 the first bounded slice ending with `[attachment message-12: 20480 bytes]`. The
