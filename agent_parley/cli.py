@@ -5136,21 +5136,26 @@ attempt of the recorded budget, which is also only reported.
         limit: int = store.MAX_SEARCH_HITS,
         identifier: int = 0,
         full: bool = False,
+        participant: str = "",
     ) -> dict:
         """Reads a mail thread, searches mail, or handles pending items.
 
         The worktree selects the reader for a thread or a search, exactly as it
         does for reports and issue transitions, so an operator reads a
-        participant's own mail rather than the whole project's. Pending
-        operator items belong to the project rather than to one lane, so
-        listing and cancelling them need no lane.
+        participant's own mail rather than the whole project's. Naming a
+        participant selects that reader instead, so an operator opens a message
+        the problems report cites from the main checkout without changing
+        directory into a lane. It stays a read: naming a participant sends
+        nothing, acknowledges nothing and marks nothing read on their behalf.
+        Pending operator items belong to the project rather than to one lane,
+        so listing and cancelling them need no lane.
 
         Listing pending items delivers nothing: an item leaves the list only
         when the supervision poll delivers it or the operator cancels it.
 
         Args:
-            repo: Assigned agent worktree, or any checkout of the repository
-                for pending items.
+            repo: Assigned agent worktree, any checkout of the repository for
+                pending items, and any checkout when a participant is named.
             action: Thread, search, list, show, pending or cancel.
             thread: Thread identifier for a thread read.
             query: Text to search subjects and bodies for.
@@ -5158,13 +5163,16 @@ attempt of the recorded budget, which is also only reported.
             limit: Maximum search hits reported.
             identifier: Pending item to cancel, or message to show.
             full: Whether a shown message's attachment is read whole.
+            participant: Lane whose mail is read, for an operator reading from
+                the main checkout. Without one the worktree selects the reader.
 
         Returns:
             One thread page, the matching messages, the most recent messages,
             one message, the pending items, or the outcome of a cancellation.
 
         Raises:
-            BridgeError: If the lane or its registered identity is unknown.
+            BridgeError: If the lane, the named participant or its registered
+                identity is unknown.
         """
         _, directory = self.project(repo)
         data = roster.read(directory)
@@ -5172,8 +5180,16 @@ attempt of the recorded budget, which is also only reported.
             return {"pending": store.schedules(self.home, data["root"])}
         if action == "cancel":
             return store.cancel_schedule(self.home, data["root"], identifier)
-        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = roster.resolve(data, lane)
+        if participant:
+            if participant not in data["participants"]:
+                raise BridgeError(
+                    f"{participant} is not a participant in this project; "
+                    "run agent-parley participant list."
+                )
+            agent = participant
+        else:
+            lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+            agent = roster.resolve(data, lane)
         name = data["participants"][agent]["display"]
         if action == "thread":
             return store.read_thread(
@@ -6300,6 +6316,25 @@ def command_help(index: CommandIndex) -> str:
     return "\n".join(lines)
 
 
+def add_reader_argument(command: argparse.ArgumentParser) -> None:
+    """Declares the reader selector the read-only mail verbs share.
+
+    Args:
+        command: Parser receiving the argument.
+    """
+    command.add_argument(
+        "--as",
+        dest="reader",
+        default="",
+        metavar="PARTICIPANT",
+        help=(
+            "Read this lane's mail from the main checkout instead of its "
+            "worktree. It reads only: nothing is sent, acknowledged or "
+            "marked read for that lane."
+        ),
+    )
+
+
 def add_say_arguments(command: argparse.ArgumentParser) -> None:
     """Declares the operator message arguments `say` and `mail send` share.
 
@@ -7213,6 +7248,7 @@ def main() -> int:
     reading.add_argument("thread_id")
     reading.add_argument("--repo", type=Path, default=Path.cwd())
     reading.add_argument("--after-id", type=int, default=0)
+    add_reader_argument(reading)
     reading.add_argument("--json", action="store_true", help=JSON_HELP)
     showing_mail = letters.add_parser(
         "show", help="Print one message you sent or received."
@@ -7224,11 +7260,13 @@ def main() -> int:
         action="store_true",
         help="Print the whole attachment after the stored body.",
     )
+    add_reader_argument(showing_mail)
     showing_mail.add_argument("--json", action="store_true", help=JSON_HELP)
     finding = letters.add_parser("search")
     finding.add_argument("query")
     finding.add_argument("--repo", type=Path, default=Path.cwd())
     finding.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
+    add_reader_argument(finding)
     finding.add_argument("--json", action="store_true", help=JSON_HELP)
     inbox = letters.add_parser(
         "list",
@@ -7239,6 +7277,7 @@ def main() -> int:
     )
     inbox.add_argument("--repo", type=Path, default=Path.cwd())
     inbox.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
+    add_reader_argument(inbox)
     inbox.add_argument("--json", action="store_true", help=JSON_HELP)
     sending = letters.add_parser(
         "send",
@@ -7984,6 +8023,7 @@ def main() -> int:
                 identifier=getattr(args, "item_id", 0)
                 or getattr(args, "message_id", 0),
                 full=getattr(args, "full", False),
+                participant=getattr(args, "reader", ""),
             )
             if args.action == "cancel":
                 state = "cancelled" if page["cancelled"] else "not pending"
