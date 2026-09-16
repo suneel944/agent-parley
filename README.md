@@ -195,6 +195,46 @@ The coordination engine is built in-house with Python's standard library. It has
 no runtime dependencies and makes no model calls. Your existing logins and
 permission settings still apply.
 
+## Notifications when you step away
+
+A lane can wait a long time on a handoff acceptance, a permission prompt or a
+fresh claim. Agent Parley can forward that moment to a Telegram bot or an email
+address, outbound only: nothing comes back, no command arrives over the channel,
+and a native permission prompt is still answered only in your terminal.
+
+Five changes notify, and nothing else: a handoff offered to a lane, a lane
+blocked on a native permission prompt, a lane idle with no claim past the
+project's `stalled_after` grace period, a lane run that finished, and a hook
+refusal such as a branch switch or detected drift. A situation that has not
+changed sends nothing further. Sending never blocks a hook or a tool call, a
+failed send is recorded in the lane's event log and dropped, and nothing is
+queued for a retry.
+
+Configuration is entirely environment variables, read by the service and the
+launcher; no token is ever written into coordination state.
+
+| Variable | Meaning |
+| --- | --- |
+| `AGENT_PARLEY_NOTIFY` | Comma-separated transports: `telegram`, `email`, or both. Unset means notifications are off. |
+| `AGENT_PARLEY_TELEGRAM_TOKEN` | Bot token from BotFather. |
+| `AGENT_PARLEY_TELEGRAM_CHAT` | Chat identifier the bot posts to. |
+| `AGENT_PARLEY_SMTP_HOST` | SMTP server host. |
+| `AGENT_PARLEY_SMTP_PORT` | SMTP port; defaults to 587, or 465 with implicit TLS. |
+| `AGENT_PARLEY_SMTP_TLS` | `starttls` (default), `implicit` or `none`. |
+| `AGENT_PARLEY_SMTP_USER` | SMTP user; omit for a server that needs no login. |
+| `AGENT_PARLEY_SMTP_PASSWORD` | SMTP password. |
+| `AGENT_PARLEY_SMTP_FROM` | Sender address. |
+| `AGENT_PARLEY_SMTP_TO` | Comma-separated recipients. |
+
+```bash
+export AGENT_PARLEY_NOTIFY=telegram,email
+agent-parley notify test
+```
+
+`notify test` sends one message on each configured transport and prints what
+each one answered, so credentials are verified before a lane depends on them.
+It exits 1 when any transport refuses.
+
 ## What it does not do
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent

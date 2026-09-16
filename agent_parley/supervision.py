@@ -13,6 +13,7 @@ from pathlib import Path
 from agent_parley import (
     forge,
     issues,
+    notify,
     process,
     records,
     roster,
@@ -560,12 +561,16 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         name: fit(home, directory, manifest, name, after)
         for name in manifest["participants"]
     }
+    stretches = {
+        name: idle_seconds(directory, name)
+        for name in sorted(manifest["participants"])
+    }
     idle = [
         name
         for name in sorted(manifest["participants"])
         if results[name]["fit"]
         and not owned.get(name)
-        and idle_seconds(directory, name) >= after
+        and stretches[name] >= after
     ]
     for name in manifest["participants"]:
         result = results[name]
@@ -583,6 +588,63 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         path = directory / f"{name}-work.json"
         if published != published_work(directory, name):
             write_json(path, published)
+    announce_idle(directory, manifest, idle, stretches, after)
+
+
+def announce_idle(
+    directory: Path,
+    manifest: dict,
+    idle: list[str],
+    stretches: dict[str, int],
+    after: float,
+) -> list[str]:
+    """Notifies the owner about each lane idle past the grace period.
+
+    The idle stretch has no native event of its own, so the sweep that
+    already measured it is what reports it. The notifier keys the report on
+    the lane's last recorded activity, so a lane idle across many sweeps is
+    reported once and reported again only after it next checks in. A
+    misconfigured transport is recorded as a supervision error rather than
+    ending the sweep.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        idle: Lanes measured as fit, unclaimed and idle past the interval.
+        stretches: Measured idle seconds per lane.
+        after: Grace period the lanes were measured against.
+
+    Returns:
+        The lanes a notification was started for.
+    """
+    if not idle or not notify.enabled():
+        return []
+    started = []
+    try:
+        for name in idle:
+            sent = notify.deliver(
+                directory,
+                name,
+                notify.Event.LANE_IDLE,
+                {
+                    "repo": manifest["root"],
+                    "provider": str(
+                        manifest["participants"][name].get("provider", "")
+                    ),
+                    "since": str(
+                        presence(directory, name, after)["last_active"]
+                    ),
+                    "detail": (
+                        f"idle {stretches[name]}s with no claim, past the "
+                        f"{int(after)}s grace period"
+                    ),
+                },
+            )
+            if sent:
+                started.append(name)
+    except (BridgeError, OSError) as exc:
+        issues.note_supervision_error(directory, f"Notification: {exc}")
+    return started
 
 
 def configuration(home: Path, manifest: dict) -> dict:
