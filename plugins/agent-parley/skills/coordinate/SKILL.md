@@ -221,7 +221,11 @@ and merges only after it passes; verify the merged result separately.
 lane's report and claimed issues. It uses native `gh` authentication, mirrors
 issue metadata under the configured project policy, and includes independently
 recorded gate and enforcement evidence. Neither a claim nor a ready report grants
-integration authority. A handoff reminder asks for an explicit completion message;
+integration authority. A repository may set `pull_request.self_service` to let a
+lane run `participant pr` for its own work from its own worktree; it is off by
+default, it still requires a ready report, a configured gate that passes, the
+assigned branch and no peer reservation over the changed paths, and it never
+covers `participant merge`. A handoff reminder asks for an explicit completion message;
 it never transfers ownership or acknowledges mail.
 
 Use the caller's existing shell tooling conventions, including RTK where required.

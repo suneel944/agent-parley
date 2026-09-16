@@ -133,6 +133,13 @@ agent-parley participant merge claude-2
 agent-parley participant pr claude-2
 ```
 
+A repository can also authorize the second of those for the lane itself, with
+`pull_request.self_service` in its private project settings. It is off by
+default; with it on, a lane opens the pull request for its own work only after
+a ready report, a configured gate that passes, its own assigned branch and no
+peer reservation over the paths it changed, and every such pull request records
+what authorized it. Merging stays an operator step either way.
+
 [Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md)
 covers the rest of the operator surface:
 deferred and bulk steering, pausing, stopping and restarting a lane, the

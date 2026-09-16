@@ -84,6 +84,7 @@ from agent_parley.state import BridgeError, lock, write_json, write_text
 
 VERIFY_TIMEOUT = 1800
 INIT_OUTPUT_LINES = 20
+MAX_OVERLAPS = 5
 CHANGE_TYPE = frozenset(
     {
         "bug",
@@ -2153,6 +2154,29 @@ def pull_request_body(
     return rendered.rstrip() + "\n\n" + report
 
 
+def reserved_overlaps(
+    changed: list[str], held: dict[str, list[str]]
+) -> list[str]:
+    """Names the peer reservations a lane's own changed paths run into.
+
+    Args:
+        changed: Repository-relative paths the lane's branch changed.
+        held: Active reservation keys per peer identity, with the lane's own
+            identity already removed.
+
+    Returns:
+        One sentence per overlap, ordered by path and then by peer, naming
+        the peer, the key it holds and the changed path that key covers.
+    """
+    return [
+        f"{peer} reserves {pattern!r}, which covers {path!r}"
+        for path in sorted(changed)
+        for peer, patterns in sorted(held.items())
+        for pattern in sorted(patterns)
+        if store.overlapping(path, pattern)
+    ]
+
+
 def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
     """Merges lane configuration without replacing native user settings.
 
@@ -2833,6 +2857,7 @@ class Bridge:
                 del data["participants"][name]
                 write_json(directory / "project.json", data)
             (directory / f"{name}-checkpoint.lock").unlink(missing_ok=True)
+            (directory / f"{name}-integration.lock").unlink(missing_ok=True)
             (directory / f"{name}.session.lock").unlink(missing_ok=True)
             return f"Retired {name}. {note} Messages are preserved."
 
@@ -3794,6 +3819,15 @@ class Bridge:
     def pull_request(self, repo: Path, name: str) -> str:
         """Opens a verified pull request while excluding a live lane launch.
 
+        A repository whose ``pull_request`` policy turns ``self_service`` on
+        also lets a lane run this command for its own work from its own
+        worktree. That path excludes a second self-service attempt instead
+        of a live lane session, because there the lane running the command
+        is that session. It is refused with the unmet condition named unless
+        every condition of the policy holds. Every other caller keeps the
+        operator path, which still excludes a live lane launch, so a project
+        that leaves the setting off behaves exactly as before.
+
         Args:
             repo: Any checkout of the target repository.
             name: Participant whose committed work is reviewed.
@@ -3804,9 +3838,120 @@ class Bridge:
         Raises:
             BridgeError: If the lane is active or integration is refused.
         """
-        directory, _, _ = self._lane(repo, name)
+        directory, data, participant = self._lane(repo, name)
+        if self._self_opened(repo, data, participant):
+            with lock(
+                directory / f"{name}-integration.lock",
+                f"{name} is already opening its own pull request.",
+            ):
+                return self._pull_request(
+                    repo, name, self._authorize(directory, data, name)
+                )
         with lock(directory / f"{name}.session.lock"):
             return self._pull_request(repo, name)
+
+    def _self_opened(self, repo: Path, data: dict, participant: dict) -> bool:
+        """Reports whether a lane is opening the pull request for its own work.
+
+        Args:
+            repo: Checkout the command was run from.
+            data: Project manifest holding the repository policy.
+            participant: Manifest entry for the named participant.
+
+        Returns:
+            Whether the repository authorizes self-service pull requests and
+            this command runs inside the named participant's own worktree.
+        """
+        if not data.get("pull_request", {}).get("self_service"):
+            return False
+        try:
+            here = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        except (BridgeError, subprocess.TimeoutExpired):
+            return False
+        return here == Path(participant["lane"]).resolve()
+
+    def _authorize(self, directory: Path, data: dict, name: str) -> dict:
+        """Checks what a repository requires before a lane opens its own work.
+
+        The conditions are the repository's own: the lane reported ready, a
+        verification command is configured for the gate that runs during the
+        push, the lane still sits on its assigned branch, and no peer holds
+        an advisory reservation over the paths the branch changed. Advisory
+        reservations are coordination signals, not filesystem locks, so an
+        overlap is a refusal to proceed unattended rather than a denial of
+        access. Reservation state that cannot be read is a refusal too,
+        because an unreadable store rules no overlap out.
+
+        Args:
+            directory: Private state directory for the common repository.
+            data: Project manifest holding this participant.
+            name: Participant opening the pull request for its own work.
+
+        Returns:
+            The conditions that authorized the pull request, recorded with
+            the review evidence so a reader sees what the policy stood on.
+
+        Raises:
+            BridgeError: Naming the first condition that does not hold.
+        """
+        import sqlite3
+
+        participant = data["participants"][name]
+        branch = participant["branch"]
+        refused = (
+            f"{name} opens its own pull request only while every condition "
+            "of this repository's self-service policy holds."
+        )
+        path = directory / f"{name}-activity.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if state.get("outcome") != "ready":
+            reported = state.get("outcome") or "nothing"
+            raise BridgeError(
+                f"{refused} {name} reported {reported}, not ready. Record a "
+                "ready report first."
+            )
+        if not (command := list(data.get("verify") or [])):
+            raise BridgeError(
+                f"{refused} This repository configures no verification "
+                "command, so no green gate can authorize the pull request. "
+                "Set one with `agent-parley verify set`."
+            )
+        actual = current_branch(Path(participant["lane"]))
+        if actual != branch:
+            raise BridgeError(f"{refused} {drift(name, participant, actual)}")
+        changed = [
+            line
+            for line in git(
+                Path(data["root"]),
+                "diff",
+                "--name-only",
+                f"{data['base']}...{branch}",
+            ).splitlines()
+            if line
+        ]
+        try:
+            held = store.active_reservations(self.home, data["root"])
+        except (BridgeError, OSError, sqlite3.Error) as exc:
+            raise BridgeError(
+                f"{refused} The advisory reservations could not be read, so "
+                f"no overlap with a peer can be ruled out: {exc}"
+            ) from exc
+        held.pop(participant["display"], None)
+        if overlaps := reserved_overlaps(changed, held):
+            raise BridgeError(
+                f"{refused} A peer reservation covers what {branch} changed: "
+                + "; ".join(overlaps[:MAX_OVERLAPS])
+                + ". Hand the work over or wait for the release."
+            )
+        return {
+            "policy": "pull_request.self_service",
+            "participant": name,
+            "branch": branch,
+            "reported_at": state.get("reported_at"),
+            "gate": shlex.join(command),
+            "changed_paths": len(changed),
+            "peers_holding_reservations": sorted(held),
+        }
 
     def _decide(
         self, repo: Path, name: str, decision: str, reason: str = ""
@@ -3931,7 +4076,9 @@ class Bridge:
         """
         return self._decide(repo, name, approvals.REJECTED, reason)
 
-    def _pull_request(self, repo: Path, name: str) -> str:
+    def _pull_request(
+        self, repo: Path, name: str, authorization: dict | None = None
+    ) -> str:
         """Pushes one lane's branch and opens its pull request.
 
         The pull request carries the lane's recorded report, so the summary,
@@ -3960,6 +4107,11 @@ class Bridge:
         Args:
             repo: Any checkout of the target repository.
             name: Participant whose bridge branch becomes a pull request.
+            authorization: Conditions a repository policy admitted a
+                lane-opened pull request under, or None for the operator
+                path. When present it is kept with the review evidence and
+                with the integration record, so a self-opened pull request
+                always carries what authorized it.
 
         Returns:
             An account naming the pushed branch and the pull request.
@@ -4049,6 +4201,8 @@ class Bridge:
         if current_branch(lane) != branch:
             raise BridgeError("Lane branch drifted; restore it before review.")
         measured = evidence.collect(self.home, directory, data, name, head)
+        if authorization:
+            measured["authorization"] = authorization
         if command := data.get("verify"):
             verify_base(lane, command)
             measured["gate"] = {
@@ -4141,9 +4295,16 @@ class Bridge:
                 "kind": "integration",
                 "action": "pull_request",
                 "pull_request": opened,
+                **({"authorization": authorization} if authorization else {}),
                 **held_claim(directory, name),
             },
         )
+        if authorization:
+            return (
+                f"Pushed {branch} and opened {opened} under this "
+                "repository's self-service policy; the conditions that "
+                "authorized it are recorded with the review evidence."
+            )
         return f"Pushed {branch} and opened {opened}"
 
     async def identity(self, agent: str, data: dict) -> dict:
