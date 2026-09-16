@@ -131,6 +131,16 @@ the path, repeated only when the set of paths changes. Nothing pauses, reverts
 or locks; reservations stay advisory. `--no-operator-edits` skips the reading
 for a repository whose base checkout is always dirty.
 
+The base branch moving under a lane is invisible in the same way. Every `top`
+and `status` frame reads the head of the base checkout once per project and
+compares it with the point each lane branched from. When it moved, the paths
+changed on the base since that fork point are matched against the lane's active
+reservations and against the paths the lane itself holds, committed on its
+branch or still uncommitted in its worktree. The overlap is printed under the
+lane's row, and the lane receives one advisory notice naming those paths,
+repeated only when the set changes. Nothing rebases or pauses; the lane decides
+whether to rebase, merge or coordinate.
+
 ## Mail is scoped, deduplicated and threaded
 
 Sends need an idempotency key, so a retry returns the original message instead

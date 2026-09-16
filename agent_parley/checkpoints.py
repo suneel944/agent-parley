@@ -1348,6 +1348,14 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                 edit_notice = bool(edited) and edited != state.get(
                     "operator_edits"
                 )
+                advanced = supervision.base_advances(home, manifest).get(
+                    agent, []
+                )
+                if not advanced:
+                    state.pop("base_advance", None)
+                advance_notice = bool(advanced) and advanced != state.get(
+                    "base_advance"
+                )
                 standing = budgets.standing(home, directory, manifest, agent)
                 notified = [
                     field
@@ -1362,6 +1370,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                     or roster_notice
                     or work_notice
                     or edit_notice
+                    or advance_notice
                     or budget_notice
                 ) and not (event == "Stop" and payload.get("stop_hook_active")):
                     parts = [
@@ -1410,6 +1419,17 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             + "\nThe base checkout holds uncommitted changes "
                             "there. Nothing was reverted; reservations are "
                             "advisory. Coordinate before continuing."
+                        )
+                    if advance_notice:
+                        parts.append(
+                            clip(
+                                "The base branch advanced over paths you "
+                                "hold: " + ", ".join(advanced),
+                                300,
+                            )
+                            + "\nIt moved after this lane forked. Nothing was "
+                            "rebased or paused; decide whether to rebase, "
+                            "merge, or coordinate before continuing."
                         )
                     if budget_notice:
                         parts.append(clip(budgets.notice(standing), 300))
@@ -1479,6 +1499,8 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             state["work_offer"] = offer["id"]
                         if edit_notice:
                             state["operator_edits"] = edited
+                        if advance_notice:
+                            state["base_advance"] = advanced
                         state["budget_notified"] = standing["crossed"]
                         state["injected_bytes"] = state.get(
                             "injected_bytes", 0
