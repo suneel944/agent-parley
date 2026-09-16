@@ -231,6 +231,49 @@ def dirty_paths(root: str) -> list[str] | None:
     return paths
 
 
+def _read(root: str, *arguments: str) -> str | None:
+    """Runs one read-only Git command against a checkout.
+
+    Args:
+        root: Checkout the command runs in.
+        *arguments: Git arguments following the checkout selection.
+
+    Returns:
+        Standard output without surrounding whitespace, or None when Git
+        refused the command, could not be run, or exceeded its timeout. An
+        answer Git cannot give is no opinion rather than an empty one.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, *arguments],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    return result.stdout.strip()
+
+
+def _changed(root: str, start: str, end: str) -> list[str]:
+    """Lists the repository-relative paths that differ between two commits.
+
+    Args:
+        root: Checkout that holds both commits.
+        start: Commit the comparison starts from.
+        end: Commit the comparison ends at.
+
+    Returns:
+        The changed paths, empty when nothing differs and when Git could not
+        answer.
+    """
+    listing = _read(root, "diff", "--name-only", start, end)
+    return [path for path in (listing or "").splitlines() if path]
+
+
 def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
     """Names the reserved paths an operator has changed in the base checkout.
 
@@ -283,6 +326,84 @@ def operator_edit_marker(paths: list[str]) -> str:
     return (
         f"operator edited reserved path{plural} {', '.join(paths)} in the "
         "base checkout; nothing was reverted"
+    )
+
+
+def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
+    """Names the paths a lane holds that the base branch changed under it.
+
+    A merge from another lane, or a push, moves the base branch under every
+    lane that already forked from it, and none of them learns anything until
+    its own merge conflicts. The head of the base checkout, which is the
+    branch every lane merges back into, is read once per project and
+    compared with the point each lane branched from; a lane whose fork point
+    is still that head is current, and the store is not read at all when no
+    lane is behind.
+
+    Where the base did advance, the paths it changed since the fork point are
+    matched against the lane's active reservations, using the same overlap
+    rule a competing reservation is judged by, and against the paths the lane
+    itself changed, both those committed on its branch and those still
+    uncommitted in its worktree.
+
+    The reading is advisory. Nothing rebases, pauses or reverts, and the lane
+    decides what a moved base means for its work.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+
+    Returns:
+        Mapping of participant name to the sorted paths the base changed that
+        the lane also holds. Empty when the base has not advanced, when the
+        advance touches nothing a lane holds, or when Git could not be read.
+    """
+    root = manifest["root"]
+    head = _read(root, "rev-parse", "HEAD")
+    if not head:
+        return {}
+    forks = {}
+    for name, participant in manifest["participants"].items():
+        fork = _read(root, "merge-base", head, participant["branch"])
+        if fork and fork != head:
+            forks[name] = fork
+    if not forks:
+        return {}
+    try:
+        held = store.active_reservations(home, root)
+    except (BridgeError, OSError, sqlite3.Error):
+        held = {}
+    advances: dict[str, list[str]] = {}
+    for name, fork in forks.items():
+        participant = manifest["participants"][name]
+        branch = participant["branch"]
+        changed = _changed(root, fork, head)
+        if not changed:
+            continue
+        patterns = held.get(participant["display"], [])
+        mine = set(_changed(root, fork, branch))
+        mine.update(dirty_paths(participant["lane"]) or [])
+        matched = sorted(
+            {
+                path
+                for path in changed
+                if path in mine
+                or any(store.overlapping(path, pattern) for pattern in patterns)
+            }
+        )
+        if matched:
+            advances[name] = matched
+    return advances
+
+
+def base_advance_marker(paths: list[str]) -> str:
+    """Describes a base branch advance in one line, naming the paths."""
+    if not paths:
+        return ""
+    plural = "" if len(paths) == 1 else "s"
+    return (
+        f"base advanced over held path{plural} {', '.join(paths)} since this "
+        "lane forked; nothing was rebased"
     )
 
 

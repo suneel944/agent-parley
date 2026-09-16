@@ -564,6 +564,7 @@ def _row(row: dict) -> dict:
         "stalled": row["stalled"],
         "stall": row["stall"],
         "operator_edits": list(row["operator_edits"]),
+        "base_advance_paths": list(row["base_advance_paths"]),
         "last_event_at": timestamp(row["last_event_ts"] or None),
         "branch": row["branch"],
         "drift": row["drift"],

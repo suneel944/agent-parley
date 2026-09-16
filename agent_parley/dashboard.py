@@ -281,6 +281,7 @@ def _row(
     idle = metrics.idle_intervals(directory, agent, context["since"])
     published = supervision.published_work(directory, agent)
     edited = context["operator_edits"].get(agent, [])
+    advanced = context["base_advances"].get(agent, [])
     budget = budgets.report(
         home, directory, data, agent, context["usage"], context["records"]
     )
@@ -306,6 +307,8 @@ def _row(
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
         "operator_edits": edited,
         "operator_edit": supervision.operator_edit_marker(edited),
+        "base_advance_paths": advanced,
+        "base_advance": supervision.base_advance_marker(advanced),
         "event_age": (
             tables.age(time.time() - events["last_ts"])
             if events["last_ts"]
@@ -462,6 +465,7 @@ def collect(
             "operator_edits": (
                 supervision.operator_edits(home, data) if operator_edits else {}
             ),
+            "base_advances": supervision.base_advances(home, data),
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -758,6 +762,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
                 lines.append(f"    {row['stall']}")
             if row["operator_edit"]:
                 lines.append(f"    {row['operator_edit']}")
+            if row.get("base_advance"):
+                lines.append(f"    {row['base_advance']}")
             if row.get("budget_marker"):
                 lines.append(f"    {row['budget_marker']}")
             if row["unfit"]:

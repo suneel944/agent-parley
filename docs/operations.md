@@ -838,6 +838,24 @@ than fourteen days are discarded at the next session start or session end, so a
 long-running lane reports recent enforcement, not project history; served-call
 counts cover the most recent 2000 events per project.
 
+A base branch that moves is the other writer no lane sees. Each `top` and
+`status` frame reads the head of the base checkout once per project and
+compares it with the point each lane branched from, through `git merge-base`.
+A lane still forked from that head is current and is read no further, so a
+project whose lanes are all up to date costs one Git read and no store read at
+all. Where the base did advance, the paths it changed since the fork point are
+matched against the lane's active reservations, using the same overlap rule a
+competing reservation is judged by, and against the paths the lane itself
+holds: those committed on its branch and those still uncommitted in its
+worktree. A match is printed as an indented line under the lane's row in `top`,
+under the reservation count in `status`, and carried in the
+`base_advance_paths` field of `top --json` and `status --json`. The lane's
+lifecycle hook delivers one bounded advisory notice naming those paths and
+stating that nothing was rebased; the notice repeats only when the set of paths
+changes, which the hook records in the lane's activity state. Nothing rebases,
+pauses or reverts, and a Git failure or timeout reports nothing rather than an
+error.
+
 Every recorded decision carries the failure that produced it, when one did, so
 a run of denials stays answerable after the lane recovers. The live copy of
 that failure is cleared by the first call that succeeds, which is exactly what

@@ -668,6 +668,8 @@ def lane_detail(record: dict, data: dict) -> None:
     )
     if edited := record["operator_edits"]:
         print("    " + supervision.operator_edit_marker(edited))
+    if advanced := record["base_advance_paths"]:
+        print("    " + supervision.base_advance_marker(advanced))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
     print(f"    Last coordination: {mail['last_coordination_at']}")
@@ -5613,6 +5615,7 @@ attempt of the recorded budget, which is also only reported.
         data: dict,
         agent: str,
         edited: Sequence[str] = (),
+        advanced: Sequence[str] = (),
         *,
         context: dict | None = None,
     ) -> dict:
@@ -5624,6 +5627,8 @@ attempt of the recorded budget, which is also only reported.
             agent: Participant that owns the lane.
             edited: Reserved paths an operator changed in the base checkout,
                 read once per project by the caller.
+            advanced: Paths this lane holds that the base branch changed
+                since the lane forked, read once per project by the caller.
             context: Project-wide readings the caller already took for this
                 frame, holding the issue ledger, the supervision
                 configuration, project usage, pending scheduled items and the
@@ -5717,6 +5722,7 @@ attempt of the recorded budget, which is also only reported.
                 "marker": supervision.stall_marker(stalled),
             },
             "operator_edits": list(edited),
+            "base_advance_paths": list(advanced),
             "idle_seconds": idle["seconds"],
             "idle_complete": idle["complete"],
             "budget": {
@@ -5812,6 +5818,7 @@ attempt of the recorded budget, which is also only reported.
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
             edits = supervision.operator_edits(self.home, data)
+            advances = supervision.base_advances(self.home, data)
             with self._project_reading() as db:
                 context = self._project_context(path.parent, data, db)
                 projects.append(
@@ -5829,6 +5836,7 @@ attempt of the recorded budget, which is also only reported.
                                 data,
                                 agent,
                                 edits.get(agent, []),
+                                advances.get(agent, []),
                                 context=context,
                             )
                             for agent in sorted(data["participants"])

@@ -26,6 +26,8 @@ def lane(name: str, **changes: object) -> dict:
         "stall_age": 0,
         "operator_edits": [],
         "operator_edit": "",
+        "base_advance_paths": [],
+        "base_advance": "",
         "event_age": "1s",
         "last_event_ts": 1.0,
         "branch": f"parley/{name}",
