@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -103,6 +104,7 @@ class Reason(StrEnum):
     PAUSED = "paused"
     POLLED_DELIVERY = "polled_delivery"
     SERVICE_FALLBACK = "service_fallback"
+    NOTIFICATION_FAILED = "notification_failed"
 
 
 def decision_of(output: dict | None) -> str:
@@ -226,6 +228,58 @@ def record(
         with event_lock(directory, agent):
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(entry) + "\n")
+
+
+def announce(
+    directory: Path,
+    agent: str,
+    manifest: dict,
+    participant: dict,
+    payload: dict,
+    reason: Reason,
+    context: dict | None = None,
+) -> str:
+    """Offers one recorded decision to the outbound notifier.
+
+    The decision is already recorded when this runs, so notification can
+    only report it and never change it. The environment is read before the
+    notifier is imported: a lane with no transport configured keeps the hook
+    import small, which is why the variable name is repeated here rather
+    than reached through the notifier. A notifier failure is discarded for
+    the same reason a log failure is.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        manifest: Current participant manifest.
+        participant: The lane's manifest entry.
+        payload: Native lifecycle event being recorded.
+        reason: Enumerated cause of the decision.
+        context: Extra situation fields, such as a waiting handoff offer.
+
+    Returns:
+        The notification's name once a send has started, or an empty string.
+    """
+    if not os.environ.get("AGENT_PARLEY_NOTIFY", "").strip():
+        return ""
+    from agent_parley import notify
+
+    try:
+        return notify.observe(
+            directory,
+            agent,
+            str(payload.get("hook_event_name", "")),
+            reason.value,
+            {
+                "repo": manifest["root"],
+                "provider": str(participant.get("provider", "")),
+                "session": str(payload.get("session_id", "")),
+                "tool": str(payload.get("tool_name", "")),
+                **(context or {}),
+            },
+        )
+    except (OSError, ValueError, BridgeError):
+        return ""
 
 
 @contextlib.contextmanager
@@ -1252,6 +1306,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         raise BridgeError(message) from None
     if guarded is not None:
         record(directory, agent, payload, guard_reason, guarded)
+        announce(directory, agent, manifest, participant, payload, guard_reason)
         return guarded
     if guard_reason is Reason.BRANCH_RESTORE:
         record(directory, agent, payload, guard_reason, None)
@@ -1315,6 +1370,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                 state["last_prompt"] = prompt[:240]
         output: dict = {}
         reason = Reason.OBSERVED
+        ledger: dict = {}
         if event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
             from agent_parley import budgets
 
@@ -1329,6 +1385,7 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                 state.pop("coordination_error", None)
                 messages = mail["messages"]
                 issues = snapshot(directory)
+                ledger = issues
                 issue_notice = issues["revision"] != state.get(
                     "issue_revision", 0
                 )
@@ -1535,6 +1592,15 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
             output,
             str(state.get("activity", "")),
             str(state.get("coordination_error", "")),
+        )
+        announce(
+            directory,
+            agent,
+            manifest,
+            participant,
+            payload,
+            reason,
+            {"ledger": ledger},
         )
         if event in ("SessionStart", "SessionEnd"):
             prune(directory, agent)

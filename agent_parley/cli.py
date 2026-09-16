@@ -41,6 +41,7 @@ from agent_parley import (
     gemini,
     history,
     metrics,
+    notify,
     opencode,
     plan,
     policy,
@@ -6360,6 +6361,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "events",
             "problems",
             "doctor",
+            "notify",
         ),
     ),
     (
@@ -6698,6 +6700,25 @@ def issue_lines(reading: dict) -> str:
     )
     reported = reading["history"]
     lines.append(history.describe(reported["records"], reported["holdings"]))
+    return "\n".join(lines)
+
+
+def notification_report(report: dict) -> str:
+    """Describes the outcome of one notification transport test.
+
+    Args:
+        report: Project root and per-transport results of the test send.
+
+    Returns:
+        One line per configured transport, carrying the refusal text when a
+        transport did not accept the message.
+    """
+    lines = [f"Notification test for {report['root']}:"]
+    lines += [
+        f"  {item['transport']}: "
+        + ("sent" if item["ok"] else f"failed: {item['error']}")
+        for item in report["results"]
+    ]
     return "\n".join(lines)
 
 
@@ -7393,6 +7414,20 @@ def main() -> int:
     acking.add_argument("message_id", type=int)
     acking.add_argument("--repo", type=Path, default=Path.cwd())
     acking.add_argument("--json", action="store_true", help=JSON_HELP)
+    notifying = commands.add_parser(
+        "notify",
+        help=(
+            "Verify the outbound notification transports configured in the "
+            "environment; exit 1 when one of them refuses the message."
+        ),
+    )
+    notices = notifying.add_subparsers(dest="action", required=True)
+    probing = notices.add_parser(
+        "test",
+        help="Send one test message on each configured transport.",
+    )
+    probing.add_argument("--repo", type=Path, default=Path.cwd())
+    probing.add_argument("--json", action="store_true", help=JSON_HELP)
     planning = commands.add_parser(
         "plan", help="Apply, compare or show the recorded work-order plan."
     )
@@ -8167,6 +8202,14 @@ def main() -> int:
                 else "\n".join(problems.lines(found))
             )
             return 1 if found else 0
+        elif args.command == "notify":
+            probed = notify.probe(args.repo.resolve().name)
+            print(
+                views.render("notify", probed)
+                if getattr(args, "json", False)
+                else notification_report(probed)
+            )
+            return 0 if all(item["ok"] for item in probed["results"]) else 1
         elif args.command == "plan":
             applied = bridge.work_plan(
                 args.repo.resolve(), args.action, getattr(args, "path", None)

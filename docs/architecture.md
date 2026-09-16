@@ -40,6 +40,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
+| `notify` | Outbound Telegram and SMTP notification of the coordination changes an absent owner needs, selected from decisions the event log already recorded |
 | `state` | Private atomic JSON and text publication and operation locks |
 
 Enforcement and telemetry share one substrate, on purpose, in two places. Hook
@@ -54,6 +55,22 @@ store loses the record rather than delaying the call. This telemetry write
 does acquire a write lock when available. Retention is bounded to the most
 recent 2000 events per project, and
 telemetry never decides an outcome.
+
+The notifier sits downstream of both, and decides nothing. A checkpoint records
+its decision in the participant event log first and only then offers it to
+`notify`, so a notification can report an outcome but can never change one, and
+a notifier failure is discarded exactly as a log failure is. The five changes
+that notify are a subset of what the log already holds; the idle stretch is the
+one exception, because it has no native event of its own and is measured by the
+supervision sweep that already computes it. Suppression follows the checkpoint's
+own rule: a digest per event, per lane, in `<participant>-notify.json`, so a
+situation that has not changed sends nothing further. Credentials are read from
+the environment at send time and never written into coordination state. The send
+runs on a daemon thread, so neither a blocking hook nor a supervision sweep waits
+on a network round trip; a hook process that exits first abandons the send, which
+is the cost of the best-effort contract and the reason there is no retry queue.
+Notification is outbound only: no transport carries a command back, and none of
+them can answer a native permission prompt.
 
 The service is a singleton **per private state directory**. An exclusive startup
 lock serializes launch and shutdown; the loopback port prevents a second listener.
