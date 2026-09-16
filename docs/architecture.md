@@ -41,6 +41,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `records` | Best-effort reading of native CLI session records on disk |
 | `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
 | `notify` | Outbound Telegram and SMTP notification of the coordination changes an absent owner needs, selected from decisions the event log already recorded |
+| `inbound` | Read-only status queries long-polled from the Telegram bot, admitted by chat identifier and passcode, parsed by the command line's own status filters |
 | `state` | Private atomic JSON and text publication and operation locks |
 
 Enforcement and telemetry share one substrate, on purpose, in two places. Hook
@@ -71,6 +72,22 @@ on a network round trip; a hook process that exits first abandons the send, whic
 is the cost of the best-effort contract and the reason there is no retry queue.
 Notification is outbound only: no transport carries a command back, and none of
 them can answer a native permission prompt.
+
+The one path that carries anything back is `inbound`, and it is limited to
+reads. It long-polls the Telegram Bot API from the service process, so it opens
+no port and registers no webhook, and it serves exactly one verb: `status`, with
+the filters `add_status_filters` declares for the command line and both readers
+share. No claim, handoff, wake, permission approval or free text reaches a
+session through it, and it writes nothing to coordination state. Admission is
+two independent checks, the configured chat identifier and a passcode read from
+the environment at service start; only a salted digest of that passcode is held
+in memory, it is compared with `hmac.compare_digest`, and it is never written to
+state, to the event log or to the service log. A message failing either check is
+dropped in silence. Five failures inside ten minutes lock the path for an hour
+and emit one outbound notification; the counter and the lock are process memory
+and are forgotten on restart. A passcode that is unset or shorter than twelve
+characters stops the poller from starting at all and is reported by `status` as
+a configuration fault rather than leaving a dead poller behind.
 
 The service is a singleton **per private state directory**. An exclusive startup
 lock serializes launch and shutdown; the loopback port prevents a second listener.
