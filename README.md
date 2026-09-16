@@ -34,6 +34,22 @@
 
 ## See it
 
+Under ninety seconds of one real run: two lanes on two providers, a claim, an
+advisory reservation, the collision a second lane meets on the same path and
+the request it queues instead, a handoff offered and accepted with its
+reservations, the dashboard, and a native hook refusing a branch switch.
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/demo.svg" width="900" alt="A terminal recording of two lanes claiming an issue, colliding on a reservation, queueing a request, handing the issue over and being refused a branch switch">
+</p>
+
+Every frame is captured command output, never typed prose. The coordination
+path is the shipped one; only the native client is a stand-in, so no model was
+called.
+[`scripts/record_demo.py`](https://github.com/suneel944/agent-parley/blob/main/scripts/record_demo.py)
+drives that run against a temporary project and writes the animation, and
+`make demo` reproduces it.
+
 One screen for every lane: session state, branch drift, issues owned, handoffs
 pending, unread mail, held reservations, delivered context, what enforcement
 denied, and what that lane's own client recorded for its session. Read-only, no

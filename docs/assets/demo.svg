@@ -1,0 +1,264 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1067" height="516" viewBox="0 0 1067 516" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13">
+<rect width="1067" height="516" rx="10" fill="#0d1117"/>
+<rect width="1067" height="30" rx="10" fill="#161b22"/>
+<rect y="20" width="1067" height="10" fill="#161b22"/>
+<circle cx="18" cy="15" r="5.5" fill="#ff5f57"/><circle cx="36" cy="15" r="5.5" fill="#febc2e"/><circle cx="54" cy="15" r="5.5" fill="#28c840"/>
+<g opacity="1">
+<animate attributeName="opacity" calcMode="discrete" values="1;0" keyTimes="0;0.058824" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley up</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley up</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Coordination server ready at http://127.0.0.1:48709/mcp/</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.058824;0.117647" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley setup /home/dev/payments-api</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley setup /home/dev/payments-api</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "version": 2,</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "root": "/home/dev/payments-api",</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  "base": "0ec210b1a62a3b8fa3777f91c0d30ed9703fea36",</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">  "verify": [],</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  "initialize": [],</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  "forge": "github",</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">  "participants": {},</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "lanes": {},</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">  "branches": {}</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.117647;0.176471" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley forge set null --repo /home/dev/payments-api</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley forge set null --repo /home/dev/payments-api</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">/home/dev/payments-api coordinates over the null forge (recorded), which opens no pull requests. Every forge e</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">xchange is best effort; the ledger decides ownership.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.176471;0.235294" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley participant add ada --provider claude</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley participant add ada --provider claude</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada: provider claude; identity ada; default account</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.235294;0.294118" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley participant add grace --provider codex</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley participant add grace --provider codex</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada: provider claude; identity ada; default account</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">grace: provider codex; identity grace; default account</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.294118;0.352941" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley run ada</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley run ada</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada (claude, default account): /home/dev/.local/state/agent-parley/projects/ccb9cfa06185c228/ada</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">Shared project: /home/dev/payments-api</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.352941;0.411765" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley run grace</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley run grace</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">grace (codex, default account): /home/dev/.local/state/agent-parley/projects/ccb9cfa06185c228/grace</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">Shared project: /home/dev/payments-api</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.411765;0.470588" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley status</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley status</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#79c0ff">Server: ready</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#79c0ff">State: /home/dev/.local/state/agent-parley</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#79c0ff">Project: /home/dev/payments-api</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">No issues claimed.</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#79c0ff">PARTICIPANT  PROVIDER  SESSION                BRANCH                          OUTCOME  ISSUES  MAIL  LEASES  REPORTED  TASK</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">ada          claude    working; event 0s ago  parley/ccb9cfa06185c228/lane-1  unknown  -       0/0   0       -         Check shared…</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">grace        codex     working; event 0s ago  parley/ccb9cfa06185c228/lane-2  unknown  -       0/0   0       -         Check shared…</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">Hidden columns: ACCOUNT</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.470588;0.529412" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue claim 41</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue claim 41</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "owner": "ada",</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "offer": null,</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  "request": null,</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">  "blocked_by": [],</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  "history": [</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    {</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">      "action": "claim",</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">      "actor": "ada",</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">      "at": 1789596827.8120382,</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada",</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">      "offer": null,</text>
+<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">      "request": null,</text>
+<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">      "offer_id": null,</text>
+<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">      "claim_id": "684933cf6fcd4375"</text>
+<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">    }</text>
+<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
+<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">  "deadline": null,</text>
+<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9">  "attempts": 0,</text>
+<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">  "budget": null,</text>
+<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9">  "claim_id": "684933cf6fcd4375"</text>
+<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.529412;0.588235" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">ada file_reservation_paths {"paths": ["src/payments/**"]}</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">ada </tspan><tspan fill="#e6edf3">file_reservation_paths {"paths": ["src/payments/**"]}</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "granted": [</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    {</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">      "id": 1,</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">      "path": "src/payments/**"</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">    }</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#ff7b72">  "conflicts": []</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.588235;0.647059" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">grace file_reservation_paths {"paths": ["src/payments/**"]}</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">grace </tspan><tspan fill="#e6edf3">file_reservation_paths {"paths": ["src/payments/**"]}</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "granted": [],</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#ff7b72">  "conflicts": [</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">    {</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">      "path": "src/payments/**",</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada"</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    }</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "has_more": false</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.647059;0.705882" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">grace request_reservation {"paths": ["src/payments/**"]}</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">grace </tspan><tspan fill="#e6edf3">request_reservation {"paths": ["src/payments/**"]}</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "granted": [],</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#ff7b72">  "conflicts": [</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">    {</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">      "path": "src/payments/**",</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada"</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    }</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "has_more": false,</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#ff7b72">  "queued": [</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">    {</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">      "id": 1,</text>
+<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">      "path": "src/payments/**",</text>
+<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada",</text>
+<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">      "position": 1</text>
+<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">    }</text>
+<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">  ]</text>
+<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.705882;0.764706" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue offer 41 --to grace --summary Refund path reserved; tests green.</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue offer 41 --to grace --summary Refund path reserved; tests green.</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "owner": "ada",</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "offer": {</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">    "id": "f57bfc5f0eff4911bbf171e9db531126",</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">    "to": "grace",</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">    "summary": "Refund path reserved; tests green.",</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    "created": 1789596827.9261005,</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">    "deadline": null,</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">    "commit": "0ec210b1a62a3b8fa3777f91c0d30ed9703fea36",</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    "reservations": [</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">      "src/payments/**"</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">    ],</text>
+<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">    "remaining": []</text>
+<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">  },</text>
+<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">  "request": null,</text>
+<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[31 lines not shown]</text>
+<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">      "claim_id": "684933cf6fcd4375"</text>
+<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">    }</text>
+<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
+<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">  "deadline": null,</text>
+<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9">  "attempts": 0,</text>
+<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">  "budget": null,</text>
+<text x="18.0" y="480.0" xml:space="preserve" fill="#c9d1d9">  "claim_id": "684933cf6fcd4375"</text>
+<text x="18.0" y="498.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.764706;0.823529" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue accept 41 --offer-id f57bfc5f0eff4911bbf171e9db531126</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue accept 41 --offer-id f57bfc5f0eff4911bbf171e9db531126</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "owner": "grace",</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "offer": null,</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  "request": null,</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">  "blocked_by": [],</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  "history": [</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    {</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">      "action": "claim",</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">      "actor": "ada",</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">      "at": 1789596827.8120382,</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada",</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">      "offer": null,</text>
+<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">      "request": null,</text>
+<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">      "offer_id": null,</text>
+<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">      "claim_id": "684933cf6fcd4375"</text>
+<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[44 lines not shown]</text>
+<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">    "diff_bytes": 0,</text>
+<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">    "from": "ada",</text>
+<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9">    "at": 1789596828.0047724</text>
+<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">  },</text>
+<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9">  "reservations_moved": [</text>
+<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">    "src/payments/**"</text>
+<text x="18.0" y="480.0" xml:space="preserve" fill="#c9d1d9">  ]</text>
+<text x="18.0" y="498.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.823529;0.882353" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue list</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue list</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">#41: grace (working; event 0s ago)</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  Accepted from ada</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  Commit: 0ec210b1a62a3b8fa3777f91c0d30ed9703fea36</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  Reservations: src/payments/**</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.882353;0.941176" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley top --once</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley top --once</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#79c0ff">agent-parley top  server: running  state: /home/dev/.local/state/agent-parley</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#79c0ff">projects 1  participants 2  hook events 2  denials 0 (0%)  context 802B  ready groups 0  idle 0s  all retained</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">Hidden columns: PROVIDER, EVENT, BRANCH, CONTEXT</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#79c0ff">project /home/dev/payments-api</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#79c0ff">PARTICIPANT     STATE                   ISSUES      MAIL       LEASES     DENIALS    CALLS      TOKENS     IDLE      FIT</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">ada             working; event 0s ago   -           0/0        0          0/1        1                     0s        fit</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">    last: Check shared coordination state and await my task.</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">grace           working; event 0s ago   #41         0/0        1 0s       0/1        2                     0s        fit</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    last: Check shared coordination state and await my task.</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">A lane marked idle is alive, has served no coordination call within the configured interval, and holds unread or unacknowledged mai…</text>
+<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">An issue marked ! is past its recorded deadline or its attempt budget. It is still owned: a deadline reports, and only an explicit …</text>
+<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[3 lines not shown]</text>
+<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="390.0" xml:space="preserve" fill="#ff7b72">Columns: MAIL unread/pending acknowledgement; LEASES held leases, !past a declared time to live, +queued requests waiting on those …</text>
+<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">FIT is the last capacity check the runtime read for that lane, with + when an advisory work offer is waiting for it; the line under…</text>
+<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">CONTEXT counts only the bytes coordination injected into a lane's context. A message, report or offer above its cap is kept whole a…</text>
+<text x="18.0" y="480.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="498.0" xml:space="preserve" fill="#c9d1d9">A row carrying drift, a stale lease, a rejected call, an overdue or orphaned issue or a stopped session is drawn in colour where th…</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.941176;1.0" dur="76.5s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">ada PreToolUse Bash: git checkout -b hotfix/refund</text>
+<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">ada </tspan><tspan fill="#e6edf3">PreToolUse Bash: git checkout -b hotfix/refund</tspan></text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "hookSpecificOutput": {</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    "hookEventName": "PreToolUse",</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#ff7b72">    "permissionDecision": "deny",</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">    "permissionDecisionReason": "Agent Parley owns this worktree on 'parley/ccb9cfa06185c228/lane-1'; branch switches are blocked. C</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">reate or use a separate worktree for feature branches."</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  }</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+</svg>
