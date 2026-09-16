@@ -70,7 +70,9 @@ and no assumption about which model reads it.
 The portal's scan of that Claude manifest demands fields the Claude directory
 does not: an `interface` block with `shortDescription`, which the submission
 form reuses as the listing subtitle and caps at 30 characters, plus `logo`
-and `composerIcon` pointing to square images inside the archive. Adding `interface` to the repository's Claude manifest would make
+and `composerIcon` pointing to square images inside the archive, and the
+`capabilities` and `defaultPrompt` fields the listing page renders. Adding
+`interface` to the repository's Claude manifest would make
 `claude plugin validate --strict` fail, so the repository keeps those fields
 in `.codex-plugin/plugin.json` and `make codex-bundle` merges them into the
 archived copy. The archive lands at
@@ -199,9 +201,31 @@ runtime dependencies. If any of those three change, the policy must change
 with them in the same commit.
 
 Listing imagery lives under `plugins/agent-parley/assets/`: `logo.png` and
-`icon.png`, both 512 by 512 pixels, referenced from the Codex manifest as
-`interface.logo` and `interface.composerIcon`. Screenshots are not included;
+`icon.png`, both 1024 by 1024 pixels, referenced from the Codex manifest as
+`interface.logo` and `interface.composerIcon`. The directory renders the
+composer icon at 54 pixels, so the bundle check rejects an edge under 1024 and
+the artwork is drawn from `docs/assets/agent-parley-icon.svg`, whose thinnest
+stroke stays about four pixels wide at that size. Regenerate the pair from the
+vector source with a headless browser:
+
+```
+google-chrome --headless --disable-gpu --hide-scrollbars \
+  --default-background-color=00000000 --window-size=1024,1024 \
+  --screenshot=plugins/agent-parley/assets/icon.png file://ICON_HTML
+```
+
+where `ICON_HTML` is a page that shows the SVG at 1024 by 1024 pixels with no
+margin; copy the result over `logo.png` as well. Screenshots are not included;
 a directory may ask for them sized to its own requirements.
+
+`interface.capabilities` declares `Interactive` and `Write`, which is what the
+skill needs: it reads coordination state in a conversation and writes claims,
+reservations and handoffs. `interface.defaultPrompt` carries three starter
+prompts. The directory keeps at most three and truncates any entry past 128
+characters, and the bundle check fails rather than letting either happen
+silently. Each prompt states a situation, naming the peers, the file and the
+outcome wanted, because a bare command reads as documentation rather than a
+reason to install.
 
 The skill frontmatter itself is in good shape: `name` is `coordinate` and the
 `description` is 211 characters covering both what the skill does and when to

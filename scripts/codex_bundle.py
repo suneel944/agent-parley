@@ -22,6 +22,9 @@ from scripts.release_artifacts import add_entry
 
 PLUGIN_DIRECTORY = Path("plugins") / "agent-parley"
 SHORT_DESCRIPTION_LIMIT = 30
+IMAGE_EDGE_MINIMUM = 1024
+PROMPT_LIMIT = 3
+PROMPT_LENGTH_LIMIT = 128
 IMAGE_FIELDS = ("logo", "composerIcon")
 CLAUDE_LISTING_FIELDS = (
     "description",
@@ -143,6 +146,30 @@ def manifest_errors(root: Path) -> list[str]:
             continue
         if width != height:
             errors.append(f"Codex interface.{field} must be square")
+        elif width < IMAGE_EDGE_MINIMUM:
+            errors.append(
+                f"Codex interface.{field} must be at least "
+                f"{IMAGE_EDGE_MINIMUM} pixels square"
+            )
+    prompts = interface.get("defaultPrompt", [])
+    if not isinstance(prompts, list) or not prompts:
+        errors.append("Codex interface.defaultPrompt must be a list of prompts")
+    elif len(prompts) > PROMPT_LIMIT:
+        errors.append(
+            f"Codex interface.defaultPrompt keeps at most {PROMPT_LIMIT} "
+            "prompts; later entries are dropped by the directory"
+        )
+    elif any(
+        not isinstance(prompt, str) or not prompt.strip() for prompt in prompts
+    ):
+        errors.append("Codex interface.defaultPrompt holds an empty prompt")
+    elif any(len(prompt) > PROMPT_LENGTH_LIMIT for prompt in prompts):
+        errors.append(
+            "Codex interface.defaultPrompt exceeds "
+            f"{PROMPT_LENGTH_LIMIT} characters"
+        )
+    if not interface.get("capabilities"):
+        errors.append("Codex manifest is missing interface.capabilities")
     return errors
 
 

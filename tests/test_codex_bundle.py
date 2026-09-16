@@ -90,6 +90,54 @@ def test_rejects_missing_and_non_square_images(tmp_path):
     ]
 
 
+def test_rejects_images_below_the_listing_edge(tmp_path):
+    root = copy_repository(tmp_path)
+    assets = root / codex_bundle.PLUGIN_DIRECTORY / "assets"
+    header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR"
+    small = codex_bundle.IMAGE_EDGE_MINIMUM - 1
+    for name in ("logo.png", "icon.png"):
+        (assets / name).write_bytes(
+            header + small.to_bytes(4, "big") + small.to_bytes(4, "big")
+        )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.logo must be at least 1024 pixels square",
+        "Codex interface.composerIcon must be at least 1024 pixels square",
+    ]
+
+
+def test_rejects_a_prompt_list_the_directory_would_truncate(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root,
+        lambda interface: interface.update(
+            defaultPrompt=["a situation"] * (codex_bundle.PROMPT_LIMIT + 1)
+        ),
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.defaultPrompt keeps at most 3 prompts; later "
+        "entries are dropped by the directory"
+    ]
+    rewrite_codex_manifest(
+        root,
+        lambda interface: interface.update(
+            defaultPrompt=["x" * (codex_bundle.PROMPT_LENGTH_LIMIT + 1)]
+        ),
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.defaultPrompt exceeds 128 characters"
+    ]
+
+
+def test_rejects_a_listing_without_capabilities(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root, lambda interface: interface.update(capabilities=[])
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex manifest is missing interface.capabilities"
+    ]
+
+
 def test_rejects_interface_block_in_claude_manifest(tmp_path):
     root = copy_repository(tmp_path)
     path = root / codex_bundle.PLUGIN_DIRECTORY / ".claude-plugin/plugin.json"
