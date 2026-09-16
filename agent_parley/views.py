@@ -358,8 +358,10 @@ def issues(state: dict) -> list[dict]:
         One record per issue, carrying its owner, any recorded forge title,
         the issues it waits on, its pending offer with that offer's
         identifier, source and structured work state, the handoff it was last
-        accepted through, any unanswered operator request to its owner, and
-        any unanswered completion reminder.
+        accepted through, any unanswered operator request to its owner, any
+        unanswered completion reminder, the orphan marker its owner carries
+        with the reservations that owner still holds, and the take an earlier
+        orphaned claim was moved by.
     """
     reported = []
     for number, record in sorted(
@@ -381,6 +383,25 @@ def issues(state: dict) -> list[dict]:
                 "blocked_by": [
                     int(other) for other in record.get("blocked_by", [])
                 ],
+                "orphan": (
+                    {
+                        "owner": orphan["owner"],
+                        "reason": orphan["reason"],
+                        "reservations": list(orphan.get("reservations", [])),
+                        "created_at": timestamp(orphan.get("created")),
+                    }
+                    if (orphan := record.get("orphan"))
+                    else None
+                ),
+                "taken": (
+                    {
+                        "from": taken["from"],
+                        "reason": taken["reason"],
+                        "at": timestamp(taken.get("at")),
+                    }
+                    if (taken := record.get("taken"))
+                    else None
+                ),
                 "offer": offer(record.get("offer")),
                 "handoff": handoff(record.get("handoff")),
                 "request": request(record.get("request")),

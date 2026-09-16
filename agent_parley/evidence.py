@@ -39,7 +39,7 @@ def collect(
             [
                 event["at"]
                 for event in reversed(record.get("history", []))
-                if event["action"] in {"claim", "accept"}
+                if event["action"] in {"claim", "accept", "take"}
                 and event.get("owner") == name
             ][:1]
         )

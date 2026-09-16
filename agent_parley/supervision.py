@@ -722,6 +722,157 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def orphan_reason(name: str, observed: dict) -> str:
+    """States why a lane's claims read as orphaned, in one clause."""
+    return (
+        f"{name} has no running session process and has been silent for "
+        f"{int(observed['age_seconds'] or 0)}s"
+    )
+
+
+def orphan_marker(numbers: list[str], keys: list[str]) -> str:
+    """Describes one lane's orphaned claims in one line, naming its keys."""
+    if not numbers:
+        return ""
+    listed = ", ".join(f"#{number}" for number in numbers)
+    held = f"; holds {', '.join(keys)}" if keys else ""
+    return (
+        f"orphaned claims {listed}{held}; still owned until a peer runs "
+        "issue claim --take-orphaned"
+    )
+
+
+def _dead(observed: dict, after: float) -> bool:
+    """Reports whether a lane is gone rather than merely quiet.
+
+    Args:
+        observed: Presence reading for the lane.
+        after: Seconds of silence the project counts as a stall.
+
+    Returns:
+        Whether the recorded session process is gone and the lane has been
+        silent for longer than that threshold. A live lane is never dead
+        however long it has been idle, and a lane that recorded no activity
+        at all has no age to measure, so it is left alone.
+    """
+    return (
+        not observed["process_alive"]
+        and observed["age_seconds"] is not None
+        and observed["age_seconds"] >= after
+    )
+
+
+def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
+    """Marks a dead lane's claims as orphaned and tells every other lane once.
+
+    A crashed lane keeps its issues, and peers that wait on them cannot tell a
+    working owner from one that will never answer. The marker states that
+    observation where the ledger is read, and one notice per dead lane names
+    the orphaned issues and the reservations it still holds.
+
+    Nothing moves here. The issue keeps its owner, the reservations keep their
+    holder, and only an explicit ``issue claim --take-orphaned`` by a peer
+    transfers either. A lane that is merely idle is never marked, and a lane
+    that returns keeps nothing but the right to claim its work again.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+    """
+    after = config["stalled_after"]
+    dead = {
+        name: observed
+        for name in manifest["participants"]
+        if _dead(
+            observed := presence(directory, name, config["inactive_after"]),
+            after,
+        )
+    }
+    if not dead:
+        return
+    try:
+        reservations = store.active_reservations(home, manifest["root"])
+    except (BridgeError, OSError, sqlite3.Error):
+        reservations = {}
+    notices = []
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        changed = False
+        for name, observed in dead.items():
+            keys = reservations.get(
+                manifest["participants"][name]["display"], []
+            )
+            reason = orphan_reason(name, observed)
+            marked = []
+            fresh = False
+            for number, record in ledger["issues"].items():
+                if record.get("owner") != name:
+                    continue
+                identifier = (
+                    f"{name}:{record.get('claim_id') or number}:"
+                    f"{int(observed['last_active'] or 0)}"
+                )
+                marked.append(number)
+                if record.get("orphan", {}).get("id") == identifier:
+                    continue
+                record["orphan"] = {
+                    "id": identifier,
+                    "owner": name,
+                    "reason": reason,
+                    "reservations": list(keys),
+                    "created": time.time(),
+                }
+                changed = True
+                fresh = True
+            if fresh:
+                notices.append((name, sorted(marked, key=int), list(keys)))
+        if changed:
+            ledger["revision"] += 1
+            write_json(directory / "issues.json", ledger)
+    for name, marked, keys in notices:
+        _announce_orphan(home, manifest, name, marked, keys)
+
+
+def _announce_orphan(
+    home: Path, manifest: dict, name: str, numbers: list[str], keys: list[str]
+) -> None:
+    """Tells every other lane once that one lane's claims read as orphaned.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        name: Participant whose claims were marked.
+        numbers: Issue numbers marked orphaned, in ledger order.
+        keys: Reservation keys that lane still holds.
+    """
+    listed = ", ".join(f"#{number}" for number in numbers)
+    held = ", ".join(keys) or "none"
+    body = (
+        f"{name} reads as orphaned: no running session process. Orphaned "
+        f"claims: {listed}. Reservations it still holds: {held}. Nothing has "
+        "moved: take one with agent-parley issue claim NUMBER "
+        "--take-orphaned, which records you as the owner and releases those "
+        "reservations. Leaving it alone keeps it with " + name + "."
+    )
+    for peer, participant in manifest["participants"].items():
+        if peer == name:
+            continue
+        digest = hashlib.sha256(
+            f"{name}\x00{listed}\x00{held}\x00{peer}".encode()
+        ).hexdigest()[:32]
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.speak(
+                home,
+                manifest["root"],
+                participant["display"],
+                f"Orphaned claims held by {name}",
+                body,
+                f"orphan:{digest}",
+            )
+
+
 def claimed_since(record: dict) -> float:
     """Reports when the current ownership generation of an issue began.
 
@@ -729,7 +880,8 @@ def claimed_since(record: dict) -> float:
     the current claim started describes earlier work and must not report that
     claim as finished. The generation starts at the most recent claim or
     accepted handoff; a record whose history no longer names one is treated as
-    having always been owned, which preserves the previous observation.
+    having always been owned, which preserves the previous observation. A take
+    of an orphaned claim starts a generation like any other claim.
 
     Args:
         record: Published ledger record for one issue.
@@ -741,7 +893,7 @@ def claimed_since(record: dict) -> float:
         (
             float(entry.get("at", 0) or 0)
             for entry in record.get("history", [])
-            if entry.get("action") in {"claim", "accept"}
+            if entry.get("action") in {"claim", "accept", "take"}
         ),
         default=0.0,
     )
@@ -916,6 +1068,7 @@ def poll(home: Path, directory: Path) -> None:
             )
         reminders(directory, manifest, closed)
         deadline_notices(directory, manifest)
+        orphans(home, directory, manifest, config)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
         observe_responses(home, directory, manifest)

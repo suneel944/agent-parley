@@ -85,6 +85,25 @@ with the seconds over, `top` marks the issue `#42!`, and a lane that reports
 Ownership never moves on a timer: an overdue claim is still owned, and only an
 explicit release or an accepted handoff transfers it.
 
+## A dead lane's claims are offered, never taken away
+
+A lane whose recorded session process is gone and that has been silent past the
+project's stall threshold has its claims marked `orphaned` in `issue list`,
+`status` and `top`, which marks the issue `#42*`. The marker states what was
+observed: an idle lane with a live process is never marked, however long it has
+been quiet. Every other lane receives one notice naming the orphaned issues and
+the reservations that lane still holds.
+
+Ownership does not move on the marker. A peer takes the work explicitly, and
+the take records the previous owner and the reason, then releases the
+reservations that owner held so the paths read as free. A lane that comes back
+regains nothing by restarting: it claims its own issue again, which clears the
+marker and starts a new claim.
+
+```sh
+agent-parley issue claim 42 --take-orphaned
+```
+
 ## A budget informs; it does not gate
 
 `participant budget NAME --tokens 2000000 --calls 5000 --hours 8` records

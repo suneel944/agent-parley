@@ -31,7 +31,7 @@ KINDS = (
     "reservation",
     "message",
 )
-CLAIM_ACTIONS = frozenset({"claim", "release"})
+CLAIM_ACTIONS = frozenset({"claim", "release", "take"})
 HANDOFF_ACTIONS = frozenset(
     {
         "offer",
@@ -99,8 +99,10 @@ def holdings(directory: Path, number: str) -> list[dict]:
     Returns:
         One record per generation, naming the participant, the claim
         identifier, when the generation started, when it ended, and how long
-        it was held. A generation that is still held reports no end and the
-        seconds so far.
+        it was held. A take of an orphaned claim ends the generation it took
+        from and starts its own, because that ownership moved without the
+        previous holder recording a release. A generation that is still held
+        reports no end and the seconds so far.
     """
     record = issues.snapshot(directory)["issues"].get(number)
     if not record:
@@ -109,7 +111,9 @@ def holdings(directory: Path, number: str) -> list[dict]:
     for entry in record.get("history", []):
         action = str(entry.get("action", ""))
         at = float(entry.get("at", 0) or 0)
-        if action in ("claim", "accept"):
+        if action in ("claim", "accept", "take"):
+            if action == "take" and held and held[-1]["ended"] is None:
+                held[-1].update(ended=at, seconds=int(at - held[-1]["started"]))
             held.append(
                 {
                     "participant": entry.get("actor"),

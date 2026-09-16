@@ -38,6 +38,7 @@ on standard output and export to a file.
 | `issue show NUMBER` | Show one issue: its owner, deadline, attempts, blockers, pending offer, the reservations its owner holds and its recorded history. |
 | `issue next` | Rank the unclaimed, unblocked issues this lane could take next, each with the reason for its place: the plan group already under way, the issues it unblocks, the peer reservations and forecast collisions its likely paths run into, and the provider it declares. It claims nothing; `--limit` bounds the list. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
+| `issue claim NUMBER --take-orphaned` | Take an issue whose owner reads as orphaned, recording the previous owner and the reason and releasing the reservations that owner held. |
 | `issue release NUMBER` | Release ownership without closing the GitHub issue. |
 | `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly; `--when-released N` records it until that issue is released. |
 | `issue accept NUMBER --offer-id ID` | Accept the current offer addressed to this lane; the offered reservations move with the issue. |
