@@ -206,6 +206,33 @@ depends on the native agents: `CONTEXT` reports the bytes coordination itself
 injects and `TOKENS` repeats what a lane's own client counted, and neither is
 billed spend or a claim about a token-saving percentage.
 
+## How it compares
+
+Every tool below runs several coding agents at once, each in its own Git
+worktree. The difference is what happens between the worktrees. Each claim is
+taken from the project's own documentation, linked so you can check it.
+
+| Project | What its own documentation describes | What Agent Parley records instead |
+| --- | --- | --- |
+| [Claude Squad](https://github.com/smtg-ai/claude-squad) | A terminal manager for background sessions, each in its own worktree, over Claude Code, Codex, Aider and Amp. Isolation is the conflict answer: separate workspaces, "so no conflicts". | The same isolation, plus state the worktrees share: an atomic issue claim, an advisory reservation that names the blocking owner and reason, and a handoff that only moves ownership when a peer accepts it. |
+| [Crystal](https://github.com/stravu/crystal) | Parallel Claude Code and Codex sessions with diffs and test output in one window. The repository now points to its successor, Nimbalyst, and its README describes editor streaming and worktree isolation. | A record rather than a view: who holds which issue, which paths are reserved, what evidence a lane attached to a `ready` report, and whether a peer reviewed that report. |
+| [Conductor](https://conductor.build) | A polished macOS app for running Claude Code in parallel worktrees. Closed source, macOS only. | A standard-library service with no runtime dependencies that runs wherever Python 3.12 does, drives Claude, Codex, Gemini, Amp, OpenCode and Copilot through their own CLIs, and keeps its coordination state outside your repository. |
+| [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) | A task board in front of coding agents. Its vendor announced a shutdown in April 2026 and the project continues community-maintained and fully local. | Coordination in the agents' own path rather than a board in front of it: native hooks refuse a branch switch inside an assigned lane and catch drift after a bypass, which no board can see. |
+
+Two things none of them document, and the reasons they matter here:
+
+- **A decision log every lane can search.** A message a lane marks as a
+  decision, or one an operator records with `agent-parley decide`, becomes
+  project-wide, so a third lane stops relitigating a settled question.
+- **A refusal to sign your work.** A commit, merge, tag or pull request that
+  credits an assistant is denied before it lands, and no flag skips the check.
+
+Agent Parley does not replace these tools' strengths. Conductor is the smoother
+macOS experience, and a board is easier to read at a glance than a table. Pick
+Agent Parley when several agents must agree about one repository, and the
+answer to "who owns this, and on what evidence" has to be recorded rather than
+remembered.
+
 ## Documentation
 
 | Page | What it covers |
