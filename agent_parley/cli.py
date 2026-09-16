@@ -40,6 +40,7 @@ from agent_parley import (
     forge,
     gemini,
     history,
+    inbound,
     metrics,
     notify,
     opencode,
@@ -1364,6 +1365,133 @@ def add_selector(
         "--yes",
         action="store_true",
         help="Skip the single confirmation covering the whole selected set.",
+    )
+
+
+def add_status_filters(command: argparse.ArgumentParser) -> None:
+    """Adds the participant and every filter a status reading accepts.
+
+    The declaration lives here rather than inside the command-line builder so
+    that a second reader of the same reading, such as the inbound Telegram
+    query, parses the identical set of filters and cannot drift from what the
+    command line accepts.
+
+    Args:
+        command: Parser that reports status, whether it is the `status`
+            subcommand or a reader built for one query.
+    """
+    command.add_argument(
+        "participant",
+        nargs="?",
+        default="",
+        help=(
+            "Report this participant alone, as the whole reading rather than "
+            "one table row."
+        ),
+    )
+    command.add_argument(
+        "--repo",
+        dest="project",
+        metavar="ROOT",
+        default="",
+        help="Report only the project at this repository root.",
+    )
+    command.add_argument(
+        "--project",
+        dest="project",
+        metavar="ROOT",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    command.add_argument(
+        "--provider",
+        action="append",
+        metavar="NAME",
+        help=(
+            "Report only participants driven by this provider. Repeat the "
+            "flag to report several."
+        ),
+    )
+    command.add_argument(
+        "--outcome",
+        choices=("ready", "blocked", "unknown"),
+        default="",
+        help="Report only lanes that reported this outcome.",
+    )
+    command.add_argument(
+        "--drifted",
+        action="store_true",
+        help=(
+            "Report only lanes away from their assigned branch. The command "
+            "exits non-zero when one matches."
+        ),
+    )
+    command.add_argument(
+        "--pending",
+        action="store_true",
+        help=(
+            "Report only lanes holding unread mail, unanswered "
+            "acknowledgements, an offer, or a reservation past its declared "
+            "time to live. The command exits non-zero when one matches."
+        ),
+    )
+    command.add_argument(
+        "--idle",
+        action="store_true",
+        help=(
+            "Report only live lanes that served no coordination call inside "
+            "the window. This measures coordination inactivity, not what a "
+            "native client was doing inside a turn."
+        ),
+    )
+    command.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help=(
+            "Inactivity an idle lane must show, such as 45m, 6h or 7d. The "
+            "project's configured interval decides by default."
+        ),
+    )
+    command.add_argument(
+        "--over-budget",
+        action="store_true",
+        help=(
+            "Report only lanes over any of their advisory token, call or "
+            "hour limits. A budget informs and does not gate; the command "
+            "exits non-zero when one matches."
+        ),
+    )
+    command.add_argument(
+        "--issue",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Report only lanes holding or offered this issue.",
+    )
+
+
+def selected_status(args: argparse.Namespace) -> Selection:
+    """Reads one parsed status command line as a lane selection.
+
+    Args:
+        args: Namespace produced by a parser `add_status_filters` built.
+
+    Returns:
+        The filters that command line asked for.
+    """
+    return Selection(
+        participant=args.participant,
+        project=args.project,
+        providers=tuple(args.provider or ()),
+        outcome=args.outcome,
+        drifted=args.drifted,
+        pending=args.pending,
+        idle=args.idle,
+        since=args.since,
+        over_budget=args.over_budget,
+        issue=args.issue,
     )
 
 
@@ -6212,9 +6340,11 @@ attempt of the recorded budget, which is also only reported.
 
         Returns:
             Server readiness and the state the service reports itself in, the
-            private state directory, and one record per registered project
-            holding its issue ledger and its lanes. A service that reports
-            itself stale is not ready, and the state names why.
+            private state directory, whether inbound status queries were asked
+            for and the configuration fault that stops them, and one record
+            per registered project holding its issue ledger and its lanes. A
+            service that reports itself stale is not ready, and the state
+            names why.
         """
         usable = (
             store.schema_state(store.schema_version(self.home))
@@ -6255,6 +6385,7 @@ attempt of the recorded budget, which is also only reported.
         return {
             "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
+            "inbound": inbound.reported(),
             "projects": projects,
         }
 
@@ -6286,6 +6417,8 @@ attempt of the recorded budget, which is also only reported.
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             print(f"Store: {schema}; {repair}")
+        if refusal := (report.get("inbound") or {}).get("fault"):
+            print(f"Inbound: {refusal}")
         print(f"State: {report['state_directory']}")
         matched = reported_lanes(report)
         if selection.filtered() and not matched:
@@ -7054,96 +7187,7 @@ def main() -> int:
         "status", help="Show server health and registered workspaces."
     )
     health.add_argument("--json", action="store_true", help=JSON_HELP)
-    health.add_argument(
-        "participant",
-        nargs="?",
-        default="",
-        help=(
-            "Report this participant alone, as the whole reading rather than "
-            "one table row."
-        ),
-    )
-    health.add_argument(
-        "--repo",
-        dest="project",
-        metavar="ROOT",
-        default="",
-        help="Report only the project at this repository root.",
-    )
-    health.add_argument(
-        "--project",
-        dest="project",
-        metavar="ROOT",
-        default="",
-        help=argparse.SUPPRESS,
-    )
-    health.add_argument(
-        "--provider",
-        action="append",
-        metavar="NAME",
-        help=(
-            "Report only participants driven by this provider. Repeat the "
-            "flag to report several."
-        ),
-    )
-    health.add_argument(
-        "--outcome",
-        choices=("ready", "blocked", "unknown"),
-        default="",
-        help="Report only lanes that reported this outcome.",
-    )
-    health.add_argument(
-        "--drifted",
-        action="store_true",
-        help=(
-            "Report only lanes away from their assigned branch. The command "
-            "exits non-zero when one matches."
-        ),
-    )
-    health.add_argument(
-        "--pending",
-        action="store_true",
-        help=(
-            "Report only lanes holding unread mail, unanswered "
-            "acknowledgements, an offer, or a reservation past its declared "
-            "time to live. The command exits non-zero when one matches."
-        ),
-    )
-    health.add_argument(
-        "--idle",
-        action="store_true",
-        help=(
-            "Report only live lanes that served no coordination call inside "
-            "the window. This measures coordination inactivity, not what a "
-            "native client was doing inside a turn."
-        ),
-    )
-    health.add_argument(
-        "--since",
-        type=duration,
-        default=0.0,
-        metavar="WINDOW",
-        help=(
-            "Inactivity an idle lane must show, such as 45m, 6h or 7d. The "
-            "project's configured interval decides by default."
-        ),
-    )
-    health.add_argument(
-        "--over-budget",
-        action="store_true",
-        help=(
-            "Report only lanes over any of their advisory token, call or "
-            "hour limits. A budget informs and does not gate; the command "
-            "exits non-zero when one matches."
-        ),
-    )
-    health.add_argument(
-        "--issue",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Report only lanes holding or offered this issue.",
-    )
+    add_status_filters(health)
     watch = commands.add_parser(
         "top",
         help=(
@@ -8933,18 +8977,7 @@ def main() -> int:
                 else json.dumps(registered, indent=2)
             )
         else:
-            selection = Selection(
-                participant=args.participant,
-                project=args.project,
-                providers=tuple(args.provider or ()),
-                outcome=args.outcome,
-                drifted=args.drifted,
-                pending=args.pending,
-                idle=args.idle,
-                since=args.since,
-                over_budget=args.over_budget,
-                issue=args.issue,
-            )
+            selection = selected_status(args)
             if args.json:
                 narrowed = narrow(bridge.status_snapshot(), selection)
                 print(views.render("status", narrowed))

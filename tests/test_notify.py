@@ -171,6 +171,9 @@ def test_telegram_posts_one_form_encoded_message(monkeypatch):
         def __exit__(self, *args):
             return False
 
+        def read(self):
+            return b'{"ok": true}'
+
     def urlopen(request, timeout=0):
         captured["url"] = request.full_url
         captured["data"] = request.data.decode()

@@ -242,6 +242,48 @@ agent-parley notify test
 each one answered, so credentials are verified before a lane depends on them.
 It exits 1 when any transport refuses.
 
+## Asking for status from the chat
+
+The same Telegram bot can answer one question and only one: what is everything
+doing. Send `status` with the filters `agent-parley status` takes, and the
+reply is the reading that command prints. Nothing else crosses the channel: no
+claim, no handoff, no wake, no permission approval, and no free text into a
+session. The service long-polls the Bot API from inside itself, so no port is
+opened and no webhook is registered.
+
+Every message starts with a passcode, and both the passcode and the chat
+identifier must match:
+
+```
+hunter2-and-then-some status --pending
+hunter2-and-then-some status codex
+hunter2-and-then-some status --provider claude --issue 14
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `AGENT_PARLEY_INBOUND` | `telegram` turns the reader on. Unset means no inbound path at all. |
+| `AGENT_PARLEY_INBOUND_PASSCODE` | Passcode every message must start with; at least 12 characters. |
+
+The bot token and chat identifier are the outbound ones above. A message from
+another chat, or with a wrong passcode, gets no reply at all: silence, not a
+hint. Five wrong passcodes inside ten minutes lock the inbound path for an hour
+and send one outbound notification saying so; the counter and the lock live
+only in memory. Only a salted hash of the passcode is held, compared in
+constant time, and it is never written to coordination state, the event log or
+the service log. The accepted message is deleted from the chat when the bot has
+permission, so the passcode does not sit in the history. A reading longer than
+one Telegram message is cut with a line naming how many rows were left out.
+
+The reader refuses to start when the passcode is unset or shorter than twelve
+characters, and `agent-parley status` prints that fault instead of leaving a
+silently dead poller behind:
+
+```
+Inbound: AGENT_PARLEY_INBOUND_PASSCODE must be set and at least 12 characters;
+inbound status queries are off.
+```
+
 ## What it does not do
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent

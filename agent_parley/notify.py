@@ -6,7 +6,9 @@ and decides no outcome. Only a change that moves ownership or blocks a lane is
 forwarded, so the signal stays as small as the event log's own selection.
 Configuration and every secret arrive through environment variables and are
 never written into coordination state. Delivery is outbound only: no transport
-carries a command back, answers a native permission prompt, or opens a port.
+answers a native permission prompt or opens a port. The Telegram calls this
+module makes are shared with the read-only reader in `inbound`, which can ask
+for a status reading and can carry no other command back.
 """
 
 import hashlib
@@ -39,6 +41,7 @@ class Event(StrEnum):
     LANE_IDLE = "lane_idle"
     RUN_FINISHED = "run_finished"
     HOOK_REFUSAL = "hook_refusal"
+    INBOUND_LOCKED = "inbound_locked"
 
 
 TITLES: dict[str, str] = {
@@ -47,6 +50,7 @@ TITLES: dict[str, str] = {
     Event.LANE_IDLE: "A lane is idle with no claim",
     Event.RUN_FINISHED: "A lane run finished",
     Event.HOOK_REFUSAL: "A hook refused a lane action",
+    Event.INBOUND_LOCKED: "Inbound status queries are locked",
 }
 
 KEY_FIELDS: dict[str, tuple[str, ...]] = {
@@ -55,6 +59,7 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
     Event.LANE_IDLE: ("since",),
     Event.RUN_FINISHED: ("session",),
     Event.HOOK_REFUSAL: ("session", "reason"),
+    Event.INBOUND_LOCKED: ("detail",),
 }
 
 REFUSALS = frozenset({"branch_drift", "branch_switch"})
@@ -248,16 +253,30 @@ def compose(event: str, fields: Mapping[str, object]) -> tuple[str, str]:
     )
 
 
-def telegram(config: dict, subject: str, body: str) -> None:
-    """Posts one message to the Telegram Bot API.
+def call(
+    config: dict,
+    method: str,
+    fields: Mapping[str, object],
+    timeout: float = TIMEOUT,
+) -> dict:
+    """Calls one Telegram Bot API method and returns its decoded answer.
 
-    The HTTP client is imported here rather than at module scope, so a
-    command line that never notifies does not pay for it at startup.
+    Every Telegram exchange in the runtime goes through this one call, so a
+    bot token is read from the same configuration, posted the same way and
+    kept out of the query string whether the message is being sent or an
+    update is being read. The HTTP client is imported here rather than at
+    module scope, so a command line that never reaches Telegram does not pay
+    for it at startup.
 
     Args:
         config: Resolved notification configuration.
-        subject: Subject line, sent as the message's first line.
-        body: Message body.
+        method: Bot API method name, such as ``sendMessage``.
+        fields: Form fields the method takes.
+        timeout: Seconds to wait for the answer; a long poll passes its own.
+
+    Returns:
+        The decoded answer document, or an empty mapping when the answer is
+        not a JSON object.
 
     Raises:
         BridgeError: If the bot token or chat identifier is missing, or the
@@ -273,17 +292,37 @@ def telegram(config: dict, subject: str, body: str) -> None:
             "Telegram needs AGENT_PARLEY_TELEGRAM_TOKEN and "
             "AGENT_PARLEY_TELEGRAM_CHAT."
         )
-    data = urllib.parse.urlencode(
-        {"chat_id": values["chat"], "text": f"{subject}\n\n{body}"}
-    ).encode()
+    data = urllib.parse.urlencode(dict(fields)).encode()
     request = urllib.request.Request(
-        f"{values['api']}/bot{values['token']}/sendMessage",
+        f"{values['api']}/bot{values['token']}/{method}",
         data=data,
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         if response.status != 200:
             raise BridgeError(f"Telegram answered {response.status}.")
+        answer = json.loads(response.read() or b"{}")
+    return answer if isinstance(answer, dict) else {}
+
+
+def telegram(config: dict, subject: str, body: str) -> None:
+    """Posts one message to the Telegram Bot API.
+
+    Args:
+        config: Resolved notification configuration.
+        subject: Subject line, sent as the message's first line.
+        body: Message body.
+
+    Raises:
+        BridgeError: If the bot token or chat identifier is missing, or the
+            API answers with a status other than 200.
+        OSError: If the request cannot be completed.
+    """
+    call(
+        config,
+        "sendMessage",
+        {"chat_id": config["telegram"]["chat"], "text": f"{subject}\n\n{body}"},
+    )
 
 
 def email(config: dict, subject: str, body: str) -> None:

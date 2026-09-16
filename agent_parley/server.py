@@ -963,13 +963,15 @@ def main() -> None:
     os.umask(0o077)
     config = json.loads((args.home / "config.json").read_text())
     store.initialize(args.home)
-    from agent_parley import supervision
+    from agent_parley import inbound, supervision
 
     stopped = threading.Event()
-    observer = threading.Thread(
-        target=supervision.run, args=(args.home, stopped), daemon=True
-    )
-    observer.start()
+    workers = [
+        threading.Thread(target=run, args=(args.home, stopped), daemon=True)
+        for run in (supervision.run, inbound.run)
+    ]
+    for worker in workers:
+        worker.start()
     try:
         with Server(args.home, config) as server:
             stop_on_signal(args.home, server)
@@ -977,7 +979,8 @@ def main() -> None:
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
-        observer.join(timeout=2)
+        for worker in workers:
+            worker.join(timeout=2)
 
 
 if __name__ == "__main__":
