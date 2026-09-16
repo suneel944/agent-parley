@@ -1,6 +1,6 @@
 """Runs Agent Parley as a Python module."""
 
-from agent_parley import cli
+from agent_parley import entry
 
 if __name__ == "__main__":
-    raise SystemExit(cli.main())
+    raise SystemExit(entry.main())

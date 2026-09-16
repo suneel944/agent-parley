@@ -9,6 +9,7 @@ runs `participant merge`, and never on an agent's behalf.
 
 | Module | Responsibility |
 | --- | --- |
+| `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
 | `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
@@ -81,6 +82,20 @@ which keeps transactions testable without HTTP.
 Use abstractions for actual boundaries. Do not add factories, interfaces, or
 inheritance solely to name a pattern. The HTTP server implements its standard-
 library base contracts; the type gate checks method overrides.
+
+Three entry paths pay an import price on every invocation, and each one loads
+only what its work needs. The lifecycle hook runs once per native tool call and
+imports the request's own modules alone, reaching the checkpoint engine only on
+the fallback path. The installed command starts in `entry`, which imports
+nothing but `sys`: a bare `--version` or `-V` answers from the compatibility
+contract, and anything else, including a version flag mixed with other
+arguments, is handed to `cli` so argparse produces the parsing, error text and
+exit status. `cli` in turn binds the command modules through `cli.deferred`,
+which registers a real module that executes on its first attribute access, so a
+command loads the few modules it reaches instead of all of them. What each path
+must not import is asserted in `tests/test_startup_imports.py` and
+`tests/test_hook_client.py`, and `scripts/benchmark.py` records the wall time of
+the cheapest invocations beside the interpreter floor they can never beat.
 
 ## Authentication and protocol
 

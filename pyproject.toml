@@ -26,7 +26,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-agent-parley = "agent_parley.cli:main"
+agent-parley = "agent_parley.entry:main"
 
 [project.urls]
 Repository = "https://github.com/suneel944/agent-parley"

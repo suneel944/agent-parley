@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import dataclasses
 import datetime
 import hashlib
 import json
@@ -21,43 +20,45 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 if TYPE_CHECKING:
     import sqlite3
+    from types import ModuleType
 
-from agent_parley import (
-    amp,
-    approvals,
-    archive,
-    attachments,
-    budgets,
-    checkpoints,
-    completion,
-    delivery,
-    evidence,
-    forecast,
-    forge,
-    gemini,
-    history,
-    metrics,
-    notify,
-    opencode,
-    plan,
-    policy,
-    problems,
-    process,
-    protocol,
-    recommend,
-    retries,
-    roster,
-    store,
-    supervision,
-    tables,
-    terminal,
-    views,
-)
-from agent_parley import watch as stream
+    from agent_parley import (
+        amp,
+        approvals,
+        archive,
+        attachments,
+        budgets,
+        checkpoints,
+        completion,
+        delivery,
+        evidence,
+        forecast,
+        forge,
+        gemini,
+        history,
+        metrics,
+        notify,
+        opencode,
+        plan,
+        policy,
+        problems,
+        process,
+        protocol,
+        recommend,
+        retries,
+        roster,
+        store,
+        supervision,
+        tables,
+        terminal,
+        views,
+    )
+    from agent_parley import watch as stream
+
 from agent_parley.checkpoints import (
     EVENTS,
     activity,
@@ -81,6 +82,80 @@ from agent_parley.issues import (
     snapshot,
 )
 from agent_parley.state import BridgeError, lock, write_json, write_text
+
+DEFERRED_MODULES = (
+    "amp",
+    "approvals",
+    "archive",
+    "attachments",
+    "budgets",
+    "checkpoints",
+    "completion",
+    "delivery",
+    "evidence",
+    "forecast",
+    "forge",
+    "gemini",
+    "history",
+    "metrics",
+    "notify",
+    "opencode",
+    "plan",
+    "policy",
+    "problems",
+    "process",
+    "protocol",
+    "recommend",
+    "retries",
+    "roster",
+    "store",
+    "supervision",
+    "tables",
+    "terminal",
+    "views",
+    "watch",
+)
+DEFERRED_ALIASES = {"watch": "stream"}
+
+
+def deferred(name: str) -> ModuleType:
+    """Binds one coordination module without executing it yet.
+
+    A launcher process runs one command, and no command touches more than a
+    few of these modules, so importing all of them before the command is even
+    parsed is the largest fixed cost the command line pays. The returned
+    module is a real module object that executes on its first attribute
+    access, which keeps every call site, monkeypatch and `from` import that
+    already names it working unchanged.
+
+    Args:
+        name: Submodule of this package to bind.
+
+    Returns:
+        The submodule, already loaded if something else loaded it first, and
+        otherwise a module that loads itself when first read.
+    """
+    import importlib.util
+
+    qualified = f"agent_parley.{name}"
+    loaded = sys.modules.get(qualified)
+    if loaded is not None:
+        return loaded
+    spec = importlib.util.find_spec(qualified)
+    if spec is None or spec.loader is None:
+        raise BridgeError(f"Missing module {qualified}")
+    spec.loader = importlib.util.LazyLoader(spec.loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[qualified] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+if not TYPE_CHECKING:
+    for _deferred_name in DEFERRED_MODULES:
+        globals()[DEFERRED_ALIASES.get(_deferred_name, _deferred_name)] = (
+            deferred(_deferred_name)
+        )
 
 VERIFY_TIMEOUT = 1800
 INIT_OUTPUT_LINES = 20
@@ -372,8 +447,7 @@ def drift(name: str, participant: dict, actual: str) -> str:
     )
 
 
-@dataclasses.dataclass(frozen=True)
-class Selection:
+class Selection(NamedTuple):
     """Narrows a status reading to the lanes an operator asked about.
 
     Every field is a filter, and filters combine: a lane is reported only
@@ -6660,6 +6734,45 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+class Absorbed:
+    """Accepts a command's declarations without building a parser for them.
+
+    Argparse builds a parser and every argument, group and nested subcommand
+    it is given, and an invocation can only ever parse with one of them. A
+    command that was not typed is declared against this instead: every
+    builder call it makes is accepted and answered with the same object, so
+    the declaration reads exactly as it does for the typed command and
+    nothing argparse charges for is created.
+    """
+
+    def __getattr__(self, name: str) -> Callable[..., Absorbed]:
+        """Answers any builder call argparse's parsers offer.
+
+        Args:
+            name: Attribute the declaration reached for.
+
+        Returns:
+            A callable that accepts the declaration and answers with this
+            same object, so nested subcommands absorb in turn.
+        """
+        return self.absorb
+
+    def absorb(self, *args: Any, **kwargs: Any) -> Absorbed:
+        """Accepts one declaration and answers with this same object.
+
+        Args:
+            *args: Positional arguments the declaration passed.
+            **kwargs: Keyword arguments the declaration passed.
+
+        Returns:
+            This object.
+        """
+        return self
+
+
+WHOLE_PARSER = frozenset({"completion", "__complete"})
+
+
 class CommandIndex:
     """Adds subcommands while recording the help the root listing prints.
 
@@ -6668,16 +6781,29 @@ class CommandIndex:
     is created, so the root help can print the same commands under the
     headings an operator thinks in while every parser keeps the arguments it
     declared. A command whose help is suppressed stays out of the listing.
+
+    Only the command an invocation typed needs a parser argparse can parse
+    with. The rest are recorded and absorbed, which keeps the listing and the
+    declarations whole while the cost of the other commands is not paid. The
+    shell completion commands read the whole parser, so they are built with
+    every command present.
     """
 
-    def __init__(self, action: argparse._SubParsersAction) -> None:
+    def __init__(
+        self,
+        action: argparse._SubParsersAction,
+        typed: str | None = None,
+    ) -> None:
         """Wraps the subparsers action every command is added through.
 
         Args:
             action: Subparsers action created on the root parser.
+            typed: Command that was typed, or ``None`` to build them all.
         """
         self.action = action
         self.summaries: dict[str, str] = {}
+        self.declared: set[str] = set()
+        self.typed = None if typed in WHOLE_PARSER else typed
 
     def add_parser(self, name: str, **kwargs: Any) -> argparse.ArgumentParser:
         """Creates one subcommand parser and records its one-line help.
@@ -6687,11 +6813,15 @@ class CommandIndex:
             **kwargs: Arguments argparse's own ``add_parser`` accepts.
 
         Returns:
-            The created subcommand parser.
+            The created subcommand parser, or an object that absorbs the
+            declarations of a command this invocation did not type.
         """
         summary = kwargs.get("help")
         if isinstance(summary, str) and summary != argparse.SUPPRESS:
             self.summaries[name] = summary
+        self.declared.add(name)
+        if self.typed is not None and self.typed != name:
+            return cast(argparse.ArgumentParser, Absorbed())
         return self.action.add_parser(name, **kwargs)
 
 
@@ -7002,33 +7132,19 @@ def notification_report(report: dict) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
-    """Dispatches the CLI and returns an operational exit status."""
-    parser = argparse.ArgumentParser(
-        prog="agent-parley",
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        usage="agent-parley [--home DIR] COMMAND [ARGUMENTS]",
-    )
-    parser.add_argument(
-        "-V",
-        "--version",
-        action="store_true",
-        help="Print the installed version and exit.",
-    )
-    parser.add_argument(
-        "--home",
-        type=Path,
-        default=Path(
-            os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
-        ),
-        help="Private state directory (or AGENT_PARLEY_HOME).",
-    )
-    commands = CommandIndex(
-        parser.add_subparsers(
-            dest="command", metavar="COMMAND", help=argparse.SUPPRESS
-        )
-    )
+def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
+    """Declares every command and renders the root help's listing.
+
+    The declarations run on every invocation because the root listing names
+    each command and its one-line help. What they produce is what changes:
+    the index builds an argparse parser for the command that was typed and
+    absorbs the arguments of the rest, so an invocation pays for one command
+    rather than for forty.
+
+    Args:
+        parser: Root parser whose epilog carries the command listing.
+        commands: Index the subcommands are declared through.
+    """
     completing = commands.add_parser(
         "completion",
         help="Print a shell completion script for this command.",
@@ -8148,6 +8264,86 @@ def main() -> int:
     profile.add_argument("--env", action="append", default=[])
     profile.add_argument("--require-env", action="append", default=[])
     parser.epilog = command_help(commands)
+
+
+def selected_command(arguments: Sequence[str]) -> str | None:
+    """Reports the command a raw argument vector asks for.
+
+    Only the two options the root parser declares are stepped over, and any
+    other leading option, including an abbreviation argparse would accept,
+    answers that the command is unknown. An unknown command is answered with
+    the whole parser, so a reading this function is unsure about costs time
+    and never changes what argparse does with the arguments.
+
+    Args:
+        arguments: Arguments as typed, without the program name.
+
+    Returns:
+        The command name, or ``None`` when every command is needed.
+    """
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in ("-V", "--version"):
+            index += 1
+        elif token == "--home":
+            index += 2
+        elif token.startswith("--home="):
+            index += 1
+        elif token.startswith("-"):
+            return None
+        else:
+            return token
+    return None
+
+
+def root_parser(
+    typed: str | None,
+) -> tuple[argparse.ArgumentParser, CommandIndex]:
+    """Builds the root parser around the command that was typed.
+
+    Args:
+        typed: Command to build a parser for, or ``None`` for all of them.
+
+    Returns:
+        The root parser and the index recording what was declared.
+    """
+    parser = argparse.ArgumentParser(
+        prog="agent-parley",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage="agent-parley [--home DIR] COMMAND [ARGUMENTS]",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="store_true",
+        help="Print the installed version and exit.",
+    )
+    parser.add_argument(
+        "--home",
+        type=Path,
+        default=Path(
+            os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
+        ),
+        help="Private state directory (or AGENT_PARLEY_HOME).",
+    )
+    commands = CommandIndex(
+        parser.add_subparsers(
+            dest="command", metavar="COMMAND", help=argparse.SUPPRESS
+        ),
+        typed,
+    )
+    declare(parser, commands)
+    return parser, commands
+
+
+def main() -> int:
+    """Dispatches the CLI and returns an operational exit status."""
+    typed = selected_command(sys.argv[1:])
+    parser, commands = root_parser(typed)
+    if typed is not None and typed not in commands.declared:
+        parser, commands = root_parser(None)
     args = parser.parse_args()
     home = args.home.expanduser()
     if args.version:
