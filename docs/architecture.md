@@ -11,7 +11,7 @@ runs `participant merge`, and never on an agent's behalf.
 | --- | --- |
 | `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
 | `server` | Authenticated MCP transport and bounded tool contracts |
-| `store` | SQLite schema, migration, scoped mail, atomic leases and tool events |
+| `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
@@ -97,7 +97,7 @@ acknowledgement, and is read back beside peer traffic. Its sender row is created
 on first use and never carries a credential digest, so no bearer token resolves
 to it and no served session can write in its name. The name `operator` is
 reserved, so no participant, provider or credential profile can claim it. No
-tool is added for this: the served surface stays the eleven tools below.
+tool is added for this: the served surface stays the fourteen tools below.
 `agent-parley decide` records a decision on the same path and addresses no
 inbox, and `agent-parley decision list` reads the log back.
 
@@ -106,9 +106,11 @@ requests, and avoids credential/body logging. It supports stateless JSON respons
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent
 official MCP SDK exercises initialization and calls in CI.
 
-Eleven tools cover sending, fetching, acknowledging, marking read, reserving
-files, releasing reservations, listing participants, reading one thread,
-searching mail, searching decisions, and paging an attachment. Unknown
+Fourteen tools cover sending, fetching, waiting for mail, acknowledging,
+marking read, reserving files, queueing a request for a key a peer holds,
+cancelling that request, releasing reservations, listing participants, reading
+one thread, searching mail, searching decisions and recommending the next
+issue. Paging an attachment is served on the same authenticated path. Unknown
 arguments fail. A body
 above its cap is spilled whole to `attachments/` under the project state
 directory by `agent_parley/attachments.py`, keyed by an opaque
@@ -151,7 +153,8 @@ applying its 32-participant limit. Sending to either is refused with an
 explanation; retained mail remains available to a re-registered participant.
 
 No coordination tool returns a participant's whole starting context. The store
-holds projects, agents, messages, recipients, reservations and events, keyed by
+holds projects, agents, messages, recipients, reservations, the requests queued
+for them, and events, keyed by
 an authenticated project and lane. The issue ledger and the participant
 manifest are files in the project state directory, whose name derives from the
 repository's Git common directory, which the store never records. A served
@@ -463,6 +466,24 @@ reassigned, it still counts against the per-lane reservation cap, and it keeps
 blocking exactly the paths it already blocked until its owner releases it.
 That distinction lets a reader separate a lane still working on a path from a
 lane that died holding it, without any process deciding on that lane's behalf.
+
+`request_reservation` takes the same batch as `file_reservation_paths`. Where
+nothing conflicts it grants exactly the same leases, so a lane never has to ask
+twice. Where a peer holds a key it grants nothing and records one queued
+request per blocked key, and the refusal names the holder and the place in that
+key's queue beside the usual conflict. Asking again for a key already queued
+keeps the first request and its place. When the holder calls
+`release_file_reservations`, the release, the grant to the first queued lane
+and the one notice naming the granted keys are a single SQLite transaction, so
+no reader observes a released key with its queue untouched and no lane is told
+it holds a key it does not. A key another lane still holds stays queued. A
+queued request reserves nothing: it blocks no peer, holds no path and locks
+nothing on disk. `cancel_reservation_request` withdraws one request or every
+request of the calling lane, and revoking a lane's registration expires its
+queued requests in the same transaction, because a lane that can no longer be
+addressed can neither take a key nor be told that it did. `agent-parley status`
+names the requests queued on a lane's keys and who asked; `agent-parley top`
+marks the count with `+` in the `LEASES` column.
 No time-to-live applies to issue ownership, which changes hands only through
 release, or an explicit offer and acceptance.
 
@@ -623,6 +644,7 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | Participants per project | At most 32 |
 | Roster listing | At most 32 participants |
 | Active reservations | At most 128 per lane |
+| Queued reservation requests | At most 32 per lane |
 | Reservation time to live | Optional; 30–3,600 seconds when declared |
 | Reservation reason | 160 bytes stored; 80 characters reported on conflict |
 | Participant event log | Rotated at 262,144 bytes; one rotated file retained |

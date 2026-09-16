@@ -680,6 +680,16 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + supervision.base_advance_marker(advanced))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    if mail.get("queued_requests"):
+        print(
+            "    Reservation requests queued on its keys: "
+            f"{mail['queued_requests']}"
+            + (
+                " (" + ", ".join(mail["queued_by"]) + ")"
+                if mail.get("queued_by")
+                else ""
+            )
+        )
     print(f"    Last coordination: {mail['last_coordination_at']}")
     for pending in mail["outstanding_ack"]:
         print(
@@ -4128,6 +4138,11 @@ resource conflicts on an exact match. Reservations are advisory:
 if conflicts are returned, stop overlapping work, release the conflicting grant,
 and agree on ownership with the peer. Do not treat a granted lease as permission
 to ignore conflicts. Renew reservations before expiry while work continues.
+Use request_reservation instead when you intend to take a contested key next:
+it grants what is free and queues for what a peer holds, naming the holder and
+your place, and the holder's release grants it to you and sends you one notice.
+Withdraw a queued request with cancel_reservation_request when you no longer
+want the key; a queued request holds nothing until that release.
 
 Use checkpoint updates before each editing phase and before committing. Announce
 interface changes, decisions, and blockers; request acknowledgement for changes
@@ -5833,6 +5848,10 @@ attempt of the recorded budget, which is also only reported.
             "reservations": mail["reservations"],
             "stale_reservations": mail.get("stale_reservations", 0),
             "named_resources": list(mail.get("named_resources", [])),
+            "queued_requests": frame["usage"].get(name, {}).get("queued", 0),
+            "queued_by": list(
+                frame["usage"].get(name, {}).get("queued_by", [])
+            ),
             "last_coordination_at": views.timestamp(mail["last_coordination"]),
             "outstanding_ack": [
                 {

@@ -211,8 +211,34 @@ TOOLS = [
         ["paths"],
     ),
     _tool(
+        "request_reservation",
+        "Reserve the same keys, and where a peer holds one, queue for it "
+        "instead of failing; the refusal names the holder and your place. "
+        "The holder's release grants it and sends you one notice.",
+        {
+            "paths": {
+                "type": "array",
+                "items": TEXT,
+                "maxItems": 16,
+                "description": "Keys as file_reservation_paths takes them.",
+            },
+            "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
+            "exclusive": FLAG,
+            "reason": {**TEXT, "maxLength": 160},
+            "idempotency_key": RETRY_KEY,
+        },
+        ["paths"],
+    ),
+    _tool(
+        "cancel_reservation_request",
+        "Withdraw one queued reservation request, or every one of yours.",
+        {"request_id": INTEGER, "idempotency_key": RETRY_KEY},
+        [],
+    ),
+    _tool(
         "release_file_reservations",
-        "Release your file reservations.",
+        "Release your file reservations. A key another lane queued for is "
+        "granted to it here, and that lane is told in the same commit.",
         {"idempotency_key": RETRY_KEY},
         [],
     ),
@@ -807,7 +833,8 @@ class Handler(BaseHTTPRequestHandler):
         so it holds no lock while it sleeps, and it is told how long this
         service is willing to hold it open. Every other tool is the served
         call it has always been, and a delivered message wakes the lanes
-        waiting for one before the sender is answered.
+        waiting for one before the sender is answered. A release that grants
+        a queued request delivers such a message, so it wakes them too.
         """
         try:
             declared = self._declared_protocol()
@@ -840,7 +867,10 @@ class Handler(BaseHTTPRequestHandler):
                     )
             else:
                 result = store.call(self.server.home, actor, tool["name"], args)
-                if tool["name"] == "send_message":
+                if tool["name"] == "send_message" or (
+                    tool["name"] == "release_file_reservations"
+                    and result["granted"]
+                ):
                     waits.delivered()
             return {
                 "content": [

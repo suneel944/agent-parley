@@ -41,6 +41,8 @@ def lane(name: str, **changes: object) -> dict:
         "leases": 0,
         "stale_leases": 0,
         "lease_age": 0,
+        "queued": 0,
+        "queued_by": [],
         "injected_bytes": 0,
         "hook_events": 0,
         "denials": 0,
