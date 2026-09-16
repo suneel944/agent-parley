@@ -90,9 +90,13 @@ archived copy. The archive lands at
 manifest, `skills/` and `assets/`. `scripts/check_policy.py` fails the gate if
 either manifest drifts from the shape its directory reads.
 
-That archive is attached to the published release, so a portal upload starts
-from a released artifact rather than a local build; it is present on v0.6.0,
-v0.7.0 and v0.8.0. Neither catalog exposes a publishing API, so each new
+That archive is a release asset. `make release-artifacts` builds it into
+`dist/release` beside the wheel, the source tarball and the plugin archive,
+records its hash in `SHA256SUMS`, and `scripts/release_publish.py` requires it
+by name, so a release missing it fails instead of publishing. A portal upload
+therefore starts from a released artifact rather than a local build. Releases
+v0.6.0 through v0.9.1 carry the same archive, uploaded by hand after the fact.
+Neither catalog exposes a publishing API, so each new
 version still needs a manual upload through the portal. Claude mirrors pushes
 once a listing is live; Codex does not.
 
@@ -116,8 +120,8 @@ confirm the stated expectation before opening either form.
   `uv run --locked python scripts/check_policy.py`
 - The Codex submission archive builds from the repository.
   `make codex-bundle`
-- The published release carries that archive as an asset, so the portal upload
-  starts from a released artifact rather than a local build.
+- The published release carries that archive as an asset, attached by the
+  `Release` workflow with no manual upload.
   `gh release view vVERSION --json assets`
 - Neither manifest passes `claude plugin validate --strict`; the single
   `protocol` warning is expected and the gate runs without `--strict`.

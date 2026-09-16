@@ -68,6 +68,7 @@ def asset_names(version: str) -> set[str]:
         f"agent_parley-{version}-py3-none-any.whl",
         f"agent_parley-{version}.tar.gz",
         f"agent-parley-plugins-{version}.zip",
+        f"agent-parley-{version}-codex-skills.zip",
         "requirements.txt",
         "CHANGELOG.md",
         "RELEASE_NOTES.md",

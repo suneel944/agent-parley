@@ -2039,7 +2039,11 @@ The official catalog is curated separately; see
 For Codex, follow [OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission).
 This is a skills-only plugin. Submission requires a verified publisher, listing
 and policy URLs, a skill bundle, and review cases. `make codex-bundle` builds
-the skill bundle the portal accepts. The Codex listing is live; the Claude
+the skill bundle the portal accepts. `make release-artifacts` builds the same
+archive into `dist/release`, so every published release carries
+`agent-parley-VERSION-codex-skills.zip` as an asset with its hash in
+`SHA256SUMS`, and the portal step downloads a released file instead of
+building one locally. The Codex listing is live; the Claude
 submission is awaiting review.
 CI builds artifacts; it does not submit review forms.
 
@@ -2145,9 +2149,9 @@ After the GitHub draft's uploaded bytes have been verified against the local
 checksums, the workflow publishes the distribution to PyPI. It
 stages a clean `dist/pypi` directory holding only the two files the index
 accepts, the `agent_parley` wheel and the source tarball, copied by exact name
-from the verified `dist/release` bundle, so the plugin archive, the exported
-requirements file, the changelog, the release notes and the checksum manifest
-are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
+from the verified `dist/release` bundle, so the plugin archive, the Codex
+submission archive, the exported requirements file, the changelog, the release
+notes and the checksum manifest are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
 job requests a short-lived identity token through an `id-token: write`
 permission scoped to that job, and PyPI exchanges it for a one-time upload
 token, so the repository stores no PyPI API token and no publishing secret. The
