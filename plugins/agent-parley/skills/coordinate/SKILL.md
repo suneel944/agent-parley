@@ -96,6 +96,13 @@ Record outcomes with `agent-parley report --state partial|blocked|ready --summar
 Every `issue` transition and `report` accepts `--idempotency-key KEY`; a script
 that retries with the key it first used records one attempt, not two.
 
+When you check a peer's work, record what you found against the report itself:
+the `review_report` MCP tool, or `agent-parley report review ID --verdict
+pass|fail --evidence "what you checked"`. A lane cannot review its own report.
+The verdict is your own claim about work you did not do, so it is neither an
+approval nor independent verification; it appears in `status`, `top`, `report
+show` and the pull request body labelled as that claim.
+
 `agent-parley plan show` prints the recorded work order as a tree: which issues
 wait on which, and who owns each. Read it before choosing work. The edges are
 advisory, so a waiting issue is information, not a gate.
@@ -124,7 +131,8 @@ and `search_messages` or `agent-parley mail search QUERY` to locate prior
 decisions. Both are scoped to mail this lane sent or received. Replies can use
 `reply_to` or the existing `thread_id` with `send_message`.
 
-A message body is capped at 4,096 UTF-8 bytes, report `--evidence` at 4,096
+A message body is capped at 4,096 UTF-8 bytes, report and review `--evidence`
+at 4,096
 and a handoff summary at 2,048. Anything longer is attached automatically:
 the record keeps the first slice and ends with
 `[attachment message-12: 20480 bytes]`, and the peer's notice ends with that

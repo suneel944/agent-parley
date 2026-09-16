@@ -67,6 +67,7 @@ def test_one_project_prints_one_table(bridge, repo, paired, capsys):
         "SESSION",
         "BRANCH",
         "OUTCOME",
+        "REVIEW",
         "ISSUES",
         "MAIL",
         "LEASES",

@@ -545,6 +545,52 @@ def narrow(report: dict, selection: Selection) -> dict:
     return {**report, "projects": projects}
 
 
+def reviewed_line(review: dict) -> str:
+    """States one peer verdict as the claim it is.
+
+    Args:
+        review: Verdict record a peer wrote against a lane's report.
+
+    Returns:
+        One line naming the verdict, the peer that recorded it and the report
+        it judges, and saying that a verdict is that peer's own claim rather
+        than independent verification.
+    """
+    return (
+        f"Peer review: {review.get('verdict', '')} by "
+        f"{review.get('reviewer', '')} on report "
+        f"{review.get('report_id', '')}; a verdict is the reviewing lane's "
+        "own claim about work it did not do, not independent verification."
+    )
+
+
+def review_fields(review: dict | None) -> dict | None:
+    """Reports one peer verdict in the shape every snapshot carries it.
+
+    Args:
+        review: Verdict record a peer wrote, or None when none is recorded.
+
+    Returns:
+        The verdict, its reviewer, the report it judges, its evidence and its
+        age, with ``independent_verification`` false so a machine reader
+        carries the same limit the printed views state. None when no peer
+        recorded a verdict.
+    """
+    if not review:
+        return None
+    at = float(review.get("at", 0) or 0)
+    return {
+        "review_id": review.get("id", ""),
+        "report_id": review.get("report_id", ""),
+        "reviewer": review.get("reviewer", ""),
+        "verdict": review.get("verdict", ""),
+        "evidence": review.get("evidence", ""),
+        "recorded_at": views.timestamp(at or None),
+        "age_seconds": int(time.time() - at) if at else None,
+        "independent_verification": False,
+    }
+
+
 def shown_record(record: dict) -> str:
     """Formats one shown message or report for a terminal.
 
@@ -560,12 +606,15 @@ def shown_record(record: dict) -> str:
     """
     body = record.get("body_md", record.get("evidence", ""))
     attached = record.get("attachment_body")
+    review = record.get("review")
     fields = [
         f"{name}: {value}"
         for name, value in record.items()
-        if name not in ("body_md", "evidence", "attachment_body")
+        if name not in ("body_md", "evidence", "attachment_body", "review")
     ]
     text = "\n".join(fields) + "\n\n" + str(body)
+    if review:
+        text += f"\n\n{reviewed_line(review)}\n{review.get('evidence', '')}"
     if attached is not None:
         text += f"\n\n--- attachment {record.get('attachment')} ---\n{attached}"
     return text
@@ -649,6 +698,10 @@ def lane_detail(record: dict, data: dict) -> None:
         print(f"    Remaining: {record['remaining']}")
     if record["evidence"]:
         print(f"    Reported verification: {record['evidence']}")
+    if review := record["review"]:
+        print(f"    {reviewed_line(review)}")
+        if review["evidence"]:
+            print(f"    Peer review evidence: {review['evidence']}")
     if wake := record["wake"]:
         print(
             f"    Runtime wake: {wake['result']}; "
@@ -2009,7 +2062,10 @@ def hygiene_metadata(
 
 
 def pull_request_body(
-    state: dict, issues: list[str], template: str = ""
+    state: dict,
+    issues: list[str],
+    template: str = "",
+    review: dict | None = None,
 ) -> str:
     """Shapes one lane's recorded report into the repository template.
 
@@ -2019,16 +2075,29 @@ def pull_request_body(
     reference to every issue the lane still claims, which is what the
     repository hygiene gate requires of a pull request.
 
+    A verdict a peer recorded against that report travels with it under the
+    verification heading, labelled as the reviewing lane's own claim, so a
+    human reader of the pull request is never left treating a peer's check
+    as independent verification.
+
     Args:
         state: Recorded lane activity holding the reported outcome.
         issues: Repository issue numbers the lane claims.
         template: Optional project or repository Markdown template. Supports
-            dollar placeholders for summary, evidence, remaining and issues.
+            dollar placeholders for summary, evidence, remaining, issues,
+            outcome and review.
+        review: Latest peer verdict on the lane's report, or None when no
+            peer recorded one.
 
     Returns:
         Markdown for the pull-request body.
     """
     references = " ".join(f"Refs #{number}" for number in issues)
+    reviewed = (
+        f"{reviewed_line(review)}\n\n{review.get('evidence', '')}".strip()
+        if review
+        else "No peer recorded a review verdict on this report."
+    )
     evidence = (
         state.get("evidence", "").strip()
         or "The lane recorded no verification evidence."
@@ -2046,6 +2115,7 @@ def pull_request_body(
         f"{references}\n\n"
         "## Verification\n\n"
         f"{evidence}\n\n"
+        f"{reviewed}\n\n"
         "## Compatibility and risks\n\n"
         f"{remaining}\n"
     )
@@ -2057,6 +2127,7 @@ def pull_request_body(
         remaining=remaining,
         issues=references,
         outcome=state.get("outcome", "unknown"),
+        review=reviewed,
     )
     return rendered.rstrip() + "\n\n" + report
 
@@ -4025,7 +4096,12 @@ class Bridge:
             "--title",
             title,
             "--body",
-            pull_request_body(state, claimed, template)
+            pull_request_body(
+                state,
+                claimed,
+                template,
+                metrics.latest_review(directory, name),
+            )
             + "\n"
             + evidence.section(recorded),
             "--assignee",
@@ -5123,7 +5199,49 @@ attempt of the recorded budget, which is also only reported.
             record["attachment_body"] = attachments.body(
                 directory, str(record["attachment"]), agent
             )
+        if record.get("kind") == "report":
+            record["review"] = metrics.latest_review(
+                directory, agent, identifier
+            )
         return record
+
+    def review_report(
+        self, repo: Path, identifier: str, verdict: str, evidence: str
+    ) -> dict:
+        """Records this lane's verdict on a peer's report.
+
+        The worktree the command runs in selects the reviewing lane, exactly
+        as it selects the lane a report is written for, so the author of a
+        report cannot record a verdict on it. The verdict is that peer's own
+        claim about work it did not do: it is neither an operator approval nor
+        independent verification, and it moves no ownership.
+
+        Args:
+            repo: Assigned agent worktree of the reviewing lane.
+            identifier: Report record the verdict judges.
+            verdict: Reviewed outcome, pass or fail.
+            evidence: Nonempty account of what the reviewer checked.
+
+        Returns:
+            The recorded verdict.
+
+        Raises:
+            BridgeError: If the lane is unknown, no participant recorded the
+                report, the reviewing lane wrote it, or the verdict or its
+                evidence is invalid.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        return metrics.record_review(
+            directory,
+            list(data["participants"]),
+            agent,
+            identifier,
+            verdict,
+            evidence,
+        )
 
     def mail(
         self,
@@ -5684,6 +5802,7 @@ attempt of the recorded budget, which is also only reported.
             "summary": state.get("summary", ""),
             "remaining": state.get("remaining", ""),
             "evidence": state.get("evidence", ""),
+            "review": review_fields(metrics.latest_review(directory, agent)),
             "reported_at": views.timestamp(reported_at),
             "report_age_seconds": (
                 int(time.time() - reported_at) if reported_at else None
@@ -7061,6 +7180,27 @@ def main() -> int:
         help="Print the whole attached evidence after the record.",
     )
     showing_report.add_argument("--json", action="store_true", help=JSON_HELP)
+    reviewing_report = records.add_parser(
+        "review",
+        help="Record this lane's verdict on another lane's report.",
+    )
+    reviewing_report.add_argument("report_id")
+    reviewing_report.add_argument("--repo", type=Path, default=Path.cwd())
+    reviewing_report.add_argument(
+        "--verdict",
+        choices=metrics.VERDICTS,
+        required=True,
+        help=(
+            "What this lane found. The verdict is this lane's own claim "
+            "about work it did not do, not independent verification."
+        ),
+    )
+    reviewing_report.add_argument(
+        "--evidence",
+        default="",
+        help="What was checked; longer evidence is attached as a report's is.",
+    )
+    reviewing_report.add_argument("--json", action="store_true", help=JSON_HELP)
     report.add_argument("--remaining", default="")
     report.add_argument("--evidence", default="")
     report.add_argument(
@@ -7884,6 +8024,18 @@ def main() -> int:
                 views.render("report_show", record)
                 if args.json
                 else shown_record(record)
+            )
+        elif args.command == "report" and args.action == "review":
+            recorded = bridge.review_report(
+                args.repo.resolve(),
+                args.report_id,
+                args.verdict,
+                args.evidence,
+            )
+            print(
+                views.render("report_review", recorded)
+                if args.json
+                else shown_record(recorded)
             )
         elif args.command == "report":
             if not args.state or not args.summary:

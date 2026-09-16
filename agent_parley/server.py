@@ -20,6 +20,7 @@ from types import FrameType
 from agent_parley import (
     checkpoints,
     hook,
+    metrics,
     protocol,
     recommend,
     retries,
@@ -262,6 +263,20 @@ TOOLS = [
             "since": {**INTEGER, "minimum": 0},
         },
         [],
+    ),
+    _tool(
+        "review_report",
+        "Record your verdict on a peer's report, never your own. A verdict "
+        "is your claim, not independent verification.",
+        {
+            "report_id": {**TEXT, "maxLength": 32},
+            "verdict": {"type": "string", "enum": list(metrics.VERDICTS)},
+            "evidence": {
+                **TEXT,
+                "description": "What you checked; at most 4096 UTF-8 bytes.",
+            },
+        },
+        ["report_id", "verdict", "evidence"],
     ),
     _tool(
         "next_issues",

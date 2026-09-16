@@ -174,6 +174,21 @@ no claim, no assignment, no gate. `plan diff` previews the edges first,
 apply is versioned by the file's digest, so an edge added by hand afterwards is
 reported as exactly that.
 
+## A peer can record a verdict, and it is still a claim
+
+A report is the reporting lane's own account. `agent-parley report review ID
+--verdict pass|fail --evidence TEXT`, and the `review_report` MCP tool, let a
+second lane record what it found when it checked that work. The verdict is kept
+beside the report it judges, with the reviewer, the instant and the evidence,
+and evidence longer than a record's budget is attached exactly as a report's
+own evidence is. The report's author is refused: a lane cannot review itself.
+
+`status`, `top`, `report show` and the pull request body `participant pr`
+writes all carry the latest verdict, each labelled as the reviewing lane's own
+claim about work it did not do. A verdict is not independent verification, it
+is not the operator approval `agent-parley approve` records, and it gates no
+merge or pull request.
+
 ## No lane waits for a human to give it something to do
 
 When a lane holds no claim, its next checkpoint carries the unclaimed work no

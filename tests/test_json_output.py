@@ -2,10 +2,11 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, store, views
+from agent_parley import cli, metrics, store, views
 
 
 def run(monkeypatch, capsys, *arguments):
@@ -77,6 +78,29 @@ def test_status_reports_a_report_and_its_age(
     assert reported["evidence"] == "12 tests passed"
     assert reported["reported_at"].endswith("Z")
     assert reported["report_age_seconds"] >= 0
+    assert reported["review"] is None
+
+
+def test_status_reports_the_verdict_a_peer_recorded(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    lane = paired["lanes"]["claude"]
+    bridge.report(lane, "ready", "Engine built", "", "12 tests passed")
+    recorded = metrics.report_records(Path(lane).parent, "claude")[-1]["id"]
+    bridge.review_report(
+        Path(paired["lanes"]["codex"]), recorded, "fail", "One case regressed"
+    )
+    document = run(
+        monkeypatch, capsys, "--home", str(bridge.home), "status", "--json"
+    )
+    lanes = document["projects"][0]["participants"]
+    reviewed = next(row for row in lanes if row["participant"] == "claude")
+    assert reviewed["review"]["verdict"] == "fail"
+    assert reviewed["review"]["reviewer"] == "codex"
+    assert reviewed["review"]["report_id"] == recorded
+    assert reviewed["review"]["evidence"] == "One case regressed"
+    assert reviewed["review"]["recorded_at"].endswith("Z")
+    assert reviewed["review"]["independent_verification"] is False
 
 
 def test_status_text_still_prints_the_same_report(bridge, repo, paired, capsys):

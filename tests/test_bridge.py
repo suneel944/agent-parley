@@ -28,6 +28,7 @@ from agent_parley import (
     dashboard,
     evidence,
     forge,
+    metrics,
     process,
     roster,
     store,
@@ -2734,6 +2735,18 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
         bridge.pull_request(repo, "codex")
     bridge.issue(lane, "claim", "42")
 
+    recorded = [
+        record["id"]
+        for record in metrics.report_records(lane.parent, "codex")
+        if record.get("kind") == "report"
+    ][-1]
+    bridge.review_report(
+        Path(paired["lanes"]["claude"]),
+        recorded,
+        "pass",
+        "Reran the suite on the lane branch",
+    )
+
     head = git(repo, "rev-parse", branch)
     message = bridge.pull_request(repo, "codex")
     assert "https://github.com/example/agent-parley/pull/7" in message
@@ -2746,6 +2759,9 @@ def test_pull_request_pushes_one_lane_and_carries_its_recorded_report(
     assert options["--title"] == "feat: add the lane feature"
     assert "Lane result" in options["--body"]
     assert "make check: 181 passed" in options["--body"]
+    assert "Peer review: pass by claude" in options["--body"]
+    assert "not independent verification" in options["--body"]
+    assert "Reran the suite on the lane branch" in options["--body"]
     assert issue_numbers(options["--body"]) == {42}
     assert options["--assignee"] == "@me"
     assert options["--label"] == "enhancement"

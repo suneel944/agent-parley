@@ -70,7 +70,7 @@ READ_ONLY = (
     "search_messages",
     "wait_for_message",
 )
-ATTACHED = ("send_message", "read_attachment")
+ATTACHED = ("send_message", "read_attachment", "review_report")
 PRESENCE_WARNINGS = {
     "idle": ("idle", "idle; wake requested"),
     "stopped": ("unreachable", "unreachable"),
@@ -1981,6 +1981,10 @@ def _effect(
     """
     if tool == "send_message":
         return _send(db, actor, args, claim, directory)
+    if tool == "review_report":
+        if directory is None:
+            raise BridgeError(NO_PROJECT)
+        return _reviewed(directory, actor, args)
     if tool == "read_attachment":
         if directory is None:
             raise BridgeError("This project keeps no attachments.")
@@ -2023,6 +2027,57 @@ def _effect(
             raise BridgeError("Message is not in your inbox.")
         return {"id": message, "acknowledged": ack}
     raise BridgeError("Unknown coordination tool.")
+
+
+def _reviewed(directory: Path, actor: dict, args: dict) -> dict:
+    """Records the calling lane's verdict on a peer's report.
+
+    The lane behind the served call is the reviewer, so a lane can no more
+    review its own report over this tool than it can from its own command
+    line. The verdict is that lane's own claim about work it did not do: it
+    approves nothing, moves no ownership and gates no integration.
+
+    The report log lives in coordination state rather than in the store, so
+    the verdict is written where reports are kept and only its served call is
+    recorded here.
+
+    Args:
+        directory: Private state directory for the common repository.
+        actor: Authenticated project and lane.
+        args: Validated tool arguments.
+
+    Returns:
+        The recorded verdict.
+
+    Raises:
+        BridgeError: If the caller is not a registered participant, the
+            report identifier is malformed, no lane recorded that report, or
+            the calling lane wrote it.
+    """
+    from agent_parley import metrics
+
+    identifier = args.get("report_id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise BridgeError("report_id must name a recorded report.")
+    participants = roster.read(directory)["participants"]
+    reviewer = next(
+        (
+            name
+            for name, entry in participants.items()
+            if entry.get("display") == actor["name"]
+        ),
+        "",
+    )
+    if not reviewer:
+        raise BridgeError("This lane is not a participant of this project.")
+    return metrics.record_review(
+        directory,
+        list(participants),
+        reviewer,
+        identifier.strip(),
+        str(args.get("verdict", "")),
+        str(args.get("evidence", "")),
+    )
 
 
 def _identify(db: sqlite3.Connection, root: str, name: str) -> dict:
