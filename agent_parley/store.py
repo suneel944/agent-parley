@@ -2892,6 +2892,50 @@ def transfer_reservations(
     return moved
 
 
+def release_reservations(home: Path, root: str, name: str) -> list[str]:
+    """Releases every advisory reservation one lane still holds.
+
+    Reservations are advisory declarations of intent, never enforced file
+    system locks. A lane whose claims a peer has taken holds declarations that
+    no longer describe anybody's work, so the take releases them in one store
+    transaction and the keys read as free to whoever reserves them next.
+
+    Nothing is granted to the taking lane here: it reserves what it needs
+    itself, which keeps every grant a declaration a lane made for itself.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose reservations are released.
+
+    Returns:
+        The released keys, in sorted order, including a lease past its
+        declared time to live, which is still held until it is released.
+
+    Raises:
+        BridgeError: If no store exists or the identity is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home, write=True) as db:
+        holder = _identify(db, root, name)
+        released = [
+            row["path_pattern"]
+            for row in db.execute(
+                "SELECT path_pattern FROM file_reservations WHERE "
+                "project_id=? AND agent_id=? AND released_ts IS NULL "
+                "ORDER BY path_pattern",
+                (holder["project_id"], holder["id"]),
+            )
+        ]
+        db.execute(
+            "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+            "WHERE project_id=? AND agent_id=? AND released_ts IS NULL",
+            (holder["project_id"], holder["id"]),
+        )
+    return released
+
+
 def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
     """Reports every unreleased, unexpired reservation key for one project.
 

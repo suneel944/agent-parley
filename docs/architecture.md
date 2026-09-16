@@ -188,6 +188,15 @@ transactions, and observation failures do not fail a committed coordination
 call. `participant_presence` is an additive table initialized with the store.
 The issue ledger retains reminders; only explicit issue transitions own claims.
 
+The same poll marks the claims of a lane whose session process is gone and that
+has been silent past the stall threshold, writing an orphan marker on each of
+its ledger records and sending every other lane one notice that names those
+issues and the reservations the dead lane still holds. The marker is an
+observation: the issue keeps its owner and the reservations keep their holder
+until a peer records `issue claim --take-orphaned`, which writes a `take`
+transition naming the previous owner and the reason and then releases that
+owner's advisory reservations through `store.py`.
+
 The same poll delivers the operator items recorded in `scheduled_deliveries`,
 an additive table whose rows carry a not-before instant, a condition and a
 bounded repeat. Recording an item and delivering it are separate: `store.py`

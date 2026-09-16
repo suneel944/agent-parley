@@ -614,6 +614,14 @@ def lane_detail(record: dict, data: dict) -> None:
             + (f" {item}" if item else "")
         )
     for claim in record["claims"]:
+        if claim.get("orphaned"):
+            held = claim.get("orphan_reservations") or []
+            print(
+                f"    Issue #{claim['issue']} is orphaned: "
+                f"{claim['orphan_reason']}; still owned until a peer runs "
+                f"issue claim {claim['issue']} --take-orphaned"
+                + (f"; holds {', '.join(held)}" if held else "")
+            )
         if claim["overdue"]:
             print(
                 f"    Issue #{claim['issue']} is overdue by "
@@ -4448,6 +4456,7 @@ attempt of the recorded budget, which is also only reported.
         key: str = "",
         when_released: str = "",
         remaining: list[str] | None = None,
+        take_orphaned: bool = False,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -4491,10 +4500,14 @@ attempt of the recorded budget, which is also only reported.
                 supervision poll applies it once that release is recorded.
             remaining: Work the offering lane states as still to do, one item
                 per entry, recorded beside the summary.
+            take_orphaned: Whether this claim takes an issue the supervisor
+                marked orphaned, recording the previous owner and the reason.
 
         Returns:
             The whole ledger for list, or the resulting issue record. An
-            acceptance additionally reports the reservation keys that moved.
+            acceptance additionally reports the reservation keys that moved,
+            and a take reports the keys the orphaned owner's reservations
+            were released under.
 
         Raises:
             BridgeError: If lane, ownership, or transition checks fail.
@@ -4555,6 +4568,7 @@ attempt of the recorded budget, which is also only reported.
                 within=within,
                 defaults=data["deadlines"],
                 carried=carried,
+                take_orphaned=take_orphaned,
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
@@ -4562,6 +4576,7 @@ attempt of the recorded budget, which is also only reported.
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
+            record = self._free_orphaned(data, record)
             forge.assign(repo, parse_issue(number))
             likely = self._claim_forecast(
                 repo, directory, data, agent, parse_issue(number)
@@ -4672,6 +4687,47 @@ attempt of the recorded budget, which is also only reported.
                 "reservations_error": str(exc),
             }
         return {**record, "reservations_moved": moved}
+
+    def _free_orphaned(self, data: dict, record: dict) -> dict:
+        """Releases the reservations of the owner an orphaned claim was taken.
+
+        Reservations are advisory declarations of intent, never enforced file
+        system locks. The lane they named is gone, so the take releases them
+        rather than moving them: the taking lane declares for itself what it
+        is about to edit, and a peer reading a key is never told a dead lane
+        is working on it.
+
+        A store that cannot answer leaves every key where it was and reports
+        why beside the record, because a committed take is not reversed by a
+        failure to tidy the declarations it left behind.
+
+        Args:
+            data: Project manifest.
+            record: Persisted record the claim produced.
+
+        Returns:
+            The record unchanged when nothing was taken, and otherwise the
+            record carrying the released keys, or the reason none were.
+        """
+        import sqlite3
+
+        taken = record.get("taken") or {}
+        previous = taken.get("from")
+        if previous not in data["participants"]:
+            return record
+        try:
+            released = store.release_reservations(
+                self.home,
+                data["root"],
+                data["participants"][previous]["display"],
+            )
+        except (BridgeError, OSError, sqlite3.Error) as exc:
+            return {
+                **record,
+                "reservations_released": [],
+                "reservations_error": str(exc),
+            }
+        return {**record, "reservations_released": released}
 
     def _claim_forecast(
         self, repo: Path, directory: Path, data: dict, agent: str, number: str
@@ -5705,6 +5761,13 @@ attempt of the recorded budget, which is also only reported.
                     "offer": offer_state(record.get("offer")),
                     "handoff": handoff_fields(
                         record.get("offer") or record.get("handoff")
+                    ),
+                    "orphaned": bool(record.get("orphan")),
+                    "orphan_reason": (record.get("orphan") or {}).get(
+                        "reason", ""
+                    ),
+                    "orphan_reservations": list(
+                        (record.get("orphan") or {}).get("reservations", [])
                     ),
                 }
                 for number, record in sorted(
@@ -7116,6 +7179,17 @@ def main() -> int:
                     "over; ownership never moves on a deadline."
                 ),
             )
+        if action == "claim":
+            command.add_argument(
+                "--take-orphaned",
+                action="store_true",
+                help=(
+                    "Take an issue whose owner the supervisor marked "
+                    "orphaned, recording that owner and the reason. It "
+                    "releases the reservations that owner still held; a lane "
+                    "that is merely idle is never orphaned."
+                ),
+            )
         if action == "offer":
             command.add_argument("--to", required=True)
             command.add_argument("--summary", required=True)
@@ -7966,6 +8040,7 @@ def main() -> int:
                 key=getattr(args, "idempotency_key", ""),
                 when_released=getattr(args, "when_released", ""),
                 remaining=getattr(args, "remaining", None),
+                take_orphaned=getattr(args, "take_orphaned", False),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))

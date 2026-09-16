@@ -102,6 +102,10 @@ LEGEND = (
     "An issue marked ! is past its recorded deadline or its attempt "
     "budget. It is still owned: a deadline reports, and only an explicit "
     "release or an accepted handoff moves ownership.",
+    "An issue marked * is held by a lane whose session process is gone and "
+    "which has been silent past the stall threshold; the line under it "
+    "names those claims and the reservations that lane still holds. It is "
+    "still owned until a peer runs issue claim --take-orphaned.",
     "A lane with a token, call or hour budget carries a line showing the "
     "share consumed; over budget marks a crossed limit with !. The budget "
     "informs and does not gate: nothing is stopped or refused, and a token "
@@ -128,8 +132,9 @@ LEGEND = (
     "context. A message, report or offer above its cap is kept whole as "
     "an attachment and its record carries a reference; the attachment's "
     "size is never counted here, only the reference that named it.",
-    "A row carrying drift, a stale lease, a rejected call, an overdue "
-    "issue or a stopped session is drawn in colour where the terminal "
+    "A row carrying drift, a stale lease, a rejected call, an overdue or "
+    "orphaned issue or a stopped session is drawn in colour where the "
+    "terminal "
     "offers it and in bold where it does not. Every one of those also "
     "carries its own ! or word in the table, so a monochrome pipe reads "
     "exactly the same.",
@@ -262,6 +267,14 @@ def _row(
         if deadline_state(issues[number])["overdue"]
         or deadline_state(issues[number])["budget_exceeded"]
     ]
+    orphaned = [number for number in owned if issues[number].get("orphan")]
+    orphan_keys = sorted(
+        {
+            key
+            for number in orphaned
+            for key in issues[number]["orphan"].get("reservations", [])
+        }
+    )
     offers = sum(
         1
         for record in issues.values()
@@ -320,8 +333,12 @@ def _row(
         "owned": owned,
         "issues_held": len(owned),
         "overdue": overdue,
+        "orphaned": orphaned,
+        "orphan": supervision.orphan_marker(orphaned, orphan_keys),
         "issues": ",".join(
-            f"#{number}" + ("!" if number in overdue else "")
+            f"#{number}"
+            + ("!" if number in overdue else "")
+            + ("*" if number in orphaned else "")
             for number in owned
         )
         or "-",
@@ -563,15 +580,17 @@ def alert(row: dict) -> bool:
 
     Returns:
         True when the lane drifted from its assigned branch, holds a stale
-        lease, had a call rejected, owns an overdue issue, or its recorded
-        session process is gone. Each of those also prints its own textual
-        marker, so colour adds emphasis and never carries meaning alone.
+        lease, had a call rejected, owns an overdue or orphaned issue, or its
+        recorded session process is gone. Each of those also prints its own
+        textual marker, so colour adds emphasis and never carries meaning
+        alone.
     """
     return bool(
         row["drift"]
         or row["stale_leases"]
         or row["errors"]
         or row["overdue"]
+        or row.get("orphaned")
         or str(row["state"]).startswith("stopped")
     )
 
@@ -764,6 +783,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
                 lines.append(f"    {row['operator_edit']}")
             if row.get("base_advance"):
                 lines.append(f"    {row['base_advance']}")
+            if row.get("orphan"):
+                lines.append(f"    {row['orphan']}")
             if row.get("budget_marker"):
                 lines.append(f"    {row['budget_marker']}")
             if row["unfit"]:
