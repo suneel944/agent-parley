@@ -574,6 +574,8 @@ def _row(row: dict) -> dict:
         "leases": row["leases"],
         "stale_leases": row["stale_leases"],
         "lease_age_seconds": row["lease_age"],
+        "queued_requests": row["queued"],
+        "queued_by": list(row["queued_by"]),
         "injected_bytes": row["injected_bytes"],
         "hook_events": row["hook_events"],
         "denials": row["denials"],

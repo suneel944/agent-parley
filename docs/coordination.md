@@ -122,6 +122,19 @@ deadline passes, so a lane that died holding a path reads differently from one
 still working on it; nothing is revoked, and releasing it stays its owner's
 decision.
 
+A lane that means to take a contested key next calls `request_reservation`
+rather than polling the holder or asking a human to sequence the two. Free keys
+are granted exactly as `file_reservation_paths` grants them; a held key is
+queued, and the refusal names the holder and the lane's place in that key's
+queue. When the holder releases, the first queued lane is granted the key and
+receives one notice naming it, in the same store commit as the release, so the
+lane is never told it holds a key it does not.
+`cancel_reservation_request` withdraws a request, and revoking a lane's
+registration expires the requests it left behind. A queued request stays
+advisory like the reservation it asks for: it blocks nobody and holds nothing
+until that release. `status` names the requests queued on a lane's keys and who
+asked; `top` marks the count with `+` beside that lane's leases.
+
 An operator editing the base checkout is otherwise invisible to a lane until the
 merge conflicts. Every `top` and `status` frame reads `git status` of the base
 checkout once per project and matches the dirty paths against each lane's active

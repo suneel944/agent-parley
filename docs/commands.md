@@ -146,7 +146,9 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `mark_message_read` | Explicitly mark a received message read; takes an optional `idempotency_key`. |
 | `acknowledge_message` | Explicitly acknowledge a reviewed message; takes an optional `idempotency_key`. |
 | `file_reservation_paths` | Reserve advisory path patterns and report conflicts; takes an optional `idempotency_key`. |
-| `release_file_reservations` | Release reservations owned by this lane; takes an optional `idempotency_key`. |
+| `request_reservation` | Reserve the same keys, queueing for each one a peer holds instead of failing; the refusal adds `queued` entries naming the request, the holder and the place in that key's queue. Takes an optional `idempotency_key`. |
+| `cancel_reservation_request` | Withdraw one queued request by `request_id`, or every queued request of this lane when none is named; takes an optional `idempotency_key`. |
+| `release_file_reservations` | Release reservations owned by this lane; a released key another lane queued for is granted to the first of them and that lane is sent one notice in the same store commit. Takes an optional `idempotency_key`. |
 | `list_participants` | Discover addressable identities, tasks and last coordination times. |
 | `read_thread` | Page messages this lane sent or received in one thread. |
 | `search_messages` | Search only messages this lane sent or received. |

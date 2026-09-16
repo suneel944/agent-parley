@@ -505,7 +505,9 @@ retry never gains authority the first call was denied.
 
 Every `issue` transition and `report` accepts `--idempotency-key`. Over MCP the
 same contract is carried by the optional `idempotency_key` argument on
-`file_reservation_paths`, `release_file_reservations`, `acknowledge_message` and
+`file_reservation_paths`, `request_reservation`,
+`cancel_reservation_request`, `release_file_reservations`,
+`acknowledge_message` and
 `mark_message_read`; `send_message` has always required one. A replayed tool
 result carries `"replayed": true` beside the original fields.
 
@@ -1128,7 +1130,9 @@ participant carries `participant`, `identity`, `provider`, `credential`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
 `idle_seconds`, `idle_complete`, `waiting`, `wake` and `mail`, whose
-`named_resources` array lists the named resources that lane holds. `claims`
+`named_resources` array lists the named resources that lane holds, whose
+`queued_requests` counts the reservation requests waiting on the keys it holds
+and whose `queued_by` names the lanes that asked. `claims`
 carries one record per issue that lane owns, with its `deadline_at`, `overdue`,
 `overdue_seconds`, `attempts`, `budget` and `budget_exceeded`. `idle` carries
 `stalled`, the waiting item's `kind`, `message_id`, `sender` and `age_seconds`,
@@ -1143,9 +1147,12 @@ failing the document, exactly as the table reports coordination as unavailable.
 carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
 `stalled`, `stall`, `branch`, `drift`, `issues`, `offers`, `unread`,
 `pending_ack`, `leases`,
-`stale_leases`, `lease_age_seconds`, `injected_bytes`, `hook_events`,
+`stale_leases`, `lease_age_seconds`, `queued_requests`, `queued_by`,
+`injected_bytes`, `hook_events`,
 `denials`, `calls`, `errors`, `tokens`, `idle_seconds`, `idle_complete` and
-`prompt`. `tokens` is null when that
+`prompt`. `queued_requests` counts the reservation requests waiting on the keys
+that lane holds and `queued_by` names the lanes that asked; a queued request
+holds nothing itself. `tokens` is null when that
 lane's own session records could not be read, and `unread` and `pending_ack`
 are null when its mailbox could not be read: null states that nothing was read,
 never that the count is zero.

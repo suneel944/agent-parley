@@ -107,7 +107,8 @@ LEGEND = (
     "informs and does not gate: nothing is stopped or refused, and a token "
     "budget counts what the client recorded, not spend.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
-    "!past a declared time to live, with the age of the oldest; DENIALS "
+    "!past a declared time to live, +queued requests waiting on those "
+    "keys, with the age of the oldest; DENIALS "
     "denied or blocked of retained hook events; CALLS served MCP calls, "
     "!rejected; TOKENS what that lane's own native client recorded for "
     "its session, not billed spend and not comparable between vendors, "
@@ -118,7 +119,8 @@ LEGEND = (
     "does not claim to know what the native client was doing inside a "
     "turn. A branch marked ! left "
     "its assigned bridge branch. A stale lease is still held; releasing "
-    "it is its owner's to do.",
+    "it is its owner's to do, and a queued request takes the key only "
+    "when that release happens.",
     "FIT is the last capacity check the runtime read for that lane, with "
     "+ when an advisory work offer is waiting for it; the line under an "
     "unfit lane names the check that failed, and no offer names that "
@@ -328,6 +330,8 @@ def _row(
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
+        "queued": stats.get("queued", 0),
+        "queued_by": list(stats.get("queued_by", [])),
         "injected_bytes": events["injected_bytes"],
         "hook_events": events["events"],
         "denials": events["denials"],
@@ -541,6 +545,7 @@ def _cells(row: dict) -> tuple[str, ...]:
         f"{row['unread']}/{row['pending_ack']}",
         f"{row['leases']}"
         + (f"!{row['stale_leases']}" if row["stale_leases"] else "")
+        + (f"+{row['queued']}" if row["queued"] else "")
         + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
         tables.size(row["injected_bytes"]),
         f"{row['denials']}/{row['hook_events']}",

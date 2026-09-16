@@ -56,7 +56,8 @@ worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
   previews, fetch bodies only when needed, and avoid repeated empty inbox polling.
 - Retry a failed write with the `idempotency_key` it first carried. The repeat
   returns the first result and writes nothing further. A retry without a key can
-  reserve twice, so `file_reservation_paths`, `release_file_reservations`,
+  reserve twice, so `file_reservation_paths`, `request_reservation`,
+  `cancel_reservation_request`, `release_file_reservations`,
   `acknowledge_message` and `mark_message_read` all accept one. The same key with
   different arguments is refused, and a refused call replays as the same refusal.
 - To hand off, stop editing the issue and run `agent-parley issue offer NUMBER
@@ -144,7 +145,19 @@ those and a named resource conflicts on an exact match. A granted reservation
 may carry `forecast`: files that habitually change together with a reserved
 path and that a peer holds now, each with `path`, `peer` and `count`. It is
 advisory; message the peer to sequence the work rather than editing the
-forecast path. `list_participants` discovers
+forecast path.
+
+`request_reservation` takes the same keys and is the call to use when you mean
+to take a contested one next. Free keys are granted exactly as
+`file_reservation_paths` grants them; a key a peer holds is queued, and each
+`queued` entry names the `id` of your request, the `owner` holding the key and
+your `position` in its queue. When that owner calls
+`release_file_reservations`, the first queued lane is granted the key and told
+so in one notice, in the same store commit as the release. Asking again for a
+key you already queued keeps your first place. `cancel_reservation_request`
+withdraws one request by `request_id`, or all of yours when you name none. A
+queued request is not a lock and holds nothing: keep working elsewhere until
+the notice arrives. `list_participants` discovers
 current identities; do not guess who is addressable.
 
 `agent-parley top --once` prints a snapshot; `top --provider NAME --since 6h`
