@@ -1861,7 +1861,8 @@ can require classification explicitly. The private `project.json` accepts a
     "change_type_labels": ["bug", "enhancement"],
     "require_label": false,
     "milestone": "match",
-    "body_template": "## Review checklist\n\n- [ ] Reviewed"
+    "body_template": "## Review checklist\n\n- [ ] Reviewed",
+    "self_service": false
   }
 }
 ```
@@ -1883,6 +1884,27 @@ state. The body names the slice and its SHA-256 digest; it is not uploaded or
 committed automatically. Counts cover retained observations, so missing or expired
 records cannot prove that no event occurred. Older logs did not distinguish
 reservation conflicts from successful calls.
+
+`self_service` is the repository's standing authorization for a lane to run
+`participant pr` for its own work from its own worktree. It is `false` unless
+the project sets it, and with it off nothing changes: `participant pr` stays an
+operator command that excludes a live lane session. With it on, that one
+command, run inside the lane it names, is admitted while every condition holds:
+the lane reported `ready`, the project configures a verification command, the
+lane still sits on its assigned branch, and no peer holds an advisory
+reservation over a path the branch changed. The gate itself still runs in the
+lane during the push, so the pull request is opened after a green gate and not
+merely after a claim of one. A condition that does not hold refuses the command
+and names that condition; unreadable reservation state is a refusal too, since
+it rules no overlap out. Advisory reservations stay advisory: an overlap
+withholds this unattended step, it does not deny anyone access to a file.
+
+A self-opened pull request carries what authorized it. The recorded review
+evidence names the policy, the participant, the gate command, how many changed
+paths were cleared, the peers holding reservations at the time, and the branch,
+both in the pull-request body and in the integration record kept in private
+project state. `participant merge` remains operator-only under every setting,
+and authentication is still the native `gh` CLI's own, with no added flag.
 
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's

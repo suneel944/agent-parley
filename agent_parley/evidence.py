@@ -136,7 +136,9 @@ def publish(directory: Path, record: dict) -> str:
 
     Args:
         directory: Project state directory beside participant worktrees.
-        record: Collected evidence and independently executed gate result.
+        record: Collected evidence, the independently executed gate result
+            and, for a pull request a repository policy let the lane open
+            itself, the conditions that authorized it.
 
     Returns:
         Markdown naming the measurements and the artifact's SHA-256 digest.
@@ -152,6 +154,18 @@ def publish(directory: Path, record: dict) -> str:
         f"exit status {gate['exit_status']}."
         if gate
         else "No verification command configured; no gate was executed."
+    )
+    authorization = record.get("authorization")
+    authorized = (
+        f"Opened by {authorization['participant']} itself under the "
+        f"repository policy `{authorization['policy']}`: a ready report, "
+        f"the gate `{authorization['gate']}` above, "
+        f"{authorization['changed_paths']} changed paths clear of the "
+        "reservations held by "
+        + (", ".join(authorization["peers_holding_reservations"]) or "no peer")
+        + f", and the lane still on `{authorization['branch']}`.\n\n"
+        if authorization
+        else ""
     )
     reasons = (
         ", ".join(
@@ -172,6 +186,7 @@ def publish(directory: Path, record: dict) -> str:
     return (
         f"{SECTION_HEADING}\n\n"
         f"Commit: `{record['head']}`. {gate_text}\n\n"
+        f"{authorized}"
         f"Retained hook denials by reason: {reasons}.\n\n"
         f"Advisory reservations held during the claim: {paths}. "
         f"Recorded conflicting requests: {record['reservation_conflicts']}.\n\n"

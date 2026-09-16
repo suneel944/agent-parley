@@ -134,6 +134,18 @@ repair. It uses your own `gh` sign-in, refuses when there is no report, no
 claimed issue, no change type on that issue or nothing to push, and reports an
 already-open pull request rather than opening a second one.
 
+That command is yours by default, and a lane that reports ready waits for you to
+run it. A repository that would always say yes can say so once instead, with
+`"pull_request": {"self_service": true}` in its private `project.json`. The lane
+may then run `agent-parley participant pr` for its own work from its own
+worktree, while its session is still live, but only after it reported `ready`,
+only when the project configures a verification command and that command passes
+during the push, only while the lane still sits on its assigned branch, and only
+when no peer holds an advisory reservation over a path the branch changed.
+Anything else refuses and names the condition that failed. The pull request
+records the policy and those conditions beside its gate evidence. Merging is
+never covered: `participant merge` stays yours.
+
 ## Integrating several lanes
 
 With several lanes finished, integrate them as a set instead of deciding the

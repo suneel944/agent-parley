@@ -424,6 +424,19 @@ a branch that adds no commits to the project base, and a base checkout on a
 detached HEAD or on the lane's own branch. An open pull request for the branch
 is reported instead of replaced by a second one.
 
+The command excludes a live lane launch through that lane's session lock. A
+project whose manifest sets `pull_request.self_service` also admits the lane
+itself, run from its own worktree for its own name, under a separate
+integration lock rather than that session lock, because there the live session
+is the caller. The manifest is the only place the authorization lives, it is
+off unless written, and the admitted path evaluates the repository's conditions
+before anything is pushed: a `ready` report in lane activity, a configured
+verification command, the assigned branch still checked out in the lane, and no
+peer entry in the store's active reservations overlapping the paths the branch
+changed. The conditions travel with the evidence record and the integration
+record, so a self-opened pull request states what authorized it. `participant
+merge` takes no such policy and stays an operator command.
+
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
 reservations continue to resolve.

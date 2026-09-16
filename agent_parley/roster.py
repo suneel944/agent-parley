@@ -1033,6 +1033,10 @@ def approval_steps(value: object) -> list[str]:
 def pull_request_policy(value: dict) -> dict:
     """Validates optional project pull-request metadata and body settings.
 
+    The ``self_service`` setting is the repository's authorization for a
+    lane to open the pull request for its own work. It is off by default,
+    so a project that does not set it keeps the operator step it has today.
+
     Args:
         value: Policy object from the private project manifest.
 
@@ -1047,6 +1051,7 @@ def pull_request_policy(value: dict) -> dict:
         "require_label",
         "milestone",
         "body_template",
+        "self_service",
     }:
         raise BridgeError("Invalid pull_request policy in project manifest.")
     labels = value.get("change_type_labels", [])
@@ -1061,6 +1066,8 @@ def pull_request_policy(value: dict) -> dict:
         raise BridgeError("change_type_labels must be a list of label names.")
     if type(value.get("require_label", False)) is not bool:
         raise BridgeError("require_label must be a boolean.")
+    if type(value.get("self_service", False)) is not bool:
+        raise BridgeError("self_service must be a boolean.")
     if value.get("milestone", "match") not in {"match", "required", "ignore"}:
         raise BridgeError("milestone must be match, required, or ignore.")
     template = value.get("body_template", "")
