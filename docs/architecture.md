@@ -35,6 +35,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
+| `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |

@@ -112,6 +112,13 @@ Use `fetch_inbox` with `unread` or `unacknowledged` to find pending mail; rows
 carry `read_ts` and `ack_ts`. Fetching changes neither. Page with `after_id`,
 request bodies only when needed, and use `body_offset` for long bodies.
 `mark_message_read` records reading; `acknowledge_message` records review.
+After asking a peer something you cannot continue without, call
+`wait_for_message` with that `thread_id` instead of polling `fetch_inbox` or
+ending your turn: it returns the reply as soon as it lands, and an expired wait
+returns an empty page. Wait when the answer is minutes away and the work
+resumes with it. Report what you did and stop when the peer is unreachable or
+paused, when the answer needs a human decision, or when a wait has already
+expired once; waiting twice for a silent peer buys nothing.
 Use `read_thread` or `agent-parley mail thread ID` to recover a conversation,
 and `search_messages` or `agent-parley mail search QUERY` to locate prior
 decisions. Both are scoped to mail this lane sent or received. Replies can use
