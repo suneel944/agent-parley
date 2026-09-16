@@ -37,6 +37,7 @@ on standard output and export to a file.
 | `issue list` | Show claims, dependencies and handoff offers; each offer carries the offering lane's head commit, the reservations that move with it and its remaining work. |
 | `issue show NUMBER` | Show one issue: its owner, deadline, attempts, blockers, pending offer, the reservations its owner holds and its recorded history. |
 | `issue next` | Rank the unclaimed, unblocked issues this lane could take next, each with the reason for its place: the plan group already under way, the issues it unblocks, the peer reservations and forecast collisions its likely paths run into, and the provider it declares. It claims nothing; `--limit` bounds the list. |
+| `issue match GOAL` | List the open issues whose recorded title or forge labels share subject words with a stated goal, marking the ones a peer already owns and naming the peer reservations those words run into. It is read only: a match is a reason to read the issue and claim or negotiate for it rather than open a second number for the same work, and no match is a recorded reason to open one. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
 | `issue claim NUMBER --take-orphaned` | Take an issue whose owner reads as orphaned, recording the previous owner and the reason and releasing the reservations that owner held. |
 | `issue release NUMBER` | Release ownership without closing the GitHub issue. |
@@ -117,7 +118,8 @@ on standard output and export to a file.
 Every read-only command above also accepts `--json` and prints exactly one JSON
 document, so a script, a shell prompt or another agent reads coordination state
 without parsing a table: `status`, `top`, `version`, `issue list`,
-`issue show`, `issue next`, `participant list`, `participant show`, `mail thread`,
+`issue show`, `issue next`, `issue match`, `participant list`, `participant show`,
+`mail thread`,
 `mail search`, `mail list`, `mail pending`, `decision list`, `approval show`,
 `verify show`, `init show`, `branch show`, `forge show`, `state show`,
 `provider list`, `provider show`, `credentials list` and `credentials show`.

@@ -301,6 +301,61 @@ def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
     return sorted(paths)[:MAX_PATHS]
 
 
+def open_issues(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, dict]:
+    """Reads the open issues the forge records, with their titles and labels.
+
+    A lane about to open an issue needs to know whether the work is already
+    tracked, and only the forge knows what is open. The whole list is read in
+    one bounded call for the same reason ``issue_providers`` reads it that
+    way. A forge that is missing, slow or unwilling reports nothing, and the
+    caller states that it found nothing rather than that nothing exists.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        limit: Most open issues to read in the one call.
+
+    Returns:
+        Bare issue number to its recorded title and label names.
+    """
+    if _implementation(repo) != "github":
+        return {}
+    project = _reachable(repo)
+    if project is None:
+        return {}
+    output = _run(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            project,
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            "number,title,labels",
+        ],
+        15,
+    )
+    if output is None:
+        return {}
+    catalog: dict[str, dict] = {}
+    try:
+        for record in json.loads(output):
+            catalog[str(int(record["number"]))] = {
+                "title": str(record.get("title") or ""),
+                "labels": sorted(
+                    str(label["name"])
+                    for label in record.get("labels") or []
+                    if label.get("name")
+                ),
+            }
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    return catalog
+
+
 def issue_providers(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, str]:
     """Reads the provider each open issue declares through a label.
 

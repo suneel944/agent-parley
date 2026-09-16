@@ -4830,6 +4830,52 @@ attempt of the recorded budget, which is also only reported.
             ),
         }
 
+    def issue_match(
+        self, repo: Path, goal: str, limit: int = recommend.MAX_SHORTLIST
+    ) -> dict:
+        """Lists the open issues a stated goal already describes.
+
+        A lane that opens a second issue for tracked work splits one task
+        across two numbers, and the split is invisible from inside a single
+        worktree. This reads the forge's open issues, the ledger's ownership
+        and the reservations peers hold, and reports what the goal's own
+        words already match. It writes nothing and claims nothing.
+
+        Args:
+            repo: Assigned worktree, which names the lane doing the reading.
+            goal: What the lane intends to do, in the operator's words.
+            limit: Most matches to return.
+
+        Returns:
+            The goal, the words it matched on, the peer reservations those
+            words run into, and the matching open issues.
+
+        Raises:
+            BridgeError: If the worktree belongs to no registered lane.
+        """
+        import sqlite3
+
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        forge.select(repo, data)
+        try:
+            held = store.active_reservations(self.home, data["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            held = {}
+        held.pop(data["participants"][agent]["display"], None)
+        return {
+            "participant": agent,
+            **recommend.match(
+                goal,
+                forge.open_issues(repo),
+                snapshot(directory),
+                held,
+                limit,
+            ),
+        }
+
     def issue_assign(
         self,
         repo: Path,
@@ -7254,6 +7300,26 @@ def main() -> int:
         metavar="COUNT",
         help="Most candidates to list; five when omitted.",
     )
+    matching = actions.add_parser(
+        "match",
+        help=(
+            "List the open issues a stated goal already describes, so work "
+            "the forge tracks is claimed rather than opened twice."
+        ),
+    )
+    matching.add_argument("--repo", type=Path, default=Path.cwd())
+    matching.add_argument("--json", action="store_true", help=JSON_HELP)
+    matching.add_argument(
+        "goal",
+        help="What this lane intends to do, in your own words.",
+    )
+    matching.add_argument(
+        "--limit",
+        type=int,
+        default=recommend.MAX_SHORTLIST,
+        metavar="COUNT",
+        help="Most matches to list; five when omitted.",
+    )
     assigning = actions.add_parser(
         "assign",
         help="Offer an issue to a lane as the operator, or withdraw it.",
@@ -8029,6 +8095,15 @@ def main() -> int:
                 views.render("issue_next", ranked)
                 if args.json
                 else recommend.render(ranked)
+            )
+        elif args.command == "issue" and args.action == "match":
+            goal_matches = bridge.issue_match(
+                args.repo.resolve(), args.goal, args.limit
+            )
+            print(
+                views.render("issue_match", goal_matches)
+                if args.json
+                else recommend.render_match(goal_matches)
             )
         elif args.command == "issue" and args.action == "assign":
             if args.unassign and args.name:

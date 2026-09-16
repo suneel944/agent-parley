@@ -38,6 +38,19 @@ agent-parley issue next --limit 3
 agent-parley issue claim 42
 ```
 
+The reading before that one is whether the work is recorded at all.
+`agent-parley issue match "GOAL"` lists the open issues whose recorded title or
+forge labels share subject words with what the lane intends to do, marks the
+ones a peer owns, and names the peer reservations the same words run into.
+Opening a second issue for tracked work splits one task across two numbers, and
+no lane can see that split from inside its own worktree. The match is shallow
+on purpose: shared words are a reason to read the issue, never proof that it is
+the same work, and an empty result is the recorded reason to open a new issue.
+
+```sh
+agent-parley issue match "make the status command start faster"
+```
+
 ## What travels with a handoff
 
 An offer carries the state a peer needs to take the work over rather than a

@@ -36,6 +36,36 @@ Do not launch nested interactive agents from a tool call or silently move an
 existing session. The plugin supplies this workflow; the launcher supplies
 worktrees, MCP configuration, identity credentials, and trusted lifecycle hooks.
 
+## Check the installation before blaming coordination
+
+`agent-parley doctor` reads the launcher version and wire protocol, the
+protocol each shipped plugin declares, the store schema against the one this
+build writes, and the code a running service answers from. It writes nothing
+and repairs nothing, so it is safe while lanes are working. Run it when a
+coordination call fails in a way the error does not explain, and report the
+component it names and the one command that component needs. `doctor --json`
+carries the same reading for a programmatic check. A stale service means the
+sources moved under a running process; an inconsistent store means this build
+queries columns the store does not have. Neither is fixed by retrying the
+call.
+
+Example situation: "My reservation call just failed with something about a
+column, and my peer says theirs works. Find out whether my installation is the
+odd one out before I touch the code."
+
+## Match a goal to a recorded issue before opening a new one
+
+`agent-parley issue match "GOAL"` lists the open issues whose recorded title
+or forge labels share subject words with a stated goal, marks the ones a peer
+already owns, and names the peer reservations those same words run into. It
+claims nothing and opens nothing. Run it before opening an issue: work the
+forge already tracks should be claimed, or negotiated for, rather than opened
+twice under a second number. A match is a prompt to read the issue, not proof
+that it is the same work, and no match is a recorded reason to open one.
+
+Example situation: "Before I file anything, check whether the slow status
+command is already tracked, and tell me if someone is holding it."
+
 ## Claim, work, and hand off
 
 - Before choosing an issue, run `agent-parley issue next`, or call the
