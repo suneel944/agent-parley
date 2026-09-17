@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.10.0](https://github.com/suneel944/agent-parley/compare/v0.9.1...v0.10.0) (2026-09-17)
+
+
+### Features
+
+* add version, show verbs, --json everywhere and one repo flag (#317) ([#270](https://github.com/suneel944/agent-parley/issues/270))
+* close the 0.10.0 milestone across coordination, listing and startup ([#144](https://github.com/suneel944/agent-parley/issues/144)) ([#250](https://github.com/suneel944/agent-parley/issues/250)) ([#252](https://github.com/suneel944/agent-parley/issues/252)) ([#254](https://github.com/suneel944/agent-parley/issues/254)) ([#255](https://github.com/suneel944/agent-parley/issues/255)) ([#263](https://github.com/suneel944/agent-parley/issues/263)) ([#264](https://github.com/suneel944/agent-parley/issues/264)) ([#265](https://github.com/suneel944/agent-parley/issues/265)) ([#267](https://github.com/suneel944/agent-parley/issues/267)) ([#268](https://github.com/suneel944/agent-parley/issues/268)) ([#273](https://github.com/suneel944/agent-parley/issues/273)) ([#274](https://github.com/suneel944/agent-parley/issues/274)) ([#302](https://github.com/suneel944/agent-parley/issues/302))
+* deliver coordination to a lane whose CLI raises no hooks (#318) ([#269](https://github.com/suneel944/agent-parley/issues/269))
+* keep a project-wide decision log that every lane can search (#316) ([#266](https://github.com/suneel944/agent-parley/issues/266))
+* let a lane wait for its next mail over MCP (#319) ([#260](https://github.com/suneel944/agent-parley/issues/260))
+* let an operator read the mail of a lane from the main checkout (#321) ([#283](https://github.com/suneel944/agent-parley/issues/283))
+* recommend the next issue for a lane with the reason for each place (#320) ([#262](https://github.com/suneel944/agent-parley/issues/262))
+
+### Bug fixes
+
+* reap the launcher a wake starts so the service sheds zombies (#314) ([#301](https://github.com/suneel944/agent-parley/issues/301))
+* report no age for a lane that has recorded no activity (#313) ([#312](https://github.com/suneel944/agent-parley/issues/312))
+
+### Performance
+
+* resolve a project directory from a cached root index (#315) ([#303](https://github.com/suneel944/agent-parley/issues/303))
+
 ## [0.9.1](https://github.com/suneel944/agent-parley/compare/v0.9.0...v0.9.1) (2026-09-15)
 
 
