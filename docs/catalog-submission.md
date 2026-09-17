@@ -237,9 +237,20 @@ skill needs: it reads coordination state in a conversation and writes claims,
 reservations and handoffs. `interface.defaultPrompt` carries three starter
 prompts. The directory keeps at most three and truncates any entry past 128
 characters, and the bundle check fails rather than letting either happen
-silently. Each prompt states a situation, naming the peers, the file and the
-outcome wanted, because a bare command reads as documentation rather than a
-reason to install.
+silently. Each prompt states a situation, naming the peers and the work in
+hand, because a bare command reads as documentation rather than a reason to
+install.
+
+Each prompt also ends in changed state rather than an answer, and covers one
+moment that a single agent cannot reach: splitting a milestone across lanes
+and starting parallel work, taking over a stalled lane's work with its commit
+and checks, and reviewing a peer's reported outcome against its recorded
+evidence before it lands. A prompt that only asks who holds what describes a
+status viewer. A prompt that stages two lanes overwriting one file advertises
+the collision that worktrees and advisory reservations exist to prevent, and a
+prompt about renewing or queueing a reservation shows plumbing the protocol
+runs without being asked. The references stay generic, because the listing
+describes the reader's repository rather than this one.
 
 The skill frontmatter itself is in good shape: `name` is `coordinate` and the
 `description` is 211 characters covering both what the skill does and when to
