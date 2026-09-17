@@ -34,6 +34,22 @@
 
 ## See it
 
+Under ninety seconds of one real run: two lanes on two providers, a claim, an
+advisory reservation, the collision a second lane meets on the same path and
+the request it queues instead, a handoff offered and accepted with its
+reservations, the dashboard, and a native hook refusing a branch switch.
+
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/demo.svg" width="900" alt="A terminal recording of two lanes claiming an issue, colliding on a reservation, queueing a request, handing the issue over and being refused a branch switch">
+</p>
+
+Every frame is captured command output, never typed prose. The coordination
+path is the shipped one; only the native client is a stand-in, so no model was
+called.
+[`scripts/record_demo.py`](https://github.com/suneel944/agent-parley/blob/main/scripts/record_demo.py)
+drives that run against a temporary project and writes the animation, and
+`make demo` reproduces it.
+
 One screen for every lane: session state, branch drift, issues owned, handoffs
 pending, unread mail, held reservations, delivered context, what enforcement
 denied, and what that lane's own client recorded for its session. Read-only, no
@@ -133,6 +149,13 @@ agent-parley participant merge claude-2
 agent-parley participant pr claude-2
 ```
 
+A repository can also authorize the second of those for the lane itself, with
+`pull_request.self_service` in its private project settings. It is off by
+default; with it on, a lane opens the pull request for its own work only after
+a ready report, a configured gate that passes, its own assigned branch and no
+peer reservation over the paths it changed, and every such pull request records
+what authorized it. Merging stays an operator step either way.
+
 [Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md)
 covers the rest of the operator surface:
 deferred and bulk steering, pausing, stopping and restarting a lane, the
@@ -195,6 +218,88 @@ The coordination engine is built in-house with Python's standard library. It has
 no runtime dependencies and makes no model calls. Your existing logins and
 permission settings still apply.
 
+## Notifications when you step away
+
+A lane can wait a long time on a handoff acceptance, a permission prompt or a
+fresh claim. Agent Parley can forward that moment to a Telegram bot or an email
+address, outbound only: nothing comes back, no command arrives over the channel,
+and a native permission prompt is still answered only in your terminal.
+
+Five changes notify, and nothing else: a handoff offered to a lane, a lane
+blocked on a native permission prompt, a lane idle with no claim past the
+project's `stalled_after` grace period, a lane run that finished, and a hook
+refusal such as a branch switch or detected drift. A situation that has not
+changed sends nothing further. Sending never blocks a hook or a tool call, a
+failed send is recorded in the lane's event log and dropped, and nothing is
+queued for a retry.
+
+Configuration is entirely environment variables, read by the service and the
+launcher; no token is ever written into coordination state.
+
+| Variable | Meaning |
+| --- | --- |
+| `AGENT_PARLEY_NOTIFY` | Comma-separated transports: `telegram`, `email`, or both. Unset means notifications are off. |
+| `AGENT_PARLEY_TELEGRAM_TOKEN` | Bot token from BotFather. |
+| `AGENT_PARLEY_TELEGRAM_CHAT` | Chat identifier the bot posts to. |
+| `AGENT_PARLEY_SMTP_HOST` | SMTP server host. |
+| `AGENT_PARLEY_SMTP_PORT` | SMTP port; defaults to 587, or 465 with implicit TLS. |
+| `AGENT_PARLEY_SMTP_TLS` | `starttls` (default), `implicit` or `none`. |
+| `AGENT_PARLEY_SMTP_USER` | SMTP user; omit for a server that needs no login. |
+| `AGENT_PARLEY_SMTP_PASSWORD` | SMTP password. |
+| `AGENT_PARLEY_SMTP_FROM` | Sender address. |
+| `AGENT_PARLEY_SMTP_TO` | Comma-separated recipients. |
+
+```bash
+export AGENT_PARLEY_NOTIFY=telegram,email
+agent-parley notify test
+```
+
+`notify test` sends one message on each configured transport and prints what
+each one answered, so credentials are verified before a lane depends on them.
+It exits 1 when any transport refuses.
+
+## Asking for status from the chat
+
+The same Telegram bot can answer one question and only one: what is everything
+doing. Send `status` with the filters `agent-parley status` takes, and the
+reply is the reading that command prints. Nothing else crosses the channel: no
+claim, no handoff, no wake, no permission approval, and no free text into a
+session. The service long-polls the Bot API from inside itself, so no port is
+opened and no webhook is registered.
+
+Every message starts with a passcode, and both the passcode and the chat
+identifier must match:
+
+```
+hunter2-and-then-some status --pending
+hunter2-and-then-some status codex
+hunter2-and-then-some status --provider claude --issue 14
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `AGENT_PARLEY_INBOUND` | `telegram` turns the reader on. Unset means no inbound path at all. |
+| `AGENT_PARLEY_INBOUND_PASSCODE` | Passcode every message must start with; at least 12 characters. |
+
+The bot token and chat identifier are the outbound ones above. A message from
+another chat, or with a wrong passcode, gets no reply at all: silence, not a
+hint. Five wrong passcodes inside ten minutes lock the inbound path for an hour
+and send one outbound notification saying so; the counter and the lock live
+only in memory. Only a salted hash of the passcode is held, compared in
+constant time, and it is never written to coordination state, the event log or
+the service log. The accepted message is deleted from the chat when the bot has
+permission, so the passcode does not sit in the history. A reading longer than
+one Telegram message is cut with a line naming how many rows were left out.
+
+The reader refuses to start when the passcode is unset or shorter than twelve
+characters, and `agent-parley status` prints that fault instead of leaving a
+silently dead poller behind:
+
+```
+Inbound: AGENT_PARLEY_INBOUND_PASSCODE must be set and at least 12 characters;
+inbound status queries are off.
+```
+
 ## What it does not do
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent
@@ -205,6 +310,33 @@ Reported `ready` is ready for review, not verified completion. Token usage still
 depends on the native agents: `CONTEXT` reports the bytes coordination itself
 injects and `TOKENS` repeats what a lane's own client counted, and neither is
 billed spend or a claim about a token-saving percentage.
+
+## How it compares
+
+Every tool below runs several coding agents at once, each in its own Git
+worktree. The difference is what happens between the worktrees. Each claim is
+taken from the project's own documentation, linked so you can check it.
+
+| Project | What its own documentation describes | What Agent Parley records instead |
+| --- | --- | --- |
+| [Claude Squad](https://github.com/smtg-ai/claude-squad) | A terminal manager for background sessions, each in its own worktree, over Claude Code, Codex, Aider and Amp. Isolation is the conflict answer: separate workspaces, "so no conflicts". | The same isolation, plus state the worktrees share: an atomic issue claim, an advisory reservation that names the blocking owner and reason, and a handoff that only moves ownership when a peer accepts it. |
+| [Crystal](https://github.com/stravu/crystal) | Parallel Claude Code and Codex sessions with diffs and test output in one window. The repository now points to its successor, Nimbalyst, and its README describes editor streaming and worktree isolation. | A record rather than a view: who holds which issue, which paths are reserved, what evidence a lane attached to a `ready` report, and whether a peer reviewed that report. |
+| [Conductor](https://conductor.build) | A polished macOS app for running Claude Code in parallel worktrees. Closed source, macOS only. | A standard-library service with no runtime dependencies that runs wherever Python 3.12 does, drives Claude, Codex, Gemini, Amp, OpenCode and Copilot through their own CLIs, and keeps its coordination state outside your repository. |
+| [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) | A task board in front of coding agents. Its vendor announced a shutdown in April 2026 and the project continues community-maintained and fully local. | Coordination in the agents' own path rather than a board in front of it: native hooks refuse a branch switch inside an assigned lane and catch drift after a bypass, which no board can see. |
+
+Two things none of them document, and the reasons they matter here:
+
+- **A decision log every lane can search.** A message a lane marks as a
+  decision, or one an operator records with `agent-parley decide`, becomes
+  project-wide, so a third lane stops relitigating a settled question.
+- **A refusal to sign your work.** A commit, merge, tag or pull request that
+  credits an assistant is denied before it lands, and no flag skips the check.
+
+Agent Parley does not replace these tools' strengths. Conductor is the smoother
+macOS experience, and a board is easier to read at a glance than a table. Pick
+Agent Parley when several agents must agree about one repository, and the
+answer to "who owns this, and on what evidence" has to be recorded rather than
+remembered.
 
 ## Documentation
 

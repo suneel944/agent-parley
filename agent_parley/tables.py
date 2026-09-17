@@ -22,13 +22,14 @@ STATUS_COLUMNS = (
     "SESSION",
     "BRANCH",
     "OUTCOME",
+    "REVIEW",
     "ISSUES",
     "MAIL",
     "LEASES",
     "REPORTED",
     "TASK",
 )
-STATUS_DROP = (2, 9, 8, 1, 7, 3, 5, 4, 6)
+STATUS_DROP = (2, 10, 9, 1, 8, 6, 3, 5, 4, 7)
 
 
 def age(seconds: float) -> str:
@@ -168,19 +169,25 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
 
     Returns:
         One cell per column of `STATUS_COLUMNS`. An issue past its deadline
-        or its attempt budget is marked, and so is a lane away from its
-        assigned branch; neither marker moves ownership or revokes anything.
+        or its attempt budget is marked with an exclamation mark, a claim of
+        a lane the supervisor read as orphaned with an asterisk, and so is a
+        lane away from its assigned branch; no marker moves ownership or
+        revokes anything.
         A mailbox that could not be read reports a question mark rather than
-        a zero, which would claim the lane owes nothing.
+        a zero, which would claim the lane owes nothing. The review cell
+        carries the latest verdict a peer recorded against this lane's
+        report, which is that peer's claim and not a verification.
     """
     mail = record["mail"] or {}
     unreadable = "error" in mail
     held = ",".join(
         f"#{claim['issue']}"
         + ("!" if claim["overdue"] or claim["budget_exceeded"] else "")
+        + ("*" if claim.get("orphaned") else "")
         for claim in record["claims"]
     )
     reported = record["report_age_seconds"]
+    review = record.get("review") or {}
     return (
         record["participant"],
         record["provider"],
@@ -193,6 +200,7 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
         ),
         record["branch"] + ("!" if record["drift"] else ""),
         record["outcome"],
+        review.get("verdict") or "-",
         (held + (f"+{len(offers)}" if offers else "")) or "-",
         "?" if unreadable else f"{mail['unread']}/{mail['pending_ack']}",
         "?"

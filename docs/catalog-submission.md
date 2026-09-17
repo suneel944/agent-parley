@@ -12,8 +12,18 @@ listing went live on 2026-09-14 at
 the submission archive has been attached to the v0.6.0, v0.7.0 and v0.8.0
 releases; each new version still needs a manual portal upload, because neither
 catalog offers a publishing API. The Claude submission was made on 2026-09-14
-and was still awaiting review on 2026-09-15; the plugin does not yet appear in
-`claude-plugins-official`.
+and was still awaiting review on 2026-09-17; a code search of
+`anthropics/claude-plugins-official` for `agent-parley` returned no match on
+that date.
+
+The developer lists that compare orchestrators are a separate surface from
+both catalogs, and nothing in this repository can file an entry there. The
+README carries a `How it compares` section whose every claim cites the
+competing project's own documentation, which is the text an entry in
+`andyrewlee/awesome-agent-orchestrators` would reuse. Opening that pull
+request against a third-party repository, and completing the PyPI pending
+publisher so the package page carries a verified repository link, are owner
+actions; both are listed again under the owner-only steps below.
 Nothing in this document submits a listing, and continuous integration builds
 artifacts rather than filling review forms. Restate the two paragraphs above
 whenever the listing state changes; a stale status here is the defect this
@@ -70,7 +80,9 @@ and no assumption about which model reads it.
 The portal's scan of that Claude manifest demands fields the Claude directory
 does not: an `interface` block with `shortDescription`, which the submission
 form reuses as the listing subtitle and caps at 30 characters, plus `logo`
-and `composerIcon` pointing to square images inside the archive. Adding `interface` to the repository's Claude manifest would make
+and `composerIcon` pointing to square images inside the archive, and the
+`capabilities` and `defaultPrompt` fields the listing page renders. Adding
+`interface` to the repository's Claude manifest would make
 `claude plugin validate --strict` fail, so the repository keeps those fields
 in `.codex-plugin/plugin.json` and `make codex-bundle` merges them into the
 archived copy. The archive lands at
@@ -78,9 +90,13 @@ archived copy. The archive lands at
 manifest, `skills/` and `assets/`. `scripts/check_policy.py` fails the gate if
 either manifest drifts from the shape its directory reads.
 
-That archive is attached to the published release, so a portal upload starts
-from a released artifact rather than a local build; it is present on v0.6.0,
-v0.7.0 and v0.8.0. Neither catalog exposes a publishing API, so each new
+That archive is a release asset. `make release-artifacts` builds it into
+`dist/release` beside the wheel, the source tarball and the plugin archive,
+records its hash in `SHA256SUMS`, and `scripts/release_publish.py` requires it
+by name, so a release missing it fails instead of publishing. A portal upload
+therefore starts from a released artifact rather than a local build. Releases
+v0.6.0 through v0.9.1 carry the same archive, uploaded by hand after the fact.
+Neither catalog exposes a publishing API, so each new
 version still needs a manual upload through the portal. Claude mirrors pushes
 once a listing is live; Codex does not.
 
@@ -104,8 +120,8 @@ confirm the stated expectation before opening either form.
   `uv run --locked python scripts/check_policy.py`
 - The Codex submission archive builds from the repository.
   `make codex-bundle`
-- The published release carries that archive as an asset, so the portal upload
-  starts from a released artifact rather than a local build.
+- The published release carries that archive as an asset, attached by the
+  `Release` workflow with no manual upload.
   `gh release view vVERSION --json assets`
 - Neither manifest passes `claude plugin validate --strict`; the single
   `protocol` warning is expected and the gate runs without `--strict`.
@@ -199,9 +215,31 @@ runtime dependencies. If any of those three change, the policy must change
 with them in the same commit.
 
 Listing imagery lives under `plugins/agent-parley/assets/`: `logo.png` and
-`icon.png`, both 512 by 512 pixels, referenced from the Codex manifest as
-`interface.logo` and `interface.composerIcon`. Screenshots are not included;
+`icon.png`, both 1024 by 1024 pixels, referenced from the Codex manifest as
+`interface.logo` and `interface.composerIcon`. The directory renders the
+composer icon at 54 pixels, so the bundle check rejects an edge under 1024 and
+the artwork is drawn from `docs/assets/agent-parley-icon.svg`, whose thinnest
+stroke stays about four pixels wide at that size. Regenerate the pair from the
+vector source with a headless browser:
+
+```
+google-chrome --headless --disable-gpu --hide-scrollbars \
+  --default-background-color=00000000 --window-size=1024,1024 \
+  --screenshot=plugins/agent-parley/assets/icon.png file://ICON_HTML
+```
+
+where `ICON_HTML` is a page that shows the SVG at 1024 by 1024 pixels with no
+margin; copy the result over `logo.png` as well. Screenshots are not included;
 a directory may ask for them sized to its own requirements.
+
+`interface.capabilities` declares `Interactive` and `Write`, which is what the
+skill needs: it reads coordination state in a conversation and writes claims,
+reservations and handoffs. `interface.defaultPrompt` carries three starter
+prompts. The directory keeps at most three and truncates any entry past 128
+characters, and the bundle check fails rather than letting either happen
+silently. Each prompt states a situation, naming the peers, the file and the
+outcome wanted, because a bare command reads as documentation rather than a
+reason to install.
 
 The skill frontmatter itself is in good shape: `name` is `coordinate` and the
 `description` is 211 characters covering both what the skill does and when to
@@ -228,6 +266,12 @@ accounts and to a legal identity that an agent does not hold.
   them.
 - **Responding to review.** Reviewer questions, requested changes and the
   final decision to publish or withdraw the listing all belong to the owner.
+- **The PyPI pending publisher.** Completing it binds the package page to this
+  repository and marks ownership as verified. It is account-bound.
+- **The orchestrator list entry.** A pull request to
+  `andyrewlee/awesome-agent-orchestrators` describes this project to a
+  third-party repository under the owner's account. The README comparison
+  section is the source text; filing it is the owner's statement to make.
 
 Everything a repository can do ahead of those steps is covered by the
 checklist and the evidence above.

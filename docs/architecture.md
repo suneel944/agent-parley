@@ -9,9 +9,10 @@ runs `participant merge`, and never on an agent's behalf.
 
 | Module | Responsibility |
 | --- | --- |
+| `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
 | `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
 | `server` | Authenticated MCP transport and bounded tool contracts |
-| `store` | SQLite schema, migration, scoped mail, atomic leases and tool events |
+| `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
@@ -30,7 +31,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text |
-| `metrics` | Idle intervals and waiting times derived from retained records |
+| `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
@@ -40,6 +41,8 @@ runs `participant merge`, and never on an agent's behalf.
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
+| `notify` | Outbound Telegram and SMTP notification of the coordination changes an absent owner needs, selected from decisions the event log already recorded |
+| `inbound` | Read-only status queries long-polled from the Telegram bot, admitted by chat identifier and passcode, parsed by the command line's own status filters |
 | `state` | Private atomic JSON and text publication and operation locks |
 
 Enforcement and telemetry share one substrate, on purpose, in two places. Hook
@@ -55,6 +58,38 @@ does acquire a write lock when available. Retention is bounded to the most
 recent 2000 events per project, and
 telemetry never decides an outcome.
 
+The notifier sits downstream of both, and decides nothing. A checkpoint records
+its decision in the participant event log first and only then offers it to
+`notify`, so a notification can report an outcome but can never change one, and
+a notifier failure is discarded exactly as a log failure is. The five changes
+that notify are a subset of what the log already holds; the idle stretch is the
+one exception, because it has no native event of its own and is measured by the
+supervision sweep that already computes it. Suppression follows the checkpoint's
+own rule: a digest per event, per lane, in `<participant>-notify.json`, so a
+situation that has not changed sends nothing further. Credentials are read from
+the environment at send time and never written into coordination state. The send
+runs on a daemon thread, so neither a blocking hook nor a supervision sweep waits
+on a network round trip; a hook process that exits first abandons the send, which
+is the cost of the best-effort contract and the reason there is no retry queue.
+Notification is outbound only: no transport carries a command back, and none of
+them can answer a native permission prompt.
+
+The one path that carries anything back is `inbound`, and it is limited to
+reads. It long-polls the Telegram Bot API from the service process, so it opens
+no port and registers no webhook, and it serves exactly one verb: `status`, with
+the filters `add_status_filters` declares for the command line and both readers
+share. No claim, handoff, wake, permission approval or free text reaches a
+session through it, and it writes nothing to coordination state. Admission is
+two independent checks, the configured chat identifier and a passcode read from
+the environment at service start; only a salted digest of that passcode is held
+in memory, it is compared with `hmac.compare_digest`, and it is never written to
+state, to the event log or to the service log. A message failing either check is
+dropped in silence. Five failures inside ten minutes lock the path for an hour
+and emit one outbound notification; the counter and the lock are process memory
+and are forgotten on restart. A passcode that is unset or shorter than twelve
+characters stops the poller from starting at all and is reported by `status` as
+a configuration fault rather than leaving a dead poller behind.
+
 The service is a singleton **per private state directory**. An exclusive startup
 lock serializes launch and shutdown; the loopback port prevents a second listener.
 Independent state directories remain independent. No global mutable application
@@ -64,6 +99,20 @@ which keeps transactions testable without HTTP.
 Use abstractions for actual boundaries. Do not add factories, interfaces, or
 inheritance solely to name a pattern. The HTTP server implements its standard-
 library base contracts; the type gate checks method overrides.
+
+Three entry paths pay an import price on every invocation, and each one loads
+only what its work needs. The lifecycle hook runs once per native tool call and
+imports the request's own modules alone, reaching the checkpoint engine only on
+the fallback path. The installed command starts in `entry`, which imports
+nothing but `sys`: a bare `--version` or `-V` answers from the compatibility
+contract, and anything else, including a version flag mixed with other
+arguments, is handed to `cli` so argparse produces the parsing, error text and
+exit status. `cli` in turn binds the command modules through `cli.deferred`,
+which registers a real module that executes on its first attribute access, so a
+command loads the few modules it reaches instead of all of them. What each path
+must not import is asserted in `tests/test_startup_imports.py` and
+`tests/test_hook_client.py`, and `scripts/benchmark.py` records the wall time of
+the cheapest invocations beside the interpreter floor they can never beat.
 
 ## Authentication and protocol
 
@@ -97,7 +146,7 @@ acknowledgement, and is read back beside peer traffic. Its sender row is created
 on first use and never carries a credential digest, so no bearer token resolves
 to it and no served session can write in its name. The name `operator` is
 reserved, so no participant, provider or credential profile can claim it. No
-tool is added for this: the served surface stays the eleven tools below.
+tool is added for this: the served surface stays the fourteen tools below.
 `agent-parley decide` records a decision on the same path and addresses no
 inbox, and `agent-parley decision list` reads the log back.
 
@@ -106,9 +155,11 @@ requests, and avoids credential/body logging. It supports stateless JSON respons
 over MCP Streamable HTTP, not SSE sessions or remote hosting. The independent
 official MCP SDK exercises initialization and calls in CI.
 
-Eleven tools cover sending, fetching, acknowledging, marking read, reserving
-files, releasing reservations, listing participants, reading one thread,
-searching mail, searching decisions, and paging an attachment. Unknown
+Fourteen tools cover sending, fetching, waiting for mail, acknowledging,
+marking read, reserving files, queueing a request for a key a peer holds,
+cancelling that request, releasing reservations, listing participants, reading
+one thread, searching mail, searching decisions and recommending the next
+issue. Paging an attachment is served on the same authenticated path. Unknown
 arguments fail. A body
 above its cap is spilled whole to `attachments/` under the project state
 directory by `agent_parley/attachments.py`, keyed by an opaque
@@ -151,7 +202,8 @@ applying its 32-participant limit. Sending to either is refused with an
 explanation; retained mail remains available to a re-registered participant.
 
 No coordination tool returns a participant's whole starting context. The store
-holds projects, agents, messages, recipients, reservations and events, keyed by
+holds projects, agents, messages, recipients, reservations, the requests queued
+for them, and events, keyed by
 an authenticated project and lane. The issue ledger and the participant
 manifest are files in the project state directory, whose name derives from the
 repository's Git common directory, which the store never records. A served
@@ -187,6 +239,15 @@ private launcher state. Its best-effort forge reads run outside store write
 transactions, and observation failures do not fail a committed coordination
 call. `participant_presence` is an additive table initialized with the store.
 The issue ledger retains reminders; only explicit issue transitions own claims.
+
+The same poll marks the claims of a lane whose session process is gone and that
+has been silent past the stall threshold, writing an orphan marker on each of
+its ledger records and sending every other lane one notice that names those
+issues and the reservations the dead lane still holds. The marker is an
+observation: the issue keeps its owner and the reservations keep their holder
+until a peer records `issue claim --take-orphaned`, which writes a `take`
+transition naming the previous owner and the reason and then releases that
+owner's advisory reservations through `store.py`.
 
 The same poll delivers the operator items recorded in `scheduled_deliveries`,
 an additive table whose rows carry a not-before instant, a condition and a
@@ -424,6 +485,19 @@ a branch that adds no commits to the project base, and a base checkout on a
 detached HEAD or on the lane's own branch. An open pull request for the branch
 is reported instead of replaced by a second one.
 
+The command excludes a live lane launch through that lane's session lock. A
+project whose manifest sets `pull_request.self_service` also admits the lane
+itself, run from its own worktree for its own name, under a separate
+integration lock rather than that session lock, because there the live session
+is the caller. The manifest is the only place the authorization lives, it is
+off unless written, and the admitted path evaluates the repository's conditions
+before anything is pushed: a `ready` report in lane activity, a configured
+verification command, the assigned branch still checked out in the lane, and no
+peer entry in the store's active reservations overlapping the paths the branch
+changed. The conditions travel with the evidence record and the integration
+record, so a self-opened pull request states what authorized it. `participant
+merge` takes no such policy and stays an operator command.
+
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
 reservations continue to resolve.
@@ -454,6 +528,24 @@ reassigned, it still counts against the per-lane reservation cap, and it keeps
 blocking exactly the paths it already blocked until its owner releases it.
 That distinction lets a reader separate a lane still working on a path from a
 lane that died holding it, without any process deciding on that lane's behalf.
+
+`request_reservation` takes the same batch as `file_reservation_paths`. Where
+nothing conflicts it grants exactly the same leases, so a lane never has to ask
+twice. Where a peer holds a key it grants nothing and records one queued
+request per blocked key, and the refusal names the holder and the place in that
+key's queue beside the usual conflict. Asking again for a key already queued
+keeps the first request and its place. When the holder calls
+`release_file_reservations`, the release, the grant to the first queued lane
+and the one notice naming the granted keys are a single SQLite transaction, so
+no reader observes a released key with its queue untouched and no lane is told
+it holds a key it does not. A key another lane still holds stays queued. A
+queued request reserves nothing: it blocks no peer, holds no path and locks
+nothing on disk. `cancel_reservation_request` withdraws one request or every
+request of the calling lane, and revoking a lane's registration expires its
+queued requests in the same transaction, because a lane that can no longer be
+addressed can neither take a key nor be told that it did. `agent-parley status`
+names the requests queued on a lane's keys and who asked; `agent-parley top`
+marks the count with `+` in the `LEASES` column.
 No time-to-live applies to issue ownership, which changes hands only through
 release, or an explicit offer and acceptance.
 
@@ -614,6 +706,7 @@ signal, so macOS shutdown carries that narrow residual race and Linux does not.
 | Participants per project | At most 32 |
 | Roster listing | At most 32 participants |
 | Active reservations | At most 128 per lane |
+| Queued reservation requests | At most 32 per lane |
 | Reservation time to live | Optional; 30–3,600 seconds when declared |
 | Reservation reason | 160 bytes stored; 80 characters reported on conflict |
 | Participant event log | Rotated at 262,144 bytes; one rotated file retained |

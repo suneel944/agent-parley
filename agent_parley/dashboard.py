@@ -42,6 +42,7 @@ COLUMNS = (
     ("STATE", 22),
     ("EVENT", 6),
     ("BRANCH", 18),
+    ("REVIEW", 8),
     ("ISSUES", 10),
     ("MAIL", 9),
     ("LEASES", 9),
@@ -62,6 +63,7 @@ DROP_ORDER = (
     "LEASES",
     "FIT",
     "IDLE",
+    "REVIEW",
     "ISSUES",
     "DENIALS",
 )
@@ -71,6 +73,7 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "STATE": lambda row: row["state"],
     "EVENT": lambda row: -row["last_event_ts"],
     "BRANCH": lambda row: row["branch"],
+    "REVIEW": lambda row: row["review"],
     "ISSUES": lambda row: -len(row["owned"]),
     "MAIL": lambda row: -_number(row["unread"]),
     "LEASES": lambda row: -row["leases"],
@@ -102,12 +105,17 @@ LEGEND = (
     "An issue marked ! is past its recorded deadline or its attempt "
     "budget. It is still owned: a deadline reports, and only an explicit "
     "release or an accepted handoff moves ownership.",
+    "An issue marked * is held by a lane whose session process is gone and "
+    "which has been silent past the stall threshold; the line under it "
+    "names those claims and the reservations that lane still holds. It is "
+    "still owned until a peer runs issue claim --take-orphaned.",
     "A lane with a token, call or hour budget carries a line showing the "
     "share consumed; over budget marks a crossed limit with !. The budget "
     "informs and does not gate: nothing is stopped or refused, and a token "
     "budget counts what the client recorded, not spend.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
-    "!past a declared time to live, with the age of the oldest; DENIALS "
+    "!past a declared time to live, +queued requests waiting on those "
+    "keys, with the age of the oldest; DENIALS "
     "denied or blocked of retained hook events; CALLS served MCP calls, "
     "!rejected; TOKENS what that lane's own native client recorded for "
     "its session, not billed spend and not comparable between vendors, "
@@ -118,18 +126,25 @@ LEGEND = (
     "does not claim to know what the native client was doing inside a "
     "turn. A branch marked ! left "
     "its assigned bridge branch. A stale lease is still held; releasing "
-    "it is its owner's to do.",
+    "it is its owner's to do, and a queued request takes the key only "
+    "when that release happens.",
     "FIT is the last capacity check the runtime read for that lane, with "
     "+ when an advisory work offer is waiting for it; the line under an "
     "unfit lane names the check that failed, and no offer names that "
     "lane. A blank cell means nothing was published for it yet. An offer "
     "claims nothing and transfers nothing.",
+    "REVIEW is the latest verdict a peer recorded against that lane's "
+    "report; the reviewer and the report it judges are in the lane detail. "
+    "A verdict is the reviewing lane's own claim about work it did not do: "
+    "it is neither an operator approval nor independent verification, and it "
+    "gates no integration.",
     "CONTEXT counts only the bytes coordination injected into a lane's "
     "context. A message, report or offer above its cap is kept whole as "
     "an attachment and its record carries a reference; the attachment's "
     "size is never counted here, only the reference that named it.",
-    "A row carrying drift, a stale lease, a rejected call, an overdue "
-    "issue or a stopped session is drawn in colour where the terminal "
+    "A row carrying drift, a stale lease, a rejected call, an overdue or "
+    "orphaned issue or a stopped session is drawn in colour where the "
+    "terminal "
     "offers it and in bold where it does not. Every one of those also "
     "carries its own ! or word in the table, so a monochrome pipe reads "
     "exactly the same.",
@@ -262,6 +277,14 @@ def _row(
         if deadline_state(issues[number])["overdue"]
         or deadline_state(issues[number])["budget_exceeded"]
     ]
+    orphaned = [number for number in owned if issues[number].get("orphan")]
+    orphan_keys = sorted(
+        {
+            key
+            for number in orphaned
+            for key in issues[number]["orphan"].get("reservations", [])
+        }
+    )
     offers = sum(
         1
         for record in issues.values()
@@ -281,9 +304,11 @@ def _row(
     idle = metrics.idle_intervals(directory, agent, context["since"])
     published = supervision.published_work(directory, agent)
     edited = context["operator_edits"].get(agent, [])
+    advanced = context["base_advances"].get(agent, [])
     budget = budgets.report(
         home, directory, data, agent, context["usage"], context["records"]
     )
+    review = metrics.latest_review(directory, agent) or {}
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -306,6 +331,8 @@ def _row(
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
         "operator_edits": edited,
         "operator_edit": supervision.operator_edit_marker(edited),
+        "base_advance_paths": advanced,
+        "base_advance": supervision.base_advance_marker(advanced),
         "event_age": (
             tables.age(time.time() - events["last_ts"])
             if events["last_ts"]
@@ -314,11 +341,18 @@ def _row(
         "last_event_ts": events["last_ts"],
         "branch": branch,
         "drift": branch != participant["branch"],
+        "review": str(review.get("verdict", "")),
+        "reviewer": str(review.get("reviewer", "")),
+        "reviewed_report": str(review.get("report_id", "")),
         "owned": owned,
         "issues_held": len(owned),
         "overdue": overdue,
+        "orphaned": orphaned,
+        "orphan": supervision.orphan_marker(orphaned, orphan_keys),
         "issues": ",".join(
-            f"#{number}" + ("!" if number in overdue else "")
+            f"#{number}"
+            + ("!" if number in overdue else "")
+            + ("*" if number in orphaned else "")
             for number in owned
         )
         or "-",
@@ -328,6 +362,8 @@ def _row(
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
+        "queued": stats.get("queued", 0),
+        "queued_by": list(stats.get("queued_by", [])),
         "injected_bytes": events["injected_bytes"],
         "hook_events": events["events"],
         "denials": events["denials"],
@@ -462,6 +498,7 @@ def collect(
             "operator_edits": (
                 supervision.operator_edits(home, data) if operator_edits else {}
             ),
+            "base_advances": supervision.base_advances(home, data),
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -537,10 +574,12 @@ def _cells(row: dict) -> tuple[str, ...]:
         row["state"],
         row["event_age"],
         row["branch"] + ("!" if row["drift"] else ""),
+        row["review"] or "-",
         row["issues"] + (f"+{row['offers']}" if row["offers"] else ""),
         f"{row['unread']}/{row['pending_ack']}",
         f"{row['leases']}"
         + (f"!{row['stale_leases']}" if row["stale_leases"] else "")
+        + (f"+{row['queued']}" if row["queued"] else "")
         + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
         tables.size(row["injected_bytes"]),
         f"{row['denials']}/{row['hook_events']}",
@@ -559,15 +598,17 @@ def alert(row: dict) -> bool:
 
     Returns:
         True when the lane drifted from its assigned branch, holds a stale
-        lease, had a call rejected, owns an overdue issue, or its recorded
-        session process is gone. Each of those also prints its own textual
-        marker, so colour adds emphasis and never carries meaning alone.
+        lease, had a call rejected, owns an overdue or orphaned issue, or its
+        recorded session process is gone. Each of those also prints its own
+        textual marker, so colour adds emphasis and never carries meaning
+        alone.
     """
     return bool(
         row["drift"]
         or row["stale_leases"]
         or row["errors"]
         or row["overdue"]
+        or row.get("orphaned")
         or str(row["state"]).startswith("stopped")
     )
 
@@ -758,6 +799,10 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
                 lines.append(f"    {row['stall']}")
             if row["operator_edit"]:
                 lines.append(f"    {row['operator_edit']}")
+            if row.get("base_advance"):
+                lines.append(f"    {row['base_advance']}")
+            if row.get("orphan"):
+                lines.append(f"    {row['orphan']}")
             if row.get("budget_marker"):
                 lines.append(f"    {row['budget_marker']}")
             if row["unfit"]:

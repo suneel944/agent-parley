@@ -505,7 +505,9 @@ retry never gains authority the first call was denied.
 
 Every `issue` transition and `report` accepts `--idempotency-key`. Over MCP the
 same contract is carried by the optional `idempotency_key` argument on
-`file_reservation_paths`, `release_file_reservations`, `acknowledge_message` and
+`file_reservation_paths`, `request_reservation`,
+`cancel_reservation_request`, `release_file_reservations`,
+`acknowledge_message` and
 `mark_message_read`; `send_message` has always required one. A replayed tool
 result carries `"replayed": true` beside the original fields.
 
@@ -838,6 +840,24 @@ than fourteen days are discarded at the next session start or session end, so a
 long-running lane reports recent enforcement, not project history; served-call
 counts cover the most recent 2000 events per project.
 
+A base branch that moves is the other writer no lane sees. Each `top` and
+`status` frame reads the head of the base checkout once per project and
+compares it with the point each lane branched from, through `git merge-base`.
+A lane still forked from that head is current and is read no further, so a
+project whose lanes are all up to date costs one Git read and no store read at
+all. Where the base did advance, the paths it changed since the fork point are
+matched against the lane's active reservations, using the same overlap rule a
+competing reservation is judged by, and against the paths the lane itself
+holds: those committed on its branch and those still uncommitted in its
+worktree. A match is printed as an indented line under the lane's row in `top`,
+under the reservation count in `status`, and carried in the
+`base_advance_paths` field of `top --json` and `status --json`. The lane's
+lifecycle hook delivers one bounded advisory notice naming those paths and
+stating that nothing was rebased; the notice repeats only when the set of paths
+changes, which the hook records in the lane's activity state. Nothing rebases,
+pauses or reverts, and a Git failure or timeout reports nothing rather than an
+error.
+
 Every recorded decision carries the failure that produced it, when one did, so
 a run of denials stays answerable after the lane recovers. The live copy of
 that failure is cleared by the first call that succeeds, which is exactly what
@@ -1128,7 +1148,9 @@ participant carries `participant`, `identity`, `provider`, `credential`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
 `idle_seconds`, `idle_complete`, `waiting`, `wake` and `mail`, whose
-`named_resources` array lists the named resources that lane holds. `claims`
+`named_resources` array lists the named resources that lane holds, whose
+`queued_requests` counts the reservation requests waiting on the keys it holds
+and whose `queued_by` names the lanes that asked. `claims`
 carries one record per issue that lane owns, with its `deadline_at`, `overdue`,
 `overdue_seconds`, `attempts`, `budget` and `budget_exceeded`. `idle` carries
 `stalled`, the waiting item's `kind`, `message_id`, `sender` and `age_seconds`,
@@ -1143,9 +1165,12 @@ failing the document, exactly as the table reports coordination as unavailable.
 carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
 `stalled`, `stall`, `branch`, `drift`, `issues`, `offers`, `unread`,
 `pending_ack`, `leases`,
-`stale_leases`, `lease_age_seconds`, `injected_bytes`, `hook_events`,
+`stale_leases`, `lease_age_seconds`, `queued_requests`, `queued_by`,
+`injected_bytes`, `hook_events`,
 `denials`, `calls`, `errors`, `tokens`, `idle_seconds`, `idle_complete` and
-`prompt`. `tokens` is null when that
+`prompt`. `queued_requests` counts the reservation requests waiting on the keys
+that lane holds and `queued_by` names the lanes that asked; a queued request
+holds nothing itself. `tokens` is null when that
 lane's own session records could not be read, and `unread` and `pending_ack`
 are null when its mailbox could not be read: null states that nothing was read,
 never that the count is zero.
@@ -1861,7 +1886,8 @@ can require classification explicitly. The private `project.json` accepts a
     "change_type_labels": ["bug", "enhancement"],
     "require_label": false,
     "milestone": "match",
-    "body_template": "## Review checklist\n\n- [ ] Reviewed"
+    "body_template": "## Review checklist\n\n- [ ] Reviewed",
+    "self_service": false
   }
 }
 ```
@@ -1883,6 +1909,27 @@ state. The body names the slice and its SHA-256 digest; it is not uploaded or
 committed automatically. Counts cover retained observations, so missing or expired
 records cannot prove that no event occurred. Older logs did not distinguish
 reservation conflicts from successful calls.
+
+`self_service` is the repository's standing authorization for a lane to run
+`participant pr` for its own work from its own worktree. It is `false` unless
+the project sets it, and with it off nothing changes: `participant pr` stays an
+operator command that excludes a live lane session. With it on, that one
+command, run inside the lane it names, is admitted while every condition holds:
+the lane reported `ready`, the project configures a verification command, the
+lane still sits on its assigned branch, and no peer holds an advisory
+reservation over a path the branch changed. The gate itself still runs in the
+lane during the push, so the pull request is opened after a green gate and not
+merely after a claim of one. A condition that does not hold refuses the command
+and names that condition; unreadable reservation state is a refusal too, since
+it rules no overlap out. Advisory reservations stay advisory: an overlap
+withholds this unattended step, it does not deny anyone access to a file.
+
+A self-opened pull request carries what authorized it. The recorded review
+evidence names the policy, the participant, the gate command, how many changed
+paths were cleared, the peers holding reservations at the time, and the branch,
+both in the pull-request body and in the integration record kept in private
+project state. `participant merge` remains operator-only under every setting,
+and authentication is still the native `gh` CLI's own, with no added flag.
 
 `participant retire` removes one lane: it refuses while a session is running or
 the worktree is dirty, removes the worktree, invalidates that participant's
@@ -1992,7 +2039,11 @@ The official catalog is curated separately; see
 For Codex, follow [OpenAI's submission guide](https://developers.openai.com/plugins/deploy/submission).
 This is a skills-only plugin. Submission requires a verified publisher, listing
 and policy URLs, a skill bundle, and review cases. `make codex-bundle` builds
-the skill bundle the portal accepts. The Codex listing is live; the Claude
+the skill bundle the portal accepts. `make release-artifacts` builds the same
+archive into `dist/release`, so every published release carries
+`agent-parley-VERSION-codex-skills.zip` as an asset with its hash in
+`SHA256SUMS`, and the portal step downloads a released file instead of
+building one locally. The Codex listing is live; the Claude
 submission is awaiting review.
 CI builds artifacts; it does not submit review forms.
 
@@ -2098,9 +2149,9 @@ After the GitHub draft's uploaded bytes have been verified against the local
 checksums, the workflow publishes the distribution to PyPI. It
 stages a clean `dist/pypi` directory holding only the two files the index
 accepts, the `agent_parley` wheel and the source tarball, copied by exact name
-from the verified `dist/release` bundle, so the plugin archive, the exported
-requirements file, the changelog, the release notes and the checksum manifest
-are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
+from the verified `dist/release` bundle, so the plugin archive, the Codex
+submission archive, the exported requirements file, the changelog, the release
+notes and the checksum manifest are never uploaded. Authentication uses PyPI Trusted Publishing over OIDC: the
 job requests a short-lived identity token through an `id-token: write`
 permission scoped to that job, and PyPI exchanges it for a one-time upload
 token, so the repository stores no PyPI API token and no publishing secret. The

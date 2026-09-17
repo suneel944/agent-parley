@@ -13,6 +13,7 @@ from pathlib import Path
 from agent_parley import (
     forge,
     issues,
+    notify,
     process,
     records,
     roster,
@@ -231,6 +232,49 @@ def dirty_paths(root: str) -> list[str] | None:
     return paths
 
 
+def _read(root: str, *arguments: str) -> str | None:
+    """Runs one read-only Git command against a checkout.
+
+    Args:
+        root: Checkout the command runs in.
+        *arguments: Git arguments following the checkout selection.
+
+    Returns:
+        Standard output without surrounding whitespace, or None when Git
+        refused the command, could not be run, or exceeded its timeout. An
+        answer Git cannot give is no opinion rather than an empty one.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", root, *arguments],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    return result.stdout.strip()
+
+
+def _changed(root: str, start: str, end: str) -> list[str]:
+    """Lists the repository-relative paths that differ between two commits.
+
+    Args:
+        root: Checkout that holds both commits.
+        start: Commit the comparison starts from.
+        end: Commit the comparison ends at.
+
+    Returns:
+        The changed paths, empty when nothing differs and when Git could not
+        answer.
+    """
+    listing = _read(root, "diff", "--name-only", start, end)
+    return [path for path in (listing or "").splitlines() if path]
+
+
 def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
     """Names the reserved paths an operator has changed in the base checkout.
 
@@ -283,6 +327,84 @@ def operator_edit_marker(paths: list[str]) -> str:
     return (
         f"operator edited reserved path{plural} {', '.join(paths)} in the "
         "base checkout; nothing was reverted"
+    )
+
+
+def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
+    """Names the paths a lane holds that the base branch changed under it.
+
+    A merge from another lane, or a push, moves the base branch under every
+    lane that already forked from it, and none of them learns anything until
+    its own merge conflicts. The head of the base checkout, which is the
+    branch every lane merges back into, is read once per project and
+    compared with the point each lane branched from; a lane whose fork point
+    is still that head is current, and the store is not read at all when no
+    lane is behind.
+
+    Where the base did advance, the paths it changed since the fork point are
+    matched against the lane's active reservations, using the same overlap
+    rule a competing reservation is judged by, and against the paths the lane
+    itself changed, both those committed on its branch and those still
+    uncommitted in its worktree.
+
+    The reading is advisory. Nothing rebases, pauses or reverts, and the lane
+    decides what a moved base means for its work.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+
+    Returns:
+        Mapping of participant name to the sorted paths the base changed that
+        the lane also holds. Empty when the base has not advanced, when the
+        advance touches nothing a lane holds, or when Git could not be read.
+    """
+    root = manifest["root"]
+    head = _read(root, "rev-parse", "HEAD")
+    if not head:
+        return {}
+    forks = {}
+    for name, participant in manifest["participants"].items():
+        fork = _read(root, "merge-base", head, participant["branch"])
+        if fork and fork != head:
+            forks[name] = fork
+    if not forks:
+        return {}
+    try:
+        held = store.active_reservations(home, root)
+    except (BridgeError, OSError, sqlite3.Error):
+        held = {}
+    advances: dict[str, list[str]] = {}
+    for name, fork in forks.items():
+        participant = manifest["participants"][name]
+        branch = participant["branch"]
+        changed = _changed(root, fork, head)
+        if not changed:
+            continue
+        patterns = held.get(participant["display"], [])
+        mine = set(_changed(root, fork, branch))
+        mine.update(dirty_paths(participant["lane"]) or [])
+        matched = sorted(
+            {
+                path
+                for path in changed
+                if path in mine
+                or any(store.overlapping(path, pattern) for pattern in patterns)
+            }
+        )
+        if matched:
+            advances[name] = matched
+    return advances
+
+
+def base_advance_marker(paths: list[str]) -> str:
+    """Describes a base branch advance in one line, naming the paths."""
+    if not paths:
+        return ""
+    plural = "" if len(paths) == 1 else "s"
+    return (
+        f"base advanced over held path{plural} {', '.join(paths)} since this "
+        "lane forked; nothing was rebased"
     )
 
 
@@ -560,12 +682,16 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         name: fit(home, directory, manifest, name, after)
         for name in manifest["participants"]
     }
+    stretches = {
+        name: idle_seconds(directory, name)
+        for name in sorted(manifest["participants"])
+    }
     idle = [
         name
         for name in sorted(manifest["participants"])
         if results[name]["fit"]
         and not owned.get(name)
-        and idle_seconds(directory, name) >= after
+        and stretches[name] >= after
     ]
     for name in manifest["participants"]:
         result = results[name]
@@ -583,6 +709,63 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         path = directory / f"{name}-work.json"
         if published != published_work(directory, name):
             write_json(path, published)
+    announce_idle(directory, manifest, idle, stretches, after)
+
+
+def announce_idle(
+    directory: Path,
+    manifest: dict,
+    idle: list[str],
+    stretches: dict[str, int],
+    after: float,
+) -> list[str]:
+    """Notifies the owner about each lane idle past the grace period.
+
+    The idle stretch has no native event of its own, so the sweep that
+    already measured it is what reports it. The notifier keys the report on
+    the lane's last recorded activity, so a lane idle across many sweeps is
+    reported once and reported again only after it next checks in. A
+    misconfigured transport is recorded as a supervision error rather than
+    ending the sweep.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        idle: Lanes measured as fit, unclaimed and idle past the interval.
+        stretches: Measured idle seconds per lane.
+        after: Grace period the lanes were measured against.
+
+    Returns:
+        The lanes a notification was started for.
+    """
+    if not idle or not notify.enabled():
+        return []
+    started = []
+    try:
+        for name in idle:
+            sent = notify.deliver(
+                directory,
+                name,
+                notify.Event.LANE_IDLE,
+                {
+                    "repo": manifest["root"],
+                    "provider": str(
+                        manifest["participants"][name].get("provider", "")
+                    ),
+                    "since": str(
+                        presence(directory, name, after)["last_active"]
+                    ),
+                    "detail": (
+                        f"idle {stretches[name]}s with no claim, past the "
+                        f"{int(after)}s grace period"
+                    ),
+                },
+            )
+            if sent:
+                started.append(name)
+    except (BridgeError, OSError) as exc:
+        issues.note_supervision_error(directory, f"Notification: {exc}")
+    return started
 
 
 def configuration(home: Path, manifest: dict) -> dict:
@@ -722,6 +905,157 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def orphan_reason(name: str, observed: dict) -> str:
+    """States why a lane's claims read as orphaned, in one clause."""
+    return (
+        f"{name} has no running session process and has been silent for "
+        f"{int(observed['age_seconds'] or 0)}s"
+    )
+
+
+def orphan_marker(numbers: list[str], keys: list[str]) -> str:
+    """Describes one lane's orphaned claims in one line, naming its keys."""
+    if not numbers:
+        return ""
+    listed = ", ".join(f"#{number}" for number in numbers)
+    held = f"; holds {', '.join(keys)}" if keys else ""
+    return (
+        f"orphaned claims {listed}{held}; still owned until a peer runs "
+        "issue claim --take-orphaned"
+    )
+
+
+def _dead(observed: dict, after: float) -> bool:
+    """Reports whether a lane is gone rather than merely quiet.
+
+    Args:
+        observed: Presence reading for the lane.
+        after: Seconds of silence the project counts as a stall.
+
+    Returns:
+        Whether the recorded session process is gone and the lane has been
+        silent for longer than that threshold. A live lane is never dead
+        however long it has been idle, and a lane that recorded no activity
+        at all has no age to measure, so it is left alone.
+    """
+    return (
+        not observed["process_alive"]
+        and observed["age_seconds"] is not None
+        and observed["age_seconds"] >= after
+    )
+
+
+def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
+    """Marks a dead lane's claims as orphaned and tells every other lane once.
+
+    A crashed lane keeps its issues, and peers that wait on them cannot tell a
+    working owner from one that will never answer. The marker states that
+    observation where the ledger is read, and one notice per dead lane names
+    the orphaned issues and the reservations it still holds.
+
+    Nothing moves here. The issue keeps its owner, the reservations keep their
+    holder, and only an explicit ``issue claim --take-orphaned`` by a peer
+    transfers either. A lane that is merely idle is never marked, and a lane
+    that returns keeps nothing but the right to claim its work again.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+    """
+    after = config["stalled_after"]
+    dead = {
+        name: observed
+        for name in manifest["participants"]
+        if _dead(
+            observed := presence(directory, name, config["inactive_after"]),
+            after,
+        )
+    }
+    if not dead:
+        return
+    try:
+        reservations = store.active_reservations(home, manifest["root"])
+    except (BridgeError, OSError, sqlite3.Error):
+        reservations = {}
+    notices = []
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        changed = False
+        for name, observed in dead.items():
+            keys = reservations.get(
+                manifest["participants"][name]["display"], []
+            )
+            reason = orphan_reason(name, observed)
+            marked = []
+            fresh = False
+            for number, record in ledger["issues"].items():
+                if record.get("owner") != name:
+                    continue
+                identifier = (
+                    f"{name}:{record.get('claim_id') or number}:"
+                    f"{int(observed['last_active'] or 0)}"
+                )
+                marked.append(number)
+                if record.get("orphan", {}).get("id") == identifier:
+                    continue
+                record["orphan"] = {
+                    "id": identifier,
+                    "owner": name,
+                    "reason": reason,
+                    "reservations": list(keys),
+                    "created": time.time(),
+                }
+                changed = True
+                fresh = True
+            if fresh:
+                notices.append((name, sorted(marked, key=int), list(keys)))
+        if changed:
+            ledger["revision"] += 1
+            write_json(directory / "issues.json", ledger)
+    for name, marked, keys in notices:
+        _announce_orphan(home, manifest, name, marked, keys)
+
+
+def _announce_orphan(
+    home: Path, manifest: dict, name: str, numbers: list[str], keys: list[str]
+) -> None:
+    """Tells every other lane once that one lane's claims read as orphaned.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        name: Participant whose claims were marked.
+        numbers: Issue numbers marked orphaned, in ledger order.
+        keys: Reservation keys that lane still holds.
+    """
+    listed = ", ".join(f"#{number}" for number in numbers)
+    held = ", ".join(keys) or "none"
+    body = (
+        f"{name} reads as orphaned: no running session process. Orphaned "
+        f"claims: {listed}. Reservations it still holds: {held}. Nothing has "
+        "moved: take one with agent-parley issue claim NUMBER "
+        "--take-orphaned, which records you as the owner and releases those "
+        "reservations. Leaving it alone keeps it with " + name + "."
+    )
+    for peer, participant in manifest["participants"].items():
+        if peer == name:
+            continue
+        digest = hashlib.sha256(
+            f"{name}\x00{listed}\x00{held}\x00{peer}".encode()
+        ).hexdigest()[:32]
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.speak(
+                home,
+                manifest["root"],
+                participant["display"],
+                f"Orphaned claims held by {name}",
+                body,
+                f"orphan:{digest}",
+            )
+
+
 def claimed_since(record: dict) -> float:
     """Reports when the current ownership generation of an issue began.
 
@@ -729,7 +1063,8 @@ def claimed_since(record: dict) -> float:
     the current claim started describes earlier work and must not report that
     claim as finished. The generation starts at the most recent claim or
     accepted handoff; a record whose history no longer names one is treated as
-    having always been owned, which preserves the previous observation.
+    having always been owned, which preserves the previous observation. A take
+    of an orphaned claim starts a generation like any other claim.
 
     Args:
         record: Published ledger record for one issue.
@@ -741,7 +1076,7 @@ def claimed_since(record: dict) -> float:
         (
             float(entry.get("at", 0) or 0)
             for entry in record.get("history", [])
-            if entry.get("action") in {"claim", "accept"}
+            if entry.get("action") in {"claim", "accept", "take"}
         ),
         default=0.0,
     )
@@ -916,6 +1251,7 @@ def poll(home: Path, directory: Path) -> None:
             )
         reminders(directory, manifest, closed)
         deadline_notices(directory, manifest)
+        orphans(home, directory, manifest, config)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
         observe_responses(home, directory, manifest)

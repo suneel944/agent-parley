@@ -20,6 +20,7 @@ from types import FrameType
 from agent_parley import (
     checkpoints,
     hook,
+    metrics,
     protocol,
     recommend,
     retries,
@@ -211,8 +212,34 @@ TOOLS = [
         ["paths"],
     ),
     _tool(
+        "request_reservation",
+        "Reserve the same keys, and where a peer holds one, queue for it "
+        "instead of failing; the refusal names the holder and your place. "
+        "The holder's release grants it and sends you one notice.",
+        {
+            "paths": {
+                "type": "array",
+                "items": TEXT,
+                "maxItems": 16,
+                "description": "Keys as file_reservation_paths takes them.",
+            },
+            "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
+            "exclusive": FLAG,
+            "reason": {**TEXT, "maxLength": 160},
+            "idempotency_key": RETRY_KEY,
+        },
+        ["paths"],
+    ),
+    _tool(
+        "cancel_reservation_request",
+        "Withdraw one queued reservation request, or every one of yours.",
+        {"request_id": INTEGER, "idempotency_key": RETRY_KEY},
+        [],
+    ),
+    _tool(
         "release_file_reservations",
-        "Release your file reservations.",
+        "Release your file reservations. A key another lane queued for is "
+        "granted to it here, and that lane is told in the same commit.",
         {"idempotency_key": RETRY_KEY},
         [],
     ),
@@ -262,6 +289,20 @@ TOOLS = [
             "since": {**INTEGER, "minimum": 0},
         },
         [],
+    ),
+    _tool(
+        "review_report",
+        "Record your verdict on a peer's report, never your own. A verdict "
+        "is your claim, not independent verification.",
+        {
+            "report_id": {**TEXT, "maxLength": 32},
+            "verdict": {"type": "string", "enum": list(metrics.VERDICTS)},
+            "evidence": {
+                **TEXT,
+                "description": "What you checked; at most 4096 UTF-8 bytes.",
+            },
+        },
+        ["report_id", "verdict", "evidence"],
     ),
     _tool(
         "next_issues",
@@ -807,7 +848,8 @@ class Handler(BaseHTTPRequestHandler):
         so it holds no lock while it sleeps, and it is told how long this
         service is willing to hold it open. Every other tool is the served
         call it has always been, and a delivered message wakes the lanes
-        waiting for one before the sender is answered.
+        waiting for one before the sender is answered. A release that grants
+        a queued request delivers such a message, so it wakes them too.
         """
         try:
             declared = self._declared_protocol()
@@ -840,7 +882,10 @@ class Handler(BaseHTTPRequestHandler):
                     )
             else:
                 result = store.call(self.server.home, actor, tool["name"], args)
-                if tool["name"] == "send_message":
+                if tool["name"] == "send_message" or (
+                    tool["name"] == "release_file_reservations"
+                    and result["granted"]
+                ):
                     waits.delivered()
             return {
                 "content": [
@@ -918,13 +963,15 @@ def main() -> None:
     os.umask(0o077)
     config = json.loads((args.home / "config.json").read_text())
     store.initialize(args.home)
-    from agent_parley import supervision
+    from agent_parley import inbound, supervision
 
     stopped = threading.Event()
-    observer = threading.Thread(
-        target=supervision.run, args=(args.home, stopped), daemon=True
-    )
-    observer.start()
+    workers = [
+        threading.Thread(target=run, args=(args.home, stopped), daemon=True)
+        for run in (supervision.run, inbound.run)
+    ]
+    for worker in workers:
+        worker.start()
     try:
         with Server(args.home, config) as server:
             stop_on_signal(args.home, server)
@@ -932,7 +979,8 @@ def main() -> None:
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
-        observer.join(timeout=2)
+        for worker in workers:
+            worker.join(timeout=2)
 
 
 if __name__ == "__main__":

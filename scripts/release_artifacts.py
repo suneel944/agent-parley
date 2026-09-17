@@ -76,8 +76,31 @@ def add_entry(archive: zipfile.ZipFile, path: Path, name: str) -> None:
     archive.writestr(entry, path.read_bytes())
 
 
+def checksums(assets: list[Path]) -> str:
+    """Builds the checksum manifest that binds the release to these bytes.
+
+    Args:
+        assets: Files written into the release directory.
+
+    Returns:
+        One ``sha256  filename`` line per asset, ordered by path.
+
+    Raises:
+        OSError: If an asset cannot be read.
+    """
+    return "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+        for path in sorted(assets)
+    )
+
+
 def main() -> None:
     """Collects release assets and hashes after checking version agreement.
+
+    The Codex submission archive is one of those assets, so every release
+    page carries the file the OpenAI plugin portal accepts and no maintainer
+    builds it by hand. Its builder is imported here rather than at module
+    scope because that module imports this one for its archive entries.
 
     Raises:
         ValueError: If a tag, plugin version, or changelog does not match.
@@ -121,6 +144,9 @@ def main() -> None:
             add_entry(archive, path, str(path.relative_to(root)))
         add_entry(archive, root / "plugins" / "README.md", "README.md")
     assets.append(bundle)
+    from scripts.codex_bundle import build as build_codex_archive
+
+    assets.append(build_codex_archive(root, output))
     requirements = output / "requirements.txt"
     subprocess.run(
         [
@@ -146,11 +172,7 @@ def main() -> None:
         path = output / filename
         path.write_text(text)
         assets.append(path)
-    sums = [
-        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-        for path in sorted(assets)
-    ]
-    (output / "SHA256SUMS").write_text("".join(sums))
+    (output / "SHA256SUMS").write_text(checksums(assets))
     print(f"Release assets for {tag}: {output}")
 
 

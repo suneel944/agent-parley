@@ -50,6 +50,7 @@ TABLES = (
     "messages",
     "message_recipients",
     "file_reservations",
+    "reservation_requests",
     "events",
     "participant_presence",
     "idempotent_calls",

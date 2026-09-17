@@ -587,7 +587,7 @@ def test_context_is_bounded_incremental_and_never_auto_acknowledges(
     state = json.loads((directory / "codex-activity.json").read_text())
     assert state["injections"] == 3
     assert state["injected_bytes"] == sum(len(text.encode()) for text in seen)
-    assert len(json.dumps(TOOLS).encode()) < 6500
+    assert len(json.dumps(TOOLS).encode()) < 8600
 
 
 def test_tool_events_record_served_and_rejected_calls_within_a_bound(

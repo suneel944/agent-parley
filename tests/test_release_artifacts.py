@@ -1,8 +1,15 @@
-"""Checks release-note extraction across maintained changelog formats."""
+"""Checks release-note extraction and the published release asset set."""
+
+import tomllib
+from pathlib import Path
 
 import pytest
 
-from scripts.release_artifacts import release_notes
+from scripts.codex_bundle import build
+from scripts.release_artifacts import checksums, release_notes
+from scripts.release_publish import asset_names, verify_assets
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
@@ -43,3 +50,31 @@ def test_full_changelog_follows_version_content_without_overview():
         "## What's Changed\n\n### Fixes\n\n- Fixed.\n\n"
         "**Full Changelog**: https://example.com/repo/commits/v0.3.1\n"
     )
+
+
+@pytest.fixture
+def release_bundle(tmp_path):
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"][
+        "version"
+    ]
+    archive = build(ROOT, tmp_path)
+    for name in asset_names(version) - {archive.name}:
+        (tmp_path / name).write_text(f"Artifact: {name}\n")
+    assets = [tmp_path / name for name in asset_names(version)]
+    (tmp_path / "SHA256SUMS").write_text(checksums(assets))
+    return tmp_path, version, archive
+
+
+def test_codex_archive_ships_with_a_checksum_entry(release_bundle):
+    directory, version, archive = release_bundle
+    assert archive.name == f"agent-parley-{version}-codex-skills.zip"
+    manifest = (directory / "SHA256SUMS").read_text().splitlines()
+    assert sum(line.endswith(f"  {archive.name}") for line in manifest) == 1
+    assert verify_assets(directory, version) != ""
+
+
+def test_release_without_the_codex_archive_fails(release_bundle):
+    directory, version, archive = release_bundle
+    archive.unlink()
+    with pytest.raises(ValueError):
+        verify_assets(directory, version)

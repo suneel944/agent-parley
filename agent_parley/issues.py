@@ -362,6 +362,7 @@ def change(
     within: float | None = None,
     defaults: dict | None = None,
     carried: dict | None = None,
+    take_orphaned: bool = False,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -396,6 +397,10 @@ def change(
             It is read from the lane at the moment the offer is made, so like
             a title it is excluded from the arguments a key is compared
             against and a changed diff never refuses a retry.
+        take_orphaned: Whether a claim may take an issue whose owner the
+            supervisor marked orphaned. Like a title it is excluded from the
+            arguments a key is compared against, so a repeat carrying the key
+            of a recorded take replays that take rather than claiming again.
 
     Returns:
         The persisted issue record, including transition history.
@@ -421,6 +426,7 @@ def change(
             title=title,
             defaults=defaults,
             carried=carried,
+            take_orphaned=take_orphaned,
             **transition,
         )
     key = retries.validate(key)
@@ -440,6 +446,7 @@ def change(
             title=title,
             defaults=defaults,
             carried=carried,
+            take_orphaned=take_orphaned,
             **transition,
         )
     except BridgeError as exc:
@@ -474,6 +481,39 @@ def _unseen() -> dict:
         "deadline": None,
         "attempts": 0,
         "budget": None,
+    }
+
+
+def _taken(record: dict, issue: str, orphan: dict) -> dict:
+    """Records which owner an orphaned claim was taken from, and why.
+
+    The previous owner is read from the marker the supervisor wrote rather
+    than from the taking lane, so a take states an observation the runtime
+    made and never a peer's opinion of who is alive.
+
+    Args:
+        record: Published record for the issue being taken.
+        issue: Repository issue number the take names.
+        orphan: Orphan marker the record carries, if any.
+
+    Returns:
+        The previous owner, the reason it was marked orphaned, the instant of
+        the take and the reservation keys that owner still held.
+
+    Raises:
+        BridgeError: If the issue carries no orphan marker, or the marker
+            names an owner other than the lane that currently holds it.
+    """
+    if not orphan or orphan.get("owner") != record["owner"]:
+        raise BridgeError(
+            f"Issue #{issue} is owned by {record['owner']}, which does not "
+            "read as orphaned; ask that lane for a handoff instead."
+        )
+    return {
+        "from": record["owner"],
+        "reason": orphan.get("reason", ""),
+        "at": time.time(),
+        "reservations": list(orphan.get("reservations", [])),
     }
 
 
@@ -642,6 +682,7 @@ def _change(
     within: float | None = None,
     defaults: dict | None = None,
     carried: dict | None = None,
+    take_orphaned: bool = False,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -672,6 +713,10 @@ def _change(
             An acceptance moves those fields onto the record as the accepted
             handoff, so the receiver reads the commit, the reservation keys
             and the remaining work it inherited without re-deriving them.
+        take_orphaned: Whether a claim may take an issue the supervisor
+            marked orphaned. Only the recorded owner of that marker is taken
+            from, and the take is recorded as its own transition naming that
+            owner and the reason the marker gave.
 
     Returns:
         The persisted issue record, including transition history.
@@ -695,11 +740,29 @@ def _change(
             )
         record = state["issues"].get(issue)
         if action == "claim":
+            orphan = (record or {}).get("orphan") or {}
+            taken: dict = {}
             if record and record["owner"]:
                 if record["owner"] == agent:
-                    return record
+                    if not orphan:
+                        return record
+                elif take_orphaned:
+                    taken = _taken(record, issue, orphan)
+                    logged = "take"
+                else:
+                    raise BridgeError(
+                        f"Issue #{issue} is owned by {record['owner']}."
+                        + (
+                            " That lane reads as orphaned; take it with "
+                            f"issue claim {issue} --take-orphaned."
+                            if orphan
+                            else ""
+                        )
+                    )
+            elif take_orphaned:
                 raise BridgeError(
-                    f"Issue #{issue} is owned by {record['owner']}."
+                    f"Issue #{issue} has no orphaned owner to take it from; "
+                    "claim it without --take-orphaned."
                 )
             previous = record or {}
             budget = budgets.get("attempts")
@@ -718,6 +781,8 @@ def _change(
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
+            if taken:
+                record["taken"] = taken
         elif action == "assign":
             record = _assign(
                 record,
@@ -943,7 +1008,10 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         display context, naming any issue it waits on and who holds that
         issue, or a notice that none are claimed. An unclaimed issue appears
         only while an offer waits on it, reported as unclaimed and naming the
-        operator as the source when the command line recorded that offer.
+        operator as the source when the command line recorded that offer. A
+        claim whose owner the supervisor marked orphaned states that marker,
+        the reservations that owner still holds and the command a peer takes
+        it with; the issue stays owned until that take is recorded.
     """
     lines = []
     for number, record in sorted(
@@ -962,6 +1030,15 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             line += f" ({liveness[record['owner']]})"
         if title := record.get("title"):
             line += f" — {title}"
+        if orphan := record.get("orphan"):
+            line += (
+                f"; orphaned, {orphan['reason']}; still owned until a peer "
+                f"runs issue claim {number} --take-orphaned"
+            )
+            if keys := orphan.get("reservations"):
+                line += "\n  Held reservations: " + ", ".join(keys)
+        if taken := record.get("taken"):
+            line += f"\n  Taken from {taken['from']}: {taken['reason']}"
         timing = deadline_state(record)
         if timing["overdue"]:
             line += f"; overdue {timing['overdue_seconds']}s, still owned"

@@ -16,7 +16,14 @@
     "category": "Productivity",
     "logo": "./assets/logo.png",
     "composerIcon": "./assets/icon.png",
-    "capabilities": [],
-    "defaultPrompt": "Check Agent Parley coordination and help me work on my assigned issue."
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Claude and Codex both edit this repo. Before I touch agent_parley/store.py, tell me who holds it and what they claimed.",
+      "A lane reports issue 42 finished and I do not trust it. Show the evidence it recorded and whether any peer reviewed it.",
+      "My lane has waited an hour on a handoff. Find which peer holds it, what blocks it, and whether that lane is still alive."
+    ]
   }
 }

@@ -38,6 +38,19 @@ agent-parley issue next --limit 3
 agent-parley issue claim 42
 ```
 
+The reading before that one is whether the work is recorded at all.
+`agent-parley issue match "GOAL"` lists the open issues whose recorded title or
+forge labels share subject words with what the lane intends to do, marks the
+ones a peer owns, and names the peer reservations the same words run into.
+Opening a second issue for tracked work splits one task across two numbers, and
+no lane can see that split from inside its own worktree. The match is shallow
+on purpose: shared words are a reason to read the issue, never proof that it is
+the same work, and an empty result is the recorded reason to open a new issue.
+
+```sh
+agent-parley issue match "make the status command start faster"
+```
+
 ## What travels with a handoff
 
 An offer carries the state a peer needs to take the work over rather than a
@@ -85,6 +98,25 @@ with the seconds over, `top` marks the issue `#42!`, and a lane that reports
 Ownership never moves on a timer: an overdue claim is still owned, and only an
 explicit release or an accepted handoff transfers it.
 
+## A dead lane's claims are offered, never taken away
+
+A lane whose recorded session process is gone and that has been silent past the
+project's stall threshold has its claims marked `orphaned` in `issue list`,
+`status` and `top`, which marks the issue `#42*`. The marker states what was
+observed: an idle lane with a live process is never marked, however long it has
+been quiet. Every other lane receives one notice naming the orphaned issues and
+the reservations that lane still holds.
+
+Ownership does not move on the marker. A peer takes the work explicitly, and
+the take records the previous owner and the reason, then releases the
+reservations that owner held so the paths read as free. A lane that comes back
+regains nothing by restarting: it claims its own issue again, which clears the
+marker and starts a new claim.
+
+```sh
+agent-parley issue claim 42 --take-orphaned
+```
+
 ## A budget informs; it does not gate
 
 `participant budget NAME --tokens 2000000 --calls 5000 --hours 8` records
@@ -122,6 +154,19 @@ deadline passes, so a lane that died holding a path reads differently from one
 still working on it; nothing is revoked, and releasing it stays its owner's
 decision.
 
+A lane that means to take a contested key next calls `request_reservation`
+rather than polling the holder or asking a human to sequence the two. Free keys
+are granted exactly as `file_reservation_paths` grants them; a held key is
+queued, and the refusal names the holder and the lane's place in that key's
+queue. When the holder releases, the first queued lane is granted the key and
+receives one notice naming it, in the same store commit as the release, so the
+lane is never told it holds a key it does not.
+`cancel_reservation_request` withdraws a request, and revoking a lane's
+registration expires the requests it left behind. A queued request stays
+advisory like the reservation it asks for: it blocks nobody and holds nothing
+until that release. `status` names the requests queued on a lane's keys and who
+asked; `top` marks the count with `+` beside that lane's leases.
+
 An operator editing the base checkout is otherwise invisible to a lane until the
 merge conflicts. Every `top` and `status` frame reads `git status` of the base
 checkout once per project and matches the dirty paths against each lane's active
@@ -130,6 +175,16 @@ printed under the lane's row, and the lane receives one advisory notice naming
 the path, repeated only when the set of paths changes. Nothing pauses, reverts
 or locks; reservations stay advisory. `--no-operator-edits` skips the reading
 for a repository whose base checkout is always dirty.
+
+The base branch moving under a lane is invisible in the same way. Every `top`
+and `status` frame reads the head of the base checkout once per project and
+compares it with the point each lane branched from. When it moved, the paths
+changed on the base since that fork point are matched against the lane's active
+reservations and against the paths the lane itself holds, committed on its
+branch or still uncommitted in its worktree. The overlap is printed under the
+lane's row, and the lane receives one advisory notice naming those paths,
+repeated only when the set changes. Nothing rebases or pauses; the lane decides
+whether to rebase, merge or coordinate.
 
 ## Mail is scoped, deduplicated and threaded
 
@@ -173,6 +228,21 @@ no claim, no assignment, no gate. `plan diff` previews the edges first,
 `plan show` prints the plan as a tree with each issue's current owner, and every
 apply is versioned by the file's digest, so an edge added by hand afterwards is
 reported as exactly that.
+
+## A peer can record a verdict, and it is still a claim
+
+A report is the reporting lane's own account. `agent-parley report review ID
+--verdict pass|fail --evidence TEXT`, and the `review_report` MCP tool, let a
+second lane record what it found when it checked that work. The verdict is kept
+beside the report it judges, with the reviewer, the instant and the evidence,
+and evidence longer than a record's budget is attached exactly as a report's
+own evidence is. The report's author is refused: a lane cannot review itself.
+
+`status`, `top`, `report show` and the pull request body `participant pr`
+writes all carry the latest verdict, each labelled as the reviewing lane's own
+claim about work it did not do. A verdict is not independent verification, it
+is not the operator approval `agent-parley approve` records, and it gates no
+merge or pull request.
 
 ## No lane waits for a human to give it something to do
 

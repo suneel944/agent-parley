@@ -6,6 +6,10 @@ answer two questions with numbers rather than impressions: how long a lane went
 without coordination activity, and how long each pending item waited before
 somebody answered it.
 
+The same durable log holds what a lane reported and what a peer found when it
+reviewed that report, because a verdict is only meaningful beside the claim it
+judges. Both are agent claims: neither is independent verification.
+
 Every figure is derived from coordination state: the per-lane hook event log,
 the served-call events in the store, the mail timestamps, and the issue ledger.
 Nothing here asks a vendor, starts a probe or infers what a native client was
@@ -37,6 +41,7 @@ MAX_REPORT_RECORDS = MAX_LOG_RECORDS
 MAX_REPORT_LOG_BYTES = MAX_LOG_BYTES
 MAX_REPORT_BYTES = 4096
 MAX_WAITS = 64
+VERDICTS = ("pass", "fail")
 
 
 def report_path(directory: Path, name: str) -> Path:
@@ -150,6 +155,131 @@ def report_records(
         ):
             records.append(record)
     return records
+
+
+def find_report(
+    directory: Path, participants: list[str], identifier: str
+) -> tuple[str, dict]:
+    """Names the lane that recorded one report and returns that record.
+
+    Args:
+        directory: Private state directory for the common repository.
+        participants: Participants whose report logs are searched.
+        identifier: Report record identifier.
+
+    Returns:
+        The participant that recorded the report and the record itself.
+
+    Raises:
+        BridgeError: If no participant retains a report with that identifier.
+    """
+    for name in participants:
+        for record in reversed(report_records(directory, name)):
+            if (
+                record.get("id") == identifier
+                and record.get("kind") == "report"
+            ):
+                return name, record
+    raise BridgeError(f"No report {identifier} is recorded in this project.")
+
+
+def record_review(
+    directory: Path,
+    participants: list[str],
+    reviewer: str,
+    identifier: str,
+    verdict: str,
+    evidence: str,
+) -> dict:
+    """Records one lane's verdict on another lane's report.
+
+    A verdict is recorded in the author's own report log, beside the report it
+    judges, so every reader of that report reaches the verdict without a
+    second lookup and the rotation that bounds the log bounds the verdicts
+    with it. Evidence longer than a record's budget is attached exactly as a
+    report's own evidence is, readable by the reviewer that wrote it and by
+    the author whose work it judges.
+
+    A verdict is the reviewing lane's own claim about work it did not do. It
+    is neither an operator approval nor independent verification, and it moves
+    no ownership, records no decision and gates no integration.
+
+    Args:
+        directory: Private state directory for the common repository.
+        participants: Participants whose report logs hold the report.
+        reviewer: Participant recording the verdict.
+        identifier: Report record the verdict judges.
+        verdict: Reviewed outcome, one of `VERDICTS`.
+        evidence: Nonempty account of what the reviewer checked.
+
+    Returns:
+        The appended verdict record, naming the report it judges, the lane
+        that wrote that report, the reviewer and any attached evidence.
+
+    Raises:
+        BridgeError: If the verdict is not one of `VERDICTS`, the evidence is
+            empty, no participant recorded the report, or the lane recording
+            the verdict is the report's own author.
+    """
+    if verdict not in VERDICTS:
+        raise BridgeError("A review verdict is " + " or ".join(VERDICTS) + ".")
+    if not evidence.strip():
+        raise BridgeError(
+            "A review verdict requires --evidence naming what was checked."
+        )
+    author, report = find_report(directory, participants, identifier)
+    if author == reviewer:
+        raise BridgeError(
+            f"{reviewer} recorded report {identifier}; a verdict is a peer's "
+            "claim about work it did not do, so another lane records it."
+        )
+    review = uuid.uuid4().hex[:16]
+    stored, attached = attachments.spill(
+        directory,
+        "report",
+        review,
+        evidence,
+        MAX_REPORT_BYTES,
+        reviewer,
+        [author],
+    )
+    return record_report(
+        directory,
+        author,
+        {
+            "id": review,
+            "kind": "review",
+            "report_id": report["id"],
+            "author": author,
+            "reviewer": reviewer,
+            "verdict": verdict,
+            "evidence": stored,
+            "attachment": attached or None,
+        },
+    )
+
+
+def latest_review(
+    directory: Path, name: str, identifier: str = ""
+) -> dict | None:
+    """Reads the newest peer verdict recorded against one lane's reports.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane and wrote the reports.
+        identifier: Report the verdict must judge, or empty for the newest
+            verdict against any report this lane still retains.
+
+    Returns:
+        The verdict record, or None when no peer recorded one. The record is
+        the reviewing lane's own claim and never an independent verification.
+    """
+    for record in reversed(report_records(directory, name)):
+        if record.get("kind") != "review":
+            continue
+        if not identifier or record.get("report_id") == identifier:
+            return record
+    return None
 
 
 def idle_intervals(

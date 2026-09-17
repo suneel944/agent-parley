@@ -16,6 +16,7 @@ from scripts import release_publish as release
 
 VERSION = "0.1.1"
 TAG = f"v{VERSION}"
+UPLOADS = len(release.asset_names(VERSION)) + 1
 
 
 @pytest.fixture
@@ -861,7 +862,9 @@ def test_published_release_without_manifest_cannot_be_rebuilt(
     assert calls == []
 
 
-@pytest.mark.parametrize("interrupted_after", [0, 1, 5, 6, 7])
+@pytest.mark.parametrize(
+    "interrupted_after", [0, 1, UPLOADS - 2, UPLOADS - 1, UPLOADS]
+)
 def test_upload_retries_preserve_assets_and_commit_manifest_last(
     assets, tmp_path, monkeypatch, interrupted_after
 ):
@@ -901,16 +904,16 @@ def test_upload_retries_preserve_assets_and_commit_manifest_last(
     monkeypatch.setattr(release, "github_release", view)
     monkeypatch.setattr(release, "download", download)
     monkeypatch.setattr(release, "command", command)
-    if interrupted_after < 7:
+    if interrupted_after < UPLOADS:
         with pytest.raises(RuntimeError, match="Interrupted"):
             release.prepare(tmp_path, TAG)
     checksum = release.prepare(tmp_path, TAG)
     assert checksum == release.digest(assets / "SHA256SUMS")
     assert uploads[-1] == "SHA256SUMS"
-    assert len(uploads) == 7
+    assert len(uploads) == UPLOADS
     (assets / "CHANGELOG.md").write_text("A later rebuild differs")
     assert release.prepare(tmp_path, TAG) == checksum
-    assert len(uploads) == 7
+    assert len(uploads) == UPLOADS
 
 
 def test_partial_draft_with_conflicting_bytes_is_not_overwritten(

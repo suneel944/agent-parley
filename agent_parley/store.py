@@ -39,6 +39,8 @@ MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
 MAX_REPEATS = 24
+MAX_QUEUED_REQUESTS = 32
+MAX_NOTICE_CHARACTERS = 1000
 SCHEDULE_FIELDS = (
     "id",
     "kind",
@@ -70,7 +72,7 @@ READ_ONLY = (
     "search_messages",
     "wait_for_message",
 )
-ATTACHED = ("send_message", "read_attachment")
+ATTACHED = ("send_message", "read_attachment", "review_report")
 PRESENCE_WARNINGS = {
     "idle": ("idle", "idle; wake requested"),
     "stopped": ("unreachable", "unreachable"),
@@ -80,8 +82,11 @@ RETRIED = {
     "acknowledge_message": ("message_id",),
     "mark_message_read": ("message_id",),
     "file_reservation_paths": ("paths", "ttl_seconds", "exclusive", "reason"),
+    "request_reservation": ("paths", "ttl_seconds", "exclusive", "reason"),
+    "cancel_reservation_request": ("request_id",),
     "release_file_reservations": (),
 }
+RESERVING = ("file_reservation_paths", "request_reservation")
 NO_PROJECT = (
     "This repository has no coordination project yet; launch a participant "
     "once with agent-parley run so the project registers."
@@ -119,6 +124,14 @@ CREATE TABLE IF NOT EXISTS file_reservations (
  expires_ts TEXT, released_ts TEXT, claim_id TEXT);
 CREATE INDEX IF NOT EXISTS leases ON file_reservations(project_id,expires_ts)
  WHERE released_ts IS NULL;
+CREATE TABLE IF NOT EXISTS reservation_requests (
+ id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
+ agent_id INTEGER NOT NULL REFERENCES agents(id), path_pattern TEXT NOT NULL,
+ exclusive INTEGER NOT NULL, reason TEXT DEFAULT '', ttl_seconds INTEGER,
+ created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ granted_ts TEXT, cancelled_ts TEXT, claim_id TEXT);
+CREATE INDEX IF NOT EXISTS queued ON reservation_requests(project_id,id)
+ WHERE granted_ts IS NULL AND cancelled_ts IS NULL;
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), tool TEXT NOT NULL,
@@ -531,6 +544,11 @@ def register(home: Path, root: str, name: str, token: str = "") -> dict:
 def revoke(home: Path, root: str, name: str) -> int:
     """Invalidates a retired participant's credential, retaining its mail.
 
+    Queued reservation requests expire with the credential, in the same
+    transaction, because a lane that can no longer be addressed can neither
+    take a key nor be told that it did. Leases the participant already holds
+    are left exactly as they were; releasing them stays an explicit act.
+
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
@@ -542,10 +560,18 @@ def revoke(home: Path, root: str, name: str) -> int:
     if not (home / DATABASE).exists():
         return 0
     with connect(home, write=True) as db:
+        selection = (
+            "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE p.human_key=? AND a.name=?"
+        )
+        db.execute(
+            "UPDATE reservation_requests SET cancelled_ts=CURRENT_TIMESTAMP "
+            "WHERE granted_ts IS NULL AND cancelled_ts IS NULL "
+            f"AND agent_id IN ({selection})",
+            (root, name),
+        )
         result = db.execute(
-            "UPDATE agents SET token_digest=NULL WHERE id IN "
-            "(SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
-            "WHERE p.human_key=? AND a.name=?)",
+            f"UPDATE agents SET token_digest=NULL WHERE id IN ({selection})",
             (root, name),
         )
         return result.rowcount
@@ -1192,6 +1218,139 @@ def overlapping(pattern: str, other: str) -> bool:
     )
 
 
+def _keys(
+    args: dict, declared: frozenset[str] | None
+) -> tuple[list[str], int | None, bool, str]:
+    """Validates one reservation batch into the keys and terms it asks for.
+
+    The same reading serves a grant and a queued request, so a key refused
+    for one is refused identically for the other.
+
+    Args:
+        args: Validated tool arguments.
+        declared: Resources this project declared, or None when it declared
+            none and any well-formed name is acceptable.
+
+    Returns:
+        The normalized keys, the optional time to live, whether the batch is
+        exclusive, and the declared reason.
+
+    Raises:
+        BridgeError: If the batch is malformed or names an undeclared
+            resource.
+    """
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 16:
+        raise BridgeError(
+            "paths must contain 1..16 repository-relative paths or named "
+            "resources such as port:5432."
+        )
+    ttl = args.get("ttl_seconds")
+    if ttl is not None:
+        ttl = _number(ttl, "ttl_seconds", 30, 3600)
+    exclusive = _flag(args.get("exclusive", True), "exclusive")
+    reason = _text(args.get("reason", ""), "reason", 160, empty=True)
+    keys = []
+    for pattern in paths:
+        _text(pattern, "path", 240)
+        if named_resource(pattern):
+            if not roster.RESOURCE.fullmatch(pattern):
+                raise BridgeError(
+                    f"{pattern!r} is not a named resource; write a scheme and "
+                    "a name, such as port:5432 or suite:integration."
+                )
+            if declared is not None and pattern not in declared:
+                raise BridgeError(
+                    f"{pattern!r} is not declared for this project. Declared "
+                    "resources: " + (", ".join(sorted(declared)) or "none")
+                )
+            keys.append(pattern)
+            continue
+        parts = PurePosixPath(pattern)
+        if (
+            parts.is_absolute()
+            or ".." in parts.parts
+            or "\\" in pattern
+            or str(parts) == "."
+        ):
+            raise BridgeError("Reservations require repository-relative paths.")
+        keys.append(str(parts))
+    return keys, ttl, exclusive, reason
+
+
+def _conflicts(
+    db: sqlite3.Connection, actor: dict, paths: list[str], exclusive: bool
+) -> tuple[list[sqlite3.Row], list[dict]]:
+    """Names every peer lease that blocks one batch of keys.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        paths: Normalized keys the batch asks for.
+        exclusive: Whether the batch asks exclusively.
+
+    Returns:
+        Every live peer lease of this project, and one conflict entry per
+        blocked key and blocking lease, in key order.
+    """
+    leases = db.execute(
+        "SELECT f.id,f.path_pattern,f.exclusive,a.name,"
+        "substr(f.reason,1,80) AS reason,"
+        "(f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP) "
+        "AS stale FROM file_reservations f "
+        "JOIN agents a ON a.id=f.agent_id WHERE f.project_id=? "
+        "AND f.agent_id!=? AND f.released_ts IS NULL",
+        (actor["project_id"], actor["id"]),
+    ).fetchall()
+    conflicts = []
+    for pattern in sorted(set(paths)):
+        for lease in leases:
+            other = lease["path_pattern"]
+            if (exclusive or lease["exclusive"]) and overlapping(
+                pattern, other
+            ):
+                conflict = {"path": pattern, "owner": lease["name"]}
+                if lease["reason"]:
+                    conflict["reason"] = lease["reason"]
+                if lease["stale"]:
+                    conflict["stale"] = True
+                conflicts.append(conflict)
+    return leases, conflicts
+
+
+def _refusal(conflicts: list[dict], queued: list[dict] | None = None) -> dict:
+    """Reports a refused batch within the serialized response budget.
+
+    Args:
+        conflicts: Every conflict the batch raised, in key order.
+        queued: Queued requests recorded for those conflicts, or None when
+            the batch queued nothing and reports no queue at all.
+
+    Returns:
+        The granted-nothing result, the conflicts that fit the budget, and
+        ``has_more`` when further conflicts exist beyond the reported ones.
+    """
+    reported: list[dict] = []
+    for conflict in conflicts[:16]:
+        candidate = {"granted": [], "conflicts": [*reported, conflict]}
+        if queued is not None:
+            candidate["queued"] = queued
+        if (
+            len(json.dumps(candidate, ensure_ascii=False).encode())
+            > MAX_RESULT_BYTES
+        ):
+            break
+        reported.append(conflict)
+    result = {
+        "granted": [],
+        "conflicts": reported,
+        "has_more": len(reported) < len(conflicts),
+    }
+    if queued is not None:
+        result["queued"] = queued
+    return result
+
+
 def _reserve(
     db: sqlite3.Connection,
     actor: dict,
@@ -1246,80 +1405,48 @@ def _reserve(
         BridgeError: If a key is malformed, names an undeclared resource, or
             the lane already holds the maximum number of leases.
     """
-    paths = args.get("paths")
-    if not isinstance(paths, list) or not 1 <= len(paths) <= 16:
-        raise BridgeError(
-            "paths must contain 1..16 repository-relative paths or named "
-            "resources such as port:5432."
-        )
-    ttl = args.get("ttl_seconds")
-    if ttl is not None:
-        ttl = _number(ttl, "ttl_seconds", 30, 3600)
-    exclusive = _flag(args.get("exclusive", True), "exclusive")
-    reason = _text(args.get("reason", ""), "reason", 160, empty=True)
-    keys = []
-    for pattern in paths:
-        _text(pattern, "path", 240)
-        if named_resource(pattern):
-            if not roster.RESOURCE.fullmatch(pattern):
-                raise BridgeError(
-                    f"{pattern!r} is not a named resource; write a scheme and "
-                    "a name, such as port:5432 or suite:integration."
-                )
-            if declared is not None and pattern not in declared:
-                raise BridgeError(
-                    f"{pattern!r} is not declared for this project. Declared "
-                    "resources: " + (", ".join(sorted(declared)) or "none")
-                )
-            keys.append(pattern)
-            continue
-        parts = PurePosixPath(pattern)
-        if (
-            parts.is_absolute()
-            or ".." in parts.parts
-            or "\\" in pattern
-            or str(parts) == "."
-        ):
-            raise BridgeError("Reservations require repository-relative paths.")
-        keys.append(str(parts))
-    paths = keys
-    leases = db.execute(
-        "SELECT f.id,f.path_pattern,f.exclusive,a.name,"
-        "substr(f.reason,1,80) AS reason,"
-        "(f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP) "
-        "AS stale FROM file_reservations f "
-        "JOIN agents a ON a.id=f.agent_id WHERE f.project_id=? "
-        "AND f.agent_id!=? AND f.released_ts IS NULL",
-        (actor["project_id"], actor["id"]),
-    ).fetchall()
-    conflicts = []
-    for pattern in set(paths):
-        for lease in leases:
-            other = lease["path_pattern"]
-            if (exclusive or lease["exclusive"]) and overlapping(
-                pattern, other
-            ):
-                conflict = {"path": pattern, "owner": lease["name"]}
-                if lease["reason"]:
-                    conflict["reason"] = lease["reason"]
-                if lease["stale"]:
-                    conflict["stale"] = True
-                conflicts.append(conflict)
+    paths, ttl, exclusive, reason = _keys(args, declared)
+    leases, conflicts = _conflicts(db, actor, paths, exclusive)
     if conflicts:
-        reported: list[dict] = []
-        for conflict in conflicts[:16]:
-            candidate = {"granted": [], "conflicts": [*reported, conflict]}
-            if (
-                len(json.dumps(candidate, ensure_ascii=False).encode())
-                > MAX_RESULT_BYTES
-            ):
-                break
-            reported.append(conflict)
-        return {
-            "granted": [],
-            "conflicts": reported,
-            "has_more": len(reported) < len(conflicts),
-        }
+        return _refusal(conflicts)
+    return _grant(
+        db, actor, paths, ttl, exclusive, reason, claim, leases, commits
+    )
+
+
+def _grant(
+    db: sqlite3.Connection,
+    actor: dict,
+    paths: list[str],
+    ttl: int | None,
+    exclusive: bool,
+    reason: str,
+    claim: str,
+    leases: list[sqlite3.Row],
+    commits: list[list[str]] | None,
+) -> dict:
+    """Records one unconflicted batch of leases and forecasts its collisions.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        paths: Normalized keys to record, already free of conflicts.
+        ttl: Seconds until the lease reports stale, or None for no deadline.
+        exclusive: Whether the batch was asked for exclusively.
+        reason: Declared scope shown to peers the lease blocks.
+        claim: Claim identifier the lane holds, recorded beside each lease.
+        leases: Live peer leases read for the conflict check, reused for the
+            forecast so the same instant answers both.
+        commits: Files per recent commit of the base checkout, or None when
+            no history is available.
+
+    Returns:
+        The granted leases, carrying ``forecast`` where a peer holds a file
+        that habitually changes with a granted path.
+
+    Raises:
+        BridgeError: If the lane already holds the maximum number of leases.
+    """
     owned = db.execute(
         "SELECT path_pattern FROM file_reservations WHERE agent_id=? "
         "AND released_ts IS NULL",
@@ -1368,6 +1495,335 @@ def _reserve(
     if advisory:
         result["forecast"] = advisory
     return result
+
+
+def _request(
+    db: sqlite3.Connection,
+    actor: dict,
+    args: dict,
+    declared: frozenset[str] | None = None,
+    claim: str = "",
+    commits: list[list[str]] | None = None,
+) -> dict:
+    """Takes the leases that are free and queues a request for the rest.
+
+    A batch that conflicts with nothing is granted exactly as
+    ``file_reservation_paths`` grants it, so a lane never has to ask twice
+    and no key is queued behind a holder that released it meanwhile. A batch
+    that conflicts grants nothing and records one queued request per blocked
+    key, naming the holder and the place in that key's queue. Asking twice
+    for a key this lane already queued keeps the first request and its
+    place rather than taking a second one.
+
+    A queued request reserves nothing. Reservations stay advisory, so a
+    queue holds no path, blocks no peer and locks nothing on disk; it
+    records who asked first and is read when the holder releases.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        args: Validated tool arguments.
+        declared: Resources this project declared, or None when it declared
+            none and any well-formed name is acceptable.
+        claim: Claim identifier the lane holds, recorded beside each request
+            and beside the lease a granted request becomes. Empty records no
+            claim.
+        commits: Files per recent commit of the base checkout, or None when
+            no history is available.
+
+    Returns:
+        The granted leases and an empty queue, or the conflicts that granted
+        nothing beside one ``queued`` entry per blocked key, each naming the
+        request identifier, the key, its holder and its place in that queue.
+
+    Raises:
+        BridgeError: If a key is malformed, names an undeclared resource, or
+            the lane already queued the maximum number of requests.
+    """
+    paths, ttl, exclusive, reason = _keys(args, declared)
+    leases, conflicts = _conflicts(db, actor, paths, exclusive)
+    if not conflicts:
+        granted = _grant(
+            db, actor, paths, ttl, exclusive, reason, claim, leases, commits
+        )
+        return {**granted, "queued": []}
+    queued = _queue(db, actor, conflicts, ttl, exclusive, reason, claim)
+    return _refusal(conflicts, queued)
+
+
+def _queue(
+    db: sqlite3.Connection,
+    actor: dict,
+    conflicts: list[dict],
+    ttl: int | None,
+    exclusive: bool,
+    reason: str,
+    claim: str,
+) -> list[dict]:
+    """Records this lane's place behind the holders of the blocked keys.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        conflicts: Conflicts the batch raised, in key order.
+        ttl: Seconds the granted lease will run for, or None for no deadline.
+        exclusive: Whether the batch was asked for exclusively.
+        reason: Declared scope, carried onto the lease a grant writes.
+        claim: Claim identifier the lane holds, or empty for none.
+
+    Returns:
+        One entry per blocked key, in key order, naming the request, the
+        holder that blocked it and its place in that key's queue.
+
+    Raises:
+        BridgeError: If the lane already queued the maximum number of
+            requests.
+    """
+    live = db.execute(
+        "SELECT id,agent_id,path_pattern FROM reservation_requests "
+        "WHERE project_id=? AND granted_ts IS NULL AND cancelled_ts IS NULL "
+        "ORDER BY id",
+        (actor["project_id"],),
+    ).fetchall()
+    queue: list[dict] = [dict(row) for row in live]
+    mine = [row for row in queue if row["agent_id"] == actor["id"]]
+    entries: list[dict] = []
+    for path in sorted({conflict["path"] for conflict in conflicts}):
+        owner = next(
+            conflict["owner"]
+            for conflict in conflicts
+            if conflict["path"] == path
+        )
+        waiting = next(
+            (row for row in mine if row["path_pattern"] == path), None
+        )
+        if waiting is None:
+            if len(mine) >= MAX_QUEUED_REQUESTS:
+                raise BridgeError(
+                    "Cancel queued reservation requests before adding more."
+                )
+            cursor = db.execute(
+                "INSERT INTO reservation_requests(project_id,agent_id,"
+                "path_pattern,exclusive,reason,ttl_seconds,claim_id) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    actor["project_id"],
+                    actor["id"],
+                    path,
+                    exclusive,
+                    reason,
+                    ttl,
+                    claim or None,
+                ),
+            )
+            waiting = {
+                "id": cursor.lastrowid,
+                "agent_id": actor["id"],
+                "path_pattern": path,
+            }
+            queue.append(waiting)
+            mine.append(waiting)
+        ahead = sum(
+            1
+            for row in queue
+            if row["id"] < waiting["id"]
+            and row["agent_id"] != actor["id"]
+            and overlapping(path, row["path_pattern"])
+        )
+        entries.append(
+            {
+                "id": waiting["id"],
+                "path": path,
+                "owner": owner,
+                "position": ahead + 1,
+            }
+        )
+    return entries
+
+
+def _cancel_request(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
+    """Withdraws this lane's own queued requests, or one named request.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        args: Validated tool arguments, optionally naming ``request_id``.
+
+    Returns:
+        How many queued requests were withdrawn.
+
+    Raises:
+        BridgeError: If the named request is not this lane's own queued
+            request.
+    """
+    statement = (
+        "UPDATE reservation_requests SET cancelled_ts=CURRENT_TIMESTAMP "
+        "WHERE agent_id=? AND granted_ts IS NULL AND cancelled_ts IS NULL"
+    )
+    if args.get("request_id") is None:
+        return {"cancelled": db.execute(statement, (actor["id"],)).rowcount}
+    identifier = _number(args["request_id"], "request_id", 1, 2**63 - 1)
+    cancelled = db.execute(
+        statement + " AND id=?", (actor["id"], identifier)
+    ).rowcount
+    if not cancelled:
+        raise BridgeError("You have no queued request with that identifier.")
+    return {"cancelled": cancelled}
+
+
+def _release(db: sqlite3.Connection, actor: dict) -> dict:
+    """Releases this lane's leases and grants what a peer queued for them.
+
+    The release, the grant and the notice that names it are one transaction,
+    so no reader sees a key released with its queue untouched, and the lane
+    that was told it holds the key holds it in the same committed state.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+
+    Returns:
+        How many leases were released and, as ``granted``, one entry per
+        lane that took queued keys, naming that lane, its keys and the
+        notice it was sent.
+    """
+    held = db.execute(
+        "SELECT path_pattern FROM file_reservations WHERE agent_id=? "
+        "AND released_ts IS NULL",
+        (actor["id"],),
+    ).fetchall()
+    released = db.execute(
+        "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+        "WHERE agent_id=? AND released_ts IS NULL",
+        (actor["id"],),
+    ).rowcount
+    granted = _grant_queued(db, actor, sorted({row[0] for row in held}))
+    return {"released": released, "granted": granted}
+
+
+def _grant_queued(
+    db: sqlite3.Connection, actor: dict, released: list[str]
+) -> list[dict]:
+    """Hands each released key to the lane that queued for it first.
+
+    Requests are read in the order they were recorded, so the first lane to
+    ask for a key is the first to take it, and a key that another lane still
+    holds is left queued rather than granted twice. A request whose lane no
+    longer holds a credential is left alone: a revoked registration expires
+    its requests instead.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane, which is releasing.
+        released: Keys this lane just released, in key order.
+
+    Returns:
+        One entry per lane granted something, naming that lane, the keys it
+        took and the identifier of the single notice it was sent.
+    """
+    if not released:
+        return []
+    queued = db.execute(
+        "SELECT r.id,r.agent_id,r.path_pattern,r.exclusive,r.reason,"
+        "r.ttl_seconds,r.claim_id,a.name FROM reservation_requests r "
+        "JOIN agents a ON a.id=r.agent_id WHERE r.project_id=? "
+        "AND r.agent_id!=? AND r.granted_ts IS NULL "
+        "AND r.cancelled_ts IS NULL AND a.token_digest IS NOT NULL "
+        "ORDER BY r.id",
+        (actor["project_id"], actor["id"]),
+    ).fetchall()
+    if not queued:
+        return []
+    held = [
+        (row["agent_id"], row["path_pattern"], row["exclusive"])
+        for row in db.execute(
+            "SELECT agent_id,path_pattern,exclusive FROM file_reservations "
+            "WHERE project_id=? AND released_ts IS NULL",
+            (actor["project_id"],),
+        )
+    ]
+    taken: dict[str, list[str]] = {}
+    first: dict[str, int] = {}
+    for request in queued:
+        pattern = request["path_pattern"]
+        if not any(overlapping(pattern, key) for key in released):
+            continue
+        if any(
+            owner != request["agent_id"]
+            and (request["exclusive"] or exclusive)
+            and overlapping(pattern, key)
+            for owner, key, exclusive in held
+        ):
+            continue
+        db.execute(
+            "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+            "WHERE agent_id=? AND path_pattern=? AND released_ts IS NULL",
+            (request["agent_id"], pattern),
+        )
+        db.execute(
+            "INSERT INTO file_reservations(project_id,agent_id,path_pattern,"
+            "exclusive,reason,expires_ts,claim_id) VALUES (?,?,?,?,?,"
+            "datetime('now',?),?)",
+            (
+                actor["project_id"],
+                request["agent_id"],
+                pattern,
+                request["exclusive"],
+                request["reason"],
+                (
+                    None
+                    if request["ttl_seconds"] is None
+                    else f"+{request['ttl_seconds']} seconds"
+                ),
+                request["claim_id"],
+            ),
+        )
+        db.execute(
+            "UPDATE reservation_requests SET granted_ts=CURRENT_TIMESTAMP "
+            "WHERE id=?",
+            (request["id"],),
+        )
+        held.append((request["agent_id"], pattern, request["exclusive"]))
+        taken.setdefault(request["name"], []).append(pattern)
+        first.setdefault(request["name"], request["id"])
+    notices = []
+    for name in sorted(taken):
+        keys = taken[name]
+        subject, body = _notice(actor["name"], keys)
+        message = _send(
+            db,
+            actor,
+            {
+                "to": [name],
+                "subject": subject,
+                "body_md": body,
+                "idempotency_key": f"reservation-granted-{first[name]}",
+            },
+        )
+        notices.append(
+            {"agent": name, "paths": keys, "message_id": message["id"]}
+        )
+    return notices
+
+
+def _notice(holder: str, keys: list[str]) -> tuple[str, str]:
+    """Words the one notice a lane reads when its queued keys are granted.
+
+    Args:
+        holder: Lane that released the keys.
+        keys: Keys the reading lane now holds, in the order granted.
+
+    Returns:
+        The bounded subject and body of the notice.
+    """
+    listed = ", ".join(keys)[:MAX_NOTICE_CHARACTERS]
+    return (
+        f"Reservation granted: {listed}"[:160],
+        f"{holder} released {listed}, and your queued request for those "
+        "keys is granted. The reservation is advisory: it records that you "
+        "declared the edit, and nothing on disk is locked. Release it with "
+        "release_file_reservations when the work is done.",
+    )
 
 
 def _event(
@@ -1643,17 +2099,17 @@ def _dispatch(
         return _recommended(home, actor, args)
     declared = (
         declared_resources(home, str(actor.get("project", "")))
-        if tool == "file_reservation_paths"
+        if tool in RESERVING
         else None
     )
     claim = (
         held_claim(home, str(actor.get("project", "")), actor["name"])
-        if tool in ("file_reservation_paths", "send_message")
+        if tool in (*RESERVING, "send_message")
         else ""
     )
     commits = (
         cochange_history(home, str(actor.get("project", "")))
-        if tool == "file_reservation_paths"
+        if tool in RESERVING
         else None
     )
     directory = (
@@ -1981,6 +2437,10 @@ def _effect(
     """
     if tool == "send_message":
         return _send(db, actor, args, claim, directory)
+    if tool == "review_report":
+        if directory is None:
+            raise BridgeError(NO_PROJECT)
+        return _reviewed(directory, actor, args)
     if tool == "read_attachment":
         if directory is None:
             raise BridgeError("This project keeps no attachments.")
@@ -2002,13 +2462,12 @@ def _effect(
         return _decisions(db, actor, args)
     if tool == "file_reservation_paths":
         return _reserve(db, actor, args, declared, claim, commits)
+    if tool == "request_reservation":
+        return _request(db, actor, args, declared, claim, commits)
+    if tool == "cancel_reservation_request":
+        return _cancel_request(db, actor, args)
     if tool == "release_file_reservations":
-        result = db.execute(
-            "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
-            "WHERE agent_id=? AND released_ts IS NULL",
-            (actor["id"],),
-        )
-        return {"released": result.rowcount}
+        return _release(db, actor)
     if tool in ("acknowledge_message", "mark_message_read"):
         message = _number(args.get("message_id"), "message_id", 1, 2**63 - 1)
         ack = tool == "acknowledge_message"
@@ -2023,6 +2482,57 @@ def _effect(
             raise BridgeError("Message is not in your inbox.")
         return {"id": message, "acknowledged": ack}
     raise BridgeError("Unknown coordination tool.")
+
+
+def _reviewed(directory: Path, actor: dict, args: dict) -> dict:
+    """Records the calling lane's verdict on a peer's report.
+
+    The lane behind the served call is the reviewer, so a lane can no more
+    review its own report over this tool than it can from its own command
+    line. The verdict is that lane's own claim about work it did not do: it
+    approves nothing, moves no ownership and gates no integration.
+
+    The report log lives in coordination state rather than in the store, so
+    the verdict is written where reports are kept and only its served call is
+    recorded here.
+
+    Args:
+        directory: Private state directory for the common repository.
+        actor: Authenticated project and lane.
+        args: Validated tool arguments.
+
+    Returns:
+        The recorded verdict.
+
+    Raises:
+        BridgeError: If the caller is not a registered participant, the
+            report identifier is malformed, no lane recorded that report, or
+            the calling lane wrote it.
+    """
+    from agent_parley import metrics
+
+    identifier = args.get("report_id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise BridgeError("report_id must name a recorded report.")
+    participants = roster.read(directory)["participants"]
+    reviewer = next(
+        (
+            name
+            for name, entry in participants.items()
+            if entry.get("display") == actor["name"]
+        ),
+        "",
+    )
+    if not reviewer:
+        raise BridgeError("This lane is not a participant of this project.")
+    return metrics.record_review(
+        directory,
+        list(participants),
+        reviewer,
+        identifier.strip(),
+        str(args.get("verdict", "")),
+        str(args.get("evidence", "")),
+    )
 
 
 def _identify(db: sqlite3.Connection, root: str, name: str) -> dict:
@@ -2757,10 +3267,58 @@ def waiting(home: Path, root: str, name: str) -> dict:
     return report
 
 
+def _waiting_on(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
+    """Maps each holding lane to the lanes queued behind the keys it holds.
+
+    A queued request is matched to a holder by the same overlap rule that
+    refused it, so a request queued on a directory or a glob is read under
+    the lane whose lease blocked it, and a request blocked by two lanes is
+    reported under both.
+
+    Args:
+        db: Open read transaction to answer from.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        Mapping of holding identity to the requesting identities waiting on
+        it, one entry per queued request.
+    """
+    requests = db.execute(
+        "SELECT a.name AS name,r.path_pattern AS pattern,"
+        "r.agent_id AS agent_id,r.exclusive AS exclusive "
+        "FROM reservation_requests r JOIN agents a ON a.id=r.agent_id "
+        "JOIN projects p ON p.id=r.project_id WHERE p.human_key=? "
+        "AND r.granted_ts IS NULL AND r.cancelled_ts IS NULL ORDER BY r.id",
+        (root,),
+    ).fetchall()
+    if not requests:
+        return {}
+    leases = db.execute(
+        "SELECT a.name AS name,f.path_pattern AS pattern,"
+        "f.agent_id AS agent_id,f.exclusive AS exclusive "
+        "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
+        "JOIN projects p ON p.id=f.project_id WHERE p.human_key=? "
+        "AND f.released_ts IS NULL",
+        (root,),
+    ).fetchall()
+    waiting: dict[str, list[str]] = {}
+    for request in requests:
+        blockers = {
+            lease["name"]
+            for lease in leases
+            if lease["agent_id"] != request["agent_id"]
+            and (request["exclusive"] or lease["exclusive"])
+            and overlapping(request["pattern"], lease["pattern"])
+        }
+        for holder in blockers:
+            waiting.setdefault(holder, []).append(request["name"])
+    return waiting
+
+
 def usage(
     home: Path, root: str, *, db: sqlite3.Connection | None = None
 ) -> dict[str, dict]:
-    """Reports retained tool events and held leases for one project.
+    """Reports retained tool events, held leases and their queues.
 
     Args:
         home: Private bridge state root.
@@ -2770,10 +3328,12 @@ def usage(
     Returns:
         Mapping of registered identity to served calls, rejected calls,
         returned bytes, held leases, how many of those leases are past a
-        declared time to live, and the age of its oldest held lease. A stale
-        lease is still held and still counted; nothing releases it on its
-        owner's behalf. Counts cover retained events only; older events are
-        retired.
+        declared time to live, the age of its oldest held lease, and the
+        queued reservation requests waiting on the keys it holds with the
+        lanes that asked. A stale lease is still held and still counted;
+        nothing releases it on its owner's behalf, and a queued request
+        holds nothing of its own. Counts cover retained events only; older
+        events are retired.
     """
     if db is None and not (home / DATABASE).exists():
         return {}
@@ -2793,7 +3353,13 @@ def usage(
                 "leases": 0,
                 "stale_leases": 0,
                 "lease_age": 0,
+                "queued": 0,
+                "queued_by": [],
             }
+        for holder, waiting in _waiting_on(db, root).items():
+            report.setdefault(holder, {}).update(
+                queued=len(waiting), queued_by=sorted(set(waiting))
+            )
         for row in db.execute(
             "SELECT a.name AS name,count(*) AS leases,"
             "coalesce(sum(f.expires_ts IS NOT NULL "
@@ -2890,6 +3456,50 @@ def transfer_reservations(
             )
             moved.append(lease["path_pattern"])
     return moved
+
+
+def release_reservations(home: Path, root: str, name: str) -> list[str]:
+    """Releases every advisory reservation one lane still holds.
+
+    Reservations are advisory declarations of intent, never enforced file
+    system locks. A lane whose claims a peer has taken holds declarations that
+    no longer describe anybody's work, so the take releases them in one store
+    transaction and the keys read as free to whoever reserves them next.
+
+    Nothing is granted to the taking lane here: it reserves what it needs
+    itself, which keeps every grant a declaration a lane made for itself.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose reservations are released.
+
+    Returns:
+        The released keys, in sorted order, including a lease past its
+        declared time to live, which is still held until it is released.
+
+    Raises:
+        BridgeError: If no store exists or the identity is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    with connect(home, write=True) as db:
+        holder = _identify(db, root, name)
+        released = [
+            row["path_pattern"]
+            for row in db.execute(
+                "SELECT path_pattern FROM file_reservations WHERE "
+                "project_id=? AND agent_id=? AND released_ts IS NULL "
+                "ORDER BY path_pattern",
+                (holder["project_id"], holder["id"]),
+            )
+        ]
+        db.execute(
+            "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+            "WHERE project_id=? AND agent_id=? AND released_ts IS NULL",
+            (holder["project_id"], holder["id"]),
+        )
+    return released
 
 
 def active_reservations(home: Path, root: str) -> dict[str, list[str]]:

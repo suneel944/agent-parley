@@ -13,6 +13,7 @@ recommendation never moves ownership and two lanes reading the same ledger
 still race for the claim rather than for the advice.
 """
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -21,6 +22,34 @@ from agent_parley import forecast, forge, issues
 MAX_SHORTLIST = 5
 MAX_LOOKUPS = 3
 MAX_REASONS = 6
+MINIMUM_TERM = 3
+COMMON_TERMS = frozenset(
+    {
+        "add",
+        "and",
+        "are",
+        "can",
+        "code",
+        "file",
+        "files",
+        "fix",
+        "for",
+        "from",
+        "issue",
+        "make",
+        "not",
+        "repo",
+        "should",
+        "that",
+        "the",
+        "this",
+        "use",
+        "want",
+        "when",
+        "with",
+        "work",
+    }
+)
 
 
 def conflicts(
@@ -240,6 +269,141 @@ def shortlist(
             limit,
         ),
     }
+
+
+def terms(text: str) -> set[str]:
+    """Reduces free text to the words worth matching an issue against.
+
+    Args:
+        text: A stated goal, an issue title or a reservation pattern.
+
+    Returns:
+        Lowercased words of at least ``MINIMUM_TERM`` characters, with the
+        words that appear in almost every goal removed, so a match means
+        shared subject matter rather than shared English.
+    """
+    found = set()
+    for word in re.split(r"[^0-9A-Za-z_]+", text.lower()):
+        stripped = word.strip("_")
+        if len(stripped) >= MINIMUM_TERM and stripped not in COMMON_TERMS:
+            found.add(stripped)
+    return found
+
+
+def _match_reasons(
+    wanted: set[str],
+    title: str,
+    labels: list[str],
+    owner: str,
+    reserved: list[dict],
+) -> list[str]:
+    """States what a goal and one recorded issue actually share."""
+    shared = sorted(wanted & terms(title))
+    said = []
+    if shared:
+        said.append("title shares " + ", ".join(shared))
+    for label in labels:
+        if wanted & terms(label):
+            said.append(f"label {label} matches")
+    for entry in reserved:
+        said.append(f"{entry['peer']} reserves {entry['path']}")
+    if owner:
+        said.append(f"held by {owner}; negotiate a handoff rather than claim")
+    return said[:MAX_REASONS]
+
+
+def match(
+    goal: str,
+    catalog: dict[str, dict],
+    state: dict,
+    held: dict[str, list[str]],
+    limit: int = MAX_SHORTLIST,
+) -> dict:
+    """Finds the recorded open issues a stated goal already describes.
+
+    Opening a second issue for work the ledger already tracks splits the
+    history of one task across two numbers, and a lane cannot see that from
+    its own worktree. The reading here is deliberately shallow: shared words
+    between the goal and an issue's recorded title or forge labels, plus the
+    peer reservations the goal's own words run into. It ranks, it never
+    decides, and a match is a prompt to read the issue rather than proof that
+    it is the same work.
+
+    Args:
+        goal: What the lane intends to do, in the operator's words.
+        catalog: Open issues the forge reports, each carrying its recorded
+            title and its labels. An empty catalog matches nothing, which is
+            reported as no match rather than as a clean slate.
+        state: Published issue ledger, read for current ownership only.
+        held: Active reservation keys per peer identity, the reading lane's
+            own identity already excluded.
+        limit: Most matches to return.
+
+    Returns:
+        The goal read, the words it was matched on, and the matching issues
+        best first, each carrying its number, recorded title, current owner,
+        labels and the reasons it matched.
+    """
+    wanted = terms(goal)
+    reserved = [
+        {"peer": peer, "path": pattern}
+        for peer, patterns in sorted(held.items())
+        for pattern in patterns
+        if wanted & terms(pattern)
+    ]
+    ledger = state.get("issues", {})
+    found = []
+    for number, record in catalog.items():
+        title = record.get("title") or ledger.get(number, {}).get("title", "")
+        names = record.get("labels", [])
+        overlap = len(wanted & terms(title)) + sum(
+            1 for name in names if wanted & terms(name)
+        )
+        if not overlap:
+            continue
+        owner = ledger.get(number, {}).get("owner") or ""
+        found.append(
+            {
+                "issue": number,
+                "title": title,
+                "owner": owner,
+                "labels": names,
+                "matched": overlap,
+                "reasons": _match_reasons(
+                    wanted, title, names, owner, reserved[:MAX_REASONS]
+                ),
+            }
+        )
+    found.sort(key=lambda record: (-record["matched"], int(record["issue"])))
+    return {
+        "goal": goal,
+        "terms": sorted(wanted),
+        "reservations": reserved[:MAX_REASONS],
+        "matches": found[: max(limit, 1)],
+    }
+
+
+def render_match(result: dict) -> str:
+    """Formats goal matches as one line per issue, closest first.
+
+    Returns:
+        The matching issues with the reason for each, or a single line
+        stating that the ledger records no open issue for that goal.
+    """
+    if not result["matches"]:
+        return (
+            "No recorded open issue matches that goal; "
+            "opening a new one is the recorded next step."
+        )
+    lines = [
+        f"#{record['issue']}"
+        + (f" {record['title']}" if record["title"] else "")
+        + ": "
+        + "; ".join(record["reasons"])
+        for record in result["matches"]
+    ]
+    lines.append("Claim one of these before opening a new issue.")
+    return "\n".join(lines)
 
 
 def render(result: dict) -> str:
