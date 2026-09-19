@@ -23,6 +23,7 @@ def test_server_binds_without_reverse_dns(tmp_path, monkeypatch):
 
 def test_a_start_and_a_stop_each_leave_one_timestamped_line(bridge):
     bridge.up()
+    assert bridge.health()["status"] == "ready"
     bridge.down()
     written = (bridge.home / "server.log").read_text()
     lines = written.splitlines()

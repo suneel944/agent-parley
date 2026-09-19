@@ -23,8 +23,15 @@ its environment under `/opt/agent-parley`. Each user's runtime state remains
 private.
 
 Upgrading needs no action: the store upgrades in place on first use, keeping
-every message, claim and lease. Stop running sessions first, and do not point an
-older installation at an upgraded state directory afterwards.
+every message, claim and lease. Issue ledgers upgrade lazily: 0.11 derives
+lifecycle defaults for older records without an `execution` field and persists
+them when a lifecycle transition next writes the record. Stop running sessions
+before upgrading.
+
+After 0.11 records a verified completion or recovery, do not run 0.10 against
+that state directory. Version 0.10 does not understand those lifecycle and
+recovery records; in particular, it can read an ownerless completed issue as
+unclaimed and offer it again. Keep that state directory on 0.11 or newer.
 
 ## Platforms
 
@@ -108,15 +115,16 @@ running behind the checkout is therefore visible in the reading rather than
 reported as ready, and `doctor` reports the same comparison as its `service`
 component.
 
-`SESSION` carries the lane's presence, which has three states. `active` is a
+`SESSION` carries the lane's presence, which has four states. `active` is a
 lane that served a coordination call inside the configured interval. `idle` is a
 live session process that served none inside the inactivity threshold: it is a
 quiet lane, not a lost one. `stopped` is a lane whose recorded session
-process is gone. A live lane past the threshold therefore never reads
-`stopped`, and presence only reports: no claim is released and no ownership
-moves on any of the three. A send result keeps the older operator wording for
-the dead case and summarises a message to a `stopped` lane as
-`queued for NAME (unreachable)`.
+process is gone. `unknown` means no trustworthy native process identity was
+recorded, so the service cannot distinguish a live manual session from one that
+was killed. A live lane past the threshold therefore never reads `stopped`, and
+presence only reports: no claim is released and no ownership moves on any of
+the four. A send result keeps the older operator wording for the dead case and
+summarises a message to a `stopped` lane as `queued for NAME (unreachable)`.
 
 Appending a participant name reports that lane as the whole reading —
 availability, drift, waiting items, claims, reported outcome, mail counters and
@@ -947,6 +955,37 @@ as a live process or as provider capacity; the three are checked separately and
 reported separately, because a quiet coordination channel alone does not prove
 that a native turn is idle or that a lane can safely accept input.
 
+When an owner is alive but its provider has published an exhausted capacity
+window, the operator can approve recovery of that exact claim and native
+session from the project base checkout:
+
+```sh
+agent-parley issue recover 42 --reason "continue on an available lane"
+```
+
+The command records an approval; it does not stop a process by itself. A later
+supervision pass must publish a matching current capacity observation before
+the runtime stops the process, captures its committed, staged, unstaged and
+non-ignored untracked content, and marks the claim recoverable. A refusal from
+the provider, elapsed time, or the approval alone cannot transfer ownership.
+Recovery also refuses while the owner is paused, waiting for a native approval,
+or waiting for more operator input.
+The receiving lane still runs `issue claim 42 --take-orphaned`. That claim
+revalidates the stopped process and ownership generation, moves only the old
+claim's reservations, fast-forwards to the captured committed HEAD, and restores
+the captured index and working tree into a clean destination. It permits
+unrelated ignored caches, but refuses dirty or untracked content and ignored
+content at a path recovery would change. Both worktrees stay intact. Restore
+progress is durable; after interruption, the new owner reruns
+`issue claim 42` to resume the exact recorded phase.
+
+The checkpoint and its Git bundle live in the private Agent Parley state
+directory. The bundle carries an exact size and SHA-256 digest, so binary and
+large files are referenced rather than embedded in the issue ledger. Ignored
+untracked files are excluded. The old session generation is refused by later
+lifecycle hooks after takeover; this is runtime fencing, not a filesystem
+security boundary against another process writing directly into the old lane.
+
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six
 hours rather than across the whole retained log. Accepted windows are a count
@@ -1261,13 +1300,14 @@ same records `top` reads, takes no lock and writes no coordination state.
 ### Availability, reminders and waking
 
 The local service observes each launcher's process identity and native checkpoint
-age. Observed availability is one of three states. `active` is a live launcher
+age. Observed availability is one of four states. `active` is a live launcher
 whose latest checkpoint is younger than `inactive_after`; `idle` is a live
 launcher whose checkpoint has aged past it, which is what a lane between turns
 looks like; `stopped` is a launcher whose recorded session process is gone. A
-lane that is only idle is never reported with the word a dead launcher gets.
-`status` reports that state beside process liveness and lists outstanding
-acknowledgement IDs, senders and ages.
+lane without a trustworthy native process identity is `unknown`, because it may
+still be a live session. A lane that is only idle is never reported with the word
+a dead launcher gets. `status` reports that state beside process liveness and
+lists outstanding acknowledgement IDs, senders and ages.
 
 A lane that has recorded no native activity yet has no age to report, so
 `last_active_at` and `age_seconds` are both `null` rather than an age measured
@@ -1284,7 +1324,9 @@ asks an idle lane holding a backlog to take its turn. A recipient whose
 process is gone reports `state` `unreachable` with the summary
 `queued for NAME (unreachable)`. A presence row written before this release
 still carries `unreachable` and is read as `stopped`. Observed availability is
-separate from last coordination and never changes claims.
+separate from last coordination and never changes claims. An `unknown` recipient
+reports that native process identity is unavailable and requires manual
+attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
@@ -1302,25 +1344,43 @@ marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
 
 For eligible idle sessions, the launcher owns a native pseudo-terminal and a
-private wake socket. It admits only a fixed coordination prompt at a native idle
-checkpoint, with no partially entered operator input. Approval prompts and
-active turns refuse injection. A stopped session can resume its recorded session
-ID through the same native launch configuration and an interactive terminal;
+private wake socket. It admits a coordination prompt at a native idle checkpoint,
+with no partially entered operator input. When supervision selected an actionable
+work offer, the launcher reads that revalidated selection from private state
+after admission and names its offer and issues in the turn. Injecting it is
+delivery, not a claim or completion. Approval prompts and active turns refuse
+injection. A stopped session can resume its recorded session ID through the same
+native launch configuration and an interactive terminal;
 `agent-parley run NAME --resume` exposes that operation explicitly. Native trust,
 authentication and permission prompts remain in force. Environment-only vendor
 accounts that cannot be reconstructed safely require manual attention.
 
 Wake attempts are separated by the inactivity interval and capped at three for
-each unchanged backlog. A `busy` answer is not one of the three: a lane that was
-mid-turn is asked again on a later poll, so a working lane never spends the
-budget that a lane with nothing to read would. Terminal control replies such as
+each unchanged backlog. Work dispatches add their offer generation and
+issue-scoped progress digest to that backlog. Delivery without a claim, handoff
+or other recorded issue progress leaves the obligation pending. Exhaustion
+records the offer, issues, attempt count, last result and operator action in the
+work publication. A `busy:turn`, `busy:input`, or `busy:repeat` answer is not
+one of the three. The suffix distinguishes an active turn, pending operator
+input, and an accepted wake that produced no later checkpoint. After the
+inactivity interval, a repeated checkpoint admits one retry. A second stalled
+wake reports `manual attention required`. Terminal control replies such as
 cursor position reports and focus events do not count as partially entered
-operator input, so they no longer refuse the wake either.
+operator input, so they do not refuse the wake. Complete replies are removed
+from the input-state check without hiding operator bytes that arrived in the
+same read; incomplete replies are carried until the next read and refuse a wake
+until they complete.
 Results appear in `status`, the retained event log and
 private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
-Lanes launched before wake sockets were introduced require relaunching. An
-unavailable adapter or socket is reported for manual attention. Waking never
-marks mail read, acknowledges it, releases reservations or transfers an issue.
+Lanes launched before wake sockets were introduced require relaunching. A live
+native session started outside `agent-parley run` has no wake socket. Exit that
+session and launch it through `agent-parley run` before automatic waking can
+reach it. Generated hooks record the native foreground process identity when
+the operating system exposes one. If they cannot, the lane remains `unknown`
+rather than being resumed into a possibly live session. An unavailable adapter
+or socket is reported for manual attention.
+Waking never marks mail read, acknowledges it, releases reservations or
+transfers an issue.
 
 The automated tests exercise local processes, pseudo-terminals, hook payloads
 and real MCP transport. They do not establish live model behavior for a provider.

@@ -1,6 +1,7 @@
 """Guards the command-line startup path against costly eager imports."""
 
 import json
+import os
 import subprocess
 import sys
 
@@ -31,6 +32,14 @@ SURFACE_ONLY = (
     "subprocess",
 )
 
+VERSION_ONLY = (
+    "agent_parley.cli",
+    "agent_parley.protocol",
+    "argparse",
+    "importlib.metadata",
+    "tomllib",
+)
+
 PROBE = """
 import importlib
 import json
@@ -39,6 +48,30 @@ import types
 
 importlib.import_module({module!r})
 
+json.dump(
+    sorted(
+        name
+        for name in {deferred!r}
+        if type(sys.modules.get(name)) is types.ModuleType
+    ),
+    sys.stdout,
+)
+"""
+
+VERSION_PROBE = """
+import contextlib
+import io
+import json
+import sys
+import types
+
+from agent_parley import entry
+
+sys.argv = ["agent-parley", "--version"]
+with contextlib.redirect_stdout(io.StringIO()):
+    status = entry.main()
+if status:
+    raise SystemExit(status)
 json.dump(
     sorted(
         name
@@ -81,6 +114,7 @@ def loaded(module: str, deferred: tuple[str, ...] = DEFERRED) -> list[str]:
 
 def test_importing_the_command_line_defers_the_costly_modules():
     assert loaded("agent_parley.cli") == []
+    assert loaded("agent_parley.cli", ("agent_parley.cli",)) == []
 
 
 def test_the_command_surface_defers_what_one_command_alone_needs():
@@ -90,6 +124,63 @@ def test_the_command_surface_defers_what_one_command_alone_needs():
 def test_the_entry_point_defers_the_whole_command_surface():
     assert loaded("agent_parley.entry", DEFERRED + COMMAND_ONLY) == []
     assert loaded("agent_parley.entry", SURFACE_ONLY) == []
+
+
+def test_the_version_path_reads_only_the_recorded_marker():
+    probe = subprocess.run(
+        [sys.executable, "-c", VERSION_PROBE.format(deferred=VERSION_ONLY)],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert json.loads(probe.stdout) == []
+
+
+def test_running_the_cli_module_does_not_trigger_a_runpy_warning():
+    environment = {**os.environ, "PYTHONWARNINGS": "error"}
+    result = subprocess.run(
+        [sys.executable, "-m", "agent_parley.cli", "--version"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=environment,
+        timeout=60,
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_running_the_entry_module_does_not_trigger_a_runpy_warning():
+    environment = {**os.environ, "PYTHONWARNINGS": "error"}
+    result = subprocess.run(
+        [sys.executable, "-m", "agent_parley.entry", "--version"],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=environment,
+        timeout=60,
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_module_words_in_user_arguments_keep_the_lazy_package_binding():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import agent_parley, sys; "
+            "print(hasattr(agent_parley, 'cli'), 'argparse' in sys.modules)",
+            "-m",
+            "agent_parley.cli",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.stdout == "True False\n"
 
 
 def test_the_deferred_modules_still_load_where_they_are_used():

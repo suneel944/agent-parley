@@ -67,9 +67,9 @@ def test_presence_separates_an_idle_lane_from_a_stopped_one(tmp_path):
     quiet = supervision.presence(tmp_path, "lane", 30)
     assert quiet["state"] == supervision.IDLE and quiet["process_alive"]
     write_json(tmp_path / "lane-activity.json", {"updated": time.time()})
-    stopped = supervision.presence(tmp_path, "lane")
-    assert stopped["state"] == supervision.STOPPED
-    assert not stopped["process_alive"]
+    unknown = supervision.presence(tmp_path, "lane")
+    assert unknown["state"] == supervision.UNKNOWN
+    assert unknown["process_alive"] is None
 
 
 def test_presence_reports_no_age_before_the_first_checkpoint(tmp_path):
@@ -233,7 +233,10 @@ def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
         },
     )
     send(bridge, actors["claude"], "codex")
-    answers = iter(["busy"] * 4 + ["accepted"] * 5)
+    answers = iter(
+        ["busy:turn", "busy:input", "busy:repeat", "busy:turn"]
+        + ["accepted"] * 5
+    )
     calls = []
     monkeypatch.setattr(
         terminal,
@@ -255,33 +258,118 @@ def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
 
 
 def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
-    registered(bridge, paired)
+    actors = registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent
     write_json(
         directory / "codex-activity.json", {"activity": "waiting for approval"}
     )
+    send(bridge, actors["claude"], "codex")
     monkeypatch.setattr(
         terminal, "request", lambda *args: pytest.fail("woke approval")
     )
     supervision.wake(
-        bridge.home, directory, paired, "codex", {}, supervision.DEFAULTS
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        {"process_alive": True},
+        supervision.DEFAULTS,
     )
 
 
-def test_unmanaged_hook_state_cannot_start_a_native_client(
+def test_dead_manual_session_resumes_from_its_recorded_session(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    native = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    native_ticks = process.start_ticks(native.pid)
+    native.kill()
+    native.wait(timeout=5)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "session_id": "manual-session",
+            "session_pid": native.pid,
+            "session_ticks": native_ticks,
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+
+    class Child:
+        pid = 4321
+
+    launched = []
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append((command, kwargs)) or Child(),
+    )
+    monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
+    observed = supervision.presence(directory, "codex")
+    assert observed["process_alive"] is False
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        observed,
+        supervision.DEFAULTS,
+    )
+    assert launched
+    assert "--resume" in launched[0][0]
+    record = json.loads((directory / "codex-wake.json").read_text())
+    assert record["result"] == "resume requested (launcher 4321)"
+
+
+def test_manual_session_without_process_identity_requires_attention(
     bridge, paired, monkeypatch
 ):
     actors = registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent
     write_json(
         directory / "codex-activity.json",
-        {"activity": "stopped", "session_id": "legacy-hook-session"},
+        {
+            "activity": "working",
+            "session_id": "manual-session",
+            "updated": time.time() - 500,
+        },
     )
     send(bridge, actors["claude"], "codex")
     monkeypatch.setattr(
         supervision.subprocess,
         "Popen",
-        lambda *args, **kwargs: pytest.fail("resumed unmanaged state"),
+        lambda *args, **kwargs: pytest.fail("adopted an unknown process"),
+    )
+    observed = supervision.presence(directory, "codex")
+    assert observed["state"] == supervision.UNKNOWN
+    assert observed["process_alive"] is None
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        observed,
+        supervision.DEFAULTS,
+    )
+    record = json.loads((directory / "codex-wake.json").read_text())
+    assert record["result"] == "manual attention required"
+
+
+def test_stopped_lane_without_a_recorded_session_requires_attention(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(directory / "codex-activity.json", {"activity": "stopped"})
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("resumed without a session"),
     )
     supervision.wake(
         bridge.home,
@@ -292,7 +380,7 @@ def test_unmanaged_hook_state_cannot_start_a_native_client(
         supervision.DEFAULTS,
     )
     record = json.loads((directory / "codex-wake.json").read_text())
-    assert "manual attention" in record["result"]
+    assert record["result"] == "manual attention required"
 
 
 def test_global_wake_opt_out_wins_over_project(bridge, paired, monkeypatch):

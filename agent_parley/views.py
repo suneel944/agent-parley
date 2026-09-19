@@ -614,6 +614,7 @@ def _row(row: dict) -> dict:
         "fit": row["fit"],
         "unfit_reason": row["unfit"] or None,
         "work_offer": row["offer_kind"] or None,
+        "work_dispatch": dict(row.get("work_dispatch") or {}),
         "prompt": row["prompt"],
     }
 

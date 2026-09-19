@@ -32,7 +32,7 @@ def stopped(directory, name):
     """Records a lane whose session process is gone."""
     write_json(
         directory / f"{name}-activity.json",
-        {"activity": "idle", "updated": 0},
+        {"activity": "stopped", "updated": 0},
     )
 
 
@@ -160,6 +160,41 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     assert row["participant"] == "claude"
     assert row["command"].startswith('agent-parley say claude "<text>"')
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
+
+
+@pytest.mark.parametrize(
+    "result,detail",
+    [
+        ("busy:input", "operator input is pending"),
+        ("busy:repeat", "produced no checkpoint"),
+        ("manual attention required", "requires operator attention"),
+    ],
+)
+def test_a_wake_refusal_names_its_reason_and_terminal_remedy(
+    bridge, repo, paired, served, result, detail
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    write_json(
+        directory / "claude-wake.json",
+        {
+            "at": time.time(),
+            "attempts": 0,
+            "backlog": ["1"],
+            "result": result,
+        },
+    )
+    [record] = [
+        row
+        for row in bridge.status_snapshot()["projects"][0]["participants"]
+        if row["participant"] == "claude"
+    ]
+    assert record["wake"]["result"] == result
+    [row] = rows(bridge, problems.WAKE)
+    assert detail in row["detail"]
+    assert row["command"] == (
+        "return to claude's terminal and complete or stop the session"
+    )
 
 
 def test_an_overdue_claim_names_the_release(bridge, repo, paired, served):

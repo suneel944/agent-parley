@@ -13,6 +13,7 @@ from pathlib import Path
 from agent_parley import (
     forge,
     issues,
+    lifecycle,
     notify,
     process,
     records,
@@ -33,6 +34,8 @@ DEFAULTS = {
 ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
+WORK_WAKE_ATTEMPTS = 3
+UNKNOWN = "unknown"
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -103,6 +106,8 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         its latest native checkpoint is no older than the threshold, `IDLE`
         once that checkpoint has aged past the threshold while the process is
         still alive, and `STOPPED` when the recorded session process is gone.
+        A session with no trustworthy process identity is `UNKNOWN`, and its
+        `process_alive` value is `None`; it is never inferred dead from age.
         A lane that has recorded no native activity yet reports `last_active`
         and `age_seconds` as `None` rather than an age measured from the Unix
         epoch, and reads as `ACTIVE` while its process is alive, because a
@@ -111,11 +116,20 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
-    alive = process.alive(value.get("session_pid"), value.get("session_ticks"))
+    pid = value.get("session_pid")
+    ticks = value.get("session_ticks")
+    identified = (
+        type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
+    )
+    alive = process.alive(pid, ticks) if identified else None
     recorded = value.get("updated")
     age = None if recorded is None else max(0.0, time.time() - recorded)
-    if not alive:
+    if value.get("activity") == "stopped":
         state = STOPPED
+    elif alive is False:
+        state = STOPPED
+    elif alive is None:
+        state = UNKNOWN if value else STOPPED
     elif age is None or age <= inactive_after:
         state = ACTIVE
     else:
@@ -409,11 +423,25 @@ def base_advance_marker(paths: list[str]) -> str:
 
 
 FIT_CHECKS = ("session", "capacity", "worktree", "mail")
+CAPACITY_STATES = frozenset({"available", "exhausted", "retryable"})
+UNKNOWN_CAPACITY = {
+    "state": "unknown",
+    "observed_at": None,
+    "reset_at": None,
+    "source": "",
+    "session_id": "",
+    "observation_id": "",
+    "participant": "",
+    "progress": None,
+    "progressed": False,
+    "request_tokens": None,
+}
 UNKNOWN_FIT: dict = {
     "fit": None,
     "checks": dict.fromkeys(FIT_CHECKS),
     "failed": [],
     "reason": "",
+    "capacity": dict(UNKNOWN_CAPACITY),
     "offer": None,
 }
 
@@ -443,30 +471,189 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
     return True, ""
 
 
-def _capacity_check(
-    home: Path, participant: dict, after: float
-) -> tuple[bool | None, str]:
-    """Reads the lane's own client records for a recent usage refusal.
+def published_capacity(directory: Path, name: str) -> dict:
+    """Reads one lane's last durable provider-capacity observation."""
+    try:
+        value = json.loads((directory / f"{name}-capacity.json").read_text())
+    except (OSError, ValueError):
+        return dict(UNKNOWN_CAPACITY)
+    if not isinstance(value, dict) or value.get("state") not in CAPACITY_STATES:
+        return dict(UNKNOWN_CAPACITY)
+    return {**UNKNOWN_CAPACITY, **value}
 
-    The reader is provider specific and defaults to no opinion, so a provider
-    whose client publishes no such record skips the check instead of blocking
-    an offer. Nothing is asked of a vendor.
+
+def record_capacity(directory: Path, name: str, observation: dict) -> dict:
+    """Persists a newer validated capacity or bounded-probe outcome.
 
     Args:
-        home: Private bridge state root.
-        participant: Manifest entry naming the lane, provider and account.
-        after: Seconds within which a recorded refusal still counts.
+        directory: Private project state directory.
+        name: Participant whose provider produced the observation.
+        observation: Validated state, evidence source, session identity and
+            observation identity. A probe caller must record its own source
+            and outcome rather than relying on elapsed time.
 
     Returns:
-        The check result and, when it failed, how old the refusal is.
+        The durable observation after rejecting older evidence.
+
+    Raises:
+        BridgeError: If the observation does not carry a usable state, time,
+            source and evidence identity.
     """
-    at = records.reported_refusal(home, participant)
-    if at is None:
+    state = observation.get("state")
+    observed_at = observation.get("observed_at")
+    if (
+        state not in CAPACITY_STATES
+        or not isinstance(observed_at, (int, float))
+        or isinstance(observed_at, bool)
+        or not observation.get("source")
+        or not observation.get("observation_id")
+    ):
+        raise BridgeError("Invalid provider capacity observation.")
+    value = {**UNKNOWN_CAPACITY, **observation, "participant": name}
+    path = directory / f"{name}-capacity.json"
+    with lock(directory / f"{name}-capacity.lock"):
+        current = published_capacity(directory, name)
+        current_at = current.get("observed_at")
+        if current_at is None or float(observed_at) >= float(current_at):
+            write_json(path, value)
+            return value
+        return current
+
+
+def _native_recovery(current: dict, observation: dict) -> bool:
+    """Checks that a native success advances beyond exhausted evidence."""
+    if (
+        current["state"] not in {"exhausted", "retryable"}
+        or observation["state"] != "available"
+    ):
+        return True
+    marker = observation.get("progress")
+    previous = current.get("progress")
+    if observation["source"] == "claude-session-record":
+        return bool(marker and marker != previous)
+    if observation["source"] != "codex-session-record":
+        return False
+    if observation.get("session_id") != current.get("session_id"):
+        request_tokens = observation.get("request_tokens")
+        return (
+            isinstance(request_tokens, int)
+            and not isinstance(request_tokens, bool)
+            and request_tokens > 0
+            and observation["observed_at"] > current["observed_at"]
+        )
+    return (
+        isinstance(marker, int)
+        and isinstance(previous, int)
+        and marker > previous
+    ) or bool(observation.get("progressed"))
+
+
+def _observe_capacity(
+    home: Path, directory: Path, name: str, participant: dict
+) -> dict:
+    """Persists one lane's newest native capacity evidence."""
+    current = published_capacity(directory, name)
+    observation = records.capacity_observation(home, participant)
+    if (
+        observation is not None
+        and observation["state"] in {"exhausted", "retryable"}
+        and observation.get("progress") is None
+        and observation.get("session_id") == current.get("session_id")
+    ):
+        observation["progress"] = current.get("progress")
+    if observation is not None and _native_recovery(current, observation):
+        current = record_capacity(directory, name, observation)
+    reset_at = current.get("reset_at")
+    if (
+        current["state"] == "exhausted"
+        and isinstance(reset_at, (int, float))
+        and not isinstance(reset_at, bool)
+        and reset_at <= time.time()
+    ):
+        current = record_capacity(
+            directory,
+            name,
+            {
+                **current,
+                "state": "available",
+                "observed_at": float(reset_at),
+                "reset_at": None,
+                "source": "provider-reset",
+                "observation_id": f"reset:{current['observation_id']}",
+            },
+        )
+    return current
+
+
+def _account_members(home: Path, manifest: dict, name: str) -> list[str]:
+    """Names lanes sharing one explicitly identified provider account."""
+    participant = manifest["participants"][name]
+    credential = participant.get("credential")
+    if not credential:
+        return [name]
+    try:
+        adapter = roster.provider(home, participant["provider"])["adapter"]
+    except (BridgeError, KeyError):
+        return [name]
+    members = []
+    for other, candidate in manifest["participants"].items():
+        if candidate.get("credential") != credential:
+            continue
+        try:
+            other_adapter = roster.provider(home, candidate["provider"])[
+                "adapter"
+            ]
+        except (BridgeError, KeyError):
+            continue
+        if other_adapter == adapter:
+            members.append(other)
+    return members or [name]
+
+
+def capacity(home: Path, directory: Path, manifest: dict, name: str) -> dict:
+    """Reports durable lane capacity, shared only for a known account."""
+    observations = [
+        _observe_capacity(
+            home, directory, member, manifest["participants"][member]
+        )
+        for member in _account_members(home, manifest, name)
+    ]
+    known = [item for item in observations if item["state"] != "unknown"]
+    if not known:
+        return dict(UNKNOWN_CAPACITY)
+    ranks = {"available": 0, "retryable": 1, "exhausted": 2}
+    return max(
+        known,
+        key=lambda item: (
+            float(item.get("observed_at") or 0),
+            ranks[item["state"]],
+        ),
+    )
+
+
+def _capacity_check(observation: dict) -> tuple[bool | None, str]:
+    """Converts a durable capacity state into a fit check.
+
+    Elapsed supervision time never changes the state. Only a later successful
+    request, a reliable provider reset, or a recorded bounded probe can make
+    an exhausted lane available again.
+
+    Args:
+        observation: Persisted provider capacity observation.
+
+    Returns:
+        The check result and, when it failed, the recorded reason.
+    """
+    state = observation["state"]
+    if state == "unknown":
         return None, ""
-    age = max(0.0, time.time() - at)
-    if age < after:
-        return False, f"its client refused a request {int(age)}s ago"
-    return True, ""
+    if state == "available":
+        return True, ""
+    reset_at = observation.get("reset_at")
+    reset = f" until {int(reset_at)}" if reset_at is not None else ""
+    if state == "exhausted":
+        return False, f"its provider capacity is exhausted{reset}"
+    return False, "its provider reported a retryable transient failure"
 
 
 def _worktree_check(participant: dict) -> tuple[bool | None, str]:
@@ -553,17 +740,17 @@ def fit(
         directory: Private project state directory.
         manifest: Project manifest holding this participant.
         name: Participant whose lane is being considered.
-        after: Seconds of the interval a refusal or an unanswered item is
-            still counted within.
+        after: Seconds after which an unanswered item blocks an offer.
 
     Returns:
         Whether the lane is fit, each check's result, the names of the failed
         checks and one line naming the first failure.
     """
     participant = manifest["participants"][name]
+    observed_capacity = capacity(home, directory, manifest, name)
     results = {
         "session": _session_check(directory, name),
-        "capacity": _capacity_check(home, participant, after),
+        "capacity": _capacity_check(observed_capacity),
         "worktree": _worktree_check(participant),
         "mail": _mail_check(home, manifest, name, after),
     }
@@ -572,12 +759,142 @@ def fit(
         "fit": not failed,
         "checks": {check: results[check][0] for check in FIT_CHECKS},
         "failed": failed,
+        "capacity": observed_capacity,
         "reason": (
             f"unfit ({failed[0]}): {name} {results[failed[0]][1]}"
             if failed
             else ""
         ),
     }
+
+
+def stranded_claims(
+    manifest: dict, ledger: dict, results: dict[str, dict]
+) -> list[dict]:
+    """Lists exhausted owners' claims and peers eligible for recovery.
+
+    The candidates are observations only. They neither grant a peer ownership
+    nor establish that a live owner stopped editing. Recovery must record its
+    own transition and fence the prior claim generation before any transfer.
+
+    Args:
+        manifest: Project manifest holding every participant.
+        ledger: Current issue ledger.
+        results: Fit result per participant, including durable capacity.
+
+    Returns:
+        One candidate per unfinished owned issue. A candidate with no eligible
+        peers remains in the result as a durable wait obligation.
+    """
+    owned = issues.holders(ledger)
+    eligible = [
+        name
+        for name in sorted(manifest["participants"])
+        if results.get(name, {}).get("fit") and not owned.get(name)
+    ]
+    candidates = []
+    for owner, numbers in sorted(owned.items()):
+        observed = results.get(owner, {}).get("capacity", UNKNOWN_CAPACITY)
+        if observed.get("state") != "exhausted":
+            continue
+        peers = [name for name in eligible if name != owner]
+        reset_at = observed.get("reset_at")
+        reason = f"{owner} provider capacity is exhausted"
+        if reset_at is not None:
+            reason += f" until {int(reset_at)}"
+        next_action = (
+            "request a recorded recovery transition"
+            if peers
+            else "wait for provider recovery or an eligible peer"
+        )
+        for number in numbers:
+            candidates.append(
+                {
+                    "issue": number,
+                    "owner": owner,
+                    "eligible_peers": peers,
+                    "reason": reason,
+                    "next_action": next_action,
+                    "reset_at": reset_at,
+                    "source": observed.get("source", ""),
+                    "session_id": observed.get("session_id", ""),
+                    "observation_id": observed.get("observation_id", ""),
+                }
+            )
+    return candidates
+
+
+def record_stranded_claims(directory: Path, candidates: list[dict]) -> None:
+    """Atomically replaces the durable exhausted-claim candidates.
+
+    Args:
+        directory: Private project state directory.
+        candidates: Complete current candidate snapshot from
+            :func:`stranded_claims`. An empty list clears stale candidates.
+
+    Raises:
+        BridgeError: If a candidate lacks the evidence recovery must verify.
+    """
+    required = {
+        "issue",
+        "owner",
+        "eligible_peers",
+        "reason",
+        "next_action",
+        "reset_at",
+        "source",
+        "session_id",
+        "observation_id",
+    }
+    for candidate in candidates:
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate) != required
+            or not isinstance(candidate.get("issue"), str)
+            or not candidate.get("owner")
+            or not isinstance(candidate.get("eligible_peers"), list)
+            or not candidate.get("source")
+            or not candidate.get("session_id")
+            or not candidate.get("observation_id")
+        ):
+            raise BridgeError("Invalid stranded capacity candidate.")
+    with lock(directory / "capacity-candidates.lock"):
+        write_json(
+            directory / "capacity-candidates.json",
+            {"version": 1, "candidates": candidates},
+        )
+
+
+def published_stranded_claim(directory: Path, issue: str) -> dict | None:
+    """Reads the authoritative exhausted-capacity candidate for one issue.
+
+    Args:
+        directory: Private project state directory.
+        issue: Issue number to find in the current candidate snapshot.
+
+    Returns:
+        The exact persisted candidate, or None when the snapshot is absent,
+        malformed, stale-cleared, or does not include the issue.
+    """
+    try:
+        document = json.loads(
+            (directory / "capacity-candidates.json").read_text()
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or document.get("version") != 1:
+        return None
+    candidates = document.get("candidates")
+    if not isinstance(candidates, list):
+        return None
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("issue") == issue
+        ),
+        None,
+    )
 
 
 def idle_seconds(directory: Path, name: str) -> int:
@@ -618,7 +935,11 @@ def published_work(directory: Path, name: str) -> dict:
         The published record, or an unknown result when the supervisor has
         published nothing for this lane yet.
     """
-    unknown = {**UNKNOWN_FIT, "checks": dict(UNKNOWN_FIT["checks"])}
+    unknown = {
+        **UNKNOWN_FIT,
+        "checks": dict(UNKNOWN_FIT["checks"]),
+        "capacity": dict(UNKNOWN_CAPACITY),
+    }
     try:
         record = json.loads((directory / f"{name}-work.json").read_text())
     except (OSError, ValueError):
@@ -628,7 +949,7 @@ def published_work(directory: Path, name: str) -> dict:
 
 def _pull_text(available: list[str], busy: list[str]) -> str:
     """Describes the work an idle lane could take from the ledger."""
-    parts = ["Work offer. You hold no claim and every fit check passed."]
+    parts = ["Work offer. You hold no claim and no fit check found a blocker."]
     if available:
         listed = ", ".join(f"#{number}" for number in available[:5])
         parts.append(
@@ -654,14 +975,169 @@ def _rebalance_text(owned: list[str], idle: list[str]) -> str:
     )
 
 
+def _continue_text(ledger: dict, numbers: list[str]) -> str:
+    """Describes already-owned work that remains authorized to continue."""
+    actions = ", ".join(
+        f"#{number} ({lifecycle.describe_action(ledger['issues'][number])})"
+        for number in numbers[:5]
+    )
+    return (
+        f"Continue authorized work already assigned to you: {actions}. "
+        "Resume the current claim generation; delivery does not mark progress."
+    )
+
+
+def _work_bindings(ledger: dict, numbers: list[str]) -> list[dict]:
+    """Captures the issue state that makes a selected offer actionable."""
+    selected = []
+    for number in numbers:
+        record = ledger["issues"].get(number, {})
+        selected.append(
+            {
+                "issue": number,
+                "owner": record.get("owner"),
+                "claim_id": record.get("claim_id"),
+                "blocked_by": record.get("blocked_by", []),
+                "offer": (record.get("offer") or {}).get("id"),
+                "execution": record.get("execution"),
+            }
+        )
+    return selected
+
+
+def _work_progress(ledger: dict, numbers: list[str]) -> str:
+    """Fingerprints issue-scoped changes that count as offer progress.
+
+    Args:
+        ledger: Current issue ledger.
+        numbers: Issues selected for this work offer.
+
+    Returns:
+        Stable digest of ownership, dependencies, handoffs and execution state.
+    """
+    encoded = json.dumps(
+        _work_bindings(ledger, numbers),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+
+def _work_dispatch(previous: dict, offer: dict) -> dict:
+    """Keeps one dispatch obligation until work changes or disappears.
+
+    Args:
+        previous: Last work publication for this lane.
+        offer: Newly derived actionable offer.
+
+    Returns:
+        Existing dispatch state for unchanged work, or a fresh generation.
+    """
+    prior_offer = previous.get("offer") or {}
+    prior = previous.get("dispatch") or {}
+    if (
+        prior_offer.get("id") == offer["id"]
+        and prior_offer.get("progress") == offer["progress"]
+        and isinstance(prior, dict)
+        and prior
+    ):
+        return prior
+    return {
+        "generation": offer["id"],
+        "progress": offer["progress"],
+        "state": "pending",
+        "attempts": 0,
+        "last_result": "",
+        "updated_at": time.time(),
+    }
+
+
+def _work_offer(
+    name: str,
+    results: dict[str, dict],
+    stretches: dict[str, int],
+    owned: dict[str, list[str]],
+    available: list[str],
+    ledger: dict,
+    after: float,
+) -> dict | None:
+    """Derives the current offer for one lane from live eligibility inputs.
+
+    Args:
+        name: Participant receiving the offer.
+        results: Current fit result for every participant.
+        stretches: Current idle duration for every participant.
+        owned: Issue numbers grouped by owner.
+        available: Current unclaimed and unblocked issue numbers.
+        ledger: Current issue ledger.
+        after: Minimum idle duration for a rebalance target.
+
+    Returns:
+        The actionable offer, or None when no work is currently eligible.
+    """
+    held = owned.get(name, [])
+    continuation = lifecycle.actionable(ledger, name)
+    busy_work = {
+        holder: lifecycle.actionable(ledger, holder) for holder in sorted(owned)
+    }
+    busy = sorted(
+        holder for holder, claims in busy_work.items() if len(claims) > 1
+    )
+    idle = [
+        peer
+        for peer in sorted(results)
+        if results[peer]["fit"]
+        and not owned.get(peer)
+        and stretches[peer] >= after
+    ]
+    offer = None
+    capacity = results[name]["checks"].get("capacity")
+    if len(continuation) > 1 and (
+        peers := [peer for peer in idle if peer != name]
+    ):
+        selected = continuation[:5]
+        offer = {
+            "kind": "rebalance",
+            "issues": selected,
+            "text": _rebalance_text(held, peers),
+            "progress": _work_progress(ledger, selected),
+        }
+    elif continuation and capacity is not False:
+        selected = continuation[:5]
+        offer = {
+            "kind": "continue",
+            "issues": selected,
+            "text": _continue_text(ledger, selected),
+            "progress": _work_progress(ledger, selected),
+        }
+    elif results[name]["fit"] and not held and (available or busy):
+        selected = available[:5]
+        for holder in busy:
+            selected.extend(
+                number for number in busy_work[holder] if number not in selected
+            )
+            selected = selected[:5]
+        offer = {
+            "kind": "pull",
+            "issues": selected,
+            "text": _pull_text(available, busy),
+            "progress": _work_progress(ledger, selected),
+        }
+    if offer:
+        offer["id"] = hashlib.sha256(
+            f"{offer['kind']}\x00{offer['text']}".encode()
+        ).hexdigest()[:16]
+    return offer
+
+
 def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     """Publishes each lane's fit result and any advisory work offer.
 
     A lane holding no claim is offered the unclaimed work and told which peers
     hold more than one claim. A lane holding more than one claim is told which
-    fit peers have been idle past the stall interval. Both are advisory: the
-    ledger is not touched, nothing is claimed, and ``issue offer`` remains the
-    only path that moves work.
+    fit peers have been idle past the stall interval. Offers are advisory and
+    never claim work. Separately approved recovery may stop an exhausted
+    owner and preserve its work before a peer explicitly takes its claim.
 
     An offer carries a digest of its own content as its identifier, so a lane
     whose situation has not changed sees the same offer rather than a new one
@@ -673,19 +1149,58 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         manifest: Current participant manifest.
         config: Resolved supervision settings.
     """
+    from agent_parley import recovery
+
     after = config["stalled_after"]
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
-    available = issues.unclaimed(ledger)
-    busy = sorted(name for name, held in owned.items() if len(held) > 1)
+    available = lifecycle.actionable(ledger)
     results = {
         name: fit(home, directory, manifest, name, after)
         for name in manifest["participants"]
     }
+    record_stranded_claims(
+        directory, stranded_claims(manifest, ledger, results)
+    )
+    recovered = recovery.quiesce_authorized(directory, manifest)
+    if recovered:
+        ledger = issues.snapshot(directory)
+        for number, record in ledger["issues"].items():
+            marker = record.get("orphan")
+            if marker in recovered:
+                _announce_orphan(
+                    home,
+                    manifest,
+                    str(record["owner"]),
+                    [number],
+                    list(marker.get("reservations") or []),
+                )
+        owned = issues.holders(ledger)
+        available = lifecycle.actionable(ledger)
+        results = {
+            name: fit(home, directory, manifest, name, after)
+            for name in manifest["participants"]
+        }
+        record_stranded_claims(
+            directory, stranded_claims(manifest, ledger, results)
+        )
     stretches = {
         name: idle_seconds(directory, name)
         for name in sorted(manifest["participants"])
     }
+    for name in manifest["participants"]:
+        result = results[name]
+        offer = _work_offer(
+            name, results, stretches, owned, available, ledger, after
+        )
+        with lock(directory / f"{name}-work.lock", timeout=1):
+            previous = published_work(directory, name)
+            published = {**result, "offer": offer}
+            if offer:
+                published["dispatch"] = _work_dispatch(previous, offer)
+            path = directory / f"{name}-work.json"
+            if published != previous:
+                write_json(path, published)
     idle = [
         name
         for name in sorted(manifest["participants"])
@@ -693,22 +1208,6 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         and not owned.get(name)
         and stretches[name] >= after
     ]
-    for name in manifest["participants"]:
-        result = results[name]
-        held = owned.get(name, [])
-        offer = None
-        if result["fit"] and not held and (available or busy):
-            offer = {"kind": "pull", "text": _pull_text(available, busy)}
-        elif len(held) > 1 and (peers := [e for e in idle if e != name]):
-            offer = {"kind": "rebalance", "text": _rebalance_text(held, peers)}
-        if offer:
-            offer["id"] = hashlib.sha256(
-                f"{offer['kind']}\x00{offer['text']}".encode()
-            ).hexdigest()[:16]
-        published = {**result, "offer": offer}
-        path = directory / f"{name}-work.json"
-        if published != published_work(directory, name):
-            write_json(path, published)
     announce_idle(directory, manifest, idle, stretches, after)
 
 
@@ -939,7 +1438,7 @@ def _dead(observed: dict, after: float) -> bool:
         at all has no age to measure, so it is left alone.
     """
     return (
-        not observed["process_alive"]
+        observed["process_alive"] is False
         and observed["age_seconds"] is not None
         and observed["age_seconds"] >= after
     )
@@ -975,6 +1474,15 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     }
     if not dead:
         return
+    from agent_parley import recovery
+
+    recoverable = set()
+    for name in dead:
+        try:
+            recovery.capture(directory, manifest, name)
+            recoverable.add(name)
+        except (BridgeError, OSError, ValueError):
+            pass
     try:
         reservations = store.active_reservations(home, manifest["root"])
     except (BridgeError, OSError, sqlite3.Error):
@@ -984,6 +1492,8 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         ledger = issues.snapshot(directory)
         changed = False
         for name, observed in dead.items():
+            if name not in recoverable:
+                continue
             keys = reservations.get(
                 manifest["participants"][name]["display"], []
             )
@@ -992,6 +1502,15 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
             fresh = False
             for number, record in ledger["issues"].items():
                 if record.get("owner") != name:
+                    continue
+                current = record.get("orphan") or {}
+                if (
+                    current.get("owner") == name
+                    and current.get("claim_id") == record.get("claim_id")
+                    and current.get("authorization")
+                    and current.get("checkpoint")
+                ):
+                    marked.append(number)
                     continue
                 identifier = (
                     f"{name}:{record.get('claim_id') or number}:"
@@ -1220,7 +1739,7 @@ def poll(home: Path, directory: Path) -> None:
                 "observed_ts=excluded.observed_ts,last_active=excluded.last_active",
                 (
                     observed["state"],
-                    observed["process_alive"],
+                    observed["process_alive"] is True,
                     time.time(),
                     observed["last_active"],
                     manifest["root"],
@@ -1310,6 +1829,164 @@ def observe_responses(home: Path, directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def _work_backlog(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    config: dict,
+    record: dict,
+) -> tuple[str, dict] | None:
+    """Builds a wake key for one still-actionable published work offer.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant receiving the offer.
+        config: Resolved supervision settings.
+        record: Lane work publication.
+
+    Returns:
+        Backlog key and offer, or None when no actionable offer is published.
+    """
+    offer = record.get("offer") or {}
+    dispatch = record.get("dispatch") or {}
+    if not config["prompts"] or not offer.get("id") or not dispatch:
+        return None
+    ledger = issues.snapshot(directory)
+    owned = issues.holders(ledger)
+    current = _work_offer(
+        name,
+        {
+            peer: fit(home, directory, manifest, peer, config["stalled_after"])
+            for peer in manifest["participants"]
+        },
+        {
+            peer: idle_seconds(directory, peer)
+            for peer in manifest["participants"]
+        },
+        owned,
+        lifecycle.actionable(ledger),
+        ledger,
+        config["stalled_after"],
+    )
+    if not current or (
+        current.get("id"),
+        current.get("progress"),
+    ) != (offer.get("id"), offer.get("progress")):
+        return None
+    return (
+        f"work:{current['id']}:{current.get('progress', current['id'])}",
+        current,
+    )
+
+
+def _work_escalation(offer: dict, attempts: int, last_result: str) -> str:
+    """Names exhausted work, its last refusal and the operator remedy."""
+    named = ", ".join(f"#{number}" for number in offer.get("issues", []))
+    subject = f"work offer {offer['id']}"
+    if named:
+        subject += f" for {named}"
+    return (
+        f"manual attention required: {subject} made no progress after "
+        f"{attempts} wake attempts; last result: {last_result or 'unknown'}; "
+        "next action: inspect the lane, resolve the refusal, then claim or "
+        "hand off one named issue"
+    )
+
+
+def _write_work_dispatch(
+    directory: Path,
+    name: str,
+    offer: dict,
+    attempts: int,
+    result: str,
+    state: str,
+) -> None:
+    """Persists a dispatch outcome only for the current offer generation.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant owning the offer.
+        offer: Offer observed before dispatch.
+        attempts: Counted attempts for this generation and progress digest.
+        result: Last launcher result or escalation reason.
+        state: Pending outcome state.
+    """
+    path = directory / f"{name}-work.json"
+    with lock(directory / f"{name}-work.lock", timeout=1):
+        current = published_work(directory, name)
+        published = current.get("offer") or {}
+        if published.get("id") != offer.get("id") or published.get(
+            "progress"
+        ) != offer.get("progress"):
+            return
+        dispatch = dict(current.get("dispatch") or {})
+        dispatch.update(
+            state=state,
+            attempts=attempts,
+            last_result=result,
+            updated_at=time.time(),
+        )
+        current["dispatch"] = dispatch
+        write_json(path, current)
+
+
+def _wake_flags(home: Path, directory: Path, name: str) -> dict:
+    """Reads the persisted wake gates used to fence prompt admission."""
+    with lock(directory / "setup.lock"):
+        manifest = roster.read(directory)
+        participants = manifest.get("participants", {})
+        participant = participants.get(name) or {}
+        config = configuration(home, manifest)
+        return {
+            "present": name in participants,
+            "enabled": bool(config["wake"]),
+            "participant_wake": bool(participant.get("wake", True)),
+            "paused": bool(participant.get("paused", False)),
+        }
+
+
+def _select_work_prompt(
+    home: Path, directory: Path, name: str, offer: dict | None
+) -> bool:
+    """Publishes a prompt fenced to current lane and issue state."""
+    path = directory / f"{name}-wake-work.json"
+    flags = _wake_flags(home, directory, name)
+    if (
+        not flags["present"]
+        or not flags["enabled"]
+        or not flags["participant_wake"]
+        or flags["paused"]
+    ):
+        path.unlink(missing_ok=True)
+        return False
+    bindings = []
+    if offer:
+        with lock(directory / "issues.lock", timeout=1):
+            ledger = issues.snapshot(directory)
+            bindings = _work_bindings(ledger, offer.get("issues", []))
+            if _work_progress(ledger, offer.get("issues", [])) != offer.get(
+                "progress"
+            ):
+                path.unlink(missing_ok=True)
+                return False
+    if _wake_flags(home, directory, name) != flags:
+        path.unlink(missing_ok=True)
+        return False
+    write_json(
+        path,
+        {
+            "offer": offer,
+            "bindings": bindings,
+            "flags": flags,
+            "selected_at": time.time(),
+        },
+    )
+    return True
+
+
 def wake(
     home: Path,
     directory: Path,
@@ -1327,10 +2004,12 @@ def wake(
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
     offer carries a new identifier, which resets the bounded attempt count
-    rather than extending the old one. A request the launcher refuses as busy
-    is spaced like any other but does not count against the bound, because
-    the lane never received a turn to decline; it is asked again once it is
-    idle.
+    rather than extending the old one. A request the launcher refuses with a
+    `busy` reason is spaced like any other but does not count against the
+    bound, because the lane never received a turn to decline; it is asked
+    again once it is idle. A non-idle activity label blocks a wake only while
+    its recorded process remains alive. A session with no trustworthy process
+    identity records a manual-attention refusal and is never presumed dead.
 
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
@@ -1338,9 +2017,18 @@ def wake(
     lane; waking only asks the lane to take its own turn.
     """
     participant = manifest["participants"][name]
+    if (
+        not config["wake"]
+        or not participant.get("wake", True)
+        or participant.get("paused", False)
+    ):
+        return
     path = directory / f"{name}-activity.json"
     state = json.loads(path.read_text()) if path.exists() else {}
-    if state.get("activity") not in {"idle", "stopped"}:
+    if (
+        state.get("activity") not in {"idle", "stopped"}
+        and observed["process_alive"]
+    ):
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -1369,59 +2057,116 @@ def wake(
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
     )
-    if not backlog:
-        return
     wake_path = directory / f"{name}-wake.json"
     with lock(directory / f"{name}-wake.lock"):
-        record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
-        attempts = (
-            record.get("attempts", 0) if record.get("backlog") == backlog else 0
+        work_item = _work_backlog(
+            home,
+            directory,
+            manifest,
+            name,
+            config,
+            published_work(directory, name),
         )
-        if (
-            attempts >= 3
-            or time.time() - record.get("at", 0) < config["inactive_after"]
-        ):
+        if work_item:
+            work_key, work_offer = work_item
+            backlog.append(work_key)
+        else:
+            work_offer = None
+        if not backlog:
+            return
+        record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
+        same_backlog = record.get("backlog") == backlog
+        attempts = record.get("attempts", 0) if same_backlog else 0
+        throttle_at = record.get("at", 0) if same_backlog else 0
+        if work_offer:
+            dispatch = published_work(directory, name).get("dispatch") or {}
+            attempts = max(attempts, int(dispatch.get("attempts", 0)))
+            if dispatch.get("attempts"):
+                throttle_at = max(
+                    throttle_at, float(dispatch.get("updated_at", 0))
+                )
+        if attempts >= WORK_WAKE_ATTEMPTS:
+            if work_offer and dispatch.get("state") != "escalated":
+                result = _work_escalation(
+                    work_offer, attempts, str(record.get("result", ""))
+                )
+                record.update(result=result, escalated_at=time.time())
+                write_json(wake_path, record)
+                _write_work_dispatch(
+                    directory,
+                    name,
+                    work_offer,
+                    attempts,
+                    result,
+                    "escalated",
+                )
+            return
+        if time.time() - throttle_at < config["inactive_after"]:
             return
         result = "manual attention required"
-        if observed["process_alive"]:
+        selected = _select_work_prompt(home, directory, name, work_offer)
+        if not selected:
+            result = "busy:stale"
+        elif observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif state.get("session_id") and state.get("launcher_managed"):
+        elif (
+            observed["process_alive"] is False
+            or state.get("activity") == "stopped"
+        ) and state.get("session_id"):
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"
             ):
-                with (directory / f"{name}-wake.log").open("ab") as output:
-                    child = subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-m",
-                            "agent_parley.cli",
-                            "--home",
-                            str(home),
-                            "run",
-                            name,
-                            "--repo",
-                            manifest["root"],
-                            "--resume",
-                            "--task",
-                            terminal.PROMPT,
-                        ],
-                        stdin=subprocess.DEVNULL,
-                        stdout=output,
-                        stderr=output,
-                        start_new_session=True,
-                    )
-                track_launcher(child)
-                result = f"resume requested (launcher {child.pid})"
+                prompt = terminal.selected_prompt(directory, name, home)
+                if prompt is None:
+                    result = "busy:stale"
+                else:
+                    with (directory / f"{name}-wake.log").open("ab") as output:
+                        child = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-m",
+                                "agent_parley.cli",
+                                "--home",
+                                str(home),
+                                "run",
+                                name,
+                                "--repo",
+                                manifest["root"],
+                                "--resume",
+                                "--task",
+                                prompt,
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=output,
+                            stderr=output,
+                            start_new_session=True,
+                        )
+                    track_launcher(child)
+                    result = f"resume requested (launcher {child.pid})"
+        counted = attempts + (not result.startswith("busy"))
         write_json(
             wake_path,
             {
                 "at": time.time(),
                 "backlog": backlog,
-                "attempts": attempts + (result != "busy"),
+                "attempts": counted,
                 "result": result,
             },
         )
+        if work_offer:
+            _write_work_dispatch(
+                directory,
+                name,
+                work_offer,
+                counted,
+                result,
+                (
+                    "deferred"
+                    if result.startswith("busy")
+                    else "awaiting_progress"
+                ),
+            )
         from agent_parley import checkpoints
 
         checkpoints.record(

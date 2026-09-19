@@ -103,16 +103,26 @@ library base contracts; the type gate checks method overrides.
 Three entry paths pay an import price on every invocation, and each one loads
 only what its work needs. The lifecycle hook runs once per native tool call and
 imports the request's own modules alone, reaching the checkpoint engine only on
-the fallback path. The installed command starts in `entry`, which imports
-nothing but `sys`: a bare `--version` or `-V` answers from the compatibility
-contract, and anything else, including a version flag mixed with other
-arguments, is handed to `cli` so argparse produces the parsing, error text and
-exit status. `cli` in turn binds the command modules through `cli.deferred`,
-which registers a real module that executes on its first attribute access, so a
-command loads the few modules it reaches instead of all of them. What each path
-must not import is asserted in `tests/test_startup_imports.py` and
-`tests/test_hook_client.py`, and `scripts/benchmark.py` records the wall time of
-the cheapest invocations beside the interpreter floor they can never beat.
+the fallback path. The installed command starts in `entry`, which imports the
+package marker: a bare `--version` or `-V` answers from that marker, and
+anything else, including a version flag mixed with other arguments, is handed
+to `cli` so argparse produces the parsing, error text and exit status. The
+package binds `cli` itself the same way, so importing the surface does not
+execute it. `cli` binds command modules, selected standard-library modules and
+its legacy direct-name callables through deferred modules, so a command loads
+only the modules it reaches. Plain, unfiltered status skips parser construction,
+reads an existing configuration without taking its creation lock and sends one
+bounded HTTP request on a loopback socket rather than loading the general URL
+opener.
+
+The startup budgets are under 20 ms for a bare version, under 50 ms for status
+and under 15 ms for importing `agent_parley.cli`. `scripts/benchmark.py`
+records medians of 15 isolated `python -S -P` processes and reports any budget
+miss beside the interpreter floor. Raw wall time depends on the host, so a host
+whose interpreter floor approaches a budget cannot validate that absolute
+number; before and after readings must use the same interpreter and machine.
+Import boundaries are asserted in `tests/test_startup_imports.py` and
+`tests/test_hook_client.py`.
 
 ## Authentication and protocol
 
@@ -232,13 +242,35 @@ from the store. The result and any work offer are published per lane as
 `<participant>-work.json` beside the other lane state, because the offer is
 about a lane rather than an issue and the ledger records only ownership. The
 checkpoint injects an offer once per identifier and `top` reads the same file,
-so the operator sees exactly what the runtime asked. An offer is advisory: it
-never writes the ledger, and `issue offer` remains the only transfer path. It reads project manifests to
-resolve lane state; this is the explicit bridge from served project identity to
-private launcher state. Its best-effort forge reads run outside store write
-transactions, and observation failures do not fail a committed coordination
-call. `participant_presence` is an additive table initialized with the store.
-The issue ledger retains reminders; only explicit issue transitions own claims.
+so the operator sees exactly what the runtime asked. The publication also keeps
+a dispatch generation, issue-scoped progress digest, bounded attempt count and
+last result. An unchanged actionable offer joins the wake backlog even after a
+checkpoint injected it. The launcher reads the revalidated wake selection from
+private state after admitting the wake, so generated work context does not
+cross the wake socket. Three attempts without issue progress produce a durable
+escalation in the same publication and in `top`; changed issue state starts a
+new bounded attempt series. An offer is advisory: it never writes the ledger,
+and `issue offer` remains the only transfer path. Supervision reads project
+manifests to resolve lane state; this is the explicit bridge from served
+project identity to private launcher state. Its best-effort forge reads run
+outside store write transactions, and observation failures do not fail a
+committed coordination call. `participant_presence` is an additive table
+initialized with the store. The issue ledger retains reminders; only explicit
+issue transitions own claims.
+
+Provider capacity is durable per lane and records available, exhausted,
+retryable and unknown states with the native evidence and session identity.
+Elapsed supervision time never restores capacity. A validated later response,
+a structured provider reset or a recorded bounded probe does. Exhaustion is
+shared across lanes only when an explicit credential profile identifies the
+same provider account. An exhausted owner's unfinished claims remain visible
+as recovery candidates even when it owns only one claim or no eligible peer is
+currently available. A candidate is evidence for a recovery decision; it does
+not transfer ownership or establish that a live owner stopped editing.
+The supervisor atomically replaces `capacity-candidates.json` with the current
+candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
+the persisted issue candidate and revalidates its owner and evidence identity
+before acting.
 
 The same poll marks the claims of a lane whose session process is gone and that
 has been silent past the stall threshold, writing an orphan marker on each of
@@ -317,10 +349,13 @@ was stored in rather than a rendered summary.
 
 A lane's session state follows a recorded session process identity, matched by
 process ID and the creation time the kernel recorded for it, never its session
-lock. The launcher holds
-that lock for the whole session, so probing it would make a concurrent launch
-fail while merely reporting. A session that ends without clearing its record
-reads as stopped, because its process is gone.
+lock. The managed launcher records its child directly. Generated hooks can also
+derive the native foreground process group from their controlling terminal;
+hook payloads cannot assert that identity. When neither source is available,
+presence is unknown and automatic resume is refused. The launcher holds the
+session lock for the whole session, so probing it would make a concurrent launch
+fail while merely reporting. A session whose recorded process is gone reads as
+stopped.
 
 Linux shutdown pins the process with pidfd before checking its creation time
 and signaling it. When a Python build omits `os.pidfd_open` or

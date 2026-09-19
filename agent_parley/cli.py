@@ -2,28 +2,28 @@
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import datetime
-import hashlib
-import json
 import os
-import secrets
-import shlex
-import shutil
-import socket
-import string
-import subprocess
 import sys
-import textwrap
 import time
-import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 if TYPE_CHECKING:
+    import argparse
+    import contextlib
+    import datetime
+    import hashlib
+    import json
+    import secrets
+    import shlex
+    import shutil
+    import socket
     import sqlite3
+    import string
+    import subprocess
+    import textwrap
+    import uuid
     from types import ModuleType
 
     from agent_parley import (
@@ -41,6 +41,8 @@ if TYPE_CHECKING:
         gemini,
         history,
         inbound,
+        issues,
+        lifecycle,
         metrics,
         notify,
         opencode,
@@ -52,6 +54,7 @@ if TYPE_CHECKING:
         recommend,
         retries,
         roster,
+        state,
         store,
         supervision,
         tables,
@@ -59,30 +62,28 @@ if TYPE_CHECKING:
         views,
     )
     from agent_parley import watch as stream
+    from agent_parley.checkpoints import (
+        activity,
+        branch_head,
+        current_branch,
+        lane_branch,
+        mailbox,
+        participant_liveness,
+        read_events,
+    )
+    from agent_parley.issues import attempt as change_attempt
+    from agent_parley.issues import (
+        change,
+        deadline_state,
+        describe,
+        handoff_fields,
+        offer_state,
+        parse_issue,
+        snapshot,
+    )
+    from agent_parley.state import lock, write_json, write_text
 
-from agent_parley.checkpoints import (
-    EVENTS,
-    activity,
-    branch_head,
-    current_branch,
-    lane_branch,
-    mailbox,
-    participant_liveness,
-    read_events,
-)
-from agent_parley.issues import (
-    attempt as change_attempt,
-)
-from agent_parley.issues import (
-    change,
-    deadline_state,
-    describe,
-    handoff_fields,
-    offer_state,
-    parse_issue,
-    snapshot,
-)
-from agent_parley.state import BridgeError, lock, write_json, write_text
+from agent_parley import BridgeError
 
 DEFERRED_MODULES = (
     "amp",
@@ -99,6 +100,8 @@ DEFERRED_MODULES = (
     "gemini",
     "history",
     "inbound",
+    "issues",
+    "lifecycle",
     "metrics",
     "notify",
     "opencode",
@@ -110,6 +113,7 @@ DEFERRED_MODULES = (
     "recommend",
     "retries",
     "roster",
+    "state",
     "store",
     "supervision",
     "tables",
@@ -117,11 +121,26 @@ DEFERRED_MODULES = (
     "views",
     "watch",
 )
+DEFERRED_STANDARD_MODULES = (
+    "argparse",
+    "contextlib",
+    "datetime",
+    "hashlib",
+    "json",
+    "secrets",
+    "shlex",
+    "shutil",
+    "socket",
+    "string",
+    "subprocess",
+    "textwrap",
+    "uuid",
+)
 DEFERRED_ALIASES = {"watch": "stream"}
 
 
-def deferred(name: str) -> ModuleType:
-    """Binds one coordination module without executing it yet.
+def deferred_module(qualified: str) -> ModuleType:
+    """Binds one module without executing it yet.
 
     A launcher process runs one command, and no command touches more than a
     few of these modules, so importing all of them before the command is even
@@ -131,7 +150,7 @@ def deferred(name: str) -> ModuleType:
     already names it working unchanged.
 
     Args:
-        name: Submodule of this package to bind.
+        qualified: Fully qualified module name to bind.
 
     Returns:
         The submodule, already loaded if something else loaded it first, and
@@ -139,7 +158,6 @@ def deferred(name: str) -> ModuleType:
     """
     import importlib.util
 
-    qualified = f"agent_parley.{name}"
     loaded = sys.modules.get(qualified)
     if loaded is not None:
         return loaded
@@ -149,15 +167,59 @@ def deferred(name: str) -> ModuleType:
     spec.loader = importlib.util.LazyLoader(spec.loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[qualified] = module
+    package_name, _, attribute = qualified.rpartition(".")
+    package = sys.modules.get(package_name)
+    if package is not None:
+        setattr(package, attribute, module)
     spec.loader.exec_module(module)
     return module
 
 
+def deferred(name: str) -> ModuleType:
+    """Binds one coordination module without executing it yet."""
+    return deferred_module(f"agent_parley.{name}")
+
+
+class _DeferredCallable:
+    """Calls one attribute of a deferred coordination module."""
+
+    def __init__(self, module: ModuleType, attribute: str) -> None:
+        """Records the deferred module and attribute name."""
+        self.module = module
+        self.attribute = attribute
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Loads and calls the recorded attribute."""
+        return getattr(self.module, self.attribute)(*args, **kwargs)
+
+
 if not TYPE_CHECKING:
+    for _deferred_name in DEFERRED_STANDARD_MODULES:
+        globals()[_deferred_name] = deferred_module(_deferred_name)
     for _deferred_name in DEFERRED_MODULES:
         globals()[DEFERRED_ALIASES.get(_deferred_name, _deferred_name)] = (
             deferred(_deferred_name)
         )
+    activity = _DeferredCallable(checkpoints, "activity")
+    branch_head = _DeferredCallable(checkpoints, "branch_head")
+    current_branch = _DeferredCallable(checkpoints, "current_branch")
+    lane_branch = _DeferredCallable(checkpoints, "lane_branch")
+    mailbox = _DeferredCallable(checkpoints, "mailbox")
+    participant_liveness = _DeferredCallable(
+        checkpoints, "participant_liveness"
+    )
+    read_events = _DeferredCallable(checkpoints, "read_events")
+    change_attempt = _DeferredCallable(issues, "attempt")
+    change = _DeferredCallable(issues, "change")
+    deadline_state = _DeferredCallable(issues, "deadline_state")
+    describe = _DeferredCallable(issues, "describe")
+    handoff_fields = _DeferredCallable(issues, "handoff_fields")
+    offer_state = _DeferredCallable(issues, "offer_state")
+    parse_issue = _DeferredCallable(issues, "parse_issue")
+    snapshot = _DeferredCallable(issues, "snapshot")
+    lock = _DeferredCallable(state, "lock")
+    write_json = _DeferredCallable(state, "write_json")
+    write_text = _DeferredCallable(state, "write_text")
 
 VERIFY_TIMEOUT = 1800
 INIT_OUTPUT_LINES = 20
@@ -197,6 +259,7 @@ COPILOT_EVENTS = frozenset(
 
 
 GIT_SECONDS = 30
+MAX_HEALTH_BYTES = 65536
 
 
 def git(repo: Path, *args: str) -> str:
@@ -851,6 +914,13 @@ def terminal_width() -> int | None:
     return max(1, shutil.get_terminal_size().columns)
 
 
+def inbound_status() -> dict:
+    """Describes inbound status without loading its transport when disabled."""
+    if not os.environ.get("AGENT_PARLEY_INBOUND", "").strip():
+        return {"enabled": False, "fault": ""}
+    return inbound.reported()
+
+
 def session_busy(name: str) -> str:
     """Builds the refusal used while a participant still holds a session.
 
@@ -1040,7 +1110,13 @@ def merge_preview(
     return "\n".join(report)
 
 
-def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
+def merge_branch(
+    root: Path,
+    lane: Path,
+    name: str,
+    branch: str,
+    source_commit: str = "",
+) -> str:
     """Merges one lane's bridge branch into the base checkout.
 
     The merge runs in the base checkout, never inside another lane, and
@@ -1058,6 +1134,8 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         lane: Assigned bridge worktree belonging to the participant.
         name: Participant that owns the lane.
         branch: Bridge branch to merge into the base checkout.
+        source_commit: Immutable reported commit to merge instead of the
+            moving branch name.
 
     Returns:
         An account of what was merged.
@@ -1076,7 +1154,8 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         git(root, "rev-parse", "--path-format=absolute", "--git-dir")
     )
     quoted = shlex.quote(str(root))
-    pending = git(root, "log", "--oneline", f"HEAD..{branch}")
+    target = source_commit or branch
+    pending = git(root, "log", "--oneline", f"HEAD..{target}")
     if not pending:
         return f"{base} already contains every commit on {branch}."
     try:
@@ -1089,7 +1168,7 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
                 "--no-ff",
                 "-m",
                 f"Merge lane branch {branch}",
-                branch,
+                target,
             ],
             capture_output=True,
             text=True,
@@ -2047,6 +2126,42 @@ def held_claim(directory: Path, name: str) -> dict:
     return {"issue": int(number), "claim_id": record.get("claim_id")}
 
 
+def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
+    """Returns one exact owned claim or refuses an ambiguous selection.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        issue: Explicit issue selection, or empty to infer a sole claim.
+
+    Returns:
+        Issue number and claim identifier, or empty fields when no claim is
+        held and none was requested.
+
+    Raises:
+        BridgeError: If the selection is not currently owned or ownership is
+            ambiguous.
+    """
+    owned = {
+        number: record
+        for number, record in snapshot(directory)["issues"].items()
+        if record["owner"] == name
+    }
+    if issue:
+        number = parse_issue(issue)
+        if number not in owned:
+            raise BridgeError(f"Issue #{number} is not owned by {name}.")
+    elif len(owned) > 1:
+        raise BridgeError(
+            f"{name} owns multiple issues; name one with --issue."
+        )
+    elif not owned:
+        return {"issue": None, "claim_id": None}
+    else:
+        number = next(iter(owned))
+    return {"issue": int(number), "claim_id": owned[number].get("claim_id")}
+
+
 def report_comment(summary: str, evidence: str) -> str:
     """Shapes one lane's ready report for the issue it claims.
 
@@ -2543,18 +2658,20 @@ class Bridge:
             raise BridgeError(
                 f"State directory must be private: chmod 700 {self.home}"
             )
-        with lock(self.home / "config.lock"):
-            path = self.home / "config.json"
-            if not path.exists():
-                port = int(os.environ.get("AGENT_PARLEY_PORT", "8876"))
-                if not 1024 <= port <= 65535:
-                    raise BridgeError(
-                        "AGENT_PARLEY_PORT must be between 1024 and 65535."
+        path = self.home / "config.json"
+        if not path.exists():
+            with lock(self.home / "config.lock"):
+                if not path.exists():
+                    port = int(os.environ.get("AGENT_PARLEY_PORT", "8876"))
+                    if not 1024 <= port <= 65535:
+                        raise BridgeError(
+                            "AGENT_PARLEY_PORT must be between 1024 and 65535."
+                        )
+                    write_json(
+                        path,
+                        {"port": port, "token": secrets.token_urlsafe(32)},
                     )
-                write_json(
-                    path, {"port": port, "token": secrets.token_urlsafe(32)}
-                )
-            self.config = json.loads(path.read_text())
+        self.config = json.loads(path.read_text())
         self.url = f"http://127.0.0.1:{self.config['port']}"
 
     def server_process(self) -> process.ServerProcess | None:
@@ -2576,18 +2693,40 @@ class Bridge:
             The readiness document, or an empty mapping when nothing answers
             on the configured port.
         """
-        import urllib.error
-        import urllib.request
-
-        request = urllib.request.Request(
-            self.url + "/health/readiness",
-            headers={"Authorization": f"Bearer {self.config['token']}"},
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        port = int(self.config["port"])
+        authority = f"127.0.0.1:{port}"
+        request = (
+            "GET /health/readiness HTTP/1.0\r\n"
+            f"Host: {authority}\r\n"
+            f"Authorization: Bearer {self.config['token']}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        response = bytearray()
         try:
-            with opener.open(request, timeout=1) as response:
-                document = json.load(response)
-        except (OSError, urllib.error.URLError, ValueError):
+            with socket.create_connection(
+                ("127.0.0.1", port), timeout=1
+            ) as connection:
+                connection.sendall(request)
+                while len(response) <= MAX_HEALTH_BYTES:
+                    chunk = connection.recv(
+                        min(8192, MAX_HEALTH_BYTES + 1 - len(response))
+                    )
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+        except OSError:
+            return {}
+        headers, separator, body = bytes(response).partition(b"\r\n\r\n")
+        status = headers.split(b"\r\n", 1)[0].split()[1:2]
+        if (
+            len(response) > MAX_HEALTH_BYTES
+            or not separator
+            or status != [b"200"]
+        ):
+            return {}
+        try:
+            document = json.loads(body)
+        except ValueError:
             return {}
         return document if isinstance(document, dict) else {}
 
@@ -3732,21 +3871,73 @@ class Bridge:
         participant = data["participants"][name]
         with lock(directory / f"{name}.session.lock", session_busy(name)):
             self._require_approval(directory, data, name, "merge")
+            claim = exact_claim(directory, name)
+            source_commit = ""
+            if claim["issue"] is not None:
+                record = snapshot(directory)["issues"][str(claim["issue"])]
+                execution = lifecycle.state(record)
+                if execution["state"] != lifecycle.READY:
+                    raise BridgeError(
+                        f"Issue #{claim['issue']} is not reported ready."
+                    )
+                source_commit = (
+                    execution.get("source_commit") or execution["commit"]
+                )
             if data["verify"]:
+                base_commit = git(root, "rev-parse", "HEAD")
                 verify_base(root, data["verify"])
+                if git(root, "rev-parse", "HEAD") != base_commit or git(
+                    root, "status", "--porcelain"
+                ):
+                    raise BridgeError(
+                        "Pre-merge verification changed the base checkout; "
+                        "nothing was merged or recorded complete."
+                    )
+            lane = Path(participant["lane"])
+            if (
+                source_commit
+                and git(lane, "rev-parse", "HEAD") != source_commit
+            ):
+                raise BridgeError(
+                    f"{name} committed since issue #{claim['issue']} was "
+                    "reported ready; record a new report before merging."
+                )
             merged = merge_branch(
                 root,
-                Path(participant["lane"]),
+                lane,
                 name,
                 participant["branch"],
+                source_commit,
             )
+            integrated = git(root, "rev-parse", "HEAD")
+            if data["verify"]:
+                verify_base(root, data["verify"], integrated=True)
+                if git(root, "rev-parse", "HEAD") != integrated:
+                    raise BridgeError(
+                        "The base commit changed while verification ran; "
+                        "the integration stands but is not recorded complete."
+                    )
+                if git(root, "status", "--porcelain"):
+                    raise BridgeError(
+                        "Verification changed repository content; "
+                        "the integration stands but is not recorded complete."
+                    )
+            if claim["issue"] is not None and claim["claim_id"]:
+                lifecycle.complete(
+                    directory,
+                    str(claim["issue"]),
+                    claim["claim_id"],
+                    integrated,
+                    data["verify"],
+                    source_commit,
+                )
             metrics.record_report(
                 directory,
                 name,
                 {
                     "kind": "integration",
                     "action": "merge",
-                    **held_claim(directory, name),
+                    **claim,
                 },
             )
             return merged
@@ -4001,15 +4192,6 @@ class Bridge:
                 continue
             merged.append(name)
             report.append(f"- {name}: {outcome}")
-            if not data["verify"]:
-                continue
-            try:
-                verify_base(root, data["verify"], integrated=True)
-            except BridgeError as failure:
-                stopped = name
-                report.append(
-                    f"- {name} is integrated but unverified. {failure}"
-                )
         report.append(
             f"Integrated {len(merged)} of {len(sequence)} lanes: "
             + (", ".join(merged) or "none")
@@ -4656,7 +4838,7 @@ attempt of the recorded budget, which is also only reported.
                     ]
                 }
             ]
-            for event in EVENTS
+            for event in checkpoints.EVENTS
         }
 
     def report(
@@ -4667,13 +4849,15 @@ attempt of the recorded budget, which is also only reported.
         remaining: str,
         evidence: str,
         key: str = "",
+        issue: str = "",
+        resume_on: str = "",
     ) -> None:
         """Records an explicitly reported outcome independently of activity.
 
         A lane that newly reaches the ready state also posts its account to
-        every issue it claims, so a reviewer reading the forge sees the same
-        summary and evidence the lane recorded. The comment is best effort and
-        is posted once per arrival at the state, not on every repeated report.
+        the exact issue reported, so a reviewer reading the forge sees the
+        same summary and evidence the lane recorded. The comment is best
+        effort and is posted once per arrival at the state.
 
         Args:
             repo: Assigned agent worktree.
@@ -4683,6 +4867,9 @@ attempt of the recorded budget, which is also only reported.
             evidence: Required verification evidence for ready reports.
             key: Idempotency key. A retried report carrying the key it first
                 used records no second attempt and posts no second comment.
+            issue: Exact owned issue, inferred only for a sole claim.
+            resume_on: Existing authorized issue whose completion resumes a
+                blocked report.
 
         Raises:
             BridgeError: If the lane or required report fields are invalid, or
@@ -4694,10 +4881,14 @@ attempt of the recorded budget, which is also only reported.
         data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
+        claim = exact_claim(directory, agent, issue)
+        commit = git(lane, "rev-parse", "HEAD")
         if outcome in ("partial", "blocked") and not remaining.strip():
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
             raise BridgeError("Ready-for-review reports require --evidence.")
+        if resume_on and outcome != "blocked":
+            raise BridgeError("--resume-on is valid only for blocked reports.")
         for field, value in (("summary", summary), ("remaining", remaining)):
             if len(value.encode()) > metrics.MAX_REPORT_BYTES:
                 raise BridgeError(
@@ -4723,40 +4914,50 @@ attempt of the recorded budget, which is also only reported.
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,
+                "issue": claim["issue"],
+                "claim_id": claim["claim_id"],
+                "resume_on": resume_on,
             },
         )
-        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
-            path = directory / f"{agent}-activity.json"
-            state = json.loads(path.read_text()) if path.exists() else {}
-            if key and (recorded := state.get("retries", {}).get(scope)):
-                retries.replayed(recorded, "report", key, fingerprint)
-                return
-            arrived = outcome == "ready" and state.get("outcome") != "ready"
-            state.update(
-                outcome=outcome,
-                summary=summary,
-                remaining=remaining,
-                evidence=evidence,
-                reported_at=time.time(),
+        replayed = False
+        path = directory / f"{agent}-activity.json"
+        with lock(directory / f"{agent}-report.lock", timeout=1):
+            with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+                state = json.loads(path.read_text()) if path.exists() else {}
+                if key and (recorded := state.get("retries", {}).get(scope)):
+                    retries.replayed(recorded, "report", key, fingerprint)
+                    replayed = True
+            lifecycle.record_report(
+                directory,
+                agent,
+                outcome,
+                commit,
+                remaining,
+                str(claim["issue"]) if claim["issue"] is not None else "",
+                claim["claim_id"] or "",
+                resume_on,
             )
-            if key:
-                retries.remember(
-                    state,
-                    scope,
-                    fingerprint,
-                    retries.SERVED,
-                    {"state": outcome},
+            if replayed:
+                return
+            with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+                state = json.loads(path.read_text()) if path.exists() else {}
+                arrived = outcome == "ready" and state.get("outcome") != "ready"
+                state.update(
+                    outcome=outcome,
+                    summary=summary,
+                    remaining=remaining,
+                    evidence=evidence,
+                    reported_at=time.time(),
                 )
-            write_json(path, state)
-        held = snapshot(directory)["issues"]
-        claimed = sorted(
-            (
-                number
-                for number, record in held.items()
-                if record["owner"] == agent
-            ),
-            key=int,
-        )
+                if key:
+                    retries.remember(
+                        state,
+                        scope,
+                        fingerprint,
+                        retries.SERVED,
+                        {"state": outcome},
+                    )
+                write_json(path, state)
         metrics.record_report(
             directory,
             agent,
@@ -4764,32 +4965,22 @@ attempt of the recorded budget, which is also only reported.
                 "id": identifier,
                 "kind": "report",
                 "state": outcome,
-                "issue": int(claimed[0]) if claimed else None,
-                "claim_id": (
-                    held[claimed[0]].get("claim_id") if claimed else None
-                ),
+                "issue": claim["issue"],
+                "claim_id": claim["claim_id"],
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,
                 "attachment": attached or None,
             },
         )
-        owned = sorted(
-            (
-                number
-                for number, record in snapshot(directory)["issues"].items()
-                if record["owner"] == agent
-            ),
-            key=int,
-        )
+        owned = [str(claim["issue"])] if claim["issue"] is not None else []
         if outcome == "blocked":
             change_attempt(directory, agent, owned)
         if arrived:
             body = report_comment(summary, evidence)
             forge.select(repo, data)
-            for issue, record in snapshot(directory)["issues"].items():
-                if record["owner"] == agent:
-                    forge.comment(repo, issue, body)
+            if claim["issue"] is not None:
+                forge.comment(repo, str(claim["issue"]), body)
 
     def say(
         self,
@@ -4898,6 +5089,36 @@ attempt of the recorded budget, which is also only reported.
             },
         )
 
+    def authorize_recovery(
+        self,
+        repo: Path,
+        number: str,
+        reason: str,
+    ) -> dict:
+        """Records operator approval for one live claim recovery.
+
+        Args:
+            repo: Project base checkout, never a participant lane.
+            number: Repository issue number whose claim may be stopped.
+            reason: Operator rationale stored with the approval.
+
+        Returns:
+            Approval bound to the current owner, claim and native session.
+
+        Raises:
+            BridgeError: If invoked from a lane or no exact live claim exists.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        if repo.resolve() != Path(data["root"]).resolve():
+            raise BridgeError(
+                "Live recovery approval must be recorded from the project "
+                "base checkout."
+            )
+        from agent_parley import recovery
+
+        return recovery.authorize(directory, data, parse_issue(number), reason)
+
     def issue(
         self,
         repo: Path,
@@ -4963,7 +5184,7 @@ attempt of the recorded budget, which is also only reported.
             The whole ledger for list, or the resulting issue record. An
             acceptance additionally reports the reservation keys that moved,
             and a take reports the keys the orphaned owner's reservations
-            were released under.
+            moved to the new ownership generation.
 
         Raises:
             BridgeError: If lane, ownership, or transition checks fail.
@@ -5008,6 +5229,18 @@ attempt of the recorded budget, which is also only reported.
             if action == "offer"
             else {}
         )
+        takeover = {}
+        if action == "claim" and take_orphaned:
+            from agent_parley import recovery
+
+            current = (
+                snapshot(directory)["issues"].get(parse_issue(number)) or {}
+            )
+            if current.get("orphan"):
+                takeover = recovery.prepare_takeover(
+                    directory, data, agent, parse_issue(number)
+                )
+                recovery.preflight(directory, repo, takeover["checkpoint"])
         try:
             record = change(
                 directory,
@@ -5025,6 +5258,7 @@ attempt of the recorded budget, which is also only reported.
                 defaults=data["deadlines"],
                 carried=carried,
                 take_orphaned=take_orphaned,
+                takeover=takeover,
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
@@ -5032,6 +5266,10 @@ attempt of the recorded budget, which is also only reported.
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
+            if record.get("taken"):
+                from agent_parley import recovery
+
+                record = recovery.restore(directory, repo, record)
             record = self._free_orphaned(data, record)
             forge.assign(repo, parse_issue(number))
             likely = self._claim_forecast(
@@ -5145,13 +5383,12 @@ attempt of the recorded budget, which is also only reported.
         return {**record, "reservations_moved": moved}
 
     def _free_orphaned(self, data: dict, record: dict) -> dict:
-        """Releases the reservations of the owner an orphaned claim was taken.
+        """Moves reservations of the recovered ownership generation.
 
         Reservations are advisory declarations of intent, never enforced file
-        system locks. The lane they named is gone, so the take releases them
-        rather than moving them: the taking lane declares for itself what it
-        is about to edit, and a peer reading a key is never told a dead lane
-        is working on it.
+        system locks. Only reservations correlated with this claim move to the
+        recovering lane. Reservations for unrelated claims stay with their
+        owner.
 
         A store that cannot answer leaves every key where it was and reports
         why beside the record, because a committed take is not reversed by a
@@ -5163,7 +5400,7 @@ attempt of the recorded budget, which is also only reported.
 
         Returns:
             The record unchanged when nothing was taken, and otherwise the
-            record carrying the released keys, or the reason none were.
+            record carrying the moved keys, or the reason none were.
         """
         import sqlite3
 
@@ -5171,19 +5408,27 @@ attempt of the recorded budget, which is also only reported.
         previous = taken.get("from")
         if previous not in data["participants"]:
             return record
+        checkpoint = taken.get("checkpoint") or {}
+        source_claim = str(checkpoint.get("claim_id") or "")
+        new_owner = str(record.get("owner") or "")
+        if new_owner not in data["participants"]:
+            return record
         try:
-            released = store.release_reservations(
+            moved = store.transfer_claim_reservations(
                 self.home,
                 data["root"],
                 data["participants"][previous]["display"],
+                data["participants"][new_owner]["display"],
+                source_claim,
+                str(record.get("claim_id") or ""),
             )
         except (BridgeError, OSError, sqlite3.Error) as exc:
             return {
                 **record,
-                "reservations_released": [],
+                "reservations_moved": [],
                 "reservations_error": str(exc),
             }
-        return {**record, "reservations_released": released}
+        return {**record, "reservations_moved": moved}
 
     def _claim_forecast(
         self, repo: Path, directory: Path, data: dict, agent: str, number: str
@@ -6460,7 +6705,7 @@ attempt of the recorded budget, which is also only reported.
         return {
             "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
-            "inbound": inbound.reported(),
+            "inbound": inbound_status(),
             "projects": projects,
         }
 
@@ -6797,6 +7042,10 @@ attempt of the recorded budget, which is also only reported.
                             env,
                             agent,
                             attached=sys.stdin.isatty(),
+                            inactive_after=supervision.configuration(
+                                self.home, data
+                            )["inactive_after"],
+                            home=self.home,
                         )
                     return subprocess.call(command, cwd=lane, env=env)
             finally:
@@ -7683,6 +7932,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     report.add_argument("--remaining", default="")
     report.add_argument("--evidence", default="")
     report.add_argument(
+        "--issue",
+        default="",
+        metavar="NUMBER",
+        help="Bind this report to one exact owned issue.",
+    )
+    report.add_argument(
+        "--resume-on",
+        default="",
+        metavar="NUMBER",
+        help=(
+            "For a blocked report, resume automatically after this existing "
+            "authorized issue completes."
+        ),
+    )
+    report.add_argument(
         "--idempotency-key", default="", metavar="KEY", help=RETRY_HELP
     )
     steer = commands.add_parser(
@@ -7734,8 +7998,8 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 help=(
                     "Take an issue whose owner the supervisor marked "
                     "orphaned, recording that owner and the reason. It "
-                    "releases the reservations that owner still held; a lane "
-                    "that is merely idle is never orphaned."
+                    "moves that claim's reservations to the new owner; a "
+                    "lane that is merely idle is never orphaned."
                 ),
             )
         if action == "offer":
@@ -7767,6 +8031,20 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    recovering = actions.add_parser(
+        "recover",
+        help=(
+            "Authorize stopping the current live owner when a matching "
+            "capacity observation is later published."
+        ),
+    )
+    recovering.add_argument("number")
+    recovering.add_argument("--repo", type=Path, default=Path.cwd())
+    recovering.add_argument(
+        "--reason",
+        required=True,
+        help="Operator rationale persisted with this exact claim approval.",
+    )
     choosing = actions.add_parser(
         "next",
         help=(
@@ -8383,8 +8661,23 @@ def root_parser(
     return parser, commands
 
 
+def _plain_status() -> int:
+    """Runs the unfiltered status command without building its parser."""
+    home = Path(
+        os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
+    )
+    try:
+        Bridge(home).status(Selection(), terminal_width())
+    except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"agent-parley: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     """Dispatches the CLI and returns an operational exit status."""
+    if sys.argv[1:] == ["status"]:
+        return _plain_status()
     typed = selected_command(sys.argv[1:])
     parser, commands = root_parser(typed)
     if typed is not None and typed not in commands.declared:
@@ -8651,6 +8944,8 @@ def main() -> int:
                 args.remaining,
                 args.evidence,
                 key=args.idempotency_key,
+                issue=args.issue,
+                resume_on=args.resume_on,
             )
             print(f"Recorded outcome: {args.state}")
         elif args.command == "say" or (
@@ -8710,6 +9005,11 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "issue" and args.action == "recover":
+            approved = bridge.authorize_recovery(
+                args.repo.resolve(), args.number, args.reason
+            )
+            print(json.dumps(approved, indent=2))
         elif args.command == "issue":
             result = bridge.issue(
                 args.repo.resolve(),

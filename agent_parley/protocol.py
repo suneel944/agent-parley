@@ -29,6 +29,8 @@ import json
 import os
 from pathlib import Path
 
+from agent_parley import __version__
+
 CLIENTS = ("claude", "codex")
 HEADER = "Agent-Parley-Protocol"
 PROTOCOL = 1
@@ -53,11 +55,6 @@ def manifests(root: Path) -> dict[str, Path]:
     }
 
 
-def package_root() -> Path:
-    """Returns the directory the project file is read from."""
-    return Path(__file__).resolve().parent.parent
-
-
 def plugin_root() -> Path:
     """Returns the directory the installed plugin tree sits under.
 
@@ -80,37 +77,17 @@ def plugin_root() -> Path:
 
 
 def launcher_version() -> str:
-    """Returns the version of the code that runs, not the one installed.
+    """Returns the version recorded in the running package.
 
-    An editable install records its version once, when it was installed, so a
-    checkout that has moved on keeps reporting the older number through
-    installation metadata. `make install-dev` is the documented development
-    path, so every contributor meets this, and a stale launcher number sends
-    an operator to the compatibility contract for drift that is not there.
-
-    The project file beside the package is therefore authoritative wherever it
-    exists, because it is the file the release path raises. A package
-    installed without one, which is every wheel, keeps its recorded metadata.
-
-    The readers are imported here rather than at module load because this
-    module sits on the lifecycle hook's import path, which runs once per
-    native tool call, and only the launcher and the doctor ask for a version.
+    Release preparation raises this marker with every packaging and plugin
+    marker. A checkout and an installed wheel therefore read the same value
+    without importing package metadata or parsing the project file during
+    startup.
 
     Returns:
         The running package version.
     """
-    import importlib.metadata
-    import tomllib
-
-    try:
-        declared = tomllib.loads(
-            (package_root() / "pyproject.toml").read_text()
-        )["project"]["version"]
-    except (OSError, ValueError, KeyError, TypeError):
-        declared = None
-    if isinstance(declared, str):
-        return declared
-    return importlib.metadata.version("agent-parley")
+    return __version__
 
 
 def revision() -> str:

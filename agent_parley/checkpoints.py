@@ -47,6 +47,7 @@ OUTAGE_GUIDANCE = (
     "Reads and agent-parley commands still run; hold edits, commits and "
     "spawns until coordination answers again."
 )
+HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
 
 
 def clip(text: str, budget: int) -> str:
@@ -105,6 +106,7 @@ class Reason(StrEnum):
     POLLED_DELIVERY = "polled_delivery"
     SERVICE_FALLBACK = "service_fallback"
     NOTIFICATION_FAILED = "notification_failed"
+    STALE_GENERATION = "stale_generation"
 
 
 def decision_of(output: dict | None) -> str:
@@ -1245,7 +1247,13 @@ def paused_output(event: str) -> dict | None:
     return None
 
 
-def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
+def checkpoint(
+    home: Path,
+    directory: Path,
+    agent: str,
+    payload: dict,
+    session_process: process.ServerProcess | None = None,
+) -> dict:
     """Observes a native event and prepares bounded coordination context.
 
     A native event carrying a session identity confirms that identity as the
@@ -1259,6 +1267,8 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         directory: Common project state directory.
         agent: Assigned native lane name.
         payload: Native lifecycle event, including cwd and session identity.
+        session_process: Native process identity derived from the generated
+            hook's foreground terminal, when one is available.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -1279,6 +1289,18 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
     lane = Path(participant["lane"]).resolve()
     if not Path(payload.get("cwd", str(lane))).resolve().is_relative_to(lane):
         raise BridgeError("Hook cwd does not belong to this agent's worktree.")
+    from agent_parley import recovery
+
+    if fenced := recovery.stale_session(directory, agent, payload):
+        record(
+            directory,
+            agent,
+            payload,
+            Reason.STALE_GENERATION,
+            fenced,
+            "ownership generation transferred",
+        )
+        return fenced
     if participant.get("paused", False):
         refusal = paused_output(event)
         record(directory, agent, payload, Reason.PAUSED, refusal, "paused")
@@ -1341,12 +1363,25 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
         ):
             record(directory, agent, payload, Reason.SESSION_MISMATCH, None)
             return {}
-        if event == "SessionStart" and session != state.get("session_id"):
+        new_session = event == "SessionStart" and session != state.get(
+            "session_id"
+        )
+        if new_session:
             state["cursor"] = 0
             state["issue_revision"] = -1
             state.pop("roster", None)
             state.pop("work_offer", None)
+            state.pop("session_pid", None)
+            state.pop("session_ticks", None)
+        elif event == "SessionStart" and not process.alive(
+            state.get("session_pid"), state.get("session_ticks")
+        ):
+            state.pop("session_pid", None)
+            state.pop("session_ticks", None)
         state.update(session_id=session, updated=time.time(), event=event)
+        if session_process is not None:
+            state["session_pid"] = session_process.pid
+            state["session_ticks"] = session_process.ticks
         if session:
             state["resumable_session"] = session
         state.pop("checkpoint_error", None)
@@ -1583,6 +1618,13 @@ def checkpoint(home: Path, directory: Path, agent: str, payload: dict) -> dict:
                             "additionalContext": text,
                         }
                     }
+        if event in ("SessionStart", "PostToolUse", "Stop", "SessionEnd"):
+            try:
+                saved = recovery.capture(directory, manifest, agent, payload)
+                state["recovery_checkpoints"] = [item["id"] for item in saved]
+                state.pop("recovery_error", None)
+            except (BridgeError, OSError, ValueError) as exc:
+                state["recovery_error"] = clip(str(exc), MAX_CAUSE_BYTES)
         write_json(state_path, state)
         record(
             directory,
@@ -1665,7 +1707,10 @@ def serve(home: Path, request: dict) -> dict:
             from agent_parley import amp as adapter
         if adapter is not None:
             payload = adapter.payload(payload)
-        output = checkpoint(home, directory, participant, payload)
+        session_process = process.foreground_process(request.get("hook_pid"))
+        output = checkpoint(
+            home, directory, participant, payload, session_process
+        )
         if adapter is not None:
             output = adapter.response(output)
         return {"status": 0, "stdout": json.dumps(output) + "\n", "stderr": ""}
@@ -1679,6 +1724,15 @@ def serve(home: Path, request: dict) -> dict:
         ):
             return {"status": 0, "stdout": "{}\n", "stderr": stderr}
         return {"status": 2, "stdout": "", "stderr": stderr}
+
+
+def _hook_pid() -> int:
+    """Returns the generated hook PID preserved across shell fallback."""
+    try:
+        value = int(os.environ.get(HOOK_PID_ENV, os.getpid()))
+    except (TypeError, ValueError):
+        return os.getpid()
+    return value if value > 1 else os.getpid()
 
 
 def main(fallback: str = "") -> int:
@@ -1724,6 +1778,7 @@ def main(fallback: str = "") -> int:
             "participant": args.participant,
             "adapter": args.adapter,
             "protocol": args.protocol,
+            "hook_pid": _hook_pid(),
             "payload": payload,
             "fallback": fallback,
         },
