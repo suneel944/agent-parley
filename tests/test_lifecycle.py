@@ -258,12 +258,21 @@ def test_ready_report_binds_source_commit_and_refuses_later_lane_commit(
     assert not (repo / "later.txt").exists()
 
 
-def test_passing_gate_that_changes_tracked_content_cannot_complete(
+@pytest.mark.parametrize(
+    ("mutation", "dirty"),
+    (
+        ("printf changed > shared.txt", "shared.txt"),
+        ("printf generated > generated.py", "generated.py"),
+    ),
+)
+def test_passing_gate_that_changes_repository_cannot_complete(
     bridge,
     repo,
     paired,
     monkeypatch,
     tmp_path,
+    mutation,
+    dirty,
 ):
     lane = Path(paired["lanes"]["codex"])
     directory = lane.parent
@@ -280,7 +289,7 @@ def test_passing_gate_that_changes_tracked_content_cannot_complete(
     script.write_text(
         "#!/bin/sh\n"
         f"if test -e {shlex.quote(str(marker))}; then\n"
-        "  printf changed > shared.txt\n"
+        f"  {mutation}\n"
         "else\n"
         f"  touch {shlex.quote(str(marker))}\n"
         "fi\n"
@@ -288,12 +297,12 @@ def test_passing_gate_that_changes_tracked_content_cannot_complete(
     script.chmod(0o700)
     bridge.verification(repo, shlex.quote(str(script)))
 
-    with pytest.raises(BridgeError, match="changed tracked"):
+    with pytest.raises(BridgeError, match="changed repository"):
         bridge.merge(repo, "codex")
 
     execution = issues.snapshot(directory)["issues"]["52"]["execution"]
     assert execution["state"] == lifecycle.READY
-    assert git(repo, "status", "--porcelain", "--untracked-files=no")
+    assert dirty in git(repo, "status", "--porcelain")
 
 
 def test_keyed_report_retry_repairs_interrupted_lifecycle_transition(

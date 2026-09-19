@@ -3909,14 +3909,9 @@ class Bridge:
                         "The base commit changed while verification ran; "
                         "the integration stands but is not recorded complete."
                     )
-                if git(
-                    root,
-                    "status",
-                    "--porcelain",
-                    "--untracked-files=no",
-                ):
+                if git(root, "status", "--porcelain"):
                     raise BridgeError(
-                        "Verification changed tracked repository content; "
+                        "Verification changed repository content; "
                         "the integration stands but is not recorded complete."
                     )
             if claim["issue"] is not None and claim["claim_id"]:
