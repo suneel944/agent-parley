@@ -692,6 +692,117 @@ def test_quiesce_resumes_after_the_exact_process_stops(
             child.wait()
 
 
+def test_pre_stop_transition_requires_fresh_authority_after_session_restart(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    old = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    fresh = None
+    try:
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "working",
+                "updated": time.time(),
+                "session_id": "old-capacity-session",
+                "session_pid": old.pid,
+                "session_ticks": process.start_ticks(old.pid),
+            },
+        )
+
+        def publish_candidate(session_id, observation_id):
+            write_json(
+                directory / "capacity-candidates.json",
+                {
+                    "version": 1,
+                    "candidates": [
+                        {
+                            "issue": "42",
+                            "owner": "claude",
+                            "eligible_peers": ["codex"],
+                            "reason": "provider capacity exhausted",
+                            "next_action": (
+                                "request recorded recovery transition"
+                            ),
+                            "reset_at": None,
+                            "source": "provider-status",
+                            "session_id": session_id,
+                            "observation_id": observation_id,
+                        }
+                    ],
+                },
+            )
+
+        publish_candidate("old-capacity-session", "old-observation")
+        bridge.authorize_recovery(repo, "42", "recover old session")
+        original_write = recovery.write_json
+
+        def interrupt_after_authorization(path, value):
+            original_write(path, value)
+            if (
+                path.name.endswith("-quiesce.json")
+                and value.get("phase") == "authorized"
+            ):
+                raise BridgeError("interrupted after authorization")
+
+        monkeypatch.setattr(
+            recovery, "write_json", interrupt_after_authorization
+        )
+        with pytest.raises(
+            BridgeError, match="interrupted after authorization"
+        ):
+            recovery.quiesce_authorized(directory, roster.read(directory))
+        monkeypatch.setattr(recovery, "write_json", original_write)
+        old.kill()
+        old.wait()
+        fresh = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "working",
+                "updated": time.time(),
+                "session_id": "fresh-capacity-session",
+                "session_pid": fresh.pid,
+                "session_ticks": process.start_ticks(fresh.pid),
+            },
+        )
+        publish_candidate("fresh-capacity-session", "fresh-observation")
+        with pytest.raises(BridgeError, match="stale session"):
+            recovery.quiesce_authorized(directory, roster.read(directory))
+        transition_path = next((directory / "recovery").glob("*-quiesce.json"))
+        assert (
+            json.loads(transition_path.read_text())["session_id"]
+            == "old-capacity-session"
+        )
+        bridge.authorize_recovery(repo, "42", "recover fresh session")
+
+        markers = recovery.quiesce_authorized(directory, roster.read(directory))
+
+        fresh.wait(timeout=5)
+        assert markers[0]["session_id"] == "fresh-capacity-session"
+        transition = json.loads(transition_path.read_text())
+        assert transition["phase"] == "complete"
+        assert transition["superseded"]["session_id"] == "old-capacity-session"
+    finally:
+        for child in (old, fresh):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
+
+
 def test_a_live_but_idle_lane_is_never_orphaned(bridge, repo, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])

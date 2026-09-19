@@ -501,28 +501,12 @@ def _consume_approval(
 
 def _capacity_candidate(directory: Path, issue: str) -> dict:
     """Returns the authoritative published capacity candidate for an issue."""
-    transitions = []
-    for path in _folder(directory).glob(f"issue-{issue}-*-quiesce.json"):
-        try:
-            transition = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if transition.get("phase") != "complete" and isinstance(
-            transition.get("candidate"), dict
-        ):
-            transitions.append(transition["candidate"])
-    if len(transitions) == 1:
-        return transitions[0]
-    if len(transitions) > 1:
-        raise BridgeError("Live recovery has conflicting durable transitions.")
     try:
         document = json.loads(
             (directory / "capacity-candidates.json").read_text()
         )
     except (OSError, ValueError):
-        raise BridgeError(
-            "Live recovery has no published capacity observation."
-        ) from None
+        document = {"version": 1, "candidates": []}
     if document.get("version") != 1:
         raise BridgeError("Published capacity observations are invalid.")
     matches = [
@@ -530,11 +514,96 @@ def _capacity_candidate(directory: Path, issue: str) -> dict:
         for value in document.get("candidates") or []
         if isinstance(value, dict) and str(value.get("issue") or "") == issue
     ]
+    replacement = matches[0] if len(matches) == 1 else None
+    transitions = []
+    for path in _folder(directory).glob(f"issue-{issue}-*-quiesce.json"):
+        try:
+            transition = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if _supersede_restarted_authorization(
+            directory, path, transition, replacement
+        ):
+            continue
+        if transition.get("phase") in (
+            "authorized",
+            "stopped",
+            "captured",
+        ) and isinstance(transition.get("candidate"), dict):
+            transitions.append(transition["candidate"])
+    if len(transitions) == 1:
+        return transitions[0]
+    if len(transitions) > 1:
+        raise BridgeError("Live recovery has conflicting durable transitions.")
     if len(matches) != 1:
         raise BridgeError(
             "Live recovery requires one current capacity observation."
         )
     return matches[0]
+
+
+def _supersede_restarted_authorization(
+    directory: Path,
+    path: Path,
+    transition: dict,
+    replacement: dict | None,
+) -> bool:
+    """Retires pre-stop authority after an exact native session restart."""
+    if transition.get("phase") != "authorized":
+        return False
+    owner = str(transition.get("owner") or "")
+    if (
+        not owner
+        or not replacement
+        or replacement.get("owner") != owner
+        or replacement.get("session_id") == transition.get("session_id")
+    ):
+        return False
+    from agent_parley import issues
+
+    issue = str(transition.get("issue") or "")
+    claim_id = str(transition.get("claim_id") or "")
+    record = issues.snapshot(directory)["issues"].get(issue) or {}
+    authorization = approval(directory, issue, claim_id)
+    if (
+        record.get("owner") != owner
+        or record.get("claim_id") != claim_id
+        or not authorization
+        or authorization.get("owner") != owner
+        or authorization.get("session_id") != replacement.get("session_id")
+    ):
+        return False
+    with lock(directory / f"{owner}-checkpoint.lock", timeout=1):
+        try:
+            activity = json.loads(
+                (directory / f"{owner}-activity.json").read_text()
+            )
+        except (OSError, ValueError):
+            return False
+        old_session = str(transition.get("session_id") or "")
+        new_session = str(activity.get("session_id") or "")
+        old_alive = process.alive(
+            transition.get("session_pid"), transition.get("session_ticks")
+        )
+        new_alive = process.alive(
+            activity.get("session_pid"), activity.get("session_ticks")
+        )
+        if (
+            not new_session
+            or new_session == old_session
+            or new_session != replacement.get("session_id")
+            or old_alive
+            or not new_alive
+            or activity.get("session_pid") != authorization.get("session_pid")
+            or activity.get("session_ticks")
+            != authorization.get("session_ticks")
+        ):
+            return False
+        transition["phase"] = "superseded"
+        transition["superseded_at"] = time.time()
+        transition["superseded_by_session"] = new_session
+        write_json(path, transition)
+    return True
 
 
 def prepare_takeover(
@@ -724,7 +793,20 @@ def quiesce_exhausted(
                 raise BridgeError(
                     "Durable live recovery transition is invalid."
                 ) from None
-            if any(
+            if transition.get("phase") == "superseded":
+                superseded = {
+                    key: transition.get(key)
+                    for key in (*expected_transition, "superseded_at")
+                }
+                transition = {
+                    **expected_transition,
+                    "phase": "authorized",
+                    "candidate": dict(candidate),
+                    "created": time.time(),
+                    "superseded": superseded,
+                }
+                write_json(transition_path, transition)
+            elif any(
                 transition.get(key) != value
                 for key, value in expected_transition.items()
             ):
@@ -864,7 +946,11 @@ def quiesce_authorized(directory: Path, manifest: dict) -> list[dict]:
         candidate = transition.get("candidate")
         if transition.get("phase") == "complete":
             completed.append(transition)
-        elif isinstance(candidate, dict):
+        elif transition.get("phase") in (
+            "authorized",
+            "stopped",
+            "captured",
+        ) and isinstance(candidate, dict):
             candidates.append(candidate)
     seen = set()
     for transition in completed:
