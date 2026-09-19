@@ -13,7 +13,16 @@ class BridgeError(Exception):
 
 
 def _defer_cli() -> None:
-    """Registers the command surface without executing its module body."""
+    """Registers the command surface without executing its module body.
+
+    Python documents that ``sys.argv[0]`` is ``-m`` while locating a module
+    requested with ``-m``. Leaving the command module absent during that phase
+    lets runpy execute it without finding a pre-registered module.
+
+    See https://docs.python.org/3/using/cmdline.html#cmdoption-m.
+    """
+    if sys.argv[:1] == ["-m"]:
+        return
     qualified = f"{__name__}.cli"
     if qualified in sys.modules:
         return

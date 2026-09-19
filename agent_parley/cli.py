@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import json
 import os
-import socket
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -14,11 +10,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 if TYPE_CHECKING:
+    import argparse
+    import contextlib
     import datetime
     import hashlib
+    import json
     import secrets
     import shlex
     import shutil
+    import socket
     import sqlite3
     import string
     import subprocess
@@ -122,11 +122,15 @@ DEFERRED_MODULES = (
     "watch",
 )
 DEFERRED_STANDARD_MODULES = (
+    "argparse",
+    "contextlib",
     "datetime",
     "hashlib",
+    "json",
     "secrets",
     "shlex",
     "shutil",
+    "socket",
     "string",
     "subprocess",
     "textwrap",
