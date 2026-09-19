@@ -305,6 +305,46 @@ def test_passing_gate_that_changes_repository_cannot_complete(
     assert dirty in git(repo, "status", "--porcelain")
 
 
+def test_premerge_gate_that_moves_base_head_cannot_integrate(
+    bridge,
+    repo,
+    paired,
+    monkeypatch,
+    tmp_path,
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda *args: None
+    )
+    monkeypatch.setattr("agent_parley.cli.forge.assign", lambda *args: True)
+    identify(repo)
+    bridge.issue(lane, "claim", "57")
+    commit(lane, "pre-gate.txt")
+    bridge.report(lane, "ready", "Ready", "", "tests passed")
+    original_base = git(repo, "rev-parse", "HEAD")
+    marker = tmp_path / "committing-gate-ran"
+    script = tmp_path / "committing-gate.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"if ! test -e {shlex.quote(str(marker))}; then\n"
+        "  git -c user.name='Gate Test' -c user.email=gate@example.com "
+        "commit --allow-empty -m 'Gate commit'\n"
+        f"  touch {shlex.quote(str(marker))}\n"
+        "fi\n"
+    )
+    script.chmod(0o700)
+    bridge.verification(repo, shlex.quote(str(script)))
+
+    with pytest.raises(BridgeError, match="Pre-merge verification changed"):
+        bridge.merge(repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD") != original_base
+    assert not (repo / "pre-gate.txt").exists()
+    execution = issues.snapshot(directory)["issues"]["57"]["execution"]
+    assert execution["state"] == lifecycle.READY
+
+
 def test_keyed_report_retry_repairs_interrupted_lifecycle_transition(
     bridge,
     paired,

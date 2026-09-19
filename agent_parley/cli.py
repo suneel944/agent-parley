@@ -3884,7 +3884,15 @@ class Bridge:
                     execution.get("source_commit") or execution["commit"]
                 )
             if data["verify"]:
+                base_commit = git(root, "rev-parse", "HEAD")
                 verify_base(root, data["verify"])
+                if git(root, "rev-parse", "HEAD") != base_commit or git(
+                    root, "status", "--porcelain"
+                ):
+                    raise BridgeError(
+                        "Pre-merge verification changed the base checkout; "
+                        "nothing was merged or recorded complete."
+                    )
             lane = Path(participant["lane"])
             if (
                 source_commit

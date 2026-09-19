@@ -212,6 +212,7 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
         else:
             eligible = (
                 record.get("owner") == owner
+                and not record.get("orphan")
                 and execution["claim_id"] == record.get("claim_id")
                 and execution["state"] in ACTIVE
             )

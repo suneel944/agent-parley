@@ -14,6 +14,7 @@ from agent_parley import (
     checkpoints,
     dashboard,
     issues,
+    lifecycle,
     process,
     recovery,
     roster,
@@ -136,6 +137,7 @@ def test_a_killed_lane_is_orphaned_announced_and_taken_by_a_peer(
     assert rows["claude"]["orphaned"] == ["42"]
     assert "#42*" in rows["claude"]["issues"]
     assert "orphaned claims #42" in rows["claude"]["orphan"]
+    assert lifecycle.actionable(issues.snapshot(directory), "claude") == []
 
     taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
 
@@ -145,6 +147,7 @@ def test_a_killed_lane_is_orphaned_announced_and_taken_by_a_peer(
     assert taken["reservations_moved"] == ["src/app.py"]
     assert "orphan" not in taken
     assert taken["history"][-1]["action"] == "take"
+    assert lifecycle.actionable(issues.snapshot(directory), "codex") == ["42"]
     assert store.active_reservations(bridge.home, paired["root"]) == {
         actors["codex"]["name"]: ["src/app.py"]
     }
@@ -608,3 +611,4 @@ def test_a_returning_owner_regains_nothing_without_claiming_again(
     assert "orphan" not in reclaimed
     assert reclaimed["claim_id"] != marked["claim_id"]
     assert reclaimed["history"][-1]["action"] == "claim"
+    assert lifecycle.actionable(issues.snapshot(directory), "claude") == ["42"]
