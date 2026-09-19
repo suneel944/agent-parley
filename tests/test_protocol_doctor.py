@@ -1,6 +1,5 @@
 """Checks the protocol contract, its refusals, and the doctor report."""
 
-import importlib.metadata
 import json
 import re
 import subprocess
@@ -10,10 +9,17 @@ from pathlib import Path
 
 import pytest
 
+from agent_parley import (
+    BridgeError as PackageBridgeError,
+)
 from agent_parley import checkpoints, cli, protocol, server, store, views
 from agent_parley.state import BridgeError
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_operational_errors_keep_one_shared_identity():
+    assert BridgeError is PackageBridgeError
 
 
 @pytest.fixture
@@ -75,20 +81,8 @@ def test_the_launcher_version_follows_the_checkout():
     assert protocol.launcher_version() == version
 
 
-def test_an_installed_package_without_a_project_file_keeps_its_metadata(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(protocol, "package_root", lambda: tmp_path)
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.9.9")
-    assert protocol.launcher_version() == "9.9.9"
-
-
-def test_an_unreadable_project_file_keeps_the_recorded_metadata(
-    tmp_path, monkeypatch
-):
-    (tmp_path / "pyproject.toml").write_text("not = [toml")
-    monkeypatch.setattr(protocol, "package_root", lambda: tmp_path)
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "9.9.9")
+def test_the_launcher_version_uses_the_runtime_marker(monkeypatch):
+    monkeypatch.setattr(protocol, "__version__", "9.9.9")
     assert protocol.launcher_version() == "9.9.9"
 
 

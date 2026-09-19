@@ -9,12 +9,10 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from agent_parley import BridgeError
+
 MAX_LOG_BYTES = 262144
 MAX_LOG_RECORDS = 2000
-
-
-class BridgeError(Exception):
-    """An actionable operational failure."""
 
 
 def write_json(path: Path, value: dict) -> None:

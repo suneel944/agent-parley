@@ -12,7 +12,12 @@ from pathlib import Path
 from agent_parley import store
 from agent_parley.server import TOOLS
 
-STARTUP_SAMPLES = 7
+STARTUP_SAMPLES = 15
+STARTUP_BUDGETS_MS = {
+    "version": 20.0,
+    "status": 50.0,
+    "import_cli": 15.0,
+}
 LAUNCH = "from agent_parley.entry import main; raise SystemExit(main())"
 STARTUP_COMMANDS = (
     ("interpreter", ("-c", "pass")),
@@ -28,10 +33,11 @@ STARTUP_COMMANDS = (
 def startup(home: Path) -> dict:
     """Times the cheapest invocations end to end against a private state.
 
-    The launcher starts the way the installed console script starts it, so a
-    reading covers interpreter start, the imports the invocation actually
-    needs and the work the command does. The interpreter and the two import
-    readings sit beside them because no command can beat the floor they set.
+    Each sample starts with site initialization and the unsafe path disabled.
+    The launcher then starts the way the installed console script starts it,
+    so a reading covers interpreter start, the imports the invocation needs
+    and the work the command does. The interpreter and the two import readings
+    sit beside them because no command can beat the floor they set.
 
     Args:
         home: State directory the measured commands read.
@@ -39,14 +45,18 @@ def startup(home: Path) -> dict:
     Returns:
         The median wall time of each measured invocation, in milliseconds.
     """
-    environment = {**os.environ, "AGENT_PARLEY_HOME": str(home)}
+    environment = {
+        **os.environ,
+        "AGENT_PARLEY_HOME": str(home),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+    }
     measured = {}
     for name, arguments in STARTUP_COMMANDS:
         samples = []
         for _ in range(STARTUP_SAMPLES):
             start = time.perf_counter_ns()
             subprocess.run(
-                [sys.executable, *arguments],
+                [sys.executable, "-S", "-P", *arguments],
                 check=False,
                 capture_output=True,
                 env=environment,
@@ -68,7 +78,7 @@ def main() -> None:
         reader = store.authenticate(home, second["registration_token"])
         if sender is None or reader is None:
             raise RuntimeError("Benchmark registration failed")
-        results = {}
+        results: dict[str, object] = {}
         for name, actor, arguments in (
             (
                 "send_message",
@@ -96,7 +106,14 @@ def main() -> None:
                 "median_ms": round(statistics.median(samples), 3),
                 "p95_ms": round(sorted(samples)[189], 3),
             }
-        results["startup_ms"] = startup(home)
+        startup_results = startup(home)
+        results["startup_ms"] = startup_results
+        results["startup_budget_ms"] = STARTUP_BUDGETS_MS
+        results["startup_over_budget"] = [
+            name
+            for name, budget in STARTUP_BUDGETS_MS.items()
+            if startup_results[name] >= budget
+        ]
         results["tool_catalog"] = {
             "tools": len(TOOLS),
             "utf8_bytes": len(

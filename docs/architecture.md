@@ -103,16 +103,26 @@ library base contracts; the type gate checks method overrides.
 Three entry paths pay an import price on every invocation, and each one loads
 only what its work needs. The lifecycle hook runs once per native tool call and
 imports the request's own modules alone, reaching the checkpoint engine only on
-the fallback path. The installed command starts in `entry`, which imports
-nothing but `sys`: a bare `--version` or `-V` answers from the compatibility
-contract, and anything else, including a version flag mixed with other
-arguments, is handed to `cli` so argparse produces the parsing, error text and
-exit status. `cli` in turn binds the command modules through `cli.deferred`,
-which registers a real module that executes on its first attribute access, so a
-command loads the few modules it reaches instead of all of them. What each path
-must not import is asserted in `tests/test_startup_imports.py` and
-`tests/test_hook_client.py`, and `scripts/benchmark.py` records the wall time of
-the cheapest invocations beside the interpreter floor they can never beat.
+the fallback path. The installed command starts in `entry`, which imports the
+package marker: a bare `--version` or `-V` answers from that marker, and
+anything else, including a version flag mixed with other arguments, is handed
+to `cli` so argparse produces the parsing, error text and exit status. The
+package binds `cli` itself the same way, so importing the surface does not
+execute it. `cli` binds command modules, selected standard-library modules and
+its legacy direct-name callables through deferred modules, so a command loads
+only the modules it reaches. Plain, unfiltered status skips parser construction,
+reads an existing configuration without taking its creation lock and sends one
+bounded HTTP request on a loopback socket rather than loading the general URL
+opener.
+
+The startup budgets are under 20 ms for a bare version, under 50 ms for status
+and under 15 ms for importing `agent_parley.cli`. `scripts/benchmark.py`
+records medians of 15 isolated `python -S -P` processes and reports any budget
+miss beside the interpreter floor. Raw wall time depends on the host, so a host
+whose interpreter floor approaches a budget cannot validate that absolute
+number; before and after readings must use the same interpreter and machine.
+Import boundaries are asserted in `tests/test_startup_imports.py` and
+`tests/test_hook_client.py`.
 
 ## Authentication and protocol
 

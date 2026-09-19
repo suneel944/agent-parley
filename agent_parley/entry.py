@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import sys
 
+from agent_parley import __version__
+
 VERSION_FLAGS = frozenset({"-V", "--version"})
 
 
@@ -28,9 +30,7 @@ def main() -> int:
     """
     arguments = sys.argv[1:]
     if arguments and VERSION_FLAGS.issuperset(arguments):
-        from agent_parley import protocol
-
-        print(protocol.launcher_version())
+        print(__version__)
         return 0
     from agent_parley import cli
 

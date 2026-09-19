@@ -632,6 +632,16 @@ def bump(root: Path, baseline: str, approved: str, version: str) -> None:
     if count != 1:
         raise ValueError("pyproject.toml has no project version to raise.")
     project.write_text(text)
+    package = root / "agent_parley/__init__.py"
+    text, count = re.subn(
+        r'(?m)^__version__ = "[^"]+"$',
+        f'__version__ = "{version}"',
+        package.read_text(),
+        count=1,
+    )
+    if count != 1:
+        raise ValueError("agent_parley has no package version to raise.")
+    package.write_text(text)
     lock = root / "uv.lock"
     text, count = re.subn(
         r'(?m)^(name = "agent-parley"\nversion = )"[^"]+"$',

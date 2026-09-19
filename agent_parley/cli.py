@@ -4,26 +4,26 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime
-import hashlib
 import json
 import os
-import secrets
-import shlex
-import shutil
 import socket
-import string
-import subprocess
 import sys
-import textwrap
 import time
-import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 if TYPE_CHECKING:
+    import datetime
+    import hashlib
+    import secrets
+    import shlex
+    import shutil
     import sqlite3
+    import string
+    import subprocess
+    import textwrap
+    import uuid
     from types import ModuleType
 
     from agent_parley import (
@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         gemini,
         history,
         inbound,
+        issues,
         lifecycle,
         metrics,
         notify,
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
         recommend,
         retries,
         roster,
+        state,
         store,
         supervision,
         tables,
@@ -60,30 +62,28 @@ if TYPE_CHECKING:
         views,
     )
     from agent_parley import watch as stream
+    from agent_parley.checkpoints import (
+        activity,
+        branch_head,
+        current_branch,
+        lane_branch,
+        mailbox,
+        participant_liveness,
+        read_events,
+    )
+    from agent_parley.issues import attempt as change_attempt
+    from agent_parley.issues import (
+        change,
+        deadline_state,
+        describe,
+        handoff_fields,
+        offer_state,
+        parse_issue,
+        snapshot,
+    )
+    from agent_parley.state import lock, write_json, write_text
 
-from agent_parley.checkpoints import (
-    EVENTS,
-    activity,
-    branch_head,
-    current_branch,
-    lane_branch,
-    mailbox,
-    participant_liveness,
-    read_events,
-)
-from agent_parley.issues import (
-    attempt as change_attempt,
-)
-from agent_parley.issues import (
-    change,
-    deadline_state,
-    describe,
-    handoff_fields,
-    offer_state,
-    parse_issue,
-    snapshot,
-)
-from agent_parley.state import BridgeError, lock, write_json, write_text
+from agent_parley import BridgeError
 
 DEFERRED_MODULES = (
     "amp",
@@ -100,6 +100,7 @@ DEFERRED_MODULES = (
     "gemini",
     "history",
     "inbound",
+    "issues",
     "lifecycle",
     "metrics",
     "notify",
@@ -112,6 +113,7 @@ DEFERRED_MODULES = (
     "recommend",
     "retries",
     "roster",
+    "state",
     "store",
     "supervision",
     "tables",
@@ -119,11 +121,22 @@ DEFERRED_MODULES = (
     "views",
     "watch",
 )
+DEFERRED_STANDARD_MODULES = (
+    "datetime",
+    "hashlib",
+    "secrets",
+    "shlex",
+    "shutil",
+    "string",
+    "subprocess",
+    "textwrap",
+    "uuid",
+)
 DEFERRED_ALIASES = {"watch": "stream"}
 
 
-def deferred(name: str) -> ModuleType:
-    """Binds one coordination module without executing it yet.
+def deferred_module(qualified: str) -> ModuleType:
+    """Binds one module without executing it yet.
 
     A launcher process runs one command, and no command touches more than a
     few of these modules, so importing all of them before the command is even
@@ -133,7 +146,7 @@ def deferred(name: str) -> ModuleType:
     already names it working unchanged.
 
     Args:
-        name: Submodule of this package to bind.
+        qualified: Fully qualified module name to bind.
 
     Returns:
         The submodule, already loaded if something else loaded it first, and
@@ -141,7 +154,6 @@ def deferred(name: str) -> ModuleType:
     """
     import importlib.util
 
-    qualified = f"agent_parley.{name}"
     loaded = sys.modules.get(qualified)
     if loaded is not None:
         return loaded
@@ -151,15 +163,59 @@ def deferred(name: str) -> ModuleType:
     spec.loader = importlib.util.LazyLoader(spec.loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[qualified] = module
+    package_name, _, attribute = qualified.rpartition(".")
+    package = sys.modules.get(package_name)
+    if package is not None:
+        setattr(package, attribute, module)
     spec.loader.exec_module(module)
     return module
 
 
+def deferred(name: str) -> ModuleType:
+    """Binds one coordination module without executing it yet."""
+    return deferred_module(f"agent_parley.{name}")
+
+
+class _DeferredCallable:
+    """Calls one attribute of a deferred coordination module."""
+
+    def __init__(self, module: ModuleType, attribute: str) -> None:
+        """Records the deferred module and attribute name."""
+        self.module = module
+        self.attribute = attribute
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Loads and calls the recorded attribute."""
+        return getattr(self.module, self.attribute)(*args, **kwargs)
+
+
 if not TYPE_CHECKING:
+    for _deferred_name in DEFERRED_STANDARD_MODULES:
+        globals()[_deferred_name] = deferred_module(_deferred_name)
     for _deferred_name in DEFERRED_MODULES:
         globals()[DEFERRED_ALIASES.get(_deferred_name, _deferred_name)] = (
             deferred(_deferred_name)
         )
+    activity = _DeferredCallable(checkpoints, "activity")
+    branch_head = _DeferredCallable(checkpoints, "branch_head")
+    current_branch = _DeferredCallable(checkpoints, "current_branch")
+    lane_branch = _DeferredCallable(checkpoints, "lane_branch")
+    mailbox = _DeferredCallable(checkpoints, "mailbox")
+    participant_liveness = _DeferredCallable(
+        checkpoints, "participant_liveness"
+    )
+    read_events = _DeferredCallable(checkpoints, "read_events")
+    change_attempt = _DeferredCallable(issues, "attempt")
+    change = _DeferredCallable(issues, "change")
+    deadline_state = _DeferredCallable(issues, "deadline_state")
+    describe = _DeferredCallable(issues, "describe")
+    handoff_fields = _DeferredCallable(issues, "handoff_fields")
+    offer_state = _DeferredCallable(issues, "offer_state")
+    parse_issue = _DeferredCallable(issues, "parse_issue")
+    snapshot = _DeferredCallable(issues, "snapshot")
+    lock = _DeferredCallable(state, "lock")
+    write_json = _DeferredCallable(state, "write_json")
+    write_text = _DeferredCallable(state, "write_text")
 
 VERIFY_TIMEOUT = 1800
 INIT_OUTPUT_LINES = 20
@@ -199,6 +255,7 @@ COPILOT_EVENTS = frozenset(
 
 
 GIT_SECONDS = 30
+MAX_HEALTH_BYTES = 65536
 
 
 def git(repo: Path, *args: str) -> str:
@@ -851,6 +908,13 @@ def terminal_width() -> int | None:
     if not sys.stdout.isatty():
         return None
     return max(1, shutil.get_terminal_size().columns)
+
+
+def inbound_status() -> dict:
+    """Describes inbound status without loading its transport when disabled."""
+    if not os.environ.get("AGENT_PARLEY_INBOUND", "").strip():
+        return {"enabled": False, "fault": ""}
+    return inbound.reported()
 
 
 def session_busy(name: str) -> str:
@@ -2545,18 +2609,20 @@ class Bridge:
             raise BridgeError(
                 f"State directory must be private: chmod 700 {self.home}"
             )
-        with lock(self.home / "config.lock"):
-            path = self.home / "config.json"
-            if not path.exists():
-                port = int(os.environ.get("AGENT_PARLEY_PORT", "8876"))
-                if not 1024 <= port <= 65535:
-                    raise BridgeError(
-                        "AGENT_PARLEY_PORT must be between 1024 and 65535."
+        path = self.home / "config.json"
+        if not path.exists():
+            with lock(self.home / "config.lock"):
+                if not path.exists():
+                    port = int(os.environ.get("AGENT_PARLEY_PORT", "8876"))
+                    if not 1024 <= port <= 65535:
+                        raise BridgeError(
+                            "AGENT_PARLEY_PORT must be between 1024 and 65535."
+                        )
+                    write_json(
+                        path,
+                        {"port": port, "token": secrets.token_urlsafe(32)},
                     )
-                write_json(
-                    path, {"port": port, "token": secrets.token_urlsafe(32)}
-                )
-            self.config = json.loads(path.read_text())
+        self.config = json.loads(path.read_text())
         self.url = f"http://127.0.0.1:{self.config['port']}"
 
     def server_process(self) -> process.ServerProcess | None:
@@ -2578,18 +2644,40 @@ class Bridge:
             The readiness document, or an empty mapping when nothing answers
             on the configured port.
         """
-        import urllib.error
-        import urllib.request
-
-        request = urllib.request.Request(
-            self.url + "/health/readiness",
-            headers={"Authorization": f"Bearer {self.config['token']}"},
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        port = int(self.config["port"])
+        authority = f"127.0.0.1:{port}"
+        request = (
+            "GET /health/readiness HTTP/1.0\r\n"
+            f"Host: {authority}\r\n"
+            f"Authorization: Bearer {self.config['token']}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        response = bytearray()
         try:
-            with opener.open(request, timeout=1) as response:
-                document = json.load(response)
-        except (OSError, urllib.error.URLError, ValueError):
+            with socket.create_connection(
+                ("127.0.0.1", port), timeout=1
+            ) as connection:
+                connection.sendall(request)
+                while len(response) <= MAX_HEALTH_BYTES:
+                    chunk = connection.recv(
+                        min(8192, MAX_HEALTH_BYTES + 1 - len(response))
+                    )
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+        except OSError:
+            return {}
+        headers, separator, body = bytes(response).partition(b"\r\n\r\n")
+        status = headers.split(b"\r\n", 1)[0].split()[1:2]
+        if (
+            len(response) > MAX_HEALTH_BYTES
+            or not separator
+            or status != [b"200"]
+        ):
+            return {}
+        try:
+            document = json.loads(body)
+        except ValueError:
             return {}
         return document if isinstance(document, dict) else {}
 
@@ -4666,7 +4754,7 @@ attempt of the recorded budget, which is also only reported.
                     ]
                 }
             ]
-            for event in EVENTS
+            for event in checkpoints.EVENTS
         }
 
     def report(
@@ -6478,7 +6566,7 @@ attempt of the recorded budget, which is also only reported.
         return {
             "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
-            "inbound": inbound.reported(),
+            "inbound": inbound_status(),
             "projects": projects,
         }
 
@@ -8404,8 +8492,23 @@ def root_parser(
     return parser, commands
 
 
+def _plain_status() -> int:
+    """Runs the unfiltered status command without building its parser."""
+    home = Path(
+        os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
+    )
+    try:
+        Bridge(home).status(Selection(), terminal_width())
+    except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(f"agent-parley: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     """Dispatches the CLI and returns an operational exit status."""
+    if sys.argv[1:] == ["status"]:
+        return _plain_status()
     typed = selected_command(sys.argv[1:])
     parser, commands = root_parser(typed)
     if typed is not None and typed not in commands.declared:

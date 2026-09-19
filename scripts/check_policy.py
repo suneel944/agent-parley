@@ -242,6 +242,12 @@ def main() -> None:
             errors.append("Commit message contains prohibited attribution.")
     if metadata["dependencies"]:
         errors.append("Runtime dependencies must remain empty.")
+    package_source = (root / "agent_parley/__init__.py").read_text()
+    package_version = re.search(
+        r'(?m)^__version__ = "([^"]+)"$', package_source
+    )
+    if not package_version or package_version[1] != metadata["version"]:
+        errors.append("Runtime package version differs from project metadata")
     for directory in ("agent_parley", "scripts"):
         for path in sorted((root / directory).glob("*.py")):
             text = path.read_text()

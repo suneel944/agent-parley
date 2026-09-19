@@ -1136,6 +1136,7 @@ def versioned_repo(git_repo):
         )
     directory = git_repo / "agent_parley"
     directory.mkdir(exist_ok=True)
+    (directory / "__init__.py").write_text('__version__ = "0.1.1"\n')
     (directory / "protocol.py").write_text("PROTOCOL = 1\n")
     (directory / "store.py").write_text("SCHEMA_VERSION = 7\n")
     directory = git_repo / "docs"
@@ -1167,6 +1168,10 @@ def test_bump_raises_every_marker_and_lists_only_counted_work(versioned_repo):
     assert (
         'name = "agent-parley"\nversion = "0.2.0"'
         in (versioned_repo / "uv.lock").read_text()
+    )
+    assert (
+        '__version__ = "0.2.0"'
+        in (versioned_repo / "agent_parley/__init__.py").read_text()
     )
     assert json.loads((versioned_repo / release.MANIFEST_PATH).read_text()) == {
         ".": "0.2.0"
