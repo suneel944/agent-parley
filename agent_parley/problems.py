@@ -103,7 +103,7 @@ def _lane_rows(
     if wake_result in wake_details:
         command = (
             f"return to {name}'s terminal and complete or stop the session"
-            if availability["process_alive"]
+            if availability["process_alive"] is not False
             else f"agent-parley run {name} {repo}"
         )
         rows.append(

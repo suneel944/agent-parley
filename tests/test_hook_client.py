@@ -147,6 +147,67 @@ def test_a_served_decision_carries_context_and_blocks_completion(
     assert recorded[-1]["reason_class"] == "coordination_pending"
 
 
+def test_a_served_hook_records_its_foreground_native_process(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    native = process.ServerProcess(
+        os.getpid(), process.start_ticks(os.getpid())
+    )
+    inspected = []
+
+    def foreground(hook_pid):
+        inspected.append(hook_pid)
+        return native
+
+    monkeypatch.setattr(checkpoints.process, "foreground_process", foreground)
+    started = run_hook(
+        bridge,
+        lane.parent,
+        {
+            **START,
+            "cwd": str(lane),
+            "session_pid": 999999,
+            "session_ticks": "forged",
+        },
+    )
+    assert started.returncode == 0, started.stderr
+    state = json.loads((lane.parent / "codex-activity.json").read_text())
+    assert inspected and type(inspected[0]) is int
+    assert state["session_pid"] == native.pid
+    assert state["session_ticks"] == native.ticks
+
+
+def test_session_start_preserves_a_live_launcher_process(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    native = process.ServerProcess(
+        os.getpid(), process.start_ticks(os.getpid())
+    )
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "previous",
+            "session_pid": native.pid,
+            "session_ticks": native.ticks,
+        },
+    )
+    monkeypatch.setattr(
+        checkpoints.process, "foreground_process", lambda hook_pid: None
+    )
+    started = run_hook(
+        bridge,
+        directory,
+        {**START, "cwd": str(lane)},
+    )
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_pid"] == native.pid
+    assert state["session_ticks"] == native.ticks
+
+
 def test_a_down_service_falls_back_in_process(bridge, repo, paired):
     lane = Path(paired["lanes"]["codex"])
     cwd = {"cwd": str(lane), "session_id": "s1"}
@@ -666,6 +727,8 @@ def test_the_shell_client_asks_for_a_timeout_bash_3_2_accepts(bridge):
     timeouts = re.findall(r"read[^\n]*?-t (\S+)", script.read_text())
     assert timeouts
     assert all(value.isdigit() and int(value) > 0 for value in timeouts)
+    assert 'export AGENT_PARLEY_HOOK_PID="$$"' in script.read_text()
+    assert '\\"hook_pid\\":$AGENT_PARLEY_HOOK_PID' in script.read_text()
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")

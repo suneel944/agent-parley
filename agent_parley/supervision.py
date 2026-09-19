@@ -35,6 +35,7 @@ ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
 WORK_WAKE_ATTEMPTS = 3
+UNKNOWN = "unknown"
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -105,6 +106,8 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         its latest native checkpoint is no older than the threshold, `IDLE`
         once that checkpoint has aged past the threshold while the process is
         still alive, and `STOPPED` when the recorded session process is gone.
+        A session with no trustworthy process identity is `UNKNOWN`, and its
+        `process_alive` value is `None`; it is never inferred dead from age.
         A lane that has recorded no native activity yet reports `last_active`
         and `age_seconds` as `None` rather than an age measured from the Unix
         epoch, and reads as `ACTIVE` while its process is alive, because a
@@ -113,11 +116,20 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
-    alive = process.alive(value.get("session_pid"), value.get("session_ticks"))
+    pid = value.get("session_pid")
+    ticks = value.get("session_ticks")
+    identified = (
+        type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
+    )
+    alive = process.alive(pid, ticks) if identified else None
     recorded = value.get("updated")
     age = None if recorded is None else max(0.0, time.time() - recorded)
-    if not alive:
+    if value.get("activity") == "stopped":
         state = STOPPED
+    elif alive is False:
+        state = STOPPED
+    elif alive is None:
+        state = UNKNOWN if value else STOPPED
     elif age is None or age <= inactive_after:
         state = ACTIVE
     else:
@@ -1392,7 +1404,7 @@ def _dead(observed: dict, after: float) -> bool:
         at all has no age to measure, so it is left alone.
     """
     return (
-        not observed["process_alive"]
+        observed["process_alive"] is False
         and observed["age_seconds"] is not None
         and observed["age_seconds"] >= after
     )
@@ -1673,7 +1685,7 @@ def poll(home: Path, directory: Path) -> None:
                 "observed_ts=excluded.observed_ts,last_active=excluded.last_active",
                 (
                     observed["state"],
-                    observed["process_alive"],
+                    observed["process_alive"] is True,
                     time.time(),
                     observed["last_active"],
                     manifest["root"],
@@ -1896,7 +1908,8 @@ def wake(
     `busy` reason is spaced like any other but does not count against the
     bound, because the lane never received a turn to decline; it is asked
     again once it is idle. A non-idle activity label blocks a wake only while
-    its recorded process remains alive.
+    its recorded process remains alive. A session with no trustworthy process
+    identity records a manual-attention refusal and is never presumed dead.
 
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
@@ -1994,7 +2007,10 @@ def wake(
         result = "manual attention required"
         if observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif state.get("session_id"):
+        elif (
+            observed["process_alive"] is False
+            or state.get("activity") == "stopped"
+        ) and state.get("session_id"):
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"

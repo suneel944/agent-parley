@@ -108,15 +108,16 @@ running behind the checkout is therefore visible in the reading rather than
 reported as ready, and `doctor` reports the same comparison as its `service`
 component.
 
-`SESSION` carries the lane's presence, which has three states. `active` is a
+`SESSION` carries the lane's presence, which has four states. `active` is a
 lane that served a coordination call inside the configured interval. `idle` is a
 live session process that served none inside the inactivity threshold: it is a
 quiet lane, not a lost one. `stopped` is a lane whose recorded session
-process is gone. A live lane past the threshold therefore never reads
-`stopped`, and presence only reports: no claim is released and no ownership
-moves on any of the three. A send result keeps the older operator wording for
-the dead case and summarises a message to a `stopped` lane as
-`queued for NAME (unreachable)`.
+process is gone. `unknown` means no trustworthy native process identity was
+recorded, so the service cannot distinguish a live manual session from one that
+was killed. A live lane past the threshold therefore never reads `stopped`, and
+presence only reports: no claim is released and no ownership moves on any of
+the four. A send result keeps the older operator wording for the dead case and
+summarises a message to a `stopped` lane as `queued for NAME (unreachable)`.
 
 Appending a participant name reports that lane as the whole reading —
 availability, drift, waiting items, claims, reported outcome, mail counters and
@@ -1261,13 +1262,14 @@ same records `top` reads, takes no lock and writes no coordination state.
 ### Availability, reminders and waking
 
 The local service observes each launcher's process identity and native checkpoint
-age. Observed availability is one of three states. `active` is a live launcher
+age. Observed availability is one of four states. `active` is a live launcher
 whose latest checkpoint is younger than `inactive_after`; `idle` is a live
 launcher whose checkpoint has aged past it, which is what a lane between turns
 looks like; `stopped` is a launcher whose recorded session process is gone. A
-lane that is only idle is never reported with the word a dead launcher gets.
-`status` reports that state beside process liveness and lists outstanding
-acknowledgement IDs, senders and ages.
+lane without a trustworthy native process identity is `unknown`, because it may
+still be a live session. A lane that is only idle is never reported with the word
+a dead launcher gets. `status` reports that state beside process liveness and
+lists outstanding acknowledgement IDs, senders and ages.
 
 A lane that has recorded no native activity yet has no age to report, so
 `last_active_at` and `age_seconds` are both `null` rather than an age measured
@@ -1284,7 +1286,9 @@ asks an idle lane holding a backlog to take its turn. A recipient whose
 process is gone reports `state` `unreachable` with the summary
 `queued for NAME (unreachable)`. A presence row written before this release
 still carries `unreachable` and is read as `stopped`. Observed availability is
-separate from last coordination and never changes claims.
+separate from last coordination and never changes claims. An `unknown` recipient
+reports that native process identity is unavailable and requires manual
+attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
@@ -1324,13 +1328,19 @@ input, and an accepted wake that produced no later checkpoint. After the
 inactivity interval, a repeated checkpoint admits one retry. A second stalled
 wake reports `manual attention required`. Terminal control replies such as
 cursor position reports and focus events do not count as partially entered
-operator input, so they do not refuse the wake.
+operator input, so they do not refuse the wake. Complete replies are removed
+from the input-state check without hiding operator bytes that arrived in the
+same read; incomplete replies are carried until the next read and refuse a wake
+until they complete.
 Results appear in `status`, the retained event log and
 private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
 Lanes launched before wake sockets were introduced require relaunching. A live
 native session started outside `agent-parley run` has no wake socket. Exit that
 session and launch it through `agent-parley run` before automatic waking can
-reach it. An unavailable adapter or socket is reported for manual attention.
+reach it. Generated hooks record the native foreground process identity when
+the operating system exposes one. If they cannot, the lane remains `unknown`
+rather than being resumed into a possibly live session. An unavailable adapter
+or socket is reported for manual attention.
 Waking never marks mail read, acknowledges it, releases reservations or
 transfers an issue.
 

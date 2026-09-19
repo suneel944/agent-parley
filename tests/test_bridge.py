@@ -245,11 +245,18 @@ def test_stale_pid_record_cannot_stop_an_unrelated_process(bridge):
     os.kill(pid, 0)
 
 
-def macos_ps(creation_times, command_lines):
+def macos_ps(creation_times, command_lines, foreground_groups=None):
     """Answers ps field requests from tables instead of a real macOS host."""
 
+    foreground_groups = foreground_groups or {}
+
     def reader(field, pid):
-        table = creation_times if field == "lstart=" else command_lines
+        if field == "lstart=":
+            table = creation_times
+        elif field == "tpgid=":
+            table = foreground_groups
+        else:
+            table = command_lines
         return table.get(pid, "")
 
     return reader
@@ -263,16 +270,31 @@ def test_ps_reader_reports_a_live_process_through_the_real_command():
 def test_process_platform_is_chosen_once_for_the_running_system():
     linux = process.platform_for("linux")
     assert linux.start_ticks is process.linux_start_ticks
+    assert linux.foreground_pid is process.linux_foreground_pid
     assert linux.running is process.linux_running
     assert linux.matches_command is process.linux_matches_command
     assert linux.terminate is process.linux_terminate
     darwin = process.platform_for("darwin")
     assert darwin.running is process.darwin_running
     assert darwin.start_ticks.func is process.darwin_start_ticks
+    assert darwin.foreground_pid.func is process.darwin_foreground_pid
     assert darwin.terminate.func is process.darwin_terminate
     with pytest.raises(BridgeError, match="Unsupported operating system"):
         process.platform_for("win32")
     assert process.running(os.getpid()) is True
+
+
+def test_macos_hook_identifies_the_foreground_native_process(monkeypatch):
+    hook_pid = 4242
+    native_pid = 4343
+    created = "Wed Sep 10 11:22:33 2026"
+    reader = macos_ps({native_pid: created}, {}, {hook_pid: str(native_pid)})
+    monkeypatch.setattr(os, "kill", lambda pid, number: None)
+    monkeypatch.setattr(process, "PLATFORM", process.darwin_platform(reader))
+    assert process.foreground_process(hook_pid) == process.ServerProcess(
+        native_pid, created
+    )
+    assert process.foreground_process(9999) is None
 
 
 def test_macos_identity_pins_the_recorded_creation_time(monkeypatch, tmp_path):

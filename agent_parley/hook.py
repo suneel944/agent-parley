@@ -22,9 +22,11 @@ STDOUT_HEADER = "X-Parley-Stdout-Bytes"
 CLIENT_NAME = "hook-client.sh"
 RELAUNCH_STAMP = "relaunch.stamp"
 RELAUNCH_INTERVAL = 60.0
+HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
 
 CLIENT_SCRIPT = r"""#!/usr/bin/env bash
 export LC_ALL=C
+export AGENT_PARLEY_HOOK_PID="$$"
 set -u
 
 arguments=("$@")
@@ -79,6 +81,7 @@ body="{\"directory\":$(quote "$directory")"
 body="$body,\"participant\":$(quote "$participant")"
 [ -n "$adapter" ] && body="$body,\"adapter\":$(quote "$adapter")"
 [ -n "$protocol" ] && body="$body,\"protocol\":$(quote "$protocol")"
+body="$body,\"hook_pid\":$AGENT_PARLEY_HOOK_PID"
 body="$body,\"payload\":$payload}"
 
 { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || decide_in_process
@@ -176,6 +179,25 @@ def options(argv: list[str]) -> dict:
     if "agent" in values:
         values["participant"] = values.pop("agent")
     return values
+
+
+def hook_pid() -> int:
+    """Returns the generated hook process ID carried across fallback.
+
+    The shell client exports its own PID before either serving the request or
+    starting Python. A direct Python hook uses its current PID. The checkpoint
+    service uses this process only to inspect its controlling terminal while
+    the hook is waiting; native payload fields never supply process identity.
+
+    Returns:
+        Positive hook process ID, falling back to this process for a missing or
+        invalid internal environment value.
+    """
+    try:
+        value = int(os.environ.get(HOOK_PID_ENV, os.getpid()))
+    except (TypeError, ValueError):
+        return os.getpid()
+    return value if value > 1 else os.getpid()
 
 
 def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
@@ -320,6 +342,7 @@ def main() -> int:
         body = {
             "directory": directory,
             "participant": participant,
+            "hook_pid": hook_pid(),
             "payload": json.loads(raw),
         }
         for name in ("adapter", "protocol"):

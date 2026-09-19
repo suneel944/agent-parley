@@ -76,6 +76,10 @@ ATTACHED = ("send_message", "read_attachment", "review_report")
 PRESENCE_WARNINGS = {
     "idle": ("idle", "idle; wake requested"),
     "stopped": ("unreachable", "unreachable"),
+    "unknown": (
+        "unknown",
+        "process identity unavailable; manual attention required",
+    ),
     "unreachable": ("unreachable", "unreachable"),
 }
 RETRIED = {

@@ -84,6 +84,26 @@ def linux_running(pid: int) -> bool:
     return Path(f"/proc/{pid}").exists()
 
 
+def linux_foreground_pid(pid: int) -> int:
+    """Reads the foreground process group of a Linux hook process.
+
+    Args:
+        pid: Hook process whose controlling terminal identifies the native
+            session.
+
+    Returns:
+        Process ID of the controlling terminal's foreground group leader.
+
+    Raises:
+        ProcessLookupError: If the hook has no foreground terminal process.
+    """
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    foreground = int(fields[5])
+    if foreground <= 1:
+        raise ProcessLookupError(f"Process {pid} has no foreground terminal.")
+    return foreground
+
+
 def linux_matches_command(pid: int, home: Path) -> bool:
     """Compares a Linux argument vector with the expected server launch.
 
@@ -236,6 +256,30 @@ def darwin_start_ticks(reader: PsReader, pid: int) -> str:
     return started
 
 
+def darwin_foreground_pid(reader: PsReader, pid: int) -> int:
+    """Reads the foreground terminal process group of a macOS hook.
+
+    Args:
+        reader: Reads one ``ps`` field for a process ID.
+        pid: Hook process whose controlling terminal identifies the native
+            session.
+
+    Returns:
+        Process ID of the controlling terminal's foreground group leader.
+
+    Raises:
+        ProcessLookupError: If the hook has no foreground terminal process.
+    """
+    value = reader("tpgid=", pid)
+    try:
+        foreground = int(value)
+    except ValueError:
+        foreground = -1
+    if foreground <= 1:
+        raise ProcessLookupError(f"Process {pid} has no foreground terminal.")
+    return foreground
+
+
 def darwin_matches_command(reader: PsReader, pid: int, home: Path) -> bool:
     """Compares a macOS command line with the expected server launch.
 
@@ -310,6 +354,7 @@ class Platform(NamedTuple):
 
     Attributes:
         start_ticks: Returns a process's recorded creation identity.
+        foreground_pid: Returns a hook's foreground terminal process group.
         running: Reports whether a process ID currently exists.
         matches_command: Reports whether a process runs this server for
             a given private state directory.
@@ -318,6 +363,7 @@ class Platform(NamedTuple):
     """
 
     start_ticks: Callable[[int], str]
+    foreground_pid: Callable[[int], int]
     running: Callable[[int], bool]
     matches_command: Callable[[int, Path], bool]
     terminate: Callable[[int, str], None]
@@ -331,6 +377,7 @@ def linux_platform() -> Platform:
     """
     return Platform(
         start_ticks=linux_start_ticks,
+        foreground_pid=linux_foreground_pid,
         running=linux_running,
         matches_command=linux_matches_command,
         terminate=linux_terminate,
@@ -349,6 +396,7 @@ def darwin_platform(reader: PsReader = read_ps_field) -> Platform:
     """
     return Platform(
         start_ticks=functools.partial(darwin_start_ticks, reader),
+        foreground_pid=functools.partial(darwin_foreground_pid, reader),
         running=darwin_running,
         matches_command=functools.partial(darwin_matches_command, reader),
         terminate=functools.partial(darwin_terminate, reader),
@@ -541,6 +589,34 @@ class ServerProcess(NamedTuple):
                 did not exit within the shutdown timeout.
         """
         PLATFORM.terminate(self.pid, self.ticks)
+
+
+def foreground_process(hook_pid: int | None) -> ServerProcess | None:
+    """Identifies the native session owning a hook's foreground terminal.
+
+    The native client and every hook it starts share the terminal's foreground
+    process group. Its leader remains the native client across short-lived hook
+    shells, unlike a hook's immediate parent. A headless or detached hook has
+    no trustworthy native identity and therefore returns no process.
+
+    Args:
+        hook_pid: Process ID of the generated hook client while it waits for
+            the checkpoint response.
+
+    Returns:
+        Verified native process identity, or ``None`` when no foreground
+        terminal process can be established.
+    """
+    if type(hook_pid) is not int or hook_pid <= 1:
+        return None
+    try:
+        pid = PLATFORM.foreground_pid(hook_pid)
+        ticks = PLATFORM.start_ticks(pid)
+        if PLATFORM.running(pid):
+            return ServerProcess(pid, ticks)
+    except (OSError, IndexError, ValueError, TypeError):
+        pass
+    return None
 
 
 def identify(record: dict, home: Path) -> ServerProcess | None:

@@ -33,16 +33,30 @@ def test_control_socket_names_fit_valid_long_participants():
         (b"\x1b[12;1R", False, False),
         (b"\x1b[I", False, False),
         (b"\x1b[A", True, True),
-        (b"\x1b", False, False),
+        (b"\x1b", False, True),
+        (b"\x1b[12;1Rtyped", False, True),
+        (b"\x1bx", False, True),
         (b"abc", False, True),
         (b"abc\r", True, False),
         (b"\x03", True, False),
+        (b"abc\x15", True, False),
+        (b"abc\x15new", True, True),
     ],
 )
 def test_control_replies_never_hold_the_operator_line(
     entered, previous, expected
 ):
     assert terminal.pending(entered, previous) is expected
+
+
+def test_control_sequences_split_across_reads_keep_later_operator_text():
+    operator, control = terminal.operator_input(b"\x1b[12;")
+    assert operator == b""
+    assert control == b"\x1b[12;"
+    operator, control = terminal.operator_input(b"1Rtyped", control)
+    assert operator == b"typed"
+    assert control == b""
+    assert terminal.pending(operator, False)
 
 
 def test_attached_launcher_admits_a_wake_after_a_cursor_report():

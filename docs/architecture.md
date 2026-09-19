@@ -349,10 +349,13 @@ was stored in rather than a rendered summary.
 
 A lane's session state follows a recorded session process identity, matched by
 process ID and the creation time the kernel recorded for it, never its session
-lock. The launcher holds
-that lock for the whole session, so probing it would make a concurrent launch
-fail while merely reporting. A session that ends without clearing its record
-reads as stopped, because its process is gone.
+lock. The managed launcher records its child directly. Generated hooks can also
+derive the native foreground process group from their controlling terminal;
+hook payloads cannot assert that identity. When neither source is available,
+presence is unknown and automatic resume is refused. The launcher holds the
+session lock for the whole session, so probing it would make a concurrent launch
+fail while merely reporting. A session whose recorded process is gone reads as
+stopped.
 
 Linux shutdown pins the process with pidfd before checking its creation time
 and signaling it. When a Python build omits `os.pidfd_open` or
