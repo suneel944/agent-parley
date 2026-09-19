@@ -9,6 +9,7 @@ import pty
 import select
 import signal
 import socket
+import struct
 import termios
 import time
 import tty
@@ -18,6 +19,17 @@ from agent_parley.state import BridgeError, lock
 
 PROMPT = "Review pending coordination messages and handoff reminders."
 MAX_WORK_PROMPT = 2_000
+DETACHED_ROWS = 24
+DETACHED_COLUMNS = 80
+
+_DETACHED_TERMINAL_QUERIES = (
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b]10;?\x07", b"\x1b]10;rgb:ffff/ffff/ffff\x07"),
+    (b"\x1b]10;?\x1b\\", b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+    (b"\x1b]11;?\x07", b"\x1b]11;rgb:0000/0000/0000\x07"),
+    (b"\x1b]11;?\x1b\\", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
+    (b"\x1b[c", b"\x1b[?1;2c"),
+)
 
 
 def _wake_flags(directory: Path, name: str, home: Path | None) -> dict:
@@ -251,6 +263,58 @@ def pending(entered: bytes, previous: bool) -> bool:
     return result
 
 
+def detached_terminal_replies(
+    output: bytes, control: bytes = b""
+) -> tuple[bytes, bytes]:
+    """Answers terminal probes emitted into an unattended pseudo-terminal.
+
+    Detached native clients still own a real pseudo-terminal, but no terminal
+    emulator sits beyond its master descriptor. This supplies the small set of
+    standard replies needed during native startup. A primary device-attribute
+    reply deliberately follows the unanswered keyboard-protocol query, which
+    reports an ordinary VT100 terminal rather than claiming keyboard features
+    this transport does not implement.
+
+    Args:
+        output: Newly read native terminal output.
+        control: A possible query prefix split from the previous read.
+
+    Returns:
+        Replies to write to the pseudo-terminal and an incomplete query suffix.
+    """
+    data = control + output
+    replies = bytearray()
+    position = 0
+    while position < len(data):
+        match = next(
+            (
+                (query, response)
+                for query, response in _DETACHED_TERMINAL_QUERIES
+                if data.startswith(query, position)
+            ),
+            None,
+        )
+        if match is None:
+            position += 1
+            continue
+        query, response = match
+        replies.extend(response)
+        position += len(query)
+    maximum = min(
+        len(data), max(len(query) for query, _ in _DETACHED_TERMINAL_QUERIES)
+    )
+    pending_bytes = b""
+    for length in range(maximum, 0, -1):
+        suffix = data[-length:]
+        if any(
+            length < len(query) and query.startswith(suffix)
+            for query, _ in _DETACHED_TERMINAL_QUERIES
+        ):
+            pending_bytes = suffix
+            break
+    return bytes(replies), pending_bytes
+
+
 def run(
     command: list[str],
     lane: Path,
@@ -290,6 +354,12 @@ def run(
         listener.listen(1)
         pid, master = pty.fork()
         if pid == 0:
+            if not attached:
+                size = struct.pack(
+                    "HHHH", DETACHED_ROWS, DETACHED_COLUMNS, 0, 0
+                )
+                with contextlib.suppress(OSError):
+                    fcntl.ioctl(0, termios.TIOCSWINSZ, size)
             os.chdir(lane)
             os.execvpe(command[0], command, env)
         previous_handler = signal.getsignal(signal.SIGWINCH)
@@ -305,6 +375,7 @@ def run(
             resize()
         pending_input = False
         pending_control = b""
+        detached_control = b""
         wake_checkpoint = None
         wake_checkpoint_at = 0.0
         wake_retried = False
@@ -333,6 +404,12 @@ def run(
                     if not output:
                         break
                     os.write(1, output)
+                    if not attached:
+                        replies, detached_control = detached_terminal_replies(
+                            output, detached_control
+                        )
+                        if replies:
+                            os.write(master, replies)
                 if listener.fileno() in ready:
                     connection, _ = listener.accept()
                     with connection:
