@@ -6794,6 +6794,11 @@ reported.
     ) -> int:
         """Runs one participant's native CLI in its persistent lane.
 
+        When the native process exits, its last process generation remains in
+        the stopped activity record. Orphan recovery needs that PID together
+        with its kernel start ticks to prove the exact generation ended; the
+        next launch replaces both before starting its client.
+
         Args:
             agent: Participant name within the project.
             repo: Target Git repository.
@@ -7059,8 +7064,6 @@ reported.
                 with lock(lane.parent / f"{agent}-checkpoint.lock", timeout=1):
                     state = json.loads(activity_path.read_text())
                     state.update(activity="stopped", updated=time.time())
-                    state.pop("session_pid", None)
-                    state.pop("session_ticks", None)
                     write_json(activity_path, state)
 
 
