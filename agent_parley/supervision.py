@@ -13,6 +13,7 @@ from pathlib import Path
 from agent_parley import (
     forge,
     issues,
+    lifecycle,
     notify,
     process,
     records,
@@ -33,6 +34,7 @@ DEFAULTS = {
 ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
+WORK_WAKE_ATTEMPTS = 3
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -928,7 +930,7 @@ def published_work(directory: Path, name: str) -> dict:
 
 def _pull_text(available: list[str], busy: list[str]) -> str:
     """Describes the work an idle lane could take from the ledger."""
-    parts = ["Work offer. You hold no claim and every fit check passed."]
+    parts = ["Work offer. You hold no claim and no fit check found a blocker."]
     if available:
         listed = ", ".join(f"#{number}" for number in available[:5])
         parts.append(
@@ -954,6 +956,152 @@ def _rebalance_text(owned: list[str], idle: list[str]) -> str:
     )
 
 
+def _continue_text(ledger: dict, numbers: list[str]) -> str:
+    """Describes already-owned work that remains authorized to continue."""
+    actions = ", ".join(
+        f"#{number} ({lifecycle.describe_action(ledger['issues'][number])})"
+        for number in numbers[:5]
+    )
+    return (
+        f"Continue authorized work already assigned to you: {actions}. "
+        "Resume the current claim generation; delivery does not mark progress."
+    )
+
+
+def _work_progress(ledger: dict, numbers: list[str]) -> str:
+    """Fingerprints issue-scoped changes that count as offer progress.
+
+    Args:
+        ledger: Current issue ledger.
+        numbers: Issues selected for this work offer.
+
+    Returns:
+        Stable digest of ownership, dependencies, handoffs and execution state.
+    """
+    selected = []
+    for number in numbers:
+        record = ledger["issues"].get(number, {})
+        selected.append(
+            {
+                "issue": number,
+                "owner": record.get("owner"),
+                "claim_id": record.get("claim_id"),
+                "blocked_by": record.get("blocked_by", []),
+                "offer": (record.get("offer") or {}).get("id"),
+                "execution": record.get("execution"),
+            }
+        )
+    encoded = json.dumps(selected, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+
+def _work_dispatch(previous: dict, offer: dict) -> dict:
+    """Keeps one dispatch obligation until work changes or disappears.
+
+    Args:
+        previous: Last work publication for this lane.
+        offer: Newly derived actionable offer.
+
+    Returns:
+        Existing dispatch state for unchanged work, or a fresh generation.
+    """
+    prior_offer = previous.get("offer") or {}
+    prior = previous.get("dispatch") or {}
+    if (
+        prior_offer.get("id") == offer["id"]
+        and prior_offer.get("progress") == offer["progress"]
+        and isinstance(prior, dict)
+        and prior
+    ):
+        return prior
+    return {
+        "generation": offer["id"],
+        "progress": offer["progress"],
+        "state": "pending",
+        "attempts": 0,
+        "last_result": "",
+        "updated_at": time.time(),
+    }
+
+
+def _work_offer(
+    name: str,
+    results: dict[str, dict],
+    stretches: dict[str, int],
+    owned: dict[str, list[str]],
+    available: list[str],
+    ledger: dict,
+    after: float,
+) -> dict | None:
+    """Derives the current offer for one lane from live eligibility inputs.
+
+    Args:
+        name: Participant receiving the offer.
+        results: Current fit result for every participant.
+        stretches: Current idle duration for every participant.
+        owned: Issue numbers grouped by owner.
+        available: Current unclaimed and unblocked issue numbers.
+        ledger: Current issue ledger.
+        after: Minimum idle duration for a rebalance target.
+
+    Returns:
+        The actionable offer, or None when no work is currently eligible.
+    """
+    held = owned.get(name, [])
+    continuation = lifecycle.actionable(ledger, name)
+    busy_work = {
+        holder: lifecycle.actionable(ledger, holder) for holder in sorted(owned)
+    }
+    busy = sorted(
+        holder for holder, claims in busy_work.items() if len(claims) > 1
+    )
+    idle = [
+        peer
+        for peer in sorted(results)
+        if results[peer]["fit"]
+        and not owned.get(peer)
+        and stretches[peer] >= after
+    ]
+    offer = None
+    capacity = results[name]["checks"].get("capacity")
+    if len(continuation) > 1 and (
+        peers := [peer for peer in idle if peer != name]
+    ):
+        selected = continuation[:5]
+        offer = {
+            "kind": "rebalance",
+            "issues": selected,
+            "text": _rebalance_text(held, peers),
+            "progress": _work_progress(ledger, selected),
+        }
+    elif continuation and capacity is not False:
+        selected = continuation[:5]
+        offer = {
+            "kind": "continue",
+            "issues": selected,
+            "text": _continue_text(ledger, selected),
+            "progress": _work_progress(ledger, selected),
+        }
+    elif results[name]["fit"] and not held and (available or busy):
+        selected = available[:5]
+        for holder in busy:
+            selected.extend(
+                number for number in busy_work[holder] if number not in selected
+            )
+            selected = selected[:5]
+        offer = {
+            "kind": "pull",
+            "issues": selected,
+            "text": _pull_text(available, busy),
+            "progress": _work_progress(ledger, selected),
+        }
+    if offer:
+        offer["id"] = hashlib.sha256(
+            f"{offer['kind']}\x00{offer['text']}".encode()
+        ).hexdigest()[:16]
+    return offer
+
+
 def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     """Publishes each lane's fit result and any advisory work offer.
 
@@ -976,8 +1124,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     after = config["stalled_after"]
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
-    available = issues.unclaimed(ledger)
-    busy = sorted(name for name, held in owned.items() if len(held) > 1)
+    available = lifecycle.actionable(ledger)
     results = {
         name: fit(home, directory, manifest, name, after)
         for name in manifest["participants"]
@@ -986,6 +1133,18 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         name: idle_seconds(directory, name)
         for name in sorted(manifest["participants"])
     }
+    for name in manifest["participants"]:
+        result = results[name]
+        previous = published_work(directory, name)
+        offer = _work_offer(
+            name, results, stretches, owned, available, ledger, after
+        )
+        published = {**result, "offer": offer}
+        if offer:
+            published["dispatch"] = _work_dispatch(previous, offer)
+        path = directory / f"{name}-work.json"
+        if published != previous:
+            write_json(path, published)
     idle = [
         name
         for name in sorted(manifest["participants"])
@@ -993,22 +1152,6 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         and not owned.get(name)
         and stretches[name] >= after
     ]
-    for name in manifest["participants"]:
-        result = results[name]
-        held = owned.get(name, [])
-        offer = None
-        if result["fit"] and not held and (available or busy):
-            offer = {"kind": "pull", "text": _pull_text(available, busy)}
-        elif len(held) > 1 and (peers := [e for e in idle if e != name]):
-            offer = {"kind": "rebalance", "text": _rebalance_text(held, peers)}
-        if offer:
-            offer["id"] = hashlib.sha256(
-                f"{offer['kind']}\x00{offer['text']}".encode()
-            ).hexdigest()[:16]
-        published = {**result, "offer": offer}
-        path = directory / f"{name}-work.json"
-        if published != published_work(directory, name):
-            write_json(path, published)
     announce_idle(directory, manifest, idle, stretches, after)
 
 
@@ -1610,6 +1753,118 @@ def observe_responses(home: Path, directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def _work_backlog(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    config: dict,
+    record: dict,
+) -> tuple[str, dict] | None:
+    """Builds a wake key for one still-actionable published work offer.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant receiving the offer.
+        config: Resolved supervision settings.
+        record: Lane work publication.
+
+    Returns:
+        Backlog key and offer, or None when no actionable offer is published.
+    """
+    offer = record.get("offer") or {}
+    dispatch = record.get("dispatch") or {}
+    if not config["prompts"] or not offer.get("id") or not dispatch:
+        return None
+    ledger = issues.snapshot(directory)
+    owned = issues.holders(ledger)
+    current = _work_offer(
+        name,
+        {
+            peer: fit(home, directory, manifest, peer, config["stalled_after"])
+            for peer in manifest["participants"]
+        },
+        {
+            peer: idle_seconds(directory, peer)
+            for peer in manifest["participants"]
+        },
+        owned,
+        lifecycle.actionable(ledger),
+        ledger,
+        config["stalled_after"],
+    )
+    if not current or (
+        current.get("id"),
+        current.get("progress"),
+    ) != (offer.get("id"), offer.get("progress")):
+        return None
+    return (
+        f"work:{current['id']}:{current.get('progress', current['id'])}",
+        current,
+    )
+
+
+def _work_escalation(offer: dict, attempts: int, last_result: str) -> str:
+    """Names exhausted work, its last refusal and the operator remedy."""
+    named = ", ".join(f"#{number}" for number in offer.get("issues", []))
+    subject = f"work offer {offer['id']}"
+    if named:
+        subject += f" for {named}"
+    return (
+        f"manual attention required: {subject} made no progress after "
+        f"{attempts} wake attempts; last result: {last_result or 'unknown'}; "
+        "next action: inspect the lane, resolve the refusal, then claim or "
+        "hand off one named issue"
+    )
+
+
+def _write_work_dispatch(
+    directory: Path,
+    name: str,
+    offer: dict,
+    attempts: int,
+    result: str,
+    state: str,
+) -> None:
+    """Persists a dispatch outcome only for the current offer generation.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant owning the offer.
+        offer: Offer observed before dispatch.
+        attempts: Counted attempts for this generation and progress digest.
+        result: Last launcher result or escalation reason.
+        state: Pending outcome state.
+    """
+    path = directory / f"{name}-work.json"
+    current = published_work(directory, name)
+    published = current.get("offer") or {}
+    if published.get("id") != offer.get("id") or published.get(
+        "progress"
+    ) != offer.get("progress"):
+        return
+    dispatch = dict(current.get("dispatch") or {})
+    dispatch.update(
+        state=state,
+        attempts=attempts,
+        last_result=result,
+        updated_at=time.time(),
+    )
+    current["dispatch"] = dispatch
+    write_json(path, current)
+
+
+def _select_work_prompt(directory: Path, name: str, offer: dict | None) -> None:
+    """Publishes only the offer revalidated for the imminent native turn."""
+    path = directory / f"{name}-wake-work.json"
+    if offer:
+        write_json(path, {"offer": offer, "selected_at": time.time()})
+    else:
+        path.unlink(missing_ok=True)
+
+
 def wake(
     home: Path,
     directory: Path,
@@ -1639,6 +1894,12 @@ def wake(
     lane; waking only asks the lane to take its own turn.
     """
     participant = manifest["participants"][name]
+    if (
+        not config["wake"]
+        or not participant.get("wake", True)
+        or participant.get("paused", False)
+    ):
+        return
     path = directory / f"{name}-activity.json"
     state = json.loads(path.read_text()) if path.exists() else {}
     if (
@@ -1673,19 +1934,49 @@ def wake(
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
     )
-    if not backlog:
-        return
     wake_path = directory / f"{name}-wake.json"
     with lock(directory / f"{name}-wake.lock"):
+        work_item = _work_backlog(
+            home,
+            directory,
+            manifest,
+            name,
+            config,
+            published_work(directory, name),
+        )
+        if work_item:
+            work_key, work_offer = work_item
+            backlog.append(work_key)
+        else:
+            work_offer = None
+        if not backlog:
+            return
         record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
         attempts = (
             record.get("attempts", 0) if record.get("backlog") == backlog else 0
         )
-        if (
-            attempts >= 3
-            or time.time() - record.get("at", 0) < config["inactive_after"]
-        ):
+        if work_offer:
+            dispatch = published_work(directory, name).get("dispatch") or {}
+            attempts = max(attempts, int(dispatch.get("attempts", 0)))
+        if attempts >= WORK_WAKE_ATTEMPTS:
+            if work_offer and dispatch.get("state") != "escalated":
+                result = _work_escalation(
+                    work_offer, attempts, str(record.get("result", ""))
+                )
+                record.update(result=result, escalated_at=time.time())
+                write_json(wake_path, record)
+                _write_work_dispatch(
+                    directory,
+                    name,
+                    work_offer,
+                    attempts,
+                    result,
+                    "escalated",
+                )
             return
+        if time.time() - record.get("at", 0) < config["inactive_after"]:
+            return
+        _select_work_prompt(directory, name, work_offer)
         result = "manual attention required"
         if observed["process_alive"]:
             result = terminal.request(directory, name)
@@ -1708,7 +1999,7 @@ def wake(
                             manifest["root"],
                             "--resume",
                             "--task",
-                            terminal.PROMPT,
+                            terminal.selected_prompt(directory, name),
                         ],
                         stdin=subprocess.DEVNULL,
                         stdout=output,
@@ -1717,15 +2008,29 @@ def wake(
                     )
                 track_launcher(child)
                 result = f"resume requested (launcher {child.pid})"
+        counted = attempts + (not result.startswith("busy"))
         write_json(
             wake_path,
             {
                 "at": time.time(),
                 "backlog": backlog,
-                "attempts": attempts + (not result.startswith("busy")),
+                "attempts": counted,
                 "result": result,
             },
         )
+        if work_offer:
+            _write_work_dispatch(
+                directory,
+                name,
+                work_offer,
+                counted,
+                result,
+                (
+                    "deferred"
+                    if result.startswith("busy")
+                    else "awaiting_progress"
+                ),
+            )
         from agent_parley import checkpoints
 
         checkpoints.record(

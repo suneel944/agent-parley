@@ -381,6 +381,7 @@ def _row(
         "unfit": published["reason"],
         "work_offer": bool(published["offer"]),
         "offer_kind": (published["offer"] or {}).get("kind", ""),
+        "work_dispatch": published.get("dispatch") or {},
         "awaiting_approval": _awaiting_approval(directory, data, agent),
         "prompt": str(
             state.get("last_prompt") or state.get("task", "")
@@ -809,6 +810,8 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
                 lines.append(f"    {row['unfit']}")
             if row["work_offer"]:
                 lines.append(f"    {row['offer_kind']} offer pending")
+            if row["work_dispatch"].get("state") == "escalated":
+                lines.append(f"    {row['work_dispatch']['last_result']}")
             if row["prompt"]:
                 lines.append(f"    last: {row['prompt']}")
             blocks.append({"root": project["root"], "lines": lines, "row": row})

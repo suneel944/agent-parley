@@ -1302,17 +1302,24 @@ marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
 
 For eligible idle sessions, the launcher owns a native pseudo-terminal and a
-private wake socket. It admits only a fixed coordination prompt at a native idle
-checkpoint, with no partially entered operator input. Approval prompts and
-active turns refuse injection. A stopped session can resume its recorded session
-ID through the same native launch configuration and an interactive terminal;
+private wake socket. It admits a coordination prompt at a native idle checkpoint,
+with no partially entered operator input. When supervision selected an actionable
+work offer, the launcher reads that revalidated selection from private state
+after admission and names its offer and issues in the turn. Injecting it is
+delivery, not a claim or completion. Approval prompts and active turns refuse
+injection. A stopped session can resume its recorded session ID through the same
+native launch configuration and an interactive terminal;
 `agent-parley run NAME --resume` exposes that operation explicitly. Native trust,
 authentication and permission prompts remain in force. Environment-only vendor
 accounts that cannot be reconstructed safely require manual attention.
 
 Wake attempts are separated by the inactivity interval and capped at three for
-each unchanged backlog. A `busy:turn`, `busy:input`, or `busy:repeat` answer is
-not one of the three. The suffix distinguishes an active turn, pending operator
+each unchanged backlog. Work dispatches add their offer generation and
+issue-scoped progress digest to that backlog. Delivery without a claim, handoff
+or other recorded issue progress leaves the obligation pending. Exhaustion
+records the offer, issues, attempt count, last result and operator action in the
+work publication. A `busy:turn`, `busy:input`, or `busy:repeat` answer is not
+one of the three. The suffix distinguishes an active turn, pending operator
 input, and an accepted wake that produced no later checkpoint. After the
 inactivity interval, a repeated checkpoint admits one retry. A second stalled
 wake reports `manual attention required`. Terminal control replies such as

@@ -232,13 +232,21 @@ from the store. The result and any work offer are published per lane as
 `<participant>-work.json` beside the other lane state, because the offer is
 about a lane rather than an issue and the ledger records only ownership. The
 checkpoint injects an offer once per identifier and `top` reads the same file,
-so the operator sees exactly what the runtime asked. An offer is advisory: it
-never writes the ledger, and `issue offer` remains the only transfer path. It reads project manifests to
-resolve lane state; this is the explicit bridge from served project identity to
-private launcher state. Its best-effort forge reads run outside store write
-transactions, and observation failures do not fail a committed coordination
-call. `participant_presence` is an additive table initialized with the store.
-The issue ledger retains reminders; only explicit issue transitions own claims.
+so the operator sees exactly what the runtime asked. The publication also keeps
+a dispatch generation, issue-scoped progress digest, bounded attempt count and
+last result. An unchanged actionable offer joins the wake backlog even after a
+checkpoint injected it. The launcher reads the revalidated wake selection from
+private state after admitting the wake, so generated work context does not
+cross the wake socket. Three attempts without issue progress produce a durable
+escalation in the same publication and in `top`; changed issue state starts a
+new bounded attempt series. An offer is advisory: it never writes the ledger,
+and `issue offer` remains the only transfer path. Supervision reads project
+manifests to resolve lane state; this is the explicit bridge from served
+project identity to private launcher state. Its best-effort forge reads run
+outside store write transactions, and observation failures do not fail a
+committed coordination call. `participant_presence` is an additive table
+initialized with the store. The issue ledger retains reminders; only explicit
+issue transitions own claims.
 
 Provider capacity is durable per lane and records available, exhausted,
 retryable and unknown states with the native evidence and session identity.

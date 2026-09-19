@@ -15,6 +15,7 @@ from agent_parley import (
     roster,
     store,
     supervision,
+    terminal,
     views,
 )
 from agent_parley.checkpoints import checkpoint
@@ -568,7 +569,9 @@ def test_a_stopped_lane_is_unfit_and_never_named_by_a_rebalance(
     assert supervision.published_work(directory, "codex")["failed"] == [
         "session"
     ]
-    assert offer_for(directory, "claude") is None
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "continue"
+    assert "codex" not in offer["text"]
 
 
 def test_a_busy_lane_is_told_which_fit_peer_has_been_idle(bridge, repo, paired):
@@ -610,6 +613,257 @@ def test_the_checkpoint_carries_one_offer_and_then_stays_quiet(
     assert "Work offer" in first["reason"]
     assert len(first["reason"].encode()) <= 1536
     assert checkpoint(bridge.home, directory, "claude", stop) == {}
+
+
+def test_an_actionable_work_offer_wakes_an_old_idle_lane(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    requested = []
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda path, name: requested.append(name) or "accepted",
+    )
+
+    supervision.poll(bridge.home, directory)
+
+    assert requested == ["claude"]
+    published = supervision.published_work(directory, "claude")
+    wake = json.loads((directory / "claude-wake.json").read_text())
+    assert wake["backlog"] == [
+        f"work:{published['offer']['id']}:{published['offer']['progress']}"
+    ]
+    assert published["dispatch"]["state"] == "awaiting_progress"
+    assert published["dispatch"]["attempts"] == 1
+
+
+def test_a_paused_lane_retains_work_without_receiving_a_wake(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    manifest = json.loads((directory / "project.json").read_text())
+    manifest["participants"]["claude"]["paused"] = True
+    write_json(directory / "project.json", manifest)
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda *args: pytest.fail("woke paused work"),
+    )
+
+    supervision.poll(bridge.home, directory)
+
+    published = supervision.published_work(directory, "claude")
+    assert published["offer"]["kind"] == "pull"
+    assert published["dispatch"]["state"] == "pending"
+    assert not (directory / "claude-wake.json").exists()
+
+
+def test_claiming_selected_work_clears_the_dispatch(bridge, repo, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    alive(directory, "claude")
+    bridge.issue(lane, "claim", "9")
+    bridge.issue(lane, "release", "9")
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    original = supervision.published_work(directory, "claude")["dispatch"]
+
+    bridge.issue(lane, "claim", "9")
+    supervision.work(bridge.home, directory, manifest, config)
+
+    published = supervision.published_work(directory, "claude")
+    assert published["offer"]["kind"] == "continue"
+    assert published["dispatch"]["generation"] != original["generation"]
+    assert published["dispatch"]["attempts"] == 0
+
+
+def test_stale_published_work_is_rechecked_before_wake(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "9")
+    bridge.issue(peer, "release", "9")
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    assert offer_for(directory, "claude")["issues"] == ["9"]
+    bridge.issue(peer, "claim", "9")
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda *args: pytest.fail("woke for stale work"),
+    )
+
+    supervision.wake(
+        bridge.home,
+        directory,
+        manifest,
+        "claude",
+        supervision.presence(directory, "claude", config["inactive_after"]),
+        config,
+    )
+
+    assert not (directory / "claude-wake.json").exists()
+
+
+def test_direct_wake_honors_lane_opt_out(bridge, repo, paired, monkeypatch):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    manifest["participants"]["claude"]["wake"] = False
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda *args: pytest.fail("woke opted-out lane"),
+    )
+
+    supervision.wake(
+        bridge.home,
+        directory,
+        manifest,
+        "claude",
+        supervision.presence(directory, "claude", config["inactive_after"]),
+        config,
+    )
+
+    assert not (directory / "claude-wake.json").exists()
+
+
+def test_delivery_without_work_progress_retries_then_escalates(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    requested = []
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda path, name: requested.append(name) or "accepted",
+    )
+    supervision.poll(bridge.home, directory)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    for _ in range(3):
+        wake_path = directory / "claude-wake.json"
+        wake = json.loads(wake_path.read_text())
+        wake["at"] = 0
+        write_json(wake_path, wake)
+        supervision.wake(
+            bridge.home,
+            directory,
+            manifest,
+            "claude",
+            observed,
+            config,
+        )
+
+    assert requested == ["claude", "claude", "claude"]
+    published = supervision.published_work(directory, "claude")
+    dispatch = published["dispatch"]
+    assert dispatch["state"] == "escalated"
+    assert dispatch["attempts"] == 3
+    assert "#2" in dispatch["last_result"]
+    assert "last result: accepted" in dispatch["last_result"]
+    assert "next action:" in dispatch["last_result"]
+    view = dashboard.collect(bridge.home, False, {})
+    lines = "\n".join(dashboard.render(view))
+    assert dispatch["last_result"] in lines
+    participants = views.frame(view)["projects"][0]["participants"]
+    reported = next(
+        item for item in participants if item["participant"] == "claude"
+    )
+    assert reported["work_dispatch"]["state"] == "escalated"
+    supervision.work(bridge.home, directory, manifest, config)
+    restarted = supervision.published_work(directory, "claude")["dispatch"]
+    assert restarted["state"] == "escalated"
+    assert restarted["attempts"] == 3
+
+
+def test_issue_progress_resets_a_rebalance_dispatch_generation(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    alive(directory, "codex")
+    turn_ended(directory, "codex", 3600)
+    bridge.issue(lane, "claim", "2")
+    bridge.issue(lane, "claim", "3")
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    before = supervision.published_work(directory, "claude")
+    supervision._write_work_dispatch(
+        directory,
+        "claude",
+        before["offer"],
+        2,
+        "accepted",
+        "awaiting_progress",
+    )
+
+    bridge.issue(lane, "offer", "2", to="codex", summary="Take issue 2")
+    supervision.work(bridge.home, directory, manifest, config)
+
+    after = supervision.published_work(directory, "claude")
+    assert after["offer"]["id"] == before["offer"]["id"]
+    assert after["offer"]["progress"] != before["offer"]["progress"]
+    assert after["dispatch"]["state"] == "pending"
+    assert after["dispatch"]["attempts"] == 0
+
+
+def test_selected_wake_prompt_names_current_work_and_issues(tmp_path):
+    write_json(
+        tmp_path / "codex-wake-work.json",
+        {
+            "fit": True,
+            "offer": {
+                "id": "offer-123",
+                "issues": ["42"],
+                "text": "Work offer. Claim one yourself.",
+            },
+        },
+    )
+
+    prompt = terminal.selected_prompt(tmp_path, "codex")
+
+    assert "offer-123" in prompt
+    assert "#42" in prompt
+    assert "Claim one yourself" in prompt
 
 
 def test_top_reports_the_fit_result_and_a_pending_offer(bridge, repo, paired):

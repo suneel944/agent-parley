@@ -58,6 +58,7 @@ def lane(name: str, **changes: object) -> dict:
         "unfit": "",
         "work_offer": False,
         "offer_kind": "",
+        "work_dispatch": {},
         "awaiting_approval": False,
         "prompt": "",
     }

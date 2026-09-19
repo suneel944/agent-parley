@@ -15,6 +15,41 @@ import tty
 from pathlib import Path
 
 PROMPT = "Review pending coordination messages and handoff reminders."
+MAX_WORK_PROMPT = 2_000
+
+
+def selected_prompt(directory: Path, name: str) -> str:
+    """Adds current actionable work to a supervisor-requested turn.
+
+    The launcher reads supervisor-owned state after admitting the wake. Work
+    context does not cross the control socket, and a malformed or obsolete
+    publication falls back to the ordinary coordination prompt.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant owning the terminal socket.
+
+    Returns:
+        Bounded prompt naming the current work offer, or the default prompt.
+    """
+    try:
+        record = json.loads((directory / f"{name}-wake-work.json").read_text())
+    except (OSError, ValueError):
+        return PROMPT
+    offer = record.get("offer") if isinstance(record, dict) else None
+    if not isinstance(offer, dict):
+        return PROMPT
+    identifier = str(offer.get("id", ""))
+    detail = str(offer.get("text", ""))
+    if not identifier or not detail:
+        return PROMPT
+    issues = ", ".join(f"#{number}" for number in offer.get("issues", [])[:5])
+    heading = f"Act on work offer {identifier}"
+    if issues:
+        heading += f" for {issues}"
+    return (f"{heading}. {detail} Delivery does not claim or complete work.")[
+        :MAX_WORK_PROMPT
+    ]
 
 
 def socket_path(directory: Path, name: str) -> Path:
@@ -174,7 +209,8 @@ def run(
                             else:
                                 result = "manual attention required"
                             if accepted:
-                                os.write(master, (PROMPT + "\r").encode())
+                                prompt = selected_prompt(lane.parent, name)
+                                os.write(master, (prompt + "\r").encode())
                                 wake_checkpoint = checkpoint
                                 wake_checkpoint_at = time.monotonic()
                                 result = "accepted"
