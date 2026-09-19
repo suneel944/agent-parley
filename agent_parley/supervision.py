@@ -1955,12 +1955,16 @@ def wake(
         if not backlog:
             return
         record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
-        attempts = (
-            record.get("attempts", 0) if record.get("backlog") == backlog else 0
-        )
+        same_backlog = record.get("backlog") == backlog
+        attempts = record.get("attempts", 0) if same_backlog else 0
+        throttle_at = record.get("at", 0) if same_backlog else 0
         if work_offer:
             dispatch = published_work(directory, name).get("dispatch") or {}
             attempts = max(attempts, int(dispatch.get("attempts", 0)))
+            if dispatch.get("attempts"):
+                throttle_at = max(
+                    throttle_at, float(dispatch.get("updated_at", 0))
+                )
         if attempts >= WORK_WAKE_ATTEMPTS:
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
@@ -1977,7 +1981,7 @@ def wake(
                     "escalated",
                 )
             return
-        if time.time() - record.get("at", 0) < config["inactive_after"]:
+        if time.time() - throttle_at < config["inactive_after"]:
             return
         _select_work_prompt(directory, name, work_offer)
         result = "manual attention required"

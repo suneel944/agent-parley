@@ -782,6 +782,9 @@ def test_delivery_without_work_progress_retries_then_escalates(
         wake = json.loads(wake_path.read_text())
         wake["at"] = 0
         write_json(wake_path, wake)
+        published = supervision.published_work(directory, "claude")
+        published["dispatch"]["updated_at"] = 0
+        write_json(directory / "claude-work.json", published)
         supervision.wake(
             bridge.home,
             directory,
