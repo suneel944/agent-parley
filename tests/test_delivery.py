@@ -111,6 +111,8 @@ def test_provider_inspection_names_the_delivery_path(bridge, polled):
     )
     prompt = bridge.protocol("helper", polled)
     directory = Path(polled["lanes"]["helper"]).parent
+    assert f"Canonical project identifier: {polled['root']}" in prompt
+    assert "canonical project identifier is an identity" in prompt
     assert str(delivery.mail_file(directory, "helper")) in prompt
     assert "Reading it is\nnot acknowledgement" in prompt
 
