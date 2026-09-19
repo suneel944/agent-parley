@@ -3462,6 +3462,69 @@ def transfer_reservations(
     return moved
 
 
+def transfer_claim_reservations(
+    home: Path,
+    root: str,
+    source: str,
+    target: str,
+    source_claim: str,
+    target_claim: str,
+) -> list[str]:
+    """Moves only reservations correlated with one recovered claim.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        source: Registered identity that lost the claim.
+        target: Registered identity that recovered the claim.
+        source_claim: Previous ownership generation recorded on reservations.
+        target_claim: New ownership generation recorded on moved reservations.
+
+    Returns:
+        Keys moved in sorted order. Reservations for other claims survive.
+
+    Raises:
+        BridgeError: If no store exists or either identity is unregistered.
+    """
+    if not source_claim:
+        return []
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    moved: list[str] = []
+    with connect(home, write=True) as db:
+        holder = _identify(db, root, source)
+        receiver = _identify(db, root, target)
+        held = db.execute(
+            "SELECT id,path_pattern,exclusive,reason,expires_ts "
+            "FROM file_reservations WHERE project_id=? AND agent_id=? "
+            "AND claim_id=? AND released_ts IS NULL ORDER BY path_pattern",
+            (holder["project_id"], holder["id"], source_claim),
+        ).fetchall()
+        for lease in held:
+            db.execute(
+                "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+                "WHERE id=? OR (agent_id=? AND path_pattern=? "
+                "AND released_ts IS NULL)",
+                (lease["id"], receiver["id"], lease["path_pattern"]),
+            )
+            db.execute(
+                "INSERT INTO file_reservations(project_id,agent_id,"
+                "path_pattern,exclusive,reason,expires_ts,claim_id) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    receiver["project_id"],
+                    receiver["id"],
+                    lease["path_pattern"],
+                    lease["exclusive"],
+                    lease["reason"],
+                    lease["expires_ts"],
+                    target_claim or None,
+                ),
+            )
+            moved.append(lease["path_pattern"])
+    return moved
+
+
 def release_reservations(home: Path, root: str, name: str) -> list[str]:
     """Releases every advisory reservation one lane still holds.
 

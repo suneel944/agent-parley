@@ -948,6 +948,36 @@ as a live process or as provider capacity; the three are checked separately and
 reported separately, because a quiet coordination channel alone does not prove
 that a native turn is idle or that a lane can safely accept input.
 
+When an owner is alive but its provider has published an exhausted capacity
+window, the operator can approve recovery of that exact claim and native
+session from the project base checkout:
+
+```sh
+agent-parley issue recover 42 --reason "continue on an available lane"
+```
+
+The command records an approval; it does not stop a process by itself. A later
+supervision pass must publish a matching current capacity observation before
+the runtime stops the process, captures its committed, staged, unstaged and
+non-ignored untracked content, and marks the claim recoverable. A refusal from
+the provider, elapsed time, or the approval alone cannot transfer ownership.
+Recovery also refuses while the owner is paused, waiting for a native approval,
+or waiting for more operator input.
+The receiving lane still runs `issue claim 42 --take-orphaned`. That claim
+revalidates the stopped process and ownership generation, moves only the old
+claim's reservations, fast-forwards to the captured committed HEAD, and restores
+the captured index and working tree into a clean destination. It refuses a
+destination with dirty, untracked or ignored work and leaves both worktrees
+intact. Restore progress is durable; after interruption, the new owner reruns
+`issue claim 42` to resume the exact recorded phase.
+
+The checkpoint and its Git bundle live in the private Agent Parley state
+directory. The bundle carries an exact size and SHA-256 digest, so binary and
+large files are referenced rather than embedded in the issue ledger. Ignored
+untracked files are excluded. The old session generation is refused by later
+lifecycle hooks after takeover; this is runtime fencing, not a filesystem
+security boundary against another process writing directly into the old lane.
+
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six
 hours rather than across the whole retained log. Accepted windows are a count

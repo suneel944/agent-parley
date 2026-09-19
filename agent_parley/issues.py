@@ -366,6 +366,7 @@ def change(
     defaults: dict | None = None,
     carried: dict | None = None,
     take_orphaned: bool = False,
+    takeover: dict | None = None,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -404,6 +405,9 @@ def change(
             supervisor marked orphaned. Like a title it is excluded from the
             arguments a key is compared against, so a repeat carrying the key
             of a recorded take replays that take rather than claiming again.
+        takeover: Revalidated owner generation and durable checkpoint for an
+            orphan take. It is excluded from retry arguments because it is
+            evidence read at execution time rather than caller intent.
 
     Returns:
         The persisted issue record, including transition history.
@@ -430,6 +434,7 @@ def change(
             defaults=defaults,
             carried=carried,
             take_orphaned=take_orphaned,
+            takeover=takeover,
             **transition,
         )
     key = retries.validate(key)
@@ -450,6 +455,7 @@ def change(
             defaults=defaults,
             carried=carried,
             take_orphaned=take_orphaned,
+            takeover=takeover,
             **transition,
         )
     except BridgeError as exc:
@@ -488,7 +494,14 @@ def _unseen() -> dict:
     }
 
 
-def _taken(record: dict, issue: str, orphan: dict) -> dict:
+def _taken(
+    directory: Path,
+    agent: str,
+    record: dict,
+    issue: str,
+    orphan: dict,
+    takeover: dict | None,
+) -> dict:
     """Records which owner an orphaned claim was taken from, and why.
 
     The previous owner is read from the marker the supervisor wrote rather
@@ -496,9 +509,12 @@ def _taken(record: dict, issue: str, orphan: dict) -> dict:
     made and never a peer's opinion of who is alive.
 
     Args:
+        directory: Private state directory for the common repository.
+        agent: Participant receiving the ownership generation.
         record: Published record for the issue being taken.
         issue: Repository issue number the take names.
         orphan: Orphan marker the record carries, if any.
+        takeover: Revalidated claim and orphan identities plus its checkpoint.
 
     Returns:
         The previous owner, the reason it was marked orphaned, the instant of
@@ -513,11 +529,24 @@ def _taken(record: dict, issue: str, orphan: dict) -> dict:
             f"Issue #{issue} is owned by {record['owner']}, which does not "
             "read as orphaned; ask that lane for a handoff instead."
         )
+    takeover = takeover or {}
+    if (
+        takeover.get("claim_id") != record.get("claim_id")
+        or takeover.get("orphan_id") != orphan.get("id")
+        or not takeover.get("checkpoint")
+    ):
+        raise BridgeError(
+            f"Issue #{issue} recovery evidence changed; inspect and retry."
+        )
+    from agent_parley import recovery
+
+    recovery.commit_takeover(directory, agent, takeover, issue, record, orphan)
     return {
         "from": record["owner"],
         "reason": orphan.get("reason", ""),
         "at": time.time(),
         "reservations": list(orphan.get("reservations", [])),
+        "checkpoint": takeover["checkpoint"],
     }
 
 
@@ -687,6 +716,7 @@ def _change(
     defaults: dict | None = None,
     carried: dict | None = None,
     take_orphaned: bool = False,
+    takeover: dict | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -721,6 +751,8 @@ def _change(
             marked orphaned. Only the recorded owner of that marker is taken
             from, and the take is recorded as its own transition naming that
             owner and the reason the marker gave.
+        takeover: Revalidated owner generation and durable checkpoint for an
+            orphan take.
 
     Returns:
         The persisted issue record, including transition history.
@@ -751,7 +783,9 @@ def _change(
                     if not orphan:
                         return record
                 elif take_orphaned:
-                    taken = _taken(record, issue, orphan)
+                    taken = _taken(
+                        directory, agent, record, issue, orphan, takeover
+                    )
                     logged = "take"
                 else:
                     raise BridgeError(
@@ -789,6 +823,8 @@ def _change(
                 record["title"] = resolved
             if taken:
                 record["taken"] = taken
+                if inherited := previous.get("handoff"):
+                    record["handoff"] = inherited
         elif action == "assign":
             record = _assign(
                 record,

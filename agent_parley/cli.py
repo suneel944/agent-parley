@@ -5081,6 +5081,36 @@ attempt of the recorded budget, which is also only reported.
             },
         )
 
+    def authorize_recovery(
+        self,
+        repo: Path,
+        number: str,
+        reason: str,
+    ) -> dict:
+        """Records operator approval for one live claim recovery.
+
+        Args:
+            repo: Project base checkout, never a participant lane.
+            number: Repository issue number whose claim may be stopped.
+            reason: Operator rationale stored with the approval.
+
+        Returns:
+            Approval bound to the current owner, claim and native session.
+
+        Raises:
+            BridgeError: If invoked from a lane or no exact live claim exists.
+        """
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        if repo.resolve() != Path(data["root"]).resolve():
+            raise BridgeError(
+                "Live recovery approval must be recorded from the project "
+                "base checkout."
+            )
+        from agent_parley import recovery
+
+        return recovery.authorize(directory, data, parse_issue(number), reason)
+
     def issue(
         self,
         repo: Path,
@@ -5146,7 +5176,7 @@ attempt of the recorded budget, which is also only reported.
             The whole ledger for list, or the resulting issue record. An
             acceptance additionally reports the reservation keys that moved,
             and a take reports the keys the orphaned owner's reservations
-            were released under.
+            moved to the new ownership generation.
 
         Raises:
             BridgeError: If lane, ownership, or transition checks fail.
@@ -5191,6 +5221,18 @@ attempt of the recorded budget, which is also only reported.
             if action == "offer"
             else {}
         )
+        takeover = {}
+        if action == "claim" and take_orphaned:
+            from agent_parley import recovery
+
+            current = (
+                snapshot(directory)["issues"].get(parse_issue(number)) or {}
+            )
+            if current.get("orphan"):
+                takeover = recovery.prepare_takeover(
+                    directory, data, agent, parse_issue(number)
+                )
+                recovery.preflight(directory, repo, takeover["checkpoint"])
         try:
             record = change(
                 directory,
@@ -5208,6 +5250,7 @@ attempt of the recorded budget, which is also only reported.
                 defaults=data["deadlines"],
                 carried=carried,
                 take_orphaned=take_orphaned,
+                takeover=takeover,
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
@@ -5215,6 +5258,10 @@ attempt of the recorded budget, which is also only reported.
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
+            if record.get("taken"):
+                from agent_parley import recovery
+
+                record = recovery.restore(directory, repo, record)
             record = self._free_orphaned(data, record)
             forge.assign(repo, parse_issue(number))
             likely = self._claim_forecast(
@@ -5328,13 +5375,12 @@ attempt of the recorded budget, which is also only reported.
         return {**record, "reservations_moved": moved}
 
     def _free_orphaned(self, data: dict, record: dict) -> dict:
-        """Releases the reservations of the owner an orphaned claim was taken.
+        """Moves reservations of the recovered ownership generation.
 
         Reservations are advisory declarations of intent, never enforced file
-        system locks. The lane they named is gone, so the take releases them
-        rather than moving them: the taking lane declares for itself what it
-        is about to edit, and a peer reading a key is never told a dead lane
-        is working on it.
+        system locks. Only reservations correlated with this claim move to the
+        recovering lane. Reservations for unrelated claims stay with their
+        owner.
 
         A store that cannot answer leaves every key where it was and reports
         why beside the record, because a committed take is not reversed by a
@@ -5346,7 +5392,7 @@ attempt of the recorded budget, which is also only reported.
 
         Returns:
             The record unchanged when nothing was taken, and otherwise the
-            record carrying the released keys, or the reason none were.
+            record carrying the moved keys, or the reason none were.
         """
         import sqlite3
 
@@ -5354,19 +5400,27 @@ attempt of the recorded budget, which is also only reported.
         previous = taken.get("from")
         if previous not in data["participants"]:
             return record
+        checkpoint = taken.get("checkpoint") or {}
+        source_claim = str(checkpoint.get("claim_id") or "")
+        new_owner = str(record.get("owner") or "")
+        if new_owner not in data["participants"]:
+            return record
         try:
-            released = store.release_reservations(
+            moved = store.transfer_claim_reservations(
                 self.home,
                 data["root"],
                 data["participants"][previous]["display"],
+                data["participants"][new_owner]["display"],
+                source_claim,
+                str(record.get("claim_id") or ""),
             )
         except (BridgeError, OSError, sqlite3.Error) as exc:
             return {
                 **record,
-                "reservations_released": [],
+                "reservations_moved": [],
                 "reservations_error": str(exc),
             }
-        return {**record, "reservations_released": released}
+        return {**record, "reservations_moved": moved}
 
     def _claim_forecast(
         self, repo: Path, directory: Path, data: dict, agent: str, number: str
@@ -7935,8 +7989,8 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 help=(
                     "Take an issue whose owner the supervisor marked "
                     "orphaned, recording that owner and the reason. It "
-                    "releases the reservations that owner still held; a lane "
-                    "that is merely idle is never orphaned."
+                    "moves that claim's reservations to the new owner; a "
+                    "lane that is merely idle is never orphaned."
                 ),
             )
         if action == "offer":
@@ -7968,6 +8022,20 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             command.add_argument("--offer-id", required=True)
         if action in ("block", "unblock"):
             command.add_argument("--on", required=True)
+    recovering = actions.add_parser(
+        "recover",
+        help=(
+            "Authorize stopping the current live owner when a matching "
+            "capacity observation is later published."
+        ),
+    )
+    recovering.add_argument("number")
+    recovering.add_argument("--repo", type=Path, default=Path.cwd())
+    recovering.add_argument(
+        "--reason",
+        required=True,
+        help="Operator rationale persisted with this exact claim approval.",
+    )
     choosing = actions.add_parser(
         "next",
         help=(
@@ -8928,6 +8996,11 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "issue" and args.action == "recover":
+            approved = bridge.authorize_recovery(
+                args.repo.resolve(), args.number, args.reason
+            )
+            print(json.dumps(approved, indent=2))
         elif args.command == "issue":
             result = bridge.issue(
                 args.repo.resolve(),

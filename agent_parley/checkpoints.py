@@ -106,6 +106,7 @@ class Reason(StrEnum):
     POLLED_DELIVERY = "polled_delivery"
     SERVICE_FALLBACK = "service_fallback"
     NOTIFICATION_FAILED = "notification_failed"
+    STALE_GENERATION = "stale_generation"
 
 
 def decision_of(output: dict | None) -> str:
@@ -1288,6 +1289,18 @@ def checkpoint(
     lane = Path(participant["lane"]).resolve()
     if not Path(payload.get("cwd", str(lane))).resolve().is_relative_to(lane):
         raise BridgeError("Hook cwd does not belong to this agent's worktree.")
+    from agent_parley import recovery
+
+    if fenced := recovery.stale_session(directory, agent, payload):
+        record(
+            directory,
+            agent,
+            payload,
+            Reason.STALE_GENERATION,
+            fenced,
+            "ownership generation transferred",
+        )
+        return fenced
     if participant.get("paused", False):
         refusal = paused_output(event)
         record(directory, agent, payload, Reason.PAUSED, refusal, "paused")
@@ -1600,6 +1613,13 @@ def checkpoint(
                             "additionalContext": text,
                         }
                     }
+        if event in ("SessionStart", "PostToolUse", "Stop", "SessionEnd"):
+            try:
+                saved = recovery.capture(directory, manifest, agent, payload)
+                state["recovery_checkpoints"] = [item["id"] for item in saved]
+                state.pop("recovery_error", None)
+            except (BridgeError, OSError, ValueError) as exc:
+                state["recovery_error"] = clip(str(exc), MAX_CAUSE_BYTES)
         write_json(state_path, state)
         record(
             directory,

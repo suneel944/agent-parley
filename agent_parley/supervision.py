@@ -1440,6 +1440,15 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     }
     if not dead:
         return
+    from agent_parley import recovery
+
+    recoverable = set()
+    for name in dead:
+        try:
+            recovery.capture(directory, manifest, name)
+            recoverable.add(name)
+        except (BridgeError, OSError, ValueError):
+            pass
     try:
         reservations = store.active_reservations(home, manifest["root"])
     except (BridgeError, OSError, sqlite3.Error):
@@ -1449,6 +1458,8 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         ledger = issues.snapshot(directory)
         changed = False
         for name, observed in dead.items():
+            if name not in recoverable:
+                continue
             keys = reservations.get(
                 manifest["participants"][name]["display"], []
             )
