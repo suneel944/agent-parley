@@ -10,6 +10,7 @@ import select
 import signal
 import socket
 import termios
+import time
 import tty
 from pathlib import Path
 
@@ -32,7 +33,8 @@ def request(directory: Path, name: str) -> str:
         name: Participant owning the terminal socket.
 
     Returns:
-        Accepted, busy, or unavailable. No user content crosses the socket.
+        Accepted, a reasoned busy refusal, manual attention, or unavailable.
+        No user content crosses the socket.
     """
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(1)
@@ -73,6 +75,7 @@ def run(
     name: str,
     *,
     attached: bool = True,
+    inactive_after: float = 300,
 ) -> int:
     """Runs the native CLI with its own controlling terminal and permissions.
 
@@ -87,6 +90,7 @@ def run(
         env: Existing native authentication and launch environment.
         name: Validated participant name.
         attached: Whether to forward the operator's terminal input.
+        inactive_after: Seconds without a new checkpoint before one retry.
 
     Returns:
         Native process exit status.
@@ -116,6 +120,8 @@ def run(
             resize()
         pending_input = False
         wake_checkpoint = None
+        wake_checkpoint_at = 0.0
+        wake_retried = False
         try:
             if attached:
                 tty.setraw(0)
@@ -145,18 +151,34 @@ def run(
                         with contextlib.suppress(OSError, ValueError):
                             requested = connection.recv(32)
                             state = json.loads(activity.read_text())
-                            accepted = (
-                                requested == b"wake\n"
-                                and state.get("activity") == "idle"
-                                and not pending_input
-                                and state.get("updated") != wake_checkpoint
-                            )
+                            checkpoint = state.get("updated")
+                            accepted = False
+                            result = "busy:turn"
+                            if requested != b"wake\n":
+                                result = "unavailable"
+                            elif state.get("activity") != "idle":
+                                result = "busy:turn"
+                            elif pending_input:
+                                result = "busy:input"
+                            elif checkpoint != wake_checkpoint:
+                                accepted = True
+                                wake_retried = False
+                            elif (
+                                time.monotonic() - wake_checkpoint_at
+                                < inactive_after
+                            ):
+                                result = "busy:repeat"
+                            elif not wake_retried:
+                                accepted = True
+                                wake_retried = True
+                            else:
+                                result = "manual attention required"
                             if accepted:
                                 os.write(master, (PROMPT + "\r").encode())
-                                wake_checkpoint = state.get("updated")
-                            connection.sendall(
-                                b"accepted" if accepted else b"busy"
-                            )
+                                wake_checkpoint = checkpoint
+                                wake_checkpoint_at = time.monotonic()
+                                result = "accepted"
+                            connection.sendall(result.encode())
         finally:
             if saved is not None:
                 termios.tcsetattr(0, termios.TCSADRAIN, saved)

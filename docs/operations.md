@@ -1311,16 +1311,21 @@ authentication and permission prompts remain in force. Environment-only vendor
 accounts that cannot be reconstructed safely require manual attention.
 
 Wake attempts are separated by the inactivity interval and capped at three for
-each unchanged backlog. A `busy` answer is not one of the three: a lane that was
-mid-turn is asked again on a later poll, so a working lane never spends the
-budget that a lane with nothing to read would. Terminal control replies such as
+each unchanged backlog. A `busy:turn`, `busy:input`, or `busy:repeat` answer is
+not one of the three. The suffix distinguishes an active turn, pending operator
+input, and an accepted wake that produced no later checkpoint. After the
+inactivity interval, a repeated checkpoint admits one retry. A second stalled
+wake reports `manual attention required`. Terminal control replies such as
 cursor position reports and focus events do not count as partially entered
-operator input, so they no longer refuse the wake either.
+operator input, so they do not refuse the wake.
 Results appear in `status`, the retained event log and
 private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
-Lanes launched before wake sockets were introduced require relaunching. An
-unavailable adapter or socket is reported for manual attention. Waking never
-marks mail read, acknowledges it, releases reservations or transfers an issue.
+Lanes launched before wake sockets were introduced require relaunching. A live
+native session started outside `agent-parley run` has no wake socket. Exit that
+session and launch it through `agent-parley run` before automatic waking can
+reach it. An unavailable adapter or socket is reported for manual attention.
+Waking never marks mail read, acknowledges it, releases reservations or
+transfers an issue.
 
 The automated tests exercise local processes, pseudo-terminals, hook payloads
 and real MCP transport. They do not establish live model behavior for a provider.

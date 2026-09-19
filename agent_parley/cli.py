@@ -6797,6 +6797,9 @@ attempt of the recorded budget, which is also only reported.
                             env,
                             agent,
                             attached=sys.stdin.isatty(),
+                            inactive_after=supervision.configuration(
+                                self.home, data
+                            )["inactive_after"],
                         )
                     return subprocess.call(command, cwd=lane, env=env)
             finally:

@@ -24,6 +24,7 @@ ACK = "awaiting acknowledgement"
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
 BUDGET = "over budget"
+WAKE = "wake attention"
 
 
 def _row(
@@ -89,6 +90,32 @@ def _lane_rows(
     idle = record["idle"]
     availability = record["availability"]
     quiet = availability["state"] != "active"
+    wake = record.get("wake") or {}
+    wake_result = wake.get("result", "")
+    wake_details = {
+        "busy:input": "wake refused because operator input is pending",
+        "busy:repeat": (
+            "wake refused because the previous accepted wake produced no "
+            "checkpoint"
+        ),
+        "manual attention required": "wake requires operator attention",
+    }
+    if wake_result in wake_details:
+        command = (
+            f"return to {name}'s terminal and complete or stop the session"
+            if availability["process_alive"]
+            else f"agent-parley run {name} {repo}"
+        )
+        rows.append(
+            _row(
+                WAKE,
+                wake_details[wake_result],
+                command,
+                wake.get("age_seconds"),
+                name,
+                root,
+            )
+        )
     if idle["stalled"]:
         rows.append(
             _row(

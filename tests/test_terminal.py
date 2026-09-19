@@ -84,7 +84,7 @@ def test_attached_launcher_admits_a_wake_after_a_cursor_report():
                 directory / "lane-activity.json",
                 {"activity": "idle", "updated": 2},
             )
-            assert terminal.request(directory, "lane") == "busy"
+            assert terminal.request(directory, "lane") == "busy:input"
         finally:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
@@ -105,7 +105,7 @@ def _read_until(master: int, marker: bytes, timeout: float = 10) -> bytes:
 
 @pytest.mark.parametrize(
     "activity,expected",
-    [("idle", "accepted"), ("waiting for approval", "busy")],
+    [("idle", "accepted"), ("waiting for approval", "busy:turn")],
 )
 def test_wake_transport_respects_native_activity(activity, expected):
     with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
@@ -137,7 +137,7 @@ def test_wake_transport_respects_native_activity(activity, expected):
             assert select.select([child.stdout], [], [], 10)[0]
             assert b"READY" in child.stdout.readline()
             assert terminal.request(directory, "lane") == expected
-            if expected == "busy":
+            if expected == "busy:turn":
                 assert child.poll() is None
                 state = json.loads(
                     (directory / "lane-activity.json").read_text()
@@ -152,6 +152,54 @@ def test_wake_transport_respects_native_activity(activity, expected):
             assert child.returncode == 0, error
             assert ("RECEIVED:" + terminal.PROMPT).encode() in output
             assert not (directory / "lane-wake.sock").exists()
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_latched_checkpoint_admits_one_retry_then_requires_attention():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        script = (
+            "import sys\nprint('READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('RECEIVED:' + line.rstrip(), flush=True)\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False, "
+            "inactive_after=0.05))"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", harness, str(lane), script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert b"READY" in child.stdout.readline()
+            assert terminal.request(directory, "lane") == "accepted"
+            assert terminal.request(directory, "lane") == "busy:repeat"
+            time.sleep(0.1)
+            assert terminal.request(directory, "lane") == "accepted"
+            assert terminal.request(directory, "lane") == "busy:repeat"
+            time.sleep(0.1)
+            assert (
+                terminal.request(directory, "lane")
+                == "manual attention required"
+            )
+            assert child.poll() is None
         finally:
             if child.poll() is None:
                 child.kill()

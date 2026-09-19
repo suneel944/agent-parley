@@ -1327,10 +1327,11 @@ def wake(
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
     offer carries a new identifier, which resets the bounded attempt count
-    rather than extending the old one. A request the launcher refuses as busy
-    is spaced like any other but does not count against the bound, because
-    the lane never received a turn to decline; it is asked again once it is
-    idle.
+    rather than extending the old one. A request the launcher refuses with a
+    `busy` reason is spaced like any other but does not count against the
+    bound, because the lane never received a turn to decline; it is asked
+    again once it is idle. A non-idle activity label blocks a wake only while
+    its recorded process remains alive.
 
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
@@ -1340,7 +1341,10 @@ def wake(
     participant = manifest["participants"][name]
     path = directory / f"{name}-activity.json"
     state = json.loads(path.read_text()) if path.exists() else {}
-    if state.get("activity") not in {"idle", "stopped"}:
+    if (
+        state.get("activity") not in {"idle", "stopped"}
+        and observed["process_alive"]
+    ):
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -1385,7 +1389,7 @@ def wake(
         result = "manual attention required"
         if observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif state.get("session_id") and state.get("launcher_managed"):
+        elif state.get("session_id"):
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"
@@ -1418,7 +1422,7 @@ def wake(
             {
                 "at": time.time(),
                 "backlog": backlog,
-                "attempts": attempts + (result != "busy"),
+                "attempts": attempts + (not result.startswith("busy")),
                 "result": result,
             },
         )
