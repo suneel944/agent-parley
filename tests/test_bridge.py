@@ -1486,7 +1486,7 @@ def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
     assert bridge.issue(repo, "list")["issues"]["432"]["owner"] == "claude"
 
 
-def test_a_ready_report_comments_once_on_every_claimed_issue(
+def test_a_report_requires_one_claim_and_comments_on_that_issue(
     bridge, repo, paired, monkeypatch
 ):
     claude = Path(paired["lanes"]["claude"])
@@ -1504,18 +1504,44 @@ def test_a_ready_report_comments_once_on_every_claimed_issue(
     bridge.issue(claude, "claim", "432")
     bridge.issue(claude, "claim", "433")
 
-    bridge.report(claude, "partial", "Halfway", "More to do", "")
+    with pytest.raises(BridgeError, match="owns multiple issues"):
+        bridge.report(claude, "partial", "Halfway", "More to do", "")
+
+    bridge.report(
+        claude,
+        "partial",
+        "Halfway",
+        "More to do",
+        "",
+        issue="432",
+    )
     assert posted == []
 
-    bridge.report(claude, "ready", "Lane result", "", "make check passed")
-    assert [number for number, _ in posted] == ["432", "433"]
+    bridge.report(
+        claude,
+        "ready",
+        "Lane result",
+        "",
+        "make check passed",
+        issue="432",
+    )
+    assert [number for number, _ in posted] == ["432"]
     assert "Reported ready for review." in posted[0][1]
     assert "claude" not in posted[0][1]
     assert "make check passed" in posted[0][1]
     assert "neither review nor independent verification" in posted[0][1]
+    with pytest.raises(BridgeError, match="owns multiple issues"):
+        bridge.merge(repo, "claude")
 
-    bridge.report(claude, "ready", "Lane result", "", "make check passed")
-    assert len(posted) == 2
+    bridge.report(
+        claude,
+        "ready",
+        "Lane result",
+        "",
+        "make check passed",
+        issue="432",
+    )
+    assert len(posted) == 1
 
 
 def test_issue_claim_records_and_renders_the_forge_title(

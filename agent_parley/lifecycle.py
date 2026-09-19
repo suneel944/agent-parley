@@ -44,6 +44,8 @@ def initial(*, authorized: bool = False) -> dict:
         "blocker": "",
         "resume_when": "",
         "commit": "",
+        "source_commit": "",
+        "integrated_commit": "",
         "gate": None,
         "progress": None,
     }
@@ -236,8 +238,11 @@ def record_report(
     outcome: str,
     commit: str,
     remaining: str,
+    issue: str = "",
+    claim_id: str = "",
+    resume_on: str = "",
 ) -> list[str]:
-    """Binds a lane report to every claim generation it currently owns.
+    """Binds a lane report to one exact current claim generation.
 
     A report can make current work blocked or ready for verification. It
     cannot verify completion. A report from an earlier generation cannot be
@@ -249,6 +254,9 @@ def record_report(
         outcome: Partial, blocked, or ready.
         commit: Exact lane HEAD at report time.
         remaining: Recorded blocker or unfinished work.
+        issue: Exact owned issue, inferred only when ownership is unambiguous.
+        claim_id: Expected ownership generation, when already observed.
+        resume_on: Existing authorized issue whose completion resumes a block.
 
     Returns:
         Issue numbers whose current execution state changed.
@@ -258,49 +266,97 @@ def record_report(
     """
     if outcome == READY and not COMMIT.fullmatch(commit):
         raise BridgeError("Ready work must name its exact Git commit.")
-    changed = []
+    if resume_on and outcome != BLOCKED:
+        raise BridgeError("--resume-on is valid only for blocked reports.")
+    resumed_by = _issue_number(resume_on, "Resume issue") if resume_on else ""
     with lock(directory / "issues.lock", timeout=1):
         ledger = _snapshot(directory)
-        for number, record in ledger["issues"].items():
-            if record.get("owner") != agent:
-                continue
-            execution = state(record)
-            if execution["claim_id"] != record.get("claim_id"):
-                continue
-            phase = {
-                "partial": RUNNING,
-                BLOCKED: BLOCKED,
-                READY: READY,
-            }.get(outcome)
-            if phase is None:
-                raise BridgeError("Unknown lifecycle report state.")
-            execution.update(
-                state=phase,
-                next_action={
-                    RUNNING: "resume",
-                    BLOCKED: "wait for recorded condition",
-                    READY: "verify and integrate",
-                }[phase],
-                updated_at=time.time(),
-                blocker=(
-                    {"reason": remaining.strip()} if phase == BLOCKED else ""
-                ),
-                resume_when=(
+        owned = [
+            number
+            for number, record in ledger["issues"].items()
+            if record.get("owner") == agent
+            and state(record)["claim_id"] == record.get("claim_id")
+        ]
+        if issue:
+            number = _issue_number(issue)
+            if number not in owned:
+                raise BridgeError(
+                    f"Issue #{number} is not owned by {agent} in its current "
+                    "claim generation."
+                )
+        elif len(owned) > 1:
+            raise BridgeError(
+                "A report must name one issue when a lane owns multiple claims."
+            )
+        elif not owned:
+            return []
+        else:
+            number = owned[0]
+        record = ledger["issues"][number]
+        if claim_id and record.get("claim_id") != claim_id:
+            raise BridgeError(
+                f"Issue #{number} changed ownership generation before its "
+                "report was recorded."
+            )
+        phase = {
+            "partial": RUNNING,
+            BLOCKED: BLOCKED,
+            READY: READY,
+        }.get(outcome)
+        if phase is None:
+            raise BridgeError("Unknown lifecycle report state.")
+        if phase == READY and record.get("blocked_by"):
+            raise BridgeError(
+                f"Issue #{number} still has incomplete dependencies."
+            )
+        if resumed_by:
+            dependency = ledger["issues"].get(resumed_by)
+            if not dependency or not state(dependency)["authorized"]:
+                raise BridgeError(
+                    f"Resume issue #{resumed_by} is not authorized work."
+                )
+            if resumed_by == number:
+                raise BridgeError("An issue cannot wait on itself.")
+            if state(dependency)["state"] == COMPLETE:
+                raise BridgeError(
+                    f"Resume issue #{resumed_by} is already complete."
+                )
+            blockers = set(record.get("blocked_by", [])) | {resumed_by}
+            if _reaches(ledger["issues"], resumed_by, number):
+                raise BridgeError(
+                    f"Issue #{number} waiting on #{resumed_by} would form "
+                    "a dependency cycle."
+                )
+            record["blocked_by"] = sorted(blockers, key=int)
+        execution = state(record)
+        execution.update(
+            state=phase,
+            next_action={
+                RUNNING: "resume",
+                BLOCKED: "wait for recorded condition",
+                READY: "verify and integrate",
+            }[phase],
+            updated_at=time.time(),
+            blocker={"reason": remaining.strip()} if phase == BLOCKED else "",
+            resume_when=(
+                {"kind": "issue", "issue": resumed_by}
+                if resumed_by
+                else (
                     {"kind": "external", "detail": remaining.strip()}
                     if phase == BLOCKED
                     else ""
-                ),
-                commit=commit
-                if phase == READY
-                else execution.get("commit", ""),
-            )
-            execution["progress"] = {"token": commit, "at": time.time()}
-            record["execution"] = execution
-            changed.append(number)
-        if changed:
-            ledger["revision"] += 1
-            write_json(directory / "issues.json", ledger)
-    return sorted(changed, key=int)
+                )
+            ),
+            commit=commit if phase == READY else execution.get("commit", ""),
+            source_commit=(
+                commit if phase == READY else execution.get("source_commit", "")
+            ),
+        )
+        execution["progress"] = {"token": commit, "at": time.time()}
+        record["execution"] = execution
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+    return [number]
 
 
 def complete(
@@ -309,6 +365,7 @@ def complete(
     claim_id: str,
     commit: str,
     gate_command: list[str],
+    source_commit: str = "",
 ) -> dict:
     """Records verified integration and reconciles dependent issues.
 
@@ -319,6 +376,7 @@ def complete(
         commit: Exact integrated repository commit that passed the gate.
         gate_command: Configured command that passed, or an empty list when
             the repository requires no gate.
+        source_commit: Exact reported lane commit that was integrated.
 
     Returns:
         Completed issue record.
@@ -343,6 +401,21 @@ def complete(
                 f"Issue #{issue} is {execution['state']}, not ready for "
                 "verification."
             )
+        if record.get("blocked_by"):
+            raise BridgeError(
+                f"Issue #{issue} still waits on "
+                + ", ".join(f"#{item}" for item in record["blocked_by"])
+                + "."
+            )
+        reported = str(
+            execution.get("source_commit") or execution.get("commit") or ""
+        )
+        source_commit = source_commit or reported
+        if not COMMIT.fullmatch(source_commit) or source_commit != reported:
+            raise BridgeError(
+                f"Issue #{issue} is ready at {reported}, not "
+                f"{source_commit or 'an unknown commit'}."
+            )
         owner = record.get("owner")
         now = time.time()
         execution.update(
@@ -350,6 +423,8 @@ def complete(
             next_action="none",
             updated_at=now,
             commit=commit,
+            source_commit=source_commit,
+            integrated_commit=commit,
             gate={
                 "command": list(gate_command),
                 "status": "passed" if gate_command else "not required",
@@ -388,11 +463,18 @@ def complete(
                 number for number in blockers if number != issue
             ]
             waiting_execution = state(waiting)
+            condition = waiting_execution.get("resume_when") or {}
+            dependency = (
+                ledger["issues"].get(str(condition.get("issue")))
+                if isinstance(condition, dict)
+                and condition.get("kind") == "issue"
+                else None
+            )
             if (
                 not waiting["blocked_by"]
                 and waiting_execution["state"] == BLOCKED
-                and waiting_execution.get("resume_when")
-                == {"kind": "issue", "issue": issue}
+                and dependency
+                and state(dependency)["state"] == COMPLETE
             ):
                 waiting_execution.update(
                     state=RUNNING if waiting.get("owner") else QUEUED,
@@ -405,6 +487,29 @@ def complete(
         ledger["revision"] += 1
         write_json(directory / "issues.json", ledger)
         return record
+
+
+def _issue_number(value: str, label: str = "Issue") -> str:
+    """Returns one positive decimal issue number."""
+    number = value[1:] if value.startswith("#") else value
+    if not number.isdigit() or int(number) < 1:
+        raise BridgeError(f"{label} must be a positive issue number.")
+    return str(int(number))
+
+
+def _reaches(records: dict, start: str, target: str) -> bool:
+    """Reports whether dependency edges lead from start to target."""
+    pending = [start]
+    seen = set()
+    while pending:
+        number = pending.pop()
+        if number == target:
+            return True
+        if number in seen:
+            continue
+        seen.add(number)
+        pending.extend(records.get(number, {}).get("blocked_by", []))
+    return False
 
 
 def _snapshot(directory: Path) -> dict:

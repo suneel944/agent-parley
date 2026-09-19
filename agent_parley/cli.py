@@ -1110,7 +1110,13 @@ def merge_preview(
     return "\n".join(report)
 
 
-def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
+def merge_branch(
+    root: Path,
+    lane: Path,
+    name: str,
+    branch: str,
+    source_commit: str = "",
+) -> str:
     """Merges one lane's bridge branch into the base checkout.
 
     The merge runs in the base checkout, never inside another lane, and
@@ -1128,6 +1134,8 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         lane: Assigned bridge worktree belonging to the participant.
         name: Participant that owns the lane.
         branch: Bridge branch to merge into the base checkout.
+        source_commit: Immutable reported commit to merge instead of the
+            moving branch name.
 
     Returns:
         An account of what was merged.
@@ -1146,7 +1154,8 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
         git(root, "rev-parse", "--path-format=absolute", "--git-dir")
     )
     quoted = shlex.quote(str(root))
-    pending = git(root, "log", "--oneline", f"HEAD..{branch}")
+    target = source_commit or branch
+    pending = git(root, "log", "--oneline", f"HEAD..{target}")
     if not pending:
         return f"{base} already contains every commit on {branch}."
     try:
@@ -1159,7 +1168,7 @@ def merge_branch(root: Path, lane: Path, name: str, branch: str) -> str:
                 "--no-ff",
                 "-m",
                 f"Merge lane branch {branch}",
-                branch,
+                target,
             ],
             capture_output=True,
             text=True,
@@ -2115,6 +2124,42 @@ def held_claim(directory: Path, name: str) -> dict:
         return {"issue": None, "claim_id": None}
     number, record = owned[0]
     return {"issue": int(number), "claim_id": record.get("claim_id")}
+
+
+def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
+    """Returns one exact owned claim or refuses an ambiguous selection.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        issue: Explicit issue selection, or empty to infer a sole claim.
+
+    Returns:
+        Issue number and claim identifier, or empty fields when no claim is
+        held and none was requested.
+
+    Raises:
+        BridgeError: If the selection is not currently owned or ownership is
+            ambiguous.
+    """
+    owned = {
+        number: record
+        for number, record in snapshot(directory)["issues"].items()
+        if record["owner"] == name
+    }
+    if issue:
+        number = parse_issue(issue)
+        if number not in owned:
+            raise BridgeError(f"Issue #{number} is not owned by {name}.")
+    elif len(owned) > 1:
+        raise BridgeError(
+            f"{name} owns multiple issues; name one with --issue."
+        )
+    elif not owned:
+        return {"issue": None, "claim_id": None}
+    else:
+        number = next(iter(owned))
+    return {"issue": int(number), "claim_id": owned[number].get("claim_id")}
 
 
 def report_comment(summary: str, evidence: str) -> str:
@@ -3826,14 +3871,35 @@ class Bridge:
         participant = data["participants"][name]
         with lock(directory / f"{name}.session.lock", session_busy(name)):
             self._require_approval(directory, data, name, "merge")
-            claim = held_claim(directory, name)
+            claim = exact_claim(directory, name)
+            source_commit = ""
+            if claim["issue"] is not None:
+                record = snapshot(directory)["issues"][str(claim["issue"])]
+                execution = lifecycle.state(record)
+                if execution["state"] != lifecycle.READY:
+                    raise BridgeError(
+                        f"Issue #{claim['issue']} is not reported ready."
+                    )
+                source_commit = (
+                    execution.get("source_commit") or execution["commit"]
+                )
             if data["verify"]:
                 verify_base(root, data["verify"])
+            lane = Path(participant["lane"])
+            if (
+                source_commit
+                and git(lane, "rev-parse", "HEAD") != source_commit
+            ):
+                raise BridgeError(
+                    f"{name} committed since issue #{claim['issue']} was "
+                    "reported ready; record a new report before merging."
+                )
             merged = merge_branch(
                 root,
-                Path(participant["lane"]),
+                lane,
                 name,
                 participant["branch"],
+                source_commit,
             )
             integrated = git(root, "rev-parse", "HEAD")
             if data["verify"]:
@@ -3843,6 +3909,16 @@ class Bridge:
                         "The base commit changed while verification ran; "
                         "the integration stands but is not recorded complete."
                     )
+                if git(
+                    root,
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                ):
+                    raise BridgeError(
+                        "Verification changed tracked repository content; "
+                        "the integration stands but is not recorded complete."
+                    )
             if claim["issue"] is not None and claim["claim_id"]:
                 lifecycle.complete(
                     directory,
@@ -3850,6 +3926,7 @@ class Bridge:
                     claim["claim_id"],
                     integrated,
                     data["verify"],
+                    source_commit,
                 )
             metrics.record_report(
                 directory,
@@ -4769,13 +4846,15 @@ attempt of the recorded budget, which is also only reported.
         remaining: str,
         evidence: str,
         key: str = "",
+        issue: str = "",
+        resume_on: str = "",
     ) -> None:
         """Records an explicitly reported outcome independently of activity.
 
         A lane that newly reaches the ready state also posts its account to
-        every issue it claims, so a reviewer reading the forge sees the same
-        summary and evidence the lane recorded. The comment is best effort and
-        is posted once per arrival at the state, not on every repeated report.
+        the exact issue reported, so a reviewer reading the forge sees the
+        same summary and evidence the lane recorded. The comment is best
+        effort and is posted once per arrival at the state.
 
         Args:
             repo: Assigned agent worktree.
@@ -4785,6 +4864,9 @@ attempt of the recorded budget, which is also only reported.
             evidence: Required verification evidence for ready reports.
             key: Idempotency key. A retried report carrying the key it first
                 used records no second attempt and posts no second comment.
+            issue: Exact owned issue, inferred only for a sole claim.
+            resume_on: Existing authorized issue whose completion resumes a
+                blocked report.
 
         Raises:
             BridgeError: If the lane or required report fields are invalid, or
@@ -4796,11 +4878,14 @@ attempt of the recorded budget, which is also only reported.
         data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
+        claim = exact_claim(directory, agent, issue)
         commit = git(lane, "rev-parse", "HEAD")
         if outcome in ("partial", "blocked") and not remaining.strip():
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
             raise BridgeError("Ready-for-review reports require --evidence.")
+        if resume_on and outcome != "blocked":
+            raise BridgeError("--resume-on is valid only for blocked reports.")
         for field, value in (("summary", summary), ("remaining", remaining)):
             if len(value.encode()) > metrics.MAX_REPORT_BYTES:
                 raise BridgeError(
@@ -4826,47 +4911,50 @@ attempt of the recorded budget, which is also only reported.
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,
+                "issue": claim["issue"],
+                "claim_id": claim["claim_id"],
+                "resume_on": resume_on,
             },
         )
-        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
-            path = directory / f"{agent}-activity.json"
-            state = json.loads(path.read_text()) if path.exists() else {}
-            if key and (recorded := state.get("retries", {}).get(scope)):
-                retries.replayed(recorded, "report", key, fingerprint)
-                return
-            arrived = outcome == "ready" and state.get("outcome") != "ready"
-            state.update(
-                outcome=outcome,
-                summary=summary,
-                remaining=remaining,
-                evidence=evidence,
-                reported_at=time.time(),
+        replayed = False
+        path = directory / f"{agent}-activity.json"
+        with lock(directory / f"{agent}-report.lock", timeout=1):
+            with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+                state = json.loads(path.read_text()) if path.exists() else {}
+                if key and (recorded := state.get("retries", {}).get(scope)):
+                    retries.replayed(recorded, "report", key, fingerprint)
+                    replayed = True
+            lifecycle.record_report(
+                directory,
+                agent,
+                outcome,
+                commit,
+                remaining,
+                str(claim["issue"]) if claim["issue"] is not None else "",
+                claim["claim_id"] or "",
+                resume_on,
             )
-            if key:
-                retries.remember(
-                    state,
-                    scope,
-                    fingerprint,
-                    retries.SERVED,
-                    {"state": outcome},
+            if replayed:
+                return
+            with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+                state = json.loads(path.read_text()) if path.exists() else {}
+                arrived = outcome == "ready" and state.get("outcome") != "ready"
+                state.update(
+                    outcome=outcome,
+                    summary=summary,
+                    remaining=remaining,
+                    evidence=evidence,
+                    reported_at=time.time(),
                 )
-            write_json(path, state)
-        lifecycle.record_report(
-            directory,
-            agent,
-            outcome,
-            commit,
-            remaining,
-        )
-        held = snapshot(directory)["issues"]
-        claimed = sorted(
-            (
-                number
-                for number, record in held.items()
-                if record["owner"] == agent
-            ),
-            key=int,
-        )
+                if key:
+                    retries.remember(
+                        state,
+                        scope,
+                        fingerprint,
+                        retries.SERVED,
+                        {"state": outcome},
+                    )
+                write_json(path, state)
         metrics.record_report(
             directory,
             agent,
@@ -4874,32 +4962,22 @@ attempt of the recorded budget, which is also only reported.
                 "id": identifier,
                 "kind": "report",
                 "state": outcome,
-                "issue": int(claimed[0]) if claimed else None,
-                "claim_id": (
-                    held[claimed[0]].get("claim_id") if claimed else None
-                ),
+                "issue": claim["issue"],
+                "claim_id": claim["claim_id"],
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,
                 "attachment": attached or None,
             },
         )
-        owned = sorted(
-            (
-                number
-                for number, record in snapshot(directory)["issues"].items()
-                if record["owner"] == agent
-            ),
-            key=int,
-        )
+        owned = [str(claim["issue"])] if claim["issue"] is not None else []
         if outcome == "blocked":
             change_attempt(directory, agent, owned)
         if arrived:
             body = report_comment(summary, evidence)
             forge.select(repo, data)
-            for issue, record in snapshot(directory)["issues"].items():
-                if record["owner"] == agent:
-                    forge.comment(repo, issue, body)
+            if claim["issue"] is not None:
+                forge.comment(repo, str(claim["issue"]), body)
 
     def say(
         self,
@@ -7796,6 +7874,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     report.add_argument("--remaining", default="")
     report.add_argument("--evidence", default="")
     report.add_argument(
+        "--issue",
+        default="",
+        metavar="NUMBER",
+        help="Bind this report to one exact owned issue.",
+    )
+    report.add_argument(
+        "--resume-on",
+        default="",
+        metavar="NUMBER",
+        help=(
+            "For a blocked report, resume automatically after this existing "
+            "authorized issue completes."
+        ),
+    )
+    report.add_argument(
         "--idempotency-key", default="", metavar="KEY", help=RETRY_HELP
     )
     steer = commands.add_parser(
@@ -8779,6 +8872,8 @@ def main() -> int:
                 args.remaining,
                 args.evidence,
                 key=args.idempotency_key,
+                issue=args.issue,
+                resume_on=args.resume_on,
             )
             print(f"Recorded outcome: {args.state}")
         elif args.command == "say" or (
