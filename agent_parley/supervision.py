@@ -1135,9 +1135,9 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     A lane holding no claim is offered the unclaimed work and told which peers
     hold more than one claim. A lane holding more than one claim is told which
-    fit peers have been idle past the stall interval. Both are advisory: the
-    ledger is not touched, nothing is claimed, and ``issue offer`` remains the
-    only path that moves work.
+    fit peers have been idle past the stall interval. Offers are advisory and
+    never claim work. Separately approved recovery may stop an exhausted
+    owner and preserve its work before a peer explicitly takes its claim.
 
     An offer carries a digest of its own content as its identifier, so a lane
     whose situation has not changed sees the same offer rather than a new one
@@ -1149,6 +1149,8 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         manifest: Current participant manifest.
         config: Resolved supervision settings.
     """
+    from agent_parley import recovery
+
     after = config["stalled_after"]
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
@@ -1160,6 +1162,28 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     record_stranded_claims(
         directory, stranded_claims(manifest, ledger, results)
     )
+    recovered = recovery.quiesce_authorized(directory, manifest)
+    if recovered:
+        ledger = issues.snapshot(directory)
+        for number, record in ledger["issues"].items():
+            marker = record.get("orphan")
+            if marker in recovered:
+                _announce_orphan(
+                    home,
+                    manifest,
+                    str(record["owner"]),
+                    [number],
+                    list(marker.get("reservations") or []),
+                )
+        owned = issues.holders(ledger)
+        available = lifecycle.actionable(ledger)
+        results = {
+            name: fit(home, directory, manifest, name, after)
+            for name in manifest["participants"]
+        }
+        record_stranded_claims(
+            directory, stranded_claims(manifest, ledger, results)
+        )
     stretches = {
         name: idle_seconds(directory, name)
         for name in sorted(manifest["participants"])

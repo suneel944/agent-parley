@@ -3,8 +3,10 @@
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -132,3 +134,87 @@ def test_closed_unmerged_pull_request_does_not_complete_or_unblock_work(
     assert ledger["issues"]["17"]["owner"] == "codex"
     assert ledger["issues"]["42"]["blocked_by"] == ["17"]
     assert issues.unclaimed(ledger) == []
+
+
+@pytest.mark.parametrize("live_exhaustion", [False, True])
+def test_poll_recovers_work_and_offers_it_to_an_eligible_peer(
+    bridge, repo, paired, monkeypatch, live_exhaustion
+):
+    directory, calls = prepare_loop(bridge, repo, paired, monkeypatch)
+    source = Path(paired["lanes"]["claude"])
+    target = Path(paired["lanes"]["codex"])
+    bridge.issue(source, "claim", "17")
+    source_head = commit_issue(source, "17")
+    (source / "staged.bin").write_bytes(b"\x00staged\xff")
+    git(source, "add", "staged.bin")
+    (source / "issue-17.txt").write_text("remaining verification\n")
+    (source / "untracked.bin").write_bytes(b"\x00untracked\xff")
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def reject_native_launch(*args, **kwargs):
+        pytest.fail("Orphan recovery must not resume the prior native owner")
+
+    monkeypatch.setattr(
+        supervision,
+        "subprocess",
+        types.SimpleNamespace(
+            **{**vars(subprocess), "Popen": reject_native_launch}
+        ),
+    )
+    try:
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "working",
+                "updated": time.time() - 1200,
+                "session_id": "recovery-integration",
+                "session_pid": child.pid,
+                "session_ticks": process.start_ticks(child.pid),
+            },
+        )
+        if live_exhaustion:
+            supervision.record_capacity(
+                directory,
+                "claude",
+                {
+                    "state": "exhausted",
+                    "observed_at": time.time(),
+                    "source": "simulated-provider-fixture",
+                    "session_id": "recovery-integration",
+                    "observation_id": "integration-exhaustion",
+                },
+            )
+            supervision.poll(bridge.home, directory)
+            assert child.poll() is None
+            assert supervision.published_stranded_claim(directory, "17")
+            bridge.authorize_recovery(repo, "17", "Exercise saved work")
+        else:
+            child.terminate()
+            child.wait(timeout=5)
+        calls.clear()
+        supervision.poll(bridge.home, directory)
+        child.wait(timeout=5)
+        assert issues.snapshot(directory)["issues"]["17"]["orphan"]
+        assert any(call[1] == "codex" for call in calls)
+        taken = bridge.issue(target, "claim", "17", take_orphaned=True)
+        assert taken["owner"] == "codex"
+        assert git(target, "rev-parse", "HEAD") == source_head
+        assert git(target, "diff", "--cached", "--name-only") == "staged.bin"
+        assert git(target, "diff", "--name-only") == "issue-17.txt"
+        assert git(target, "ls-files", "--others", "--exclude-standard") == (
+            "untracked.bin"
+        )
+        for name in ("staged.bin", "issue-17.txt", "untracked.bin"):
+            assert (target / name).read_bytes() == (source / name).read_bytes()
+        assert issues.snapshot(directory)["issues"]["42"]["blocked_by"] == [
+            "17"
+        ]
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
