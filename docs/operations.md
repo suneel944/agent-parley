@@ -23,8 +23,15 @@ its environment under `/opt/agent-parley`. Each user's runtime state remains
 private.
 
 Upgrading needs no action: the store upgrades in place on first use, keeping
-every message, claim and lease. Stop running sessions first, and do not point an
-older installation at an upgraded state directory afterwards.
+every message, claim and lease. Issue ledgers upgrade lazily: 0.11 derives
+lifecycle defaults for older records without an `execution` field and persists
+them when a lifecycle transition next writes the record. Stop running sessions
+before upgrading.
+
+After 0.11 records a verified completion or recovery, do not run 0.10 against
+that state directory. Version 0.10 does not understand those lifecycle and
+recovery records; in particular, it can read an ownerless completed issue as
+unclaimed and offer it again. Keep that state directory on 0.11 or newer.
 
 ## Platforms
 
