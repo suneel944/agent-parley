@@ -117,7 +117,9 @@ def codex_capacity_record(
     paired,
     rate_limits,
     progress=1,
+    request_tokens=None,
     timestamp="2026-09-19T12:00:00Z",
+    session="capacity",
 ):
     """Writes one structured Codex rate-limit observation."""
     lane = Path(paired["lanes"]["codex"])
@@ -130,7 +132,10 @@ def codex_capacity_record(
         / f"{today:%d}"
     )
     directory.mkdir(parents=True)
-    path = directory / "rollout-capacity.jsonl"
+    path = directory / f"rollout-{session}.jsonl"
+    info = {"total_token_usage": {"total_tokens": progress}}
+    if request_tokens is not None:
+        info["last_token_usage"] = {"total_tokens": request_tokens}
     path.write_text(
         json.dumps({"payload": {"cwd": str(lane)}})
         + "\n"
@@ -139,7 +144,7 @@ def codex_capacity_record(
                 "timestamp": timestamp,
                 "payload": {
                     "type": "token_count",
-                    "info": {"total_token_usage": {"total_tokens": progress}},
+                    "info": info,
                     "rate_limits": rate_limits,
                 },
             }
@@ -274,6 +279,77 @@ def test_codex_structured_limit_preserves_reliable_reset(bridge, repo, paired):
     assert observation["reset_at"] == reset_at
     assert observation["source"] == "codex-session-record"
     assert observation["session_id"] == "rollout-capacity"
+
+
+def test_first_real_codex_response_in_new_session_restores_capacity(
+    bridge, repo, paired
+):
+    directory = Path(paired["lanes"]["codex"]).parent
+    supervision.record_capacity(
+        directory,
+        "codex",
+        {
+            "state": "exhausted",
+            "observed_at": datetime.datetime.fromisoformat(
+                "2026-09-19T12:00:00+00:00"
+            ).timestamp(),
+            "source": "codex-session-record",
+            "session_id": "rollout-old",
+            "observation_id": "old-refusal",
+            "progress": 10,
+        },
+    )
+    codex_capacity_record(
+        paired,
+        {"primary": {"used_percent": 10}},
+        progress=10,
+        request_tokens=2,
+        timestamp="2026-09-19T12:01:00Z",
+        session="new",
+    )
+    observed = supervision.capacity(bridge.home, directory, paired, "codex")
+    assert observed["state"] == "available"
+    assert observed["session_id"] == "rollout-new"
+    assert observed["request_tokens"] == 2
+
+
+@pytest.mark.parametrize(
+    ("request_tokens", "timestamp"),
+    [
+        (None, "2026-09-19T12:01:00Z"),
+        (0, "2026-09-19T12:01:00Z"),
+        (2, "2026-09-19T11:59:00Z"),
+    ],
+)
+def test_new_codex_session_replay_does_not_restore_capacity(
+    bridge, repo, paired, request_tokens, timestamp
+):
+    directory = Path(paired["lanes"]["codex"]).parent
+    supervision.record_capacity(
+        directory,
+        "codex",
+        {
+            "state": "exhausted",
+            "observed_at": datetime.datetime.fromisoformat(
+                "2026-09-19T12:00:00+00:00"
+            ).timestamp(),
+            "source": "codex-session-record",
+            "session_id": "rollout-old",
+            "observation_id": "old-refusal",
+            "progress": 10,
+        },
+    )
+    codex_capacity_record(
+        paired,
+        {"primary": {"used_percent": 10}},
+        progress=10,
+        request_tokens=request_tokens,
+        timestamp=timestamp,
+        session="copied",
+    )
+    observed = supervision.capacity(bridge.home, directory, paired, "codex")
+    assert observed["state"] == "exhausted"
+    assert observed["session_id"] == "rollout-old"
 
 
 def test_replayed_codex_usage_does_not_clear_exhaustion(bridge, repo, paired):

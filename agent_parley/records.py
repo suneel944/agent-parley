@@ -284,10 +284,29 @@ def _codex_capacity(record: dict) -> dict | None:
     progress = usage.get("total_tokens") if isinstance(usage, dict) else None
     if not isinstance(progress, int) or isinstance(progress, bool):
         progress = None
+    request_usage = (
+        info.get("last_token_usage") if isinstance(info, dict) else None
+    )
+    request_tokens = (
+        request_usage.get("total_tokens")
+        if isinstance(request_usage, dict)
+        else None
+    )
+    if (
+        not isinstance(request_tokens, int)
+        or isinstance(request_tokens, bool)
+        or request_tokens <= 0
+    ):
+        request_tokens = None
     limits = payload.get("rate_limits")
     if not isinstance(limits, dict):
         return (
-            {"state": "available", "observed_at": at, "progress": progress}
+            {
+                "state": "available",
+                "observed_at": at,
+                "progress": progress,
+                "request_tokens": request_tokens,
+            }
             if progress is not None
             else None
         )
@@ -311,9 +330,15 @@ def _codex_capacity(record: dict) -> dict | None:
             "observed_at": at,
             "reset_at": _reset_at(limits, reached),
             "progress": progress,
+            "request_tokens": request_tokens,
         }
     return (
-        {"state": "available", "observed_at": at, "progress": progress}
+        {
+            "state": "available",
+            "observed_at": at,
+            "progress": progress,
+            "request_tokens": request_tokens,
+        }
         if progress is not None
         else None
     )

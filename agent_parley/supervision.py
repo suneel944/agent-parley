@@ -422,6 +422,7 @@ UNKNOWN_CAPACITY = {
     "participant": "",
     "progress": None,
     "progressed": False,
+    "request_tokens": None,
 }
 UNKNOWN_FIT: dict = {
     "fit": None,
@@ -521,7 +522,13 @@ def _native_recovery(current: dict, observation: dict) -> bool:
     if observation["source"] != "codex-session-record":
         return False
     if observation.get("session_id") != current.get("session_id"):
-        return bool(observation.get("progressed"))
+        request_tokens = observation.get("request_tokens")
+        return (
+            isinstance(request_tokens, int)
+            and not isinstance(request_tokens, bool)
+            and request_tokens > 0
+            and observation["observed_at"] > current["observed_at"]
+        )
     return (
         isinstance(marker, int)
         and isinstance(previous, int)
