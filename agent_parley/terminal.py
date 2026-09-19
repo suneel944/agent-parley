@@ -14,31 +14,114 @@ import time
 import tty
 from pathlib import Path
 
+from agent_parley.state import BridgeError, lock
+
 PROMPT = "Review pending coordination messages and handoff reminders."
 MAX_WORK_PROMPT = 2_000
 
 
-def selected_prompt(directory: Path, name: str) -> str:
+def _wake_flags(directory: Path, name: str, home: Path | None) -> dict:
+    """Reads lane and project wake gates under the setup lock."""
+    with lock(directory / "setup.lock", timeout=1):
+        manifest = json.loads((directory / "project.json").read_text())
+    participants = manifest.get("participants", {})
+    participant = participants.get(name) or {}
+    project_wake = (manifest.get("supervision") or {}).get("wake", True)
+    global_wake = True
+    if home is not None:
+        path = home / "supervision.json"
+        if path.exists():
+            global_wake = json.loads(path.read_text()).get("wake", True)
+    return {
+        "present": name in participants,
+        "enabled": bool(project_wake and global_wake),
+        "participant_wake": bool(participant.get("wake", True)),
+        "paused": bool(participant.get("paused", False)),
+    }
+
+
+def _work_bindings(ledger: dict, numbers: list[str]) -> list[dict]:
+    """Captures fields that must still match at prompt admission."""
+    bindings = []
+    for number in numbers:
+        issue = ledger.get("issues", {}).get(number, {})
+        bindings.append(
+            {
+                "issue": number,
+                "owner": issue.get("owner"),
+                "claim_id": issue.get("claim_id"),
+                "blocked_by": issue.get("blocked_by", []),
+                "offer": (issue.get("offer") or {}).get("id"),
+                "execution": issue.get("execution"),
+            }
+        )
+    return bindings
+
+
+def selected_prompt(
+    directory: Path, name: str, home: Path | None = None
+) -> str | None:
     """Adds current actionable work to a supervisor-requested turn.
 
     The launcher reads supervisor-owned state after admitting the wake. Work
     context does not cross the control socket, and a malformed or obsolete
-    publication falls back to the ordinary coordination prompt.
+    publication refuses delivery. A missing selection is the ordinary
+    coordination prompt used by launchers outside the supervisor wake path.
 
     Args:
         directory: Private project state directory.
         name: Participant owning the terminal socket.
+        home: Private bridge state root for the global wake gate.
 
     Returns:
-        Bounded prompt naming the current work offer, or the default prompt.
+        Bounded prompt naming current work, the default prompt, or None when
+        the selected lane or issue state changed before admission.
     """
     try:
         record = json.loads((directory / f"{name}-wake-work.json").read_text())
+    except FileNotFoundError:
+        return PROMPT
     except (OSError, ValueError):
-        return PROMPT
+        return None
+    if not isinstance(record, dict) or not isinstance(
+        record.get("flags"), dict
+    ):
+        return None
+    try:
+        flags = _wake_flags(directory, name, home)
+    except (BridgeError, OSError, ValueError):
+        return None
+    if flags != record["flags"] or (
+        not flags["present"]
+        or not flags["enabled"]
+        or not flags["participant_wake"]
+        or flags["paused"]
+    ):
+        return None
     offer = record.get("offer") if isinstance(record, dict) else None
+    if offer is None:
+        try:
+            return (
+                PROMPT if _wake_flags(directory, name, home) == flags else None
+            )
+        except (BridgeError, OSError, ValueError):
+            return None
     if not isinstance(offer, dict):
-        return PROMPT
+        return None
+    try:
+        with lock(directory / "issues.lock", timeout=1):
+            ledger = json.loads((directory / "issues.json").read_text())
+    except (BridgeError, OSError, ValueError):
+        return None
+    if _work_bindings(ledger, offer.get("issues", [])) != record.get(
+        "bindings"
+    ):
+        return None
+    try:
+        if _wake_flags(directory, name, home) != flags:
+            return None
+    except (BridgeError, OSError, ValueError):
+        return None
     identifier = str(offer.get("id", ""))
     detail = str(offer.get("text", ""))
     if not identifier or not detail:
@@ -176,6 +259,7 @@ def run(
     *,
     attached: bool = True,
     inactive_after: float = 300,
+    home: Path | None = None,
 ) -> int:
     """Runs the native CLI with its own controlling terminal and permissions.
 
@@ -191,6 +275,7 @@ def run(
         name: Validated participant name.
         attached: Whether to forward the operator's terminal input.
         inactive_after: Seconds without a new checkpoint before one retry.
+        home: Private bridge state root for admission-time wake validation.
 
     Returns:
         Native process exit status.
@@ -278,11 +363,17 @@ def run(
                             else:
                                 result = "manual attention required"
                             if accepted:
-                                prompt = selected_prompt(lane.parent, name)
-                                os.write(master, (prompt + "\r").encode())
-                                wake_checkpoint = checkpoint
-                                wake_checkpoint_at = time.monotonic()
-                                result = "accepted"
+                                prompt = selected_prompt(
+                                    lane.parent, name, home
+                                )
+                                if prompt is None:
+                                    accepted = False
+                                    result = "busy:stale"
+                                else:
+                                    os.write(master, (prompt + "\r").encode())
+                                    wake_checkpoint = checkpoint
+                                    wake_checkpoint_at = time.monotonic()
+                                    result = "accepted"
                             connection.sendall(result.encode())
         finally:
             if saved is not None:

@@ -7037,6 +7037,7 @@ attempt of the recorded budget, which is also only reported.
                             inactive_after=supervision.configuration(
                                 self.home, data
                             )["inactive_after"],
+                            home=self.home,
                         )
                     return subprocess.call(command, cwd=lane, env=env)
             finally:

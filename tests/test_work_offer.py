@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -831,6 +832,42 @@ def test_direct_wake_honors_lane_opt_out(bridge, repo, paired, monkeypatch):
     assert not (directory / "claude-wake.json").exists()
 
 
+def test_wake_rechecks_persisted_pause_before_request(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    stale_manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, stale_manifest)
+    supervision.work(bridge.home, directory, stale_manifest, config)
+    persisted = json.loads((directory / "project.json").read_text())
+    persisted["participants"]["claude"]["paused"] = True
+    write_json(directory / "project.json", persisted)
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda *args: pytest.fail("woke a newly paused lane"),
+    )
+
+    supervision.wake(
+        bridge.home,
+        directory,
+        stale_manifest,
+        "claude",
+        supervision.presence(directory, "claude", config["inactive_after"]),
+        config,
+    )
+
+    wake = json.loads((directory / "claude-wake.json").read_text())
+    assert wake["result"] == "busy:stale"
+    assert wake["attempts"] == 0
+
+
 def test_delivery_without_work_progress_retries_then_escalates(
     bridge, repo, paired, monkeypatch
 ):
@@ -925,11 +962,108 @@ def test_issue_progress_resets_a_rebalance_dispatch_generation(
     assert after["dispatch"]["attempts"] == 0
 
 
+def test_work_poll_cannot_erase_a_concurrent_dispatch_attempt(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude")
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    published = supervision.published_work(directory, "claude")
+    offer = published["offer"]
+    published["obsolete"] = True
+    write_json(directory / "claude-work.json", published)
+    paused = threading.Event()
+    release = threading.Event()
+    original_write = supervision.write_json
+
+    def delayed_write(path, value):
+        if (
+            path.name == "claude-work.json"
+            and threading.current_thread().name == "work-publisher"
+        ):
+            paused.set()
+            assert release.wait(2)
+        original_write(path, value)
+
+    monkeypatch.setattr(supervision, "write_json", delayed_write)
+    publisher = threading.Thread(
+        target=supervision.work,
+        args=(bridge.home, directory, manifest, config),
+        name="work-publisher",
+    )
+    publisher.start()
+    assert paused.wait(2)
+    dispatch_started = threading.Event()
+
+    def dispatch() -> None:
+        dispatch_started.set()
+        supervision._write_work_dispatch(
+            directory,
+            "claude",
+            offer,
+            1,
+            "accepted",
+            "awaiting_progress",
+        )
+
+    dispatcher = threading.Thread(
+        target=dispatch,
+    )
+    dispatcher.start()
+    assert dispatch_started.wait(2)
+    assert dispatcher.is_alive()
+    release.set()
+    publisher.join(2)
+    dispatcher.join(2)
+
+    assert not publisher.is_alive()
+    assert not dispatcher.is_alive()
+    final = supervision.published_work(directory, "claude")
+    assert final["dispatch"]["attempts"] == 1
+    assert final["dispatch"]["state"] == "awaiting_progress"
+
+
 def test_selected_wake_prompt_names_current_work_and_issues(tmp_path):
+    issue = {
+        "owner": None,
+        "claim_id": None,
+        "blocked_by": [],
+        "offer": None,
+        "execution": {"state": "queued"},
+    }
+    bindings = [
+        {
+            "issue": "42",
+            "owner": None,
+            "claim_id": None,
+            "blocked_by": [],
+            "offer": None,
+            "execution": {"state": "queued"},
+        }
+    ]
+    flags = {
+        "present": True,
+        "enabled": True,
+        "participant_wake": True,
+        "paused": False,
+    }
+    write_json(
+        tmp_path / "project.json",
+        {"participants": {"codex": {}}, "supervision": {}},
+    )
+    write_json(tmp_path / "issues.json", {"issues": {"42": issue}})
     write_json(
         tmp_path / "codex-wake-work.json",
         {
-            "fit": True,
+            "flags": flags,
+            "bindings": bindings,
             "offer": {
                 "id": "offer-123",
                 "issues": ["42"],
@@ -940,9 +1074,63 @@ def test_selected_wake_prompt_names_current_work_and_issues(tmp_path):
 
     prompt = terminal.selected_prompt(tmp_path, "codex")
 
+    assert prompt is not None
     assert "offer-123" in prompt
     assert "#42" in prompt
     assert "Claim one yourself" in prompt
+
+
+def test_selected_prompt_refuses_changed_owner_or_pause(tmp_path):
+    issue = {
+        "owner": "codex",
+        "claim_id": "claim-1",
+        "blocked_by": [],
+        "offer": None,
+        "execution": {"state": "running"},
+    }
+    offer = {
+        "id": "offer-123",
+        "issues": ["42"],
+        "text": "Continue authorized work.",
+        "progress": supervision._work_progress(
+            {"issues": {"42": issue}}, ["42"]
+        ),
+    }
+    write_json(
+        tmp_path / "project.json",
+        {"participants": {"codex": {}}, "supervision": {}},
+    )
+    write_json(tmp_path / "issues.json", {"issues": {"42": issue}})
+    write_json(
+        tmp_path / "codex-wake-work.json",
+        {
+            "offer": offer,
+            "bindings": supervision._work_bindings(
+                {"issues": {"42": issue}}, ["42"]
+            ),
+            "flags": {
+                "present": True,
+                "enabled": True,
+                "participant_wake": True,
+                "paused": False,
+            },
+        },
+    )
+
+    issue["owner"] = "claude"
+    write_json(tmp_path / "issues.json", {"issues": {"42": issue}})
+    assert terminal.selected_prompt(tmp_path, "codex", tmp_path) is None
+
+    issue["owner"] = "codex"
+    write_json(tmp_path / "issues.json", {"issues": {"42": issue}})
+    write_json(
+        tmp_path / "project.json",
+        {
+            "participants": {"codex": {"paused": True}},
+            "supervision": {},
+        },
+    )
+    assert terminal.selected_prompt(tmp_path, "codex", tmp_path) is None
 
 
 def test_top_reports_the_fit_result_and_a_pending_offer(bridge, repo, paired):

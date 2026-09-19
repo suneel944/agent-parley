@@ -987,16 +987,8 @@ def _continue_text(ledger: dict, numbers: list[str]) -> str:
     )
 
 
-def _work_progress(ledger: dict, numbers: list[str]) -> str:
-    """Fingerprints issue-scoped changes that count as offer progress.
-
-    Args:
-        ledger: Current issue ledger.
-        numbers: Issues selected for this work offer.
-
-    Returns:
-        Stable digest of ownership, dependencies, handoffs and execution state.
-    """
+def _work_bindings(ledger: dict, numbers: list[str]) -> list[dict]:
+    """Captures the issue state that makes a selected offer actionable."""
     selected = []
     for number in numbers:
         record = ledger["issues"].get(number, {})
@@ -1010,7 +1002,24 @@ def _work_progress(ledger: dict, numbers: list[str]) -> str:
                 "execution": record.get("execution"),
             }
         )
-    encoded = json.dumps(selected, sort_keys=True, separators=(",", ":"))
+    return selected
+
+
+def _work_progress(ledger: dict, numbers: list[str]) -> str:
+    """Fingerprints issue-scoped changes that count as offer progress.
+
+    Args:
+        ledger: Current issue ledger.
+        numbers: Issues selected for this work offer.
+
+    Returns:
+        Stable digest of ownership, dependencies, handoffs and execution state.
+    """
+    encoded = json.dumps(
+        _work_bindings(ledger, numbers),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(encoded.encode()).hexdigest()[:16]
 
 
@@ -1157,16 +1166,17 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     }
     for name in manifest["participants"]:
         result = results[name]
-        previous = published_work(directory, name)
         offer = _work_offer(
             name, results, stretches, owned, available, ledger, after
         )
-        published = {**result, "offer": offer}
-        if offer:
-            published["dispatch"] = _work_dispatch(previous, offer)
-        path = directory / f"{name}-work.json"
-        if published != previous:
-            write_json(path, published)
+        with lock(directory / f"{name}-work.lock", timeout=1):
+            previous = published_work(directory, name)
+            published = {**result, "offer": offer}
+            if offer:
+                published["dispatch"] = _work_dispatch(previous, offer)
+            path = directory / f"{name}-work.json"
+            if published != previous:
+                write_json(path, published)
     idle = [
         name
         for name in sorted(manifest["participants"])
@@ -1872,30 +1882,76 @@ def _write_work_dispatch(
         state: Pending outcome state.
     """
     path = directory / f"{name}-work.json"
-    current = published_work(directory, name)
-    published = current.get("offer") or {}
-    if published.get("id") != offer.get("id") or published.get(
-        "progress"
-    ) != offer.get("progress"):
-        return
-    dispatch = dict(current.get("dispatch") or {})
-    dispatch.update(
-        state=state,
-        attempts=attempts,
-        last_result=result,
-        updated_at=time.time(),
-    )
-    current["dispatch"] = dispatch
-    write_json(path, current)
+    with lock(directory / f"{name}-work.lock", timeout=1):
+        current = published_work(directory, name)
+        published = current.get("offer") or {}
+        if published.get("id") != offer.get("id") or published.get(
+            "progress"
+        ) != offer.get("progress"):
+            return
+        dispatch = dict(current.get("dispatch") or {})
+        dispatch.update(
+            state=state,
+            attempts=attempts,
+            last_result=result,
+            updated_at=time.time(),
+        )
+        current["dispatch"] = dispatch
+        write_json(path, current)
 
 
-def _select_work_prompt(directory: Path, name: str, offer: dict | None) -> None:
-    """Publishes only the offer revalidated for the imminent native turn."""
+def _wake_flags(home: Path, directory: Path, name: str) -> dict:
+    """Reads the persisted wake gates used to fence prompt admission."""
+    with lock(directory / "setup.lock"):
+        manifest = roster.read(directory)
+        participants = manifest.get("participants", {})
+        participant = participants.get(name) or {}
+        config = configuration(home, manifest)
+        return {
+            "present": name in participants,
+            "enabled": bool(config["wake"]),
+            "participant_wake": bool(participant.get("wake", True)),
+            "paused": bool(participant.get("paused", False)),
+        }
+
+
+def _select_work_prompt(
+    home: Path, directory: Path, name: str, offer: dict | None
+) -> bool:
+    """Publishes a prompt fenced to current lane and issue state."""
     path = directory / f"{name}-wake-work.json"
-    if offer:
-        write_json(path, {"offer": offer, "selected_at": time.time()})
-    else:
+    flags = _wake_flags(home, directory, name)
+    if (
+        not flags["present"]
+        or not flags["enabled"]
+        or not flags["participant_wake"]
+        or flags["paused"]
+    ):
         path.unlink(missing_ok=True)
+        return False
+    bindings = []
+    if offer:
+        with lock(directory / "issues.lock", timeout=1):
+            ledger = issues.snapshot(directory)
+            bindings = _work_bindings(ledger, offer.get("issues", []))
+            if _work_progress(ledger, offer.get("issues", [])) != offer.get(
+                "progress"
+            ):
+                path.unlink(missing_ok=True)
+                return False
+    if _wake_flags(home, directory, name) != flags:
+        path.unlink(missing_ok=True)
+        return False
+    write_json(
+        path,
+        {
+            "offer": offer,
+            "bindings": bindings,
+            "flags": flags,
+            "selected_at": time.time(),
+        },
+    )
+    return True
 
 
 def wake(
@@ -2014,9 +2070,11 @@ def wake(
             return
         if time.time() - throttle_at < config["inactive_after"]:
             return
-        _select_work_prompt(directory, name, work_offer)
         result = "manual attention required"
-        if observed["process_alive"]:
+        selected = _select_work_prompt(home, directory, name, work_offer)
+        if not selected:
+            result = "busy:stale"
+        elif observed["process_alive"]:
             result = terminal.request(directory, name)
         elif (
             observed["process_alive"] is False
@@ -2026,29 +2084,33 @@ def wake(
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"
             ):
-                with (directory / f"{name}-wake.log").open("ab") as output:
-                    child = subprocess.Popen(
-                        [
-                            sys.executable,
-                            "-m",
-                            "agent_parley.cli",
-                            "--home",
-                            str(home),
-                            "run",
-                            name,
-                            "--repo",
-                            manifest["root"],
-                            "--resume",
-                            "--task",
-                            terminal.selected_prompt(directory, name),
-                        ],
-                        stdin=subprocess.DEVNULL,
-                        stdout=output,
-                        stderr=output,
-                        start_new_session=True,
-                    )
-                track_launcher(child)
-                result = f"resume requested (launcher {child.pid})"
+                prompt = terminal.selected_prompt(directory, name, home)
+                if prompt is None:
+                    result = "busy:stale"
+                else:
+                    with (directory / f"{name}-wake.log").open("ab") as output:
+                        child = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-m",
+                                "agent_parley.cli",
+                                "--home",
+                                str(home),
+                                "run",
+                                name,
+                                "--repo",
+                                manifest["root"],
+                                "--resume",
+                                "--task",
+                                prompt,
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=output,
+                            stderr=output,
+                            start_new_session=True,
+                        )
+                    track_launcher(child)
+                    result = f"resume requested (launcher {child.pid})"
         counted = attempts + (not result.startswith("busy"))
         write_json(
             wake_path,

@@ -218,3 +218,42 @@ def test_latched_checkpoint_admits_one_retry_then_requires_attention():
             if child.poll() is None:
                 child.kill()
             child.communicate(timeout=10)
+
+
+def test_stale_selected_work_is_refused_without_terminal_injection():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        write_json(directory / "lane-wake-work.json", {})
+        script = (
+            "import sys\nprint('READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('RECEIVED:' + line.rstrip(), flush=True)\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False))"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", harness, str(lane), script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert b"READY" in child.stdout.readline()
+            assert terminal.request(directory, "lane") == "busy:stale"
+            assert child.poll() is None
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
