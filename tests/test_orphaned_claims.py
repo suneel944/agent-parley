@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -818,7 +819,7 @@ def test_a_live_but_idle_lane_is_never_orphaned(bridge, repo, paired):
 
 
 def test_a_lane_gone_for_less_than_the_threshold_is_never_orphaned(
-    bridge, repo, paired
+    bridge, repo, paired, monkeypatch
 ):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])
@@ -826,6 +827,21 @@ def test_a_lane_gone_for_less_than_the_threshold_is_never_orphaned(
     bridge.issue(lane, "claim", "42")
     killed(directory, "claude", STALLED - 60)
     running(directory, "codex")
+    manifest = roster.read(directory)
+    manifest["supervision"] = {"wake": False}
+    write_json(directory / "project.json", manifest)
+    monkeypatch.setattr(
+        supervision,
+        "subprocess",
+        types.SimpleNamespace(
+            **{
+                **vars(subprocess),
+                "Popen": lambda *args, **kwargs: pytest.fail(
+                    "started a native launcher"
+                ),
+            }
+        ),
+    )
 
     supervision.poll(bridge.home, directory)
 

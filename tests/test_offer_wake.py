@@ -3,6 +3,7 @@
 import json
 import os
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,18 @@ from agent_parley.state import write_json
 @pytest.fixture
 def offered(bridge, paired, monkeypatch):
     """Offers a claimed issue to an idle Codex lane holding no mail."""
+    monkeypatch.setattr(
+        supervision,
+        "subprocess",
+        types.SimpleNamespace(
+            **{
+                **vars(supervision.subprocess),
+                "Popen": lambda *args, **kwargs: pytest.fail(
+                    "started a native launcher"
+                ),
+            }
+        ),
+    )
     store.initialize(bridge.home)
     for name in ("claude", "codex"):
         store.register(bridge.home, paired["root"], name)
@@ -75,18 +88,25 @@ def test_a_cancelled_offer_stops_waking_the_recipient(
     assert woken(offered) is None
 
 
-def test_an_accepted_offer_stops_waking_the_recipient(
+def test_an_accepted_offer_wakes_the_recipient_for_owned_work(
     bridge, paired, offered, monkeypatch
 ):
     peer = Path(paired["lanes"]["codex"])
     record = issues.snapshot(offered)["issues"]["1"]
-    bridge.issue(peer, "accept", "1", offer_id=record["offer"]["id"])
-    monkeypatch.setattr(
-        terminal, "request", lambda *args: pytest.fail("woke after accept")
-    )
+    accepted_offer = record["offer"]["id"]
+    bridge.issue(peer, "accept", "1", offer_id=accepted_offer)
+    captured = requests(monkeypatch)
+
     supervision.poll(bridge.home, offered)
-    assert woken(offered) is None
+
+    assert captured == ["codex"]
+    wake = woken(offered)
+    assert accepted_offer not in wake["backlog"]
+    assert wake["backlog"][0].startswith("work:")
     assert issues.snapshot(offered)["issues"]["1"]["owner"] == "codex"
+    assert supervision.published_work(offered, "codex")["offer"]["kind"] == (
+        "continue"
+    )
 
 
 def test_a_repeated_poll_does_not_wake_the_recipient_again(
@@ -117,7 +137,12 @@ def test_a_lane_waiting_for_approval_is_never_woken_by_an_offer(
 ):
     write_json(
         offered / "codex-activity.json",
-        {"activity": "waiting for approval", "updated": time.time() - 500},
+        {
+            "activity": "waiting for approval",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
     )
     monkeypatch.setattr(
         terminal, "request", lambda *args: pytest.fail("woke an approval")
