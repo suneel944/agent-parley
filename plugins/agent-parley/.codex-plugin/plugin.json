@@ -21,9 +21,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Claude and Codex both edit this repo. Before I touch agent_parley/store.py, tell me who holds it and what they claimed.",
-      "A lane reports issue 42 finished and I do not trust it. Show the evidence it recorded and whether any peer reviewed it.",
-      "My lane has waited an hour on a handoff. Find which peer holds it, what blocks it, and whether that lane is still alive."
+      "Codex and I are both free here. Split the open v2.1 issues, claim my half, and tell Codex which ones are its to start.",
+      "Codex stalled on issue 42 and my lane is free. Take the handoff with its commit and checks, then finish the work here.",
+      "Codex reports issue 42 ready. Check its commit and evidence from my lane, then land it or hand it back with what to fix."
     ]
   }
 }
