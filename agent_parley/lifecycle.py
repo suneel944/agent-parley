@@ -155,8 +155,16 @@ def released(record: dict) -> dict:
 
     Returns:
         The execution mapping stored on the record.
+
+    Raises:
+        BridgeError: If ready work still awaits verified integration.
     """
     execution = state(record)
+    if execution["state"] == READY:
+        raise BridgeError(
+            "Ready work must remain claimed until verified integration "
+            "completes."
+        )
     if execution["state"] != COMPLETE:
         execution.update(
             state=QUEUED,

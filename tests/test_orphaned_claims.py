@@ -13,6 +13,7 @@ import pytest
 
 from agent_parley import (
     checkpoints,
+    cli,
     dashboard,
     issues,
     lifecycle,
@@ -152,6 +153,65 @@ def test_a_killed_lane_is_orphaned_announced_and_taken_by_a_peer(
     assert store.active_reservations(bridge.home, paired["root"]) == {
         actors["codex"]["name"]: ["src/app.py"]
     }
+
+
+def test_a_native_exit_retains_the_generation_needed_for_recovery(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    activity_path = directory / "claude-activity.json"
+    bridge.issue(lane, "claim", "42")
+    child_identity = {}
+
+    def exit_native(*args, **kwargs):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        ticks = process.start_ticks(child.pid)
+        child.kill()
+        child.wait()
+        child_identity.update(pid=child.pid, ticks=ticks)
+        state = json.loads(activity_path.read_text())
+        state.update(
+            activity="working",
+            session_id="native-session",
+            session_pid=child.pid,
+            session_ticks=ticks,
+        )
+        write_json(activity_path, state)
+        return 0
+
+    async def identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    monkeypatch.setattr(bridge, "identity", identity)
+    monkeypatch.setattr(cli.shutil, "which", lambda command: sys.executable)
+    monkeypatch.setattr(cli.subprocess, "call", exit_native)
+    monkeypatch.setattr(
+        cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: False)
+    )
+
+    assert bridge.launch("claude", repo, "Continue recovery work") == 0
+    activity = checkpoints.activity(directory, "claude")
+    assert activity["activity"] == "stopped"
+    assert activity["session_pid"] == child_identity["pid"]
+    assert activity["session_ticks"] == child_identity["ticks"]
+
+    activity["updated"] = time.time() - STALLED - 100
+    write_json(activity_path, activity)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+
+    taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
+    assert taken["owner"] == "codex"
+    assert taken["taken"]["from"] == "claude"
 
 
 def test_takeover_restores_committed_staged_unstaged_and_untracked_work(

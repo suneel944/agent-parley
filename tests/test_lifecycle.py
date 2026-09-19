@@ -119,6 +119,32 @@ def test_release_requeues_partial_work_but_never_recycles_completion(tmp_path):
         claim(tmp_path, "8")
 
 
+def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
+    current = claim(tmp_path, "9")
+    lifecycle.record_report(
+        tmp_path,
+        "codex",
+        "ready",
+        "e" * 40,
+        "",
+    )
+
+    with pytest.raises(BridgeError, match="must remain claimed"):
+        issues.change(
+            tmp_path,
+            "codex",
+            "release",
+            "9",
+            participants={"codex"},
+        )
+
+    record = issues.snapshot(tmp_path)["issues"]["9"]
+    assert record["owner"] == "codex"
+    assert record["claim_id"] == current["claim_id"]
+    assert record["execution"]["state"] == lifecycle.READY
+    assert record["execution"]["commit"] == "e" * 40
+
+
 def test_old_generation_and_closed_pull_request_cannot_complete_new_claim(
     tmp_path,
 ):

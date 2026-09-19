@@ -1,6 +1,10 @@
 """Checks launcher-owned delivery for a lane whose CLI raises no hooks."""
 
 import asyncio
+import os
+import shlex
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -111,8 +115,41 @@ def test_provider_inspection_names_the_delivery_path(bridge, polled):
     )
     prompt = bridge.protocol("helper", polled)
     directory = Path(polled["lanes"]["helper"]).parent
+    assert f"Canonical project identifier: {polled['root']}" in prompt
+    assert "canonical project identifier is an identity" in prompt
     assert str(delivery.mail_file(directory, "helper")) in prompt
     assert "Reading it is\nnot acknowledgement" in prompt
+    command = shlex.join([sys.executable, "-m", "agent_parley.cli"])
+    assert f"`{command} issue claim NUMBER`" in prompt
+    assert f"`{command} issue release NUMBER`" in prompt
+    assert "`agent-parley issue" not in prompt
+    assert "`issue " not in prompt
+
+
+def test_protocol_cli_ignores_a_conflicting_path_copy(bridge, polled, tmp_path):
+    marker = tmp_path / "wrong-cli-ran"
+    conflicting = tmp_path / "agent-parley"
+    conflicting.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
+    conflicting.chmod(0o700)
+    prompt = bridge.protocol("helper", polled)
+    command = prompt.split("through `", 1)[1].split("`", 1)[0]
+    environment = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ.get("PATH", ""),
+    }
+
+    result = subprocess.run(
+        ["/bin/bash", "-c", f"{command} --version"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip()
+    assert not marker.exists()
 
 
 def test_a_paused_lane_keeps_its_mail_undelivered(bridge, repo, polled):
