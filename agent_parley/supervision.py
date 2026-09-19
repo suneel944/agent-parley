@@ -1129,6 +1129,9 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         name: fit(home, directory, manifest, name, after)
         for name in manifest["participants"]
     }
+    record_stranded_claims(
+        directory, stranded_claims(manifest, ledger, results)
+    )
     stretches = {
         name: idle_seconds(directory, name)
         for name in sorted(manifest["participants"])
