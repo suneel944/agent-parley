@@ -32,7 +32,7 @@ def stopped(directory, name):
     """Records a lane whose session process is gone."""
     write_json(
         directory / f"{name}-activity.json",
-        {"activity": "idle", "updated": 0},
+        {"activity": "stopped", "updated": 0},
     )
 
 

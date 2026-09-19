@@ -51,7 +51,7 @@ def lane(bridge, repo, monkeypatch, tmp_path, account):
     monkeypatch.setattr(
         cli.terminal,
         "run",
-        lambda command, lane, env, agent, attached: subprocess.call(
+        lambda command, lane, env, agent, **_: subprocess.call(
             command, cwd=lane, env=env
         ),
     )
