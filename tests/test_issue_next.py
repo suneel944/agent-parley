@@ -19,9 +19,25 @@ LEDGER = {
     "revision": 9,
     "issues": {
         "42": {"owner": "claude", "offer": None, "blocked_by": []},
-        "43": {"owner": None, "offer": None, "blocked_by": []},
-        "44": {"owner": None, "offer": None, "blocked_by": [], "title": "Docs"},
-        "46": {"owner": None, "offer": None, "blocked_by": []},
+        "43": {
+            "owner": None,
+            "offer": None,
+            "blocked_by": [],
+            "execution": {"authorized": True},
+        },
+        "44": {
+            "owner": None,
+            "offer": None,
+            "blocked_by": [],
+            "title": "Docs",
+            "execution": {"authorized": True},
+        },
+        "46": {
+            "owner": None,
+            "offer": None,
+            "blocked_by": [],
+            "execution": {"authorized": True},
+        },
         "47": {"owner": "claude", "offer": None, "blocked_by": ["46"]},
     },
 }
