@@ -1503,6 +1503,15 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
             for number, record in ledger["issues"].items():
                 if record.get("owner") != name:
                     continue
+                current = record.get("orphan") or {}
+                if (
+                    current.get("owner") == name
+                    and current.get("claim_id") == record.get("claim_id")
+                    and current.get("authorization")
+                    and current.get("checkpoint")
+                ):
+                    marked.append(number)
+                    continue
                 identifier = (
                     f"{name}:{record.get('claim_id') or number}:"
                     f"{int(observed['last_active'] or 0)}"

@@ -157,6 +157,48 @@ def _tree(lane: Path, revision: str) -> str:
     return _text(lane, "rev-parse", f"{revision}^{{tree}}")
 
 
+def _paths(output: bytes) -> set[str]:
+    """Decodes a NUL-delimited Git path list without losing byte values."""
+    return {os.fsdecode(value) for value in output.split(b"\0") if value}
+
+
+def _refuse_untracked_collisions(
+    lane: Path,
+    destination_head: str,
+    worktree_commit: str,
+) -> None:
+    """Refuses ignored destination content touched by recovered paths."""
+    tracked = _paths(_git(lane, "ls-files", "-z"))
+    affected = _paths(
+        _git(
+            lane,
+            "diff",
+            "--name-only",
+            "-z",
+            destination_head,
+            worktree_commit,
+        )
+    )
+    root = lane.resolve()
+    for name in affected:
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise BridgeError("Recovery checkpoint contains an unsafe path.")
+        target = root / relative
+        if name not in tracked and (target.exists() or target.is_symlink()):
+            raise BridgeError(
+                f"Recovery destination has untracked content at {name}; "
+                "preserve it before resuming this checkpoint."
+            )
+        parent = target.parent
+        while parent != root:
+            if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                raise BridgeError(
+                    f"Recovery destination has an unsafe parent for {name}."
+                )
+            parent = parent.parent
+
+
 def _require_dead(activity: dict, issue: str, owner: str) -> None:
     """Requires one recorded process generation to be known and stopped."""
     session_id = activity.get("session_id")
@@ -293,12 +335,18 @@ def capture(
     for number, record in owned:
         claim_id = str(record["claim_id"])
         identifier = _identifier(number, claim_id)
+        record_path = folder / f"{identifier}.json"
+        try:
+            previous = json.loads(record_path.read_text())
+        except (OSError, ValueError):
+            previous = {}
         bundle = folder / f"{identifier}.bundle"
         size, digest = _publish_bundle(
             lane, bundle, identifier, worktree_commit
         )
         handoff = record.get("handoff") or {}
         offer = record.get("offer") or {}
+        same_content = previous.get("worktree_commit") == worktree_commit
         checkpoint = {
             "id": identifier,
             "issue": number,
@@ -310,8 +358,16 @@ def capture(
             "index_commit": index_commit,
             "worktree_commit": worktree_commit,
             "captured_at": time.time(),
-            "last_verified_step": step,
-            "gate": gate,
+            "last_verified_step": (
+                step
+                if payload is not None
+                else str(previous.get("last_verified_step") or "")
+            ),
+            "gate": (
+                gate
+                if gate or not same_content
+                else dict(previous.get("gate") or {})
+            ),
             "remaining": list(
                 handoff.get("remaining") or offer.get("remaining") or []
             ),
@@ -323,7 +379,7 @@ def capture(
                 "sha256": digest,
             },
         }
-        write_json(folder / f"{identifier}.json", checkpoint)
+        write_json(record_path, checkpoint)
         published.append(checkpoint)
     return published
 
@@ -420,8 +476,45 @@ def approval(directory: Path, issue: str, claim_id: str) -> dict | None:
     return value
 
 
+def _consume_approval(
+    directory: Path,
+    issue: str,
+    claim_id: str,
+    authorization_id: str,
+) -> None:
+    """Durably consumes the exact approval behind a completed transition."""
+    path = _folder(directory) / f"{_identifier(issue, claim_id)}-approval.json"
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise BridgeError(
+            "Completed live recovery has no matching operator approval."
+        ) from None
+    if value.get("id") != authorization_id:
+        raise BridgeError(
+            "Completed live recovery names a different operator approval."
+        )
+    if not value.get("used_at"):
+        value["used_at"] = time.time()
+        write_json(path, value)
+
+
 def _capacity_candidate(directory: Path, issue: str) -> dict:
     """Returns the authoritative published capacity candidate for an issue."""
+    transitions = []
+    for path in _folder(directory).glob(f"issue-{issue}-*-quiesce.json"):
+        try:
+            transition = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if transition.get("phase") != "complete" and isinstance(
+            transition.get("candidate"), dict
+        ):
+            transitions.append(transition["candidate"])
+    if len(transitions) == 1:
+        return transitions[0]
+    if len(transitions) > 1:
+        raise BridgeError("Live recovery has conflicting durable transitions.")
     try:
         document = json.loads(
             (directory / "capacity-candidates.json").read_text()
@@ -501,7 +594,7 @@ def commit_takeover(
     issue: str,
     record: dict,
     orphan: dict,
-) -> None:
+) -> dict:
     """Fences a revalidated dead generation inside issue serialization.
 
     Args:
@@ -511,6 +604,10 @@ def commit_takeover(
         issue: Bare issue number being transferred.
         record: Current issue record under the issue ledger lock.
         orphan: Current orphan marker under the same lock.
+
+    Returns:
+        Prepared fence identity. The issue ledger history makes the fence
+        effective when it publishes the matching takeover.
 
     Raises:
         BridgeError: If process identity returned or evidence changed.
@@ -529,7 +626,13 @@ def commit_takeover(
         except (OSError, ValueError):
             activity = {}
         _require_dead(activity, issue, owner)
-        activity["ownership_fence"] = {
+        fence = {
+            "id": hashlib.sha256(
+                (
+                    f"{issue}\0{record['claim_id']}\0"
+                    f"{orphan.get('id', '')}\0{agent}"
+                ).encode()
+            ).hexdigest(),
             "issue": issue,
             "claim_id": record["claim_id"],
             "session_id": activity.get("session_id", ""),
@@ -537,7 +640,9 @@ def commit_takeover(
             "taken_by": agent,
             "created": time.time(),
         }
+        activity["ownership_fence"] = fence
         write_json(activity_path, activity)
+    return fence
 
 
 def quiesce_exhausted(
@@ -599,6 +704,41 @@ def quiesce_exhausted(
                 "Live recovery requires operator approval for this claim "
                 "session."
             )
+        transition_path = (
+            _folder(directory) / f"{_identifier(issue, claim_id)}-quiesce.json"
+        )
+        expected_transition = {
+            "issue": issue,
+            "claim_id": claim_id,
+            "owner": owner,
+            "session_id": candidate["session_id"],
+            "session_pid": authorization["session_pid"],
+            "session_ticks": authorization["session_ticks"],
+            "authorization_id": authorization["id"],
+            "observation_id": candidate["observation_id"],
+        }
+        if transition_path.exists():
+            try:
+                transition = json.loads(transition_path.read_text())
+            except (OSError, ValueError):
+                raise BridgeError(
+                    "Durable live recovery transition is invalid."
+                ) from None
+            if any(
+                transition.get(key) != value
+                for key, value in expected_transition.items()
+            ):
+                raise BridgeError(
+                    "Durable live recovery transition names stale evidence."
+                )
+        else:
+            transition = {
+                **expected_transition,
+                "phase": "authorized",
+                "candidate": dict(candidate),
+                "created": time.time(),
+            }
+            write_json(transition_path, transition)
         with lock(directory / f"{owner}-checkpoint.lock", timeout=1):
             try:
                 activity = json.loads(activity_path.read_text())
@@ -625,11 +765,20 @@ def quiesce_exhausted(
                 raise BridgeError(
                     "Operator approval names a stale process generation."
                 )
-            if not process.alive(pid, ticks):
-                raise BridgeError("Capacity owner process is no longer live.")
-            process.ServerProcess(int(pid), str(ticks)).stop()
+            alive = process.alive(pid, ticks)
+            if not alive and transition.get("phase") not in (
+                "authorized",
+                "stopped",
+                "captured",
+            ):
+                raise BridgeError("Capacity recovery process evidence changed.")
+            if alive:
+                process.ServerProcess(int(pid), str(ticks)).stop()
             if process.alive(pid, ticks):
                 raise BridgeError("Capacity owner process did not stop.")
+            transition["phase"] = "stopped"
+            transition["stopped_at"] = time.time()
+            write_json(transition_path, transition)
             activity["activity"] = "stopped for recovery"
             activity["quiesced"] = {
                 "issue": issue,
@@ -638,12 +787,20 @@ def quiesce_exhausted(
                 "stopped_at": time.time(),
             }
             write_json(activity_path, activity)
-            capture(directory, manifest, owner)
+            saved = next(
+                value
+                for value in capture(directory, manifest, owner)
+                if value["issue"] == issue
+            )
+            transition["phase"] = "captured"
+            transition["checkpoint"] = saved["id"]
+            write_json(transition_path, transition)
         marker: dict = {
             "id": (
                 f"capacity:{claim_id}:{str(candidate['observation_id'])[:64]}"
             ),
             "owner": owner,
+            "claim_id": claim_id,
             "reason": str(candidate.get("reason") or "capacity exhausted")[
                 :2000
             ],
@@ -653,6 +810,7 @@ def quiesce_exhausted(
             "session_id": str(candidate["session_id"]),
             "reset_at": candidate.get("reset_at"),
             "source": str(candidate["source"]),
+            "checkpoint": saved["id"],
             "authorization": {
                 "id": authorization["id"],
                 "actor": authorization["authorized_by"],
@@ -663,11 +821,14 @@ def quiesce_exhausted(
         current["orphan"] = marker
         ledger["revision"] += 1
         write_json(directory / "issues.json", ledger)
-        authorization["used_at"] = time.time()
-        write_json(
-            _folder(directory)
-            / f"{_identifier(issue, claim_id)}-approval.json",
-            authorization,
+        transition["phase"] = "complete"
+        transition["completed_at"] = time.time()
+        write_json(transition_path, transition)
+        _consume_approval(
+            directory,
+            issue,
+            claim_id,
+            str(authorization["id"]),
         )
     return marker
 
@@ -687,18 +848,56 @@ def quiesce_authorized(directory: Path, manifest: dict) -> list[dict]:
             (directory / "capacity-candidates.json").read_text()
         )
     except (OSError, ValueError):
-        return []
+        document = {"version": 1, "candidates": []}
     if document.get("version") != 1:
         return []
+    from agent_parley import issues
+
     markers = []
-    for candidate in document.get("candidates") or []:
+    candidates = list(document.get("candidates") or [])
+    completed = []
+    for path in _folder(directory).glob("issue-*-quiesce.json"):
+        try:
+            transition = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        candidate = transition.get("candidate")
+        if transition.get("phase") == "complete":
+            completed.append(transition)
+        elif isinstance(candidate, dict):
+            candidates.append(candidate)
+    seen = set()
+    for transition in completed:
+        issue = str(transition.get("issue") or "")
+        record = issues.snapshot(directory)["issues"].get(issue) or {}
+        marker = record.get("orphan") or {}
+        candidate = transition.get("candidate") or {}
+        identity = (issue, str(candidate.get("observation_id") or ""))
+        if (
+            record.get("owner") == transition.get("owner")
+            and record.get("claim_id") == transition.get("claim_id")
+            and marker.get("authorization", {}).get("id")
+            == transition.get("authorization_id")
+            and marker.get("checkpoint") == transition.get("checkpoint")
+        ):
+            _consume_approval(
+                directory,
+                issue,
+                str(transition.get("claim_id") or ""),
+                str(transition.get("authorization_id") or ""),
+            )
+            markers.append(marker)
+            seen.add(identity)
+    for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
         issue = str(candidate.get("issue") or "")
+        identity = (issue, str(candidate.get("observation_id") or ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
         if not re.fullmatch(r"[1-9][0-9]{0,17}", issue):
             continue
-        from agent_parley import issues
-
         record = issues.snapshot(directory)["issues"].get(issue) or {}
         claim_id = str(record.get("claim_id") or "")
         allowed = approval(directory, issue, claim_id) if claim_id else None
@@ -722,6 +921,18 @@ def stale_session(directory: Path, agent: str, payload: dict) -> dict | None:
     fence = activity.get("ownership_fence") or {}
     session = str(payload.get("session_id") or "")
     if not fence or session != str(fence.get("session_id") or ""):
+        return None
+    from agent_parley import issues
+
+    record = issues.snapshot(directory)["issues"].get(
+        str(fence.get("issue") or "")
+    ) or {"history": []}
+    published = any(
+        entry.get("action") == "take"
+        and (entry.get("taken") or {}).get("fence") == fence.get("id")
+        for entry in record.get("history") or []
+    )
+    if not published:
         return None
     detail = (
         f"Claim {fence.get('claim_id')} for issue #{fence.get('issue')} was "
@@ -780,10 +991,10 @@ def preflight(directory: Path, lane: Path, saved: dict) -> None:
     Raises:
         BridgeError: If content could be overwritten or history is unsafe.
     """
-    if _git(lane, "status", "--porcelain", "--ignored", "-z"):
+    if _git(lane, "status", "--porcelain", "-z"):
         raise BridgeError(
-            "Recovery destination has dirty, untracked, or ignored work; "
-            "preserve it before resuming this checkpoint."
+            "Recovery destination has dirty or untracked work; preserve it "
+            "before resuming this checkpoint."
         )
     bundle = _artifact(directory, saved)
     _git(lane, "bundle", "verify", str(bundle))
@@ -801,6 +1012,9 @@ def preflight(directory: Path, lane: Path, saved: dict) -> None:
             "Recovery destination has commits outside the captured history; "
             "choose a clean lane based on the captured claim."
         )
+    _refuse_untracked_collisions(
+        lane, destination_head, str(saved["worktree_commit"])
+    )
 
 
 def restore(directory: Path, lane: Path, record: dict) -> dict:

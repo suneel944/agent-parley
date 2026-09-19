@@ -966,9 +966,10 @@ or waiting for more operator input.
 The receiving lane still runs `issue claim 42 --take-orphaned`. That claim
 revalidates the stopped process and ownership generation, moves only the old
 claim's reservations, fast-forwards to the captured committed HEAD, and restores
-the captured index and working tree into a clean destination. It refuses a
-destination with dirty, untracked or ignored work and leaves both worktrees
-intact. Restore progress is durable; after interruption, the new owner reruns
+the captured index and working tree into a clean destination. It permits
+unrelated ignored caches, but refuses dirty or untracked content and ignored
+content at a path recovery would change. Both worktrees stay intact. Restore
+progress is durable; after interruption, the new owner reruns
 `issue claim 42` to resume the exact recorded phase.
 
 The checkpoint and its Git bundle live in the private Agent Parley state

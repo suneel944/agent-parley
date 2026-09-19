@@ -540,13 +540,18 @@ def _taken(
         )
     from agent_parley import recovery
 
-    recovery.commit_takeover(directory, agent, takeover, issue, record, orphan)
+    fence = recovery.commit_takeover(
+        directory, agent, takeover, issue, record, orphan
+    )
     return {
         "from": record["owner"],
         "reason": orphan.get("reason", ""),
         "at": time.time(),
         "reservations": list(orphan.get("reservations", [])),
         "checkpoint": takeover["checkpoint"],
+        "claim_id": record["claim_id"],
+        "orphan_id": orphan.get("id", ""),
+        "fence": fence["id"],
     }
 
 
@@ -963,18 +968,19 @@ def _change(
                     ]
                 else:
                     raise BridgeError("Unknown issue action.")
-        record["history"].append(
-            {
-                "action": logged,
-                "actor": agent,
-                "at": time.time(),
-                "owner": record["owner"],
-                "offer": record["offer"],
-                "request": record.get("request"),
-                "offer_id": offer_id,
-                "claim_id": record.get("claim_id"),
-            }
-        )
+        history = {
+            "action": logged,
+            "actor": agent,
+            "at": time.time(),
+            "owner": record["owner"],
+            "offer": record["offer"],
+            "request": record.get("request"),
+            "offer_id": offer_id,
+            "claim_id": record.get("claim_id"),
+        }
+        if logged == "take":
+            history["taken"] = dict(record["taken"])
+        record["history"].append(history)
         state["issues"][issue] = record
         if scope:
             retries.remember(state, scope, fingerprint, retries.SERVED, record)

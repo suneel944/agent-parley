@@ -185,8 +185,26 @@ def test_takeover_restores_committed_staged_unstaged_and_untracked_work(
         "from": "earlier-owner",
     }
     write_json(directory / "issues.json", state)
+    recovery.capture(
+        directory,
+        roster.read(directory),
+        "claude",
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "pytest -q"},
+            "tool_response": {"exit_code": 0},
+        },
+    )
     killed(directory, "claude", STALLED + 100)
     running(directory, "codex")
+    exclude = Path(git(peer, "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = peer / exclude
+    exclude.write_text(exclude.read_text() + "\n.pytest_cache/\n")
+    cache = peer / ".pytest_cache"
+    cache.mkdir()
+    (cache / "README.md").write_text("recipient cache\n")
 
     supervision.poll(bridge.home, directory)
     taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
@@ -197,6 +215,7 @@ def test_takeover_restores_committed_staged_unstaged_and_untracked_work(
     assert (peer / "artifact.bin").read_bytes() == b"\x00\xffrecovery"
     assert (lane / "ignored-secret.bin").read_bytes() == b"secret"
     assert not (peer / "ignored-secret.bin").exists()
+    assert (cache / "README.md").read_text() == "recipient cache\n"
     assert git(peer, "log", "-1", "--format=%s") == "Work before interruption"
     status = git(peer, "status", "--short")
     assert "committed.txt" not in status
@@ -208,6 +227,9 @@ def test_takeover_restores_committed_staged_unstaged_and_untracked_work(
     checkpoint = taken["taken"]["checkpoint"]
     assert checkpoint["artifact"]["bytes"] > 0
     assert len(checkpoint["artifact"]["sha256"]) == 64
+    assert checkpoint["last_verified_step"] == "PostToolUse: Bash"
+    assert checkpoint["gate"]["command"] == "pytest -q"
+    assert checkpoint["gate"]["exit_code"] == 0
 
     refused = checkpoints.checkpoint(
         bridge.home,
@@ -275,11 +297,37 @@ def test_takeover_refuses_a_dirty_destination_before_changing_owner(
     with pytest.raises(BridgeError) as refusal:
         bridge.issue(peer, "claim", "42", take_orphaned=True)
 
-    assert "dirty, untracked, or ignored work" in str(refusal.value)
+    assert "dirty or untracked work" in str(refusal.value)
     assert (peer / "local.txt").read_text() == "keep me\n"
     record = issues.snapshot(directory)["issues"]["42"]
     assert record["owner"] == "claude"
     assert record["orphan"]["owner"] == "claude"
+
+
+def test_capture_does_not_reuse_gate_evidence_for_changed_content(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    manifest = roster.read(directory)
+    recovery.capture(
+        directory,
+        manifest,
+        "claude",
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "pytest -q"},
+            "tool_response": {"exit_code": 0},
+        },
+    )
+    (lane / "changed-after-gate.txt").write_text("new content\n")
+
+    saved = recovery.capture(directory, manifest, "claude")[0]
+
+    assert saved["gate"] == {}
+    assert saved["last_verified_step"] == "PostToolUse: Bash"
 
 
 @pytest.mark.parametrize("boundary", ["head", "index", "worktree"])
@@ -421,7 +469,45 @@ def test_competing_takeovers_publish_one_owner_and_one_fence(
     assert activity["ownership_fence"]["taken_by"] == record["owner"]
 
 
-def test_explicit_approval_quiesces_one_published_capacity_session(
+def test_unpublished_takeover_fence_does_not_stop_the_old_owner(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    original_write = issues.write_json
+    interrupted = False
+
+    def interrupt_ledger(path, value):
+        nonlocal interrupted
+        if path.name == "issues.json" and not interrupted:
+            interrupted = True
+            raise BridgeError("interrupted before takeover publication")
+        original_write(path, value)
+
+    monkeypatch.setattr(issues, "write_json", interrupt_ledger)
+    with pytest.raises(
+        BridgeError, match="interrupted before takeover publication"
+    ):
+        bridge.issue(peer, "claim", "42", take_orphaned=True)
+    payload = {"session_id": "claude-session", "hook_event_name": "PreToolUse"}
+    assert recovery.stale_session(directory, "claude", payload) is None
+    assert issues.snapshot(directory)["issues"]["42"]["owner"] == "claude"
+
+    monkeypatch.setattr(issues, "write_json", original_write)
+    taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
+
+    assert taken["owner"] == "codex"
+    refusal = recovery.stale_session(directory, "claude", payload)
+    assert refusal["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_explicit_approval_quiesces_session_observation_after_reclaim(
     bridge, repo, paired
 ):
     registered(bridge, paired)
@@ -466,6 +552,8 @@ def test_explicit_approval_quiesces_one_published_capacity_session(
                 ],
             },
         )
+        bridge.issue(lane, "release", "42")
+        bridge.issue(lane, "claim", "42")
 
         manifest = roster.read(directory)
         assert recovery.quiesce_authorized(directory, manifest) == []
@@ -501,6 +589,103 @@ def test_explicit_approval_quiesces_one_published_capacity_session(
         assert record["orphan"]["reset_at"] is None
         saved = recovery.checkpoint(directory, "42", record["claim_id"])
         assert saved["artifact"]["bytes"] > 0
+        marker = dict(record["orphan"])
+        activity = json.loads(activity_path.read_text())
+        activity["updated"] = time.time() - STALLED - 100
+        write_json(activity_path, activity)
+        supervision.poll(bridge.home, directory)
+        assert issues.snapshot(directory)["issues"]["42"]["orphan"] == marker
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_quiesce_resumes_after_the_exact_process_stops(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    (lane / "pending.txt").write_text("pending\n")
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    session_id = "interrupted-capacity-session"
+    try:
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "working",
+                "updated": time.time(),
+                "session_id": session_id,
+                "session_pid": child.pid,
+                "session_ticks": process.start_ticks(child.pid),
+            },
+        )
+        write_json(
+            directory / "capacity-candidates.json",
+            {
+                "version": 1,
+                "candidates": [
+                    {
+                        "issue": "42",
+                        "owner": "claude",
+                        "eligible_peers": ["codex"],
+                        "reason": "provider capacity exhausted",
+                        "next_action": "request recorded recovery transition",
+                        "reset_at": None,
+                        "source": "provider-status",
+                        "session_id": session_id,
+                        "observation_id": "interrupted-observation",
+                    }
+                ],
+            },
+        )
+        manifest = roster.read(directory)
+        bridge.authorize_recovery(repo, "42", "recover after provider refusal")
+        original_stop = process.ServerProcess.stop
+
+        def interrupted_stop(server):
+            original_stop(server)
+            raise BridgeError("interrupted after process stop")
+
+        monkeypatch.setattr(process.ServerProcess, "stop", interrupted_stop)
+        with pytest.raises(BridgeError, match="interrupted after process stop"):
+            recovery.quiesce_authorized(directory, manifest)
+        child.wait(timeout=5)
+        assert "orphan" not in issues.snapshot(directory)["issues"]["42"]
+
+        monkeypatch.setattr(process.ServerProcess, "stop", original_stop)
+        original_write = recovery.write_json
+
+        def interrupt_before_approval_consumption(path, value):
+            if path.name.endswith("-approval.json") and value.get("used_at"):
+                raise BridgeError("interrupted before approval consumption")
+            original_write(path, value)
+
+        monkeypatch.setattr(
+            recovery, "write_json", interrupt_before_approval_consumption
+        )
+        with pytest.raises(
+            BridgeError, match="interrupted before approval consumption"
+        ):
+            recovery.quiesce_authorized(directory, manifest)
+        approval_path = next((directory / "recovery").glob("*-approval.json"))
+        assert "used_at" not in json.loads(approval_path.read_text())
+        monkeypatch.setattr(recovery, "write_json", original_write)
+        markers = recovery.quiesce_authorized(directory, manifest)
+
+        assert markers[0]["checkpoint"].startswith("issue-42-")
+        record = issues.snapshot(directory)["issues"]["42"]
+        assert record["orphan"]["authorization"]["actor"] == "operator"
+        transitions = list((directory / "recovery").glob("*-quiesce.json"))
+        assert json.loads(transitions[0].read_text())["phase"] == "complete"
+        assert recovery.approval(directory, "42", record["claim_id"]) is None
     finally:
         if child.poll() is None:
             child.kill()
