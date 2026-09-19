@@ -1363,12 +1363,17 @@ def checkpoint(
         ):
             record(directory, agent, payload, Reason.SESSION_MISMATCH, None)
             return {}
-        if event == "SessionStart" and session != state.get("session_id"):
+        new_session = event == "SessionStart" and session != state.get(
+            "session_id"
+        )
+        if new_session:
             state["cursor"] = 0
             state["issue_revision"] = -1
             state.pop("roster", None)
             state.pop("work_offer", None)
-        if event == "SessionStart" and not process.alive(
+            state.pop("session_pid", None)
+            state.pop("session_ticks", None)
+        elif event == "SessionStart" and not process.alive(
             state.get("session_pid"), state.get("session_ticks")
         ):
             state.pop("session_pid", None)

@@ -189,7 +189,7 @@ def test_session_start_preserves_a_live_launcher_process(
     write_json(
         directory / "codex-activity.json",
         {
-            "session_id": "previous",
+            "session_id": "s1",
             "session_pid": native.pid,
             "session_ticks": native.ticks,
         },
@@ -206,6 +206,36 @@ def test_session_start_preserves_a_live_launcher_process(
     state = json.loads((directory / "codex-activity.json").read_text())
     assert state["session_pid"] == native.pid
     assert state["session_ticks"] == native.ticks
+
+
+def test_new_session_clears_an_unrelated_live_process(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    native = process.ServerProcess(
+        os.getpid(), process.start_ticks(os.getpid())
+    )
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "previous",
+            "session_pid": native.pid,
+            "session_ticks": native.ticks,
+        },
+    )
+    monkeypatch.setattr(
+        checkpoints.process, "foreground_process", lambda hook_pid: None
+    )
+    started = run_hook(
+        bridge,
+        directory,
+        {**START, "cwd": str(lane)},
+    )
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert "session_pid" not in state
+    assert "session_ticks" not in state
 
 
 def test_a_down_service_falls_back_in_process(bridge, repo, paired):
