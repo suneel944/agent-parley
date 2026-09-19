@@ -1,4 +1,4 @@
-"""Reads token counts from the session records native CLIs already write.
+"""Reads usage and capacity from session records native CLIs already write.
 
 A native client keeps its own session transcript under its config home. That
 transcript reports the tokens the client itself counted for the session. Agent
@@ -15,6 +15,7 @@ must not fail on a client's private file format.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -37,14 +38,19 @@ CLAUDE_FIELDS = (
 DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
 UNSAFE = re.compile(r"[^A-Za-z0-9]")
 MAX_TAIL = 1 << 16
-REFUSAL = re.compile(
-    r"rate[ _-]?limit|usage limit|quota exceed|too many requests",
+EXHAUSTION = re.compile(
+    r"usage limit|quota exceed|(?:have|has|ve) hit (?:your|the) limit|"
+    r"limit reached",
+    re.IGNORECASE,
+)
+TRANSIENT = re.compile(
+    r"rate[ _-]?limit|too many requests|temporarily overloaded",
     re.IGNORECASE,
 )
 
 Finder = Callable[[Path, Path], "Path | None"]
 Fold = Callable[[dict, dict], None]
-Refusal = Callable[[dict], "float | None"]
+CapacityReader = Callable[[dict], "dict | None"]
 
 
 def _mtime(path: Path) -> float:
@@ -181,65 +187,152 @@ def _stamp(value: object) -> float | None:
     return moment.timestamp()
 
 
-def _claude_refusal(record: dict) -> float | None:
-    """Reads a Claude transcript record that reports a refused request.
+def _capacity_state(text: str) -> str | None:
+    """Classifies provider-authored refusal text without reading user prose."""
+    if TRANSIENT.search(text):
+        return "retryable"
+    if EXHAUSTION.search(text):
+        return "exhausted"
+    return None
+
+
+def _claude_capacity(record: dict) -> dict | None:
+    """Reads one validated Claude capacity observation.
 
     Claude marks a request its API refused on the transcript record itself and
-    keeps the refusal text in the message content, so the reader looks at that
-    flag before matching the text.
+    keeps the refusal text in the message content. A later successful assistant
+    response proves that this session could make another provider request.
 
     Args:
         record: One parsed transcript record.
 
     Returns:
-        When the refusal was recorded, or None when this record reports no
-        usage-window or rate-limit refusal.
+        Capacity state and observation time, or None when this record does not
+        establish provider capacity.
     """
-    if not record.get("isApiErrorMessage"):
+    at = _stamp(record.get("timestamp"))
+    if at is None:
         return None
     message = record.get("message")
-    content = message.get("content") if isinstance(message, dict) else None
-    if not REFUSAL.search(json.dumps(content if content else "")):
+    if not isinstance(message, dict):
         return None
-    return _stamp(record.get("timestamp"))
+    if record.get("isApiErrorMessage"):
+        content = json.dumps(message.get("content") or "")
+        state = _capacity_state(content)
+        return {"state": state, "observed_at": at} if state else None
+    usage = message.get("usage")
+    if record.get("type") == "assistant" and isinstance(usage, dict):
+        identifier = str(message.get("id", ""))
+        if identifier:
+            return {
+                "state": "available",
+                "observed_at": at,
+                "progress": identifier,
+            }
+    return None
 
 
-def _codex_refusal(record: dict) -> float | None:
-    """Reads a Codex rollout record that reports a refused request.
+def _reset_at(rate_limits: dict, reached: str) -> float | None:
+    """Reads the reset instant for the rate-limit window that was reached."""
+    windows = (
+        [rate_limits.get(reached)]
+        if reached in {"primary", "secondary", "individual_limit"}
+        else [
+            rate_limits.get("primary"),
+            rate_limits.get("secondary"),
+            rate_limits.get("individual_limit"),
+        ]
+    )
+    resets = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        value = window.get("resets_at")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            resets.append(float(value))
+    return max(resets) if resets else None
+
+
+def _codex_capacity(record: dict) -> dict | None:
+    """Reads one validated Codex capacity observation.
 
     Codex wraps each rollout record in a payload naming its own kind, so the
-    reader matches the refusal text only on a payload that reports an error.
+    reader matches refusal text only on an error. Token-count events carry
+    structured rate limits and prove a successful request.
 
     Args:
         record: One parsed rollout record.
 
     Returns:
-        When the refusal was recorded, or None when this record reports no
-        usage-window or rate-limit refusal.
+        Capacity state and observation time, or None when this record does not
+        establish provider capacity.
     """
     payload = record.get("payload")
-    source = payload if isinstance(payload, dict) else record
-    if str(source.get("type", "")) not in ("error", "stream_error"):
+    if not isinstance(payload, dict):
         return None
-    if not REFUSAL.search(str(source.get("message", ""))):
+    at = _stamp(record.get("timestamp") or payload.get("timestamp"))
+    if at is None:
         return None
-    return _stamp(record.get("timestamp") or source.get("timestamp"))
+    kind = str(payload.get("type", ""))
+    if kind in ("error", "stream_error"):
+        state = _capacity_state(str(payload.get("message", "")))
+        return {"state": state, "observed_at": at} if state else None
+    if kind != "token_count":
+        return None
+    info = payload.get("info")
+    usage = info.get("total_token_usage") if isinstance(info, dict) else None
+    progress = usage.get("total_tokens") if isinstance(usage, dict) else None
+    if not isinstance(progress, int) or isinstance(progress, bool):
+        progress = None
+    limits = payload.get("rate_limits")
+    if not isinstance(limits, dict):
+        return (
+            {"state": "available", "observed_at": at, "progress": progress}
+            if progress is not None
+            else None
+        )
+    reached = str(limits.get("rate_limit_reached_type") or "")
+    exhausted = bool(reached or limits.get("spend_control_reached"))
+    if not exhausted:
+        exhausted = any(
+            isinstance(window, dict)
+            and isinstance(window.get("used_percent"), (int, float))
+            and not isinstance(window.get("used_percent"), bool)
+            and float(window["used_percent"]) >= 100
+            for window in (
+                limits.get("primary"),
+                limits.get("secondary"),
+                limits.get("individual_limit"),
+            )
+        )
+    if exhausted:
+        return {
+            "state": "exhausted",
+            "observed_at": at,
+            "reset_at": _reset_at(limits, reached),
+            "progress": progress,
+        }
+    return (
+        {"state": "available", "observed_at": at, "progress": progress}
+        if progress is not None
+        else None
+    )
 
 
-REFUSALS: dict[str, Refusal] = {
-    "claude": _claude_refusal,
-    "codex": _codex_refusal,
+CAPACITY_READERS: dict[str, CapacityReader] = {
+    "claude": _claude_capacity,
+    "codex": _codex_capacity,
 }
 
 
-def reported_refusal(home: Path, participant: dict) -> float | None:
-    """Reports when a lane's own client last recorded a usage refusal.
+def capacity_observation(home: Path, participant: dict) -> dict | None:
+    """Reports the latest capacity event in a lane's native session record.
 
     The reading comes from the same session records the reported token count
     is parsed from, so it costs no vendor request, no API key and no account
-    of its own: it states what one client wrote about one session. Only the
-    tail of the record is read, because a refusal that matters is the most
-    recent one rather than one the session has already recovered from.
+    of its own. Only provider-authored error envelopes, successful response
+    records, and structured rate-limit fields can produce an observation.
+    Ordinary transcript prose is ignored.
 
     Every provider whose client publishes nothing has no reader here and
     reports None, which a caller must treat as no opinion rather than as a
@@ -250,14 +343,14 @@ def reported_refusal(home: Path, participant: dict) -> float | None:
         participant: Manifest entry naming the lane, provider and account.
 
     Returns:
-        Unix time of the most recent recorded refusal, or None when this
-        provider publishes no such record or none could be read.
+        Latest capacity observation with its evidence source, record identity
+        and session identity, or None when no validated event could be read.
     """
     try:
         entry = roster.provider(home, str(participant.get("provider", "")))
         adapter = str(entry.get("adapter", ""))
         finder = ADAPTERS[adapter][0]
-        refusal = REFUSALS[adapter]
+        reader = CAPACITY_READERS[adapter]
         config = _config_home(home, entry, participant.get("credential"))
         if config is None:
             return None
@@ -270,16 +363,63 @@ def reported_refusal(home: Path, participant: dict) -> float | None:
             chunk = handle.read(MAX_TAIL)
     except (BridgeError, KeyError, OSError, ValueError):
         return None
-    latest: float | None = None
+    latest: dict | None = None
+    last_progress: str | int | None = None
+    seen_progress: set[str | int] = set()
     for line in chunk.split(b"\n")[1 if size > MAX_TAIL else 0 :]:
         try:
             record = json.loads(line)
         except ValueError:
             continue
-        at = refusal(record) if isinstance(record, dict) else None
-        if at is not None and (latest is None or at > latest):
-            latest = at
+        observation = reader(record) if isinstance(record, dict) else None
+        if observation is None:
+            continue
+        state = observation["state"]
+        marker = observation.get("progress")
+        progressed = False
+        if state == "available":
+            if not isinstance(marker, (str, int)) or isinstance(marker, bool):
+                continue
+            if marker in seen_progress:
+                continue
+            if adapter == "codex":
+                progressed = (
+                    isinstance(marker, int)
+                    and isinstance(last_progress, int)
+                    and marker > last_progress
+                )
+            else:
+                progressed = marker is not None and marker != last_progress
+            seen_progress.add(marker)
+            if (
+                latest is not None
+                and latest["state"] in {"exhausted", "retryable"}
+                and adapter == "codex"
+                and not progressed
+            ):
+                last_progress = marker
+                continue
+            observation["progressed"] = progressed
+            last_progress = marker
+        elif marker is None:
+            observation["progress"] = last_progress
+        if (
+            latest is None
+            or observation["observed_at"] >= latest["observed_at"]
+        ):
+            latest = observation
+            latest["source"] = f"{adapter}-session-record"
+            latest["session_id"] = path.stem
+            latest["observation_id"] = hashlib.sha256(line).hexdigest()[:16]
     return latest
+
+
+def reported_refusal(home: Path, participant: dict) -> float | None:
+    """Reports the latest validated refusal time for compatibility callers."""
+    observation = capacity_observation(home, participant)
+    if observation and observation["state"] in {"exhausted", "retryable"}:
+        return float(observation["observed_at"])
+    return None
 
 
 def _advance(path: Path, fold: Fold, reading: dict) -> dict:

@@ -240,6 +240,20 @@ transactions, and observation failures do not fail a committed coordination
 call. `participant_presence` is an additive table initialized with the store.
 The issue ledger retains reminders; only explicit issue transitions own claims.
 
+Provider capacity is durable per lane and records available, exhausted,
+retryable and unknown states with the native evidence and session identity.
+Elapsed supervision time never restores capacity. A validated later response,
+a structured provider reset or a recorded bounded probe does. Exhaustion is
+shared across lanes only when an explicit credential profile identifies the
+same provider account. An exhausted owner's unfinished claims remain visible
+as recovery candidates even when it owns only one claim or no eligible peer is
+currently available. A candidate is evidence for a recovery decision; it does
+not transfer ownership or establish that a live owner stopped editing.
+The supervisor atomically replaces `capacity-candidates.json` with the current
+candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
+the persisted issue candidate and revalidates its owner and evidence identity
+before acting.
+
 The same poll marks the claims of a lane whose session process is gone and that
 has been silent past the stall threshold, writing an orphan marker on each of
 its ledger records and sending every other lane one notice that names those

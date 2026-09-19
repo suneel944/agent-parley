@@ -1,5 +1,6 @@
 """Checks the capacity gate and the advisory work offers built on it."""
 
+import datetime
 import json
 import os
 import time
@@ -11,6 +12,7 @@ from agent_parley import (
     dashboard,
     issues,
     records,
+    roster,
     store,
     supervision,
     views,
@@ -56,7 +58,7 @@ def turn_ended(directory, name, ago):
     )
 
 
-def refused(paired, name, ago):
+def refused(paired, name, ago, text="API Error: usage limit reached"):
     """Writes a usage refusal into the lane's own client session record."""
     lane = Path(paired["lanes"][name])
     directory = (
@@ -74,15 +76,76 @@ def refused(paired, name, ago):
                 "timestamp": time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment)
                 ),
-                "message": {
-                    "content": [
-                        {"type": "text", "text": "API Error: rate limit"}
-                    ]
+                "message": {"content": [{"type": "text", "text": text}]},
+            }
+        )
+        + "\n"
+    )
+
+
+def succeeded(paired, name, ago):
+    """Appends a successful provider response to one lane's transcript."""
+    lane = Path(paired["lanes"][name])
+    path = (
+        Path(os.environ["CLAUDE_CONFIG_DIR"])
+        / "projects"
+        / records.UNSAFE.sub("-", str(lane))
+        / "session.jsonl"
+    )
+    moment = time.time() - ago
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment)
+                    ),
+                    "message": {
+                        "id": f"success-{moment}",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {"output_tokens": 1},
+                    },
+                }
+            )
+            + "\n"
+        )
+
+
+def codex_capacity_record(
+    paired,
+    rate_limits,
+    progress=1,
+    timestamp="2026-09-19T12:00:00Z",
+):
+    """Writes one structured Codex rate-limit observation."""
+    lane = Path(paired["lanes"]["codex"])
+    today = datetime.date.today()
+    directory = (
+        Path(os.environ["CODEX_HOME"])
+        / "sessions"
+        / f"{today:%Y}"
+        / f"{today:%m}"
+        / f"{today:%d}"
+    )
+    directory.mkdir(parents=True)
+    path = directory / "rollout-capacity.jsonl"
+    path.write_text(
+        json.dumps({"payload": {"cwd": str(lane)}})
+        + "\n"
+        + json.dumps(
+            {
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"total_tokens": progress}},
+                    "rate_limits": rate_limits,
                 },
             }
         )
         + "\n"
     )
+    return path
 
 
 def offer_for(directory, name):
@@ -145,11 +208,11 @@ def test_a_recent_usage_refusal_makes_a_lane_unfit_and_unoffered(
     assert published["fit"] is False
     assert published["failed"] == ["capacity"]
     assert published["checks"]["capacity"] is False
-    assert "refused a request" in published["reason"]
+    assert "provider capacity is exhausted" in published["reason"]
     assert published["offer"] is None
 
 
-def test_a_refusal_older_than_the_interval_no_longer_blocks_an_offer(
+def test_elapsed_stall_time_does_not_restore_exhausted_capacity(
     bridge, repo, paired
 ):
     registered(bridge, paired)
@@ -162,9 +225,149 @@ def test_a_refusal_older_than_the_interval_no_longer_blocks_an_offer(
     refused(paired, "claude", 4000)
     supervision.poll(bridge.home, directory)
     published = supervision.published_work(directory, "claude")
+    assert published["checks"]["capacity"] is False
+    assert published["capacity"]["state"] == "exhausted"
+    assert published["fit"] is False
+    assert published["offer"] is None
+
+
+def test_later_success_restores_exhausted_capacity(bridge, repo, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    alive(directory, "claude")
+    refused(paired, "claude", 60)
+    succeeded(paired, "claude", 30)
+    supervision.poll(bridge.home, directory)
+    published = supervision.published_work(directory, "claude")
     assert published["checks"]["capacity"] is True
-    assert published["fit"] is True
-    assert published["offer"]["kind"] == "pull"
+    assert published["capacity"]["state"] == "available"
+
+
+def test_transient_rate_limit_is_distinct_from_exhaustion(bridge, repo, paired):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    alive(directory, "claude")
+    refused(paired, "claude", 30, "API Error: rate limit")
+    supervision.poll(bridge.home, directory)
+    published = supervision.published_work(directory, "claude")
+    assert published["checks"]["capacity"] is False
+    assert published["capacity"]["state"] == "retryable"
+    assert "retryable transient failure" in published["reason"]
+
+
+def test_codex_structured_limit_preserves_reliable_reset(bridge, repo, paired):
+    reset_at = time.time() + 3600
+    codex_capacity_record(
+        paired,
+        {
+            "rate_limit_reached_type": "primary",
+            "primary": {"used_percent": 100, "resets_at": reset_at},
+        },
+    )
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["codex"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+    assert observation["reset_at"] == reset_at
+    assert observation["source"] == "codex-session-record"
+    assert observation["session_id"] == "rollout-capacity"
+
+
+def test_replayed_codex_usage_does_not_clear_exhaustion(bridge, repo, paired):
+    path = codex_capacity_record(
+        paired,
+        {"primary": {"used_percent": 10}},
+        progress=10,
+        timestamp="2026-09-19T12:00:00Z",
+    )
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-09-19T12:01:00Z",
+                    "payload": {
+                        "type": "error",
+                        "message": "usage limit reached",
+                    },
+                }
+            )
+            + "\n"
+        )
+        stream.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-09-19T12:02:00Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 10}},
+                        "rate_limits": {"primary": {"used_percent": 10}},
+                    },
+                }
+            )
+            + "\n"
+        )
+    participant = paired["participants"]["codex"]
+    replayed = records.capacity_observation(bridge.home, participant)
+    assert replayed is not None
+    assert replayed["state"] == "exhausted"
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-09-19T12:03:00Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 11}},
+                        "rate_limits": {"primary": {"used_percent": 10}},
+                    },
+                }
+            )
+            + "\n"
+        )
+    recovered = records.capacity_observation(bridge.home, participant)
+    assert recovered is not None
+    assert recovered["state"] == "available"
+    assert recovered["progressed"] is True
+
+
+def test_exhaustion_is_shared_only_by_an_explicit_account(bridge, repo):
+    roster.define_credential(
+        bridge.home,
+        "shared",
+        os.environ["CLAUDE_CONFIG_DIR"],
+        [],
+        [],
+    )
+    bridge.add_participant(repo, "claude-a", "claude", "shared")
+    manifest = bridge.add_participant(repo, "claude-b", "claude", "shared")
+    refused(manifest, "claude-a", 30)
+    directory = Path(manifest["lanes"]["claude-a"]).parent
+    observed = supervision.capacity(
+        bridge.home, directory, manifest, "claude-b"
+    )
+    assert observed["state"] == "exhausted"
+    assert observed["participant"] == "claude-a"
+
+
+def test_reliable_reset_restores_persisted_capacity(bridge, repo, paired):
+    directory = Path(paired["lanes"]["claude"]).parent
+    supervision.record_capacity(
+        directory,
+        "claude",
+        {
+            "state": "exhausted",
+            "observed_at": time.time() - 60,
+            "reset_at": time.time() - 30,
+            "source": "bounded-probe",
+            "session_id": "session",
+            "observation_id": "probe-1",
+        },
+    )
+    observed = supervision.capacity(bridge.home, directory, paired, "claude")
+    assert observed["state"] == "available"
+    assert observed["source"] == "provider-reset"
 
 
 def test_a_provider_that_publishes_nothing_skips_the_capacity_check(
@@ -177,6 +380,178 @@ def test_a_provider_that_publishes_nothing_skips_the_capacity_check(
     published = supervision.published_work(directory, "claude")
     assert published["checks"]["capacity"] is None
     assert published["fit"] is True
+
+
+def test_ordinary_transcript_text_is_not_capacity_evidence(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    alive(directory, "claude")
+    records_dir = (
+        Path(os.environ["CLAUDE_CONFIG_DIR"])
+        / "projects"
+        / records.UNSAFE.sub("-", str(lane))
+    )
+    records_dir.mkdir(parents=True)
+    (records_dir / "session.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": "2026-09-19T12:00:00Z",
+                "message": {"content": "Document usage limit handling."},
+            }
+        )
+        + "\n"
+    )
+    supervision.poll(bridge.home, directory)
+    published = supervision.published_work(directory, "claude")
+    assert published["checks"]["capacity"] is None
+    assert published["capacity"]["state"] == "unknown"
+
+
+def test_replayed_claude_message_does_not_clear_exhaustion(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    records_dir = (
+        Path(os.environ["CLAUDE_CONFIG_DIR"])
+        / "projects"
+        / records.UNSAFE.sub("-", str(lane))
+    )
+    records_dir.mkdir(parents=True)
+    success = {
+        "type": "assistant",
+        "timestamp": "2026-09-19T12:00:00Z",
+        "message": {"id": "message-1", "usage": {"output_tokens": 1}},
+    }
+    refusal = {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "timestamp": "2026-09-19T12:01:00Z",
+        "message": {"content": "usage limit reached"},
+    }
+    replay = {
+        **success,
+        "timestamp": "2026-09-19T12:02:00Z",
+    }
+    (records_dir / "session.jsonl").write_text(
+        "\n".join(json.dumps(item) for item in (success, refusal, replay))
+        + "\n"
+    )
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+
+
+def test_exhaustion_survives_native_transcript_rotation(bridge, repo, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    alive(directory, "claude")
+    refused(paired, "claude", 30)
+    supervision.poll(bridge.home, directory)
+    records_dir = (
+        Path(os.environ["CLAUDE_CONFIG_DIR"])
+        / "projects"
+        / records.UNSAFE.sub("-", str(lane))
+    )
+    time.sleep(0.01)
+    (records_dir / "rotated.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": "2026-09-19T12:00:00Z",
+                "message": {"content": "continue"},
+            }
+        )
+        + "\n"
+    )
+    supervision.poll(bridge.home, directory)
+    published = supervision.published_work(directory, "claude")
+    assert published["capacity"]["state"] == "exhausted"
+
+
+def test_single_exhausted_claim_is_a_recovery_candidate(bridge, repo, paired):
+    lane = Path(paired["lanes"]["claude"])
+    bridge.issue(lane, "claim", "42")
+    ledger = issues.snapshot(lane.parent)
+    results = {
+        "claude": {
+            "fit": False,
+            "capacity": {
+                "state": "exhausted",
+                "reset_at": 200.0,
+                "source": "claude-session-record",
+                "session_id": "session",
+                "observation_id": "event",
+            },
+        },
+        "codex": {"fit": True, "capacity": {"state": "available"}},
+    }
+    candidates = supervision.stranded_claims(paired, ledger, results)
+    assert candidates == [
+        {
+            "issue": "42",
+            "owner": "claude",
+            "eligible_peers": ["codex"],
+            "reason": "claude provider capacity is exhausted until 200",
+            "next_action": "request a recorded recovery transition",
+            "reset_at": 200.0,
+            "source": "claude-session-record",
+            "session_id": "session",
+            "observation_id": "event",
+        }
+    ]
+
+
+def test_exhausted_claim_without_a_peer_remains_a_wait_obligation(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    bridge.issue(lane, "claim", "42")
+    ledger = issues.snapshot(lane.parent)
+    results = {
+        name: {
+            "fit": False,
+            "capacity": {
+                "state": "exhausted",
+                "source": f"{name}-session-record",
+                "session_id": name,
+                "observation_id": name,
+            },
+        }
+        for name in paired["participants"]
+    }
+    candidates = supervision.stranded_claims(paired, ledger, results)
+    assert candidates[0]["eligible_peers"] == []
+    assert candidates[0]["next_action"] == (
+        "wait for provider recovery or an eligible peer"
+    )
+
+
+def test_stranded_claim_snapshot_is_authoritative_and_clearable(
+    bridge, repo, paired
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    candidate = {
+        "issue": "42",
+        "owner": "claude",
+        "eligible_peers": ["codex"],
+        "reason": "claude provider capacity is exhausted",
+        "next_action": "request a recorded recovery transition",
+        "reset_at": None,
+        "source": "claude-session-record",
+        "session_id": "session",
+        "observation_id": "event",
+    }
+    supervision.record_stranded_claims(directory, [candidate])
+    assert supervision.published_stranded_claim(directory, "42") == candidate
+    supervision.record_stranded_claims(directory, [])
+    assert supervision.published_stranded_claim(directory, "42") is None
 
 
 def test_a_stopped_lane_is_unfit_and_never_named_by_a_rebalance(

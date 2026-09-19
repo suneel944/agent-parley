@@ -409,11 +409,24 @@ def base_advance_marker(paths: list[str]) -> str:
 
 
 FIT_CHECKS = ("session", "capacity", "worktree", "mail")
+CAPACITY_STATES = frozenset({"available", "exhausted", "retryable"})
+UNKNOWN_CAPACITY = {
+    "state": "unknown",
+    "observed_at": None,
+    "reset_at": None,
+    "source": "",
+    "session_id": "",
+    "observation_id": "",
+    "participant": "",
+    "progress": None,
+    "progressed": False,
+}
 UNKNOWN_FIT: dict = {
     "fit": None,
     "checks": dict.fromkeys(FIT_CHECKS),
     "failed": [],
     "reason": "",
+    "capacity": dict(UNKNOWN_CAPACITY),
     "offer": None,
 }
 
@@ -443,30 +456,183 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
     return True, ""
 
 
-def _capacity_check(
-    home: Path, participant: dict, after: float
-) -> tuple[bool | None, str]:
-    """Reads the lane's own client records for a recent usage refusal.
+def published_capacity(directory: Path, name: str) -> dict:
+    """Reads one lane's last durable provider-capacity observation."""
+    try:
+        value = json.loads((directory / f"{name}-capacity.json").read_text())
+    except (OSError, ValueError):
+        return dict(UNKNOWN_CAPACITY)
+    if not isinstance(value, dict) or value.get("state") not in CAPACITY_STATES:
+        return dict(UNKNOWN_CAPACITY)
+    return {**UNKNOWN_CAPACITY, **value}
 
-    The reader is provider specific and defaults to no opinion, so a provider
-    whose client publishes no such record skips the check instead of blocking
-    an offer. Nothing is asked of a vendor.
+
+def record_capacity(directory: Path, name: str, observation: dict) -> dict:
+    """Persists a newer validated capacity or bounded-probe outcome.
 
     Args:
-        home: Private bridge state root.
-        participant: Manifest entry naming the lane, provider and account.
-        after: Seconds within which a recorded refusal still counts.
+        directory: Private project state directory.
+        name: Participant whose provider produced the observation.
+        observation: Validated state, evidence source, session identity and
+            observation identity. A probe caller must record its own source
+            and outcome rather than relying on elapsed time.
 
     Returns:
-        The check result and, when it failed, how old the refusal is.
+        The durable observation after rejecting older evidence.
+
+    Raises:
+        BridgeError: If the observation does not carry a usable state, time,
+            source and evidence identity.
     """
-    at = records.reported_refusal(home, participant)
-    if at is None:
+    state = observation.get("state")
+    observed_at = observation.get("observed_at")
+    if (
+        state not in CAPACITY_STATES
+        or not isinstance(observed_at, (int, float))
+        or isinstance(observed_at, bool)
+        or not observation.get("source")
+        or not observation.get("observation_id")
+    ):
+        raise BridgeError("Invalid provider capacity observation.")
+    value = {**UNKNOWN_CAPACITY, **observation, "participant": name}
+    path = directory / f"{name}-capacity.json"
+    with lock(directory / f"{name}-capacity.lock"):
+        current = published_capacity(directory, name)
+        current_at = current.get("observed_at")
+        if current_at is None or float(observed_at) >= float(current_at):
+            write_json(path, value)
+            return value
+        return current
+
+
+def _native_recovery(current: dict, observation: dict) -> bool:
+    """Checks that a native success advances beyond exhausted evidence."""
+    if (
+        current["state"] not in {"exhausted", "retryable"}
+        or observation["state"] != "available"
+    ):
+        return True
+    marker = observation.get("progress")
+    previous = current.get("progress")
+    if observation["source"] == "claude-session-record":
+        return bool(marker and marker != previous)
+    if observation["source"] != "codex-session-record":
+        return False
+    if observation.get("session_id") != current.get("session_id"):
+        return bool(observation.get("progressed"))
+    return (
+        isinstance(marker, int)
+        and isinstance(previous, int)
+        and marker > previous
+    ) or bool(observation.get("progressed"))
+
+
+def _observe_capacity(
+    home: Path, directory: Path, name: str, participant: dict
+) -> dict:
+    """Persists one lane's newest native capacity evidence."""
+    current = published_capacity(directory, name)
+    observation = records.capacity_observation(home, participant)
+    if (
+        observation is not None
+        and observation["state"] in {"exhausted", "retryable"}
+        and observation.get("progress") is None
+        and observation.get("session_id") == current.get("session_id")
+    ):
+        observation["progress"] = current.get("progress")
+    if observation is not None and _native_recovery(current, observation):
+        current = record_capacity(directory, name, observation)
+    reset_at = current.get("reset_at")
+    if (
+        current["state"] == "exhausted"
+        and isinstance(reset_at, (int, float))
+        and not isinstance(reset_at, bool)
+        and reset_at <= time.time()
+    ):
+        current = record_capacity(
+            directory,
+            name,
+            {
+                **current,
+                "state": "available",
+                "observed_at": float(reset_at),
+                "reset_at": None,
+                "source": "provider-reset",
+                "observation_id": f"reset:{current['observation_id']}",
+            },
+        )
+    return current
+
+
+def _account_members(home: Path, manifest: dict, name: str) -> list[str]:
+    """Names lanes sharing one explicitly identified provider account."""
+    participant = manifest["participants"][name]
+    credential = participant.get("credential")
+    if not credential:
+        return [name]
+    try:
+        adapter = roster.provider(home, participant["provider"])["adapter"]
+    except (BridgeError, KeyError):
+        return [name]
+    members = []
+    for other, candidate in manifest["participants"].items():
+        if candidate.get("credential") != credential:
+            continue
+        try:
+            other_adapter = roster.provider(home, candidate["provider"])[
+                "adapter"
+            ]
+        except (BridgeError, KeyError):
+            continue
+        if other_adapter == adapter:
+            members.append(other)
+    return members or [name]
+
+
+def capacity(home: Path, directory: Path, manifest: dict, name: str) -> dict:
+    """Reports durable lane capacity, shared only for a known account."""
+    observations = [
+        _observe_capacity(
+            home, directory, member, manifest["participants"][member]
+        )
+        for member in _account_members(home, manifest, name)
+    ]
+    known = [item for item in observations if item["state"] != "unknown"]
+    if not known:
+        return dict(UNKNOWN_CAPACITY)
+    ranks = {"available": 0, "retryable": 1, "exhausted": 2}
+    return max(
+        known,
+        key=lambda item: (
+            float(item.get("observed_at") or 0),
+            ranks[item["state"]],
+        ),
+    )
+
+
+def _capacity_check(observation: dict) -> tuple[bool | None, str]:
+    """Converts a durable capacity state into a fit check.
+
+    Elapsed supervision time never changes the state. Only a later successful
+    request, a reliable provider reset, or a recorded bounded probe can make
+    an exhausted lane available again.
+
+    Args:
+        observation: Persisted provider capacity observation.
+
+    Returns:
+        The check result and, when it failed, the recorded reason.
+    """
+    state = observation["state"]
+    if state == "unknown":
         return None, ""
-    age = max(0.0, time.time() - at)
-    if age < after:
-        return False, f"its client refused a request {int(age)}s ago"
-    return True, ""
+    if state == "available":
+        return True, ""
+    reset_at = observation.get("reset_at")
+    reset = f" until {int(reset_at)}" if reset_at is not None else ""
+    if state == "exhausted":
+        return False, f"its provider capacity is exhausted{reset}"
+    return False, "its provider reported a retryable transient failure"
 
 
 def _worktree_check(participant: dict) -> tuple[bool | None, str]:
@@ -553,17 +719,17 @@ def fit(
         directory: Private project state directory.
         manifest: Project manifest holding this participant.
         name: Participant whose lane is being considered.
-        after: Seconds of the interval a refusal or an unanswered item is
-            still counted within.
+        after: Seconds after which an unanswered item blocks an offer.
 
     Returns:
         Whether the lane is fit, each check's result, the names of the failed
         checks and one line naming the first failure.
     """
     participant = manifest["participants"][name]
+    observed_capacity = capacity(home, directory, manifest, name)
     results = {
         "session": _session_check(directory, name),
-        "capacity": _capacity_check(home, participant, after),
+        "capacity": _capacity_check(observed_capacity),
         "worktree": _worktree_check(participant),
         "mail": _mail_check(home, manifest, name, after),
     }
@@ -572,12 +738,142 @@ def fit(
         "fit": not failed,
         "checks": {check: results[check][0] for check in FIT_CHECKS},
         "failed": failed,
+        "capacity": observed_capacity,
         "reason": (
             f"unfit ({failed[0]}): {name} {results[failed[0]][1]}"
             if failed
             else ""
         ),
     }
+
+
+def stranded_claims(
+    manifest: dict, ledger: dict, results: dict[str, dict]
+) -> list[dict]:
+    """Lists exhausted owners' claims and peers eligible for recovery.
+
+    The candidates are observations only. They neither grant a peer ownership
+    nor establish that a live owner stopped editing. Recovery must record its
+    own transition and fence the prior claim generation before any transfer.
+
+    Args:
+        manifest: Project manifest holding every participant.
+        ledger: Current issue ledger.
+        results: Fit result per participant, including durable capacity.
+
+    Returns:
+        One candidate per unfinished owned issue. A candidate with no eligible
+        peers remains in the result as a durable wait obligation.
+    """
+    owned = issues.holders(ledger)
+    eligible = [
+        name
+        for name in sorted(manifest["participants"])
+        if results.get(name, {}).get("fit") and not owned.get(name)
+    ]
+    candidates = []
+    for owner, numbers in sorted(owned.items()):
+        observed = results.get(owner, {}).get("capacity", UNKNOWN_CAPACITY)
+        if observed.get("state") != "exhausted":
+            continue
+        peers = [name for name in eligible if name != owner]
+        reset_at = observed.get("reset_at")
+        reason = f"{owner} provider capacity is exhausted"
+        if reset_at is not None:
+            reason += f" until {int(reset_at)}"
+        next_action = (
+            "request a recorded recovery transition"
+            if peers
+            else "wait for provider recovery or an eligible peer"
+        )
+        for number in numbers:
+            candidates.append(
+                {
+                    "issue": number,
+                    "owner": owner,
+                    "eligible_peers": peers,
+                    "reason": reason,
+                    "next_action": next_action,
+                    "reset_at": reset_at,
+                    "source": observed.get("source", ""),
+                    "session_id": observed.get("session_id", ""),
+                    "observation_id": observed.get("observation_id", ""),
+                }
+            )
+    return candidates
+
+
+def record_stranded_claims(directory: Path, candidates: list[dict]) -> None:
+    """Atomically replaces the durable exhausted-claim candidates.
+
+    Args:
+        directory: Private project state directory.
+        candidates: Complete current candidate snapshot from
+            :func:`stranded_claims`. An empty list clears stale candidates.
+
+    Raises:
+        BridgeError: If a candidate lacks the evidence recovery must verify.
+    """
+    required = {
+        "issue",
+        "owner",
+        "eligible_peers",
+        "reason",
+        "next_action",
+        "reset_at",
+        "source",
+        "session_id",
+        "observation_id",
+    }
+    for candidate in candidates:
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate) != required
+            or not isinstance(candidate.get("issue"), str)
+            or not candidate.get("owner")
+            or not isinstance(candidate.get("eligible_peers"), list)
+            or not candidate.get("source")
+            or not candidate.get("session_id")
+            or not candidate.get("observation_id")
+        ):
+            raise BridgeError("Invalid stranded capacity candidate.")
+    with lock(directory / "capacity-candidates.lock"):
+        write_json(
+            directory / "capacity-candidates.json",
+            {"version": 1, "candidates": candidates},
+        )
+
+
+def published_stranded_claim(directory: Path, issue: str) -> dict | None:
+    """Reads the authoritative exhausted-capacity candidate for one issue.
+
+    Args:
+        directory: Private project state directory.
+        issue: Issue number to find in the current candidate snapshot.
+
+    Returns:
+        The exact persisted candidate, or None when the snapshot is absent,
+        malformed, stale-cleared, or does not include the issue.
+    """
+    try:
+        document = json.loads(
+            (directory / "capacity-candidates.json").read_text()
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or document.get("version") != 1:
+        return None
+    candidates = document.get("candidates")
+    if not isinstance(candidates, list):
+        return None
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and candidate.get("issue") == issue
+        ),
+        None,
+    )
 
 
 def idle_seconds(directory: Path, name: str) -> int:
@@ -618,7 +914,11 @@ def published_work(directory: Path, name: str) -> dict:
         The published record, or an unknown result when the supervisor has
         published nothing for this lane yet.
     """
-    unknown = {**UNKNOWN_FIT, "checks": dict(UNKNOWN_FIT["checks"])}
+    unknown = {
+        **UNKNOWN_FIT,
+        "checks": dict(UNKNOWN_FIT["checks"]),
+        "capacity": dict(UNKNOWN_CAPACITY),
+    }
     try:
         record = json.loads((directory / f"{name}-work.json").read_text())
     except (OSError, ValueError):
