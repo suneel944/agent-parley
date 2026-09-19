@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         gemini,
         history,
         inbound,
+        lifecycle,
         metrics,
         notify,
         opencode,
@@ -99,6 +100,7 @@ DEFERRED_MODULES = (
     "gemini",
     "history",
     "inbound",
+    "lifecycle",
     "metrics",
     "notify",
     "opencode",
@@ -3732,6 +3734,7 @@ class Bridge:
         participant = data["participants"][name]
         with lock(directory / f"{name}.session.lock", session_busy(name)):
             self._require_approval(directory, data, name, "merge")
+            claim = held_claim(directory, name)
             if data["verify"]:
                 verify_base(root, data["verify"])
             merged = merge_branch(
@@ -3740,13 +3743,29 @@ class Bridge:
                 name,
                 participant["branch"],
             )
+            integrated = git(root, "rev-parse", "HEAD")
+            if data["verify"]:
+                verify_base(root, data["verify"], integrated=True)
+                if git(root, "rev-parse", "HEAD") != integrated:
+                    raise BridgeError(
+                        "The base commit changed while verification ran; "
+                        "the integration stands but is not recorded complete."
+                    )
+            if claim["issue"] is not None and claim["claim_id"]:
+                lifecycle.complete(
+                    directory,
+                    str(claim["issue"]),
+                    claim["claim_id"],
+                    integrated,
+                    data["verify"],
+                )
             metrics.record_report(
                 directory,
                 name,
                 {
                     "kind": "integration",
                     "action": "merge",
-                    **held_claim(directory, name),
+                    **claim,
                 },
             )
             return merged
@@ -4001,15 +4020,6 @@ class Bridge:
                 continue
             merged.append(name)
             report.append(f"- {name}: {outcome}")
-            if not data["verify"]:
-                continue
-            try:
-                verify_base(root, data["verify"], integrated=True)
-            except BridgeError as failure:
-                stopped = name
-                report.append(
-                    f"- {name} is integrated but unverified. {failure}"
-                )
         report.append(
             f"Integrated {len(merged)} of {len(sequence)} lanes: "
             + (", ".join(merged) or "none")
@@ -4694,6 +4704,7 @@ attempt of the recorded budget, which is also only reported.
         data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         agent = roster.resolve(data, lane)
+        commit = git(lane, "rev-parse", "HEAD")
         if outcome in ("partial", "blocked") and not remaining.strip():
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
@@ -4748,6 +4759,13 @@ attempt of the recorded budget, which is also only reported.
                     {"state": outcome},
                 )
             write_json(path, state)
+        lifecycle.record_report(
+            directory,
+            agent,
+            outcome,
+            commit,
+            remaining,
+        )
         held = snapshot(directory)["issues"]
         claimed = sorted(
             (

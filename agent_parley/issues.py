@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_parley import attachments, retries
+from agent_parley import attachments, lifecycle, retries
 from agent_parley.state import BridgeError, lock, write_json
 
 MAX_BLOCKERS = 10
@@ -74,11 +74,10 @@ def released(record: dict) -> bool:
     """Reports whether an issue carries an explicit release or completion.
 
     The reading uses recorded transitions only. An issue reads as released
-    when its own history ends in a release, or when supervision recorded that
-    the pull request of the current ownership generation ended. An issue that
+    when its own history ends in a release or its current execution generation
+    is verified complete. A closed pull request is neither one. An issue that
     was released and claimed again reads as held, because its history no
-    longer ends in a release, and an old pull request on a reused lane branch
-    never answers for a later claim.
+    longer ends in a release.
 
     Args:
         record: Published ledger record for one issue, or an empty mapping.
@@ -89,8 +88,7 @@ def released(record: dict) -> bool:
     history = record.get("history") or []
     if history and history[-1].get("action") == "release":
         return True
-    prompt = record.get("handoff_prompt") or {}
-    return prompt.get("trigger") == "pull request ended"
+    return lifecycle.state(record)["state"] == lifecycle.COMPLETE
 
 
 def offer_source(offer: dict | None) -> str:
@@ -266,7 +264,10 @@ def holders(state: dict) -> dict[str, list[str]]:
     """
     owned: dict[str, list[str]] = {}
     for number in sorted(state.get("issues", {}), key=int):
-        owner = state["issues"][number].get("owner")
+        record = state["issues"][number]
+        owner = record.get("owner")
+        if lifecycle.state(record)["state"] == lifecycle.COMPLETE:
+            continue
         if owner:
             owned.setdefault(owner, []).append(number)
     return owned
@@ -322,6 +323,8 @@ def unclaimed(state: dict) -> list[str]:
             if not record.get("owner")
             and not record.get("offer")
             and not record.get("blocked_by")
+            and lifecycle.state(record)["authorized"]
+            and lifecycle.state(record)["state"] != lifecycle.COMPLETE
         ),
         key=lambda number: (-len(waiting.get(number, [])), int(number)),
     )
@@ -481,6 +484,7 @@ def _unseen() -> dict:
         "deadline": None,
         "attempts": 0,
         "budget": None,
+        "execution": lifecycle.initial(),
     }
 
 
@@ -777,7 +781,9 @@ def _change(
                 "attempts": 0,
                 "budget": budget or None,
                 "claim_id": uuid.uuid4().hex[:16],
+                "execution": previous.get("execution"),
             }
+            lifecycle.claimed(record, record["claim_id"])
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
@@ -792,6 +798,7 @@ def _change(
                 participants=participants,
                 budgets=budgets,
             )
+            lifecycle.authorize(record)
         elif action == "unassign":
             record = _withdraw(record, issue)
         else:
@@ -831,6 +838,7 @@ def _change(
                         budget=budgets.get("attempts") or None,
                         claim_id=uuid.uuid4().hex[:16],
                     )
+                    lifecycle.claimed(record, record["claim_id"])
                     if offer.get("attachment"):
                         record["attachment"] = offer["attachment"]
                     record["handoff"] = inherited
@@ -897,6 +905,7 @@ def _change(
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
+                    lifecycle.released(record)
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
                     if blocker in waiting:

@@ -6,10 +6,9 @@ the shape that was intended. A plan is that record: one plain TOML file the
 operator writes, applied to the ledger as the same advisory dependencies
 `issue block` records.
 
-A plan decides nothing. Applying one records edges and nothing else: it never
-claims an issue, never assigns a lane and never gates a transition. The edges
-it writes stay advisory, exactly as a hand-recorded edge is, so a plan can be
-wrong without stopping anybody.
+A plan authorizes its listed issues for automatic dispatch and records their
+advisory dependency edges. It never claims an issue or assigns a lane. The
+edges stay advisory, exactly as a hand-recorded edge is.
 """
 
 import hashlib
@@ -18,7 +17,7 @@ import time
 import tomllib
 from pathlib import Path
 
-from agent_parley import roster
+from agent_parley import lifecycle, roster
 from agent_parley.issues import MAX_BLOCKERS, parse_issue, snapshot
 from agent_parley.state import BridgeError, lock, write_json
 
@@ -295,12 +294,11 @@ def diff(directory: Path, path: Path) -> dict:
 def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
     """Records a plan's dependencies and the version that recorded them.
 
-    Applying adds edges. It never removes one, never claims an issue and never
-    assigns a lane, so an operator who narrows a plan drops the edge with
-    `issue unblock` and sees it as unlisted until then. An issue named only as
-    a blocker gains no record of its own; an issue that waits on something
-    gains an unowned record carrying its dependencies, exactly as
-    `issue block` would leave it.
+    Applying authorizes every issue the plan names and adds edges. It never
+    removes one, claims an issue or assigns a lane, so an operator who narrows
+    a plan drops the edge with `issue unblock` and sees it as unlisted until
+    then. Blockers gain queued records so dispatch can finish them before
+    their successors.
 
     Args:
         directory: Private state directory for the common repository.
@@ -318,11 +316,35 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
     with lock(directory / "issues.lock", timeout=1):
         state = snapshot(directory)
         added = []
-        for issue, blockers in sorted(document["dependencies"].items()):
+        approved = set(document["dependencies"])
+        approved.update(
+            blocker
+            for blockers in document["dependencies"].values()
+            for blocker in blockers
+        )
+        approved.update(
+            member
+            for members in document["groups"].values()
+            for member in members
+        )
+        for issue in sorted(approved, key=int):
             record = state["issues"].setdefault(
                 issue,
-                {"owner": None, "offer": None, "blocked_by": [], "history": []},
+                {
+                    "owner": None,
+                    "offer": None,
+                    "request": None,
+                    "blocked_by": [],
+                    "history": [],
+                    "deadline": None,
+                    "attempts": 0,
+                    "budget": None,
+                    "execution": lifecycle.initial(),
+                },
             )
+            lifecycle.authorize(record)
+        for issue, blockers in sorted(document["dependencies"].items()):
+            record = state["issues"][issue]
             waiting = record.get("blocked_by", [])
             for blocker in blockers:
                 if blocker not in waiting:
@@ -334,7 +356,7 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
                     "issues; drop one with issue unblock."
                 )
             record["blocked_by"] = sorted(waiting, key=int)
-        if added:
+        if approved:
             state["revision"] += 1
             write_json(directory / "issues.json", state)
     version = {
