@@ -23,7 +23,7 @@ from agent_parley import (
     server,
     store,
 )
-from agent_parley.state import write_json
+from agent_parley.state import lock, write_json
 
 ALLOW = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {}}
 DENY = {
@@ -33,6 +33,7 @@ DENY = {
 }
 STOP = {"hook_event_name": "Stop", "stop_hook_active": False}
 START = {"hook_event_name": "SessionStart", "session_id": "s1"}
+PROMPT = {"hook_event_name": "UserPromptSubmit", "prompt": "continue"}
 STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} ")
 
 
@@ -512,7 +513,7 @@ def free_slots(instance):
     return taken
 
 
-def test_a_stalled_decision_is_answered_and_frees_its_slot(
+def test_a_stalled_decision_is_held_and_frees_its_slot(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
     lane = Path(paired["lanes"]["codex"])
@@ -535,8 +536,8 @@ def test_a_stalled_decision_is_answered_and_frees_its_slot(
     monkeypatch.setattr(server, "DECISION_SECONDS", 0.2)
     monkeypatch.setattr(server.checkpoints, "serve", stalling)
     status, reply = hook.request(bridge.config["port"], token, body)
-    assert status == 503
-    assert json.loads(reply)["status"] == protocol.STALE
+    assert status == hook.DECIDING
+    assert json.loads(reply)["detail"] == server.UNDECIDED
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and free_slots(service) < server.WORKERS:
         time.sleep(0.05)
@@ -856,3 +857,146 @@ def test_no_relaunch_is_asked_for_without_a_recorded_service(
     hook.relaunch(str(bridge.home))
     assert asked == []
     assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
+
+
+def held_lock(path, release):
+    """Holds one lock from its own thread until the caller releases it."""
+    taken = threading.Event()
+
+    def hold():
+        with lock(path):
+            taken.set()
+            release.wait(30)
+
+    keeper = threading.Thread(target=hold, daemon=True)
+    keeper.start()
+    assert taken.wait(10)
+    return keeper
+
+
+def settled(directory, count, agent="codex"):
+    """Waits for the event log to hold at least the expected records."""
+    path = directory / f"{agent}-events.jsonl"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if path.exists() and len(events(directory, agent)) >= count:
+            return
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("payload", [ALLOW, PROMPT])
+def test_a_held_checkpoint_lock_defers_rather_than_denying(
+    bridge, repo, paired, service, payload
+):
+    lane = Path(paired["lanes"]["codex"])
+    release = threading.Event()
+    keeper = held_lock(lane.parent / "codex-checkpoint.lock", release)
+    try:
+        served = run_hook(
+            bridge,
+            lane.parent,
+            {**payload, "cwd": str(lane), "session_id": "s1"},
+        )
+    finally:
+        release.set()
+        keeper.join(timeout=10)
+    assert served.returncode == 0, served.stderr
+    assert json.loads(served.stdout) == {}
+    assert "deferred" in served.stderr
+    settled(lane.parent, 1)
+    assert [entry["reason_class"] for entry in events(lane.parent)] == [
+        "lock_contended"
+    ]
+
+
+def stalling(monkeypatch, seconds):
+    """Delays every served decision past the service's own deadline."""
+    served = server.checkpoints.serve
+    asked = []
+
+    def slow(home, request):
+        asked.append(request)
+        time.sleep(seconds)
+        return served(home, request)
+
+    monkeypatch.setattr(server.checkpoints, "serve", slow)
+    return asked
+
+
+@pytest.mark.parametrize("payload", [ALLOW, PROMPT])
+def test_a_decision_past_its_deadline_is_never_decided_again(
+    bridge, repo, paired, service, monkeypatch, payload
+):
+    asked = stalling(monkeypatch, server.DECISION_SECONDS + 0.5)
+    lane = Path(paired["lanes"]["codex"])
+    served = run_hook(
+        bridge, lane.parent, {**payload, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert served.returncode == 0, served.stderr
+    assert json.loads(served.stdout) == {}
+    settled(lane.parent, 1)
+    assert len(asked) == 1
+    assert len(events(lane.parent)) == 1
+
+
+def test_a_lane_stops_starting_decisions_at_the_undecided_bound(
+    bridge, repo, paired, service, monkeypatch
+):
+    asked = stalling(monkeypatch, server.DECISION_SECONDS * 4)
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    body = json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**ALLOW, "cwd": str(lane), "session_id": "s1"},
+        }
+    ).encode()
+    together = threading.Barrier(server.UNDECIDED_LIMIT + 1)
+    answers: list[int] = []
+
+    def ask():
+        together.wait(10)
+        status, _ = hook.request(
+            bridge.config["port"], identity["registration_token"], body
+        )
+        answers.append(status)
+
+    callers = [
+        threading.Thread(target=ask, daemon=True)
+        for _ in range(server.UNDECIDED_LIMIT + 1)
+    ]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(timeout=30)
+    assert answers == [hook.DECIDING] * (server.UNDECIDED_LIMIT + 1)
+    assert len(asked) == server.UNDECIDED_LIMIT
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_shell_client_leaves_a_running_decision_alone(
+    bridge, repo, paired, service, monkeypatch
+):
+    asked = stalling(monkeypatch, server.DECISION_SECONDS + 0.5)
+    lane = Path(paired["lanes"]["codex"])
+    shell = run_shell(
+        bridge, lane.parent, {**PROMPT, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert shell.returncode == 0, shell.stderr
+    assert json.loads(shell.stdout) == {}
+    settled(lane.parent, 1)
+    assert len(asked) == 1
+    assert not any(
+        entry["reason_class"] == "service_fallback"
+        for entry in events(lane.parent)
+    )
+
+
+def test_the_hook_budget_covers_the_worst_bounded_path():
+    assert (
+        hook.CONNECT_TIMEOUT
+        + server.DECISION_SECONDS
+        + checkpoints.LOCK_SECONDS
+        <= checkpoints.HOOK_TIMEOUT
+    )

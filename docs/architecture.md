@@ -789,10 +789,26 @@ escapes in a shell is where a wrong byte would quietly change what a hook
 injects or what status it exits with, so the shell never decodes one. A client
 that sends no such `Accept` header is answered with the original JSON reply.
 
-A refused connection, a timeout, a refused credential, any non-200 reply or a
-reply the client cannot frame falls back to `checkpoints.main` in the hook
-process, which records the cause as a `service_fallback` event before
-deciding; `python -m agent_parley.checkpoints` remains a valid hook command.
+A refused connection, a timeout, a refused credential, any other reply the
+client cannot use, or a reply it cannot frame falls back to `checkpoints.main`
+in the hook process, which records the cause as a `service_fallback` event
+before deciding; `python -m agent_parley.checkpoints` remains a valid hook
+command. A status the shell client already read travels into that fallback, so
+one refusal is never posted to the service twice.
+
+Status 202 is the exception, and it is not an outage. It means the service is
+still running a decision for this lane and abandoned only the reply. Such a
+decision keeps the lane's checkpoint lock and still writes the lane's activity
+file and event record, so deciding the same event again in the hook process
+would contend with it and could deny a native call over coordination work
+already in progress. The client therefore injects no context and exits
+successfully, and the service counts a lane's decisions that are past their
+deadline and starts no further decision for it beyond that bound. Contention on
+a lane's own checkpoint lock is likewise never an enforcement result: the loser
+of the bounded wait records a `lock_contended` event and degrades to no
+injection. The bounded worst case is one connection attempt, one service
+deadline and one lock wait, which is 2.75 seconds against the 3-second hook
+timeout the launcher registers.
 
 Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,

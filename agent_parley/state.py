@@ -15,6 +15,16 @@ MAX_LOG_BYTES = 262144
 MAX_LOG_RECORDS = 2000
 
 
+class LockBusy(BridgeError):
+    """Contention a current holder of the same lock caused.
+
+    A caller that cannot distinguish contention from a real operational
+    failure has to treat both as a failure, and a hook that treats
+    contention as a failure denies the native call it was deciding. This
+    names the case so a caller can wait, defer, or degrade instead.
+    """
+
+
 def write_json(path: Path, value: dict) -> None:
     """Writes private JSON using atomic replacement.
 
@@ -122,7 +132,7 @@ def lock(path: Path, busy: str = "", *, timeout: float = 0) -> Iterator[None]:
         None while the caller holds the operation lock.
 
     Raises:
-        BridgeError: If another process holds the lock.
+        LockBusy: If another process holds the lock.
     """
     with path.open("a") as stream:
         deadline = time.monotonic() + timeout
@@ -133,7 +143,7 @@ def lock(path: Path, busy: str = "", *, timeout: float = 0) -> Iterator[None]:
             except BlockingIOError:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise BridgeError(
+                    raise LockBusy(
                         busy
                         or "Another bridge operation/session owns "
                         f"{path.name}; "

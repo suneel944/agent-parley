@@ -4841,7 +4841,11 @@ reported.
             event: [
                 {
                     "hooks": [
-                        {"type": "command", "command": command, "timeout": 3}
+                        {
+                            "type": "command",
+                            "command": command,
+                            "timeout": checkpoints.HOOK_TIMEOUT,
+                        }
                     ]
                 }
             ]
