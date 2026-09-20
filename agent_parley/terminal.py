@@ -19,6 +19,7 @@ from agent_parley.state import BridgeError, lock
 
 PROMPT = "Review pending coordination messages and handoff reminders."
 MAX_WORK_PROMPT = 2_000
+SUBMIT_DELAY = 0.2
 DETACHED_ROWS = 24
 DETACHED_COLUMNS = 80
 
@@ -332,6 +333,11 @@ def run(
     states cannot receive injected text. The launcher holds the session lock
     outside this function and owns the private control socket throughout.
 
+    An admitted prompt is written first and its carriage return follows as a
+    separate delivery a short moment later. A client that reads the text and
+    the return together treats the burst as pasted input and leaves the prompt
+    unsent in its composer.
+
     Args:
         command: Native argument vector, without a shell.
         lane: Assigned participant worktree.
@@ -379,6 +385,7 @@ def run(
         wake_checkpoint = None
         wake_checkpoint_at = 0.0
         wake_retried = False
+        submit_at = 0.0
         try:
             if attached:
                 tty.setraw(0)
@@ -386,7 +393,14 @@ def run(
                 descriptors = [master, listener.fileno()]
                 if attached:
                     descriptors.append(0)
-                ready, _, _ = select.select(descriptors, [], [], 1)
+                waiting = 1.0
+                if submit_at:
+                    waiting = max(0.0, submit_at - time.monotonic())
+                ready, _, _ = select.select(descriptors, [], [], waiting)
+                if submit_at and time.monotonic() >= submit_at:
+                    submit_at = 0.0
+                    with contextlib.suppress(OSError):
+                        os.write(master, b"\r")
                 if 0 in ready:
                     entered = os.read(0, 4096)
                     if not entered:
@@ -447,7 +461,8 @@ def run(
                                     accepted = False
                                     result = "busy:stale"
                                 else:
-                                    os.write(master, (prompt + "\r").encode())
+                                    os.write(master, prompt.encode())
+                                    submit_at = time.monotonic() + SUBMIT_DELAY
                                     wake_checkpoint = checkpoint
                                     wake_checkpoint_at = time.monotonic()
                                     result = "accepted"
