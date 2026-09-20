@@ -552,11 +552,16 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
         }
     ).encode()
     deciding = checkpoints.serve
+    budget = server.DECISION_SECONDS
     release = threading.Event()
+    finished = threading.Event()
 
     def stalling(home, request):
         release.wait(20)
-        return deciding(home, request)
+        try:
+            return deciding(home, request)
+        finally:
+            finished.set()
 
     monkeypatch.setattr(server, "DECISION_SECONDS", 0.2)
     monkeypatch.setattr(server.checkpoints, "serve", stalling)
@@ -575,8 +580,10 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     assert STAMP.match(entry)
     assert f"{hook.PATH} codex undecided" in entry
     assert token not in entry
+    monkeypatch.setattr(server, "DECISION_SECONDS", budget)
     monkeypatch.setattr(server.checkpoints, "serve", deciding)
     release.set()
+    assert finished.wait(20)
     assert hook.request(bridge.config["port"], token, body)[0] == 200
 
 
