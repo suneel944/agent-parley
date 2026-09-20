@@ -243,6 +243,7 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
+| 0.11.0 | 1 | 9 |
 | 0.10.0 | 1 | 9 |
 | 0.9.1 | 1 | 9 |
 | 0.9.0 | 1 | 8 |

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/suneel944/agent-parley/compare/v0.10.0...v0.11.0) (2026-09-20)
+
+
+### Features
+
+* connect authorized work dispatch, verification, and recovery ([#323](https://github.com/suneel944/agent-parley/issues/323)) ([#326](https://github.com/suneel944/agent-parley/issues/326)) ([#327](https://github.com/suneel944/agent-parley/issues/327)) ([#328](https://github.com/suneel944/agent-parley/issues/328)) ([#332](https://github.com/suneel944/agent-parley/issues/332)) ([#333](https://github.com/suneel944/agent-parley/issues/333)) ([#334](https://github.com/suneel944/agent-parley/issues/334)) ([#335](https://github.com/suneel944/agent-parley/issues/335)) ([#336](https://github.com/suneel944/agent-parley/issues/336))
+
+### Bug fixes
+
+* close the 0.11.0 native work loop against live clients (#341) ([#332](https://github.com/suneel944/agent-parley/issues/332)) ([#333](https://github.com/suneel944/agent-parley/issues/333)) ([#335](https://github.com/suneel944/agent-parley/issues/335)) ([#336](https://github.com/suneel944/agent-parley/issues/336)) ([#340](https://github.com/suneel944/agent-parley/issues/340)) ([#342](https://github.com/suneel944/agent-parley/issues/342)) ([#343](https://github.com/suneel944/agent-parley/issues/343)) ([#344](https://github.com/suneel944/agent-parley/issues/344))
+* preserve native coordination across launch and recovery (#339) ([#336](https://github.com/suneel944/agent-parley/issues/336))
+
 ## [0.10.0](https://github.com/suneel944/agent-parley/compare/v0.9.1...v0.10.0) (2026-09-17)
 
 
