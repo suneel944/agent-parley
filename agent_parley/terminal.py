@@ -22,6 +22,7 @@ MAX_WORK_PROMPT = 2_000
 SUBMIT_DELAY = 0.2
 DETACHED_ROWS = 24
 DETACHED_COLUMNS = 80
+STRING_SEQUENCES = frozenset({ord("]"), ord("P"), ord("X"), ord("^"), ord("_")})
 
 _DETACHED_TERMINAL_QUERIES = (
     (b"\x1b[6n", b"\x1b[1;1R"),
@@ -181,9 +182,14 @@ def operator_input(entered: bytes, control: bytes = b"") -> tuple[bytes, bytes]:
     """Separates operator bytes from complete terminal control sequences.
 
     A control sequence may be split across terminal reads, while the final read
-    may also contain operator text. Only recognized CSI, SS3 and OSC sequences
-    are removed. An unknown escape prefix remains operator input so a wake
-    cannot overwrite text the detector did not understand.
+    may also contain operator text. Recognized CSI and SS3 sequences are
+    removed, as are the string sequences a terminal answers with: OSC, DCS, SOS,
+    PM and APC, each ended by a string terminator or a bell. A terminal that
+    reports its version or its capabilities answers on the operator's input
+    descriptor, and an unrecognized reply would read as a partially typed line
+    that no keystroke of the lane's own can clear. An unknown escape prefix
+    remains operator input so a wake cannot overwrite text the detector did not
+    understand.
 
     Args:
         entered: Newly read terminal bytes.
@@ -218,7 +224,7 @@ def operator_input(entered: bytes, control: bytes = b"") -> tuple[bytes, bytes]:
             if 0x40 <= data[position + 2] <= 0x7E:
                 position += 3
                 continue
-        if kind == ord("]"):
+        if kind in STRING_SEQUENCES:
             end = position + 2
             while end < len(data):
                 if data[end] == 0x07:

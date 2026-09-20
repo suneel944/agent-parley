@@ -35,6 +35,12 @@ def test_control_socket_names_fit_valid_long_participants():
         (b"\x1b[A", True, True),
         (b"\x1b", False, True),
         (b"\x1b[12;1Rtyped", False, True),
+        (b"\x1bP>|tmux 3.4\x1b\\", False, False),
+        (b"\x1bP>|tmux 3.4\x1b\\", True, True),
+        (b"\x1b_capabilities\x1b\\", False, False),
+        (b"\x1bX status\x07", False, False),
+        (b"\x1b^message\x1b\\", False, False),
+        (b"\x1bP>|tmux 3.4\x1b\\typed", False, True),
         (b"\x1bx", False, True),
         (b"abc", False, True),
         (b"abc\r", True, False),
@@ -57,6 +63,16 @@ def test_control_sequences_split_across_reads_keep_later_operator_text():
     assert operator == b"typed"
     assert control == b""
     assert terminal.pending(operator, False)
+
+
+def test_a_version_report_split_across_reads_holds_no_operator_line():
+    operator, control = terminal.operator_input(b"\x1bP>|tmux")
+    assert operator == b""
+    assert control == b"\x1bP>|tmux"
+    operator, control = terminal.operator_input(b" 3.4\x1b\\", control)
+    assert operator == b""
+    assert control == b""
+    assert terminal.pending(b"\x1bP>|tmux 3.4\x1b\\", False) is False
 
 
 def test_detached_terminal_replies_cover_native_startup_probes():
