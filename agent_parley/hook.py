@@ -4,6 +4,27 @@ Every native tool call runs one hook process, so the price this module pays
 at import sets the floor of every call. It imports only what the request
 itself needs and reaches the checkpoint engine solely on the fallback path,
 where a coordination outage is already the slower case.
+
+The native client kills a hook at the timeout the launcher registered for it,
+which is `checkpoints.HOOK_TIMEOUT` seconds, and discards whatever the hook
+had produced. Every path here is bounded so the worst case fits inside that
+budget:
+
+* Served: `CONNECT_TIMEOUT` to reach the service, then at most
+  `server.DECISION_SECONDS` until it answers with a decision or with
+  `DECIDING`. `DECIDING` ends the hook immediately with no context, so a
+  slow decision costs 0.25 + 1.5 seconds and is never repeated.
+* Outage: the connection fails within `CONNECT_TIMEOUT`, then the in-process
+  decision runs, which waits at most `checkpoints.LOCK_SECONDS` for the
+  lane's checkpoint lock.
+* Refused: the service answers a status the client cannot use. The answer
+  itself proves the service will not decide this event, so `ANSWERED_ENV`
+  carries that status into the in-process path and suppresses a second post.
+
+The largest of those is 0.25 + 1.5 + 1.0 = 2.75 seconds against a 3-second
+budget. Raising `REPLY_TIMEOUT`, `server.DECISION_SECONDS`,
+`checkpoints.LOCK_SECONDS`, or `checkpoints.HOOK_TIMEOUT` requires redoing
+this arithmetic.
 """
 
 import json
@@ -23,6 +44,8 @@ CLIENT_NAME = "hook-client.sh"
 RELAUNCH_STAMP = "relaunch.stamp"
 RELAUNCH_INTERVAL = 60.0
 HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
+ANSWERED_ENV = "AGENT_PARLEY_SERVICE_ANSWERED"
+DECIDING = 202
 
 CLIENT_SCRIPT = r"""#!/usr/bin/env bash
 export LC_ALL=C
@@ -92,7 +115,18 @@ printf 'POST @PATH@ HTTP/1.1\r\nHost: 127.0.0.1:%s\r\n'\
 
 line=""
 IFS= read -r -t @TIMEOUT@ line <&3 || decide_in_process
-[[ $line =~ ^HTTP/1\.[01][[:space:]]+200 ]] || decide_in_process
+[[ $line =~ ^HTTP/1\.[01][[:space:]]+([0-9]+) ]] || decide_in_process
+answered="${BASH_REMATCH[1]}"
+if [ "$answered" = "@DECIDING@" ]; then
+  exec 3<&- 3>&-
+  printf '{}'
+  exit 0
+fi
+if [ "$answered" != "200" ]; then
+  exec 3<&- 3>&-
+  export @ANSWERED@="$answered"
+  decide_in_process
+fi
 
 status=""
 stdout_bytes=""
@@ -149,6 +183,8 @@ def write_client(home: str, python: str) -> str:
         .replace("@PATH@", PATH)
         .replace("@ACCEPT@", RAW_REPLY)
         .replace("@TIMEOUT@", str(SHELL_TIMEOUT))
+        .replace("@DECIDING@", str(DECIDING))
+        .replace("@ANSWERED@", ANSWERED_ENV)
         .replace("@status_header@", STATUS_HEADER)
         .replace("@stdout_header@", STDOUT_HEADER)
     )
@@ -327,9 +363,26 @@ def main() -> int:
     and its recorded cause are the same ones an outage produced before. That
     path also asks for the service back when the recorded one is gone, so an
     outage heals on the next native tool call.
+
+    `DECIDING` is the exception, and it is not a failure: the service holds
+    a decision for this exact event and is still running it. Deciding the
+    event again here would contend with that decision for the lane's
+    checkpoint lock and could deny a native call over coordination work
+    already in progress, so this emits no context and succeeds instead.
+
+    A status the shell client already collected arrives in `ANSWERED_ENV`.
+    The service has answered once; asking it again would spend the rest of
+    the hook's budget on the same refusal, so that case goes straight to the
+    in-process decision.
     """
     raw = sys.stdin.read(MAX_INPUT_BYTES)
     selected = options(sys.argv[1:])
+    if refused := os.environ.get(ANSWERED_ENV, ""):
+        return fallback(
+            raw,
+            f"service answered {refused}",
+            selected.get("home", ""),
+        )
     try:
         directory = selected["directory"]
         participant = selected["participant"]
@@ -349,6 +402,9 @@ def main() -> int:
             if name in selected:
                 body[name] = selected[name]
         status, reply = request(port, str(token), json.dumps(body).encode())
+        if status == DECIDING:
+            sys.stdout.write("{}\n")
+            return 0
         if status != 200:
             raise OSError(f"service answered {status}")
         served = json.loads(reply)

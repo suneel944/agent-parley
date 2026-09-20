@@ -35,6 +35,12 @@ def test_control_socket_names_fit_valid_long_participants():
         (b"\x1b[A", True, True),
         (b"\x1b", False, True),
         (b"\x1b[12;1Rtyped", False, True),
+        (b"\x1bP>|tmux 3.4\x1b\\", False, False),
+        (b"\x1bP>|tmux 3.4\x1b\\", True, True),
+        (b"\x1b_capabilities\x1b\\", False, False),
+        (b"\x1bX status\x07", False, False),
+        (b"\x1b^message\x1b\\", False, False),
+        (b"\x1bP>|tmux 3.4\x1b\\typed", False, True),
         (b"\x1bx", False, True),
         (b"abc", False, True),
         (b"abc\r", True, False),
@@ -57,6 +63,16 @@ def test_control_sequences_split_across_reads_keep_later_operator_text():
     assert operator == b"typed"
     assert control == b""
     assert terminal.pending(operator, False)
+
+
+def test_a_version_report_split_across_reads_holds_no_operator_line():
+    operator, control = terminal.operator_input(b"\x1bP>|tmux")
+    assert operator == b""
+    assert control == b"\x1bP>|tmux"
+    operator, control = terminal.operator_input(b" 3.4\x1b\\", control)
+    assert operator == b""
+    assert control == b""
+    assert terminal.pending(b"\x1bP>|tmux 3.4\x1b\\", False) is False
 
 
 def test_detached_terminal_replies_cover_native_startup_probes():
@@ -236,6 +252,56 @@ def test_wake_transport_respects_native_activity(activity, expected):
             assert child.returncode == 0, error
             assert ("RECEIVED:" + terminal.PROMPT).encode() in output
             assert not (directory / "lane-wake.sock").exists()
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_an_admitted_prompt_submits_after_its_text():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        script = (
+            "import os, sys, tty\ntty.setraw(0)\n"
+            "print('READY', flush=True)\nseen = b''\n"
+            "while b'\\r' not in seen:\n"
+            "    chunk = os.read(0, 4096)\n"
+            "    seen += chunk\n"
+            "    print('CHUNK:' + repr(chunk), flush=True)\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False))"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", harness, str(lane), script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert b"READY" in child.stdout.readline()
+            assert terminal.request(directory, "lane") == "accepted"
+            output, error = child.communicate(timeout=10)
+            assert child.returncode == 0, error
+            chunks = [
+                line.split("CHUNK:", 1)[1]
+                for line in output.decode().splitlines()
+                if line.startswith("CHUNK:")
+            ]
+            assert chunks[-1] == repr(b"\r")
+            assert terminal.PROMPT in "".join(chunks[:-1])
+            assert "\\r" not in "".join(chunks[:-1])
         finally:
             if child.poll() is None:
                 child.kill()

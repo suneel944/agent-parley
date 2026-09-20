@@ -29,6 +29,7 @@ from agent_parley.state import BridgeError
 STOP_TIMEOUT = 10
 POLL_INTERVAL = 0.05
 PS_TIMEOUT = 5
+ANCESTRY_LIMIT = 8
 
 PsReader = Callable[[str, int], str]
 
@@ -102,6 +103,19 @@ def linux_foreground_pid(pid: int) -> int:
     if foreground <= 1:
         raise ProcessLookupError(f"Process {pid} has no foreground terminal.")
     return foreground
+
+
+def linux_parent_pid(pid: int) -> int:
+    """Reads the parent of a Linux process.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        Process ID of the parent, which is 0 for a reaped ancestry.
+    """
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    return int(fields[1])
 
 
 def linux_matches_command(pid: int, home: Path) -> bool:
@@ -280,6 +294,23 @@ def darwin_foreground_pid(reader: PsReader, pid: int) -> int:
     return foreground
 
 
+def darwin_parent_pid(reader: PsReader, pid: int) -> int:
+    """Reads the parent of a macOS process.
+
+    Args:
+        reader: Reads one ``ps`` field for a process ID.
+        pid: Process ID to inspect.
+
+    Returns:
+        Process ID of the parent, which is 0 for a reaped ancestry.
+    """
+    value = reader("ppid=", pid)
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
 def darwin_matches_command(reader: PsReader, pid: int, home: Path) -> bool:
     """Compares a macOS command line with the expected server launch.
 
@@ -355,6 +386,8 @@ class Platform(NamedTuple):
     Attributes:
         start_ticks: Returns a process's recorded creation identity.
         foreground_pid: Returns a hook's foreground terminal process group.
+        parent_pid: Returns a process's parent, for walking a hook's
+            ancestry when it has no controlling terminal.
         running: Reports whether a process ID currently exists.
         matches_command: Reports whether a process runs this server for
             a given private state directory.
@@ -364,6 +397,7 @@ class Platform(NamedTuple):
 
     start_ticks: Callable[[int], str]
     foreground_pid: Callable[[int], int]
+    parent_pid: Callable[[int], int]
     running: Callable[[int], bool]
     matches_command: Callable[[int, Path], bool]
     terminate: Callable[[int, str], None]
@@ -378,6 +412,7 @@ def linux_platform() -> Platform:
     return Platform(
         start_ticks=linux_start_ticks,
         foreground_pid=linux_foreground_pid,
+        parent_pid=linux_parent_pid,
         running=linux_running,
         matches_command=linux_matches_command,
         terminate=linux_terminate,
@@ -397,6 +432,7 @@ def darwin_platform(reader: PsReader = read_ps_field) -> Platform:
     return Platform(
         start_ticks=functools.partial(darwin_start_ticks, reader),
         foreground_pid=functools.partial(darwin_foreground_pid, reader),
+        parent_pid=functools.partial(darwin_parent_pid, reader),
         running=darwin_running,
         matches_command=functools.partial(darwin_matches_command, reader),
         terminate=functools.partial(darwin_terminate, reader),
@@ -614,6 +650,55 @@ def foreground_process(hook_pid: int | None) -> ServerProcess | None:
         ticks = PLATFORM.start_ticks(pid)
         if PLATFORM.running(pid):
             return ServerProcess(pid, ticks)
+    except (OSError, IndexError, ValueError, TypeError):
+        pass
+    return None
+
+
+def launched_process(
+    hook_pid: int | None, launcher_pid: object, launcher_ticks: object
+) -> ServerProcess | None:
+    """Identifies the native session a recorded launcher started.
+
+    A provider that starts its hooks with no controlling terminal leaves
+    ``foreground_process`` nothing to read, and a lane with no recorded
+    session identity is never eligible for work. The launcher's own
+    identity is recorded when it starts the native client, and the client
+    is its direct child, so walking a hook's ancestry to the process whose
+    parent is that launcher names the same session without a terminal.
+
+    The launcher's creation identity is rechecked before the walk, so a
+    recycled process ID cannot adopt a hook, and the ancestry walk is
+    bounded, so a long or looping chain cannot hold the hook.
+
+    Args:
+        hook_pid: Process ID of the generated hook client while it waits
+            for the checkpoint response.
+        launcher_pid: Process ID the launcher recorded for itself.
+        launcher_ticks: Creation ticks the launcher recorded for itself.
+
+    Returns:
+        Verified native process identity, or ``None`` when no ancestor of
+        the hook is a child of that launcher.
+    """
+    if type(hook_pid) is not int or hook_pid <= 1:
+        return None
+    if type(launcher_pid) is not int or launcher_pid <= 1:
+        return None
+    try:
+        if PLATFORM.start_ticks(launcher_pid) != launcher_ticks:
+            return None
+        pid = hook_pid
+        for _ in range(ANCESTRY_LIMIT):
+            parent = PLATFORM.parent_pid(pid)
+            if parent == launcher_pid:
+                ticks = PLATFORM.start_ticks(pid)
+                if PLATFORM.running(pid):
+                    return ServerProcess(pid, ticks)
+                return None
+            if parent <= 1:
+                return None
+            pid = parent
     except (OSError, IndexError, ValueError, TypeError):
         pass
     return None

@@ -1376,8 +1376,11 @@ Lanes launched before wake sockets were introduced require relaunching. A live
 native session started outside `agent-parley run` has no wake socket. Exit that
 session and launch it through `agent-parley run` before automatic waking can
 reach it. Generated hooks record the native foreground process identity when
-the operating system exposes one. If they cannot, the lane remains `unknown`
-rather than being resumed into a possibly live session. An unavailable adapter
+the operating system exposes one, and otherwise the client the lane's recorded
+launcher started, so a provider that gives its hooks no controlling terminal
+still leaves a lane eligible for work. If neither reading establishes an
+identity, the lane remains `unknown` rather than being resumed into a possibly
+live session. An unavailable adapter
 or socket is reported for manual attention.
 Waking never marks mail read, acknowledges it, releases reservations or
 transfers an issue.

@@ -19,8 +19,10 @@ from agent_parley.state import BridgeError, lock
 
 PROMPT = "Review pending coordination messages and handoff reminders."
 MAX_WORK_PROMPT = 2_000
+SUBMIT_DELAY = 0.2
 DETACHED_ROWS = 24
 DETACHED_COLUMNS = 80
+STRING_SEQUENCES = frozenset({ord("]"), ord("P"), ord("X"), ord("^"), ord("_")})
 
 _DETACHED_TERMINAL_QUERIES = (
     (b"\x1b[6n", b"\x1b[1;1R"),
@@ -180,9 +182,14 @@ def operator_input(entered: bytes, control: bytes = b"") -> tuple[bytes, bytes]:
     """Separates operator bytes from complete terminal control sequences.
 
     A control sequence may be split across terminal reads, while the final read
-    may also contain operator text. Only recognized CSI, SS3 and OSC sequences
-    are removed. An unknown escape prefix remains operator input so a wake
-    cannot overwrite text the detector did not understand.
+    may also contain operator text. Recognized CSI and SS3 sequences are
+    removed, as are the string sequences a terminal answers with: OSC, DCS, SOS,
+    PM and APC, each ended by a string terminator or a bell. A terminal that
+    reports its version or its capabilities answers on the operator's input
+    descriptor, and an unrecognized reply would read as a partially typed line
+    that no keystroke of the lane's own can clear. An unknown escape prefix
+    remains operator input so a wake cannot overwrite text the detector did not
+    understand.
 
     Args:
         entered: Newly read terminal bytes.
@@ -217,7 +224,7 @@ def operator_input(entered: bytes, control: bytes = b"") -> tuple[bytes, bytes]:
             if 0x40 <= data[position + 2] <= 0x7E:
                 position += 3
                 continue
-        if kind == ord("]"):
+        if kind in STRING_SEQUENCES:
             end = position + 2
             while end < len(data):
                 if data[end] == 0x07:
@@ -332,6 +339,11 @@ def run(
     states cannot receive injected text. The launcher holds the session lock
     outside this function and owns the private control socket throughout.
 
+    An admitted prompt is written first and its carriage return follows as a
+    separate delivery a short moment later. A client that reads the text and
+    the return together treats the burst as pasted input and leaves the prompt
+    unsent in its composer.
+
     Args:
         command: Native argument vector, without a shell.
         lane: Assigned participant worktree.
@@ -379,6 +391,7 @@ def run(
         wake_checkpoint = None
         wake_checkpoint_at = 0.0
         wake_retried = False
+        submit_at = 0.0
         try:
             if attached:
                 tty.setraw(0)
@@ -386,7 +399,14 @@ def run(
                 descriptors = [master, listener.fileno()]
                 if attached:
                     descriptors.append(0)
-                ready, _, _ = select.select(descriptors, [], [], 1)
+                waiting = 1.0
+                if submit_at:
+                    waiting = max(0.0, submit_at - time.monotonic())
+                ready, _, _ = select.select(descriptors, [], [], waiting)
+                if submit_at and time.monotonic() >= submit_at:
+                    submit_at = 0.0
+                    with contextlib.suppress(OSError):
+                        os.write(master, b"\r")
                 if 0 in ready:
                     entered = os.read(0, 4096)
                     if not entered:
@@ -447,7 +467,8 @@ def run(
                                     accepted = False
                                     result = "busy:stale"
                                 else:
-                                    os.write(master, (prompt + "\r").encode())
+                                    os.write(master, prompt.encode())
+                                    submit_at = time.monotonic() + SUBMIT_DELAY
                                     wake_checkpoint = checkpoint
                                     wake_checkpoint_at = time.monotonic()
                                     result = "accepted"

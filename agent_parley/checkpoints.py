@@ -17,7 +17,7 @@ from types import ModuleType
 
 from agent_parley import policy, process, protocol, roster, store
 from agent_parley.issues import describe, snapshot
-from agent_parley.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
 MAX_CONTEXT_BYTES = 1536
 MAX_CAUSE_BYTES = 200
@@ -25,6 +25,8 @@ MAX_EVENT_LOG_BYTES = 262144
 MAX_EVENT_LOG_AGE = 1209600
 EVENT_LOCK_TIMEOUT = 2.0
 EVENT_LOCK_POLL = 0.01
+LOCK_SECONDS = 1.0
+HOOK_TIMEOUT = 3
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
         "-C",
@@ -107,6 +109,7 @@ class Reason(StrEnum):
     SERVICE_FALLBACK = "service_fallback"
     NOTIFICATION_FAILED = "notification_failed"
     STALE_GENERATION = "stale_generation"
+    LOCK_CONTENDED = "lock_contended"
 
 
 def decision_of(output: dict | None) -> str:
@@ -1247,6 +1250,41 @@ def paused_output(event: str) -> dict | None:
     return None
 
 
+def native_process(
+    directory: Path, agent: str, hook_pid: object
+) -> process.ServerProcess | None:
+    """Names the native session a hook event came from.
+
+    A hook that keeps its controlling terminal identifies its session by
+    the terminal's foreground group. A provider that starts hooks without
+    one leaves that reading empty, and a lane with no recorded session
+    identity is never eligible for work, so the launcher's own recorded
+    identity is used to find the client it started instead.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        hook_pid: Process ID the hook client reported for itself.
+
+    Returns:
+        Verified native process identity, or None when neither reading
+        establishes one.
+    """
+    pid = hook_pid if type(hook_pid) is int else None
+    session = process.foreground_process(pid)
+    if session is not None:
+        return session
+    try:
+        state = json.loads((directory / f"{agent}-activity.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return process.launched_process(
+        pid, state.get("launcher_pid"), state.get("launcher_ticks")
+    )
+
+
 def checkpoint(
     home: Path,
     directory: Path,
@@ -1311,7 +1349,7 @@ def checkpoint(
         )
     except subprocess.TimeoutExpired as exc:
         message = f"Git branch inspection timed out after {exc.timeout}s."
-        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+        with lock(directory / f"{agent}-checkpoint.lock", timeout=LOCK_SECONDS):
             state = activity(directory, agent)
             state.update(
                 updated=time.time(), event=event, checkpoint_error=message
@@ -1351,7 +1389,7 @@ def checkpoint(
         return {}
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
     state_path = directory / f"{agent}-activity.json"
-    with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=LOCK_SECONDS):
         state = (
             json.loads(state_path.read_text()) if state_path.exists() else {}
         )
@@ -1657,6 +1695,14 @@ def serve(home: Path, request: dict) -> dict:
     The non-native adapters are imported here so only the adapter a lane
     selected is loaded.
 
+    Contention on the lane's own checkpoint lock is not an enforcement
+    result. Another holder of that lock is coordination work in progress,
+    not a reason to block a prompt or deny a tool call, so the loser of the
+    bounded wait degrades to no context injection and exits successfully.
+    It writes its own record first, because the ledger is where a denial or
+    a deferral is counted afterwards and the winner records only its own
+    decision.
+
     Args:
         home: Private bridge state root.
         request: ``directory``, ``participant`` and ``payload`` as the hook
@@ -1707,13 +1753,31 @@ def serve(home: Path, request: dict) -> dict:
             from agent_parley import amp as adapter
         if adapter is not None:
             payload = adapter.payload(payload)
-        session_process = process.foreground_process(request.get("hook_pid"))
+        session_process = native_process(
+            directory, participant, request.get("hook_pid")
+        )
         output = checkpoint(
             home, directory, participant, payload, session_process
         )
         if adapter is not None:
             output = adapter.response(output)
         return {"status": 0, "stdout": json.dumps(output) + "\n", "stderr": ""}
+    except LockBusy as exc:
+        if isinstance(payload, dict):
+            record(
+                directory,
+                participant,
+                payload,
+                Reason.LOCK_CONTENDED,
+                None,
+                "",
+                str(exc),
+            )
+        return {
+            "status": 0,
+            "stdout": "{}\n",
+            "stderr": f"Agent Parley checkpoint deferred: {exc}\n",
+        }
     except (OSError, ValueError, KeyError, BridgeError) as exc:
         stderr = f"Agent Parley checkpoint failed: {exc}\n"
         if isinstance(payload, dict) and payload.get("hook_event_name") in (

@@ -38,7 +38,12 @@ REVISION_SECONDS = 2.0
 LOG_NAME = "server.log"
 WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
+UNDECIDED_LIMIT = 2
 REFUSAL_SECONDS = 5.0
+UNDECIDED = (
+    "A decision for this lane is still running; this event was answered "
+    "without context injection so the running decision is not repeated."
+)
 SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 DRIFTED = (
     "Sources changed under the running service; it is answering from a "
@@ -344,6 +349,7 @@ class Server(ThreadingHTTPServer):
         self.reading = threading.Lock()
         self.stopping = threading.Event()
         self.counting = threading.Lock()
+        self.deciding: dict[str, int] = {}
         self.refusals = 0
         self.reported: float | None = None
         super().__init__(("127.0.0.1", config["port"]), Handler)
@@ -751,14 +757,28 @@ class Handler(BaseHTTPRequestHandler):
     def _decide(self, request: dict, participant: str) -> dict | None:
         """Produces one hook decision under a deadline of its own.
 
-        The client stops reading after `hook.REPLY_TIMEOUT` and decides in
-        process, so a decision still running shortly before that is worth
-        nothing to it. A checkpoint that stalls on a Git subprocess or a busy
-        store is therefore answered with the status a stopped service already
-        sends, which is the fallback path the client handles, and the worker
-        slot is released with the reply rather than held for as long as the
-        stall lasts. The stalled decision finishes on its own thread, where
-        it holds nothing this service counts.
+        The client stops reading after `hook.REPLY_TIMEOUT`, so a decision
+        still running shortly before that is worth nothing to it. A
+        checkpoint that stalls on a Git subprocess or a busy store is
+        therefore abandoned at the deadline and the worker slot is released
+        with the reply rather than held for as long as the stall lasts.
+
+        An abandoned decision is not finished work. It keeps running on its
+        own thread, and it still holds the lane's checkpoint lock, still
+        writes the lane's activity file, and still appends the lane's event
+        record when it completes. Answering the client as though the service
+        were unavailable used to make it ask again, which started a second
+        decision for the same event, and the two then contended for that
+        lock until one of them lost and denied a native call. Expiry is
+        therefore answered with `hook.DECIDING`, which tells the client the
+        decision is held here: it emits no context and exits successfully
+        rather than repeating the event.
+
+        The abandoned decisions of a lane are counted for the same reason.
+        A lane already at `UNDECIDED_LIMIT` is answered without starting
+        another decision, so a host slow enough to expire every decision
+        costs a bounded number of threads and lock waiters instead of one
+        per native event.
 
         Args:
             request: Hook request the credential was accepted for.
@@ -766,7 +786,8 @@ class Handler(BaseHTTPRequestHandler):
 
         Returns:
             The decision, or None once the client has been answered because
-            the decision failed or ran past its deadline.
+            the decision failed, was already running, or ran past its
+            deadline.
         """
         outcome: dict = {}
 
@@ -776,7 +797,27 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["served"] = checkpoints.serve(self.server.home, request)
             except Exception:
                 outcome["failed"] = traceback.format_exc()
+            finally:
+                with self.server.counting:
+                    remaining = self.server.deciding.get(participant, 1) - 1
+                    if remaining > 0:
+                        self.server.deciding[participant] = remaining
+                    else:
+                        self.server.deciding.pop(participant, None)
 
+        with self.server.counting:
+            undecided = self.server.deciding.get(participant, 0)
+            if undecided >= UNDECIDED_LIMIT:
+                log(
+                    self.server.home,
+                    "undecided",
+                    f"{self.path} {participant} already has {undecided} "
+                    "decisions past their deadline; answered without "
+                    "starting another",
+                )
+                self._reply(hook.DECIDING, {"detail": UNDECIDED})
+                return None
+            self.server.deciding[participant] = undecided + 1
         worker = threading.Thread(target=decide, daemon=True)
         worker.start()
         worker.join(DECISION_SECONDS)
@@ -795,9 +836,9 @@ class Handler(BaseHTTPRequestHandler):
             self.server.home,
             "expired",
             f"{self.path} {participant} undecided after "
-            f"{DECISION_SECONDS} seconds; answered as unavailable",
+            f"{DECISION_SECONDS} seconds; answered as still deciding",
         )
-        self._reply(503, {"status": protocol.STALE, "detail": DRIFTED})
+        self._reply(hook.DECIDING, {"detail": UNDECIDED})
         return None
 
     def _raw_hook(self, served: dict) -> None:
