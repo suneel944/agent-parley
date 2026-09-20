@@ -5,7 +5,10 @@ description: Inspect Agent Parley status, claim repository issues, and manage ex
 
 # Agent Parley coordination
 
-Use the installed `agent-parley` executable. Honor `AGENT_PARLEY_HOME` when set;
+In a launcher-managed session, use the exact Agent Parley CLI prefix supplied
+by the injected protocol for every shell command; it pins the launcher's
+running installation. The bare `agent-parley` examples below are shorthand
+only when no launcher prefix was supplied. Honor `AGENT_PARLEY_HOME` when set;
 all participants must use the same private state root.
 
 Start with `agent-parley status`, `agent-parley participant list`, and
@@ -117,9 +120,12 @@ command is already tracked, and tell me if someone is holding it."
   `handoff`, naming the lane the work came from. Do not re-reserve a key the
   acceptance already moved. A decline or a cancel moves nothing: every key
   stays with the lane that offered.
-- The owner can `agent-parley issue cancel NUMBER` to retain responsibility or
-  `agent-parley issue release NUMBER` when responsibility ends. Silence and process
-  exits never transfer ownership. Release is not GitHub issue closure or completion.
+- The owner can `agent-parley issue cancel NUMBER` to retain responsibility.
+  Release unfinished responsibility with `agent-parley issue release NUMBER`
+  only after a partial or blocked report. Keep ready work claimed through
+  verified integration; never release it after a ready report. Silence and
+  process exits never transfer ownership. Release is not GitHub issue closure
+  or completion.
 
 Attribution is refused everywhere: a commit, merge, tag or pull request that
 credits an assistant, names a vendor or model in an authorship position, or

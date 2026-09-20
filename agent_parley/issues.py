@@ -939,6 +939,7 @@ def _change(
                     _drop_offer(directory, record)
                     record["offer"] = None
                 elif action == "release":
+                    lifecycle.released(record)
                     attachments.remove(directory, record.get("attachment", ""))
                     record.pop("attachment", None)
                     inherited = record.pop("handoff", None) or {}
@@ -946,7 +947,6 @@ def _change(
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
-                    lifecycle.released(record)
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
                     if blocker in waiting:

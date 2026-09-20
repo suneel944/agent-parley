@@ -59,6 +59,76 @@ def test_control_sequences_split_across_reads_keep_later_operator_text():
     assert terminal.pending(operator, False)
 
 
+def test_detached_terminal_replies_cover_native_startup_probes():
+    replies, control = terminal.detached_terminal_replies(
+        b"\x1b[6n\x1b]10;?\x1b\\\x1b]11;?\x07\x1b[?u\x1b[c"
+    )
+
+    assert replies == (
+        b"\x1b[1;1R"
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"
+        b"\x1b]11;rgb:0000/0000/0000\x07"
+        b"\x1b[?1;2c"
+    )
+    assert control == b""
+
+
+def test_detached_terminal_replies_reassemble_split_queries():
+    replies, control = terminal.detached_terminal_replies(b"\x1b]10;?")
+    assert replies == b""
+    assert control == b"\x1b]10;?"
+
+    replies, control = terminal.detached_terminal_replies(b"\x1b\\", control)
+    assert replies == b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"
+    assert control == b""
+
+
+def test_detached_launcher_supplies_terminal_responses_and_window_size():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        script = (
+            "import os, signal, tty\n"
+            "signal.alarm(5)\n"
+            "tty.setraw(0)\n"
+            "size = os.get_terminal_size(0)\n"
+            "assert (size.lines, size.columns) == (24, 80), size\n"
+            "os.write(1, b'\\x1b[6n\\x1b]10;?\\x1b\\\\'"
+            " b'\\x1b]11;?\\x1b\\\\\\x1b[?u\\x1b[c')\n"
+            "reply = b''\n"
+            "while b'\\x1b[?1;2c' not in reply:\n"
+            "    reply += os.read(0, 4096)\n"
+            "assert b'\\x1b[1;1R' in reply, reply\n"
+            "assert b'\\x1b]10;rgb:ffff/ffff/ffff\\x1b\\\\' in reply\n"
+            "assert b'\\x1b]11;rgb:0000/0000/0000\\x1b\\\\' in reply\n"
+            "assert b'\\x1b[?0u' not in reply, reply\n"
+            "signal.alarm(0)\n"
+            "print('READY', flush=True)\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False))"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", harness, str(lane), script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            output, error = child.communicate(timeout=10)
+            assert child.returncode == 0, error
+            assert b"READY" in output
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
 def test_attached_launcher_admits_a_wake_after_a_cursor_report():
     with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
         directory = Path(temporary)
