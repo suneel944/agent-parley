@@ -351,8 +351,12 @@ A lane's session state follows a recorded session process identity, matched by
 process ID and the creation time the kernel recorded for it, never its session
 lock. The managed launcher records its child directly. Generated hooks can also
 derive the native foreground process group from their controlling terminal;
-hook payloads cannot assert that identity. When neither source is available,
-presence is unknown and automatic resume is refused. The launcher holds the
+hook payloads cannot assert that identity. A provider that starts its hooks
+without a controlling terminal leaves that reading empty, so a hook whose
+terminal names nothing is instead traced up a bounded ancestry to the client
+the recorded launcher started, after the launcher's own creation identity is
+rechecked. When neither source is available, presence is unknown and automatic
+resume is refused. The launcher holds the
 session lock for the whole session, so probing it would make a concurrent launch
 fail while merely reporting. A session whose recorded process is gone reads as
 stopped.

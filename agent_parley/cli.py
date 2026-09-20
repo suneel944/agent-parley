@@ -3752,6 +3752,8 @@ class Bridge:
             state.update(activity="stopped", updated=time.time())
             state.pop("session_pid", None)
             state.pop("session_ticks", None)
+            state.pop("launcher_pid", None)
+            state.pop("launcher_ticks", None)
             write_json(path, state)
         self._record_operator(
             directory, name, checkpoints.Reason.OPERATOR_STOPPED, "stopped"
@@ -7043,6 +7045,8 @@ reported.
                 cursor=0,
                 session_pid=os.getpid(),
                 session_ticks=process.start_ticks(os.getpid()),
+                launcher_pid=os.getpid(),
+                launcher_ticks=process.start_ticks(os.getpid()),
                 session_started=time.time(),
             )
             previous.pop("last_prompt", None)

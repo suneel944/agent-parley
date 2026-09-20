@@ -209,6 +209,31 @@ def test_session_start_preserves_a_live_launcher_process(
     assert state["session_ticks"] == native.ticks
 
 
+def test_a_hook_with_no_terminal_records_the_launched_session(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    launcher = os.getpid()
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "",
+            "launcher_pid": launcher,
+            "launcher_ticks": process.start_ticks(launcher),
+        },
+    )
+    monkeypatch.setattr(
+        checkpoints.process, "foreground_process", lambda hook_pid: None
+    )
+    started = run_hook(bridge, directory, {**START, "cwd": str(lane)})
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert type(state["session_pid"]) is int
+    assert state["session_pid"] not in (launcher, 0)
+    assert state["session_ticks"]
+
+
 def test_new_session_clears_an_unrelated_live_process(
     bridge, repo, paired, service, monkeypatch
 ):

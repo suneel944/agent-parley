@@ -271,6 +271,7 @@ def test_process_platform_is_chosen_once_for_the_running_system():
     linux = process.platform_for("linux")
     assert linux.start_ticks is process.linux_start_ticks
     assert linux.foreground_pid is process.linux_foreground_pid
+    assert linux.parent_pid is process.linux_parent_pid
     assert linux.running is process.linux_running
     assert linux.matches_command is process.linux_matches_command
     assert linux.terminate is process.linux_terminate
@@ -278,6 +279,7 @@ def test_process_platform_is_chosen_once_for_the_running_system():
     assert darwin.running is process.darwin_running
     assert darwin.start_ticks.func is process.darwin_start_ticks
     assert darwin.foreground_pid.func is process.darwin_foreground_pid
+    assert darwin.parent_pid.func is process.darwin_parent_pid
     assert darwin.terminate.func is process.darwin_terminate
     with pytest.raises(BridgeError, match="Unsupported operating system"):
         process.platform_for("win32")
@@ -295,6 +297,62 @@ def test_macos_hook_identifies_the_foreground_native_process(monkeypatch):
         native_pid, created
     )
     assert process.foreground_process(9999) is None
+
+
+@contextlib.contextmanager
+def launcher_ancestry():
+    """Starts a real client-and-hook chain below the running test process."""
+    client = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys;"
+            "hook = subprocess.Popen("
+            "[sys.executable, '-c', 'import sys, time;"
+            " sys.stdin.readline()'], stdin=subprocess.PIPE);"
+            "print(hook.pid, flush=True);"
+            "hook.wait()",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert client.stdout is not None
+        yield client.pid, int(client.stdout.readline())
+    finally:
+        client.kill()
+        client.wait()
+
+
+def test_a_hook_without_a_terminal_is_named_by_its_launcher():
+    with launcher_ancestry() as (client_pid, hook_pid):
+        launcher = os.getpid()
+        session = process.launched_process(
+            hook_pid, launcher, process.start_ticks(launcher)
+        )
+        assert session == process.ServerProcess(
+            client_pid, process.start_ticks(client_pid)
+        )
+
+
+def test_a_hook_outside_the_launcher_ancestry_names_no_session():
+    with launcher_ancestry() as (client_pid, hook_pid):
+        assert (
+            process.launched_process(
+                hook_pid, client_pid, "forged creation identity"
+            )
+            is None
+        )
+        stranger = subprocess.Popen([sys.executable, "-c", "import time"])
+        stranger.wait()
+        assert (
+            process.launched_process(
+                hook_pid, stranger.pid, process.start_ticks(os.getpid())
+            )
+            is None
+        )
+        assert process.launched_process(hook_pid, None, "") is None
+        assert process.launched_process(None, os.getpid(), "") is None
 
 
 def test_macos_identity_pins_the_recorded_creation_time(monkeypatch, tmp_path):

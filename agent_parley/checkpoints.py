@@ -1250,6 +1250,41 @@ def paused_output(event: str) -> dict | None:
     return None
 
 
+def native_process(
+    directory: Path, agent: str, hook_pid: object
+) -> process.ServerProcess | None:
+    """Names the native session a hook event came from.
+
+    A hook that keeps its controlling terminal identifies its session by
+    the terminal's foreground group. A provider that starts hooks without
+    one leaves that reading empty, and a lane with no recorded session
+    identity is never eligible for work, so the launcher's own recorded
+    identity is used to find the client it started instead.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        hook_pid: Process ID the hook client reported for itself.
+
+    Returns:
+        Verified native process identity, or None when neither reading
+        establishes one.
+    """
+    pid = hook_pid if type(hook_pid) is int else None
+    session = process.foreground_process(pid)
+    if session is not None:
+        return session
+    try:
+        state = json.loads((directory / f"{agent}-activity.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return process.launched_process(
+        pid, state.get("launcher_pid"), state.get("launcher_ticks")
+    )
+
+
 def checkpoint(
     home: Path,
     directory: Path,
@@ -1718,7 +1753,9 @@ def serve(home: Path, request: dict) -> dict:
             from agent_parley import amp as adapter
         if adapter is not None:
             payload = adapter.payload(payload)
-        session_process = process.foreground_process(request.get("hook_pid"))
+        session_process = native_process(
+            directory, participant, request.get("hook_pid")
+        )
         output = checkpoint(
             home, directory, participant, payload, session_process
         )
