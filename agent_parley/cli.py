@@ -6531,9 +6531,14 @@ reported.
             "identity": name,
             "provider": participant["provider"],
             "credential": participant["credential"],
-            "session": participant_liveness(directory, agent),
+            "session": participant_liveness(
+                directory, agent, configuration["inactive_after"]
+            ),
             "availability": {
                 "state": observed["state"],
+                "activity": observed["activity"],
+                "evidence": observed["evidence"],
+                "stale": observed["stale"],
                 "process_alive": observed["process_alive"],
                 "last_active_at": views.timestamp(observed["last_active"]),
                 "age_seconds": observed["age_seconds"],

@@ -969,33 +969,36 @@ def work_offer(directory: Path, agent: str) -> dict | None:
     return offer
 
 
-def participant_liveness(directory: Path, agent: str) -> str:
+def participant_liveness(
+    directory: Path, agent: str, inactive_after: float = 300
+) -> str:
     """Summarizes one lane's session state and last observed checkpoint.
 
     The launcher owns its lane's session lock for the whole session, so
     liveness is decided from the recorded session process instead. Probing
     that lock would make a concurrent launch fail while merely reporting.
 
+    The words come from the single lane derivation in `supervision`, so this
+    cell reports the same state as availability and the problems rows instead
+    of replaying the raw activity record as if it were current.
+
     Args:
         directory: Private state directory for the common repository.
         agent: Participant that owns the lane.
+        inactive_after: Age past which the published record reads as stale.
 
     Returns:
-        Session activity followed by the age of its last checkpoint event.
+        The derived state's evidence followed by the age of that evidence.
     """
-    state = activity(directory, agent)
-    running = process.alive(
-        state.get("session_pid"), state.get("session_ticks")
-    )
-    reported = state.get(
-        "activity", "running; checkpoints unavailable (relaunch)"
-    )
+    from agent_parley import supervision
+
+    derived = supervision.lane_state(activity(directory, agent), inactive_after)
     age = (
-        f"; event {int(time.time() - state['updated'])}s ago"
-        if state.get("updated")
+        f"; event {derived['age_seconds']}s ago"
+        if derived["last_active"]
         else ""
     )
-    return f"{reported if running else 'stopped'}{age}"
+    return f"{derived['evidence']}{age}"
 
 
 def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
