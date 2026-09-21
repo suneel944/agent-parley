@@ -20,6 +20,7 @@ STALLED = "stalled"
 INACTIVE = "inactive"
 OVERDUE = "overdue claim"
 OFFER = "unanswered offer"
+UNRESOLVED = "unresolved completion"
 ACK = "awaiting acknowledgement"
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
@@ -146,6 +147,18 @@ def _lane_rows(
                     f"issue #{claim['issue']} is past its deadline",
                     f"agent-parley issue release {claim['issue']} {repo}",
                     claim["overdue_seconds"],
+                    name,
+                    root,
+                )
+            )
+        if claim.get("unresolved"):
+            observed = claim.get("observed_at") or now
+            rows.append(
+                _row(
+                    UNRESOLVED,
+                    f"issue #{claim['issue']}: {claim.get('reason', '')}",
+                    f"agent-parley issue resolve {claim['issue']} {repo}",
+                    max(0, int(now - float(observed))),
                     name,
                     root,
                 )

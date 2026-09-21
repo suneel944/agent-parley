@@ -48,6 +48,7 @@ on standard output and export to a file.
 | `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
 | `issue assign NUMBER NAME` | Offer an issue to a lane as `operator`; `--reason` travels with the offer and `--unassign` withdraws one no lane accepted. |
+| `issue resolve NUMBER` | End a claim whose holder never filed the completion its pull request already landed, as `operator` and never as the lane. The forge is read at that moment and its pull request must have been opened inside the current claim, and the supervisor must already have escalated the claim as an unresolved completion, so an answering holder is never resolved out from under it. `--reason` is kept beside the recorded evidence, and `--release` returns the work to the queue instead, which a pull request closed without merging requires. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
