@@ -36,6 +36,16 @@ def actors(bridge):
     ]
 
 
+def expire(bridge, holder, seconds):
+    """Backdates one lane's lease deadlines by a number of seconds."""
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET expires_ts=datetime('now',?) "
+            "WHERE agent_id=? AND released_ts IS NULL",
+            (f"-{seconds} seconds", holder["id"]),
+        )
+
+
 def message(**overrides):
     """Builds a valid small message for mutation-focused tests."""
     return {
@@ -278,7 +288,7 @@ def test_a_reservation_without_a_time_to_live_never_reports_stale(
     assert mail["stale_reservations"] == 0
 
 
-def test_a_lease_past_its_time_to_live_reports_stale_and_still_blocks(
+def test_a_lease_inside_the_expiry_grace_reports_stale_and_still_blocks(
     bridge, actors
 ):
     store.call(
@@ -294,12 +304,7 @@ def test_a_lease_past_its_time_to_live_reports_stale_and_still_blocks(
     assert "stale" not in live["conflicts"][0]
     before = store.usage(bridge.home, "/project")
     assert before["GreenCastle"]["stale_leases"] == 0
-    with store.connect(bridge.home, write=True) as db:
-        db.execute(
-            "UPDATE file_reservations SET expires_ts='2000-01-01' "
-            "WHERE agent_id=?",
-            (actors[0]["id"],),
-        )
+    expire(bridge, actors[0], 60)
     expired = store.call(
         bridge.home, actors[1], "file_reservation_paths", {"paths": ["src/a"]}
     )
@@ -310,9 +315,37 @@ def test_a_lease_past_its_time_to_live_reports_stale_and_still_blocks(
     usage = store.usage(bridge.home, "/project")
     assert usage["GreenCastle"]["leases"] == 1
     assert usage["GreenCastle"]["stale_leases"] == 1
+    assert usage["GreenCastle"]["stale_lease_age"] >= 60
     mail = mailbox(bridge.home, "/project", "GreenCastle")
     assert mail["reservations"] == 1
     assert mail["stale_reservations"] == 1
+    assert mail["stale_reservation_age"] >= 60
+
+
+def test_a_lease_stale_past_the_grace_stops_blocking_and_is_released(
+    bridge, actors
+):
+    store.call(
+        bridge.home,
+        actors[0],
+        "file_reservation_paths",
+        {"paths": ["src/a"], "ttl_seconds": 30},
+    )
+    expire(bridge, actors[0], store.RESERVATION_GRACE + 1)
+    taken = store.call(
+        bridge.home, actors[1], "file_reservation_paths", {"paths": ["src/a"]}
+    )
+    assert [lease["path"] for lease in taken["granted"]] == ["src/a"]
+    assert taken["conflicts"] == []
+    usage = store.usage(bridge.home, "/project")
+    assert usage["GreenCastle"]["leases"] == 0
+    assert usage["BlueLake"]["leases"] == 1
+    notice = store.call(
+        bridge.home, actors[0], "fetch_inbox", {"include_bodies": True}
+    )["messages"][0]
+    assert notice["sender"] == "operator"
+    assert notice["subject"] == "Reservation expired and released: src/a"
+    assert "nothing on disk was locked" in notice["body_md"]
 
 
 def test_the_conflict_listing_separates_live_holders_from_stale_ones(
@@ -336,12 +369,7 @@ def test_the_conflict_listing_separates_live_holders_from_stale_ones(
         "file_reservation_paths",
         {"paths": ["src/dead.py"], "ttl_seconds": 30},
     )
-    with store.connect(bridge.home, write=True) as db:
-        db.execute(
-            "UPDATE file_reservations SET expires_ts='2000-01-01' "
-            "WHERE agent_id=?",
-            (third["id"],),
-        )
+    expire(bridge, third, 60)
     denied = store.call(
         bridge.home,
         actors[1],

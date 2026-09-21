@@ -162,8 +162,11 @@ def _compose(
     if mail["stale_reservations"]:
         parts.append(
             f"{mail['stale_reservations']} of your {mail['reservations']} "
-            "reservations are past their declared time to live. They are "
-            "still held; renew or release them."
+            "reservations are past their declared time to live, the oldest "
+            f"by {mail.get('stale_reservation_age', 0)}s. They are still "
+            "held and this checkpoint renews them; release the ones you have "
+            "finished with, or the runtime hands them to a queued peer once "
+            "this lane stops coordinating."
         )
     delivered = []
     for message in mail["messages"]:

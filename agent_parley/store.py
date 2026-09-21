@@ -23,7 +23,7 @@ from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 SCHEMA_ABSENT = "absent"
 SCHEMA_BEHIND = "needs migration"
 SCHEMA_CURRENT = "ok"
@@ -42,6 +42,7 @@ MAX_REPEATS = 24
 MAX_QUEUED_REQUESTS = 32
 MAX_NOTICE_CHARACTERS = 1000
 DEFAULT_ACK_SECONDS = 240
+RESERVATION_GRACE = 1800
 SCHEDULE_FIELDS = (
     "id",
     "kind",
@@ -126,7 +127,7 @@ CREATE TABLE IF NOT EXISTS file_reservations (
  agent_id INTEGER NOT NULL REFERENCES agents(id), path_pattern TEXT NOT NULL,
  exclusive INTEGER NOT NULL, reason TEXT DEFAULT '',
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- expires_ts TEXT, released_ts TEXT, claim_id TEXT);
+ expires_ts TEXT, released_ts TEXT, claim_id TEXT, ttl_seconds INTEGER);
 CREATE INDEX IF NOT EXISTS leases ON file_reservations(project_id,expires_ts)
  WHERE released_ts IS NULL;
 CREATE TABLE IF NOT EXISTS reservation_requests (
@@ -280,6 +281,11 @@ def initialize(home: Path) -> None:
     Upgrading a store written before the decision log marks every stored
     message as ordinary mail, so nothing a lane sent in private becomes
     project-wide by being upgraded.
+
+    Upgrading a store written before leases recorded their declared window
+    backfills that window from the distance between a lease's creation and
+    its deadline, so a renewal restores what its holder asked for rather
+    than a value this build invented.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -306,6 +312,7 @@ def initialize(home: Path) -> None:
                     _add_reservation_created(db)
                 _rebuild_reservations(db)
                 _add_claim_correlation(db)
+                _add_reservation_ttl(db)
                 _add_message_search(db)
                 legacy = home / "mail.sqlite3"
                 if version == 0 and legacy.exists():
@@ -369,6 +376,37 @@ def _add_claim_correlation(db: sqlite3.Connection) -> None:
         columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
         if "claim_id" not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN claim_id TEXT")
+
+
+def _add_reservation_ttl(db: sqlite3.Connection) -> None:
+    """Records the window a lease was taken for, where it is missing.
+
+    A renewal restores the window its holder declared rather than inventing
+    one, so the declared time to live is kept beside the deadline it produced.
+    The column is additive and nullable: a lease taken without a deadline
+    keeps none, and a lease stored before the upgrade is backfilled from the
+    distance between its creation and its deadline, which is the window it
+    was taken with.
+
+    It runs after the reservation table has been rebuilt into its current
+    shape, because that rebuild copies a fixed column list.
+
+    Args:
+        db: Open upgrade transaction owned by the caller.
+    """
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(file_reservations)")
+    }
+    if "ttl_seconds" not in columns:
+        db.execute(
+            "ALTER TABLE file_reservations ADD COLUMN ttl_seconds INTEGER"
+        )
+    db.execute(
+        "UPDATE file_reservations SET ttl_seconds="
+        "max(1,strftime('%s',expires_ts)-strftime('%s',created_ts)) "
+        "WHERE ttl_seconds IS NULL AND expires_ts IS NOT NULL "
+        "AND created_ts IS NOT NULL"
+    )
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -1310,6 +1348,155 @@ def _keys(
     return keys, ttl, exclusive, reason
 
 
+def _operator(db: sqlite3.Connection, project_id: int) -> dict:
+    """Returns the command-line operator identity of one project.
+
+    Args:
+        db: Open write transaction owned by the caller.
+        project_id: Registered project the identity belongs to.
+
+    Returns:
+        The operator identity, registered on first use, which is the sender
+        of a notice no lane composed.
+    """
+    db.execute(
+        "INSERT INTO agents(project_id,name) VALUES (?,?) "
+        "ON CONFLICT(project_id,name) DO NOTHING",
+        (project_id, OPERATOR),
+    )
+    return dict(
+        db.execute(
+            "SELECT id,project_id,name FROM agents "
+            "WHERE project_id=? AND name=?",
+            (project_id, OPERATOR),
+        ).fetchone()
+    )
+
+
+def _expired_leases(
+    db: sqlite3.Connection, project_id: int
+) -> list[sqlite3.Row]:
+    """Names the leases of one project that no longer describe live work.
+
+    A lease is reclaimable once its declared deadline has passed and either
+    the last observation of its holder found no live session process, or it
+    has been past that deadline longer than ``RESERVATION_GRACE``. The grace
+    is longer than the runtime's whole wake budget, so a holder that can be
+    woken is woken, and renews the lease from its next checkpoint, before any
+    peer takes the key. A holder never observed at all is not assumed dead:
+    only the grace reclaims its lease.
+
+    Args:
+        db: Open transaction owned by the caller.
+        project_id: Registered project whose leases are read.
+
+    Returns:
+        One row per reclaimable lease, with its holder, its key and how long
+        it has been past its deadline, in holder and key order.
+    """
+    return db.execute(
+        "SELECT f.id,f.agent_id,f.path_pattern,a.name,"
+        "max(0,unixepoch('now')-unixepoch(f.expires_ts)) AS stale_seconds "
+        "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
+        "LEFT JOIN participant_presence s ON s.agent_id=f.agent_id "
+        "WHERE f.project_id=? AND f.released_ts IS NULL "
+        "AND f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP "
+        "AND (s.process_alive=0 "
+        "OR unixepoch('now')-unixepoch(f.expires_ts)>=?) "
+        "ORDER BY a.name,f.path_pattern",
+        (project_id, RESERVATION_GRACE),
+    ).fetchall()
+
+
+def _reclaim(db: sqlite3.Connection, project_id: int) -> list[dict]:
+    """Releases expired leases nobody is working under and hands them on.
+
+    The release, the grant it enables and both notices share the caller's
+    transaction, so no reader sees a key reclaimed with its queue untouched.
+    Reservations stay advisory throughout: this changes who is told that a
+    key is free, not what the file system allows.
+
+    Args:
+        db: Open write transaction owned by the caller.
+        project_id: Registered project whose leases are swept.
+
+    Returns:
+        One entry per holder whose leases were reclaimed, naming that holder,
+        the released keys, the notice it was sent and the lanes that took the
+        keys from its queue.
+    """
+    holders: dict[str, list[sqlite3.Row]] = {}
+    for row in _expired_leases(db, project_id):
+        holders.setdefault(row["name"], []).append(row)
+    reclaimed: list[dict] = []
+    for name, leases in holders.items():
+        keys = sorted({lease["path_pattern"] for lease in leases})
+        db.execute(
+            "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+            "WHERE id IN (" + ",".join("?" * len(leases)) + ")",
+            tuple(lease["id"] for lease in leases),
+        )
+        holder = {
+            "id": leases[0]["agent_id"],
+            "project_id": project_id,
+            "name": name,
+        }
+        granted = _grant_queued(db, holder, keys, reclaimed=True)
+        subject, body = _reclaim_notice(
+            keys, max(lease["stale_seconds"] for lease in leases), granted
+        )
+        message = _send(
+            db,
+            _operator(db, project_id),
+            {
+                "to": [name],
+                "subject": subject,
+                "body_md": body,
+                "idempotency_key": (
+                    f"reservation-reclaimed-"
+                    f"{max(lease['id'] for lease in leases)}"
+                ),
+            },
+        )
+        reclaimed.append(
+            {
+                "agent": name,
+                "paths": keys,
+                "message_id": message["id"],
+                "granted": granted,
+            }
+        )
+    return reclaimed
+
+
+def _reclaim_notice(
+    keys: list[str], stale_seconds: int, granted: list[dict]
+) -> tuple[str, str]:
+    """Words the notice a holder reads when its expired leases are released.
+
+    Args:
+        keys: Keys released from that holder, in key order.
+        stale_seconds: Age of the oldest released lease past its deadline.
+        granted: Lanes that took those keys from the queue, if any.
+
+    Returns:
+        The bounded subject and body of the notice.
+    """
+    listed = ", ".join(keys)[:MAX_NOTICE_CHARACTERS]
+    took = ", ".join(entry["agent"] for entry in granted)
+    return (
+        f"Reservation expired and released: {listed}"[:160],
+        f"Your reservation of {listed} passed its declared time to live "
+        f"{stale_seconds} seconds ago and was released, because no live "
+        "session was observed for it and nothing renewed it within the "
+        f"{RESERVATION_GRACE}-second grace. "
+        + (f"{took} took it from the queue. " if took else "")
+        + "Reservations are advisory: nothing on disk was locked or "
+        "reverted, and your work is untouched. Reserve the keys again with "
+        "file_reservation_paths if you are still editing them.",
+    )
+
+
 def _conflicts(
     db: sqlite3.Connection, actor: dict, paths: list[str], exclusive: bool
 ) -> tuple[list[sqlite3.Row], list[dict]]:
@@ -1399,12 +1586,15 @@ def _reserve(
     Conflicts are reported until the response budget is reached; ``has_more``
     states that further conflicts exist beyond the reported ones.
 
-    ``ttl_seconds`` is optional. Without it the lease carries no deadline and
-    never reports as stale. With it, a lease whose deadline has passed carries
-    ``stale`` in the conflict it raises, so a reader can tell a working owner
-    from one that died holding the path. Staleness is a report: the lease is
-    not revoked, not reassigned, and blocks exactly the paths it already
-    blocked until its owner releases it.
+    ``ttl_seconds`` is optional. Without it the lease carries no deadline,
+    never reports as stale and is never reclaimed. With it, a lease whose
+    deadline has passed carries ``stale`` in the conflict it raises, so a
+    reader can tell a working owner from one that died holding the path. An
+    expired lease keeps blocking while its holder may still be working: it is
+    reclaimed only once the last observation of that holder found no live
+    session, or once it has been expired longer than ``RESERVATION_GRACE``,
+    whichever comes first. A holder that is alive renews it from its next
+    checkpoint instead.
 
     A key written with a scheme, such as ``port:5432``, ``db:local``,
     ``suite:integration`` or ``device:android-1``, reserves a named resource
@@ -1438,6 +1628,7 @@ def _reserve(
             the lane already holds the maximum number of leases.
     """
     paths, ttl, exclusive, reason = _keys(args, declared)
+    _reclaim(db, actor["project_id"])
     leases, conflicts = _conflicts(db, actor, paths, exclusive)
     if conflicts:
         return _refusal(conflicts)
@@ -1495,8 +1686,8 @@ def _grant(
         )
         cursor = db.execute(
             "INSERT INTO file_reservations(project_id,agent_id,path_pattern,"
-            "exclusive,reason,expires_ts,claim_id) VALUES (?,?,?,?,?,"
-            "datetime('now',?),?)",
+            "exclusive,reason,expires_ts,claim_id,ttl_seconds) VALUES "
+            "(?,?,?,?,?,datetime('now',?),?,?)",
             (
                 actor["project_id"],
                 actor["id"],
@@ -1505,6 +1696,7 @@ def _grant(
                 reason,
                 None if ttl is None else f"+{ttl} seconds",
                 claim or None,
+                ttl,
             ),
         )
         granted.append({"id": cursor.lastrowid, "path": pattern})
@@ -1573,6 +1765,7 @@ def _request(
             the lane already queued the maximum number of requests.
     """
     paths, ttl, exclusive, reason = _keys(args, declared)
+    _reclaim(db, actor["project_id"])
     leases, conflicts = _conflicts(db, actor, paths, exclusive)
     if not conflicts:
         granted = _grant(
@@ -1734,7 +1927,10 @@ def _release(db: sqlite3.Connection, actor: dict) -> dict:
 
 
 def _grant_queued(
-    db: sqlite3.Connection, actor: dict, released: list[str]
+    db: sqlite3.Connection,
+    actor: dict,
+    released: list[str],
+    reclaimed: bool = False,
 ) -> list[dict]:
     """Hands each released key to the lane that queued for it first.
 
@@ -1748,6 +1944,9 @@ def _grant_queued(
         db: Open transaction owned by the caller.
         actor: Authenticated project and lane, which is releasing.
         released: Keys this lane just released, in key order.
+        reclaimed: Whether the release was the runtime reclaiming expired
+            leases rather than the holder releasing them, which the notice
+            says so the taking lane knows the holder never handed over.
 
     Returns:
         One entry per lane granted something, naming that lane, the keys it
@@ -1794,8 +1993,8 @@ def _grant_queued(
         )
         db.execute(
             "INSERT INTO file_reservations(project_id,agent_id,path_pattern,"
-            "exclusive,reason,expires_ts,claim_id) VALUES (?,?,?,?,?,"
-            "datetime('now',?),?)",
+            "exclusive,reason,expires_ts,claim_id,ttl_seconds) VALUES "
+            "(?,?,?,?,?,datetime('now',?),?,?)",
             (
                 actor["project_id"],
                 request["agent_id"],
@@ -1808,6 +2007,7 @@ def _grant_queued(
                     else f"+{request['ttl_seconds']} seconds"
                 ),
                 request["claim_id"],
+                request["ttl_seconds"],
             ),
         )
         db.execute(
@@ -1821,7 +2021,7 @@ def _grant_queued(
     notices = []
     for name in sorted(taken):
         keys = taken[name]
-        subject, body = _notice(actor["name"], keys)
+        subject, body = _notice(actor["name"], keys, reclaimed)
         message = _send(
             db,
             actor,
@@ -1838,20 +2038,29 @@ def _grant_queued(
     return notices
 
 
-def _notice(holder: str, keys: list[str]) -> tuple[str, str]:
+def _notice(
+    holder: str, keys: list[str], reclaimed: bool = False
+) -> tuple[str, str]:
     """Words the one notice a lane reads when its queued keys are granted.
 
     Args:
-        holder: Lane that released the keys.
+        holder: Lane that held the keys.
         keys: Keys the reading lane now holds, in the order granted.
+        reclaimed: Whether the runtime released the keys because they were
+            expired and unworked, rather than the holder releasing them.
 
     Returns:
         The bounded subject and body of the notice.
     """
     listed = ", ".join(keys)[:MAX_NOTICE_CHARACTERS]
+    handed = (
+        f"{holder}'s reservation of {listed} expired unrenewed and was released"
+        if reclaimed
+        else f"{holder} released {listed}"
+    )
     return (
         f"Reservation granted: {listed}"[:160],
-        f"{holder} released {listed}, and your queued request for those "
+        f"{handed}, and your queued request for those "
         "keys is granted. The reservation is advisory: it records that you "
         "declared the edit, and nothing on disk is locked. Release it with "
         "release_file_reservations when the work is done.",
@@ -3481,12 +3690,13 @@ def usage(
     Returns:
         Mapping of registered identity to served calls, rejected calls,
         returned bytes, held leases, how many of those leases are past a
-        declared time to live, the age of its oldest held lease, and the
-        queued reservation requests waiting on the keys it holds with the
-        lanes that asked. A stale lease is still held and still counted;
-        nothing releases it on its owner's behalf, and a queued request
-        holds nothing of its own. Counts cover retained events only; older
-        events are retired.
+        declared time to live, the age of its oldest held lease, how long
+        the oldest expired one has been expired, and the queued reservation
+        requests waiting on the keys it holds with the lanes that asked. An
+        expired lease is counted apart from the live ones and keeps blocking
+        until it is renewed, released or reclaimed; a queued request holds
+        nothing of its own. Counts cover retained events only; older events
+        are retired.
     """
     if db is None and not (home / DATABASE).exists():
         return {}
@@ -3506,6 +3716,7 @@ def usage(
                 "leases": 0,
                 "stale_leases": 0,
                 "lease_age": 0,
+                "stale_lease_age": 0,
                 "queued": 0,
                 "queued_by": [],
             }
@@ -3518,7 +3729,10 @@ def usage(
             "coalesce(sum(f.expires_ts IS NOT NULL "
             "AND f.expires_ts<=CURRENT_TIMESTAMP),0) AS stale_leases,"
             "cast(strftime('%s','now')-strftime('%s',min(f.created_ts)) "
-            "AS INTEGER) AS lease_age FROM file_reservations f "
+            "AS INTEGER) AS lease_age,"
+            "coalesce(max(0,unixepoch('now')-unixepoch(min(CASE WHEN "
+            "f.expires_ts<=CURRENT_TIMESTAMP THEN f.expires_ts END))),0) "
+            "AS stale_lease_age FROM file_reservations f "
             "JOIN agents a ON a.id=f.agent_id "
             "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
             "AND f.released_ts IS NULL GROUP BY a.id",
@@ -3528,6 +3742,7 @@ def usage(
                 leases=row["leases"],
                 stale_leases=row["stale_leases"],
                 lease_age=max(0, row["lease_age"] or 0),
+                stale_lease_age=row["stale_lease_age"],
             )
     return report
 
@@ -3579,7 +3794,7 @@ def transfer_reservations(
         holder = _identify(db, root, source)
         receiver = _identify(db, root, target)
         held = db.execute(
-            "SELECT id,path_pattern,exclusive,reason,expires_ts "
+            "SELECT id,path_pattern,exclusive,reason,expires_ts,ttl_seconds "
             "FROM file_reservations WHERE project_id=? AND agent_id=? "
             "AND released_ts IS NULL AND path_pattern IN ("
             + ",".join("?" * len(wanted))
@@ -3595,8 +3810,8 @@ def transfer_reservations(
             )
             db.execute(
                 "INSERT INTO file_reservations(project_id,agent_id,"
-                "path_pattern,exclusive,reason,expires_ts,claim_id) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "path_pattern,exclusive,reason,expires_ts,claim_id,"
+                "ttl_seconds) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     receiver["project_id"],
                     receiver["id"],
@@ -3605,6 +3820,7 @@ def transfer_reservations(
                     lease["reason"],
                     lease["expires_ts"],
                     claim or None,
+                    lease["ttl_seconds"],
                 ),
             )
             moved.append(lease["path_pattern"])
@@ -3644,7 +3860,7 @@ def transfer_claim_reservations(
         holder = _identify(db, root, source)
         receiver = _identify(db, root, target)
         held = db.execute(
-            "SELECT id,path_pattern,exclusive,reason,expires_ts "
+            "SELECT id,path_pattern,exclusive,reason,expires_ts,ttl_seconds "
             "FROM file_reservations WHERE project_id=? AND agent_id=? "
             "AND claim_id=? AND released_ts IS NULL ORDER BY path_pattern",
             (holder["project_id"], holder["id"], source_claim),
@@ -3658,8 +3874,8 @@ def transfer_claim_reservations(
             )
             db.execute(
                 "INSERT INTO file_reservations(project_id,agent_id,"
-                "path_pattern,exclusive,reason,expires_ts,claim_id) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "path_pattern,exclusive,reason,expires_ts,claim_id,"
+                "ttl_seconds) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     receiver["project_id"],
                     receiver["id"],
@@ -3668,6 +3884,7 @@ def transfer_claim_reservations(
                     lease["reason"],
                     lease["expires_ts"],
                     target_claim or None,
+                    lease["ttl_seconds"],
                 ),
             )
             moved.append(lease["path_pattern"])
@@ -3716,6 +3933,114 @@ def release_reservations(home: Path, root: str, name: str) -> list[str]:
             (holder["project_id"], holder["id"]),
         )
     return released
+
+
+def reclaim_expired(home: Path, root: str) -> list[dict]:
+    """Sweeps one project's expired leases so a queue is never held forever.
+
+    A queued request is only read when a key is released, so a holder that
+    stops coordinating would otherwise keep a peer waiting without limit.
+    Sweeping releases the leases no live session is working under and grants
+    what peers queued for them, and both lanes are told in the same
+    transaction. Reservations stay advisory; nothing on disk is affected.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        One entry per holder whose leases were reclaimed, naming that holder,
+        the released keys, the notice it was sent and the lanes that took the
+        keys. An unregistered project or an absent store reclaims nothing.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home, write=True) as db:
+        row = db.execute(
+            "SELECT id FROM projects WHERE human_key=?", (root,)
+        ).fetchone()
+        return _reclaim(db, int(row[0])) if row else []
+
+
+def renew_reservations(home: Path, root: str, name: str) -> dict:
+    """Renews a working lane's expired leases from its own checkpoint.
+
+    A lane that is still editing the keys it declared keeps them by
+    coordinating: each checkpoint restores the window its holder asked for,
+    so an expired lease belonging to live work is never reclaimed from it. A
+    lease correlated with a claim that lane no longer holds describes nobody's
+    work, so it is released instead, its queue is granted, and the lane is
+    told which keys it lost and why.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own leases are renewed.
+
+    Returns:
+        The renewed keys and the released keys, both in key order.
+
+    Raises:
+        BridgeError: If no store exists or the identity is unregistered.
+    """
+    if not (home / DATABASE).exists():
+        raise BridgeError("No coordination store yet; run agent-parley up.")
+    claim = held_claim(home, root, name)
+    with connect(home, write=True) as db:
+        holder = _identify(db, root, name)
+        expired = db.execute(
+            "SELECT id,path_pattern,claim_id,ttl_seconds FROM "
+            "file_reservations WHERE project_id=? AND agent_id=? "
+            "AND released_ts IS NULL AND expires_ts IS NOT NULL "
+            "AND expires_ts<=CURRENT_TIMESTAMP ORDER BY path_pattern",
+            (holder["project_id"], holder["id"]),
+        ).fetchall()
+        renewed: list[str] = []
+        dropped: list[sqlite3.Row] = []
+        for lease in expired:
+            if lease["claim_id"] and lease["claim_id"] != claim:
+                dropped.append(lease)
+                continue
+            window = lease["ttl_seconds"] or RESERVATION_GRACE
+            db.execute(
+                "UPDATE file_reservations SET expires_ts=datetime('now',?) "
+                "WHERE id=?",
+                (f"+{window} seconds", lease["id"]),
+            )
+            renewed.append(lease["path_pattern"])
+        released = sorted({lease["path_pattern"] for lease in dropped})
+        if dropped:
+            db.execute(
+                "UPDATE file_reservations SET released_ts=CURRENT_TIMESTAMP "
+                "WHERE id IN (" + ",".join("?" * len(dropped)) + ")",
+                tuple(lease["id"] for lease in dropped),
+            )
+            _grant_queued(db, holder, released, reclaimed=True)
+            _send(
+                db,
+                _operator(db, holder["project_id"]),
+                {
+                    "to": [name],
+                    "subject": (
+                        "Reservation released with its claim: "
+                        + ", ".join(released)
+                    )[:160],
+                    "body_md": (
+                        "Your reservation of "
+                        + ", ".join(released)[:MAX_NOTICE_CHARACTERS]
+                        + " passed its declared time to live under a claim "
+                        "you no longer hold, so it was released and any peer "
+                        "queued for those keys now holds them. Reservations "
+                        "are advisory: nothing on disk was locked or "
+                        "reverted."
+                    ),
+                    "idempotency_key": (
+                        f"reservation-claim-closed-"
+                        f"{max(lease['id'] for lease in dropped)}"
+                    ),
+                },
+            )
+        return {"renewed": sorted(set(renewed)), "released": released}
 
 
 def active_reservations(home: Path, root: str) -> dict[str, list[str]]:

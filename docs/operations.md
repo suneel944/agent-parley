@@ -243,7 +243,7 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
-| 0.11.0 | 1 | 9 |
+| 0.11.0 | 1 | 10 |
 | 0.10.0 | 1 | 9 |
 | 0.9.1 | 1 | 9 |
 | 0.9.0 | 1 | 8 |
@@ -841,12 +841,21 @@ seconds, the same bounds as `inactive_after`.
 
 A reservation may declare `ttl_seconds`, and one taken without it never
 reports as stale. Once a declared time to live passes, the LEASES count in
-`top` gains `!` and the stale count, `status` reports the stale share of a
-lane's reservations, and a conflict names that holder as stale. The lease is
-still held: nothing revokes it, reassigns it, or narrows what it blocks, and
-only its owner releases it. Reading `!` as "an agent died holding this" is the
-point; acting on it is the operator's decision, exactly as with a stalled
-issue owner.
+`top` gains `!` and the stale count, `status` counts the expired leases apart
+from the live ones and names the age of the oldest in seconds past its
+deadline, and a conflict names that holder as stale.
+
+An expired lease does not stay expired. A holder that is still coordinating
+renews it at that lane's next checkpoint, restoring the window the holder
+declared, so a lane working under a key keeps it. A holder whose last
+observation found no live session process, or whose lease has been expired
+longer than the 1800-second grace, loses it: the runtime releases the lease,
+grants the oldest queued request for each key, tells the lane that took the key
+who lost it, and tells the former holder what was released and why. A lease
+whose correlated claim is closed is released at the holder's next checkpoint in
+the same way. Nothing here is enforcement: reservations stay advisory, nothing
+on disk is locked or reverted, and a lane that is still editing a reclaimed key
+reserves it again.
 
 A reservation is also forecast against the base checkout's co-change history.
 When a lane files reservations, the store reads `git log --name-only` over the

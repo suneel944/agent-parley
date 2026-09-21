@@ -2248,6 +2248,11 @@ def poll(home: Path, directory: Path) -> None:
     Launches are judged against their start deadline first, so a lane whose
     client never reported a native hook is published as not started before this
     same poll reads presence, publishes fitness and considers a wake.
+
+    Expired reservations are reclaimed once presence has been refreshed, so
+    the sweep decides on this poll's observation of each holder rather than
+    the previous one. A store that is busy or unreadable reclaims nothing
+    this round rather than failing the poll.
     """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
@@ -2275,6 +2280,8 @@ def poll(home: Path, directory: Path) -> None:
                     participant["display"],
                 ),
             )
+    with contextlib.suppress(BridgeError, sqlite3.Error):
+        store.reclaim_expired(home, manifest["root"])
     deliveries(home, directory, manifest)
     if config["prompts"]:
         closed: set[str] = set()

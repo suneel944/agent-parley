@@ -591,12 +591,24 @@ previous lease atomically. Released leases no longer block work.
 `ttl_seconds` is optional. A lease taken without one carries no deadline and
 never reports as stale. A lease taken with one reports as stale once its
 deadline passes: the conflict it raises carries `stale`, `agent-parley top`
-marks the count with `!`, and `agent-parley status` names the stale share.
-Staleness is a report and nothing more. The lease is not revoked or
-reassigned, it still counts against the per-lane reservation cap, and it keeps
-blocking exactly the paths it already blocked until its owner releases it.
-That distinction lets a reader separate a lane still working on a path from a
-lane that died holding it, without any process deciding on that lane's behalf.
+marks the count with `!`, `agent-parley status` counts the expired leases apart
+from the live ones and names the age of the oldest, and both surfaces report
+that age in seconds past the deadline.
+
+An expired lease is renewed by its holder or reclaimed from it. A holder that
+is still coordinating renews its own expired leases at its next checkpoint,
+restoring the window that holder declared, so live work never loses a key it
+is using. A lease correlated with a claim that holder no longer holds is
+released at that checkpoint instead, and the holder is told which keys it lost.
+A lease whose holder was last observed without a live session process, or that
+has been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
+is released by the next reservation call or supervision poll: the oldest queued
+request for each key is granted, the lane that took it is told who lost it, and
+the former holder is told what was released and why. The grace sits above the
+whole wake budget, so a holder that can be woken is woken and renews before any
+peer takes its key. Reclaiming stays advisory: it changes who is told that a
+key is free, never what the file system allows, and nothing on disk is locked
+or reverted.
 
 `request_reservation` takes the same batch as `file_reservation_paths`. Where
 nothing conflicts it grants exactly the same leases, so a lane never has to ask

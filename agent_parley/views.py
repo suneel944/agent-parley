@@ -68,7 +68,7 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "agent_parley_lane_leases_stale",
         "gauge",
         "stale_leases",
-        "Held reservations whose holder has no live session.",
+        "Held reservations past their declared time to live.",
     ),
     (
         "agent_parley_lane_idle_seconds",
@@ -599,6 +599,7 @@ def _row(row: dict) -> dict:
         "leases": row["leases"],
         "stale_leases": row["stale_leases"],
         "lease_age_seconds": row["lease_age"],
+        "stale_lease_age_seconds": row.get("stale_lease_age", 0),
         "queued_requests": row["queued"],
         "queued_by": list(row["queued_by"]),
         "injected_bytes": row["injected_bytes"],

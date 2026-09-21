@@ -1143,9 +1143,11 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
 
     Returns:
         Message previews, pending counts, held reservations with how many are
-        past a declared time to live, the named resources among them, and
-        coordination age. A stale reservation is still held; nothing releases
-        it on its owner's behalf.
+        past a declared time to live and how long the oldest of those has
+        been past it, the named resources among them, and coordination age.
+        A reservation past its time to live is still held and still listed:
+        it is reported apart from the live ones so its holder can renew or
+        release it before the runtime reclaims it.
 
     Raises:
         BridgeError: If the agent is not registered.
@@ -1198,7 +1200,9 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         ).fetchall()
         leases = db.execute(
             "SELECT count(*) AS held,coalesce(sum(expires_ts IS NOT NULL "
-            "AND expires_ts<=datetime('now')),0) AS stale "
+            "AND expires_ts<=datetime('now')),0) AS stale,"
+            "coalesce(max(0,unixepoch('now')-unixepoch(min(CASE WHEN "
+            "expires_ts<=datetime('now') THEN expires_ts END))),0) AS age "
             "FROM file_reservations WHERE agent_id=? AND released_ts IS NULL",
             (agent["id"],),
         ).fetchone()
@@ -1217,10 +1221,40 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "unread": unread,
             "reservations": leases["held"],
             "stale_reservations": leases["stale"],
+            "stale_reservation_age": leases["age"],
             "named_resources": [row["path_pattern"] for row in named],
             "reported_task": agent["task_description"],
             "last_coordination": agent["last_active_ts"],
         }
+
+
+def renewed_leases(home: Path, root: str, name: str, after: int = 0) -> dict:
+    """Renews this lane's expired reservations and reads the mailbox again.
+
+    A checkpoint is the lane saying it is alive and still working, so it is
+    where a lease that outlived its declared window is restored to that
+    window. Without it the runtime would reclaim a working lane's keys for a
+    peer, and with it a lane that has stopped coordinating loses them. Only a
+    lane that already holds an expired lease pays for this; the mailbox is
+    read again afterwards so the checkpoint reports what is true after the
+    renewal rather than before it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the bridge store.
+        name: Registered agent identity.
+        after: Last locally delivered message ID.
+
+    Returns:
+        The mailbox batch as it stands once expired leases have been renewed
+        or, where their claim is closed, released.
+
+    Raises:
+        BridgeError: If the agent is not registered.
+        sqlite3.Error: If the store cannot be written or read.
+    """
+    store.renew_reservations(home, root, name)
+    return mailbox(home, root, name, after)
 
 
 def paused_output(event: str) -> dict | None:
@@ -1479,6 +1513,13 @@ def checkpoint(
                 )
                 state["pending_ack"] = mail["pending_ack"]
                 state.pop("coordination_error", None)
+                if mail.get("stale_reservations", 0):
+                    mail = renewed_leases(
+                        home,
+                        manifest["root"],
+                        identity["name"],
+                        state.get("cursor", 0),
+                    )
                 messages = mail["messages"]
                 issues = snapshot(directory)
                 ledger = issues

@@ -888,11 +888,16 @@ def lane_detail(record: dict, data: dict) -> None:
         print(f"    Coordination unavailable: {mail['error']}")
         return
     stale = mail["stale_reservations"]
+    age = mail.get("stale_reservation_age", 0)
     print(
         f"    Unread: {mail['unread']}; "
         f"pending acknowledgements: {mail['pending_ack']}; "
-        f"active reservations: {mail['reservations']}"
-        + (f" ({stale} stale)" if stale else "")
+        f"active reservations: {mail['reservations'] - stale}"
+        + (
+            f"; expired: {stale}, oldest {age}s past its deadline"
+            if stale
+            else ""
+        )
     )
     if edited := record["operator_edits"]:
         print("    " + supervision.operator_edit_marker(edited))
@@ -6680,6 +6685,7 @@ reported.
             "pending_ack": mail["pending_ack"],
             "reservations": mail["reservations"],
             "stale_reservations": mail.get("stale_reservations", 0),
+            "stale_reservation_age": mail.get("stale_reservation_age", 0),
             "named_resources": list(mail.get("named_resources", [])),
             "queued_requests": frame["usage"].get(name, {}).get("queued", 0),
             "queued_by": list(
