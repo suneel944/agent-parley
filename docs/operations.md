@@ -339,34 +339,54 @@ The command derives its rows from the same reading `status` and `top` print,
 the supervision thresholds and the store classification, and writes nothing.
 Rows are ordered by how long each has held, longest first; a store or service
 row carries no age and leads the list, because no lane can be acted on until
-the store is usable and the service is up. Each row names the lane, the
-condition, its age and the one command that clears it:
+the store is usable and the service is up. One lane holding twenty messages,
+three overdue claims or four changed files is one row per cause, carrying how
+many items that row covers and the age of the oldest, so the list is as long
+as the work rather than as long as the backlog. Each row names the lane, the
+condition, that count, its age and what clears it:
 
 | Condition | When | Clears with |
 | --- | --- | --- |
 | `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
 | `service` | The coordination server is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
-| `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
-| `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
-| `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
-| `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
-| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
+| `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | Whatever the lane's state allows, from the remedy table below. |
+| `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
+| `overdue claim` | One or more held issues are past their recorded deadline. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
+| `unanswered offer` | One or more handoff offers to the same lane have no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
+| `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
-| `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
+| `dirty worktree` | The lane holds uncommitted work and is not active. | Commit or stash the named files in the named worktree. |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
 
-A lane row's command follows the lane's presence state. While the recorded
-session process is alive the row names a wake, because `run NAME --resume`
-would collide with the session lock the running launcher holds; once the
-process is gone the same row names the resume. The printed command is
-therefore how an operator tells a lane between turns from a lane whose
-launcher exited.
+A lane row's remedy follows the lane's state rather than the condition alone,
+because a lane that cannot read mail does not become reachable by being sent
+more of it:
+
+| Lane state | Remedy | Why |
+| --- | --- | --- |
+| `stopped` | `agent-parley run NAME --resume` | The launcher exited, so nothing is holding the session lock. |
+| Waiting on a native prompt | Answer the prompt in the lane's own client. | The client reads no mail until the prompt is cleared. |
+| Refused every wake | Take the turn waiting in the lane's own client. | The service stopped asking after its refusals. |
+| Paused | `agent-parley participant resume NAME` | Delivery resumes with the lane, not before it. |
+| The service is still waking it | Nothing yet; the row says how many wakes the loop has already made and that it wakes again on its next poll. | The supervision loop owns this row. |
+| Otherwise reachable | `agent-parley say NAME "<text>"` | The lane is alive and reading. |
+
+A row an operator must act on and a row the supervision loop is already
+working are therefore different rows. The wake, the delivery, the orphan
+reclaim and the lease bounce belong to that loop, which runs them on its own
+interval; `problems` reports what it has attempted and what it will do next,
+and the closing line counts how many rows need an operator against how many
+the service is handling. An active lane is never told to leave its session,
+and a dirty worktree row names the worktree and the changed files rather than
+offering to retire the lane, because retiring it would drop the claims it
+holds to clean one directory.
 
 An empty list prints one line saying so and exits zero; any row exits 1, so a
 shell or a cron can gate on it. `--json` prints the same rows inside the shared
-snapshot envelope with `count`. The `P` key in `top` shows the same rows in
+snapshot envelope, each with `count` and `actor`, alongside the totals
+`count`, `operator` and `service`. The `P` key in `top` shows the same rows in
 place of the table until any key returns. Every command named is a suggestion:
-the view revokes nothing, releases nothing and wakes nobody.
+the view itself revokes nothing, releases nothing and wakes nobody.
 
 ### Recording the work order as a plan file
 

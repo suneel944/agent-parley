@@ -134,11 +134,22 @@ supervision threshold, a claim past its deadline, a handoff offer with no
 answer, a message awaiting acknowledgement past `--ack-after`, a lane whose
 branch drifted or whose worktree is dirty with no recent activity, a lane over
 its advisory budget, a store schema behind the code, and a service that is down.
-Each row names the lane, the condition, how long it has held and the exact
-command that clears it. An empty list exits zero with one line saying so; any
-row exits 1, so a shell or a cron can notice. `--json` prints the same rows, and
-`P` in `top` shows them in place. The view reads the same snapshot `status`
-prints and moves nothing.
+
+Each lane contributes one row per cause, not one row per item: a lane sitting
+on twenty unacknowledged messages is a single row carrying that count and the
+age of the oldest message. The remedy follows the lane's state, so a lane
+parked on a native prompt is pointed at its own client instead of being sent
+more mail it cannot read, an active lane is never told to leave its session,
+and a dirty worktree is named by path with its changed files rather than
+offered a retirement that would drop the lane's claims. Rows the supervision
+service already handles — the wakes, the deliveries, the reclaims — say what
+that loop has attempted and what it does next, and the report closes by
+counting operator rows against service rows.
+
+An empty list exits zero with one line saying so; any row exits 1, so a shell
+or a cron can notice. `--json` prints the same rows, and `P` in `top` shows
+them in place. The view reads the same snapshot `status` prints and moves
+nothing itself.
 
 ## `doctor`
 
