@@ -1330,10 +1330,11 @@ reports that native process identity is unavailable and requires manual
 attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
-30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
-Numeric values range from 1 to 86400 seconds. The same keys in
+30 seconds), `inactive_after` (300 seconds), `prompts`, `wake` and `reclaim`
+(all true). Numeric values range from 1 to 86400 seconds. The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
-`wake` and `prompts` cannot be enabled by a project. A participant entry may set
+`wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
+entry may set
 `"wake": false` to opt out individually. These settings remain outside source.
 
 Releasing a claim with waiting peers creates a visible handoff reminder.
@@ -1474,6 +1475,34 @@ accounts need no relationship to each other. Sign in to each directory with the
 native CLI once. Agent Parley stores directory paths and
 variable names; it never stores tokens or keys, and rejects `--env` values whose
 names look like credentials.
+
+### Reclaiming landed lanes
+
+Every lane owns a worktree in the private project state directory and a branch
+in the repository, and both outlive the claim they were created for. The
+service sweeps them at most once every 900 seconds, after the rest of a poll,
+and `agent-parley gc` runs the same sweep on demand: without `--apply` it
+reports what it would do, with `--apply` it removes what it may. The outcome
+of the service's own sweep is published in `reclaim.json` in the project state
+directory, so the next sweep is bounded even when one fails.
+
+A lane is reclaimed only when every one of these holds: its worktree is a
+registered worktree directly inside this project's state directory; no session
+is running in it; the ledger records no claim it still owns; it has nothing
+uncommitted; the base checkout's head already carries every commit on its
+branch; its branch carries nothing its configured upstream lacks; its branch
+has moved at all since the lane was created; and the forge reports the newest
+pull request from that branch as merged, or, with no pull request to read, the
+upstream no longer carries the branch. Removal is the ordinary retirement,
+followed by `git branch -d`, which deletes the branch under Git's own
+merged-branch rule and refuses otherwise.
+
+Anything else is kept and reported with the one condition that held it, and
+uncommitted files and unmerged or unpushed commits are reported by name. A
+pull request closed without merging, an open one, an unreachable forge, a
+worktree Git cannot inspect and a path outside the project's own lanes all
+decide against reclaiming. The sweep never touches a remote branch, and it
+never fails because the remote branch is already gone.
 
 ## Other agent CLIs
 
