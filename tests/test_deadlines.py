@@ -6,7 +6,15 @@ import time
 
 import pytest
 
-from agent_parley import cli, dashboard, issues, roster, store, supervision
+from agent_parley import (
+    checkpoints,
+    cli,
+    dashboard,
+    issues,
+    roster,
+    store,
+    supervision,
+)
 from agent_parley.state import BridgeError, write_json
 
 
@@ -21,6 +29,73 @@ def age_claim(directory, number, seconds):
     state["issues"][number]["deadline"] = time.time() - seconds
     state["revision"] += 1
     write_json(directory / "issues.json", state)
+
+
+def registered(bridge, paired, name):
+    """Registers one lane with the store and authenticates it."""
+    store.initialize(bridge.home)
+    return store.authenticate(
+        bridge.home,
+        store.register(bridge.home, paired["root"], name)["registration_token"],
+    )
+
+
+def request_ack(bridge, actor, recipients, key, within=None):
+    """Sends one acknowledgement request from a served lane."""
+    arguments = {
+        "to": recipients,
+        "subject": "Confirm the schema change",
+        "body_md": "Confirm the schema change",
+        "idempotency_key": key,
+        "ack_required": True,
+    }
+    if within is not None:
+        arguments["ack_within"] = within
+    return store.call(bridge.home, actor, "send_message", arguments)
+
+
+def remaining(bridge, identifier):
+    """Returns the seconds left on one message's acknowledgement deadline."""
+    with store.connect(bridge.home) as db:
+        row = db.execute(
+            "SELECT CAST((julianday(ack_deadline_ts)-julianday('now'))*86400 "
+            "AS INTEGER) AS window FROM messages WHERE id=?",
+            (identifier,),
+        ).fetchone()
+    return None if row["window"] is None else int(row["window"])
+
+
+def expire(bridge, identifier):
+    """Moves one acknowledgement deadline into the past."""
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE messages SET ack_deadline_ts=datetime('now','-90 seconds') "
+            "WHERE id=?",
+            (identifier,),
+        )
+
+
+def returned(bridge, name):
+    """Returns the deadline notices one sender received."""
+    with store.connect(bridge.home) as db:
+        return [
+            dict(row)
+            for row in db.execute(
+                "SELECT m.id,m.subject,m.body_md FROM messages m "
+                "JOIN message_recipients r ON r.message_id=m.id "
+                "JOIN agents a ON a.id=r.agent_id WHERE a.name=? AND "
+                "m.subject LIKE 'Acknowledgement deadline passed%' "
+                "ORDER BY m.id",
+                (name,),
+            )
+        ]
+
+
+def outstanding(bridge, paired, name):
+    """Returns the acknowledgements one lane still owes."""
+    return checkpoints.mailbox(bridge.home, paired["root"], name)[
+        "outstanding_ack"
+    ]
 
 
 def test_a_claim_records_the_window_it_was_given(bridge, repo, paired):
@@ -146,6 +221,88 @@ def test_the_runtime_records_one_notice_per_breach(bridge, repo, paired):
     revision = issues.snapshot(directory)["revision"]
     supervision.deadline_notices(directory, paired)
     assert issues.snapshot(directory)["revision"] == revision
+
+
+def test_a_request_without_a_window_takes_the_configured_default(
+    bridge, repo, paired
+):
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    inherited = request_ack(bridge, actor, ["codex"], "inherited")
+    assert (
+        store.DEFAULT_ACK_SECONDS - 10
+        <= remaining(bridge, inherited["id"])
+        <= store.DEFAULT_ACK_SECONDS
+    )
+    bridge.budgets(repo, {"ack": 900})
+    configured = request_ack(bridge, actor, ["codex"], "configured")
+    assert 890 <= remaining(bridge, configured["id"]) <= 900
+    explicit = request_ack(bridge, actor, ["codex"], "explicit", within=60)
+    assert 50 <= remaining(bridge, explicit["id"]) <= 60
+    operator = bridge.say(repo, "claude", "Answer this", ack=True)
+    assert remaining(bridge, operator["id"]) is not None
+
+
+def test_a_missed_deadline_returns_to_the_sender_with_its_reason(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    request = request_ack(bridge, actor, ["codex"], "missed", within=60)
+    assert outstanding(bridge, paired, "codex")
+    supervision.poll(bridge.home, directory)
+    assert returned(bridge, "claude") == []
+    expire(bridge, request["id"])
+    supervision.poll(bridge.home, directory)
+    [notice] = returned(bridge, "claude")
+    assert f"message {request['id']}" in notice["subject"]
+    assert "codex has no running session" in notice["body_md"]
+    assert "retired" in notice["body_md"]
+    assert outstanding(bridge, paired, "codex") == []
+    supervision.poll(bridge.home, directory)
+    assert len(returned(bridge, "claude")) == 1
+
+
+def test_an_acknowledged_request_never_returns_to_its_sender(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    actor = registered(bridge, paired, "claude")
+    recipient = registered(bridge, paired, "codex")
+    request = request_ack(bridge, actor, ["codex"], "answered", within=60)
+    store.call(
+        bridge.home,
+        recipient,
+        "acknowledge_message",
+        {"message_id": request["id"]},
+    )
+    expire(bridge, request["id"])
+    supervision.poll(bridge.home, directory)
+    assert returned(bridge, "claude") == []
+    assert store.overdue_acknowledgements(bridge.home, paired["root"]) == []
+
+
+def test_a_broadcast_returns_one_notice_naming_every_silent_lane(
+    bridge, repo, paired
+):
+    bridge.add_participant(repo, "claude-1", "claude")
+    directory = bridge.project(repo)[1]
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    registered(bridge, paired, "claude-1")
+    request = request_ack(
+        bridge, actor, ["codex", "claude-1"], "broadcast", within=60
+    )
+    expire(bridge, request["id"])
+    [breach] = store.overdue_acknowledgements(bridge.home, paired["root"])
+    assert breach["recipients"] == ["claude-1", "codex"]
+    supervision.poll(bridge.home, directory)
+    [notice] = returned(bridge, "claude")
+    assert "claude-1 has no running session" in notice["body_md"]
+    assert "codex has no running session" in notice["body_md"]
+    assert not outstanding(bridge, paired, "codex")
+    assert not outstanding(bridge, paired, "claude-1")
 
 
 def test_defaults_are_validated_and_reported_as_json(

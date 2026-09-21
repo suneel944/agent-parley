@@ -130,6 +130,15 @@ TOOLS = [
                 "description": "Message answered; joins its thread.",
             },
             "ack_required": FLAG,
+            "ack_within": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": roster.MAX_DEADLINE,
+                "description": (
+                    "Seconds before it returns unanswered; omitted takes "
+                    "the default."
+                ),
+            },
             "decision": {
                 **FLAG,
                 "description": "Also record in the shared decision log.",

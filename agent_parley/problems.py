@@ -83,6 +83,9 @@ def _lane_rows(
         Zero or more rows, one per condition the record shows. A lane that has
         recorded no native activity carries no age on the rows that report one,
         because the span it has been quiet for is unknown rather than long.
+        A lane owing several acknowledgements carries one row naming the
+        oldest, so a broadcast costs one row per lane rather than one per
+        message it created.
     """
     name = record["participant"]
     repo = f"--repo {root}"
@@ -150,19 +153,33 @@ def _lane_rows(
                     root,
                 )
             )
-    for pending in (record.get("mail") or {}).get("outstanding_ack", []):
-        if pending["age_seconds"] >= ack_after:
-            rows.append(
-                _row(
-                    ACK,
-                    f"message {pending['message_id']} from "
-                    f"{pending['sender']} awaits acknowledgement",
-                    _wake(name, repo, availability),
-                    pending["age_seconds"],
-                    name,
-                    root,
-                )
+    waiting = [
+        pending
+        for pending in (record.get("mail") or {}).get("outstanding_ack", [])
+        if pending.get("age_seconds", 0) >= ack_after
+    ]
+    if waiting:
+        oldest = max(waiting, key=lambda pending: pending.get("age_seconds", 0))
+        detail = (
+            f"message {oldest.get('message_id')} from "
+            f"{oldest.get('sender')} awaits acknowledgement"
+        )
+        if len(waiting) > 1:
+            detail = (
+                f"{len(waiting)} messages await acknowledgement, "
+                f"the oldest {oldest.get('message_id')} from "
+                f"{oldest.get('sender')}"
             )
+        rows.append(
+            _row(
+                ACK,
+                detail,
+                _wake(name, repo, availability),
+                oldest.get("age_seconds"),
+                name,
+                root,
+            )
+        )
     if record["drift"]:
         rows.append(
             _row(

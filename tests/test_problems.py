@@ -246,6 +246,34 @@ def test_a_message_awaiting_acknowledgement_past_the_age_is_a_row(
     assert row["command"].startswith('agent-parley say claude "<text>"')
 
 
+def test_a_broadcast_costs_one_row_per_parked_lane(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    store.initialize(bridge.home)
+    for name in ("claude", "codex"):
+        stopped(directory, name)
+        store.register(bridge.home, paired["root"], name)
+    for key in ("first", "second"):
+        for name in ("claude", "codex"):
+            bridge.say(
+                repo,
+                name,
+                f"Answer the {key}",
+                ack=True,
+                key=f"{key}-{name}",
+            )
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE messages SET created_ts=datetime('now','-1800 seconds')"
+        )
+    found = rows(bridge, problems.ACK, ack_after=600)
+    assert len(found) == 2
+    assert {row["participant"] for row in found} == {"claude", "codex"}
+    assert "2 messages await acknowledgement" in found[0]["detail"]
+    assert "the oldest" in found[0]["detail"]
+
+
 def test_a_drifted_lane_names_the_restore(bridge, repo, paired, served):
     lane = paired["lanes"]["claude"]
     subprocess.run(

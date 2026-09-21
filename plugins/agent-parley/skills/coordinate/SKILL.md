@@ -91,6 +91,12 @@ command is already tracked, and tell me if someone is holding it."
   pass project/agent names as tool arguments. Send concise state changes with an
   idempotency key; reuse that key only when retrying the same send. Use checkpoint
   previews, fetch bodies only when needed, and avoid repeated empty inbox polling.
+- `ack_required` on `send_message` always carries a deadline. Set `ack_within`
+  in seconds when the answer is needed sooner or later than the project
+  default; omit it to take that default. Past the deadline the request comes
+  back to you naming the recipients that did not acknowledge and what the
+  runtime could read about why, and the expectation is retired, so a silent
+  peer never leaves a permanent row. Send it again only if you still need it.
 - Retry a failed write with the `idempotency_key` it first carried. The repeat
   returns the first result and writes nothing further. A retry without a key can
   reserve twice, so `file_reservation_paths`, `request_reservation`,

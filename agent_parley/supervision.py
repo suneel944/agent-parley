@@ -36,6 +36,7 @@ IDLE = "idle"
 STOPPED = "stopped"
 WORK_WAKE_ATTEMPTS = 3
 UNKNOWN = "unknown"
+DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -1404,6 +1405,104 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
+    """States in one clause why a lane did not acknowledge in time.
+
+    Only what the runtime can read locally is reported: the recorded session
+    process, the last wake outcome, the lane's durable provider capacity and
+    the measured idle stretch. Nothing here is inferred from the silence
+    itself, so a lane that reads as available is reported as exactly that.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owes the acknowledgement.
+        observed: That lane's presence reading.
+
+    Returns:
+        One clause naming the condition, worded to follow the lane's name.
+    """
+    if observed.get("state") == STOPPED:
+        return "has no running session"
+    try:
+        wake = json.loads((directory / f"{name}-wake.json").read_text())
+    except (OSError, ValueError):
+        wake = {}
+    if wake.get("result") in DIALOG_WAKES:
+        return "has a native dialog waiting for the operator"
+    state = published_capacity(directory, name)["state"]
+    if state == "exhausted":
+        return "has exhausted its provider capacity"
+    if state == "retryable":
+        return "hit a retryable provider failure"
+    if observed.get("state") == UNKNOWN:
+        return "has no trustworthy session identity"
+    if observed.get("state") == IDLE:
+        return f"has been idle for {int(observed.get('age_seconds') or 0)}s"
+    return "was live and did not answer"
+
+
+def acknowledgement_deadlines(
+    home: Path, directory: Path, manifest: dict, observations: dict
+) -> None:
+    """Returns each missed acknowledgement deadline to the lane that sent it.
+
+    An acknowledgement nobody answers is otherwise permanent: it stays on the
+    problem list of a lane that may never read mail again and its sender is
+    never told. Past the deadline the sender receives one message naming every
+    recipient that did not acknowledge and what the runtime could read about
+    why, and the expectation is retired so the row clears. The notice is
+    deduplicated by the message it reports, so a sweep that repeats writes
+    nothing further.
+
+    A sender that holds no inbox, such as the supervising operator, is not
+    mailed; the expectation is still retired, because a permanent row is the
+    condition this removes.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant from this sweep.
+    """
+    named = {
+        entry["display"]: name
+        for name, entry in manifest["participants"].items()
+    }
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        for breach in store.overdue_acknowledgements(home, manifest["root"]):
+            silent = []
+            for display in breach["recipients"]:
+                observed = observations.get(named.get(display, display))
+                reason = (
+                    unacknowledged_reason(directory, named[display], observed)
+                    if observed
+                    else "is not a participant in this project"
+                )
+                silent.append(f"- {display} {reason}")
+            body = (
+                f"Message {breach['message_id']} ({breach['subject']}) "
+                "required an acknowledgement and its deadline passed "
+                f"{breach['overdue_seconds']}s ago. These recipients did not "
+                "acknowledge it:\n"
+                + "\n".join(silent)
+                + "\nThe expectation is retired. Send it again, ask the "
+                "operator to acknowledge it, or continue without it."
+            )
+            with contextlib.suppress(BridgeError):
+                store.speak(
+                    home,
+                    manifest["root"],
+                    breach["sender"],
+                    "Acknowledgement deadline passed: message "
+                    f"{breach['message_id']}",
+                    body,
+                    f"ack-deadline-{breach['message_id']}",
+                )
+            store.retire_acknowledgement(
+                home, manifest["root"], breach["message_id"]
+            )
+
+
 def orphan_reason(name: str, observed: dict) -> str:
     """States why a lane's claims read as orphaned, in one clause."""
     return (
@@ -1770,6 +1869,7 @@ def poll(home: Path, directory: Path) -> None:
             )
         reminders(directory, manifest, closed)
         deadline_notices(directory, manifest)
+        acknowledgement_deadlines(home, directory, manifest, observations)
         orphans(home, directory, manifest, config)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)

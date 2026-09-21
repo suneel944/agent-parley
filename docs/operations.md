@@ -350,7 +350,7 @@ condition, its age and the one command that clears it:
 | `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
 | `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
 | `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
-| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
+| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. One row per lane, naming the oldest, so a broadcast costs one row per lane. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
 | `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
@@ -552,7 +552,26 @@ stays the owner's or the operator's decision.
 `deadlines set` records the defaults every claim, offer and acknowledgement
 inherits when it passes no `--within`, so lanes carry a budget without repeating
 a flag. Windows take the same units as `--since` (`45m`, `6h`, `7d`), and a
-project that records none gives a deadline only to the records that ask for one.
+project that records none gives a claim and an offer a deadline only when they
+ask for one.
+
+**Every acknowledgement request carries a deadline.** A send marked
+`ack_required` that names no window takes the project's `--ack` default, and a
+project that records none takes 240 seconds, which is shorter than the 300-second
+`inactive_after` default so a missed acknowledgement is known before the lane
+itself reads as idle. A served lane sets its own window with the `ack_within`
+argument of `send_message`.
+
+**A missed acknowledgement goes back to its sender.** Past the deadline the
+supervision sweep sends the sender one message naming each recipient that did
+not acknowledge and what the runtime could read about why — no running session,
+a native dialog waiting for the operator, exhausted provider capacity, or an
+idle stretch — and retires the expectation, so the request stops being reported
+as outstanding. The notice is deduplicated by the message it reports, and
+retiring records no acknowledgement for any lane: a recipient that never
+answered still carries no acknowledgement time. A sender that holds no inbox,
+such as the supervising operator, is not mailed and the expectation is still
+retired.
 
 Deadlines are evaluated when a checkpoint, a `status`, a `top` refresh or a
 served call reads the record, from the stored timestamps. The service gains no

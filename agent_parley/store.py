@@ -41,6 +41,7 @@ MAX_QUERY_BYTES = 160
 MAX_REPEATS = 24
 MAX_QUEUED_REQUESTS = 32
 MAX_NOTICE_CHARACTERS = 1000
+DEFAULT_ACK_SECONDS = 240
 SCHEDULE_FIELDS = (
     "id",
     "kind",
@@ -675,6 +676,31 @@ def _answered_thread(db: sqlite3.Connection, actor: dict, value: object) -> str:
     return row[0]
 
 
+def _ack_window(directory: Path | None) -> float:
+    """Resolves the deadline an acknowledgement request carries by default.
+
+    Every acknowledgement request carries a deadline, so an unanswered one is
+    returned to its sender and retired instead of waiting forever in a lane
+    that may never read mail again. The project's recorded ``ack`` default
+    wins; a project that records none takes ``DEFAULT_ACK_SECONDS``, which is
+    shorter than the default inactivity threshold so a missed acknowledgement
+    is known before the lane itself reads as idle.
+
+    Args:
+        directory: Project state directory holding the manifest, or None when
+            the caller resolved no project.
+
+    Returns:
+        Seconds the recorded deadline is measured from.
+    """
+    if directory is not None:
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            recorded = roster.read(directory)["deadlines"].get("ack")
+            if recorded is not None:
+                return float(recorded)
+    return float(DEFAULT_ACK_SECONDS)
+
+
 def _send(
     db: sqlite3.Connection,
     actor: dict,
@@ -717,6 +743,8 @@ def _send(
     within = args.get("ack_within")
     if within is not None:
         within = _number(within, "ack_within", 1, 86400 * 30)
+    if ack and within is None:
+        within = _ack_window(directory)
     if "reply_to" in args:
         if thread:
             raise BridgeError("Answer with reply_to or thread_id, not both.")
@@ -2829,6 +2857,81 @@ def acknowledge(home: Path, root: str, identifier: int) -> dict:
             "id": identifier,
             "participants": [row["name"] for row in rows],
         }
+
+
+def overdue_acknowledgements(home: Path, root: str) -> list[dict]:
+    """Lists the acknowledgement requests whose deadline passed unanswered.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        One entry per message, oldest message first, naming the sender, the
+        subject, how long the deadline has been past and the registered
+        identities that have not acknowledged it. A broadcast is one entry
+        holding every silent recipient rather than one entry per recipient.
+        A project with no store yet has nothing overdue.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home) as db:
+        rows = db.execute(
+            "SELECT m.id AS message_id,m.subject AS subject,"
+            "s.name AS sender,a.name AS recipient,"
+            "CAST((julianday('now')-julianday(m.ack_deadline_ts))*86400 "
+            "AS INTEGER) AS overdue FROM messages m "
+            "JOIN message_recipients r ON r.message_id=m.id "
+            "JOIN agents a ON a.id=r.agent_id "
+            "JOIN agents s ON s.id=m.sender_id "
+            "JOIN projects p ON p.id=m.project_id "
+            "WHERE p.human_key=? AND m.ack_required=1 AND r.ack_ts IS NULL "
+            "AND m.ack_deadline_ts IS NOT NULL "
+            "AND m.ack_deadline_ts<=datetime('now') ORDER BY m.id,a.name",
+            (root,),
+        ).fetchall()
+    breaches: dict[int, dict] = {}
+    for row in rows:
+        breach = breaches.setdefault(
+            row["message_id"],
+            {
+                "message_id": row["message_id"],
+                "subject": row["subject"],
+                "sender": row["sender"],
+                "overdue_seconds": max(0, int(row["overdue"] or 0)),
+                "recipients": [],
+            },
+        )
+        breach["recipients"].append(row["recipient"])
+    return list(breaches.values())
+
+
+def retire_acknowledgement(home: Path, root: str, identifier: int) -> bool:
+    """Retires one acknowledgement expectation whose deadline has passed.
+
+    The expectation is cleared on the message instead of being recorded as an
+    answer: a recipient that never acknowledged keeps no acknowledgement time,
+    so what happened stays readable while the message stops being reported as
+    outstanding. Retiring acknowledges nothing for any lane, moves no
+    ownership and deletes no mail.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        identifier: Message whose acknowledgement expectation is retired.
+
+    Returns:
+        Whether an outstanding expectation was retired by this call.
+    """
+    if not (home / DATABASE).exists():
+        return False
+    with connect(home, write=True) as db:
+        cursor = db.execute(
+            "UPDATE messages SET ack_required=0 WHERE id=? AND ack_required=1 "
+            "AND project_id=(SELECT id FROM projects WHERE human_key=?)",
+            (identifier, root),
+        )
+        return cursor.rowcount > 0
 
 
 def speak(
