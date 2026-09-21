@@ -31,7 +31,7 @@ on standard output and export to a file.
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | The dashboard of every lane; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
-| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
+| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--idempotency-key` makes a retry safe. |
 | `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
 | `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |

@@ -976,6 +976,19 @@ def _rebalance_text(owned: list[str], idle: list[str]) -> str:
     )
 
 
+def _split_text(issue: str, count: int, recipients: list[str]) -> str:
+    """Describes the backlog an idle holder can split with a fit peer."""
+    return (
+        f"Split offer. You hold #{issue} with {count} units of remaining work "
+        "recorded and no coordination event past the stall interval, so the "
+        f"claim is held while nothing moves. {', '.join(recipients)} read as "
+        "able to take part of it now. Split the backlog and send one part "
+        "with send_message and ack_required, or hand the whole claim over "
+        "with agent-parley issue offer. You decide what moves, and nothing "
+        "moves until a recipient answers."
+    )
+
+
 def _continue_text(ledger: dict, numbers: list[str]) -> str:
     """Describes already-owned work that remains authorized to continue."""
     actions = ", ".join(
@@ -1053,6 +1066,56 @@ def _work_dispatch(previous: dict, offer: dict) -> dict:
     }
 
 
+def share_recipients(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    results: dict[str, dict],
+    stretches: dict[str, int],
+    owned: dict[str, list[str]],
+    ledger: dict,
+    config: dict,
+) -> list[str]:
+    """Lists the lanes that could act on a share of somebody else's work.
+
+    A lane qualifies only when both readings the runtime already has agree: the
+    fit check every work offer uses, and the share conditions a returned share
+    is judged by. It must also hold no claim of its own and have been idle past
+    the stall interval, which is the same threshold that makes a lane a
+    rebalance target.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        results: Current fit result for every participant.
+        stretches: Current idle duration for every participant.
+        owned: Issue numbers grouped by owner.
+        ledger: Current issue ledger.
+        config: Resolved supervision settings.
+
+    Returns:
+        Qualifying participants in name order. The reading is derived on every
+        sweep, so a lane that parks on a dialog or takes a claim of its own
+        stops qualifying without anything being cleared.
+    """
+    return [
+        name
+        for name in sorted(manifest["participants"])
+        if results.get(name, {}).get("fit")
+        and not owned.get(name)
+        and stretches.get(name, 0) >= config["stalled_after"]
+        and not share_blocker(
+            home,
+            directory,
+            manifest,
+            name,
+            presence(directory, name, config["inactive_after"]),
+            ledger,
+        )
+    ]
+
+
 def _work_offer(
     name: str,
     results: dict[str, dict],
@@ -1061,8 +1124,18 @@ def _work_offer(
     available: list[str],
     ledger: dict,
     after: float,
+    recipients: list[str],
 ) -> dict | None:
     """Derives the current offer for one lane from live eligibility inputs.
+
+    A lane that holds a claim carrying a countable backlog and has recorded no
+    coordination event for the stall interval is offered a split of that
+    backlog, because a held claim with remaining work and an idle holder moves
+    nothing until someone says so. The split is offered only while a recipient
+    could act on it and while this lane's own capacity check has not failed:
+    the holder still has to take the turn that sends the share, and an
+    exhausted owner belongs to recovery instead. A lane holding more than one
+    claim is told to shed a whole claim first, which needs no split.
 
     Args:
         name: Participant receiving the offer.
@@ -1072,6 +1145,7 @@ def _work_offer(
         available: Current unclaimed and unblocked issue numbers.
         ledger: Current issue ledger.
         after: Minimum idle duration for a rebalance target.
+        recipients: Participants that read as able to act on a share now.
 
     Returns:
         The actionable offer, or None when no work is currently eligible.
@@ -1102,6 +1176,31 @@ def _work_offer(
             "issues": selected,
             "text": _rebalance_text(held, peers),
             "progress": _work_progress(ledger, selected),
+        }
+    elif (
+        capacity is not False
+        and stretches[name] >= after
+        and (able := [peer for peer in recipients if peer != name])
+        and (
+            loaded := next(
+                (
+                    number
+                    for number in continuation
+                    if lifecycle.backlog(ledger["issues"].get(number) or {})
+                ),
+                "",
+            )
+        )
+    ):
+        offer = {
+            "kind": "split",
+            "issues": [loaded],
+            "text": _split_text(
+                loaded,
+                lifecycle.backlog(ledger["issues"][loaded]),
+                able,
+            ),
+            "progress": _work_progress(ledger, [loaded]),
         }
     elif continuation and capacity is not False:
         selected = continuation[:5]
@@ -1136,9 +1235,16 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     A lane holding no claim is offered the unclaimed work and told which peers
     hold more than one claim. A lane holding more than one claim is told which
-    fit peers have been idle past the stall interval. Offers are advisory and
-    never claim work. Separately approved recovery may stop an exhausted
-    owner and preserve its work before a peer explicitly takes its claim.
+    fit peers have been idle past the stall interval. A lane holding one claim
+    that carries a countable backlog, and that has itself been idle past that
+    interval, is offered a split of that backlog with a peer that reads as able
+    to act on a share. Offers are advisory and never claim work. Separately
+    approved recovery may stop an exhausted owner and preserve its work before
+    a peer explicitly takes its claim.
+
+    A recipient must pass both readings the runtime already has: the fit check
+    every offer uses, and the share conditions a returned share is judged by,
+    so no lane is offered a split with a peer that could not answer it.
 
     An offer carries a digest of its own content as its identifier, so a lane
     whose situation has not changed sees the same offer rather than a new one
@@ -1189,10 +1295,20 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         name: idle_seconds(directory, name)
         for name in sorted(manifest["participants"])
     }
+    recipients = share_recipients(
+        home, directory, manifest, results, stretches, owned, ledger, config
+    )
     for name in manifest["participants"]:
         result = results[name]
         offer = _work_offer(
-            name, results, stretches, owned, available, ledger, after
+            name,
+            results,
+            stretches,
+            owned,
+            available,
+            ledger,
+            after,
+            recipients,
         )
         with lock(directory / f"{name}-work.lock", timeout=1):
             previous = published_work(directory, name)
@@ -2155,20 +2271,31 @@ def _work_backlog(
         return None
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
+    results = {
+        peer: fit(home, directory, manifest, peer, config["stalled_after"])
+        for peer in manifest["participants"]
+    }
+    stretches = {
+        peer: idle_seconds(directory, peer) for peer in manifest["participants"]
+    }
     current = _work_offer(
         name,
-        {
-            peer: fit(home, directory, manifest, peer, config["stalled_after"])
-            for peer in manifest["participants"]
-        },
-        {
-            peer: idle_seconds(directory, peer)
-            for peer in manifest["participants"]
-        },
+        results,
+        stretches,
         owned,
         lifecycle.actionable(ledger),
         ledger,
         config["stalled_after"],
+        share_recipients(
+            home,
+            directory,
+            manifest,
+            results,
+            stretches,
+            owned,
+            ledger,
+            config,
+        ),
     )
     if not current or (
         current.get("id"),

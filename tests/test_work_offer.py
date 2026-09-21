@@ -160,6 +160,30 @@ def offer_for(directory, name):
     return supervision.published_work(directory, name)["offer"]
 
 
+def holding_a_backlog(bridge, paired, monkeypatch, count):
+    """Leaves claude holding one claim with a stated remaining-work count."""
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude")
+    alive(directory, "codex")
+    bridge.issue(lane, "claim", "2")
+    if count is not None:
+        bridge.report(
+            lane,
+            "partial",
+            "Processing families.",
+            "families still to convert",
+            "",
+            backlog=count,
+        )
+    turn_ended(directory, "claude", 3600)
+    turn_ended(directory, "codex", 3600)
+    return lane, peer, directory
+
+
 def test_unclaimed_work_is_ordered_by_the_peers_that_wait_on_it(
     bridge, repo, paired
 ):
@@ -666,6 +690,56 @@ def test_a_busy_lane_is_told_which_fit_peer_has_been_idle(bridge, repo, paired):
     assert "codex" in offer["text"]
     assert "#2" in offer["text"] and "#3" in offer["text"]
     assert issues.snapshot(directory)["issues"]["2"]["owner"] == "claude"
+
+
+def test_an_idle_claim_with_a_countable_backlog_offers_one_split(
+    bridge, repo, paired, monkeypatch
+):
+    _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, 129)
+
+    supervision.poll(bridge.home, directory)
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "split"
+    assert offer["issues"] == ["2"]
+    assert "129 units" in offer["text"]
+    assert "codex" in offer["text"]
+    first = supervision.published_work(directory, "claude")["dispatch"]
+
+    supervision.poll(bridge.home, directory)
+    repeated = supervision.published_work(directory, "claude")
+    assert repeated["offer"]["id"] == offer["id"]
+    assert repeated["dispatch"]["generation"] == first["generation"]
+    assert issues.snapshot(directory)["issues"]["2"]["owner"] == "claude"
+    view = dashboard.collect(bridge.home, False, {})
+    rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
+    assert rows["claude"]["offer_kind"] == "split"
+    assert "split offer pending" in "\n".join(dashboard.render(view))
+    reported = views.frame(view)["projects"][0]["participants"]
+    holder = next(row for row in reported if row["participant"] == "claude")
+    assert holder["work_offer"] == "split"
+    assert holder["work_dispatch"]["state"] == repeated["dispatch"]["state"]
+
+
+def test_a_claim_with_no_recorded_backlog_offers_no_split(
+    bridge, repo, paired, monkeypatch
+):
+    _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, None)
+
+    supervision.poll(bridge.home, directory)
+    assert offer_for(directory, "claude")["kind"] == "continue"
+
+
+def test_a_split_names_no_recipient_parked_on_a_dialog(
+    bridge, repo, paired, monkeypatch
+):
+    _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, 129)
+    write_json(
+        directory / "codex-wake.json",
+        {"result": sorted(supervision.DIALOG_WAKES)[0]},
+    )
+
+    supervision.poll(bridge.home, directory)
+    assert offer_for(directory, "claude")["kind"] == "continue"
 
 
 def test_the_checkpoint_carries_one_offer_and_then_stays_quiet(

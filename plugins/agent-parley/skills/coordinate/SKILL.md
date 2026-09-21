@@ -147,6 +147,14 @@ Record outcomes with `agent-parley report --state partial|blocked|ready --summar
 Every `issue` transition and `report` accepts `--idempotency-key KEY`; a script
 that retries with the key it first used records one attempt, not two.
 
+Add `--backlog COUNT` whenever your claim has countable work left — families,
+files, subtasks, whatever that claim counts. The count is what lets the runtime
+see that a held claim still has work in it: once you go quiet on that claim past
+the stall interval, you are offered a split of the backlog naming the peers that
+can take part of it, with no operator asking for one. You decide what to split,
+you send it with `send_message` and `ack_required` or hand the whole claim over
+with `agent-parley issue offer`, and nothing moves until a recipient answers.
+
 When you check a peer's work, record what you found against the report itself:
 the `review_report` MCP tool, or `agent-parley report review ID --verdict
 pass|fail --evidence "what you checked"`. A lane cannot review its own report.

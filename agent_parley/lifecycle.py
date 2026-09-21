@@ -48,6 +48,7 @@ def initial(*, authorized: bool = False) -> dict:
         "integrated_commit": "",
         "gate": None,
         "progress": None,
+        "backlog": None,
     }
 
 
@@ -241,6 +242,26 @@ def describe_action(record: dict) -> str:
     return str(state(record)["next_action"])
 
 
+def backlog(record: dict) -> int:
+    """Counts the work units the owner of one claim still states as remaining.
+
+    The count is whatever the claim's own domain counts: issue families in a
+    target project, files to convert, subtasks of a migration. Only the owner
+    can state it, so it is recorded by that lane's own progress report and
+    bound to the claim generation the report named.
+
+    Args:
+        record: Issue ledger record.
+
+    Returns:
+        The count last reported, or zero when none was reported. Any other
+        stored value reads as zero, because a backlog the runtime cannot
+        count decides nothing.
+    """
+    value = state(record).get("backlog")
+    return value if type(value) is int and value > 0 else 0
+
+
 def record_report(
     directory: Path,
     agent: str,
@@ -250,6 +271,7 @@ def record_report(
     issue: str = "",
     claim_id: str = "",
     resume_on: str = "",
+    backlog_count: int | None = None,
 ) -> list[str]:
     """Binds a lane report to one exact current claim generation.
 
@@ -266,15 +288,23 @@ def record_report(
         issue: Exact owned issue, inferred only when ownership is unambiguous.
         claim_id: Expected ownership generation, when already observed.
         resume_on: Existing authorized issue whose completion resumes a block.
+        backlog_count: Work units the lane still states as remaining on this
+            claim. None leaves the recorded count as it stands, because a
+            report that does not restate the count says nothing about it.
 
     Returns:
         Issue numbers whose current execution state changed.
 
     Raises:
-        BridgeError: If a ready report has no valid commit.
+        BridgeError: If a ready report has no valid commit, or a stated
+            backlog is not a count of zero or more.
     """
     if outcome == READY and not COMMIT.fullmatch(commit):
         raise BridgeError("Ready work must name its exact Git commit.")
+    if backlog_count is not None and (
+        type(backlog_count) is not int or backlog_count < 0
+    ):
+        raise BridgeError("A reported backlog must be a count of zero or more.")
     if resume_on and outcome != BLOCKED:
         raise BridgeError("--resume-on is valid only for blocked reports.")
     resumed_by = _issue_number(resume_on, "Resume issue") if resume_on else ""
@@ -362,6 +392,8 @@ def record_report(
             ),
         )
         execution["progress"] = {"token": commit, "at": time.time()}
+        if backlog_count is not None:
+            execution["backlog"] = backlog_count
         record["execution"] = execution
         ledger["revision"] += 1
         write_json(directory / "issues.json", ledger)

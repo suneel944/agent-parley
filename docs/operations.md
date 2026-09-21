@@ -977,17 +977,52 @@ an offer, and only a check that actually failed makes a lane unfit. An unfit
 lane prints the failed check under its row, and no offer names it. A blank cell
 means nothing has been published for that lane yet.
 
-Two offers are built on that check, both advisory and neither moving ownership.
+Three offers are built on that check, all advisory and none moving ownership.
 A lane that holds no claim and passes the check is offered, at its next
 checkpoint, the unclaimed ledger issues no recorded dependency blocks — ordered
 so the ones other owned issues wait on come first — together with the peers
 holding more than one claim. A lane that holds more than one claim is told
 which fit peers have been idle past the stall interval, so it can shed one.
-Both messages count against the same 1,536-byte checkpoint budget as every
-other injection and are delivered once per distinct offer: a lane whose
-situation has not changed sees nothing new. Nothing is claimed for a lane,
-`issue offer` remains the only transfer path, and the recipient still accepts
-or declines.
+A lane that holds one claim carrying a countable backlog, and that has itself
+recorded no coordination event for that same interval, is offered a split of
+that backlog. Every message counts against the same 1,536-byte checkpoint
+budget as every other injection and is delivered once per distinct offer: a
+lane whose situation has not changed sees nothing new. Nothing is claimed for a
+lane, `issue offer` remains the only transfer path, and the recipient still
+accepts or declines.
+
+**An idle holder offers the split itself.** A claim held by a lane that has
+gone quiet on it is a defect that reads as healthy: the claim is held, the
+remaining work is untouched, and no row says anything is wrong. The runtime
+cannot count that remaining work by itself, because a claim's units are
+whatever its own domain counts — issue families in a target project, files to
+convert, subtasks of a migration — so the owner states the count on its own
+progress report:
+
+```sh
+agent-parley report --state partial --summary "converted 12 families" \
+  --remaining "families still to convert" --backlog 129
+```
+
+The count is recorded on that claim's execution state, bound to the claim
+generation the report named, and a later report that does not restate it leaves
+it standing. A new claim generation starts with no count, because the lane that
+takes the work states its own. Once the count is above zero and the lane's own
+idle stretch passes the stall interval, the sweep offers it a split without an
+operator asking for one, naming the issue, the count and the peers that could
+take part of it. A recipient qualifies only when both readings already in the
+runtime agree: the fit check above, and the same share conditions a returned
+share is judged by — a live session process, no native dialog on its screen,
+capacity that is not exhausted, and no claim of its own blocked by unfinished
+dependencies. When no peer qualifies, nothing is offered and nothing is
+invented; if the lane does split its work and sends a part, a recipient that
+cannot answer returns that share through the bounced-share path above. The
+holder's own capacity check must also not have failed, since it has to take the
+turn that sends the share, and an exhausted owner belongs to recovery instead.
+The offer and its dispatch outcome sit on the holder's row in `status` and
+`top` as `split offer pending`, like every other work offer. The lane decides
+what to split, nothing moves until a recipient answers, and no ownership
+changes here.
 
 Idleness here is observed coordination inactivity, which is not the same thing
 as a live process or as provider capacity; the three are checked separately and
@@ -2044,7 +2079,8 @@ still resolve their sender.
 Mutations and reports run from the assigned lane. The owner pauses offered work
 until acceptance, decline, or cancellation. Use `issue decline`, `issue cancel`,
 and `issue release` explicitly; release does not close a GitHub issue. Partial or
-blocked reports require `--remaining` instead of `--evidence`.
+blocked reports require `--remaining` instead of `--evidence`, and `--backlog`
+states how many units of work the claim still has left.
 
 `up` starts the detached service; `down` stops its verified process and retains
 state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in

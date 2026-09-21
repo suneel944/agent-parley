@@ -4864,6 +4864,7 @@ reported.
         key: str = "",
         issue: str = "",
         resume_on: str = "",
+        backlog: int | None = None,
     ) -> None:
         """Records an explicitly reported outcome independently of activity.
 
@@ -4883,6 +4884,10 @@ reported.
             issue: Exact owned issue, inferred only for a sole claim.
             resume_on: Existing authorized issue whose completion resumes a
                 blocked report.
+            backlog: Work units still remaining on this claim, in whatever the
+                claim itself counts. Recording the count is what lets the
+                supervisor offer a split once this lane goes idle on it. None
+                leaves any recorded count as it stands.
 
         Raises:
             BridgeError: If the lane or required report fields are invalid, or
@@ -4930,6 +4935,7 @@ reported.
                 "issue": claim["issue"],
                 "claim_id": claim["claim_id"],
                 "resume_on": resume_on,
+                "backlog": backlog,
             },
         )
         replayed = False
@@ -4949,6 +4955,7 @@ reported.
                 str(claim["issue"]) if claim["issue"] is not None else "",
                 claim["claim_id"] or "",
                 resume_on,
+                backlog,
             )
             if replayed:
                 return
@@ -7965,6 +7972,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     report.add_argument(
+        "--backlog",
+        type=int,
+        default=None,
+        metavar="COUNT",
+        help=(
+            "Work units still remaining on this claim, in whatever it counts: "
+            "issue families, files, subtasks. Recording the count lets the "
+            "supervisor offer a split once this lane goes idle on the claim."
+        ),
+    )
+    report.add_argument(
         "--idempotency-key", default="", metavar="KEY", help=RETRY_HELP
     )
     steer = commands.add_parser(
@@ -8964,6 +8982,7 @@ def main() -> int:
                 key=args.idempotency_key,
                 issue=args.issue,
                 resume_on=args.resume_on,
+                backlog=args.backlog,
             )
             print(f"Recorded outcome: {args.state}")
         elif args.command == "say" or (
