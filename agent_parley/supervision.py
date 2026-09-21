@@ -1444,6 +1444,31 @@ def _dead(observed: dict, after: float) -> bool:
     )
 
 
+def _quiesced(marker: dict, name: str, record: dict) -> bool:
+    """Reports whether a marker records an authorized live-recovery stop.
+
+    An authorized quiesce stops the owner's session on purpose and keeps a
+    checkpoint of its work, so its marker describes a decision rather than a
+    crash. A crash marker carries neither, which is what separates the two
+    everywhere a marker is written or withdrawn.
+
+    Args:
+        marker: Orphan marker the record carries, if any.
+        name: Participant that currently owns the record.
+        record: Published ledger record for one issue.
+
+    Returns:
+        Whether the marker names this owner's current claim and was published
+        with both an operator authorization and a durable checkpoint.
+    """
+    return bool(
+        marker.get("owner") == name
+        and marker.get("claim_id") == record.get("claim_id")
+        and marker.get("authorization")
+        and marker.get("checkpoint")
+    )
+
+
 def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     """Marks a dead lane's claims as orphaned and tells every other lane once.
 
@@ -1454,8 +1479,15 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     Nothing moves here. The issue keeps its owner, the reservations keep their
     holder, and only an explicit ``issue claim --take-orphaned`` by a peer
-    transfers either. A lane that is merely idle is never marked, and a lane
-    that returns keeps nothing but the right to claim its work again.
+    transfers either. A lane that is merely idle is never marked.
+
+    A marker is an observation, not a verdict, so it is withdrawn as soon as
+    the observation stops holding: a lane whose recorded session process is
+    running again loses the marker on its claims and keeps those claims. The
+    alternative left the ledger reporting a claim as orphaned while takeover
+    read the owner as live and refused, so the remedy the marker printed could
+    never succeed. A marker published by authorized live recovery survives,
+    because it records an approved stop rather than a crash.
 
     Args:
         home: Private bridge state root.
@@ -1464,30 +1496,39 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         config: Resolved supervision settings.
     """
     after = config["stalled_after"]
+    observations = {
+        name: presence(directory, name, config["inactive_after"])
+        for name in manifest["participants"]
+    }
     dead = {
         name: observed
-        for name in manifest["participants"]
-        if _dead(
-            observed := presence(directory, name, config["inactive_after"]),
-            after,
-        )
+        for name, observed in observations.items()
+        if _dead(observed, after)
     }
-    if not dead:
+    returned = [
+        name
+        for name, observed in observations.items()
+        if name not in dead and observed["process_alive"] is True
+    ]
+    if not dead and not returned:
         return
-    from agent_parley import recovery
+    recoverable: set[str] = set()
+    reservations: dict = {}
+    if dead:
+        from agent_parley import recovery
 
-    recoverable = set()
-    for name in dead:
+        for name in dead:
+            try:
+                recovery.capture(directory, manifest, name)
+                recoverable.add(name)
+            except (BridgeError, OSError, ValueError):
+                pass
         try:
-            recovery.capture(directory, manifest, name)
-            recoverable.add(name)
-        except (BridgeError, OSError, ValueError):
-            pass
-    try:
-        reservations = store.active_reservations(home, manifest["root"])
-    except (BridgeError, OSError, sqlite3.Error):
-        reservations = {}
+            reservations = store.active_reservations(home, manifest["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            reservations = {}
     notices = []
+    withdrawn = []
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
         changed = False
@@ -1504,12 +1545,7 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 if record.get("owner") != name:
                     continue
                 current = record.get("orphan") or {}
-                if (
-                    current.get("owner") == name
-                    and current.get("claim_id") == record.get("claim_id")
-                    and current.get("authorization")
-                    and current.get("checkpoint")
-                ):
+                if _quiesced(current, name, record):
                     marked.append(number)
                     continue
                 identifier = (
@@ -1530,11 +1566,26 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 fresh = True
             if fresh:
                 notices.append((name, sorted(marked, key=int), list(keys)))
+        for name in returned:
+            recovered = []
+            for number, record in ledger["issues"].items():
+                if record.get("owner") != name:
+                    continue
+                current = record.get("orphan") or {}
+                if not current or _quiesced(current, name, record):
+                    continue
+                del record["orphan"]
+                recovered.append(number)
+                changed = True
+            if recovered:
+                withdrawn.append((name, sorted(recovered, key=int)))
         if changed:
             ledger["revision"] += 1
             write_json(directory / "issues.json", ledger)
     for name, marked, keys in notices:
         _announce_orphan(home, manifest, name, marked, keys)
+    for name, recovered in withdrawn:
+        _announce_return(home, manifest, name, recovered)
 
 
 def _announce_orphan(
@@ -1572,6 +1623,46 @@ def _announce_orphan(
                 f"Orphaned claims held by {name}",
                 body,
                 f"orphan:{digest}",
+            )
+
+
+def _announce_return(
+    home: Path, manifest: dict, name: str, numbers: list[str]
+) -> None:
+    """Tells every other lane once that one lane's orphan marker is withdrawn.
+
+    A peer that was told to take the work is told that the work is no longer
+    available, so the earlier notice is never left standing as the last thing
+    that lane heard about those issues.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        name: Participant whose marker was withdrawn.
+        numbers: Issue numbers that lost the marker, in ledger order.
+    """
+    listed = ", ".join(f"#{number}" for number in numbers)
+    body = (
+        f"{name} is running again: its recorded session process answered, so "
+        f"the orphan marker on {listed} is withdrawn. Those claims stay with "
+        f"{name} and are no longer available to take. A peer that was told to "
+        "take one should leave it alone and ask that lane for a handoff "
+        "instead."
+    )
+    for peer, participant in manifest["participants"].items():
+        if peer == name:
+            continue
+        digest = hashlib.sha256(
+            f"{name}\x00{listed}\x00{peer}".encode()
+        ).hexdigest()[:32]
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.speak(
+                home,
+                manifest["root"],
+                participant["display"],
+                f"Orphan marker withdrawn for {name}",
+                body,
+                f"orphan-return:{digest}",
             )
 
 

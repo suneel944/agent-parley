@@ -78,6 +78,7 @@ if TYPE_CHECKING:
         describe,
         handoff_fields,
         offer_state,
+        orphan_age,
         parse_issue,
         snapshot,
     )
@@ -215,6 +216,7 @@ if not TYPE_CHECKING:
     describe = _DeferredCallable(issues, "describe")
     handoff_fields = _DeferredCallable(issues, "handoff_fields")
     offer_state = _DeferredCallable(issues, "offer_state")
+    orphan_age = _DeferredCallable(issues, "orphan_age")
     parse_issue = _DeferredCallable(issues, "parse_issue")
     snapshot = _DeferredCallable(issues, "snapshot")
     lock = _DeferredCallable(state, "lock")
@@ -806,10 +808,12 @@ def lane_detail(record: dict, data: dict) -> None:
     for claim in record["claims"]:
         if claim.get("orphaned"):
             held = claim.get("orphan_reservations") or []
+            recorded = claim.get("orphan_recorded_seconds") or 0
             print(
-                f"    Issue #{claim['issue']} is orphaned: "
-                f"{claim['orphan_reason']}; still owned until a peer runs "
-                f"issue claim {claim['issue']} --take-orphaned"
+                f"    Issue #{claim['issue']} was marked orphaned "
+                f"{recorded}s ago: {claim['orphan_reason']}; still owned "
+                f"until a peer runs issue claim {claim['issue']} "
+                "--take-orphaned"
                 + (f"; holds {', '.join(held)}" if held else "")
             )
         if claim["overdue"]:
@@ -6568,6 +6572,11 @@ reported.
                     "orphaned": bool(record.get("orphan")),
                     "orphan_reason": (record.get("orphan") or {}).get(
                         "reason", ""
+                    ),
+                    "orphan_recorded_seconds": (
+                        orphan_age(record["orphan"])
+                        if record.get("orphan")
+                        else None
                     ),
                     "orphan_reservations": list(
                         (record.get("orphan") or {}).get("reservations", [])
