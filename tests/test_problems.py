@@ -274,6 +274,40 @@ def test_a_broadcast_costs_one_row_per_parked_lane(
     assert "the oldest" in found[0]["detail"]
 
 
+def test_a_bounced_share_is_a_row_on_the_sender(bridge, repo, paired, served):
+    directory = bridge.project(repo)[1]
+    store.initialize(bridge.home)
+    alive(directory, "claude")
+    stopped(directory, "codex")
+    actor = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, paired["root"], "claude")[
+            "registration_token"
+        ],
+    )
+    store.register(bridge.home, paired["root"], "codex")
+    share = store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Take the parser half",
+            "body_md": "Take the parser half",
+            "idempotency_key": "share",
+            "ack_required": True,
+            "ack_within": 600,
+        },
+    )
+    [row] = rows(bridge, problems.BOUNCE)
+    assert row["participant"] == "claude"
+    assert f"share {share['id']}" in row["detail"]
+    assert "codex has no live session process" in row["detail"]
+    assert row["command"] == (
+        f"agent-parley run codex --resume --repo {paired['root']}"
+    )
+
+
 def test_a_drifted_lane_names_the_restore(bridge, repo, paired, served):
     lane = paired["lanes"]["claude"]
     subprocess.run(

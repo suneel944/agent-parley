@@ -21,6 +21,7 @@ INACTIVE = "inactive"
 OVERDUE = "overdue claim"
 OFFER = "unanswered offer"
 ACK = "awaiting acknowledgement"
+BOUNCE = "bounced share"
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
 BUDGET = "over budget"
@@ -246,6 +247,57 @@ def _offer_rows(project: dict, now: float) -> list[dict]:
     return rows
 
 
+def _bounce_rows(
+    home: Path, directory: Path, data: dict, project: dict
+) -> list[dict]:
+    """Derives one row per share whose recipients cannot act on it.
+
+    The row sits on the sender's lane, because that is the lane still holding
+    work it believed it had shared. The command names what the first blocked
+    recipient needs, since clearing that condition is what lets the share be
+    answered at all. An operator's own request carries no row here; it is
+    already reported as awaiting acknowledgement.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        data: Project manifest holding every participant.
+        project: One project's status reading.
+
+    Returns:
+        Zero or more rows, oldest share first.
+    """
+    availability = {
+        record["participant"]: record.get("availability") or {}
+        for record in project["participants"]
+    }
+    repo = f"--repo {project['root']}"
+    rows = []
+    for share in supervision.bounced_shares(
+        home, directory, data, availability
+    ):
+        blocked = share["blocked"]
+        listed = ", ".join(
+            f"{entry['recipient']} {entry['reason']}" for entry in blocked[:3]
+        )
+        first = blocked[0]["lane"]
+        rows.append(
+            _row(
+                BOUNCE,
+                f"share {share['message_id']} returned unanswerable: {listed}",
+                _wake(
+                    first,
+                    repo,
+                    availability.get(first) or {"state": supervision.UNKNOWN},
+                ),
+                share["waiting_seconds"],
+                share["sender_lane"] or share["sender"],
+                project["root"],
+            )
+        )
+    return rows
+
+
 def derive(
     home: Path, report: dict, ack_after: float = 0.0, now: float = 0.0
 ) -> list[dict]:
@@ -274,13 +326,13 @@ def derive(
             _row(SERVICE, "coordination server is not ready", "agent-parley up")
         )
     manifests = {
-        data["root"]: data
+        data["root"]: (path.parent, data)
         for path in (home / "projects").glob("*/project.json")
         for data in [roster.normalize(json.loads(path.read_text()))]
     }
     aged: list[dict] = []
     for project in report["projects"]:
-        data = manifests[project["root"]]
+        directory, data = manifests[project["root"]]
         after = (
             ack_after or supervision.configuration(home, data)["stalled_after"]
         )
@@ -295,6 +347,7 @@ def derive(
                 )
             )
         aged.extend(_offer_rows(project, stamp))
+        aged.extend(_bounce_rows(home, directory, data, project))
     aged.sort(key=lambda row: -(row["seconds"] or 0))
     return rows + aged
 

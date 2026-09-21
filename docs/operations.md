@@ -351,6 +351,7 @@ condition, its age and the one command that clears it:
 | `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
 | `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
 | `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. One row per lane, naming the oldest, so a broadcast costs one row per lane. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
+| `bounced share` | A share the sender is still waiting on reached a recipient that cannot act on it. The row sits on the sender's lane. | The command the first blocked recipient needs: a wake while its launcher is alive, `agent-parley run NAME --resume` once it is stopped. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
 | `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
@@ -572,6 +573,24 @@ retiring records no acknowledgement for any lane: a recipient that never
 answered still carries no acknowledgement time. A sender that holds no inbox,
 such as the supervising operator, is not mailed and the expectation is still
 retired.
+
+**A share no recipient can act on comes back before its deadline.** A share is
+an acknowledgement request still inside its window: the sender is waiting for an
+answer that decides whether work moves. Writing it into a mailbox is not
+receipt, so each sweep reads whether every recipient could answer at all — a
+live session process, no native dialog on its screen, provider capacity that is
+not exhausted, and no claim of its own blocked by unfinished dependencies. A
+recipient failing one of those cannot answer, and the sweep returns the share to
+its sender naming each such recipient and its reason. The sender keeps the work
+and may offer it to a lane that reads as fit; the notice is ordinary mail, so it
+joins the sender's backlog rather than leaving that lane waiting quietly. The
+notice is deduplicated by the share it reports. Nothing is withdrawn, no
+ownership moves, no mail is deleted, and the acknowledgement expectation stays in
+force, so a recipient that recovers can still answer and the deadline above
+remains the only place an expectation is retired. `problems` carries the same
+reading as a `bounced share` row on the sender's lane while it holds. A request
+the operator sent is not returned this way: that operator is at a terminal and
+already reads it as awaiting acknowledgement.
 
 Deadlines are evaluated when a checkpoint, a `status`, a `top` refresh or a
 served call reads the record, from the stored timestamps. The service gains no

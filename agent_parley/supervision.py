@@ -1405,6 +1405,30 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
+def dialog_waiting(directory: Path, name: str) -> bool:
+    """Reports whether the lane's own state reads as a dialog on its screen.
+
+    The lane's last wake outcome is the only local reading that distinguishes
+    a session waiting for the operator from one working, so it is the
+    predicate every caller uses. A screen watcher that records a dialog
+    through the same lane state is read here without further change.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        Whether the lane last read as waiting for operator input. A lane with
+        no recorded wake outcome reads as not waiting, because an absent
+        record is no evidence of a dialog.
+    """
+    try:
+        wake = json.loads((directory / f"{name}-wake.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(wake, dict) and wake.get("result") in DIALOG_WAKES
+
+
 def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     """States in one clause why a lane did not acknowledge in time.
 
@@ -1423,11 +1447,7 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     """
     if observed.get("state") == STOPPED:
         return "has no running session"
-    try:
-        wake = json.loads((directory / f"{name}-wake.json").read_text())
-    except (OSError, ValueError):
-        wake = {}
-    if wake.get("result") in DIALOG_WAKES:
+    if dialog_waiting(directory, name):
         return "has a native dialog waiting for the operator"
     state = published_capacity(directory, name)["state"]
     if state == "exhausted":
@@ -1500,6 +1520,184 @@ def acknowledgement_deadlines(
                 )
             store.retire_acknowledgement(
                 home, manifest["root"], breach["message_id"]
+            )
+
+
+def share_blocker(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    observed: dict,
+    ledger: dict,
+) -> str:
+    """States in one clause why a lane cannot act on a share right now.
+
+    Only conditions the runtime can read locally count: the recorded session
+    process, the lane's own dialog state, its durable provider capacity and
+    the dependencies of the claims it already holds. Silence is not one of
+    them, so a live lane that has simply not answered yet is never reported
+    as unable to act; that case belongs to the acknowledgement deadline.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Project manifest holding this participant.
+        name: Participant the share was addressed to.
+        observed: That lane's presence reading.
+        ledger: Current issue ledger.
+
+    Returns:
+        One clause naming the condition, worded to follow the lane's name, or
+        an empty string when nothing local says the lane cannot act.
+    """
+    if observed.get("state") == STOPPED:
+        return "has no live session process"
+    if dialog_waiting(directory, name):
+        return "has a native dialog waiting for the operator"
+    if capacity(home, directory, manifest, name)["state"] == "exhausted":
+        return "has exhausted its provider capacity"
+    blocked = sorted(
+        (
+            number
+            for number, record in ledger.get("issues", {}).items()
+            if record.get("owner") == name
+            and record.get("blocked_by")
+            and not lifecycle.dependencies_complete(ledger, record)
+        ),
+        key=int,
+    )
+    if blocked:
+        held = ledger["issues"][blocked[0]]
+        waiting = ", ".join(f"#{number}" for number in held["blocked_by"])
+        return f"holds #{blocked[0]}, itself blocked by {waiting}"
+    return ""
+
+
+def bounced_shares(
+    home: Path, directory: Path, manifest: dict, observations: dict
+) -> list[dict]:
+    """Lists the shares whose recipients cannot act on them.
+
+    A share here is an acknowledgement request still inside its deadline: the
+    sender is waiting for an answer that decides whether the work moves. A
+    recipient that reads as unable to act will not produce that answer, so
+    the share is reported bounced while the sender can still keep the work
+    and offer it elsewhere.
+
+    The reading is derived, never stored: a recipient that becomes fit, or
+    acknowledges, stops appearing without anything being cleared. Nothing
+    here withdraws a share, moves ownership or deletes mail.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant.
+
+    Only a share a lane sent is reported. The supervising operator is at a
+    terminal and already reads the request as awaiting acknowledgement, so
+    returning it would add a second row for a condition that is on screen.
+
+    Returns:
+        One entry per share, oldest first, naming the message, its subject,
+        its sender as an identity and as a participant, how long it has
+        waited, and one blocked entry per recipient that cannot act, carrying
+        that recipient and the reason. A store that cannot be read yields what
+        was read before it failed.
+    """
+    named = {
+        entry["display"]: name
+        for name, entry in manifest["participants"].items()
+    }
+    found: list[dict] = []
+    ledger = issues.snapshot(directory)
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        for share in store.pending_acknowledgements(home, manifest["root"]):
+            if share["sender"] not in named:
+                continue
+            blocked = []
+            for display in share["recipients"]:
+                lane = named.get(display)
+                observed = observations.get(lane) if lane else None
+                if lane is None or observed is None:
+                    continue
+                reason = share_blocker(
+                    home, directory, manifest, lane, observed, ledger
+                )
+                if reason:
+                    blocked.append(
+                        {
+                            "lane": lane,
+                            "recipient": display,
+                            "reason": reason,
+                        }
+                    )
+            if blocked:
+                found.append(
+                    {
+                        "message_id": share["message_id"],
+                        "subject": share["subject"],
+                        "sender": share["sender"],
+                        "sender_lane": named[share["sender"]],
+                        "waiting_seconds": share["waiting_seconds"],
+                        "blocked": blocked,
+                    }
+                )
+    return found
+
+
+def share_bounces(
+    home: Path, directory: Path, manifest: dict, observations: dict
+) -> None:
+    """Returns a share no recipient can act on to the lane that sent it.
+
+    Delivery into a mailbox is not receipt. A share addressed to a lane with
+    no live session, a dialog on its screen, exhausted provider capacity or a
+    blocked claim of its own is answered by nobody, and until now the sender
+    learned that only when the acknowledgement deadline passed, or never. The
+    sweep returns it as soon as the condition is readable, naming each
+    recipient and its reason, so the sender keeps the work and can offer it to
+    a lane that reads as fit.
+
+    The notice is deduplicated by the share it reports, so a repeating sweep
+    writes nothing further, and it is ordinary mail: the sender's own backlog
+    carries it, which is what stops that lane waiting quietly on an answer
+    that is not coming. The acknowledgement expectation is left in force, so a
+    recipient that recovers can still answer and the deadline path stays the
+    one place an expectation is retired.
+
+    A share the supervising operator sent is not returned: that operator is at
+    a terminal and reads the request as awaiting acknowledgement already.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant from this sweep.
+    """
+    for share in bounced_shares(home, directory, manifest, observations):
+        listed = "\n".join(
+            f"- {entry['recipient']} {entry['reason']}"
+            for entry in share["blocked"]
+        )
+        body = (
+            f"Message {share['message_id']} ({share['subject']}) asked for an "
+            "acknowledgement that these recipients cannot give:\n"
+            f"{listed}\n"
+            "The share is returned to you. You keep the work: offer it to a "
+            "lane that reads as fit with agent-parley participant status, or "
+            "hold it yourself. Nothing was withdrawn, no ownership moved, and "
+            "the acknowledgement still stands until its deadline."
+        )
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.speak(
+                home,
+                manifest["root"],
+                share["sender"],
+                f"Share returned: message {share['message_id']}",
+                body,
+                f"share-bounce-{share['message_id']}",
             )
 
 
@@ -1870,6 +2068,7 @@ def poll(home: Path, directory: Path) -> None:
         reminders(directory, manifest, closed)
         deadline_notices(directory, manifest)
         acknowledgement_deadlines(home, directory, manifest, observations)
+        share_bounces(home, directory, manifest, observations)
         orphans(home, directory, manifest, config)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)

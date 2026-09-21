@@ -2859,19 +2859,22 @@ def acknowledge(home: Path, root: str, identifier: int) -> dict:
         }
 
 
-def overdue_acknowledgements(home: Path, root: str) -> list[dict]:
-    """Lists the acknowledgement requests whose deadline passed unanswered.
+def _unanswered(home: Path, root: str, deadline: str) -> list[dict]:
+    """Groups the unanswered acknowledgement rows one deadline clause selects.
 
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
+        deadline: Clause restricting the recorded deadline, appended to the
+            selection of every acknowledgement no recipient has answered.
 
     Returns:
         One entry per message, oldest message first, naming the sender, the
-        subject, how long the deadline has been past and the registered
-        identities that have not acknowledged it. A broadcast is one entry
-        holding every silent recipient rather than one entry per recipient.
-        A project with no store yet has nothing overdue.
+        subject, how long the message has waited, how long its deadline has
+        been past and the registered identities that have not acknowledged
+        it. A broadcast is one entry holding every silent recipient rather
+        than one entry per recipient. A project with no store yet has nothing
+        to report.
     """
     if not (home / DATABASE).exists():
         return []
@@ -2879,6 +2882,8 @@ def overdue_acknowledgements(home: Path, root: str) -> list[dict]:
         rows = db.execute(
             "SELECT m.id AS message_id,m.subject AS subject,"
             "s.name AS sender,a.name AS recipient,"
+            "CAST((julianday('now')-julianday(m.created_ts))*86400 "
+            "AS INTEGER) AS waiting,"
             "CAST((julianday('now')-julianday(m.ack_deadline_ts))*86400 "
             "AS INTEGER) AS overdue FROM messages m "
             "JOIN message_recipients r ON r.message_id=m.id "
@@ -2886,8 +2891,7 @@ def overdue_acknowledgements(home: Path, root: str) -> list[dict]:
             "JOIN agents s ON s.id=m.sender_id "
             "JOIN projects p ON p.id=m.project_id "
             "WHERE p.human_key=? AND m.ack_required=1 AND r.ack_ts IS NULL "
-            "AND m.ack_deadline_ts IS NOT NULL "
-            "AND m.ack_deadline_ts<=datetime('now') ORDER BY m.id,a.name",
+            f"AND {deadline} ORDER BY m.id,a.name",
             (root,),
         ).fetchall()
     breaches: dict[int, dict] = {}
@@ -2898,12 +2902,54 @@ def overdue_acknowledgements(home: Path, root: str) -> list[dict]:
                 "message_id": row["message_id"],
                 "subject": row["subject"],
                 "sender": row["sender"],
+                "waiting_seconds": max(0, int(row["waiting"] or 0)),
                 "overdue_seconds": max(0, int(row["overdue"] or 0)),
                 "recipients": [],
             },
         )
         breach["recipients"].append(row["recipient"])
     return list(breaches.values())
+
+
+def overdue_acknowledgements(home: Path, root: str) -> list[dict]:
+    """Lists the acknowledgement requests whose deadline passed unanswered.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        One entry per message as :func:`_unanswered` shapes it, restricted to
+        the messages whose recorded deadline is already past.
+    """
+    return _unanswered(
+        home,
+        root,
+        "m.ack_deadline_ts IS NOT NULL AND m.ack_deadline_ts<=datetime('now')",
+    )
+
+
+def pending_acknowledgements(home: Path, root: str) -> list[dict]:
+    """Lists the acknowledgement requests still inside their deadline.
+
+    These are the requests a recipient may yet answer, so they are exactly
+    the ones a fitness reading can still act on: past the deadline the
+    request belongs to :func:`overdue_acknowledgements`, which returns it to
+    its sender and retires it. The two sets never overlap.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        One entry per message as :func:`_unanswered` shapes it, restricted to
+        the messages whose deadline has not passed or was never recorded.
+    """
+    return _unanswered(
+        home,
+        root,
+        "(m.ack_deadline_ts IS NULL OR m.ack_deadline_ts>datetime('now'))",
+    )
 
 
 def retire_acknowledgement(home: Path, root: str, identifier: int) -> bool:

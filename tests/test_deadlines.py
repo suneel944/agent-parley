@@ -1,6 +1,7 @@
 """Checks recorded deadlines, attempt budgets and their visible states."""
 
 import json
+import os
 import sys
 import time
 
@@ -15,6 +16,7 @@ from agent_parley import (
     store,
     supervision,
 )
+from agent_parley.process import start_ticks
 from agent_parley.state import BridgeError, write_json
 
 
@@ -96,6 +98,43 @@ def outstanding(bridge, paired, name):
     return checkpoints.mailbox(bridge.home, paired["root"], name)[
         "outstanding_ack"
     ]
+
+
+def bounced(bridge, name):
+    """Returns the returned shares one sender received."""
+    with store.connect(bridge.home) as db:
+        return [
+            dict(row)
+            for row in db.execute(
+                "SELECT m.id,m.subject,m.body_md FROM messages m "
+                "JOIN message_recipients r ON r.message_id=m.id "
+                "JOIN agents a ON a.id=r.agent_id WHERE a.name=? AND "
+                "m.subject LIKE 'Share returned%' ORDER BY m.id",
+                (name,),
+            )
+        ]
+
+
+def alive(directory, name):
+    """Records a live but long-quiet session process for one lane."""
+    write_json(
+        directory / f"{name}-activity.json",
+        {
+            "session_pid": os.getpid(),
+            "session_ticks": start_ticks(os.getpid()),
+            "activity": "idle",
+            "updated": 0,
+        },
+    )
+
+
+def readings(bridge, directory):
+    """Returns the manifest and one presence reading per participant."""
+    manifest = roster.read(directory)
+    return manifest, {
+        name: supervision.presence(directory, name)
+        for name in manifest["participants"]
+    }
 
 
 def test_a_claim_records_the_window_it_was_given(bridge, repo, paired):
@@ -303,6 +342,103 @@ def test_a_broadcast_returns_one_notice_naming_every_silent_lane(
     assert "codex has no running session" in notice["body_md"]
     assert not outstanding(bridge, paired, "codex")
     assert not outstanding(bridge, paired, "claude-1")
+
+
+def test_a_share_no_recipient_can_act_on_returns_before_its_deadline(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    share = request_ack(bridge, actor, ["codex"], "parked", within=600)
+    supervision.poll(bridge.home, directory)
+    [notice] = bounced(bridge, "claude")
+    assert f"message {share['id']}" in notice["subject"]
+    assert "codex has no live session process" in notice["body_md"]
+    assert "You keep the work" in notice["body_md"]
+    assert len(outstanding(bridge, paired, "codex")) == 1
+    assert returned(bridge, "claude") == []
+    supervision.poll(bridge.home, directory)
+    assert len(bounced(bridge, "claude")) == 1
+
+
+def test_a_returned_share_still_reaches_its_deadline_and_retires(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    share = request_ack(bridge, actor, ["codex"], "unanswered", within=60)
+    supervision.poll(bridge.home, directory)
+    assert len(bounced(bridge, "claude")) == 1
+    expire(bridge, share["id"])
+    assert store.pending_acknowledgements(bridge.home, paired["root"]) == []
+    supervision.poll(bridge.home, directory)
+    [missed] = returned(bridge, "claude")
+    assert f"message {share['id']}" in missed["subject"]
+    assert outstanding(bridge, paired, "codex") == []
+    manifest, observations = readings(bridge, directory)
+    assert (
+        supervision.bounced_shares(
+            bridge.home, directory, manifest, observations
+        )
+        == []
+    )
+
+
+def test_a_share_a_fit_lane_can_answer_is_delivered_once(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    alive(directory, "codex")
+    request_ack(bridge, actor, ["codex"], "fit", within=600)
+    manifest, observations = readings(bridge, directory)
+    assert (
+        supervision.bounced_shares(
+            bridge.home, directory, manifest, observations
+        )
+        == []
+    )
+    supervision.share_bounces(bridge.home, directory, manifest, observations)
+    assert bounced(bridge, "claude") == []
+    assert len(outstanding(bridge, paired, "codex")) == 1
+
+
+def test_a_recipient_a_dialog_or_a_blocked_claim_holds_cannot_act(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    alive(directory, "codex")
+    manifest, observations = readings(bridge, directory)
+
+    def blocker():
+        return supervision.share_blocker(
+            bridge.home,
+            directory,
+            manifest,
+            "codex",
+            observations["codex"],
+            issues.snapshot(directory),
+        )
+
+    assert blocker() == ""
+    write_json(
+        directory / "codex-wake.json", {"result": "manual attention required"}
+    )
+    assert "native dialog" in blocker()
+    write_json(directory / "codex-wake.json", {"result": "delivered"})
+    assert blocker() == ""
+    state = issues.snapshot(directory)
+    state["issues"]["7"] = {
+        "owner": "codex",
+        "blocked_by": ["9"],
+        "action": "implement",
+    }
+    state["revision"] += 1
+    write_json(directory / "issues.json", state)
+    assert blocker() == "holds #7, itself blocked by #9"
 
 
 def test_defaults_are_validated_and_reported_as_json(

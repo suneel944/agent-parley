@@ -97,6 +97,10 @@ command is already tracked, and tell me if someone is holding it."
   back to you naming the recipients that did not acknowledge and what the
   runtime could read about why, and the expectation is retired, so a silent
   peer never leaves a permanent row. Send it again only if you still need it.
+- A share you sent returns sooner when no recipient can act on it at all: no
+  live session, a dialog on its screen, exhausted capacity, or a blocked claim
+  of its own. The notice names each recipient and its reason. You still hold
+  the work, so offer it to a lane that reads as fit instead of waiting.
 - Retry a failed write with the `idempotency_key` it first carried. The repeat
   returns the first result and writes nothing further. A retry without a key can
   reserve twice, so `file_reservation_paths`, `request_reservation`,
