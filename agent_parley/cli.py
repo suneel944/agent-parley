@@ -705,6 +705,28 @@ def reviewed_line(review: dict) -> str:
     )
 
 
+def wake_schedule(wake: dict) -> str:
+    """States when a parked lane is asked again, or why it is not.
+
+    Args:
+        wake: Wake reading from a participant record.
+
+    Returns:
+        One line naming the next attempt and the cause that postponed it, or
+        the exhausted budget with the last cause. A record written before the
+        schedule existed reports that it is still to be re-decided rather than
+        inventing a time.
+    """
+    cause = wake.get("blocked") or wake.get("result") or "unknown"
+    if wake.get("exhausted"):
+        return f"Wake budget exhausted; last cause: {cause}"
+    seconds = wake.get("next_seconds")
+    if seconds is None:
+        return "Next wake: due on the next re-evaluation"
+    blocked = f"; blocked: {wake['blocked']}" if wake.get("blocked") else ""
+    return f"Next wake in {seconds}s at {wake['next_at']}{blocked}"
+
+
 def review_fields(review: dict | None) -> dict | None:
     """Reports one peer verdict in the shape every snapshot carries it.
 
@@ -854,9 +876,11 @@ def lane_detail(record: dict, data: dict) -> None:
     if wake := record["wake"]:
         print(
             f"    Runtime wake: {wake['result']}; "
-            f"attempt {wake['attempts']}; "
-            f"{wake['age_seconds']}s ago"
+            f"attempt {wake['attempts']}"
+            + (f"/{wake['budget']}" if wake.get("budget") else "")
+            + f"; {wake['age_seconds']}s ago"
         )
+        print(f"    {wake_schedule(wake)}")
     mail = record["mail"] or {}
     if "error" in mail:
         print(f"    Coordination unavailable: {mail['error']}")
@@ -6618,11 +6642,19 @@ reported.
         wake_path = directory / f"{agent}-wake.json"
         if wake_path.exists():
             wake = json.loads(wake_path.read_text())
+            next_at = wake.get("next_at")
             record["wake"] = {
                 "result": wake["result"],
                 "attempts": wake["attempts"],
                 "at": views.timestamp(wake["at"]),
                 "age_seconds": int(time.time() - wake["at"]),
+                "budget": supervision.WORK_WAKE_ATTEMPTS,
+                "blocked": wake.get("blocked", ""),
+                "exhausted": bool(wake.get("exhausted_at")),
+                "next_at": (views.timestamp(next_at) if next_at else None),
+                "next_seconds": (
+                    max(int(next_at - time.time()), 0) if next_at else None
+                ),
             }
         try:
             mail = mailbox(

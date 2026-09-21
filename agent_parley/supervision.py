@@ -38,6 +38,8 @@ WORK_WAKE_ATTEMPTS = 3
 UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
 WORK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop"})
+WAKE_READY = frozenset({IDLE, STOPPED})
+WAKE_ATTENTION = "manual attention required"
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -2480,6 +2482,134 @@ def _select_work_prompt(
     return True
 
 
+def _wake_due(
+    at: float, attempts: int, ready_at: float, window: float
+) -> float:
+    """Times the next wake attempt after the recorded one.
+
+    The delay doubles with each attempt already spent, so a lane that answered
+    nothing is asked again less often instead of being asked on every poll, and
+    a cause that names its own clearing time postpones the attempt until then.
+
+    Args:
+        at: Time of the last recorded attempt.
+        attempts: Attempts already spent against the current backlog.
+        ready_at: Earliest time the blocking cause can clear, 0 when unknown.
+        window: Inactivity window the attempts are spaced by.
+
+    Returns:
+        Unix time from which the next attempt may be made.
+    """
+    delay = window * 2 ** max(attempts - 1, 0)
+    return max(at + delay, ready_at)
+
+
+def _wake_block(
+    directory: Path, name: str, state: dict, observed: dict, record: dict
+) -> tuple[str, float]:
+    """Names what stops a wake attempt now and when it could clear.
+
+    A wake is re-decided on every poll rather than once, so an attempt is spent
+    only on a lane that could answer it. Capacity is read from the durable
+    observation, never from elapsed time, and blocks only while the provider
+    named a reset still ahead, because the attempt after that reset is itself
+    the evidence that the lane is back. A lane whose screen state is not idle
+    or stopped while its recorded process runs is working or parked on a native
+    dialog it owns, and the dialog watcher publishes into the same activity
+    state, so answering the dialog clears this cause with no change here. A
+    lane with no running process and no session to resume is blocked only once
+    its first attempt has already recorded that, so the refusal is reported
+    before the cause starts sparing the budget.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        state: The lane's published activity state.
+        observed: The lane's presence reading.
+        record: The lane's last durable wake record.
+
+    Returns:
+        The blocking cause, empty when an attempt can be made, and the earliest
+        time that cause can clear, 0 when only a later observation clears it.
+    """
+    observation = published_capacity(directory, name)
+    allowed, reason = _capacity_check(observation)
+    reset_at = observation.get("reset_at")
+    if (
+        allowed is False
+        and isinstance(reset_at, (int, float))
+        and not isinstance(reset_at, bool)
+        and float(reset_at) > time.time()
+    ):
+        return reason, float(reset_at)
+    activity = str(state.get("activity", "")) or UNKNOWN
+    if activity not in WAKE_READY and observed["process_alive"]:
+        return f"its screen state is {activity}", 0.0
+    if (
+        observed["process_alive"] is False
+        and not state.get("session_id")
+        and str(record.get("result", "")) == WAKE_ATTENTION
+    ):
+        return "its session process is not running", 0.0
+    return "", 0.0
+
+
+def _park_wake(path: Path, record: dict, cause: str, due: float | None) -> None:
+    """Publishes the blocking cause and next attempt time on a wake record.
+
+    Args:
+        path: The lane's durable wake record.
+        record: That record as read.
+        cause: Why no attempt was made, empty when only spacing applies.
+        due: Unix time of the next attempt, None once the budget is spent.
+    """
+    if record.get("blocked") == cause and record.get("next_at") == due:
+        return
+    record.update(blocked=cause, next_at=due)
+    write_json(path, record)
+
+
+def _defer_wake(
+    directory: Path, name: str, cause: str, ready_at: float, window: float
+) -> None:
+    """Keeps a blocked lane's next attempt visible without spending one.
+
+    Only a lane that already recorded an attempt is parked, because a lane the
+    service never woke owes no schedule and must not gain a wake record from
+    being observed.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        cause: Why no attempt was made.
+        ready_at: Earliest time the cause can clear, 0 when unknown.
+        window: Inactivity window the attempts are spaced by.
+    """
+    path = directory / f"{name}-wake.json"
+    if not path.exists():
+        return
+    with lock(directory / f"{name}-wake.lock"):
+        record: dict = {}
+        with contextlib.suppress(OSError, ValueError):
+            record = json.loads(path.read_text())
+        if not isinstance(record, dict) or not record.get("result"):
+            return
+        if record.get("exhausted_at"):
+            _park_wake(path, record, cause, None)
+            return
+        _park_wake(
+            path,
+            record,
+            cause,
+            _wake_due(
+                float(record.get("at", 0) or 0),
+                int(record.get("attempts", 0) or 0),
+                ready_at,
+                window,
+            ),
+        )
+
+
 def wake(
     home: Path,
     directory: Path,
@@ -2514,6 +2644,17 @@ def wake(
     the whole bound is escalated, because only then is there something an
     operator has to do.
 
+    A spent attempt is not the end of the series. Every poll re-decides the
+    lane against what it can read locally: durable provider capacity, the
+    published screen state and the recorded session process. A cause that is
+    still in force parks the lane with that cause and the time its next attempt
+    is due, and spends nothing, so the budget is not consumed while nothing
+    could have answered. When the cause clears, the next attempt is due one
+    doubling window after the last one, or at the provider reset the capacity
+    observation named, whichever is later. Only a lane that has actually spent
+    its whole budget is recorded as exhausted, and it keeps the last cause and
+    result for the operator instead of a next time it will never have.
+
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
@@ -2528,10 +2669,16 @@ def wake(
         return
     path = directory / f"{name}-activity.json"
     state = json.loads(path.read_text()) if path.exists() else {}
-    if (
-        state.get("activity") not in {"idle", "stopped"}
-        and observed["process_alive"]
-    ):
+    wake_path = directory / f"{name}-wake.json"
+    window = config["inactive_after"]
+    parked: dict = {}
+    with contextlib.suppress(OSError, ValueError):
+        if wake_path.exists():
+            published = json.loads(wake_path.read_text())
+            parked = published if isinstance(published, dict) else {}
+    blocked, ready_at = _wake_block(directory, name, state, observed, parked)
+    if blocked:
+        _defer_wake(directory, name, blocked, ready_at, window)
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -2560,7 +2707,6 @@ def wake(
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
     )
-    wake_path = directory / f"{name}-wake.json"
     with lock(directory / f"{name}-wake.lock"):
         work_item = _work_backlog(
             home,
@@ -2599,9 +2745,13 @@ def wake(
                 )
         if worked:
             record.pop("escalated_at", None)
-            record.update(attempts=0, activity=marker)
+            record.pop("exhausted_at", None)
+            record.update(attempts=0, activity=marker, blocked="", next_at=None)
             write_json(wake_path, record)
         if attempts >= WORK_WAKE_ATTEMPTS:
+            if not record.get("exhausted_at"):
+                record.update(exhausted_at=time.time(), next_at=None)
+                write_json(wake_path, record)
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
                     work_offer, attempts, str(record.get("result", ""))
@@ -2617,9 +2767,12 @@ def wake(
                     "escalated",
                 )
             return
-        if time.time() - throttle_at < config["inactive_after"]:
+        due = _wake_due(float(throttle_at), int(attempts), ready_at, window)
+        if time.time() < due:
+            if record.get("result"):
+                _park_wake(wake_path, record, "", due)
             return
-        result = "manual attention required"
+        result = WAKE_ATTENTION
         selected = _select_work_prompt(home, directory, name, work_offer)
         if not selected:
             result = "busy:stale"
@@ -2661,14 +2814,21 @@ def wake(
                     track_launcher(child)
                     result = f"resume requested (launcher {child.pid})"
         counted = attempts + (not result.startswith("busy"))
+        now = time.time()
+        spent = counted >= WORK_WAKE_ATTEMPTS
         write_json(
             wake_path,
             {
-                "at": time.time(),
+                "at": now,
                 "backlog": backlog,
                 "attempts": counted,
                 "result": result,
                 "activity": marker,
+                "blocked": "",
+                "next_at": (
+                    None if spent else _wake_due(now, counted, 0.0, window)
+                ),
+                "exhausted_at": now if spent else None,
             },
         )
         if work_offer:

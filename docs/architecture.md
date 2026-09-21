@@ -254,7 +254,15 @@ cover the reports, commits and mail a working lane produces. Three attempts
 across which that marker never changes produce a durable escalation in the same
 publication and in `top`; any recorded lane activity resets the series and
 clears the escalation, and changed issue state starts a new bounded attempt
-series. An offer is advisory: it never writes the ledger,
+series. A spent attempt is re-decided on every poll rather than being final:
+durable capacity, the published screen state and the recorded session process
+are read again, and a cause still in force parks the lane with that cause and
+the time its next attempt is due without spending one, so nothing is consumed
+while nothing could answer. A cleared cause makes the next attempt due one
+doubling inactivity window after the last, or at the provider reset the
+capacity observation named, whichever is later. `status` prints that next time,
+and prints the exhausted budget with its last cause only for a lane that spent
+every attempt. An offer is advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served
 project identity to private launcher state. Its best-effort forge reads run

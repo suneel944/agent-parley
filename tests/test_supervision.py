@@ -277,6 +277,191 @@ def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
     )
 
 
+def test_a_wake_without_a_session_process_is_retried_when_it_returns(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(directory / "codex-activity.json", {"activity": "stopped"})
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("resumed without a session"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    path = directory / "codex-wake.json"
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        {"process_alive": False},
+        config,
+    )
+    first = json.loads(path.read_text())
+    assert first["result"] == "manual attention required"
+    assert first["attempts"] == 1
+    assert first["next_at"] == pytest.approx(first["at"] + 1)
+    first["at"] = 0
+    write_json(path, first)
+
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        {"process_alive": False},
+        config,
+    )
+
+    parked = json.loads(path.read_text())
+    assert not calls
+    assert parked["attempts"] == 1
+    assert parked["blocked"] == "its session process is not running"
+    assert not parked.get("exhausted_at")
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    observed = supervision.presence(directory, "codex", 1)
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    retried = json.loads(path.read_text())
+    assert calls
+    assert retried["attempts"] == 2
+    assert retried["result"] == "accepted"
+    assert retried["blocked"] == ""
+
+
+def test_a_wake_blocked_by_exhausted_capacity_is_retried_at_the_reset(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    message = send(bridge, actors["claude"], "codex")
+    reset_at = time.time() + 900
+    supervision.record_capacity(
+        directory,
+        "codex",
+        {
+            "state": "exhausted",
+            "observed_at": time.time(),
+            "reset_at": reset_at,
+            "source": "codex-session-record",
+            "session_id": "rollout-capacity",
+            "observation_id": "refusal-1",
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    path = directory / "codex-wake.json"
+    write_json(
+        path,
+        {
+            "at": 0,
+            "backlog": [str(message["id"])],
+            "attempts": 1,
+            "result": "manual attention required",
+        },
+    )
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    parked = json.loads(path.read_text())
+    assert not calls
+    assert parked["attempts"] == 1
+    assert parked["next_at"] == reset_at
+    assert "provider capacity is exhausted" in parked["blocked"]
+    supervision.record_capacity(
+        directory,
+        "codex",
+        {
+            "state": "exhausted",
+            "observed_at": time.time(),
+            "reset_at": time.time() - 1,
+            "source": "codex-session-record",
+            "session_id": "rollout-capacity",
+            "observation_id": "refusal-2",
+        },
+    )
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    retried = json.loads(path.read_text())
+    assert calls
+    assert retried["attempts"] == 2
+    assert retried["result"] == "accepted"
+
+
+def test_status_reports_the_next_wake_or_the_exhausted_budget(
+    bridge, paired, capsys
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-wake.json",
+        {
+            "at": time.time() - 10,
+            "backlog": ["1"],
+            "attempts": 1,
+            "result": "manual attention required",
+            "blocked": "its screen state is waiting for approval",
+            "next_at": time.time() + 120,
+        },
+    )
+
+    bridge.status(cli.Selection(participant="codex"))
+
+    scheduled = capsys.readouterr().out
+    assert "Next wake in 1" in scheduled
+    assert "blocked: its screen state is waiting for approval" in scheduled
+    write_json(
+        directory / "codex-wake.json",
+        {
+            "at": time.time() - 10,
+            "backlog": ["1"],
+            "attempts": supervision.WORK_WAKE_ATTEMPTS,
+            "result": "manual attention required",
+            "blocked": "its session process is not running",
+            "next_at": None,
+            "exhausted_at": time.time() - 5,
+        },
+    )
+
+    bridge.status(cli.Selection(participant="codex"))
+
+    printed = capsys.readouterr().out
+    assert f"attempt 3/{supervision.WORK_WAKE_ATTEMPTS}" in printed
+    assert (
+        "Wake budget exhausted; last cause: its session process is not running"
+        in printed
+    )
+
+
 def test_dead_manual_session_resumes_from_its_recorded_session(
     bridge, paired, monkeypatch
 ):
