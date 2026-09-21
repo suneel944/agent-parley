@@ -410,6 +410,10 @@ def complete(
 ) -> dict:
     """Records verified integration and reconciles dependent issues.
 
+    Completion closes the ownership generation it names, so the mail that
+    generation sent is retired with it: nothing it asked for can still be
+    answered, and its senders stop waiting for acknowledgements of it.
+
     Args:
         directory: Private project state directory.
         issue: Issue number being completed.
@@ -527,7 +531,12 @@ def complete(
                 waiting["execution"] = waiting_execution
         ledger["revision"] += 1
         write_json(directory / "issues.json", ledger)
-        return record
+    from agent_parley import store
+
+    store.supersede_project_claim(
+        directory, claim_id, f"issue #{issue} completed"
+    )
+    return record
 
 
 def _issue_number(value: str, label: str = "Issue") -> str:

@@ -1270,7 +1270,9 @@ participant carries `participant`, `identity`, `provider`, `credential`,
 `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
-`idle_seconds`, `idle_complete`, `waiting`, `wake` and `mail`, whose
+`idle_seconds`, `idle_complete`, `waiting`, `wake` and `mail`, whose `unread`
+counts live mail alone and whose `superseded` counts the deliveries a closed or
+reassigned claim retired, whose
 `named_resources` array lists the named resources that lane holds, whose
 `queued_requests` counts the reservation requests waiting on the keys it holds
 and whose `queued_by` names the lanes that asked. `claims`
@@ -1287,7 +1289,7 @@ failing the document, exactly as the table reports coordination as unavailable.
 `totals` and one entry per project holding `root` and `participants`. Each row
 carries `participant`, `provider`, `credential`, `state`, `last_event_at`,
 `stalled`, `stall`, `branch`, `drift`, `issues`, `offers`, `unread`,
-`pending_ack`, `leases`,
+`superseded`, `pending_ack`, `leases`,
 `stale_leases`, `lease_age_seconds`, `queued_requests`, `queued_by`,
 `injected_bytes`, `hook_events`,
 `denials`, `calls`, `errors`, `tokens`, `idle_seconds`, `idle_complete` and

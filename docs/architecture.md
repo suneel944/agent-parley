@@ -149,6 +149,18 @@ their intersection and preserve `after_id` paging. All body offsets are
 validated even when no row is returned. Inbox, thread, search and reservation
 responses use the same `MAX_RESULT_BYTES` budget.
 
+Every message carries the claim its sender held when it was written. When that
+claim closes, moves to another lane or completes, each delivery of its mail that
+is still unread or still owes an acknowledgement is marked superseded with the
+reason, and the sender stops expecting an answer to it. Receipts are never
+forged: `read_ts` and `ack_ts` keep the empty values they had. Superseded mail
+is excluded from checkpoint previews, mailbox counts and the stall reading, and
+is reported separately as a count, so a lane woken after days asleep is handed
+the threads that are still live rather than every message it ever received. The
+wake backlog is a bounded digest of the newest message per live thread, capped
+at `WAKE_DIGEST_THREADS`, because the checkpoint context a woken turn receives
+is itself bounded by `MAX_CONTEXT_BYTES` and previews at most three messages.
+
 The supervising operator writes from the command line only. `agent-parley say`
 resolves the project and the addressed participant, then takes the ordinary
 send path, so the message is deduplicated by its key, can require an

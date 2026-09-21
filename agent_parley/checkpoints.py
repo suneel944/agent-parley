@@ -1141,13 +1141,17 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         name: Registered agent identity.
         after: Last locally delivered message ID.
 
+    Every count and preview covers live mail only. Mail superseded by a claim
+    that closed or moved is reported separately as a count, so a lane reads
+    what is still worth a turn without losing the fact that dead mail arrived.
+
     Returns:
-        Message previews, pending counts, held reservations with how many are
-        past a declared time to live and how long the oldest of those has
-        been past it, the named resources among them, and coordination age.
-        A reservation past its time to live is still held and still listed:
-        it is reported apart from the live ones so its holder can renew or
-        release it before the runtime reclaims it.
+        Message previews, pending counts, the superseded count, held
+        reservations with how many are past a declared time to live and how
+        long the oldest of those has been past it, the named resources among
+        them, and coordination age. A reservation past its time to live is
+        still held and still listed: it is reported apart from the live ones
+        so its holder can renew or release it before the runtime reclaims it.
 
     Raises:
         BridgeError: If the agent is not registered.
@@ -1172,7 +1176,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "substr(m.body_md,-80) AS body_tail,m.ack_required "
             "FROM messages m JOIN message_recipients r ON r.message_id=m.id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? AND m.id>? "
-            "AND (r.read_ts IS NULL "
+            "AND r.superseded_ts IS NULL AND (r.read_ts IS NULL "
             "OR (m.ack_required=1 AND r.ack_ts IS NULL)) "
             "ORDER BY m.id LIMIT 3",
             (agent["id"], after),
@@ -1180,12 +1184,19 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         pending = db.execute(
             "SELECT count(*) FROM message_recipients r "
             "JOIN messages m ON m.id=r.message_id "
-            "WHERE r.agent_id=? AND m.ack_required=1 AND r.ack_ts IS NULL",
+            "WHERE r.agent_id=? AND r.superseded_ts IS NULL "
+            "AND m.ack_required=1 AND r.ack_ts IS NULL",
             (agent["id"],),
         ).fetchone()[0]
         unread = db.execute(
             "SELECT count(*) FROM message_recipients "
-            "WHERE agent_id=? AND read_ts IS NULL",
+            "WHERE agent_id=? AND superseded_ts IS NULL AND read_ts IS NULL",
+            (agent["id"],),
+        ).fetchone()[0]
+        superseded = db.execute(
+            "SELECT count(*) FROM message_recipients "
+            "WHERE agent_id=? AND superseded_ts IS NOT NULL "
+            "AND read_ts IS NULL",
             (agent["id"],),
         ).fetchone()[0]
         outstanding = db.execute(
@@ -1195,7 +1206,8 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "AS overdue_seconds "
             "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? "
-            "AND m.ack_required=1 AND r.ack_ts IS NULL ORDER BY m.id LIMIT 32",
+            "AND r.superseded_ts IS NULL AND m.ack_required=1 "
+            "AND r.ack_ts IS NULL ORDER BY m.id LIMIT 32",
             (agent["id"],),
         ).fetchall()
         leases = db.execute(
@@ -1219,6 +1231,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "pending_ack": pending,
             "outstanding_ack": [dict(row) for row in outstanding],
             "unread": unread,
+            "superseded": superseded,
             "reservations": leases["held"],
             "stale_reservations": leases["stale"],
             "stale_reservation_age": leases["age"],

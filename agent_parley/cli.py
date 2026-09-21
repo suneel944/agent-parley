@@ -890,9 +890,14 @@ def lane_detail(record: dict, data: dict) -> None:
     stale = mail["stale_reservations"]
     age = mail.get("stale_reservation_age", 0)
     print(
-        f"    Unread: {mail['unread']}; "
-        f"pending acknowledgements: {mail['pending_ack']}; "
-        f"active reservations: {mail['reservations'] - stale}"
+        f"    Unread: {mail['unread']}"
+        + (
+            f" ({mail['superseded']} superseded)"
+            if mail.get("superseded")
+            else ""
+        )
+        + f"; pending acknowledgements: {mail['pending_ack']}; "
+        + f"active reservations: {mail['reservations'] - stale}"
         + (
             f"; expired: {stale}, oldest {age}s past its deadline"
             if stale
@@ -6682,6 +6687,7 @@ reported.
         record["mail"] = {
             "pending_operator_items": scheduled,
             "unread": mail["unread"],
+            "superseded": mail.get("superseded", 0),
             "pending_ack": mail["pending_ack"],
             "reservations": mail["reservations"],
             "stale_reservations": mail.get("stale_reservations", 0),

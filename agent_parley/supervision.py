@@ -38,6 +38,7 @@ STOPPED = "stopped"
 STARTING = "starting; awaiting native hook"
 NOT_STARTED = "not started; no native hook"
 WORK_WAKE_ATTEMPTS = 3
+WAKE_DIGEST_THREADS = 8
 UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
 WORK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop"})
@@ -2740,6 +2741,35 @@ def _defer_wake(
         )
 
 
+def _mail_digest(rows: list) -> list[str]:
+    """Reduces outstanding mail to the latest message of each live thread.
+
+    A lane that has been asleep for days holds one unread message per turn
+    every peer took, and replaying all of them spends its first turns on
+    answers that later messages already superseded. Only the newest message
+    of a thread can still be answered, so the digest keeps that one and drops
+    the rest, and keeps at most the newest threads: the checkpoint context a
+    woken lane receives is bounded well under two kilobytes and previews at
+    most three messages, so a larger digest would name work the turn it asks
+    for cannot carry, while a smaller one would hide conversations a peer is
+    actively waiting on.
+
+    Args:
+        rows: Outstanding deliveries with their message identifier and thread,
+            in ascending identifier order.
+
+    Returns:
+        Message identifiers as text, oldest first, one per thread, bounded to
+        the newest ``WAKE_DIGEST_THREADS`` threads.
+    """
+    latest: dict[str, int] = {}
+    for row in rows:
+        thread = str(row["thread_id"] or "") or f"message:{row['id']}"
+        latest[thread] = max(latest.get(thread, 0), int(row["id"]))
+    newest = sorted(latest.values())[-WAKE_DIGEST_THREADS:]
+    return [str(identifier) for identifier in newest]
+
+
 def wake(
     home: Path,
     directory: Path,
@@ -2750,9 +2780,14 @@ def wake(
 ) -> None:
     """Requests or resumes a native turn with bounded attempts per backlog.
 
-    The backlog counts every reason this lane owes someone a turn: unread or
-    unacknowledged mail, an unanswered completion reminder it holds, and a
-    handoff offer naming it as recipient. An offer alone is enough, because a
+    The backlog counts every reason this lane owes someone a turn: live
+    unread or unacknowledged mail, an unanswered completion reminder it
+    holds, and a handoff offer naming it as recipient. Mail is counted as a
+    bounded digest of one message per thread rather than every identifier,
+    and mail superseded by a claim that closed or moved is not a reason to
+    wake anybody; the record names how many superseded deliveries were
+    skipped, so a quiet lane is visibly quiet rather than silently ignored.
+    An offer alone is enough, because a
     peer that offers an issue to an idle lane would otherwise wait for an
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
@@ -2817,14 +2852,24 @@ def wake(
         return
     with store.connect(home) as db:
         pending = db.execute(
-            "SELECT m.id FROM messages m JOIN message_recipients r "
-            "ON r.message_id=m.id JOIN agents a ON a.id=r.agent_id "
+            "SELECT m.id,m.thread_id FROM messages m "
+            "JOIN message_recipients r ON r.message_id=m.id "
+            "JOIN agents a ON a.id=r.agent_id "
             "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
-            "AND a.name=? AND (r.read_ts IS NULL OR "
+            "AND a.name=? AND r.superseded_ts IS NULL "
+            "AND (r.read_ts IS NULL OR "
             "(m.ack_required=1 AND r.ack_ts IS NULL)) ORDER BY m.id",
             (manifest["root"], participant["display"]),
         ).fetchall()
-    backlog = [str(row["id"]) for row in pending]
+        superseded = db.execute(
+            "SELECT count(*) FROM message_recipients r "
+            "JOIN agents a ON a.id=r.agent_id "
+            "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
+            "AND a.name=? AND r.superseded_ts IS NOT NULL "
+            "AND r.read_ts IS NULL",
+            (manifest["root"], participant["display"]),
+        ).fetchone()[0]
+    backlog = _mail_digest(pending)
     ledger = issues.snapshot(directory)["issues"].values()
     backlog.extend(
         record["handoff_prompt"]["id"]
@@ -2951,6 +2996,7 @@ def wake(
             {
                 "at": now,
                 "backlog": backlog,
+                "superseded": superseded,
                 "attempts": counted,
                 "result": result,
                 "activity": marker,

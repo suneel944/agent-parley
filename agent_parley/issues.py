@@ -759,6 +759,12 @@ def _change(
         takeover: Revalidated owner generation and durable checkpoint for an
             orphan take.
 
+    A transition that ends an ownership generation, by releasing it, by
+    handing it to another lane or by taking it from an orphaned owner, also
+    retires the mail that generation sent. Supersession is written where the
+    claim changes rather than derived when a lane is woken, because only the
+    transition knows which generation stopped mattering and why.
+
     Returns:
         The persisted issue record, including transition history.
 
@@ -769,6 +775,8 @@ def _change(
     budgets = defaults or {}
     logged = action
     blocker = ""
+    retired = ""
+    retired_reason = ""
     if action in ("block", "unblock"):
         blocker = parse_issue(on or "", "Blocker")
         if blocker == issue:
@@ -792,6 +800,10 @@ def _change(
                         directory, agent, record, issue, orphan, takeover
                     )
                     logged = "take"
+                    retired = str(record.get("claim_id") or "")
+                    retired_reason = (
+                        f"issue #{issue} taken from {record['owner']}"
+                    )
                 else:
                     raise BridgeError(
                         f"Issue #{issue} is owned by {record['owner']}."
@@ -871,6 +883,8 @@ def _change(
                         "from": record["owner"],
                         "at": time.time(),
                     }
+                    retired = str(record.get("claim_id") or "")
+                    retired_reason = f"issue #{issue} reassigned to {agent}"
                     record.update(
                         owner=agent,
                         request=None,
@@ -939,6 +953,8 @@ def _change(
                     _drop_offer(directory, record)
                     record["offer"] = None
                 elif action == "release":
+                    retired = str(record.get("claim_id") or "")
+                    retired_reason = f"issue #{issue} released"
                     lifecycle.released(record)
                     attachments.remove(directory, record.get("attachment", ""))
                     record.pop("attachment", None)
@@ -986,6 +1002,10 @@ def _change(
             retries.remember(state, scope, fingerprint, retries.SERVED, record)
         state["revision"] += 1
         write_json(directory / "issues.json", state)
+    if retired:
+        from agent_parley import store
+
+        store.supersede_project_claim(directory, retired, retired_reason)
     if action == "release":
         from agent_parley import roster, supervision
 

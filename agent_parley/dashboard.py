@@ -360,6 +360,7 @@ def _row(
         or "-",
         "offers": offers,
         "unread": mail.get("unread", "?"),
+        "superseded": mail.get("superseded", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),

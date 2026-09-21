@@ -38,6 +38,7 @@ MAX_EVENT_ROWS = 2000
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
+MAX_SUPERSEDE_REASON = 200
 MAX_REPEATS = 24
 MAX_QUEUED_REQUESTS = 32
 MAX_NOTICE_CHARACTERS = 1000
@@ -116,6 +117,7 @@ CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), read_ts TEXT, ack_ts TEXT,
+ superseded_ts TEXT, superseded_reason TEXT,
  PRIMARY KEY(message_id,agent_id));
 CREATE INDEX IF NOT EXISTS inbox ON message_recipients(agent_id,message_id);
 CREATE INDEX IF NOT EXISTS unread ON message_recipients(agent_id)
@@ -286,6 +288,12 @@ def initialize(home: Path) -> None:
     backfills that window from the distance between a lease's creation and
     its deadline, so a renewal restores what its holder asked for rather
     than a value this build invented.
+
+    Upgrading a store written before mail supersession adds the marker and
+    its reason to each delivery. Every message keeps its text, its recipients
+    and its receipts, and mail delivered before the upgrade reads as live
+    until the claim it was sent under closes, so no backlog is retired by
+    being upgraded.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -313,6 +321,7 @@ def initialize(home: Path) -> None:
                 _rebuild_reservations(db)
                 _add_claim_correlation(db)
                 _add_reservation_ttl(db)
+                _add_supersession(db)
                 _add_message_search(db)
                 legacy = home / "mail.sqlite3"
                 if version == 0 and legacy.exists():
@@ -407,6 +416,25 @@ def _add_reservation_ttl(db: sqlite3.Connection) -> None:
         "WHERE ttl_seconds IS NULL AND expires_ts IS NOT NULL "
         "AND created_ts IS NOT NULL"
     )
+
+
+def _add_supersession(db: sqlite3.Connection) -> None:
+    """Adds the supersession marker to deliveries that carry none.
+
+    Both columns are additive and nullable, so a delivery written before the
+    upgrade keeps its receipts and reads as live. Supersession is recorded
+    beside the receipt rather than derived at reading time, because the reason
+    a delivery stopped mattering is a fact about the claim that ended, which a
+    later reading of the ledger can no longer recover.
+    """
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(message_recipients)")
+    }
+    for column in ("superseded_ts", "superseded_reason"):
+        if column not in columns:
+            db.execute(
+                f"ALTER TABLE message_recipients ADD COLUMN {column} TEXT"
+            )
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -2523,6 +2551,73 @@ def held_claim(home: Path, root: str, display: str) -> str:
     return latest[1]
 
 
+def supersede_claim(home: Path, root: str, claim: str, reason: str) -> int:
+    """Retires the outstanding mail one ownership generation sent.
+
+    Every message a lane sends while it holds a claim carries that claim's
+    identifier. When the claim closes or moves to another lane, the mail it
+    sent stops describing work anybody can still act on, so each delivery
+    that is still unread, or still owes an acknowledgement, is marked
+    superseded with the reason. Nothing is read, acknowledged or deleted on a
+    lane's behalf: the receipts keep their original empty values, and the
+    marker only says the sender no longer expects an answer.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        claim: Ownership generation whose mail is being retired. An empty
+            identifier retires nothing, because mail that carries no claim
+            was never bound to one.
+        reason: Why the claim stopped being actionable, recorded beside each
+            delivery and bounded before it is stored.
+
+    Returns:
+        The number of deliveries marked superseded by this call.
+    """
+    if not claim or not (home / DATABASE).exists():
+        return 0
+    with connect(home, write=True) as db:
+        cursor = db.execute(
+            "UPDATE message_recipients SET superseded_ts=CURRENT_TIMESTAMP,"
+            "superseded_reason=? WHERE superseded_ts IS NULL AND EXISTS ("
+            "SELECT 1 FROM messages m JOIN projects p ON p.id=m.project_id "
+            "WHERE m.id=message_recipients.message_id AND p.human_key=? "
+            "AND m.claim_id=? AND (message_recipients.read_ts IS NULL OR "
+            "(m.ack_required=1 AND message_recipients.ack_ts IS NULL)))",
+            (reason[:MAX_SUPERSEDE_REASON], root, claim),
+        )
+        return cursor.rowcount
+
+
+def supersede_project_claim(directory: Path, claim: str, reason: str) -> int:
+    """Retires the mail of a claim that a project transition just ended.
+
+    The transition that closes or reassigns a claim is authoritative and has
+    already been published when this runs. Supersession is bookkeeping over
+    mail that transition made dead, so a store or a manifest that cannot be
+    read retires nothing and never fails the transition it follows; the mail
+    simply stays live, which is what it was before.
+
+    Args:
+        directory: Private project state directory holding the manifest.
+        claim: Ownership generation whose mail is being retired.
+        reason: Why the claim stopped being actionable.
+
+    Returns:
+        The number of deliveries marked superseded, or zero when project
+        state could not be read.
+    """
+    if not claim:
+        return 0
+    try:
+        manifest = roster.read(directory)
+        return supersede_claim(
+            directory.parent.parent, manifest["root"], claim, reason
+        )
+    except (BridgeError, OSError, ValueError, KeyError, sqlite3.Error):
+        return 0
+
+
 def _recorded(
     db: sqlite3.Connection, actor: dict, tool: str, key: str
 ) -> dict | None:
@@ -3575,6 +3670,9 @@ def waiting(home: Path, root: str, name: str) -> dict:
         root: Canonical project key registered with the store.
         name: Registered identity whose mailbox is read.
 
+    Mail superseded by a claim that closed or moved is not an unanswered
+    item: nobody is waiting on it, so it never makes a lane read as stalled.
+
     Returns:
         The oldest waiting item with its kind, sender, identifier and age in
         seconds, and the age of the last served call. An item is ``None`` when
@@ -3614,7 +3712,8 @@ def waiting(home: Path, root: str, name: str) -> dict:
                 "FROM message_recipients r "
                 "JOIN messages m ON m.id=r.message_id "
                 "JOIN agents a ON a.id=m.sender_id "
-                f"WHERE r.agent_id=? AND {condition} ORDER BY m.id LIMIT 1",
+                f"WHERE r.agent_id=? AND r.superseded_ts IS NULL "
+                f"AND {condition} ORDER BY m.id LIMIT 1",
                 (agent["id"],),
             ).fetchone()
             if row and (
