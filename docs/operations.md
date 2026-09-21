@@ -353,8 +353,12 @@ condition, its age and the one command that clears it:
 | `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. One row per lane, naming the oldest, so a broadcast costs one row per lane. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
 | `bounced share` | A share the sender is still waiting on reached a recipient that cannot act on it. The row sits on the sender's lane. | The command the first blocked recipient needs: a wake while its launcher is alive, `agent-parley run NAME --resume` once it is stopped. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
-| `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
+| `dirty worktree` | The lane holds uncommitted work and is not active, or it retired and its uncommitted work kept the worktree. | `agent-parley participant retire NAME`; `agent-parley participant add NAME` for a retired lane, which returns it to service with that work still in place. |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
+
+A retired lane reports nothing but that kept worktree. Its quiet is the state
+it was asked for, so it raises no stall, no inactivity and no acknowledgement
+row, and no printed command wakes it.
 
 A lane row's command follows the lane's presence state. While the recorded
 session process is alive the row names a wake, because `run NAME --resume`
@@ -2104,6 +2108,19 @@ coordination credential, and drops its manifest entry. The branch is deleted
 only when it adds no commits to the project base; otherwise the branch is kept
 and named in the output. Message history is always preserved, so past handoffs
 still resolve their sender.
+
+A lane can also retire itself, which is the path to take when the lane is
+finished rather than abandoned. The `retire` MCP tool releases the issues that
+lane holds, declines the handoffs offered to it and tells each lane that had
+handed it work, releases its advisory reservations and grants any key a peer was
+queued for, removes its worktree when Git reports it clean, and invalidates its
+credential. Unlike `participant retire` it keeps the manifest entry, marked with
+the time it retired: `status` and `top` show the lane as `retired AGE ago`, the
+JSON views carry `retired_at`, and the service neither wakes it nor names it in
+a work offer. A lane whose worktree is dirty keeps it, and the changed paths are
+reported in the tool result. Return that lane to service with the same
+`participant add NAME` command that created it, which restores its worktree on
+its own branch; the next launch registers a fresh credential.
 
 Mutations and reports run from the assigned lane. The owner pauses offered work
 until acceptance, decline, or cancellation. Use `issue decline`, `issue cancel`,

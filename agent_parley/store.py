@@ -94,6 +94,7 @@ RETRIED = {
     "release_file_reservations": (),
 }
 RESERVING = ("file_reservation_paths", "request_reservation")
+RETIRE = "retire"
 NO_PROJECT = (
     "This repository has no coordination project yet; launch a participant "
     "once with agent-parley run so the project registers."
@@ -631,21 +632,35 @@ def revoke(home: Path, root: str, name: str) -> int:
     if not (home / DATABASE).exists():
         return 0
     with connect(home, write=True) as db:
-        selection = (
-            "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
-            "WHERE p.human_key=? AND a.name=?"
-        )
-        db.execute(
-            "UPDATE reservation_requests SET cancelled_ts=CURRENT_TIMESTAMP "
-            "WHERE granted_ts IS NULL AND cancelled_ts IS NULL "
-            f"AND agent_id IN ({selection})",
-            (root, name),
-        )
-        result = db.execute(
-            f"UPDATE agents SET token_digest=NULL WHERE id IN ({selection})",
-            (root, name),
-        )
-        return result.rowcount
+        return _expire(db, root, name)
+
+
+def _expire(db: sqlite3.Connection, root: str, name: str) -> int:
+    """Invalidates one credential and expires its queued requests together.
+
+    Args:
+        db: Open write transaction owned by the caller.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose credential is invalidated.
+
+    Returns:
+        Number of credentials invalidated.
+    """
+    selection = (
+        "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
+        "WHERE p.human_key=? AND a.name=?"
+    )
+    db.execute(
+        "UPDATE reservation_requests SET cancelled_ts=CURRENT_TIMESTAMP "
+        "WHERE granted_ts IS NULL AND cancelled_ts IS NULL "
+        f"AND agent_id IN ({selection})",
+        (root, name),
+    )
+    result = db.execute(
+        f"UPDATE agents SET token_digest=NULL WHERE id IN ({selection})",
+        (root, name),
+    )
+    return result.rowcount
 
 
 def authenticate(home: Path, token: str) -> dict | None:
@@ -2363,9 +2378,16 @@ def _dispatch(
     A recommendation reads the ledger, the recorded plan and, best effort, the
     forge. It writes nothing and its slowest reading is another process, so it
     is answered entirely outside the transaction for the same reason.
+
+    A retirement returns work through the issue ledger and inspects a Git
+    worktree before it touches the store at all, so it too runs its own steps
+    first and then opens one transaction for the mail, the leases and the
+    credential it ends with.
     """
     if tool == "next_issues":
         return _recommended(home, actor, args)
+    if tool == RETIRE:
+        return _retire(home, actor, started)
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool in RESERVING
@@ -2459,6 +2481,141 @@ def _recommended(home: Path, actor: dict, args: dict) -> dict:
         overlapping,
         limit,
     )
+
+
+def _retirement_notice(lane: str, numbers: list[str]) -> tuple[str, str]:
+    """Words the notice a lane reads when a peer it handed work to retires.
+
+    Args:
+        lane: Lane that retired.
+        numbers: Issues that lane had accepted from the reading lane.
+
+    Returns:
+        The bounded subject and body of the notice.
+    """
+    listed = ", ".join(f"#{number}" for number in numbers)[
+        :MAX_NOTICE_CHARACTERS
+    ]
+    return (
+        f"Retired, work returned: {listed}"[:160],
+        f"{lane} retired and released {listed}, which you had handed to it. "
+        "That work is unclaimed again, so claim it back or offer it to "
+        "another lane. Nothing was claimed on your behalf.",
+    )
+
+
+def _addressable(
+    db: sqlite3.Connection, actor: dict, candidates: dict[str, list[str]]
+) -> list[str]:
+    """Keeps the identities in a project that can still receive mail.
+
+    A lane that is itself retired, or that never registered, holds no active
+    credential and can be told nothing. Leaving it out of the notices keeps a
+    retirement from failing on a peer that already left.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated project and lane.
+        candidates: Registered identities considered, keyed by identity.
+
+    Returns:
+        The identities that hold an active credential in this project.
+    """
+    if not candidates:
+        return []
+    rows = db.execute(
+        "SELECT name FROM agents WHERE project_id=? "
+        "AND token_digest IS NOT NULL",
+        (actor["project_id"],),
+    ).fetchall()
+    active = {row["name"] for row in rows}
+    return [name for name in candidates if name and name in active]
+
+
+def _retire(home: Path, actor: dict, started: float) -> dict:
+    """Retires the calling lane and invalidates its own credential last.
+
+    The lane's work leaves through the issue ledger and its worktree is
+    inspected before the store is touched, because neither can be undone by
+    rolling a transaction back. One transaction then releases the advisory
+    leases it holds, grants any key a peer was queued for, tells each lane
+    that had handed it work where that work went, and invalidates the
+    credential the call itself authenticated with.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        started: Monotonic reading taken before the call was dispatched.
+
+    Returns:
+        What the retirement did, with the leases released, the keys granted to
+        queued peers, and the notices sent.
+
+    Raises:
+        BridgeError: If the project keeps no registered state directory, or
+            the calling lane is not one of its participants.
+    """
+    from agent_parley import retirement
+
+    root = str(actor.get("project", ""))
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        raise BridgeError(NO_PROJECT)
+    participants = roster.read(directory)["participants"]
+    name = next(
+        (
+            participant
+            for participant, entry in participants.items()
+            if entry.get("display") == actor["name"]
+        ),
+        "",
+    )
+    if not name:
+        raise BridgeError("This lane is not a participant of this project.")
+    report = retirement.withdraw(directory, name)
+    senders = {
+        str(participants[sender].get("display", "")): numbers
+        for sender, numbers in report.pop("senders", {}).items()
+        if sender in participants
+    }
+    with connect(home, write=True) as db:
+        leases = _release(db, actor)
+        notices = []
+        for sender in sorted(_addressable(db, actor, senders)):
+            subject, body = _retirement_notice(actor["name"], senders[sender])
+            message = _send(
+                db,
+                actor,
+                {
+                    "to": [sender],
+                    "subject": subject,
+                    "body_md": body,
+                    "idempotency_key": f"retired-{sender}"[:80],
+                },
+            )
+            notices.append(
+                {
+                    "agent": sender,
+                    "issues": senders[sender],
+                    "message_id": message["id"],
+                }
+            )
+        result = {
+            **report,
+            "reservations_released": leases["released"],
+            "granted": leases["granted"],
+            "notices": notices,
+            "credentials_invalidated": _expire(db, root, actor["name"]),
+        }
+        _event(
+            db,
+            actor,
+            RETIRE,
+            "ok",
+            started,
+            len(json.dumps(result, ensure_ascii=False).encode()),
+        )
+        return result
 
 
 def declared_resources(home: Path, root: str) -> frozenset[str] | None:

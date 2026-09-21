@@ -570,6 +570,23 @@ def paused(home: Path, root: str, display: str) -> bool:
     )
 
 
+def retired(participant: dict) -> bool:
+    """Reports whether a participant has retired from its project.
+
+    A retired lane stays in the roster carrying the time it retired, so the
+    reading is the presence of that time rather than the absence of an entry.
+    It is not relaunched, not woken and never an offer or rebalance target
+    until an operator re-admits it.
+
+    Args:
+        participant: One participant entry from a normalized manifest.
+
+    Returns:
+        Whether that participant is currently retired.
+    """
+    return bool(participant.get("retired"))
+
+
 def _registry(home: Path, filename: str, presets: dict) -> dict:
     """Merges built-in presets with locally defined entries."""
     path = home / filename
@@ -961,6 +978,10 @@ def normalize(manifest: dict) -> dict:
         if "approve_bridge_tools" in participant:
             participant["approve_bridge_tools"] = approval_opt_in(
                 participant["approve_bridge_tools"]
+            )
+        if type(participant.get("retired", 0.0)) not in (int, float):
+            raise BridgeError(
+                "Participant retirement must be recorded as a time."
             )
         if participant.setdefault("scheme", "participant") not in SCHEMES:
             raise BridgeError(

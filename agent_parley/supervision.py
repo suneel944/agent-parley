@@ -1350,6 +1350,10 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     whose situation has not changed sees the same offer rather than a new one
     on every poll.
 
+    A retired lane is not measured, not offered anything and never named as a
+    peer an offer could move work to, so retiring removes a lane from work
+    selection rather than leaving it to refuse every offer it is sent.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -1362,9 +1366,13 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
     available = lifecycle.actionable(ledger)
+    serving = [
+        name
+        for name, participant in manifest["participants"].items()
+        if not roster.retired(participant)
+    ]
     results = {
-        name: fit(home, directory, manifest, name, after)
-        for name in manifest["participants"]
+        name: fit(home, directory, manifest, name, after) for name in serving
     }
     record_stranded_claims(
         directory, stranded_claims(manifest, ledger, results)
@@ -1386,19 +1394,18 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         available = lifecycle.actionable(ledger)
         results = {
             name: fit(home, directory, manifest, name, after)
-            for name in manifest["participants"]
+            for name in serving
         }
         record_stranded_claims(
             directory, stranded_claims(manifest, ledger, results)
         )
     stretches = {
-        name: idle_seconds(directory, name)
-        for name in sorted(manifest["participants"])
+        name: idle_seconds(directory, name) for name in sorted(serving)
     }
     recipients = share_recipients(
         home, directory, manifest, results, stretches, owned, ledger, config
     )
-    for name in manifest["participants"]:
+    for name in serving:
         result = results[name]
         offer = _work_offer(
             name,
@@ -1420,7 +1427,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 write_json(path, published)
     idle = [
         name
-        for name in sorted(manifest["participants"])
+        for name in sorted(serving)
         if results[name]["fit"]
         and not owned.get(name)
         and stretches[name] >= after
@@ -2824,12 +2831,16 @@ def wake(
     A resumed process uses a real terminal, not an unattended permission mode.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
     lane; waking only asks the lane to take its own turn.
+
+    A lane that retired is never woken and never resumed. It asked to stop,
+    released what it held, and only an operator re-admitting it brings it back.
     """
     participant = manifest["participants"][name]
     if (
         not config["wake"]
         or not participant.get("wake", True)
         or participant.get("paused", False)
+        or roster.retired(participant)
     ):
         return
     path = directory / f"{name}-activity.json"

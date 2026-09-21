@@ -172,6 +172,26 @@ the issue. Handoffs never acknowledge mail: acknowledge reviewed messages
 explicitly through MCP. Coordinate integration separately; do not infer
 merge or push authority from issue ownership.
 
+## Retire when there is nothing left to do
+
+Call the `retire` MCP tool when this lane is finished, or when the operator or a
+peer has asked it to stand down. Going quiet instead is read as a stall and the
+lane is woken again, so retiring is how a lane ends its own participation.
+
+Retirement returns everything first. Each issue this lane holds is released
+back to the pool, each handoff offered to it is declined so the offering lane
+owns that work again, and every lane that had handed it work is told by mail
+where that work went. The advisory reservations are released, any key a peer
+was queued for is granted to that peer, and the credential is invalidated last,
+so the retiring call is the final one this lane can serve.
+
+Report before retiring, with `agent-parley report`, so the state you reached is
+recorded while you can still record it. Commit or hand off work you want kept:
+a lane with uncommitted changes keeps its worktree and its changed paths are
+reported to the operator, while a clean worktree is removed. Retirement is not
+a way to drop work you were asked to finish, and only the operator returns a
+retired lane to service.
+
 ## Read mail and inspect evidence
 
 Use `fetch_inbox` with `unread` or `unacknowledged` to find pending mail; rows

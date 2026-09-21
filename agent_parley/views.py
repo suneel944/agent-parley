@@ -477,6 +477,7 @@ def participants(manifest: dict) -> list[dict]:
             "lane": participant["lane"],
             "paused": participant.get("paused", False),
             "wake": participant.get("wake", True),
+            "retired_at": timestamp(participant.get("retired")),
             "budget": participant.get("budget") or {},
         }
         for name, participant in sorted(manifest["participants"].items())

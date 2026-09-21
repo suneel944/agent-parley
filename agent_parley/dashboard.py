@@ -327,6 +327,11 @@ def _row(
             participant.get("paused", False),
             stalled["stalled"],
             stalled["age_seconds"],
+            (
+                time.time() - float(participant["retired"])
+                if roster.retired(participant)
+                else None
+            ),
         ),
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),

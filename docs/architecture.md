@@ -16,6 +16,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
+| `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
@@ -358,6 +359,22 @@ also becomes a directory and a branch component, so the validator accepts only
 lowercase letters, digits, hyphens and underscores. Dots are refused: a lane
 named after a peer's state file would otherwise shadow that file. Adding a
 participant creates only that lane and never touches existing lanes or branches.
+
+A lane leaves the project by retiring itself through the `retire` tool, and the
+order of that withdrawal is what keeps nothing stranded when a later step fails.
+The work leaves first: every issue it holds is released back to the pool and
+every handoff offered to it is declined, because an offer returned to its sender
+would park ownership on a lane that can no longer answer. The sender is told by
+mail instead. The worktree leaves next, and only when Git reports it clean; a
+lane with uncommitted changes keeps its worktree and reports the paths, and a
+checkout Git cannot inspect is treated the same way. The manifest mark is then
+written, which is what makes the retirement durable, and one store transaction
+finally releases the advisory reservations, grants any key a peer was queued
+for, sends the notices and invalidates the credential. The participant stays in
+the roster carrying the time it retired, so `status` and `top` report it as
+retired rather than stalled, the supervisor never wakes it, never measures it
+and never names it as a peer work could move to, and the operator returns it to
+service with the same `participant add` command that created it.
 
 The activity file holds last state only; the event log,
 `<participant>-events.jsonl`, appends one record per observed hook event with an

@@ -319,6 +319,14 @@ TOOLS = [
         ["report_id", "verdict", "evidence"],
     ),
     _tool(
+        store.RETIRE,
+        "Retire this lane when nothing is left: releases your claims, "
+        "handoffs and keys, then ends your credential. Only the operator "
+        "re-admits you.",
+        {},
+        [],
+    ),
+    _tool(
         "next_issues",
         "Rank unclaimed issues you could take next, with the reason for "
         "each. Read this before claiming; it claims nothing.",
@@ -899,7 +907,8 @@ class Handler(BaseHTTPRequestHandler):
         service is willing to hold it open. Every other tool is the served
         call it has always been, and a delivered message wakes the lanes
         waiting for one before the sender is answered. A release that grants
-        a queued request delivers such a message, so it wakes them too.
+        a queued request delivers such a message, so it wakes them too, and so
+        does a retirement, which tells the lanes that handed it work.
         """
         try:
             declared = self._declared_protocol()
@@ -932,7 +941,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
             else:
                 result = store.call(self.server.home, actor, tool["name"], args)
-                if tool["name"] == "send_message" or (
+                if tool["name"] in ("send_message", store.RETIRE) or (
                     tool["name"] == "release_file_reservations"
                     and result["granted"]
                 ):

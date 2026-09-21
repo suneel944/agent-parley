@@ -2926,6 +2926,10 @@ class Bridge:
         Returns:
             Manifest using the participant roster layout.
 
+        A retired participant is never checked for branch drift. It kept no
+        worktree to be on the wrong branch of, and reading its pruned lane
+        would report an unavailable worktree as a drifted one.
+
         Raises:
             BridgeError: If a checked lane left its assigned branch, or no
                 manifest exists and creation is not allowed.
@@ -2941,6 +2945,8 @@ class Bridge:
             )
             for name in sorted(names):
                 participant = participants[name]
+                if roster.retired(participant):
+                    continue
                 actual = lane_branch(Path(participant["lane"]))
                 if actual != participant["branch"]:
                     raise BridgeError(drift(name, participant, actual))
@@ -2970,6 +2976,11 @@ class Bridge:
         credential: str | None = None,
     ) -> dict:
         """Adds one lane for a participant without touching existing lanes.
+
+        This is also how a retired participant is re-admitted: naming it again
+        with the provider and account it already had clears the retirement and
+        restores its worktree, so a lane that retired itself comes back the
+        same way it was first admitted.
 
         Args:
             repo: Main checkout or linked worktree of the target repository.
@@ -3007,6 +3018,8 @@ class Bridge:
                         f"{existing['provider']} with "
                         f"{existing['credential'] or 'the default account'}."
                     )
+                if roster.retired(existing):
+                    self._readmit(root, directory, data, name)
                 return roster.expand(data)
             if len(participants) >= roster.MAX_PARTICIPANTS:
                 raise BridgeError(
@@ -3053,6 +3066,46 @@ class Bridge:
                 )
                 raise
             return roster.expand(data)
+
+    def _readmit(
+        self, root: Path, directory: Path, data: dict, name: str
+    ) -> None:
+        """Returns a retired participant to service under its own lane.
+
+        Retirement pruned the worktree when it was clean and left the branch
+        alone, so re-admission adds the worktree back on that same branch and
+        any commits it carried are exactly where the lane left them. A branch
+        that no longer exists is created again from the project base. The
+        credential is not reissued here; the next launch registers one, which
+        is the only path that has ever issued a lane's credential.
+
+        Args:
+            root: Common repository root.
+            directory: Private state directory for the repository.
+            data: Manifest being updated, under the held setup lock.
+            name: Retired participant being re-admitted.
+        """
+        participant = data["participants"][name]
+        lane = Path(participant["lane"])
+        branch = participant["branch"]
+        if not lane.exists():
+            git(root, "worktree", "prune")
+            if has_branch(root, branch):
+                git(root, "worktree", "add", str(lane), branch)
+            else:
+                git(
+                    root,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(lane),
+                    data["base"],
+                )
+            if data.get("initialize"):
+                initialize_lane(lane, data["initialize"], root)
+        participant.pop("retired", None)
+        write_json(directory / "project.json", data)
 
     def _lane(self, repo: Path, name: str) -> tuple[Path, dict, dict]:
         """Resolves one participant's state directory and manifest entry."""
@@ -6588,6 +6641,12 @@ reported.
             "paused": participant.get("paused", False),
             "dialog": (
                 state["dialog"] if isinstance(state.get("dialog"), dict) else {}
+            ),
+            "retired_at": views.timestamp(participant.get("retired")),
+            "retired_age_seconds": (
+                int(time.time() - float(participant["retired"]))
+                if roster.retired(participant)
+                else None
             ),
             "outcome": state.get("outcome", "unknown"),
             "approval": self._approval_state(directory, data, agent),

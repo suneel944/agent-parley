@@ -89,11 +89,27 @@ def _lane_rows(
         oldest, so a broadcast costs one row per lane rather than one per
         message it created. A native approval prompt is reported once it has
         stood unanswered past the same bound an unacknowledged message uses,
-        because a prompt the operator is about to answer needs no row.
+        because a prompt the operator is about to answer needs no row. A lane
+        that retired reports only the worktree it kept, because its quiet is
+        the state the operator asked for and every other remedy here would
+        wake a lane that has given its work back.
     """
     name = record["participant"]
     repo = f"--repo {root}"
     rows: list[dict] = []
+    if roster.retired(participant):
+        if supervision.dirty_paths(participant["lane"]):
+            rows.append(
+                _row(
+                    DIRTY,
+                    "uncommitted work kept when this lane retired",
+                    f"agent-parley participant add {name} {repo}",
+                    record.get("retired_age_seconds"),
+                    name,
+                    root,
+                )
+            )
+        return rows
     idle = record["idle"]
     availability = record["availability"]
     quiet = availability["state"] != "active"
