@@ -247,9 +247,14 @@ a dispatch generation, issue-scoped progress digest, bounded attempt count and
 last result. An unchanged actionable offer joins the wake backlog even after a
 checkpoint injected it. The launcher reads the revalidated wake selection from
 private state after admitting the wake, so generated work context does not
-cross the wake socket. Three attempts without issue progress produce a durable
-escalation in the same publication and in `top`; changed issue state starts a
-new bounded attempt series. An offer is advisory: it never writes the ledger,
+cross the wake socket. The attempt bound measures lane silence rather than
+elapsed wakes: each attempt records the lane's own activity marker, built from
+its tool and turn-end hook events and the last message it sent, which together
+cover the reports, commits and mail a working lane produces. Three attempts
+across which that marker never changes produce a durable escalation in the same
+publication and in `top`; any recorded lane activity resets the series and
+clears the escalation, and changed issue state starts a new bounded attempt
+series. An offer is advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served
 project identity to private launcher state. Its best-effort forge reads run

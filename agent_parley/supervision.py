@@ -37,6 +37,7 @@ STOPPED = "stopped"
 WORK_WAKE_ATTEMPTS = 3
 UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
+WORK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop"})
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -2308,17 +2309,83 @@ def _work_backlog(
     )
 
 
+def _lane_activity(
+    home: Path, directory: Path, manifest: dict, name: str
+) -> dict:
+    """Marks what the lane itself did, for comparison across wake attempts.
+
+    A lane can work for far longer than one wake window without changing the
+    state of the issue it was offered, so an offer's progress digest cannot
+    separate a busy lane from a silent one. Every signal read here is work the
+    lane performed: the newest tool or turn-end event it recorded, and the last
+    message it sent. A report, a commit on the claim branch and a message are
+    all tool calls, so the event log already carries them; the store reading is
+    kept beside it because a lane whose hooks are not installed still leaves
+    the messages it sent. Nothing here starts a process: the wake path must not
+    make a lane's own activity depend on a Git call that can time out.
+
+    Only `WORK_EVENTS` count. Session starts, prompt submissions, permission
+    requests, wake records and notification failures are produced by the
+    runtime, by a resumed launcher or by the very dialog an operator is being
+    told about, so counting them would make a stuck lane look busy and an
+    escalation unreachable.
+
+    Each reading is best effort and contributes nothing when it cannot be
+    taken. An event log held by maintenance and a store that cannot be opened
+    must neither fail the wake nor invent activity the lane did not produce.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant that owns the lane.
+
+    Returns:
+        Comparable activity marker for the lane, whose values change only when
+        the lane acts.
+    """
+    from agent_parley import checkpoints
+
+    participant = manifest.get("participants", {}).get(name) or {}
+    marker: dict = {"events": 0.0, "message": 0}
+    entries: list[dict] = []
+    with contextlib.suppress(BridgeError, OSError):
+        entries = checkpoints.read_events(directory, name)
+    marker["events"] = max(
+        (
+            float(entry["ts"])
+            for entry in entries
+            if str(entry.get("event", "")) in WORK_EVENTS
+            and type(entry.get("ts")) in (int, float)
+        ),
+        default=0.0,
+    )
+    display = participant.get("display", "")
+    if display:
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            with store.connect(home) as db:
+                row = db.execute(
+                    "SELECT MAX(m.id) AS sent FROM messages m "
+                    "JOIN agents a ON a.id=m.sender_id "
+                    "JOIN projects p ON p.id=a.project_id "
+                    "WHERE p.human_key=? AND a.name=?",
+                    (manifest.get("root", ""), display),
+                ).fetchone()
+            marker["message"] = int((row["sent"] if row else 0) or 0)
+    return marker
+
+
 def _work_escalation(offer: dict, attempts: int, last_result: str) -> str:
-    """Names exhausted work, its last refusal and the operator remedy."""
+    """Names abandoned work, its last refusal and the operator remedy."""
     named = ", ".join(f"#{number}" for number in offer.get("issues", []))
     subject = f"work offer {offer['id']}"
     if named:
         subject += f" for {named}"
     return (
-        f"manual attention required: {subject} made no progress after "
-        f"{attempts} wake attempts; last result: {last_result or 'unknown'}; "
-        "next action: inspect the lane, resolve the refusal, then claim or "
-        "hand off one named issue"
+        f"manual attention required: {subject} recorded no lane activity "
+        f"across {attempts} wake attempts; last result: "
+        f"{last_result or 'unknown'}; next action: inspect the lane, resolve "
+        "the refusal, then claim or hand off one named issue"
     )
 
 
@@ -2437,6 +2504,16 @@ def wake(
     its recorded process remains alive. A session with no trustworthy process
     identity records a manual-attention refusal and is never presumed dead.
 
+    The attempt bound counts silence, not elapsed wakes. A lane accepts an
+    offer and then works for as long as the work takes, which can span several
+    wake windows without moving the offer's progress digest, so the digest is
+    no longer what the bound is judged on. Each attempt records the lane's own
+    activity marker, and an attempt that finds the marker changed resets the
+    count to zero and clears any escalation on the offer, whether or not this
+    pass goes on to ask for a turn. Only a lane that recorded nothing across
+    the whole bound is escalated, because only then is there something an
+    operator has to do.
+
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
@@ -2502,15 +2579,28 @@ def wake(
             return
         record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
         same_backlog = record.get("backlog") == backlog
-        attempts = record.get("attempts", 0) if same_backlog else 0
+        marker = _lane_activity(home, directory, manifest, name)
+        worked = bool(record.get("activity")) and record["activity"] != marker
+        attempts = (
+            record.get("attempts", 0) if same_backlog and not worked else 0
+        )
         throttle_at = record.get("at", 0) if same_backlog else 0
         if work_offer:
             dispatch = published_work(directory, name).get("dispatch") or {}
-            attempts = max(attempts, int(dispatch.get("attempts", 0)))
+            if not worked:
+                attempts = max(attempts, int(dispatch.get("attempts", 0)))
             if dispatch.get("attempts"):
                 throttle_at = max(
                     throttle_at, float(dispatch.get("updated_at", 0))
                 )
+            if worked and dispatch:
+                _write_work_dispatch(
+                    directory, name, work_offer, 0, "", "pending"
+                )
+        if worked:
+            record.pop("escalated_at", None)
+            record.update(attempts=0, activity=marker)
+            write_json(wake_path, record)
         if attempts >= WORK_WAKE_ATTEMPTS:
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
@@ -2578,6 +2668,7 @@ def wake(
                 "backlog": backlog,
                 "attempts": counted,
                 "result": result,
+                "activity": marker,
             },
         )
         if work_offer:

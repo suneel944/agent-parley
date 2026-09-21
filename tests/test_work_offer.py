@@ -60,6 +60,27 @@ def turn_ended(directory, name, ago):
     )
 
 
+def tool_used(directory, name):
+    """Appends one tool-use event of the kind a working lane records."""
+    with (directory / f"{name}-events.jsonl").open("a") as stream:
+        stream.write(
+            json.dumps({"ts": time.time(), "event": "PostToolUse"}) + "\n"
+        )
+
+
+def unthrottle(directory, name):
+    """Ages the wake spacing so the next attempt is admitted immediately."""
+    path = directory / f"{name}-wake.json"
+    if path.exists():
+        record = json.loads(path.read_text())
+        record["at"] = 0
+        write_json(path, record)
+    published = supervision.published_work(directory, name)
+    if published.get("dispatch"):
+        published["dispatch"]["updated_at"] = 0
+        write_json(directory / f"{name}-work.json", published)
+
+
 def refused(paired, name, ago, text="API Error: usage limit reached"):
     """Writes a usage refusal into the lane's own client session record."""
     lane = Path(paired["lanes"][name])
@@ -1001,6 +1022,84 @@ def test_delivery_without_work_progress_retries_then_escalates(
     restarted = supervision.published_work(directory, "claude")["dispatch"]
     assert restarted["state"] == "escalated"
     assert restarted["attempts"] == 3
+
+
+def test_a_lane_working_between_wakes_is_never_escalated(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+    supervision.poll(bridge.home, directory)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    for _ in range(5):
+        tool_used(directory, "claude")
+        unthrottle(directory, "claude")
+        supervision.wake(
+            bridge.home, directory, manifest, "claude", observed, config
+        )
+        record = json.loads((directory / "claude-wake.json").read_text())
+        assert record["attempts"] <= 1
+
+    dispatch = supervision.published_work(directory, "claude")["dispatch"]
+    assert dispatch["state"] == "awaiting_progress"
+
+
+def test_an_escalation_holds_until_the_lane_records_activity(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+    supervision.poll(bridge.home, directory)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    for _ in range(4):
+        unthrottle(directory, "claude")
+        supervision.wake(
+            bridge.home, directory, manifest, "claude", observed, config
+        )
+    wake_path = directory / "claude-wake.json"
+    escalated = json.loads(wake_path.read_text())
+    dispatch = supervision.published_work(directory, "claude")["dispatch"]
+    assert dispatch["state"] == "escalated"
+
+    unthrottle(directory, "claude")
+    supervision.wake(
+        bridge.home, directory, manifest, "claude", observed, config
+    )
+    held = json.loads(wake_path.read_text())
+    assert held["escalated_at"] == escalated["escalated_at"]
+
+    tool_used(directory, "claude")
+    unthrottle(directory, "claude")
+    supervision.wake(
+        bridge.home, directory, manifest, "claude", observed, config
+    )
+
+    cleared = supervision.published_work(directory, "claude")["dispatch"]
+    assert cleared["state"] == "awaiting_progress"
+    assert cleared["attempts"] == 1
+    record = json.loads(wake_path.read_text())
+    assert "escalated_at" not in record
+    assert record["attempts"] == 1
 
 
 def test_issue_progress_resets_a_rebalance_dispatch_generation(
