@@ -1498,12 +1498,21 @@ and real MCP transport. They do not establish live model behavior for a provider
 ```sh
 agent-parley provider list
 agent-parley credentials add account-1 --config-home ~/.claude-account-1
+CLAUDE_CONFIG_DIR=~/.claude-account-1 claude
 agent-parley participant add claude-1 --provider claude --credentials account-1
 agent-parley run claude-1 --task "Work on issue 44"
 agent-parley provider add vendor --adapter claude --executable claude \
   --home-env CLAUDE_CONFIG_DIR --env ANTHROPIC_BASE_URL=https://vendor.example \
   --require-env ANTHROPIC_AUTH_TOKEN
 ```
+
+The third line is the native CLI signing in to that account's directory once;
+nothing here records a token. `--provider` defaults to the participant name, so
+name it whenever the participant is not named after its provider, and the
+provider and profile a participant is created with are fixed for that
+participant's life. [Providers](providers.md#accounts) carries that model, the
+second-account walkthrough, the `participant list` verification line and the
+retire-and-add-again route for a binding that is already wrong.
 
 `run` creates a participant's lane on first use, so `participant add` is only
 needed to prepare a roster in advance. Worktrees start at committed HEAD, so the
@@ -1579,7 +1588,9 @@ subscription; there is no limit besides the 32-participant project cap, and the
 accounts need no relationship to each other. Sign in to each directory with the
 native CLI once. Agent Parley stores directory paths and
 variable names; it never stores tokens or keys, and rejects `--env` values whose
-names look like credentials.
+names look like credentials. A shell alias or wrapper function is not an
+account: the launcher resolves a provider's executable on `PATH`, so an alias is
+never seen, and a profile is the supported way to say the same thing.
 
 ## Other agent CLIs
 

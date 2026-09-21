@@ -26,8 +26,10 @@ agent-parley credentials add account-2 --config-home ~/.claude-account-2
 agent-parley run claude-2 --provider claude --credentials account-2
 ```
 
-Which native CLI a name drives, and how an account is selected, is in
-[Providers](providers.md).
+`--provider` defaults to the participant name, and the provider and account a
+participant is created with stay fixed for that participant's life. Which native
+CLI a name drives, how an account is selected, and how to recover a binding that
+is already wrong, are in [Providers](providers.md#accounts).
 
 A new lane starts as a bare worktree, so every agent would otherwise spend its
 first turns installing dependencies or copying an untracked file. Record that
