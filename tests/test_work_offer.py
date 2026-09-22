@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -25,6 +26,10 @@ from agent_parley.state import write_json
 
 OVERLOADED = (
     "API Error: 529 Overloaded. This is a server-side issue, usually temporary."
+)
+SESSION_LIMIT = (
+    "You've hit your session limit · resets 3:30am (Asia/Dubai) "
+    "(error type rate_limit, HTTP 429)"
 )
 
 
@@ -312,6 +317,29 @@ def test_transient_rate_limit_is_distinct_from_exhaustion(bridge, repo, paired):
     assert "retryable transient failure" in published["reason"]
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Rate limit reached for claude-opus-5 in organization org-x",
+            "retryable",
+        ),
+        (SESSION_LIMIT, "exhausted"),
+        (OVERLOADED, "retryable"),
+        ("overloaded; usage limit reached", "exhausted"),
+        ("You've hit your weekly limit", "exhausted"),
+        ("quota exceeded", "exhausted"),
+        ("limit reached", "exhausted"),
+        ("API Error: rate limit", "retryable"),
+        ("the 500 records we wrote", None),
+        ("http://127.0.0.1:5000/health", None),
+        ("API Error: 400 Bad Request", None),
+    ],
+)
+def test_refusal_text_is_read_by_evidence_strength(text, expected):
+    assert records._capacity_state(text) == expected
+
+
 def test_a_transient_api_error_is_classified_retryable(bridge, repo, paired):
     refused(paired, "claude", 30, OVERLOADED)
     observation = records.capacity_observation(
@@ -328,6 +356,50 @@ def test_a_bare_server_status_report_is_a_transient_block(bridge, repo, paired):
     )
     assert observation is not None
     assert observation["state"] == "retryable"
+
+
+def test_a_session_limit_beside_a_status_report_is_exhausted(
+    bridge, repo, paired
+):
+    refused(paired, "claude", 30, SESSION_LIMIT)
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+
+
+def test_a_session_limit_carries_its_named_reset_instant(bridge, repo, paired):
+    refused(paired, "claude", 30, SESSION_LIMIT)
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["reset_at"] > observation["observed_at"]
+    reset = datetime.datetime.fromtimestamp(
+        observation["reset_at"], ZoneInfo("Asia/Dubai")
+    )
+    assert (reset.hour, reset.minute, reset.second) == (3, 30, 0)
+
+
+def test_a_qualified_weekly_limit_is_exhausted(bridge, repo, paired):
+    refused(paired, "claude", 30, "You've hit your weekly limit")
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+    assert "reset_at" not in observation
+
+
+def test_a_named_reset_holds_the_lane_until_it_passes(bridge, repo, paired):
+    directory = Path(paired["lanes"]["claude"]).parent
+    refused(paired, "claude", 30, SESSION_LIMIT)
+    observed = supervision.capacity(bridge.home, directory, paired, "claude")
+    assert observed["state"] == "exhausted"
+    assert observed["reset_at"] > observed["observed_at"]
+    published = supervision.published_capacity(directory, "claude")
+    assert published["reset_at"] == observed["reset_at"]
 
 
 def test_a_status_report_beside_a_usage_limit_stays_exhausted(

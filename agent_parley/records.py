@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import zoneinfo
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -38,18 +39,28 @@ CLAUDE_FIELDS = (
 DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
 UNSAFE = re.compile(r"[^A-Za-z0-9]")
 MAX_TAIL = 1 << 16
-EXHAUSTION = re.compile(
-    r"usage limit|quota exceed|(?:have|has|ve) hit (?:your|the) limit|"
-    r"limit reached",
+STRONG_EXHAUSTION = re.compile(
+    r"usage limit|quota exceed|"
+    r"(?:have|has|ve) hit (?:your|the) (?:[\w-]+ ){0,2}limit",
     re.IGNORECASE,
 )
 TRANSIENT = re.compile(
-    r"rate[ _-]?limit|too many requests|overloaded",
+    r"rate[ _-]?limit|too many requests",
+    re.IGNORECASE,
+)
+WEAK_EXHAUSTION = re.compile(
+    r"limit reached",
     re.IGNORECASE,
 )
 THROTTLED = re.compile(
-    r"\b(?:api|http|status)\b[\W_]{0,3}(?:error|code)?[\W_]{0,3}"
+    r"overloaded"
+    r"|\b(?:api|http|status)\b[\W_]{0,3}(?:error|code)?[\W_]{0,3}"
     r"(?:429|5\d\d)\b",
+    re.IGNORECASE,
+)
+RESET_CLOCK = re.compile(
+    r"resets?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?"
+    r"\s*\(([A-Za-z]+(?:/[A-Za-z_+-]+)+)\)",
     re.IGNORECASE,
 )
 
@@ -195,13 +206,19 @@ def _stamp(value: object) -> float | None:
 def _capacity_state(text: str) -> str | None:
     """Classifies provider-authored refusal text without reading user prose.
 
-    A named refusal decides first: a throttle or overload report is retryable,
-    and an account or quota limit is exhausted. A bare status report such as
-    ``API Error: 529`` or ``HTTP 429`` is read only once the exhaustion
-    phrases are ruled out, because a provider that names its usage limit
-    beside a status code is exhausted rather than briefly blocked. A status
-    number counts only next to an explicit API, HTTP or status label, so
-    ordinary error prose that merely mentions a number is no evidence.
+    The text is read by the strength of its evidence, not by one flat pattern.
+    A named account, quota or session limit decides first, because a provider
+    reports such a limit beside its own throttle wording and status code and
+    the limit is the stronger evidence: the lane is parked until a reset, not
+    briefly blocked. It accepts at most two words between the possessive and
+    ``limit``, so a session or weekly limit is recognised without the phrase
+    spanning unrelated text. A named throttle decides next. Only then does a
+    bare ``limit reached`` count as exhaustion, because that wording also ends
+    an ordinary throttle report such as ``Rate limit reached for a model``,
+    which is retryable. An overload report and a bare status report such as
+    ``API Error: 529`` or ``HTTP 429`` are read last, and a status number
+    counts only next to an explicit API, HTTP or status label, so ordinary
+    error prose that merely mentions a number is no evidence.
 
     Args:
         text: Provider-authored refusal text from one error envelope.
@@ -210,13 +227,76 @@ def _capacity_state(text: str) -> str | None:
         The capacity state this text establishes, or None when it establishes
         none.
     """
+    if STRONG_EXHAUSTION.search(text):
+        return "exhausted"
     if TRANSIENT.search(text):
         return "retryable"
-    if EXHAUSTION.search(text):
+    if WEAK_EXHAUSTION.search(text):
         return "exhausted"
     if THROTTLED.search(text):
         return "retryable"
     return None
+
+
+def _reset_clock(text: str, observed_at: float) -> float | None:
+    """Reads a named reset clock time as the next instant it occurs.
+
+    A provider that names the wall-clock time its limit resets names the zone
+    with it, as in ``resets 3:30am (Asia/Dubai)``. The first occurrence of that
+    clock time after the refusal is the earliest instant the lane can work
+    again. A clock time with no named zone is not read, because the zone would
+    have to be guessed.
+
+    Args:
+        text: Provider-authored refusal text from one error envelope.
+        observed_at: Epoch seconds the refusal was recorded at.
+
+    Returns:
+        Epoch seconds of the named reset, or None when the text names no
+        readable reset time or names a zone this host does not know.
+    """
+    match = RESET_CLOCK.search(text)
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    hour = hour % 12 + (12 if match.group(3).lower() == "p" else 0)
+    try:
+        zone = zoneinfo.ZoneInfo(match.group(4))
+    except (KeyError, ValueError, OSError):
+        return None
+    moment = datetime.datetime.fromtimestamp(observed_at, zone).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if moment.timestamp() <= observed_at:
+        moment += datetime.timedelta(days=1)
+    return moment.timestamp()
+
+
+def _text_capacity(text: str, observed_at: float) -> dict | None:
+    """Builds one capacity observation from provider-authored refusal text.
+
+    Args:
+        text: Refusal text from one provider error envelope.
+        observed_at: Epoch seconds the envelope was recorded at.
+
+    Returns:
+        Capacity state, observation time and, when an exhausted provider named
+        the clock time its limit resets, that reset instant for the existing
+        reset handling to hold the lane until. None when the text establishes
+        no capacity state.
+    """
+    state = _capacity_state(text)
+    if state is None:
+        return None
+    observation: dict = {"state": state, "observed_at": observed_at}
+    if state == "exhausted":
+        reset_at = _reset_clock(text, observed_at)
+        if reset_at is not None:
+            observation["reset_at"] = reset_at
+    return observation
 
 
 def _claude_capacity(record: dict) -> dict | None:
@@ -240,9 +320,7 @@ def _claude_capacity(record: dict) -> dict | None:
     if not isinstance(message, dict):
         return None
     if record.get("isApiErrorMessage"):
-        content = json.dumps(message.get("content") or "")
-        state = _capacity_state(content)
-        return {"state": state, "observed_at": at} if state else None
+        return _text_capacity(json.dumps(message.get("content") or ""), at)
     usage = message.get("usage")
     if record.get("type") == "assistant" and isinstance(usage, dict):
         identifier = str(message.get("id", ""))
@@ -298,8 +376,7 @@ def _codex_capacity(record: dict) -> dict | None:
         return None
     kind = str(payload.get("type", ""))
     if kind in ("error", "stream_error"):
-        state = _capacity_state(str(payload.get("message", "")))
-        return {"state": state, "observed_at": at} if state else None
+        return _text_capacity(str(payload.get("message", "")), at)
     if kind != "token_count":
         return None
     info = payload.get("info")

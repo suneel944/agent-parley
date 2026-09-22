@@ -287,14 +287,21 @@ issue transitions own claims.
 Provider capacity is durable per lane and records available, exhausted,
 retryable and unknown states with the native evidence and session identity.
 Elapsed supervision time never restores capacity. A validated later response,
-a structured provider reset or a recorded bounded probe does. A throttle or
-overload report, including a bare status report such as `API Error: 529` or
-`HTTP 429` next to an explicit API, HTTP or status label, records a retryable
-block; text that names a usage or quota limit stays exhausted even when it
-also carries a status number. A retryable block makes the lane unfit, so no
-work or share is offered to it, and it is a wake backlog reason keyed by its
-observation, so the resume runs on the bounded wake backoff rather than on the
-inactivity budget. Exhaustion is
+a structured provider reset or a recorded bounded probe does. Refusal text is
+read by the strength of its evidence: a named account, quota or session limit
+first, then a named throttle, then a bare `limit reached`, then an overload
+report or a bare status report such as `API Error: 529` or `HTTP 429` next to
+an explicit API, HTTP or status label. The named limit accepts at most two
+words between the possessive and `limit`, so a session or weekly limit is
+recognised and stays exhausted even when the same text carries throttle
+wording or a status number, while `Rate limit reached for a model` stays
+retryable because the named throttle is read before the weaker wording.
+Text that names the clock time and zone its limit resets, as in
+`resets 3:30am (Asia/Dubai)`, carries that instant as the observation's reset,
+which the existing reset handling holds the lane to and clears on. A retryable
+block makes the lane unfit, so no work or share is offered to it, and it is a
+wake backlog reason keyed by its observation, so the resume runs on the bounded
+wake backoff rather than on the inactivity budget. Exhaustion is
 shared across lanes only when an explicit credential profile identifies the
 same provider account. An exhausted owner's unfinished claims remain visible
 as recovery candidates even when it owns only one claim or no eligible peer is
