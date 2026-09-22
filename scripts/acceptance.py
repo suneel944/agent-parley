@@ -24,10 +24,14 @@ operator touch is what it is measuring the absence of.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import pty
+import struct
 import subprocess
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -36,6 +40,9 @@ HOURS = 24.0
 IDENTITY = ("Acceptance run", "acceptance@localhost")
 INTERVAL = 300.0
 SETTLE = 20.0
+ROWS = 40
+COLUMNS = 120
+TERMINALS: list[int] = []
 LANES = (
     "claude:claude",
     "claude-1:claude",
@@ -49,17 +56,19 @@ LANES = (
 TASK = """You are one lane of an unattended acceptance run. No operator
 is watching, and nobody will answer a question you ask.
 
+Coordinate through your `agent_parley` tools rather than a shell: they
+are the surface this estate gives you, and the shell is not.
+
 Work this loop until the backlog is empty:
 
-1. Run `agent-parley issue list` and pick the lowest numbered task in
-   `tasks/` that no lane owns.
-2. Claim it with `agent-parley issue claim <number>`.
+1. List the issues and pick the lowest numbered task in `tasks/` that no
+   lane owns.
+2. Claim it.
 3. Read `tasks/<number>.md` in your worktree and make exactly the change
    it asks for, with a test.
-4. Run the project's verify command. When it passes, commit and run
-   `agent-parley report ready <number> --summary "<what you changed>"`.
-   When the task cannot be done as written, run
-   `agent-parley report blocked <number> --summary "<the reason>"` and
+4. Run the project's verify command. When it passes, commit and report
+   the issue ready with a summary of what you changed. When the task
+   cannot be done as written, report it blocked with the reason and
    release the claim.
 5. Take the next task.
 
@@ -208,6 +217,113 @@ def register(cli: str, home: Path, repo: Path, lanes: list[str]) -> None:
         result = _run(command)
         if result.returncode and "already" not in result.stderr:
             raise SystemExit(result.stderr.strip() or result.stdout.strip())
+    supervise(home, repo)
+
+
+def supervise(home: Path, repo: Path) -> None:
+    """Records the one opt-in an unattended estate is given.
+
+    Args:
+        home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
+
+    A resumed session asks again for permission to use this bridge's own
+    MCP tools, and no operator is there to answer. The opt-in scopes a
+    native permission rule to this bridge's coordination tools and
+    nothing else: no file tool, no shell, no other server. Every other
+    permission the clients ask for is left exactly as the operator
+    configured it, because what this run measures is a day without an
+    operator, not a day without permissions.
+    """
+    manifest = _directory(home, repo) / "project.json"
+    data = _read(manifest)
+    supervision = dict(data.get("supervision") or {})
+    supervision["approve_bridge_tools"] = True
+    data["supervision"] = supervision
+    manifest.write_text(json.dumps(data, indent=1) + "\n")
+
+
+def trust(home: Path, repo: Path, lanes: list[str]) -> list[str]:
+    """Records the operator's trust of the throwaway project's directories.
+
+    Args:
+        home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
+        lanes: Lane specifications as ``name:provider[:credentials]``.
+
+    Returns:
+        The directories recorded as trusted, so the report can say which
+        ones the run was given.
+
+    Both native clients open a fresh directory with a trust screen, and a
+    launcher cannot name or answer that screen. Eight lanes on eight new
+    worktrees therefore park at startup and never fire a hook. The
+    decision itself stays the operator's: this writes only the
+    directories of a project the run seeded, into each client's own trust
+    record, and only when the operator asked for it on the command line.
+    """
+    directory = _directory(home, repo)
+    paths = [str(repo)]
+    providers: dict[str, list[str]] = {}
+    for lane in lanes:
+        name, provider, _ = _lane(lane)
+        paths.append(str(directory / name))
+        providers.setdefault(provider, []).append(str(directory / name))
+    if "claude" in providers:
+        record = Path.home() / ".claude.json"
+        data = _read(record)
+        projects = data.setdefault("projects", {})
+        for path in [str(repo), *providers["claude"]]:
+            entry = projects.setdefault(path, {})
+            entry["hasTrustDialogAccepted"] = True
+        _replace(record, json.dumps(data, indent=2) + "\n")
+    if "codex" in providers:
+        record = Path.home() / ".codex" / "config.toml"
+        text = record.read_text() if record.exists() else ""
+        added = ""
+        for path in [str(repo), *providers["codex"]]:
+            if f'[projects."{path}"]' not in text:
+                added += f'\n[projects."{path}"]\ntrust_level = "trusted"\n'
+        if added:
+            _replace(record, text + added)
+    return paths
+
+
+def mark(home: Path, repo: Path) -> None:
+    """Records where the shared service log stood when the run began.
+
+    Args:
+        home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
+
+    One service writes one log for every project on the machine, so the
+    verdict reads only what was appended after this instant.
+    """
+    log = home / "server.log"
+    directory = repo / "acceptance"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "start.json").write_text(
+        json.dumps(
+            {
+                "at": time.time(),
+                "log": log.stat().st_size if log.exists() else 0,
+            },
+            indent=1,
+        )
+        + "\n"
+    )
+
+
+def _replace(path: Path, text: str) -> None:
+    """Writes a file the native clients also write, without a half file.
+
+    Args:
+        path: File to replace.
+        text: Whole new contents.
+    """
+    scratch = path.with_name(path.name + ".acceptance")
+    scratch.write_text(text)
+    os.replace(scratch, path)
 
 
 def _lane(spec: str) -> tuple[str, str, str]:
@@ -239,6 +355,13 @@ def launch(cli: str, home: Path, repo: Path, lanes: list[str]) -> dict:
     Returns:
         Each lane's launcher process identifier, so the report can say
         which lanes were started and the operator can find them.
+
+    Each launcher is given a pseudo-terminal of its own on standard
+    input. A launcher started with no terminal runs its client without
+    one, which `codex` refuses outright and which leaves a `claude` lane
+    with no screen for the dialog watcher to read. Nothing ever writes to
+    the controlling side; it is held open only so the client's terminal
+    never reports end of file.
     """
     started: dict[str, int] = {}
     logs = repo / "acceptance" / "launch"
@@ -260,14 +383,22 @@ def launch(cli: str, home: Path, repo: Path, lanes: list[str]) -> dict:
         ]
         if credentials:
             command.extend(["--credentials", credentials])
+        controller, lane_terminal = pty.openpty()
+        fcntl.ioctl(
+            lane_terminal,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", ROWS, COLUMNS, 0, 0),
+        )
         with (logs / f"{name}.log").open("ab") as output:
             child = subprocess.Popen(
                 command,
-                stdin=subprocess.DEVNULL,
+                stdin=lane_terminal,
                 stdout=output,
                 stderr=output,
                 start_new_session=True,
             )
+        os.close(lane_terminal)
+        TERMINALS.append(controller)
         started[name] = child.pid
         time.sleep(SETTLE)
     return started
@@ -446,19 +577,26 @@ def _reports(cli: str, home: Path, repo: Path, issues: int) -> dict:
     return endings
 
 
-def _log_faults(home: Path) -> dict:
+def _log_faults(home: Path, repo: Path) -> dict:
     """Counts the service faults the run refuses to pass with.
 
     Args:
         home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
 
     Returns:
         The number of broken pipes and hook expiries the service log
-        holds, and whether the log could be read at all.
+        holds, and whether the log could be read at all. Only the part
+        of the log written after the run started is counted, because one
+        service writes the log for every project on the machine and a
+        fault from last week is not this run's.
     """
     path = home / "server.log"
+    start = int(_read(repo / "acceptance" / "start.json").get("log", 0) or 0)
     try:
-        text = path.read_text(errors="replace")
+        with path.open(errors="replace") as handle:
+            handle.seek(start)
+            text = handle.read()
     except OSError:
         return {"readable": False, "broken_pipe": 0, "hook_expiry": 0}
     return {
@@ -582,6 +720,10 @@ def verdict(
         run's overall result. A condition that could not be measured
         fails rather than passes, because an unmeasured estate is exactly
         what this run exists to replace.
+
+    The problems view reports the whole estate, so its rows are narrowed
+    to this project: a home that also runs the operator's real work would
+    otherwise decide this run on somebody else's lanes.
     """
     endings = _reports(cli, home, repo, issues)
     unreported = [
@@ -591,7 +733,11 @@ def verdict(
         or (ending["state"] != "ready" and not ending["reason"])
     ]
     final = _document(cli, home, ["problems"])
-    rows = final.get("problems") or []
+    rows = [
+        row
+        for row in (final.get("problems") or [])
+        if row.get("project") == str(repo)
+    ]
     unattended = [
         row
         for row in rows
@@ -599,7 +745,7 @@ def verdict(
     ]
     if "error" in final:
         unattended.append({"condition": "unreadable", "detail": final})
-    faults = _log_faults(home)
+    faults = _log_faults(home, repo)
     stranded = _worktrees(repo, endings)
     counters = lane_counters(home, repo, lanes)
     taken = samples(frames)
@@ -736,6 +882,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval", type=float, default=INTERVAL)
     parser.add_argument("--issues", type=int, default=BACKLOG)
     parser.add_argument("--lane", action="append", default=[])
+    parser.add_argument("--trust", action="store_true")
     arguments = parser.parse_args(argv)
     if not arguments.home:
         parser.error("--home or AGENT_PARLEY_HOME is required")
@@ -749,6 +896,9 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "run":
         workspace(repo, arguments.issues)
         register(arguments.cli, home, repo, lanes)
+        if arguments.trust:
+            trust(home, repo, lanes)
+        mark(home, repo)
         started = launch(arguments.cli, home, repo, lanes)
         (repo / "acceptance" / "launched.json").write_text(
             json.dumps(started, indent=1)

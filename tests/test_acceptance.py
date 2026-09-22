@@ -42,6 +42,11 @@ import sys
 sys.stderr.write("the service is not ready\\n")
 sys.exit(1)
 """
+NEIGHBOUR = SHIM.replace(
+    '{{"problems": []}}',
+    '{{"problems": [{{"project": "/elsewhere", "actor": "lane",'
+    ' "command": "", "condition": "stalled"}}]}}',
+)
 
 
 def estate(tmp_path, lanes=LANES):
@@ -185,6 +190,58 @@ def test_a_problems_view_that_cannot_be_read_fails_the_run(tmp_path):
     assert decided["conditions"]["every backlog issue reported"]["passed"] is (
         False
     )
+
+
+def test_a_fault_older_than_the_run_is_not_counted(tmp_path):
+    home, repo = estate(tmp_path)
+    (home / "server.log").write_text("BrokenPipeError: [Errno 32]\nready\n")
+    acceptance.mark(home, repo)
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [], 0, True)])
+    decided = acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
+    assert decided["conditions"]["service log is clean"]["passed"] is True
+
+
+def test_another_project_cannot_fail_this_run(tmp_path):
+    home, repo = estate(tmp_path)
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [1], 0, True)])
+    decided = acceptance.verdict(
+        shim(tmp_path, NEIGHBOUR), home, repo, LANES, 1, frames
+    )
+    condition = decided["conditions"]["problems holds only operator rows"]
+    assert condition["passed"] is True
+    assert condition["evidence"] == "0 rows, 0 unattended"
+
+
+def test_trust_is_recorded_for_every_lane_directory(tmp_path, monkeypatch):
+    home, repo = estate(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    (tmp_path / "operator" / ".codex").mkdir(parents=True)
+    (tmp_path / "operator" / ".codex" / "config.toml").write_text(
+        'approval_policy = "never"\n'
+    )
+    recorded = acceptance.trust(home, repo, LANES)
+    written = json.loads((tmp_path / "operator" / ".claude.json").read_text())
+    projects = written["projects"]
+    lane = str(home / "projects" / "one" / "claude")
+    assert projects[lane]["hasTrustDialogAccepted"] is True
+    assert projects[str(repo)]["hasTrustDialogAccepted"] is True
+    text = (tmp_path / "operator" / ".codex" / "config.toml").read_text()
+    assert 'approval_policy = "never"' in text
+    assert f'[projects."{repo}"]' in text
+    assert 'trust_level = "trusted"' in text
+    assert str(home / "projects" / "one" / "codex") in recorded
+
+
+def test_the_bridge_tool_opt_in_is_the_only_one_recorded(tmp_path):
+    home, repo = estate(tmp_path)
+    manifest = home / "projects" / "one" / "project.json"
+    acceptance.supervise(home, repo)
+    data = json.loads(manifest.read_text())
+    assert data["supervision"] == {"approve_bridge_tools": True}
+    assert data["root"] == str(repo)
+    assert "dialogs" not in data.get("supervision", {})
 
 
 def test_the_status_reading_of_another_project_is_ignored(tmp_path):
