@@ -314,7 +314,14 @@ publishes through the lane surfaces a reader already has: the activity record
 gains a `dialog` entry and its `activity` string is prefixed `dialog: `, so
 status reports the dialog instead of `working` or `starting`. It sends the
 keystrokes an operator would press and never a flag that skips a permission
-decision. `gemini.py`, `copilot.py`, `opencode.py` and
+decision. A permission prompt reaches `checkpoints.py` as well, because the
+client runs its `PermissionRequest` hook while it waits; that branch publishes
+the same `dialog` record, naming the tool and the instant the wait began, so
+status, the fit checks, wake admission and `problems.py` read one surface for
+both observations. `dialogs.py` also owns the operator opt-in the launch reads
+before it carries approval of this bridge's own MCP server into a client's
+native permission settings, which is off by default and scoped to that one
+server. `gemini.py`, `copilot.py`, `opencode.py` and
 `amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in

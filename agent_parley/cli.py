@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         checkpoints,
         completion,
         delivery,
+        dialogs,
         evidence,
         forecast,
         forge,
@@ -94,6 +95,7 @@ DEFERRED_MODULES = (
     "checkpoints",
     "completion",
     "delivery",
+    "dialogs",
     "evidence",
     "forecast",
     "forge",
@@ -6526,7 +6528,8 @@ reported.
 
         Returns:
             The lane's session, availability, branch, reported outcome and
-            mailbox counts. An unreadable mailbox is reported as an error
+            mailbox counts, together with any native dialog the lane records as
+            holding its client. An unreadable mailbox is reported as an error
             beside the rest of the lane rather than failing the whole report.
         """
         import sqlite3
@@ -6573,6 +6576,9 @@ reported.
             "assigned_branch": participant["branch"],
             "drift": branch != participant["branch"],
             "paused": participant.get("paused", False),
+            "dialog": (
+                state["dialog"] if isinstance(state.get("dialog"), dict) else {}
+            ),
             "outcome": state.get("outcome", "unknown"),
             "approval": self._approval_state(directory, data, agent),
             "summary": state.get("summary", ""),
@@ -6844,6 +6850,14 @@ reported.
         with its kernel start ticks to prove the exact generation ended; the
         next launch replaces both before starting its client.
 
+        A resumed session asks again for permission to use this bridge's own
+        MCP tools, and a service-driven resume has nobody at the keyboard to
+        answer. Where the client carries per-tool approval in its own settings,
+        and only where the operator recorded the opt-in for this project or
+        this lane, the launch allows that one MCP server through those native
+        settings. No other tool is named, no permission decision is weakened
+        and no bypass flag is ever passed.
+
         Args:
             agent: Participant name within the project.
             repo: Target Git repository.
@@ -6914,7 +6928,7 @@ reported.
                     config,
                     {
                         "mcpServers": {
-                            "agent_parley": {
+                            protocol.SERVER: {
                                 "type": "http",
                                 "url": self.url + "/mcp/",
                                 "headers": {
@@ -6927,6 +6941,9 @@ reported.
                         }
                     },
                 )
+                native: dict = {"hooks": hooks}
+                if dialogs.pre_approved(data, agent):
+                    native["permissions"] = {"allow": [protocol.TOOL_PREFIX]}
                 command = [
                     executable,
                     "--mcp-config",
@@ -6934,7 +6951,7 @@ reported.
                     "--append-system-prompt",
                     prompt,
                     "--settings",
-                    json.dumps({"hooks": hooks}),
+                    json.dumps(native),
                     "--",
                     task,
                 ]

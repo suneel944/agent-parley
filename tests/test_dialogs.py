@@ -15,7 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import dialogs, terminal
+from agent_parley import (
+    checkpoints,
+    dialogs,
+    process,
+    protocol,
+    roster,
+    terminal,
+)
 from agent_parley.state import write_json
 
 USAGE_LIMIT = (
@@ -406,3 +413,114 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
         finally:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
+
+
+BRIDGE_TOOL = f"{protocol.TOOL_PREFIX}__fetch_inbox"
+
+
+def test_a_permission_request_records_the_tool_and_when_it_began(
+    bridge, paired
+):
+    """Shows the hook naming the waiting tool and the instant it began."""
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "session_id": "test",
+        "cwd": paired["lanes"]["claude"],
+        "tool_name": BRIDGE_TOOL,
+    }
+    checkpoints.checkpoint(bridge.home, directory, "claude", payload)
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert state["activity"] == f"{dialogs.APPROVAL}: {BRIDGE_TOOL}"
+    record = state["dialog"]
+    assert record["name"] == dialogs.PERMISSION
+    assert record["tool"] == BRIDGE_TOOL
+    assert record["bridge"] is True
+    assert record["since"] <= record["at"]
+
+    began = record["since"] - 120
+    asked = record["at"]
+    state["dialog"]["since"] = began
+    write_json(directory / "claude-activity.json", state)
+    checkpoints.checkpoint(bridge.home, directory, "claude", payload)
+    again = json.loads((directory / "claude-activity.json").read_text())
+    assert again["dialog"]["since"] == began
+    assert again["dialog"]["at"] >= asked
+
+
+def test_a_repeated_request_keeps_the_instant_the_wait_began():
+    """Separates how long the prompt stood from when the client asked."""
+    first = dialogs.requested(BRIDGE_TOOL, None, 100.0)
+    again = dialogs.requested(BRIDGE_TOOL, first, 160.0)
+    assert (again["since"], again["at"]) == (100.0, 160.0)
+    other = dialogs.requested("Bash", first, 160.0)
+    assert other["since"] == 160.0
+    assert other["bridge"] is False
+    assert first["bridge"] is True
+
+
+def test_status_names_the_prompt_and_how_long_it_has_waited(tmp_path):
+    """Reports the waiting tool and the age of the unanswered prompt."""
+    now = time.time()
+    write_json(
+        tmp_path / "lane-activity.json",
+        {
+            "activity": f"{dialogs.APPROVAL}: {BRIDGE_TOOL}",
+            "updated": now,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+            "dialog": dialogs.requested(BRIDGE_TOOL, None, now - 90),
+        },
+    )
+    line = checkpoints.participant_liveness(tmp_path, "lane")
+    assert line.startswith(f"{dialogs.APPROVAL}: {BRIDGE_TOOL}")
+    assert "; waiting 90s" in line
+
+
+@pytest.mark.parametrize(
+    "opt_in,allowed",
+    [(None, None), (False, None), (True, [protocol.TOOL_PREFIX])],
+)
+def test_the_launch_approves_this_bridge_and_nothing_else(
+    bridge, repo, monkeypatch, tmp_path, opt_in, allowed
+):
+    """Records what the opt-in adds to the client's own settings."""
+    roster.define_provider(
+        bridge.home, "stub-claude", "claude", "stub-claude", "", [], []
+    )
+    binary = tmp_path / "bin"
+    binary.mkdir(exist_ok=True)
+    script = binary / "stub-claude"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump({'argv': sys.argv[1:]}, f)\n"
+    )
+    script.chmod(0o755)
+    capture = tmp_path / "stub-claude.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    data = bridge.add_participant(repo, "lane", "stub-claude")
+    directory = Path(data["participants"]["lane"]["lane"]).parent
+    if opt_in is not None:
+        manifest = json.loads((directory / "project.json").read_text())
+        manifest["supervision"] = {dialogs.PRE_APPROVE: opt_in}
+        write_json(directory / "project.json", manifest)
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    assert bridge.launch("lane", repo, "Work on issue 359") == 0
+    argv = json.loads(capture.read_text())["argv"]
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    if allowed is None:
+        assert set(settings) == {"hooks"}
+    else:
+        assert set(settings) == {"hooks", "permissions"}
+        assert settings["permissions"] == {"allow": allowed}
+    assert "bypass" not in " ".join(argv).lower()
+    assert "--dangerously-skip-permissions" not in argv

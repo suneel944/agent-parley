@@ -958,6 +958,10 @@ def normalize(manifest: dict) -> dict:
             raise BridgeError("Participant paused setting must be a boolean.")
         if "dialogs" in participant:
             participant["dialogs"] = dialog_answers(participant["dialogs"])
+        if "approve_bridge_tools" in participant:
+            participant["approve_bridge_tools"] = approval_opt_in(
+                participant["approve_bridge_tools"]
+            )
         if participant.setdefault("scheme", "participant") not in SCHEMES:
             raise BridgeError(
                 "Participant branch scheme must be one of: "
@@ -969,6 +973,10 @@ def normalize(manifest: dict) -> dict:
     project = dict(manifest.get("supervision", {}))
     if "dialogs" in project:
         project["dialogs"] = dialog_answers(project["dialogs"])
+    if "approve_bridge_tools" in project:
+        project["approve_bridge_tools"] = approval_opt_in(
+            project["approve_bridge_tools"]
+        )
     return {
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
@@ -1017,6 +1025,28 @@ def dialog_answers(value: object) -> dict[str, str]:
             "choose."
         )
     return {name: answer.strip() for name, answer in value.items()}
+
+
+def approval_opt_in(value: object) -> bool:
+    """Validates the native approval pre-approval an operator recorded.
+
+    The setting decides whether a launch carries approval of this bridge's own
+    MCP server into the client's native permission settings. It grants nothing
+    wider, so it is a plain choice rather than a list of tools, and a value that
+    is not a boolean is refused instead of read as consent.
+
+    Args:
+        value: Recorded opt-in for a project or one of its lanes.
+
+    Returns:
+        The recorded choice.
+
+    Raises:
+        BridgeError: If the value is not a boolean.
+    """
+    if type(value) is not bool:
+        raise BridgeError("The approve_bridge_tools setting must be a boolean.")
+    return value
 
 
 def forge_choice(value: object) -> str | None:

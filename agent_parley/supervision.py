@@ -546,9 +546,10 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
         A launch that passed its start deadline without a native hook fails
         here, which is what keeps it out of offers and out of share targets.
         A lane whose launcher published a native dialog fails the check as
-        well: its client is alive and reading nothing but a keypress.
+        well: its client is alive and reading nothing but a keypress. A lane
+        waiting on a native approval names the tool the prompt asked about.
     """
-    from agent_parley import checkpoints
+    from agent_parley import checkpoints, dialogs
 
     state = checkpoints.activity(directory, name)
     if not state:
@@ -560,8 +561,10 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
         return False, "its session process is not running"
     if state.get("activity") == "stopped":
         return False, "its session ended"
-    if state.get("activity") == "waiting for approval":
-        return False, "it is waiting for a native approval"
+    if str(state.get("activity", "")).startswith(dialogs.APPROVAL):
+        tool = str((state.get("dialog") or {}).get("tool", ""))
+        named = f" of {tool}" if tool else ""
+        return False, f"it is waiting for a native approval{named}"
     if isinstance(state.get("dialog"), dict):
         label = str(state["dialog"].get("label", "a native dialog"))
         return False, f"its client is held by {label}"
@@ -1481,12 +1484,24 @@ def announce_idle(
 
 
 def configuration(home: Path, manifest: dict) -> dict:
-    """Resolves project settings while honoring the global wake opt-out."""
+    """Resolves project settings while honoring the global wake opt-out.
+
+    A project's supervision block also carries lane-facing choices the
+    supervisor has no threshold for, such as the answers recorded for native
+    dialogs and the native approval opt-in. The roster validates those where it
+    reads the manifest, so only the supervisor's own fields are resolved here
+    rather than refusing a manifest that records one of them.
+    """
     path = home / "supervision.json"
     global_config = settings(
         json.loads(path.read_text()) if path.exists() else {}
     )
-    config = settings({**global_config, **manifest.get("supervision", {})})
+    project = {
+        field: value
+        for field, value in (manifest.get("supervision") or {}).items()
+        if field in DEFAULTS
+    }
+    config = settings({**global_config, **project})
     config["wake"] = config["wake"] and global_config["wake"]
     config["prompts"] = config["prompts"] and global_config["prompts"]
     return config

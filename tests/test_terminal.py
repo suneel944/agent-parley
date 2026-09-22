@@ -205,7 +205,7 @@ def _read_until(master: int, marker: bytes, timeout: float = 10) -> bytes:
 
 @pytest.mark.parametrize(
     "activity,expected",
-    [("idle", "accepted"), ("waiting for approval", "busy:turn")],
+    [("idle", "accepted"), ("waiting for approval", "busy:approval")],
 )
 def test_wake_transport_respects_native_activity(activity, expected):
     with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
@@ -237,7 +237,7 @@ def test_wake_transport_respects_native_activity(activity, expected):
             assert select.select([child.stdout], [], [], 10)[0]
             assert b"READY" in child.stdout.readline()
             assert terminal.request(directory, "lane") == expected
-            if expected == "busy:turn":
+            if expected == "busy:approval":
                 assert child.poll() is None
                 state = json.loads(
                     (directory / "lane-activity.json").read_text()

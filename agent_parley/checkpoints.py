@@ -981,8 +981,12 @@ def participant_liveness(directory: Path, agent: str) -> str:
         agent: Participant that owns the lane.
 
     Returns:
-        Session activity followed by the age of its last checkpoint event.
+        Session activity followed by the age of its last checkpoint event. A
+        lane held by a native approval prompt also reports how long that
+        prompt has stood unanswered, which a repeated request does not reset.
     """
+    from agent_parley import dialogs
+
     state = activity(directory, agent)
     running = process.alive(
         state.get("session_pid"), state.get("session_ticks")
@@ -990,12 +994,16 @@ def participant_liveness(directory: Path, agent: str) -> str:
     reported = state.get(
         "activity", "running; checkpoints unavailable (relaunch)"
     )
+    approval = dialogs.waited(state, time.time())
+    waiting = (
+        f"; waiting {approval}s" if running and approval is not None else ""
+    )
     age = (
         f"; event {int(time.time() - state['updated'])}s ago"
         if state.get("updated")
         else ""
     )
-    return f"{reported if running else 'stopped'}{age}"
+    return f"{reported if running else 'stopped'}{waiting}{age}"
 
 
 def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
@@ -1304,7 +1312,10 @@ def checkpoint(
     after the launch passed its start deadline clears the not-started mark the
     supervision poll published, however late it is. It also clears any dialog
     the launcher published for the lane: a client that reached a hook is running
-    again rather than waiting on a keypress.
+    again rather than waiting on a keypress. A permission request is the
+    exception, because the client runs that hook while it waits: it republishes
+    the dialog record naming the tool it asked about and the instant that wait
+    began.
 
     Args:
         home: Private bridge state root.
@@ -1430,13 +1441,17 @@ def checkpoint(
             state["resumable_session"] = session
         state.pop("checkpoint_error", None)
         state.pop("not_started", None)
-        state.pop("dialog", None)
+        held = state.pop("dialog", None)
         if event == "SessionEnd":
             state["activity"] = "stopped"
         elif event == "Stop":
             state["activity"] = "idle"
         elif event == "PermissionRequest":
-            state["activity"] = "waiting for approval"
+            from agent_parley import dialogs
+
+            tool = str(payload.get("tool_name", "")) or "an unnamed tool"
+            state["dialog"] = dialogs.requested(tool, held, time.time())
+            state["activity"] = f"{dialogs.APPROVAL}: {tool}"
         else:
             command = str(payload.get("tool_input", {}))
             testing = event == "PreToolUse" and re.search(

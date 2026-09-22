@@ -65,6 +65,44 @@ and holds the screen for 30 seconds are all escalated to you instead. The
 keystrokes sent are the ones you would press on an option the client itself
 offered; no permission check is skipped and no bypass flag exists.
 
+## A lane waiting for a tool approval
+
+A permission prompt is also visible without the screen: the client runs its
+`PermissionRequest` hook while it waits, and that hook names the tool it is
+asking about. The lane then reports `waiting for approval` followed by that tool
+name, and its activity record carries the same `dialog` entry the launcher
+publishes, naming the tool and the instant the wait began. A repeated request for
+the same tool keeps that instant, so `status` shows how long the prompt has stood
+unanswered rather than how recently the client asked again. A wake addressed to
+the lane is refused with `busy:approval`, which names the prompt without counting
+the refusal as a failed wake, and no fit check passes the lane, so work is never
+offered to a client that is holding a question for you. Once the prompt has
+waited past the project's stall interval, `problems` reports it under `waiting on
+approval` with the tool and the age.
+
+A resumed session asks again for permission to use this bridge's own MCP tools,
+and a service-driven resume has nobody at the keyboard to answer. `claude` 2.1.270
+carries per-tool approval in its own settings, so a launch can allow that one MCP
+server there, and only when you record the opt-in:
+
+```json
+{
+  "supervision": {"approve_bridge_tools": true},
+  "participants": {
+    "claude-2": {"approve_bridge_tools": false}
+  }
+}
+```
+
+The default is off and changes nothing about the client's configuration. With it
+on, the launch adds one native permission rule, `mcp__agent_parley`, which allows
+this bridge's own coordination tools and nothing else: no file tool, no shell, no
+other MCP server, no bypass flag and no weakened decision. A participant entry
+overrides the project entry, so one lane can stay fully interactive. Codex CLI
+0.153.4 has no per-tool approval surface of its own — its approval settings are
+whole-session policies — so its launch is left untouched and its prompts are
+reported for you to answer.
+
 ## `status`
 
 `status` prints the server line, the code line, the state directory and then one

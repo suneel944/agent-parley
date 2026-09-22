@@ -834,7 +834,10 @@ def quiesce_exhausted(
                 raise BridgeError(
                     "Capacity owner is paused; resume it before live recovery."
                 )
-            if activity.get("activity") in ("waiting for approval", "idle"):
+            from agent_parley import dialogs
+
+            reading = str(activity.get("activity", ""))
+            if reading == "idle" or reading.startswith(dialogs.APPROVAL):
                 raise BridgeError(
                     "Capacity owner is waiting for operator input; resolve "
                     "that native wait before live recovery."

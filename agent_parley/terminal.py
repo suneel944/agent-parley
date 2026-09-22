@@ -351,6 +351,11 @@ def run(
     for this lane, only with an option the client itself is offering, and never
     while the operator holds a partially entered line.
 
+    A lane the client itself reported as waiting for approval refuses the wake
+    as busy and names that prompt, because injecting a turn cannot answer it and
+    counting the refusal as a failed wake would escalate a lane that is simply
+    holding a question for its operator.
+
     Args:
         command: Native argument vector, without a shell.
         lane: Assigned participant worktree.
@@ -462,6 +467,10 @@ def run(
                                 result = "unavailable"
                             elif watch.holding:
                                 result = "manual attention required"
+                            elif str(state.get("activity", "")).startswith(
+                                dialogs.APPROVAL
+                            ):
+                                result = "busy:approval"
                             elif state.get("activity") != "idle":
                                 result = "busy:turn"
                             elif pending_input or pending_control:

@@ -28,6 +28,16 @@ carries the dialog under `dialog` and names it in `activity`, provider capacity
 is recorded through the supervisor's durable observation, and the operator gets
 one notification per situation. Nothing here observes liveness or moves
 ownership.
+
+A permission prompt is also visible without the screen: the client runs its
+`PermissionRequest` hook, which names the tool it is asking about. The
+checkpoint publishes that observation through the same record, so status, the
+fit checks, wake admission and the problem report read one surface whether the
+prompt was seen on the terminal or reported by the client. A resumed session
+asks again for tools the operator already allowed, and no answer the bridge can
+give is a decision the operator made, so carrying that decision forward is an
+opt-in the operator records per project or per lane, scoped to this bridge's own
+MCP server.
 """
 
 import calendar
@@ -41,6 +51,7 @@ import zoneinfo
 from pathlib import Path
 from typing import NamedTuple
 
+from agent_parley import protocol
 from agent_parley.state import BridgeError, lock, write_json
 
 SCREEN_BYTES = 8192
@@ -52,6 +63,9 @@ OPTION_LABEL = 60
 ESCALATE_AFTER = 30.0
 REPEAT_LIMIT = 2
 MARKER = "dialog: "
+APPROVAL = "waiting for approval"
+PERMISSION = "tool-permission"
+PRE_APPROVE = "approve_bridge_tools"
 EXHAUSTED = "exhausted"
 ANSWER = "answer"
 
@@ -116,7 +130,7 @@ DIALOGS: tuple[Dialog, ...] = (
         ANSWER,
     ),
     Dialog(
-        "tool-permission",
+        PERMISSION,
         "native tool permission prompt",
         re.compile(r"do you want to proceed\?", re.IGNORECASE),
         ANSWER,
@@ -124,6 +138,7 @@ DIALOGS: tuple[Dialog, ...] = (
 )
 
 NAMES = frozenset(item.name for item in DIALOGS)
+BY_NAME = {item.name: item for item in DIALOGS}
 
 
 def flatten(data: bytes) -> str:
@@ -315,6 +330,89 @@ def configured(manifest: dict, name: str) -> dict[str, str]:
             if str(key) in NAMES and str(value).strip():
                 merged[str(key)] = str(value).strip()
     return merged
+
+
+def requested(tool: str, previous: object, now: float) -> dict:
+    """Records the tool a native permission prompt is waiting on.
+
+    A client that asks for permission reaches the coordination substrate twice:
+    as the screen the launcher's watcher reads, and as the `PermissionRequest`
+    checkpoint, which names the tool but draws nothing. Both publish the same
+    record on the same lane surface, so a reader has one place to look.
+
+    Args:
+        tool: Fully qualified tool name the client asked about.
+        previous: Record already published for this lane, if any.
+        now: Wall-clock instant this request was observed.
+
+    Returns:
+        The dialog record naming the tool, whether it belongs to this bridge's
+        own MCP server, and the instant the wait began. A repeated request for
+        the same tool keeps the earlier instant, so the recorded wait measures
+        how long the prompt has stood unanswered rather than how recently the
+        client redrew it.
+    """
+    dialog = BY_NAME[PERMISSION]
+    since = now
+    if isinstance(previous, dict) and previous.get("tool") == tool:
+        recorded = previous.get("since")
+        if isinstance(recorded, (int, float)):
+            since = float(recorded)
+    return {
+        "name": dialog.name,
+        "label": dialog.label,
+        "action": dialog.action,
+        "tool": tool,
+        "bridge": tool.startswith(protocol.TOOL_PREFIX),
+        "since": since,
+        "at": now,
+    }
+
+
+def waited(state: dict, now: float) -> int | None:
+    """Measures how long a recorded approval prompt has stood unanswered.
+
+    Args:
+        state: Lane activity record.
+        now: Wall-clock instant to measure against.
+
+    Returns:
+        Seconds the prompt has waited, or None when the lane records no
+        approval prompt with an instant to measure from.
+    """
+    record = state.get("dialog")
+    if not str(state.get("activity", "")).startswith(APPROVAL):
+        return None
+    if not isinstance(record, dict) or record.get("name") != PERMISSION:
+        return None
+    since = record.get("since")
+    if not isinstance(since, (int, float)):
+        return None
+    return max(0, int(now - float(since)))
+
+
+def pre_approved(manifest: dict, name: str) -> bool:
+    """Reports whether a lane may pre-approve this bridge's own MCP tools.
+
+    A resumed session asks again for permission to use the tools the operator
+    already allowed, and nothing the bridge records can answer that prompt. The
+    client's own permission settings can carry the decision into the next
+    session, but granting it is the operator's to make, so it is off until a
+    project or one of its lanes records it. A lane entry overrides the project.
+
+    Args:
+        manifest: Project manifest as the roster reports it.
+        name: Participant that owns the lane.
+
+    Returns:
+        True when the operator recorded the opt-in for this lane, which scopes
+        the pre-approval to this bridge's own MCP server and nothing else.
+    """
+    project = (manifest.get("supervision") or {}).get(PRE_APPROVE)
+    participant = (manifest.get("participants") or {}).get(name) or {}
+    lane = participant.get(PRE_APPROVE)
+    chosen = lane if isinstance(lane, bool) else project
+    return chosen is True
 
 
 class Watch:

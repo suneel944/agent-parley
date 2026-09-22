@@ -12,7 +12,7 @@ import json
 import time
 from pathlib import Path
 
-from agent_parley import issues, roster, store, supervision, tables
+from agent_parley import dialogs, issues, roster, store, supervision, tables
 
 STORE = "store"
 SERVICE = "service"
@@ -26,6 +26,7 @@ DRIFT = "branch drift"
 DIRTY = "dirty worktree"
 BUDGET = "over budget"
 WAKE = "wake attention"
+APPROVAL = "waiting on approval"
 
 
 def _row(
@@ -86,7 +87,9 @@ def _lane_rows(
         because the span it has been quiet for is unknown rather than long.
         A lane owing several acknowledgements carries one row naming the
         oldest, so a broadcast costs one row per lane rather than one per
-        message it created.
+        message it created. A native approval prompt is reported once it has
+        stood unanswered past the same bound an unacknowledged message uses,
+        because a prompt the operator is about to answer needs no row.
     """
     name = record["participant"]
     repo = f"--repo {root}"
@@ -101,6 +104,9 @@ def _lane_rows(
         "busy:repeat": (
             "wake refused because the previous accepted wake produced no "
             "checkpoint"
+        ),
+        "busy:approval": (
+            "wake refused because the client is waiting for a native approval"
         ),
         "manual attention required": "wake requires operator attention",
     }
@@ -120,6 +126,24 @@ def _lane_rows(
                 root,
             )
         )
+    held = record.get("dialog") or {}
+    since = held.get("since")
+    if held.get("name") == dialogs.PERMISSION and isinstance(
+        since, (int, float)
+    ):
+        waited = max(0, int(now - float(since)))
+        if waited >= ack_after:
+            tool = str(held.get("tool", "")) or "a tool"
+            rows.append(
+                _row(
+                    APPROVAL,
+                    f"the client is waiting for approval of {tool}",
+                    f"answer the prompt in {name}'s terminal",
+                    waited,
+                    name,
+                    root,
+                )
+            )
     if idle["stalled"]:
         rows.append(
             _row(
