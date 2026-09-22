@@ -66,6 +66,24 @@ def service(bridge):
             thread.join(timeout=2)
 
 
+def importable():
+    """Returns an environment that can import this checkout anywhere.
+
+    A hook client reached through this helper may ask for the service
+    back, and the relaunch it asks for starts the service from the bridge
+    home rather than from the current directory. The implicit path entry
+    that lets ``python -m`` find the package under test therefore does not
+    reach that grandchild, which then fails to import it unless the
+    interpreter running this suite also has the package installed. The
+    checkout root travels on ``PYTHONPATH`` so the outage tests state that
+    precondition themselves instead of inheriting it from the environment.
+    """
+    root = Path(__file__).resolve().parents[1]
+    carried = os.environ.get("PYTHONPATH", "")
+    entries = [str(root)] + ([carried] if carried else [])
+    return {**os.environ, "PYTHONPATH": os.pathsep.join(entries)}
+
+
 def run_hook(bridge, directory, payload, module="agent_parley.hook"):
     return subprocess.run(
         [
@@ -84,6 +102,7 @@ def run_hook(bridge, directory, payload, module="agent_parley.hook"):
         text=True,
         timeout=30,
         check=False,
+        env=importable(),
     )
 
 
