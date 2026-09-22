@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0](https://github.com/suneel944/agent-parley/compare/v0.11.0...v0.12.0) (2026-09-22)
+
+
+### Features
+
+* close the 0.12.0 autonomy gaps across the coordination loop (#381) ([#349](https://github.com/suneel944/agent-parley/issues/349)) ([#350](https://github.com/suneel944/agent-parley/issues/350)) ([#351](https://github.com/suneel944/agent-parley/issues/351)) ([#353](https://github.com/suneel944/agent-parley/issues/353)) ([#355](https://github.com/suneel944/agent-parley/issues/355)) ([#356](https://github.com/suneel944/agent-parley/issues/356)) ([#358](https://github.com/suneel944/agent-parley/issues/358)) ([#359](https://github.com/suneel944/agent-parley/issues/359)) ([#360](https://github.com/suneel944/agent-parley/issues/360)) ([#361](https://github.com/suneel944/agent-parley/issues/361)) ([#364](https://github.com/suneel944/agent-parley/issues/364)) ([#367](https://github.com/suneel944/agent-parley/issues/367)) ([#370](https://github.com/suneel944/agent-parley/issues/370)) ([#371](https://github.com/suneel944/agent-parley/issues/371)) ([#372](https://github.com/suneel944/agent-parley/issues/372))
+* give an observed-complete claim a terminating transition (#380) ([#369](https://github.com/suneel944/agent-parley/issues/369))
+* reclaim landed lane worktrees and branches (#375) ([#357](https://github.com/suneel944/agent-parley/issues/357))
+
+### Bug fixes
+
+* derive one lane state every status column reports from (#376) ([#362](https://github.com/suneel944/agent-parley/issues/362))
+* group problems rows and prescribe remedies a lane can take (#377) ([#363](https://github.com/suneel944/agent-parley/issues/363))
+* keep a lane's client identity across a new session id (#373) ([#352](https://github.com/suneel944/agent-parley/issues/352))
+* stop a drifted service before it records the drift (#378) ([#365](https://github.com/suneel944/agent-parley/issues/365))
+* time each hook decision and degrade a lane once (#374) ([#354](https://github.com/suneel944/agent-parley/issues/354))
+* withdraw an orphan marker when the lane returns (#379) ([#368](https://github.com/suneel944/agent-parley/issues/368))
+
 ## [0.11.0](https://github.com/suneel944/agent-parley/compare/v0.10.0...v0.11.0) (2026-09-20)
 
 
