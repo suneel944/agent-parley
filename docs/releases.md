@@ -297,6 +297,11 @@ version automatically.
 
 ## Verification limits
 
+The gate proves the protocol with synthetic clients and proves nothing about
+a day of real native clients. The unattended acceptance run in
+[acceptance.md](acceptance.md) closes that gap on the maintainer's machine,
+and its report is attached to the release it validates.
+
 `make check` includes real temporary Git repositories for tag resolution and
 history and migration checks, plus simulated GitHub/PyPI failures for retry
 and ordering checks. These are not live publication tests. Read-only checks

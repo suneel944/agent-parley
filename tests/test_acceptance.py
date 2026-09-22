@@ -1,0 +1,177 @@
+"""Checks the unattended acceptance run's seeding and its verdict."""
+
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
+from scripts import acceptance
+
+LANES = ["claude:claude", "codex:codex"]
+SHIM = """#!{executable}
+import json
+import sys
+
+arguments = [item for item in sys.argv[1:] if item != "--json"]
+command = arguments[2:]
+if command[0] == "issue" and command[1] == "show":
+    print(
+        json.dumps(
+            {{
+                "history": [
+                    {{
+                        "action": "report",
+                        "participant": "claude",
+                        "detail": {{"state": "ready", "summary": "done"}},
+                    }}
+                ]
+            }}
+        )
+    )
+elif command[0] == "problems":
+    print(json.dumps({{"problems": []}}))
+else:
+    print(json.dumps({{}}))
+"""
+
+
+def estate(tmp_path, lanes=LANES):
+    """Builds a state home and a project the verdict can be read from."""
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    directory = home / "projects" / "one"
+    directory.mkdir(parents=True)
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+    (home / "server.log").write_text("ready\n")
+    (directory / "project.json").write_text(json.dumps({"root": str(repo)}))
+    for lane in lanes:
+        name = lane.split(":")[0]
+        (directory / f"{name}-wake.json").write_text(
+            json.dumps({"attempts": 1, "result": "accepted"})
+        )
+        (directory / f"{name}-activity.json").write_text(
+            json.dumps({"activity": "working", "session_pid": 4242})
+        )
+    return home, repo
+
+
+def shim(tmp_path):
+    """Writes a coordination CLI that answers the verdict's readings."""
+    path = tmp_path / "parley-shim"
+    path.write_text(SHIM.format(executable=sys.executable))
+    path.chmod(0o755)
+    return str(path)
+
+
+def lane_frame(stalled, claims, stale_reservations, process_alive):
+    """Builds one frame holding a single lane's status reading."""
+    return {
+        "at": 0.0,
+        "status": {
+            "participants": [
+                {
+                    "participant": "claude",
+                    "idle": {"stalled": stalled},
+                    "claims": [{"issue": number} for number in claims],
+                    "mail": {"stale_reservations": stale_reservations},
+                    "availability": {"process_alive": process_alive},
+                }
+            ]
+        },
+    }
+
+
+def record(frames, samples):
+    """Writes frames the way the run appends them."""
+    frames.parent.mkdir(parents=True, exist_ok=True)
+    frames.write_text("".join(json.dumps(sample) + "\n" for sample in samples))
+
+
+def test_seeding_refuses_a_directory_that_holds_a_repository(tmp_path):
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True)
+    with pytest.raises(SystemExit):
+        acceptance.workspace(tmp_path, 2)
+
+
+def test_seeding_writes_one_task_per_backlog_issue(tmp_path):
+    acceptance.workspace(tmp_path, 3)
+    tasks = sorted(path.name for path in (tmp_path / "tasks").glob("*.md"))
+    assert tasks == ["1.md", "2.md", "3.md"]
+    assert (tmp_path / ".git").is_dir()
+    assert "task_2" in (tmp_path / "tasks" / "2.md").read_text()
+
+
+def test_frames_survive_a_line_written_while_the_run_was_killed(tmp_path):
+    frames = tmp_path / "frames.jsonl"
+    frames.write_text(json.dumps({"at": 1.0}) + '\n{"at": 2.0')
+    assert acceptance.samples(frames) == [{"at": 1.0}]
+
+
+def test_an_idle_lane_holding_a_claim_fails_the_run(tmp_path):
+    home, repo = estate(tmp_path)
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(
+        frames,
+        [
+            lane_frame(False, [1], 0, True),
+            lane_frame(True, [1], 0, True),
+        ],
+    )
+    decided = acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
+    condition = decided["conditions"]["no lane idled on an open claim"]
+    assert condition["passed"] is False
+    assert condition["detail"] == ["claude#1"]
+    assert decided["passed"] is False
+
+
+def test_an_expired_lease_on_a_dead_lane_fails_the_run(tmp_path):
+    home, repo = estate(tmp_path)
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [], 2, False)])
+    decided = acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
+    condition = decided["conditions"]["no lease outlived its holder"]
+    assert condition["passed"] is False
+    assert condition["detail"] == ["claude"]
+
+
+def test_a_quiet_estate_passes_every_condition(tmp_path):
+    home, repo = estate(tmp_path)
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [1], 0, True)])
+    decided = acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
+    assert decided["passed"] is True, decided["conditions"]
+    assert decided["frames"] == 1
+    text = acceptance.report(decided, repo, 24.0)
+    assert "Result: PASS" in text
+    assert "| claude | 1 | accepted | - | working |" in text
+
+
+def test_a_broken_pipe_in_the_service_log_fails_the_run(tmp_path):
+    home, repo = estate(tmp_path)
+    (home / "server.log").write_text("BrokenPipeError: [Errno 32]\n")
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [], 0, True)])
+    decided = acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
+    assert decided["conditions"]["service log is clean"]["passed"] is False
+
+
+def test_the_status_reading_of_another_project_is_ignored(tmp_path):
+    document = {
+        "projects": [
+            {"root": "/somewhere/else", "participants": [1]},
+            {"root": str(tmp_path), "participants": [2]},
+        ]
+    }
+    assert acceptance._project(document, tmp_path)["participants"] == [2]
+
+
+def test_the_run_never_writes_into_the_state_home(tmp_path):
+    home, repo = estate(tmp_path)
+    before = sorted(os.listdir(home))
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [], 0, True)])
+    acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
+    assert sorted(os.listdir(home)) == before
