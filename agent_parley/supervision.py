@@ -29,7 +29,11 @@ DEFAULTS = {
     "stalled_after": 600,
     "prompts": True,
     "wake": True,
+    "reclaim": True,
 }
+
+RECLAIM_INTERVAL = 900.0
+RECLAIM_PUBLICATION = "reclaim.json"
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -89,7 +93,7 @@ def settings(value: dict) -> dict:
             or not 1 <= result[field] <= 86400
         ):
             raise BridgeError(f"{field} must be between 1 and 86400 seconds.")
-    for field in ("prompts", "wake"):
+    for field in ("prompts", "wake", "reclaim"):
         if type(result[field]) is not bool:
             raise BridgeError(f"{field} must be a boolean.")
     return result
@@ -1366,6 +1370,7 @@ def configuration(home: Path, manifest: dict) -> dict:
     config = settings({**global_config, **manifest.get("supervision", {})})
     config["wake"] = config["wake"] and global_config["wake"]
     config["prompts"] = config["prompts"] and global_config["prompts"]
+    config["reclaim"] = config["reclaim"] and global_config["reclaim"]
     return config
 
 
@@ -1804,6 +1809,61 @@ def deliveries(home: Path, directory: Path, manifest: dict) -> None:
                     )
 
 
+def reclaim_due(directory: Path, now: float, interval: float) -> bool:
+    """Reports whether a project's lane sweep is due again.
+
+    Args:
+        directory: Private project state directory holding the publication.
+        now: Unix time the previous sweep is compared against.
+        interval: Seconds between sweeps of one project.
+
+    Returns:
+        True when no readable sweep was published, or when the published one
+        is older than the interval.
+    """
+    try:
+        published = json.loads((directory / RECLAIM_PUBLICATION).read_text())
+        swept = published["swept"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    if type(swept) not in (int, float):
+        return True
+    return now - swept >= interval
+
+
+def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
+    """Reclaims the lanes whose work has landed, at most once an interval.
+
+    The sweep reads Git in every lane and the forge for the lanes that pass
+    every local check, so it is the most expensive thing a poll can do and
+    it never runs on the ordinary thirty second cadence. Its outcome is
+    published whether it succeeded, refused or failed, which both bounds the
+    next attempt and gives the operator the account of what was removed and
+    what was kept.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory holding the lanes.
+        manifest: Project manifest naming the root and the participants.
+    """
+    from agent_parley import cli
+
+    now = time.time()
+    if not reclaim_due(directory, now, RECLAIM_INTERVAL):
+        return
+    rows: list[dict] = []
+    try:
+        rows = cli.Bridge(home).reclaim(Path(manifest["root"]), apply=True)
+    except BridgeError:
+        rows = []
+    finally:
+        with contextlib.suppress(OSError):
+            write_json(
+                directory / RECLAIM_PUBLICATION,
+                {"swept": now, "lanes": rows},
+            )
+
+
 def poll(home: Path, directory: Path) -> None:
     """Refreshes presence, delivers due operator items and reminds holders.
 
@@ -1871,6 +1931,8 @@ def poll(home: Path, directory: Path) -> None:
                 wake(
                     home, directory, manifest, name, observations[name], config
                 )
+    if config["reclaim"]:
+        reclaim_lanes(home, directory, manifest)
 
 
 def observe_responses(home: Path, directory: Path, manifest: dict) -> None:
