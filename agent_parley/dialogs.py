@@ -528,10 +528,14 @@ class Watch:
         return pressed
 
     def _exhaust(self, dialog: Dialog, screen: str) -> None:
-        """Parks the lane and records the provider capacity it reported."""
+        """Parks the lane and records the provider capacity it reported.
+
+        The capacity is recorded before the dialog is published, so a reader
+        that sees the lane parked on a usage limit also sees the exhaustion
+        that parked it rather than a lane with no capacity record.
+        """
         observed = time.time()
         reset = reset_at(screen, observed)
-        self._publish(dialog, screen, {"reset_at": reset})
         from agent_parley import supervision
 
         with contextlib.suppress(BridgeError, OSError, ValueError):
@@ -546,6 +550,7 @@ class Watch:
                     "observation_id": self._evidence(dialog.name, reset),
                 },
             )
+        self._publish(dialog, screen, {"reset_at": reset})
         self._notify(dialog.label, screen)
 
     def _escalate(self, dialog: Dialog | None, label: str, screen: str) -> None:

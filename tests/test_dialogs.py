@@ -147,6 +147,19 @@ def read_line(child, timeout: float = 10) -> str:
     return child.stdout.readline().decode(errors="replace")
 
 
+def drawn(master: int, timeout: float = 30) -> None:
+    """Waits for an attached client to report the screen it drew."""
+    deadline = time.monotonic() + timeout
+    seen = b""
+    while time.monotonic() < deadline:
+        if not select.select([master], [], [], 0.5)[0]:
+            continue
+        seen += os.read(master, 4096)
+        if b"DRAWN" in seen:
+            return
+    raise AssertionError("the client never drew its screen")
+
+
 def published(directory: Path, timeout: float = 10) -> dict:
     """Waits for the launcher to publish a dialog on the lane's state."""
     deadline = time.monotonic() + timeout
@@ -402,7 +415,8 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
             os.write(master, b"typed")
             time.sleep(0.2)
             os.write(master, b"go")
-            time.sleep(2.0)
+            drawn(master)
+            time.sleep(1.0)
             state = json.loads((directory / "lane-activity.json").read_text())
             assert "dialog" not in state
 

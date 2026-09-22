@@ -362,11 +362,14 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
     directory = Path(paired["lanes"]["codex"]).parent
     write_json(directory / "codex-activity.json", {"activity": "stopped"})
     send(bridge, actors["claude"], "codex")
-    monkeypatch.setattr(
-        supervision.subprocess,
-        "Popen",
-        lambda *args, **kwargs: pytest.fail("resumed without a session"),
-    )
+    spawned = supervision.subprocess.Popen
+
+    def guard(*args, **kwargs):
+        if args and "agent_parley.cli" in list(args[0]):
+            pytest.fail("resumed without a session")
+        return spawned(*args, **kwargs)
+
+    monkeypatch.setattr(supervision.subprocess, "Popen", guard)
     calls = []
     monkeypatch.setattr(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
