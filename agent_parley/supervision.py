@@ -27,6 +27,7 @@ DEFAULTS = {
     "interval": 30,
     "inactive_after": 300,
     "stalled_after": 600,
+    "start_deadline": 30,
     "completion_reminders": 3,
     "prompts": True,
     "wake": True,
@@ -41,8 +42,15 @@ RECLAIM_PUBLICATION = "reclaim.json"
 ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
+STARTING = "starting; awaiting native hook"
+NOT_STARTED = "not started; no native hook"
 WORK_WAKE_ATTEMPTS = 3
+WAKE_DIGEST_THREADS = 8
 UNKNOWN = "unknown"
+DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
+WORK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop"})
+WAKE_READY = frozenset({IDLE, STOPPED})
+WAKE_ATTENTION = "manual attention required"
 WORKING = "working"
 WAITING = "waiting"
 TOOL_TIMEOUT = 600
@@ -90,7 +98,12 @@ def settings(value: dict) -> dict:
     if not isinstance(value, dict) or set(value) - set(DEFAULTS):
         raise BridgeError("Invalid supervision settings.")
     result = {**DEFAULTS, **value}
-    for field in ("interval", "inactive_after", "stalled_after"):
+    for field in (
+        "interval",
+        "inactive_after",
+        "stalled_after",
+        "start_deadline",
+    ):
         if (
             type(result[field]) not in (int, float)
             or not 1 <= result[field] <= 86400
@@ -251,6 +264,81 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "evidence": derived["evidence"],
         "stale": derived["stale"],
     }
+
+
+def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
+    """Records that one launch produced no native hook inside its deadline.
+
+    The launcher's own activity write is the evidence: it clears the live
+    session field and publishes `STARTING` before it starts a client, so a lane
+    still carrying that label owns a client that has reported nothing. Only the
+    label and the observation are written. The recorded launch time, the live
+    session field and the resumable session are left exactly as the launcher
+    and any earlier session left them, and no native process is signalled.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        deadline: Seconds a launch may take before it reads as not started.
+
+    Returns:
+        Whether this call published the mark.
+    """
+    from agent_parley import checkpoints
+
+    path = directory / f"{name}-activity.json"
+    started = checkpoints.activity(directory, name).get("session_started")
+    if (
+        not isinstance(started, (int, float))
+        or isinstance(started, bool)
+        or time.time() - float(started) < deadline
+    ):
+        return False
+    with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+        state = checkpoints.activity(directory, name)
+        if state.get("activity") != STARTING or state.get(
+            "session_started"
+        ) != float(started):
+            return False
+        state["activity"] = NOT_STARTED
+        state["not_started"] = {
+            "at": time.time(),
+            "deadline": float(deadline),
+            "waited": int(time.time() - float(started)),
+        }
+        write_json(path, state)
+        return True
+
+
+def launches(directory: Path, manifest: dict, config: dict) -> list[str]:
+    """Marks the launches that never reported a native hook event.
+
+    A client can sit on a native trust, authentication or update dialog that
+    fires no hook, and the launch label alone would then describe that lane as
+    starting for as long as the dialog stands. The deadline turns that silence
+    into an observation with a time on it. The mark says only what was
+    observed: no native hook inside `start_deadline` seconds of the launch. It
+    ends nothing, moves no claim and answers no dialog, and the next native
+    hook event republishes the lane's real activity, which is what clears it.
+
+    Contention is not a failure here. A lane whose checkpoint lock is held is
+    being written by its own hook, which is the outcome this pass is watching
+    for, so it is left to the next poll.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+
+    Returns:
+        The lanes this pass marked, in manifest order.
+    """
+    marked = []
+    for name in sorted(manifest.get("participants", {})):
+        with contextlib.suppress(BridgeError, OSError):
+            if _mark_unstarted(directory, name, config["start_deadline"]):
+                marked.append(name)
+    return marked
 
 
 def stall(
@@ -567,18 +655,31 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
     Returns:
         The check result and, when it failed, why. A lane that published no
         activity yet reports None, which is no opinion rather than a refusal.
+        A launch that passed its start deadline without a native hook fails
+        here, which is what keeps it out of offers and out of share targets.
+        A lane whose launcher published a native dialog fails the check as
+        well: its client is alive and reading nothing but a keypress. A lane
+        waiting on a native approval names the tool the prompt asked about.
     """
-    from agent_parley import checkpoints
+    from agent_parley import checkpoints, dialogs
 
     state = checkpoints.activity(directory, name)
     if not state:
         return None, ""
+    if state.get("activity") == NOT_STARTED:
+        waited = (state.get("not_started") or {}).get("deadline", 0)
+        return False, f"it never started within {int(waited)}s of its launch"
     if not process.alive(state.get("session_pid"), state.get("session_ticks")):
         return False, "its session process is not running"
     if state.get("activity") == "stopped":
         return False, "its session ended"
-    if state.get("activity") == "waiting for approval":
-        return False, "it is waiting for a native approval"
+    if str(state.get("activity", "")).startswith(dialogs.APPROVAL):
+        tool = str((state.get("dialog") or {}).get("tool", ""))
+        named = f" of {tool}" if tool else ""
+        return False, f"it is waiting for a native approval{named}"
+    if isinstance(state.get("dialog"), dict):
+        label = str(state["dialog"].get("label", "a native dialog"))
+        return False, f"its client is held by {label}"
     return True, ""
 
 
@@ -1086,6 +1187,19 @@ def _rebalance_text(owned: list[str], idle: list[str]) -> str:
     )
 
 
+def _split_text(issue: str, count: int, recipients: list[str]) -> str:
+    """Describes the backlog an idle holder can split with a fit peer."""
+    return (
+        f"Split offer. You hold #{issue} with {count} units of remaining work "
+        "recorded and no coordination event past the stall interval, so the "
+        f"claim is held while nothing moves. {', '.join(recipients)} read as "
+        "able to take part of it now. Split the backlog and send one part "
+        "with send_message and ack_required, or hand the whole claim over "
+        "with agent-parley issue offer. You decide what moves, and nothing "
+        "moves until a recipient answers."
+    )
+
+
 def _continue_text(ledger: dict, numbers: list[str]) -> str:
     """Describes already-owned work that remains authorized to continue."""
     actions = ", ".join(
@@ -1163,6 +1277,56 @@ def _work_dispatch(previous: dict, offer: dict) -> dict:
     }
 
 
+def share_recipients(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    results: dict[str, dict],
+    stretches: dict[str, int],
+    owned: dict[str, list[str]],
+    ledger: dict,
+    config: dict,
+) -> list[str]:
+    """Lists the lanes that could act on a share of somebody else's work.
+
+    A lane qualifies only when both readings the runtime already has agree: the
+    fit check every work offer uses, and the share conditions a returned share
+    is judged by. It must also hold no claim of its own and have been idle past
+    the stall interval, which is the same threshold that makes a lane a
+    rebalance target.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        results: Current fit result for every participant.
+        stretches: Current idle duration for every participant.
+        owned: Issue numbers grouped by owner.
+        ledger: Current issue ledger.
+        config: Resolved supervision settings.
+
+    Returns:
+        Qualifying participants in name order. The reading is derived on every
+        sweep, so a lane that parks on a dialog or takes a claim of its own
+        stops qualifying without anything being cleared.
+    """
+    return [
+        name
+        for name in sorted(manifest["participants"])
+        if results.get(name, {}).get("fit")
+        and not owned.get(name)
+        and stretches.get(name, 0) >= config["stalled_after"]
+        and not share_blocker(
+            home,
+            directory,
+            manifest,
+            name,
+            presence(directory, name, config["inactive_after"]),
+            ledger,
+        )
+    ]
+
+
 def _work_offer(
     name: str,
     results: dict[str, dict],
@@ -1171,8 +1335,18 @@ def _work_offer(
     available: list[str],
     ledger: dict,
     after: float,
+    recipients: list[str],
 ) -> dict | None:
     """Derives the current offer for one lane from live eligibility inputs.
+
+    A lane that holds a claim carrying a countable backlog and has recorded no
+    coordination event for the stall interval is offered a split of that
+    backlog, because a held claim with remaining work and an idle holder moves
+    nothing until someone says so. The split is offered only while a recipient
+    could act on it and while this lane's own capacity check has not failed:
+    the holder still has to take the turn that sends the share, and an
+    exhausted owner belongs to recovery instead. A lane holding more than one
+    claim is told to shed a whole claim first, which needs no split.
 
     Args:
         name: Participant receiving the offer.
@@ -1182,6 +1356,7 @@ def _work_offer(
         available: Current unclaimed and unblocked issue numbers.
         ledger: Current issue ledger.
         after: Minimum idle duration for a rebalance target.
+        recipients: Participants that read as able to act on a share now.
 
     Returns:
         The actionable offer, or None when no work is currently eligible.
@@ -1212,6 +1387,31 @@ def _work_offer(
             "issues": selected,
             "text": _rebalance_text(held, peers),
             "progress": _work_progress(ledger, selected),
+        }
+    elif (
+        capacity is not False
+        and stretches[name] >= after
+        and (able := [peer for peer in recipients if peer != name])
+        and (
+            loaded := next(
+                (
+                    number
+                    for number in continuation
+                    if lifecycle.backlog(ledger["issues"].get(number) or {})
+                ),
+                "",
+            )
+        )
+    ):
+        offer = {
+            "kind": "split",
+            "issues": [loaded],
+            "text": _split_text(
+                loaded,
+                lifecycle.backlog(ledger["issues"][loaded]),
+                able,
+            ),
+            "progress": _work_progress(ledger, [loaded]),
         }
     elif continuation and capacity is not False:
         selected = continuation[:5]
@@ -1246,13 +1446,24 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     A lane holding no claim is offered the unclaimed work and told which peers
     hold more than one claim. A lane holding more than one claim is told which
-    fit peers have been idle past the stall interval. Offers are advisory and
-    never claim work. Separately approved recovery may stop an exhausted
-    owner and preserve its work before a peer explicitly takes its claim.
+    fit peers have been idle past the stall interval. A lane holding one claim
+    that carries a countable backlog, and that has itself been idle past that
+    interval, is offered a split of that backlog with a peer that reads as able
+    to act on a share. Offers are advisory and never claim work. Separately
+    approved recovery may stop an exhausted owner and preserve its work before
+    a peer explicitly takes its claim.
+
+    A recipient must pass both readings the runtime already has: the fit check
+    every offer uses, and the share conditions a returned share is judged by,
+    so no lane is offered a split with a peer that could not answer it.
 
     An offer carries a digest of its own content as its identifier, so a lane
     whose situation has not changed sees the same offer rather than a new one
     on every poll.
+
+    A retired lane is not measured, not offered anything and never named as a
+    peer an offer could move work to, so retiring removes a lane from work
+    selection rather than leaving it to refuse every offer it is sent.
 
     Args:
         home: Private bridge state root.
@@ -1266,9 +1477,13 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
     available = lifecycle.actionable(ledger)
+    serving = [
+        name
+        for name, participant in manifest["participants"].items()
+        if not roster.retired(participant)
+    ]
     results = {
-        name: fit(home, directory, manifest, name, after)
-        for name in manifest["participants"]
+        name: fit(home, directory, manifest, name, after) for name in serving
     }
     record_stranded_claims(
         directory, stranded_claims(manifest, ledger, results)
@@ -1290,19 +1505,28 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         available = lifecycle.actionable(ledger)
         results = {
             name: fit(home, directory, manifest, name, after)
-            for name in manifest["participants"]
+            for name in serving
         }
         record_stranded_claims(
             directory, stranded_claims(manifest, ledger, results)
         )
     stretches = {
-        name: idle_seconds(directory, name)
-        for name in sorted(manifest["participants"])
+        name: idle_seconds(directory, name) for name in sorted(serving)
     }
-    for name in manifest["participants"]:
+    recipients = share_recipients(
+        home, directory, manifest, results, stretches, owned, ledger, config
+    )
+    for name in serving:
         result = results[name]
         offer = _work_offer(
-            name, results, stretches, owned, available, ledger, after
+            name,
+            results,
+            stretches,
+            owned,
+            available,
+            ledger,
+            after,
+            recipients,
         )
         with lock(directory / f"{name}-work.lock", timeout=1):
             previous = published_work(directory, name)
@@ -1314,7 +1538,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 write_json(path, published)
     idle = [
         name
-        for name in sorted(manifest["participants"])
+        for name in sorted(serving)
         if results[name]["fit"]
         and not owned.get(name)
         and stretches[name] >= after
@@ -1379,12 +1603,24 @@ def announce_idle(
 
 
 def configuration(home: Path, manifest: dict) -> dict:
-    """Resolves project settings while honoring the global wake opt-out."""
+    """Resolves project settings while honoring the global wake opt-out.
+
+    A project's supervision block also carries lane-facing choices the
+    supervisor has no threshold for, such as the answers recorded for native
+    dialogs and the native approval opt-in. The roster validates those where it
+    reads the manifest, so only the supervisor's own fields are resolved here
+    rather than refusing a manifest that records one of them.
+    """
     path = home / "supervision.json"
     global_config = settings(
         json.loads(path.read_text()) if path.exists() else {}
     )
-    config = settings({**global_config, **manifest.get("supervision", {})})
+    project = {
+        field: value
+        for field, value in (manifest.get("supervision") or {}).items()
+        if field in DEFAULTS
+    }
+    config = settings({**global_config, **project})
     config["wake"] = config["wake"] and global_config["wake"]
     config["prompts"] = config["prompts"] and global_config["prompts"]
     config["reclaim"] = config["reclaim"] and global_config["reclaim"]
@@ -1588,6 +1824,302 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
         if changed:
             ledger["revision"] += 1
             write_json(directory / "issues.json", ledger)
+
+
+def dialog_waiting(directory: Path, name: str) -> bool:
+    """Reports whether the lane's own state reads as a dialog on its screen.
+
+    The lane's last wake outcome is the only local reading that distinguishes
+    a session waiting for the operator from one working, so it is the
+    predicate every caller uses. A screen watcher that records a dialog
+    through the same lane state is read here without further change.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        Whether the lane last read as waiting for operator input. A lane with
+        no recorded wake outcome reads as not waiting, because an absent
+        record is no evidence of a dialog.
+    """
+    try:
+        wake = json.loads((directory / f"{name}-wake.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(wake, dict) and wake.get("result") in DIALOG_WAKES
+
+
+def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
+    """States in one clause why a lane did not acknowledge in time.
+
+    Only what the runtime can read locally is reported: the recorded session
+    process, the last wake outcome, the lane's durable provider capacity and
+    the measured idle stretch. Nothing here is inferred from the silence
+    itself, so a lane that reads as available is reported as exactly that.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owes the acknowledgement.
+        observed: That lane's presence reading.
+
+    Returns:
+        One clause naming the condition, worded to follow the lane's name.
+    """
+    if observed.get("state") == STOPPED:
+        return "has no running session"
+    if dialog_waiting(directory, name):
+        return "has a native dialog waiting for the operator"
+    state = published_capacity(directory, name)["state"]
+    if state == "exhausted":
+        return "has exhausted its provider capacity"
+    if state == "retryable":
+        return "hit a retryable provider failure"
+    if observed.get("state") == UNKNOWN:
+        return "has no trustworthy session identity"
+    if observed.get("state") == IDLE:
+        return f"has been idle for {int(observed.get('age_seconds') or 0)}s"
+    return "was live and did not answer"
+
+
+def acknowledgement_deadlines(
+    home: Path, directory: Path, manifest: dict, observations: dict
+) -> None:
+    """Returns each missed acknowledgement deadline to the lane that sent it.
+
+    An acknowledgement nobody answers is otherwise permanent: it stays on the
+    problem list of a lane that may never read mail again and its sender is
+    never told. Past the deadline the sender receives one message naming every
+    recipient that did not acknowledge and what the runtime could read about
+    why, and the expectation is retired so the row clears. The notice is
+    deduplicated by the message it reports, so a sweep that repeats writes
+    nothing further.
+
+    A sender that holds no inbox, such as the supervising operator, is not
+    mailed; the expectation is still retired, because a permanent row is the
+    condition this removes.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant from this sweep.
+    """
+    named = {
+        entry["display"]: name
+        for name, entry in manifest["participants"].items()
+    }
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        for breach in store.overdue_acknowledgements(home, manifest["root"]):
+            silent = []
+            for display in breach["recipients"]:
+                observed = observations.get(named.get(display, display))
+                reason = (
+                    unacknowledged_reason(directory, named[display], observed)
+                    if observed
+                    else "is not a participant in this project"
+                )
+                silent.append(f"- {display} {reason}")
+            body = (
+                f"Message {breach['message_id']} ({breach['subject']}) "
+                "required an acknowledgement and its deadline passed "
+                f"{breach['overdue_seconds']}s ago. These recipients did not "
+                "acknowledge it:\n"
+                + "\n".join(silent)
+                + "\nThe expectation is retired. Send it again, ask the "
+                "operator to acknowledge it, or continue without it."
+            )
+            with contextlib.suppress(BridgeError):
+                store.speak(
+                    home,
+                    manifest["root"],
+                    breach["sender"],
+                    "Acknowledgement deadline passed: message "
+                    f"{breach['message_id']}",
+                    body,
+                    f"ack-deadline-{breach['message_id']}",
+                )
+            store.retire_acknowledgement(
+                home, manifest["root"], breach["message_id"]
+            )
+
+
+def share_blocker(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    observed: dict,
+    ledger: dict,
+) -> str:
+    """States in one clause why a lane cannot act on a share right now.
+
+    Only conditions the runtime can read locally count: the recorded session
+    process, the lane's own dialog state, its durable provider capacity and
+    the dependencies of the claims it already holds. Silence is not one of
+    them, so a live lane that has simply not answered yet is never reported
+    as unable to act; that case belongs to the acknowledgement deadline.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Project manifest holding this participant.
+        name: Participant the share was addressed to.
+        observed: That lane's presence reading.
+        ledger: Current issue ledger.
+
+    Returns:
+        One clause naming the condition, worded to follow the lane's name, or
+        an empty string when nothing local says the lane cannot act.
+    """
+    if observed.get("state") == STOPPED:
+        return "has no live session process"
+    if dialog_waiting(directory, name):
+        return "has a native dialog waiting for the operator"
+    if capacity(home, directory, manifest, name)["state"] == "exhausted":
+        return "has exhausted its provider capacity"
+    blocked = sorted(
+        (
+            number
+            for number, record in ledger.get("issues", {}).items()
+            if record.get("owner") == name
+            and record.get("blocked_by")
+            and not lifecycle.dependencies_complete(ledger, record)
+        ),
+        key=int,
+    )
+    if blocked:
+        held = ledger["issues"][blocked[0]]
+        waiting = ", ".join(f"#{number}" for number in held["blocked_by"])
+        return f"holds #{blocked[0]}, itself blocked by {waiting}"
+    return ""
+
+
+def bounced_shares(
+    home: Path, directory: Path, manifest: dict, observations: dict
+) -> list[dict]:
+    """Lists the shares whose recipients cannot act on them.
+
+    A share here is an acknowledgement request still inside its deadline: the
+    sender is waiting for an answer that decides whether the work moves. A
+    recipient that reads as unable to act will not produce that answer, so
+    the share is reported bounced while the sender can still keep the work
+    and offer it elsewhere.
+
+    The reading is derived, never stored: a recipient that becomes fit, or
+    acknowledges, stops appearing without anything being cleared. Nothing
+    here withdraws a share, moves ownership or deletes mail.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant.
+
+    Only a share a lane sent is reported. The supervising operator is at a
+    terminal and already reads the request as awaiting acknowledgement, so
+    returning it would add a second row for a condition that is on screen.
+
+    Returns:
+        One entry per share, oldest first, naming the message, its subject,
+        its sender as an identity and as a participant, how long it has
+        waited, and one blocked entry per recipient that cannot act, carrying
+        that recipient and the reason. A store that cannot be read yields what
+        was read before it failed.
+    """
+    named = {
+        entry["display"]: name
+        for name, entry in manifest["participants"].items()
+    }
+    found: list[dict] = []
+    ledger = issues.snapshot(directory)
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        for share in store.pending_acknowledgements(home, manifest["root"]):
+            if share["sender"] not in named:
+                continue
+            blocked = []
+            for display in share["recipients"]:
+                lane = named.get(display)
+                observed = observations.get(lane) if lane else None
+                if lane is None or observed is None:
+                    continue
+                reason = share_blocker(
+                    home, directory, manifest, lane, observed, ledger
+                )
+                if reason:
+                    blocked.append(
+                        {
+                            "lane": lane,
+                            "recipient": display,
+                            "reason": reason,
+                        }
+                    )
+            if blocked:
+                found.append(
+                    {
+                        "message_id": share["message_id"],
+                        "subject": share["subject"],
+                        "sender": share["sender"],
+                        "sender_lane": named[share["sender"]],
+                        "waiting_seconds": share["waiting_seconds"],
+                        "blocked": blocked,
+                    }
+                )
+    return found
+
+
+def share_bounces(
+    home: Path, directory: Path, manifest: dict, observations: dict
+) -> None:
+    """Returns a share no recipient can act on to the lane that sent it.
+
+    Delivery into a mailbox is not receipt. A share addressed to a lane with
+    no live session, a dialog on its screen, exhausted provider capacity or a
+    blocked claim of its own is answered by nobody, and until now the sender
+    learned that only when the acknowledgement deadline passed, or never. The
+    sweep returns it as soon as the condition is readable, naming each
+    recipient and its reason, so the sender keeps the work and can offer it to
+    a lane that reads as fit.
+
+    The notice is deduplicated by the share it reports, so a repeating sweep
+    writes nothing further, and it is ordinary mail: the sender's own backlog
+    carries it, which is what stops that lane waiting quietly on an answer
+    that is not coming. The acknowledgement expectation is left in force, so a
+    recipient that recovers can still answer and the deadline path stays the
+    one place an expectation is retired.
+
+    A share the supervising operator sent is not returned: that operator is at
+    a terminal and reads the request as awaiting acknowledgement already.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant from this sweep.
+    """
+    for share in bounced_shares(home, directory, manifest, observations):
+        listed = "\n".join(
+            f"- {entry['recipient']} {entry['reason']}"
+            for entry in share["blocked"]
+        )
+        body = (
+            f"Message {share['message_id']} ({share['subject']}) asked for an "
+            "acknowledgement that these recipients cannot give:\n"
+            f"{listed}\n"
+            "The share is returned to you. You keep the work: offer it to a "
+            "lane that reads as fit with agent-parley participant status, or "
+            "hold it yourself. Nothing was withdrawn, no ownership moved, and "
+            "the acknowledgement still stands until its deadline."
+        )
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.speak(
+                home,
+                manifest["root"],
+                share["sender"],
+                f"Share returned: message {share['message_id']}",
+                body,
+                f"share-bounce-{share['message_id']}",
+            )
 
 
 def orphan_reason(name: str, observed: dict) -> str:
@@ -2052,9 +2584,19 @@ def poll(home: Path, directory: Path) -> None:
     Recorded operator items are delivered here, before reminders and waking,
     so a message whose time or condition has just arrived is part of the
     backlog this same poll may wake the lane for.
+
+    Launches are judged against their start deadline first, so a lane whose
+    client never reported a native hook is published as not started before this
+    same poll reads presence, publishes fitness and considers a wake.
+
+    Expired reservations are reclaimed once presence has been refreshed, so
+    the sweep decides on this poll's observation of each holder rather than
+    the previous one. A store that is busy or unreadable reclaims nothing
+    this round rather than failing the poll.
     """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
+    launches(directory, manifest, config)
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
@@ -2078,6 +2620,8 @@ def poll(home: Path, directory: Path) -> None:
                     participant["display"],
                 ),
             )
+    with contextlib.suppress(BridgeError, sqlite3.Error):
+        store.reclaim_expired(home, manifest["root"])
     deliveries(home, directory, manifest)
     if config["prompts"]:
         closed: set[str] = set()
@@ -2107,6 +2651,8 @@ def poll(home: Path, directory: Path) -> None:
                 }
         reminders(directory, manifest, closed)
         deadline_notices(directory, manifest)
+        acknowledgement_deadlines(home, directory, manifest, observations)
+        share_bounces(home, directory, manifest, observations)
         orphans(home, directory, manifest, config)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
@@ -2205,20 +2751,31 @@ def _work_backlog(
         return None
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
+    results = {
+        peer: fit(home, directory, manifest, peer, config["stalled_after"])
+        for peer in manifest["participants"]
+    }
+    stretches = {
+        peer: idle_seconds(directory, peer) for peer in manifest["participants"]
+    }
     current = _work_offer(
         name,
-        {
-            peer: fit(home, directory, manifest, peer, config["stalled_after"])
-            for peer in manifest["participants"]
-        },
-        {
-            peer: idle_seconds(directory, peer)
-            for peer in manifest["participants"]
-        },
+        results,
+        stretches,
         owned,
         lifecycle.actionable(ledger),
         ledger,
         config["stalled_after"],
+        share_recipients(
+            home,
+            directory,
+            manifest,
+            results,
+            stretches,
+            owned,
+            ledger,
+            config,
+        ),
     )
     if not current or (
         current.get("id"),
@@ -2231,17 +2788,83 @@ def _work_backlog(
     )
 
 
+def _lane_activity(
+    home: Path, directory: Path, manifest: dict, name: str
+) -> dict:
+    """Marks what the lane itself did, for comparison across wake attempts.
+
+    A lane can work for far longer than one wake window without changing the
+    state of the issue it was offered, so an offer's progress digest cannot
+    separate a busy lane from a silent one. Every signal read here is work the
+    lane performed: the newest tool or turn-end event it recorded, and the last
+    message it sent. A report, a commit on the claim branch and a message are
+    all tool calls, so the event log already carries them; the store reading is
+    kept beside it because a lane whose hooks are not installed still leaves
+    the messages it sent. Nothing here starts a process: the wake path must not
+    make a lane's own activity depend on a Git call that can time out.
+
+    Only `WORK_EVENTS` count. Session starts, prompt submissions, permission
+    requests, wake records and notification failures are produced by the
+    runtime, by a resumed launcher or by the very dialog an operator is being
+    told about, so counting them would make a stuck lane look busy and an
+    escalation unreachable.
+
+    Each reading is best effort and contributes nothing when it cannot be
+    taken. An event log held by maintenance and a store that cannot be opened
+    must neither fail the wake nor invent activity the lane did not produce.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant that owns the lane.
+
+    Returns:
+        Comparable activity marker for the lane, whose values change only when
+        the lane acts.
+    """
+    from agent_parley import checkpoints
+
+    participant = manifest.get("participants", {}).get(name) or {}
+    marker: dict = {"events": 0.0, "message": 0}
+    entries: list[dict] = []
+    with contextlib.suppress(BridgeError, OSError):
+        entries = checkpoints.read_events(directory, name)
+    marker["events"] = max(
+        (
+            float(entry["ts"])
+            for entry in entries
+            if str(entry.get("event", "")) in WORK_EVENTS
+            and type(entry.get("ts")) in (int, float)
+        ),
+        default=0.0,
+    )
+    display = participant.get("display", "")
+    if display:
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            with store.connect(home) as db:
+                row = db.execute(
+                    "SELECT MAX(m.id) AS sent FROM messages m "
+                    "JOIN agents a ON a.id=m.sender_id "
+                    "JOIN projects p ON p.id=a.project_id "
+                    "WHERE p.human_key=? AND a.name=?",
+                    (manifest.get("root", ""), display),
+                ).fetchone()
+            marker["message"] = int((row["sent"] if row else 0) or 0)
+    return marker
+
+
 def _work_escalation(offer: dict, attempts: int, last_result: str) -> str:
-    """Names exhausted work, its last refusal and the operator remedy."""
+    """Names abandoned work, its last refusal and the operator remedy."""
     named = ", ".join(f"#{number}" for number in offer.get("issues", []))
     subject = f"work offer {offer['id']}"
     if named:
         subject += f" for {named}"
     return (
-        f"manual attention required: {subject} made no progress after "
-        f"{attempts} wake attempts; last result: {last_result or 'unknown'}; "
-        "next action: inspect the lane, resolve the refusal, then claim or "
-        "hand off one named issue"
+        f"manual attention required: {subject} recorded no lane activity "
+        f"across {attempts} wake attempts; last result: "
+        f"{last_result or 'unknown'}; next action: inspect the lane, resolve "
+        "the refusal, then claim or hand off one named issue"
     )
 
 
@@ -2336,6 +2959,173 @@ def _select_work_prompt(
     return True
 
 
+def _wake_due(
+    at: float, attempts: int, ready_at: float, window: float
+) -> float:
+    """Times the next wake attempt after the recorded one.
+
+    The delay doubles with each attempt already spent, so a lane that answered
+    nothing is asked again less often instead of being asked on every poll, and
+    a cause that names its own clearing time postpones the attempt until then.
+
+    Args:
+        at: Time of the last recorded attempt.
+        attempts: Attempts already spent against the current backlog.
+        ready_at: Earliest time the blocking cause can clear, 0 when unknown.
+        window: Inactivity window the attempts are spaced by.
+
+    Returns:
+        Unix time from which the next attempt may be made.
+    """
+    delay = window * 2 ** max(attempts - 1, 0)
+    return max(at + delay, ready_at)
+
+
+def _wake_block(
+    directory: Path, name: str, state: dict, observed: dict, record: dict
+) -> tuple[str, float]:
+    """Names what stops a wake attempt now and when it could clear.
+
+    A wake is re-decided on every poll rather than once, so an attempt is spent
+    only on a lane that could answer it. Capacity is read from the durable
+    observation, never from elapsed time, and blocks only while the provider
+    named a reset still ahead, because the attempt after that reset is itself
+    the evidence that the lane is back. A lane whose screen state is not idle
+    or stopped while its recorded process runs is working or parked on a native
+    dialog it owns, and the dialog watcher publishes into the same activity
+    state, so answering the dialog clears this cause with no change here. A
+    lane with no running process and no session to resume is blocked only once
+    its first attempt has already recorded that, so the refusal is reported
+    before the cause starts sparing the budget.
+
+    A launch marked not started is blocked before any of that. It has no session
+    to resume and no client that could read an injected prompt, so it is a lane
+    with no session however alive its launcher still is, and nothing a wake can
+    do reaches the dialog that is holding it. The operator answering that dialog
+    produces a native hook event, which republishes the activity and clears the
+    cause here with no change of its own.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        state: The lane's published activity state.
+        observed: The lane's presence reading.
+        record: The lane's last durable wake record.
+
+    Returns:
+        The blocking cause, empty when an attempt can be made, and the earliest
+        time that cause can clear, 0 when only a later observation clears it.
+    """
+    observation = published_capacity(directory, name)
+    allowed, reason = _capacity_check(observation)
+    reset_at = observation.get("reset_at")
+    if (
+        allowed is False
+        and isinstance(reset_at, (int, float))
+        and not isinstance(reset_at, bool)
+        and float(reset_at) > time.time()
+    ):
+        return reason, float(reset_at)
+    activity = str(state.get("activity", "")) or UNKNOWN
+    if activity == NOT_STARTED:
+        waited = (state.get("not_started") or {}).get("deadline", 0)
+        return f"it never started within {int(waited)}s of its launch", 0.0
+    if activity not in WAKE_READY and observed["process_alive"]:
+        return f"its screen state is {activity}", 0.0
+    if (
+        observed["process_alive"] is False
+        and not state.get("session_id")
+        and str(record.get("result", "")) == WAKE_ATTENTION
+    ):
+        return "its session process is not running", 0.0
+    return "", 0.0
+
+
+def _park_wake(path: Path, record: dict, cause: str, due: float | None) -> None:
+    """Publishes the blocking cause and next attempt time on a wake record.
+
+    Args:
+        path: The lane's durable wake record.
+        record: That record as read.
+        cause: Why no attempt was made, empty when only spacing applies.
+        due: Unix time of the next attempt, None once the budget is spent.
+    """
+    if record.get("blocked") == cause and record.get("next_at") == due:
+        return
+    record.update(blocked=cause, next_at=due)
+    write_json(path, record)
+
+
+def _defer_wake(
+    directory: Path, name: str, cause: str, ready_at: float, window: float
+) -> None:
+    """Keeps a blocked lane's next attempt visible without spending one.
+
+    Only a lane that already recorded an attempt is parked, because a lane the
+    service never woke owes no schedule and must not gain a wake record from
+    being observed.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        cause: Why no attempt was made.
+        ready_at: Earliest time the cause can clear, 0 when unknown.
+        window: Inactivity window the attempts are spaced by.
+    """
+    path = directory / f"{name}-wake.json"
+    if not path.exists():
+        return
+    with lock(directory / f"{name}-wake.lock"):
+        record: dict = {}
+        with contextlib.suppress(OSError, ValueError):
+            record = json.loads(path.read_text())
+        if not isinstance(record, dict) or not record.get("result"):
+            return
+        if record.get("exhausted_at"):
+            _park_wake(path, record, cause, None)
+            return
+        _park_wake(
+            path,
+            record,
+            cause,
+            _wake_due(
+                float(record.get("at", 0) or 0),
+                int(record.get("attempts", 0) or 0),
+                ready_at,
+                window,
+            ),
+        )
+
+
+def _mail_digest(rows: list) -> list[str]:
+    """Reduces outstanding mail to the latest message of each live thread.
+
+    A lane that has been asleep for days holds one unread message per turn
+    every peer took, and replaying all of them spends its first turns on
+    answers that later messages already superseded. Only the newest message
+    of a thread can still be answered, so the digest keeps that one and drops
+    the rest, and keeps at most the newest threads: the checkpoint context a
+    woken lane receives is bounded well under two kilobytes and previews at
+    most three messages, so a larger digest would name work the turn it asks
+    for cannot carry, while a smaller one would hide conversations a peer is
+    actively waiting on.
+
+    Args:
+        rows: Outstanding deliveries with their message identifier and thread,
+            in ascending identifier order.
+
+    Returns:
+        Message identifiers as text, oldest first, one per thread, bounded to
+        the newest ``WAKE_DIGEST_THREADS`` threads.
+    """
+    latest: dict[str, int] = {}
+    for row in rows:
+        thread = str(row["thread_id"] or "") or f"message:{row['id']}"
+        latest[thread] = max(latest.get(thread, 0), int(row["id"]))
+    newest = sorted(latest.values())[-WAKE_DIGEST_THREADS:]
+    return [str(identifier) for identifier in newest]
+
+
 def wake(
     home: Path,
     directory: Path,
@@ -2346,9 +3136,14 @@ def wake(
 ) -> None:
     """Requests or resumes a native turn with bounded attempts per backlog.
 
-    The backlog counts every reason this lane owes someone a turn: unread or
-    unacknowledged mail, an unanswered completion reminder it holds, and a
-    handoff offer naming it as recipient. An offer alone is enough, because a
+    The backlog counts every reason this lane owes someone a turn: live
+    unread or unacknowledged mail, an unanswered completion reminder it
+    holds, and a handoff offer naming it as recipient. Mail is counted as a
+    bounded digest of one message per thread rather than every identifier,
+    and mail superseded by a claim that closed or moved is not a reason to
+    wake anybody; the record names how many superseded deliveries were
+    skipped, so a quiet lane is visibly quiet rather than silently ignored.
+    An offer alone is enough, because a
     peer that offers an issue to an idle lane would otherwise wait for an
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
@@ -2360,24 +3155,63 @@ def wake(
     its recorded process remains alive. A session with no trustworthy process
     identity records a manual-attention refusal and is never presumed dead.
 
+    The attempt bound counts silence, not elapsed wakes. A lane accepts an
+    offer and then works for as long as the work takes, which can span several
+    wake windows without moving the offer's progress digest, so the digest is
+    no longer what the bound is judged on. Each attempt records the lane's own
+    activity marker, and an attempt that finds the marker changed resets the
+    count to zero and clears any escalation on the offer, whether or not this
+    pass goes on to ask for a turn. Only a lane that recorded nothing across
+    the whole bound is escalated, because only then is there something an
+    operator has to do.
+
+    A spent attempt is not the end of the series. Every poll re-decides the
+    lane against what it can read locally: durable provider capacity, the
+    published screen state and the recorded session process. A cause that is
+    still in force parks the lane with that cause and the time its next attempt
+    is due, and spends nothing, so the budget is not consumed while nothing
+    could have answered. When the cause clears, the next attempt is due one
+    doubling window after the last one, or at the provider reset the capacity
+    observation named, whichever is later. Only a lane that has actually spent
+    its whole budget is recorded as exhausted, and it keeps the last cause and
+    result for the operator instead of a next time it will never have.
+
+    A durable retryable capacity observation is itself a backlog reason, so a
+    lane whose client stopped on a transient provider error resumes on this
+    bounded backoff rather than on the silence budget. The reason is keyed by
+    the observation that recorded the block, so a newer transient failure
+    schedules its own attempts and a restored capacity drops the reason. An
+    exhausted lane is never woken this way, because only a later success, a
+    reliable reset or a recorded probe can clear exhaustion.
+
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
     lane; waking only asks the lane to take its own turn.
+
+    A lane that retired is never woken and never resumed. It asked to stop,
+    released what it held, and only an operator re-admitting it brings it back.
     """
     participant = manifest["participants"][name]
     if (
         not config["wake"]
         or not participant.get("wake", True)
         or participant.get("paused", False)
+        or roster.retired(participant)
     ):
         return
     path = directory / f"{name}-activity.json"
     state = json.loads(path.read_text()) if path.exists() else {}
-    if (
-        state.get("activity") not in {"idle", "stopped"}
-        and observed["process_alive"]
-    ):
+    wake_path = directory / f"{name}-wake.json"
+    window = config["inactive_after"]
+    parked: dict = {}
+    with contextlib.suppress(OSError, ValueError):
+        if wake_path.exists():
+            published = json.loads(wake_path.read_text())
+            parked = published if isinstance(published, dict) else {}
+    blocked, ready_at = _wake_block(directory, name, state, observed, parked)
+    if blocked:
+        _defer_wake(directory, name, blocked, ready_at, window)
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -2386,14 +3220,24 @@ def wake(
         return
     with store.connect(home) as db:
         pending = db.execute(
-            "SELECT m.id FROM messages m JOIN message_recipients r "
-            "ON r.message_id=m.id JOIN agents a ON a.id=r.agent_id "
+            "SELECT m.id,m.thread_id FROM messages m "
+            "JOIN message_recipients r ON r.message_id=m.id "
+            "JOIN agents a ON a.id=r.agent_id "
             "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
-            "AND a.name=? AND (r.read_ts IS NULL OR "
+            "AND a.name=? AND r.superseded_ts IS NULL "
+            "AND (r.read_ts IS NULL OR "
             "(m.ack_required=1 AND r.ack_ts IS NULL)) ORDER BY m.id",
             (manifest["root"], participant["display"]),
         ).fetchall()
-    backlog = [str(row["id"]) for row in pending]
+        superseded = db.execute(
+            "SELECT count(*) FROM message_recipients r "
+            "JOIN agents a ON a.id=r.agent_id "
+            "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
+            "AND a.name=? AND r.superseded_ts IS NOT NULL "
+            "AND r.read_ts IS NULL",
+            (manifest["root"], participant["display"]),
+        ).fetchone()[0]
+    backlog = _mail_digest(pending)
     ledger = issues.snapshot(directory)["issues"].values()
     backlog.extend(
         record["handoff_prompt"]["id"]
@@ -2406,7 +3250,9 @@ def wake(
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
     )
-    wake_path = directory / f"{name}-wake.json"
+    capacity = published_capacity(directory, name)
+    if capacity["state"] == "retryable":
+        backlog.append(f"capacity:{capacity['observation_id']}")
     with lock(directory / f"{name}-wake.lock"):
         work_item = _work_backlog(
             home,
@@ -2425,16 +3271,33 @@ def wake(
             return
         record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
         same_backlog = record.get("backlog") == backlog
-        attempts = record.get("attempts", 0) if same_backlog else 0
+        marker = _lane_activity(home, directory, manifest, name)
+        worked = bool(record.get("activity")) and record["activity"] != marker
+        attempts = (
+            record.get("attempts", 0) if same_backlog and not worked else 0
+        )
         throttle_at = record.get("at", 0) if same_backlog else 0
         if work_offer:
             dispatch = published_work(directory, name).get("dispatch") or {}
-            attempts = max(attempts, int(dispatch.get("attempts", 0)))
+            if not worked:
+                attempts = max(attempts, int(dispatch.get("attempts", 0)))
             if dispatch.get("attempts"):
                 throttle_at = max(
                     throttle_at, float(dispatch.get("updated_at", 0))
                 )
+            if worked and dispatch:
+                _write_work_dispatch(
+                    directory, name, work_offer, 0, "", "pending"
+                )
+        if worked:
+            record.pop("escalated_at", None)
+            record.pop("exhausted_at", None)
+            record.update(attempts=0, activity=marker, blocked="", next_at=None)
+            write_json(wake_path, record)
         if attempts >= WORK_WAKE_ATTEMPTS:
+            if not record.get("exhausted_at"):
+                record.update(exhausted_at=time.time(), next_at=None)
+                write_json(wake_path, record)
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
                     work_offer, attempts, str(record.get("result", ""))
@@ -2450,9 +3313,12 @@ def wake(
                     "escalated",
                 )
             return
-        if time.time() - throttle_at < config["inactive_after"]:
+        due = _wake_due(float(throttle_at), int(attempts), ready_at, window)
+        if time.time() < due:
+            if record.get("result"):
+                _park_wake(wake_path, record, "", due)
             return
-        result = "manual attention required"
+        result = WAKE_ATTENTION
         selected = _select_work_prompt(home, directory, name, work_offer)
         if not selected:
             result = "busy:stale"
@@ -2494,13 +3360,22 @@ def wake(
                     track_launcher(child)
                     result = f"resume requested (launcher {child.pid})"
         counted = attempts + (not result.startswith("busy"))
+        now = time.time()
+        spent = counted >= WORK_WAKE_ATTEMPTS
         write_json(
             wake_path,
             {
-                "at": time.time(),
+                "at": now,
                 "backlog": backlog,
+                "superseded": superseded,
                 "attempts": counted,
                 "result": result,
+                "activity": marker,
+                "blocked": "",
+                "next_at": (
+                    None if spent else _wake_due(now, counted, 0.0, window)
+                ),
+                "exhausted_at": now if spent else None,
             },
         )
         if work_offer:

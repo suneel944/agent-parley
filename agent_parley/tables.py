@@ -69,7 +69,11 @@ def fit(value: str, width: int) -> str:
 
 
 def session(
-    liveness: str, paused: bool, stalled: bool, stall_age: float
+    liveness: str,
+    paused: bool,
+    stalled: bool,
+    stall_age: float,
+    retired_age: float | None = None,
 ) -> str:
     """Describes a lane's session the same way in every operator view.
 
@@ -79,13 +83,20 @@ def session(
         stalled: Whether the lane is alive and has served no coordination
             call inside the configured interval.
         stall_age: Seconds the lane has been in that state.
+        retired_age: Seconds since the participant retired, or None when it is
+            still serving. The absolute time it retired at is reported by the
+            machine-readable views, which are not width-bound.
 
     Returns:
-        One cell naming the state the lane is in. A paused lane reports its
-        pause first, an idle lane reports how long it has been idle, and a
-        lane whose checkpoints are unreadable says so rather than claiming
-        enforcement it cannot observe.
+        One cell naming the state the lane is in. A retired lane reports that
+        first, with how long ago it retired, because nothing else the cell
+        could say about it is actionable. A paused lane reports its pause
+        next, an idle lane reports how long it has been idle, and a lane whose
+        checkpoints are unreadable says so rather than claiming enforcement it
+        cannot observe.
     """
+    if retired_age is not None:
+        return f"retired {age(retired_age)} ago"
     if paused:
         return f"paused; {liveness}"
     if stalled:
@@ -168,7 +179,10 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
         offers: Issue numbers offered to this participant and still pending.
 
     Returns:
-        One cell per column of `STATUS_COLUMNS`. An issue past its deadline
+        One cell per column of `STATUS_COLUMNS`. A retired lane reports the
+        retirement and how long ago it was in the session cell, so an operator
+        does not read a lane that asked to stop as a lane that stalled.
+        An issue past its deadline
         or its attempt budget is marked with an exclamation mark, a claim of
         a lane the supervisor read as orphaned with an asterisk, and so is a
         lane away from its assigned branch; no marker moves ownership or
@@ -197,6 +211,7 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
             record["paused"],
             record["idle"]["stalled"],
             record["idle"]["age_seconds"],
+            record.get("retired_age_seconds"),
         ),
         record["branch"] + ("!" if record["drift"] else ""),
         record["outcome"],

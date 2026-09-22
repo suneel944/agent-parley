@@ -125,9 +125,11 @@ LEGEND = (
     "IDLE says how long a lane went without coordination activity; it "
     "does not claim to know what the native client was doing inside a "
     "turn. A branch marked ! left "
-    "its assigned bridge branch. A stale lease is still held; releasing "
-    "it is its owner's to do, and a queued request takes the key only "
-    "when that release happens.",
+    "its assigned bridge branch. A lease past a declared time to live is "
+    "counted apart from the live ones and still held: it keeps blocking "
+    "until its holder renews it at a checkpoint or releases it, and the "
+    "runtime reclaims it for the first queued lane once no live session is "
+    "observed for that holder or the expiry grace has run out.",
     "FIT is the last capacity check the runtime read for that lane, with "
     "+ when an advisory work offer is waiting for it; the line under an "
     "unfit lane names the check that failed, and no offer names that "
@@ -325,6 +327,11 @@ def _row(
             participant.get("paused", False),
             stalled["stalled"],
             stalled["age_seconds"],
+            (
+                time.time() - float(participant["retired"])
+                if roster.retired(participant)
+                else None
+            ),
         ),
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
@@ -358,10 +365,12 @@ def _row(
         or "-",
         "offers": offers,
         "unread": mail.get("unread", "?"),
+        "superseded": mail.get("superseded", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
+        "stale_lease_age": stats.get("stale_lease_age", 0),
         "queued": stats.get("queued", 0),
         "queued_by": list(stats.get("queued_by", [])),
         "injected_bytes": events["injected_bytes"],

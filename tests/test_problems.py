@@ -426,6 +426,68 @@ def test_a_parked_lane_with_twenty_awaited_messages_is_one_row(
     )
 
 
+def test_a_broadcast_costs_one_row_per_parked_lane(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    store.initialize(bridge.home)
+    for name in ("claude", "codex"):
+        stopped(directory, name)
+        store.register(bridge.home, paired["root"], name)
+    for key in ("first", "second"):
+        for name in ("claude", "codex"):
+            bridge.say(
+                repo,
+                name,
+                f"Answer the {key}",
+                ack=True,
+                key=f"{key}-{name}",
+            )
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE messages SET created_ts=datetime('now','-1800 seconds')"
+        )
+    found = rows(bridge, problems.ACK, ack_after=600)
+    assert len(found) == 2
+    assert {row["participant"] for row in found} == {"claude", "codex"}
+    assert "2 messages await acknowledgement" in found[0]["detail"]
+    assert "the oldest" in found[0]["detail"]
+
+
+def test_a_bounced_share_is_a_row_on_the_sender(bridge, repo, paired, served):
+    directory = bridge.project(repo)[1]
+    store.initialize(bridge.home)
+    alive(directory, "claude")
+    stopped(directory, "codex")
+    actor = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, paired["root"], "claude")[
+            "registration_token"
+        ],
+    )
+    store.register(bridge.home, paired["root"], "codex")
+    share = store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Take the parser half",
+            "body_md": "Take the parser half",
+            "idempotency_key": "share",
+            "ack_required": True,
+            "ack_within": 600,
+        },
+    )
+    [row] = rows(bridge, problems.BOUNCE)
+    assert row["participant"] == "claude"
+    assert f"share {share['id']}" in row["detail"]
+    assert "codex has no live session process" in row["detail"]
+    assert row["command"] == (
+        f"agent-parley run codex --resume --repo {paired['root']}"
+    )
+
+
 def test_a_drifted_lane_names_the_restore(bridge, repo, paired, served):
     lane = paired["lanes"]["claude"]
     subprocess.run(

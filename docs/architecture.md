@@ -16,6 +16,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
 | `roster` | Providers, credential profiles and project participants |
+| `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
@@ -149,6 +150,18 @@ their intersection and preserve `after_id` paging. All body offsets are
 validated even when no row is returned. Inbox, thread, search and reservation
 responses use the same `MAX_RESULT_BYTES` budget.
 
+Every message carries the claim its sender held when it was written. When that
+claim closes, moves to another lane or completes, each delivery of its mail that
+is still unread or still owes an acknowledgement is marked superseded with the
+reason, and the sender stops expecting an answer to it. Receipts are never
+forged: `read_ts` and `ack_ts` keep the empty values they had. Superseded mail
+is excluded from checkpoint previews, mailbox counts and the stall reading, and
+is reported separately as a count, so a lane woken after days asleep is handed
+the threads that are still live rather than every message it ever received. The
+wake backlog is a bounded digest of the newest message per live thread, capped
+at `WAKE_DIGEST_THREADS`, because the checkpoint context a woken turn receives
+is itself bounded by `MAX_CONTEXT_BYTES` and previews at most three messages.
+
 The supervising operator writes from the command line only. `agent-parley say`
 resolves the project and the addressed participant, then takes the ordinary
 send path, so the message is deduplicated by its key, can require an
@@ -247,9 +260,22 @@ a dispatch generation, issue-scoped progress digest, bounded attempt count and
 last result. An unchanged actionable offer joins the wake backlog even after a
 checkpoint injected it. The launcher reads the revalidated wake selection from
 private state after admitting the wake, so generated work context does not
-cross the wake socket. Three attempts without issue progress produce a durable
-escalation in the same publication and in `top`; changed issue state starts a
-new bounded attempt series. An offer is advisory: it never writes the ledger,
+cross the wake socket. The attempt bound measures lane silence rather than
+elapsed wakes: each attempt records the lane's own activity marker, built from
+its tool and turn-end hook events and the last message it sent, which together
+cover the reports, commits and mail a working lane produces. Three attempts
+across which that marker never changes produce a durable escalation in the same
+publication and in `top`; any recorded lane activity resets the series and
+clears the escalation, and changed issue state starts a new bounded attempt
+series. A spent attempt is re-decided on every poll rather than being final:
+durable capacity, the published screen state and the recorded session process
+are read again, and a cause still in force parks the lane with that cause and
+the time its next attempt is due without spending one, so nothing is consumed
+while nothing could answer. A cleared cause makes the next attempt due one
+doubling inactivity window after the last, or at the provider reset the
+capacity observation named, whichever is later. `status` prints that next time,
+and prints the exhausted budget with its last cause only for a lane that spent
+every attempt. An offer is advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served
 project identity to private launcher state. Its best-effort forge reads run
@@ -272,7 +298,21 @@ without deleting anything and keeps every deletion on one path.
 Provider capacity is durable per lane and records available, exhausted,
 retryable and unknown states with the native evidence and session identity.
 Elapsed supervision time never restores capacity. A validated later response,
-a structured provider reset or a recorded bounded probe does. Exhaustion is
+a structured provider reset or a recorded bounded probe does. Refusal text is
+read by the strength of its evidence: a named account, quota or session limit
+first, then a named throttle, then a bare `limit reached`, then an overload
+report or a bare status report such as `API Error: 529` or `HTTP 429` next to
+an explicit API, HTTP or status label. The named limit accepts at most two
+words between the possessive and `limit`, so a session or weekly limit is
+recognised and stays exhausted even when the same text carries throttle
+wording or a status number, while `Rate limit reached for a model` stays
+retryable because the named throttle is read before the weaker wording.
+Text that names the clock time and zone its limit resets, as in
+`resets 3:30am (Asia/Dubai)`, carries that instant as the observation's reset,
+which the existing reset handling holds the lane to and clears on. A retryable
+block makes the lane unfit, so no work or share is offered to it, and it is a
+wake backlog reason keyed by its observation, so the resume runs on the bounded
+wake backoff rather than on the inactivity budget. Exhaustion is
 shared across lanes only when an explicit credential profile identifies the
 same provider account. An exhausted owner's unfinished claims remain visible
 as recovery candidates even when it owns only one claim or no eligible peer is
@@ -307,7 +347,24 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. `gemini.py`, `copilot.py`, `opencode.py` and
+the existing session lock. Because it owns that stream, it is also the only
+place that can see a dialog the client draws on its own screen, so it passes
+every chunk it forwards to `dialogs.py`. That module recognizes the screens
+recorded from live clients, records an exhausted provider capacity with the
+reset instant a usage limit names, sends the option the operator configured for
+an answerable prompt, and escalates anything else that holds the screen. It
+publishes through the lane surfaces a reader already has: the activity record
+gains a `dialog` entry and its `activity` string is prefixed `dialog: `, so
+status reports the dialog instead of `working` or `starting`. It sends the
+keystrokes an operator would press and never a flag that skips a permission
+decision. A permission prompt reaches `checkpoints.py` as well, because the
+client runs its `PermissionRequest` hook while it waits; that branch publishes
+the same `dialog` record, naming the tool and the instant the wait began, so
+status, the fit checks, wake admission and `problems.py` read one surface for
+both observations. `dialogs.py` also owns the operator opt-in the launch reads
+before it carries approval of this bridge's own MCP server into a client's
+native permission settings, which is off by default and scoped to that one
+server. `gemini.py`, `copilot.py`, `opencode.py` and
 `amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in
@@ -332,6 +389,22 @@ also becomes a directory and a branch component, so the validator accepts only
 lowercase letters, digits, hyphens and underscores. Dots are refused: a lane
 named after a peer's state file would otherwise shadow that file. Adding a
 participant creates only that lane and never touches existing lanes or branches.
+
+A lane leaves the project by retiring itself through the `retire` tool, and the
+order of that withdrawal is what keeps nothing stranded when a later step fails.
+The work leaves first: every issue it holds is released back to the pool and
+every handoff offered to it is declined, because an offer returned to its sender
+would park ownership on a lane that can no longer answer. The sender is told by
+mail instead. The worktree leaves next, and only when Git reports it clean; a
+lane with uncommitted changes keeps its worktree and reports the paths, and a
+checkout Git cannot inspect is treated the same way. The manifest mark is then
+written, which is what makes the retirement durable, and one store transaction
+finally releases the advisory reservations, grants any key a peer was queued
+for, sends the notices and invalidates the credential. The participant stays in
+the roster carrying the time it retired, so `status` and `top` report it as
+retired rather than stalled, the supervisor never wakes it, never measures it
+and never names it as a peer work could move to, and the operator returns it to
+service with the same `participant add` command that created it.
 
 The activity file holds last state only; the event log,
 `<participant>-events.jsonl`, appends one record per observed hook event with an
@@ -577,12 +650,24 @@ previous lease atomically. Released leases no longer block work.
 `ttl_seconds` is optional. A lease taken without one carries no deadline and
 never reports as stale. A lease taken with one reports as stale once its
 deadline passes: the conflict it raises carries `stale`, `agent-parley top`
-marks the count with `!`, and `agent-parley status` names the stale share.
-Staleness is a report and nothing more. The lease is not revoked or
-reassigned, it still counts against the per-lane reservation cap, and it keeps
-blocking exactly the paths it already blocked until its owner releases it.
-That distinction lets a reader separate a lane still working on a path from a
-lane that died holding it, without any process deciding on that lane's behalf.
+marks the count with `!`, `agent-parley status` counts the expired leases apart
+from the live ones and names the age of the oldest, and both surfaces report
+that age in seconds past the deadline.
+
+An expired lease is renewed by its holder or reclaimed from it. A holder that
+is still coordinating renews its own expired leases at its next checkpoint,
+restoring the window that holder declared, so live work never loses a key it
+is using. A lease correlated with a claim that holder no longer holds is
+released at that checkpoint instead, and the holder is told which keys it lost.
+A lease whose holder was last observed without a live session process, or that
+has been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
+is released by the next reservation call or supervision poll: the oldest queued
+request for each key is granted, the lane that took it is told who lost it, and
+the former holder is told what was released and why. The grace sits above the
+whole wake budget, so a holder that can be woken is woken and renews before any
+peer takes its key. Reclaiming stays advisory: it changes who is told that a
+key is free, never what the file system allows, and nothing on disk is locked
+or reverted.
 
 `request_reservation` takes the same batch as `file_reservation_paths`. Where
 nothing conflicts it grants exactly the same leases, so a lane never has to ask

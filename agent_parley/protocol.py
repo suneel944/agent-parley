@@ -23,6 +23,11 @@ service already loaded against the sources now on disk. `revision` fingerprints
 those sources so the service can notice that it is answering from a module set
 the checkout no longer holds, rather than failing one lazily imported call at a
 time.
+
+One more identity crosses the same boundaries: the name this bridge's MCP server
+carries in the client configuration a launch writes, in the native permission
+rules that name its tools, and in the tool names a hook reports. `SERVER` and
+`TOOL_PREFIX` hold that name so no surface matches a second spelling of it.
 """
 
 import json
@@ -32,6 +37,8 @@ from pathlib import Path
 from agent_parley import __version__
 
 CLIENTS = ("claude", "codex")
+SERVER = "agent_parley"
+TOOL_PREFIX = f"mcp__{SERVER}"
 HEADER = "Agent-Parley-Protocol"
 PROTOCOL = 1
 SUPPORTED = (1,)

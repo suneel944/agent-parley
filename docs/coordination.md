@@ -156,10 +156,14 @@ sequence before it edits. `issue claim` reports the same forecast from the paths
 the issue's earlier pull requests touched when a forge is configured. The
 forecast is advisory and never withholds a grant or a claim.
 
-A reservation that declared a time to live is counted with `!` once that
-deadline passes, so a lane that died holding a path reads differently from one
-still working on it; nothing is revoked, and releasing it stays its owner's
-decision.
+A reservation that declared a time to live is counted apart from the live ones
+once that deadline passes, with the age of the oldest, so a lane that died
+holding a path reads differently from one still working on it. A lane that is
+still coordinating renews its own expired leases at its next checkpoint. One
+whose last observation found no live session, or whose lease has been expired
+longer than the 1800-second grace, has it released to the first lane queued for
+that key, and both lanes are told. Reservations stay advisory throughout:
+nothing on disk is locked or reverted.
 
 A lane that means to take a contested key next calls `request_reservation`
 rather than polling the holder or asking a human to sequence the two. Free keys

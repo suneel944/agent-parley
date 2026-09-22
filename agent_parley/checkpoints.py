@@ -1035,17 +1035,26 @@ def participant_liveness(
         inactive_after: Age past which the published record reads as stale.
 
     Returns:
-        The derived state's evidence followed by the age of that evidence.
+        The derived state's evidence followed by the age of that evidence. A
+        lane held by a native approval prompt also reports how long that
+        prompt has stood unanswered, which a repeated request does not reset.
     """
-    from agent_parley import supervision
+    from agent_parley import dialogs, supervision
 
-    derived = supervision.lane_state(activity(directory, agent), inactive_after)
+    state = activity(directory, agent)
+    derived = supervision.lane_state(state, inactive_after)
+    approval = dialogs.waited(state, time.time())
+    waiting = (
+        f"; waiting {approval}s"
+        if derived["process_alive"] and approval is not None
+        else ""
+    )
     age = (
         f"; event {derived['age_seconds']}s ago"
         if derived["last_active"]
         else ""
     )
-    return f"{derived['evidence']}{age}"
+    return f"{derived['evidence']}{waiting}{age}"
 
 
 def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
@@ -1183,11 +1192,17 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         name: Registered agent identity.
         after: Last locally delivered message ID.
 
+    Every count and preview covers live mail only. Mail superseded by a claim
+    that closed or moved is reported separately as a count, so a lane reads
+    what is still worth a turn without losing the fact that dead mail arrived.
+
     Returns:
-        Message previews, pending counts, held reservations with how many are
-        past a declared time to live, the named resources among them, and
-        coordination age. A stale reservation is still held; nothing releases
-        it on its owner's behalf.
+        Message previews, pending counts, the superseded count, held
+        reservations with how many are past a declared time to live and how
+        long the oldest of those has been past it, the named resources among
+        them, and coordination age. A reservation past its time to live is
+        still held and still listed: it is reported apart from the live ones
+        so its holder can renew or release it before the runtime reclaims it.
 
     Raises:
         BridgeError: If the agent is not registered.
@@ -1212,7 +1227,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "substr(m.body_md,-80) AS body_tail,m.ack_required "
             "FROM messages m JOIN message_recipients r ON r.message_id=m.id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? AND m.id>? "
-            "AND (r.read_ts IS NULL "
+            "AND r.superseded_ts IS NULL AND (r.read_ts IS NULL "
             "OR (m.ack_required=1 AND r.ack_ts IS NULL)) "
             "ORDER BY m.id LIMIT 3",
             (agent["id"], after),
@@ -1220,12 +1235,19 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         pending = db.execute(
             "SELECT count(*) FROM message_recipients r "
             "JOIN messages m ON m.id=r.message_id "
-            "WHERE r.agent_id=? AND m.ack_required=1 AND r.ack_ts IS NULL",
+            "WHERE r.agent_id=? AND r.superseded_ts IS NULL "
+            "AND m.ack_required=1 AND r.ack_ts IS NULL",
             (agent["id"],),
         ).fetchone()[0]
         unread = db.execute(
             "SELECT count(*) FROM message_recipients "
-            "WHERE agent_id=? AND read_ts IS NULL",
+            "WHERE agent_id=? AND superseded_ts IS NULL AND read_ts IS NULL",
+            (agent["id"],),
+        ).fetchone()[0]
+        superseded = db.execute(
+            "SELECT count(*) FROM message_recipients "
+            "WHERE agent_id=? AND superseded_ts IS NOT NULL "
+            "AND read_ts IS NULL",
             (agent["id"],),
         ).fetchone()[0]
         outstanding = db.execute(
@@ -1235,12 +1257,15 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "AS overdue_seconds "
             "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? "
-            "AND m.ack_required=1 AND r.ack_ts IS NULL ORDER BY m.id LIMIT 32",
+            "AND r.superseded_ts IS NULL AND m.ack_required=1 "
+            "AND r.ack_ts IS NULL ORDER BY m.id LIMIT 32",
             (agent["id"],),
         ).fetchall()
         leases = db.execute(
             "SELECT count(*) AS held,coalesce(sum(expires_ts IS NOT NULL "
-            "AND expires_ts<=datetime('now')),0) AS stale "
+            "AND expires_ts<=datetime('now')),0) AS stale,"
+            "coalesce(max(0,unixepoch('now')-unixepoch(min(CASE WHEN "
+            "expires_ts<=datetime('now') THEN expires_ts END))),0) AS age "
             "FROM file_reservations WHERE agent_id=? AND released_ts IS NULL",
             (agent["id"],),
         ).fetchone()
@@ -1257,12 +1282,43 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "pending_ack": pending,
             "outstanding_ack": [dict(row) for row in outstanding],
             "unread": unread,
+            "superseded": superseded,
             "reservations": leases["held"],
             "stale_reservations": leases["stale"],
+            "stale_reservation_age": leases["age"],
             "named_resources": [row["path_pattern"] for row in named],
             "reported_task": agent["task_description"],
             "last_coordination": agent["last_active_ts"],
         }
+
+
+def renewed_leases(home: Path, root: str, name: str, after: int = 0) -> dict:
+    """Renews this lane's expired reservations and reads the mailbox again.
+
+    A checkpoint is the lane saying it is alive and still working, so it is
+    where a lease that outlived its declared window is restored to that
+    window. Without it the runtime would reclaim a working lane's keys for a
+    peer, and with it a lane that has stopped coordinating loses them. Only a
+    lane that already holds an expired lease pays for this; the mailbox is
+    read again afterwards so the checkpoint reports what is true after the
+    renewal rather than before it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the bridge store.
+        name: Registered agent identity.
+        after: Last locally delivered message ID.
+
+    Returns:
+        The mailbox batch as it stands once expired leases have been renewed
+        or, where their claim is closed, released.
+
+    Raises:
+        BridgeError: If the agent is not registered.
+        sqlite3.Error: If the store cannot be written or read.
+    """
+    store.renew_reservations(home, root, name)
+    return mailbox(home, root, name, after)
 
 
 def paused_output(event: str) -> dict | None:
@@ -1362,6 +1418,15 @@ def checkpoint(
     before it starts a client, so this confirmation is what separates an
     attempted launch from a session that actually reported itself, and it is
     what a later resume reads.
+
+    Any observed event republishes the lane's activity, so an event that arrives
+    after the launch passed its start deadline clears the not-started mark the
+    supervision poll published, however late it is. It also clears any dialog
+    the launcher published for the lane: a client that reached a hook is running
+    again rather than waiting on a keypress. A permission request is the
+    exception, because the client runs that hook while it waits: it republishes
+    the dialog record naming the tool it asked about and the instant that wait
+    began.
 
     A session identity dropped because the process it named is gone records
     the lane as stopped, so the state derivation still reads positive
@@ -1502,12 +1567,18 @@ def checkpoint(
         if session:
             state["resumable_session"] = session
         state.pop("checkpoint_error", None)
+        state.pop("not_started", None)
+        held = state.pop("dialog", None)
         if event == "SessionEnd":
             state["activity"] = "stopped"
         elif event == "Stop":
             state["activity"] = "idle"
         elif event == "PermissionRequest":
-            state["activity"] = "waiting for approval"
+            from agent_parley import dialogs
+
+            tool = str(payload.get("tool_name", "")) or "an unnamed tool"
+            state["dialog"] = dialogs.requested(tool, held, time.time())
+            state["activity"] = f"{dialogs.APPROVAL}: {tool}"
         else:
             command = str(payload.get("tool_input", {}))
             testing = event == "PreToolUse" and re.search(
@@ -1538,6 +1609,13 @@ def checkpoint(
                 )
                 state["pending_ack"] = mail["pending_ack"]
                 state.pop("coordination_error", None)
+                if mail.get("stale_reservations", 0):
+                    mail = renewed_leases(
+                        home,
+                        manifest["root"],
+                        identity["name"],
+                        state.get("cursor", 0),
+                    )
                 messages = mail["messages"]
                 stages.enter("scan")
                 issues = snapshot(directory)

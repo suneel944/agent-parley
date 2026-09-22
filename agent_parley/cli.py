@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         checkpoints,
         completion,
         delivery,
+        dialogs,
         evidence,
         forecast,
         forge,
@@ -96,6 +97,7 @@ DEFERRED_MODULES = (
     "checkpoints",
     "completion",
     "delivery",
+    "dialogs",
     "evidence",
     "forecast",
     "forge",
@@ -709,6 +711,28 @@ def reviewed_line(review: dict) -> str:
     )
 
 
+def wake_schedule(wake: dict) -> str:
+    """States when a parked lane is asked again, or why it is not.
+
+    Args:
+        wake: Wake reading from a participant record.
+
+    Returns:
+        One line naming the next attempt and the cause that postponed it, or
+        the exhausted budget with the last cause. A record written before the
+        schedule existed reports that it is still to be re-decided rather than
+        inventing a time.
+    """
+    cause = wake.get("blocked") or wake.get("result") or "unknown"
+    if wake.get("exhausted"):
+        return f"Wake budget exhausted; last cause: {cause}"
+    seconds = wake.get("next_seconds")
+    if seconds is None:
+        return "Next wake: due on the next re-evaluation"
+    blocked = f"; blocked: {wake['blocked']}" if wake.get("blocked") else ""
+    return f"Next wake in {seconds}s at {wake['next_at']}{blocked}"
+
+
 def review_fields(review: dict | None) -> dict | None:
     """Reports one peer verdict in the shape every snapshot carries it.
 
@@ -866,19 +890,31 @@ def lane_detail(record: dict, data: dict) -> None:
     if wake := record["wake"]:
         print(
             f"    Runtime wake: {wake['result']}; "
-            f"attempt {wake['attempts']}; "
-            f"{wake['age_seconds']}s ago"
+            f"attempt {wake['attempts']}"
+            + (f"/{wake['budget']}" if wake.get("budget") else "")
+            + f"; {wake['age_seconds']}s ago"
         )
+        print(f"    {wake_schedule(wake)}")
     mail = record["mail"] or {}
     if "error" in mail:
         print(f"    Coordination unavailable: {mail['error']}")
         return
     stale = mail["stale_reservations"]
+    age = mail.get("stale_reservation_age", 0)
     print(
-        f"    Unread: {mail['unread']}; "
-        f"pending acknowledgements: {mail['pending_ack']}; "
-        f"active reservations: {mail['reservations']}"
-        + (f" ({stale} stale)" if stale else "")
+        f"    Unread: {mail['unread']}"
+        + (
+            f" ({mail['superseded']} superseded)"
+            if mail.get("superseded")
+            else ""
+        )
+        + f"; pending acknowledgements: {mail['pending_ack']}; "
+        + f"active reservations: {mail['reservations'] - stale}"
+        + (
+            f"; expired: {stale}, oldest {age}s past its deadline"
+            if stale
+            else ""
+        )
     )
     if edited := record["operator_edits"]:
         print("    " + supervision.operator_edit_marker(edited))
@@ -2908,6 +2944,10 @@ class Bridge:
         Returns:
             Manifest using the participant roster layout.
 
+        A retired participant is never checked for branch drift. It kept no
+        worktree to be on the wrong branch of, and reading its pruned lane
+        would report an unavailable worktree as a drifted one.
+
         Raises:
             BridgeError: If a checked lane left its assigned branch, or no
                 manifest exists and creation is not allowed.
@@ -2923,6 +2963,8 @@ class Bridge:
             )
             for name in sorted(names):
                 participant = participants[name]
+                if roster.retired(participant):
+                    continue
                 actual = lane_branch(Path(participant["lane"]))
                 if actual != participant["branch"]:
                     raise BridgeError(drift(name, participant, actual))
@@ -2952,6 +2994,11 @@ class Bridge:
         credential: str | None = None,
     ) -> dict:
         """Adds one lane for a participant without touching existing lanes.
+
+        This is also how a retired participant is re-admitted: naming it again
+        with the provider and account it already had clears the retirement and
+        restores its worktree, so a lane that retired itself comes back the
+        same way it was first admitted.
 
         Args:
             repo: Main checkout or linked worktree of the target repository.
@@ -2989,6 +3036,8 @@ class Bridge:
                         f"{existing['provider']} with "
                         f"{existing['credential'] or 'the default account'}."
                     )
+                if roster.retired(existing):
+                    self._readmit(root, directory, data, name)
                 return roster.expand(data)
             if len(participants) >= roster.MAX_PARTICIPANTS:
                 raise BridgeError(
@@ -3035,6 +3084,46 @@ class Bridge:
                 )
                 raise
             return roster.expand(data)
+
+    def _readmit(
+        self, root: Path, directory: Path, data: dict, name: str
+    ) -> None:
+        """Returns a retired participant to service under its own lane.
+
+        Retirement pruned the worktree when it was clean and left the branch
+        alone, so re-admission adds the worktree back on that same branch and
+        any commits it carried are exactly where the lane left them. A branch
+        that no longer exists is created again from the project base. The
+        credential is not reissued here; the next launch registers one, which
+        is the only path that has ever issued a lane's credential.
+
+        Args:
+            root: Common repository root.
+            directory: Private state directory for the repository.
+            data: Manifest being updated, under the held setup lock.
+            name: Retired participant being re-admitted.
+        """
+        participant = data["participants"][name]
+        lane = Path(participant["lane"])
+        branch = participant["branch"]
+        if not lane.exists():
+            git(root, "worktree", "prune")
+            if has_branch(root, branch):
+                git(root, "worktree", "add", str(lane), branch)
+            else:
+                git(
+                    root,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(lane),
+                    data["base"],
+                )
+            if data.get("initialize"):
+                initialize_lane(lane, data["initialize"], root)
+        participant.pop("retired", None)
+        write_json(directory / "project.json", data)
 
     def _lane(self, repo: Path, name: str) -> tuple[Path, dict, dict]:
         """Resolves one participant's state directory and manifest entry."""
@@ -4882,6 +4971,7 @@ reported.
         key: str = "",
         issue: str = "",
         resume_on: str = "",
+        backlog: int | None = None,
     ) -> None:
         """Records an explicitly reported outcome independently of activity.
 
@@ -4901,6 +4991,10 @@ reported.
             issue: Exact owned issue, inferred only for a sole claim.
             resume_on: Existing authorized issue whose completion resumes a
                 blocked report.
+            backlog: Work units still remaining on this claim, in whatever the
+                claim itself counts. Recording the count is what lets the
+                supervisor offer a split once this lane goes idle on it. None
+                leaves any recorded count as it stands.
 
         Raises:
             BridgeError: If the lane or required report fields are invalid, or
@@ -4948,6 +5042,7 @@ reported.
                 "issue": claim["issue"],
                 "claim_id": claim["claim_id"],
                 "resume_on": resume_on,
+                "backlog": backlog,
             },
         )
         replayed = False
@@ -4967,6 +5062,7 @@ reported.
                 str(claim["issue"]) if claim["issue"] is not None else "",
                 claim["claim_id"] or "",
                 resume_on,
+                backlog,
             )
             if replayed:
                 return
@@ -6650,7 +6746,8 @@ reported.
 
         Returns:
             The lane's session, availability, branch, reported outcome and
-            mailbox counts. An unreadable mailbox is reported as an error
+            mailbox counts, together with any native dialog the lane records as
+            holding its client. An unreadable mailbox is reported as an error
             beside the rest of the lane rather than failing the whole report.
         """
         import sqlite3
@@ -6702,6 +6799,15 @@ reported.
             "assigned_branch": participant["branch"],
             "drift": branch != participant["branch"],
             "paused": participant.get("paused", False),
+            "dialog": (
+                state["dialog"] if isinstance(state.get("dialog"), dict) else {}
+            ),
+            "retired_at": views.timestamp(participant.get("retired")),
+            "retired_age_seconds": (
+                int(time.time() - float(participant["retired"]))
+                if roster.retired(participant)
+                else None
+            ),
             "outcome": state.get("outcome", "unknown"),
             "approval": self._approval_state(directory, data, agent),
             "summary": state.get("summary", ""),
@@ -6777,11 +6883,19 @@ reported.
         wake_path = directory / f"{agent}-wake.json"
         if wake_path.exists():
             wake = json.loads(wake_path.read_text())
+            next_at = wake.get("next_at")
             record["wake"] = {
                 "result": wake["result"],
                 "attempts": wake["attempts"],
                 "at": views.timestamp(wake["at"]),
                 "age_seconds": int(time.time() - wake["at"]),
+                "budget": supervision.WORK_WAKE_ATTEMPTS,
+                "blocked": wake.get("blocked", ""),
+                "exhausted": bool(wake.get("exhausted_at")),
+                "next_at": (views.timestamp(next_at) if next_at else None),
+                "next_seconds": (
+                    max(int(next_at - time.time()), 0) if next_at else None
+                ),
             }
         try:
             mail = mailbox(
@@ -6798,9 +6912,11 @@ reported.
         record["mail"] = {
             "pending_operator_items": scheduled,
             "unread": mail["unread"],
+            "superseded": mail.get("superseded", 0),
             "pending_ack": mail["pending_ack"],
             "reservations": mail["reservations"],
             "stale_reservations": mail.get("stale_reservations", 0),
+            "stale_reservation_age": mail.get("stale_reservation_age", 0),
             "named_resources": list(mail.get("named_resources", [])),
             "queued_requests": frame["usage"].get(name, {}).get("queued", 0),
             "queued_by": list(
@@ -6971,6 +7087,14 @@ reported.
         with its kernel start ticks to prove the exact generation ended; the
         next launch replaces both before starting its client.
 
+        A resumed session asks again for permission to use this bridge's own
+        MCP tools, and a service-driven resume has nobody at the keyboard to
+        answer. Where the client carries per-tool approval in its own settings,
+        and only where the operator recorded the opt-in for this project or
+        this lane, the launch allows that one MCP server through those native
+        settings. No other tool is named, no permission decision is weakened
+        and no bypass flag is ever passed.
+
         Args:
             agent: Participant name within the project.
             repo: Target Git repository.
@@ -7041,7 +7165,7 @@ reported.
                     config,
                     {
                         "mcpServers": {
-                            "agent_parley": {
+                            protocol.SERVER: {
                                 "type": "http",
                                 "url": self.url + "/mcp/",
                                 "headers": {
@@ -7054,6 +7178,9 @@ reported.
                         }
                     },
                 )
+                native: dict = {"hooks": hooks}
+                if dialogs.pre_approved(data, agent):
+                    native["permissions"] = {"allow": [protocol.TOOL_PREFIX]}
                 command = [
                     executable,
                     "--mcp-config",
@@ -7061,7 +7188,7 @@ reported.
                     "--append-system-prompt",
                     prompt,
                     "--settings",
-                    json.dumps({"hooks": hooks}),
+                    json.dumps(native),
                     "--",
                     task,
                 ]
@@ -7203,7 +7330,7 @@ reported.
                 else:
                     command[1:1] = ["--resume", session]
             previous.update(
-                activity="starting; awaiting native hook",
+                activity=supervision.STARTING,
                 launcher_managed=True,
                 task=task,
                 updated=time.time(),
@@ -8129,6 +8256,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help=(
             "For a blocked report, resume automatically after this existing "
             "authorized issue completes."
+        ),
+    )
+    report.add_argument(
+        "--backlog",
+        type=int,
+        default=None,
+        metavar="COUNT",
+        help=(
+            "Work units still remaining on this claim, in whatever it counts: "
+            "issue families, files, subtasks. Recording the count lets the "
+            "supervisor offer a split once this lane goes idle on the claim."
         ),
     )
     report.add_argument(
@@ -9172,6 +9310,7 @@ def main() -> int:
                 key=args.idempotency_key,
                 issue=args.issue,
                 resume_on=args.resume_on,
+                backlog=args.backlog,
             )
             print(f"Recorded outcome: {args.state}")
         elif args.command == "say" or (

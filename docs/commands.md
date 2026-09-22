@@ -31,7 +31,7 @@ on standard output and export to a file.
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | The dashboard of every lane; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
-| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--idempotency-key` makes a retry safe. |
+| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--idempotency-key` makes a retry safe. |
 | `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
 | `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
@@ -161,6 +161,7 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `search_decisions` | Search decisions any lane recorded for this project, whoever sent or received them; an empty query lists the newest and `since` bounds their age. |
 | `read_attachment` | Page an attachment a message, report or offer named; only its writer and its addressees may read it. |
 | `next_issues` | Rank the unclaimed, unblocked issues this lane could take next, with the reason for each; `limit` bounds the list. It claims nothing, so the chosen issue is still taken by an explicit claim. |
+| `retire` | Retire this lane from the project when it has nothing left to do. Every issue it holds is released back to the pool and every handoff offered to it is declined, so the offering lane owns that work again; each lane that had handed it work is told by mail. Its advisory reservations are released, any key a peer queued for is granted, its worktree is removed when Git reports it clean and kept with its changed paths reported when it is not, and its credential is invalidated last. The lane is then never woken, never relaunched by the service and never named as a peer work could move to. Only the operator returns it to service, with `agent-parley participant add`. |
 | `review_report` | Record this lane's `verdict` of `pass` or `fail` on the peer report named by `report_id`, with the `evidence` it checked. The report's own author is refused. A verdict is that lane's own claim about work it did not do: it is not independent verification, it approves nothing and it gates no integration. |
 
 `send_message` also takes a `decision` flag. A message marked that way is

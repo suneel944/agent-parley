@@ -24,7 +24,7 @@ import json
 import time
 from pathlib import Path
 
-from agent_parley import issues, roster, store, supervision, tables
+from agent_parley import dialogs, issues, roster, store, supervision, tables
 
 STORE = "store"
 SERVICE = "service"
@@ -34,16 +34,19 @@ OVERDUE = "overdue claim"
 OFFER = "unanswered offer"
 UNRESOLVED = "unresolved completion"
 ACK = "awaiting acknowledgement"
+BOUNCE = "bounced share"
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
 BUDGET = "over budget"
 WAKE = "wake attention"
+APPROVAL = "waiting on approval"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
 
 DIALOG = "busy:input"
 RETRY = "busy:repeat"
+APPROVAL = "busy:approval"
 ATTENTION = "manual attention required"
 PAUSED = "paused"
 
@@ -51,6 +54,9 @@ WAKE_DETAILS = {
     DIALOG: "wake refused because operator input is pending",
     RETRY: (
         "wake refused because the previous accepted wake produced no checkpoint"
+    ),
+    APPROVAL: (
+        "wake refused because the client is waiting for a native approval"
     ),
     ATTENTION: "wake requires operator attention",
 }
@@ -385,10 +391,31 @@ def _lane_rows(
         many items share that cause and the age of the oldest. A lane that has
         recorded no native activity carries no age on the rows that report one,
         because the span it has been quiet for is unknown rather than long.
+        A lane owing several acknowledgements carries one row naming the
+        oldest, so a broadcast costs one row per lane rather than one per
+        message it created. A native approval prompt is reported once it has
+        stood unanswered past the same bound an unacknowledged message uses,
+        because a prompt the operator is about to answer needs no row. A lane
+        that retired reports only the worktree it kept, because its quiet is
+        the state the operator asked for and every other remedy here would
+        wake a lane that has given its work back.
     """
     name = record["participant"]
     repo = f"--repo {root}"
     rows: list[dict] = []
+    if roster.retired(participant):
+        if supervision.dirty_paths(participant["lane"]):
+            rows.append(
+                _row(
+                    DIRTY,
+                    "uncommitted work kept when this lane retired",
+                    f"agent-parley participant add {name} {repo}",
+                    record.get("retired_age_seconds"),
+                    name,
+                    root,
+                )
+            )
+        return rows
     idle = record["idle"]
     availability = record["availability"]
     quiet = availability["state"] != supervision.ACTIVE
@@ -407,6 +434,24 @@ def _lane_rows(
                 actor,
             )
         )
+    held = record.get("dialog") or {}
+    since = held.get("since")
+    if held.get("name") == dialogs.PERMISSION and isinstance(
+        since, (int, float)
+    ):
+        waited = max(0, int(now - float(since)))
+        if waited >= ack_after:
+            tool = str(held.get("tool", "")) or "a tool"
+            rows.append(
+                _row(
+                    APPROVAL,
+                    f"the client is waiting for approval of {tool}",
+                    f"answer the prompt in {name}'s terminal",
+                    waited,
+                    name,
+                    root,
+                )
+            )
     if idle["stalled"]:
         command, actor = _remedy(name, repo, record, waking)
         rows.append(
@@ -530,6 +575,67 @@ def _offer_rows(project: dict, now: float) -> list[dict]:
     return rows
 
 
+def _bounce_rows(
+    home: Path, directory: Path, data: dict, project: dict, config: dict
+) -> list[dict]:
+    """Derives one row per share whose recipients cannot act on it.
+
+    The row sits on the sender's lane, because that is the lane still holding
+    work it believed it had shared. The command names what the first blocked
+    recipient needs, since clearing that condition is what lets the share be
+    answered at all. An operator's own request carries no row here; it is
+    already reported as awaiting acknowledgement.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        data: Project manifest holding every participant.
+        project: One project's status reading.
+        config: Resolved supervision settings for the project.
+
+    Returns:
+        Zero or more rows, oldest share first.
+    """
+    records = {
+        record["participant"]: record for record in project["participants"]
+    }
+    availability = {
+        name: record.get("availability") or {}
+        for name, record in records.items()
+    }
+    repo = f"--repo {project['root']}"
+    rows = []
+    for share in supervision.bounced_shares(
+        home, directory, data, availability
+    ):
+        blocked = share["blocked"]
+        listed = ", ".join(
+            f"{entry['recipient']} {entry['reason']}" for entry in blocked[:3]
+        )
+        first = blocked[0]["lane"]
+        record = records.get(first) or {
+            "availability": availability.get(first)
+            or {"state": supervision.UNKNOWN}
+        }
+        waking = bool(
+            config["wake"]
+            and (data["participants"].get(first) or {}).get("wake", True)
+        )
+        command, actor = _remedy(first, repo, record, waking)
+        rows.append(
+            _row(
+                BOUNCE,
+                f"share {share['message_id']} returned unanswerable: {listed}",
+                command,
+                share["waiting_seconds"],
+                share["sender_lane"] or share["sender"],
+                project["root"],
+                actor,
+            )
+        )
+    return rows
+
+
 def derive(
     home: Path, report: dict, ack_after: float = 0.0, now: float = 0.0
 ) -> list[dict]:
@@ -561,13 +667,13 @@ def derive(
             _row(SERVICE, "coordination server is not ready", "agent-parley up")
         )
     manifests = {
-        data["root"]: data
+        data["root"]: (path.parent, data)
         for path in (home / "projects").glob("*/project.json")
         for data in [roster.normalize(json.loads(path.read_text()))]
     }
     aged: list[dict] = []
     for project in report["projects"]:
-        data = manifests[project["root"]]
+        directory, data = manifests[project["root"]]
         config = supervision.configuration(home, data)
         after = ack_after or config["stalled_after"]
         for record in project["participants"]:
@@ -582,6 +688,7 @@ def derive(
                 )
             )
         aged.extend(_offer_rows(project, stamp))
+        aged.extend(_bounce_rows(home, directory, data, project, config))
     aged.sort(key=lambda row: -(row["seconds"] or 0))
     return rows + aged
 

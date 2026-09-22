@@ -29,6 +29,80 @@ requested)`. A presence row written before this release still carries
 `idle` names the oldest waiting item and how long it has waited, so a lane that
 is quiet with an empty inbox reads differently from one sitting on unread mail.
 
+## A lane held by a native dialog
+
+A native client sometimes stops on a screen of its own: a usage limit, a tool
+permission prompt, a hook trust review. The client process stays alive and runs
+no hook, so without the screen a held lane reads as a quiet lane. The launcher
+owns the client's terminal, so it reads that screen and reports it. The activity
+column then shows `dialog: ` and the dialog's name, the activity record carries
+a `dialog` entry with the last screen lines, a wake addressed to the lane is
+refused with `manual attention required`, and you get one notification with the
+screen text. A recognized usage limit also records the provider capacity as
+exhausted with the reset instant the screen names, so the lane is parked with
+that reason and restored when the reset passes. No lane on a dialog is ever
+reported as `working` or `starting`.
+
+Three dialogs are recognized, recorded from `claude` CLI 2.1.270 and Codex CLI
+0.153.4: `usage-limit`, `hook-review` and `tool-permission`. Answering one is
+your decision, so nothing is answered until you say which option to press. Name
+the option's own text, not its position, because the clients reorder options
+between versions:
+
+```json
+{
+  "supervision": {"dialogs": {"hook-review": "review hooks"}},
+  "participants": {
+    "claude": {"dialogs": {"tool-permission": "yes"}}
+  }
+}
+```
+
+A participant entry overrides the project entry for that dialog name. An
+unanswered dialog, a dialog whose configured option the screen does not offer,
+an answer the screen survives twice, and any prompt that is not one of the three
+and holds the screen for 30 seconds are all escalated to you instead. The
+keystrokes sent are the ones you would press on an option the client itself
+offered; no permission check is skipped and no bypass flag exists.
+
+## A lane waiting for a tool approval
+
+A permission prompt is also visible without the screen: the client runs its
+`PermissionRequest` hook while it waits, and that hook names the tool it is
+asking about. The lane then reports `waiting for approval` followed by that tool
+name, and its activity record carries the same `dialog` entry the launcher
+publishes, naming the tool and the instant the wait began. A repeated request for
+the same tool keeps that instant, so `status` shows how long the prompt has stood
+unanswered rather than how recently the client asked again. A wake addressed to
+the lane is refused with `busy:approval`, which names the prompt without counting
+the refusal as a failed wake, and no fit check passes the lane, so work is never
+offered to a client that is holding a question for you. Once the prompt has
+waited past the project's stall interval, `problems` reports it under `waiting on
+approval` with the tool and the age.
+
+A resumed session asks again for permission to use this bridge's own MCP tools,
+and a service-driven resume has nobody at the keyboard to answer. `claude` 2.1.270
+carries per-tool approval in its own settings, so a launch can allow that one MCP
+server there, and only when you record the opt-in:
+
+```json
+{
+  "supervision": {"approve_bridge_tools": true},
+  "participants": {
+    "claude-2": {"approve_bridge_tools": false}
+  }
+}
+```
+
+The default is off and changes nothing about the client's configuration. With it
+on, the launch adds one native permission rule, `mcp__agent_parley`, which allows
+this bridge's own coordination tools and nothing else: no file tool, no shell, no
+other MCP server, no bypass flag and no weakened decision. A participant entry
+overrides the project entry, so one lane can stay fully interactive. Codex CLI
+0.153.4 has no per-tool approval surface of its own — its approval settings are
+whole-session policies — so its launch is left untouched and its prompts are
+reported for you to answer.
+
 ## `status`
 
 `status` prints the server line, the code line, the state directory and then one

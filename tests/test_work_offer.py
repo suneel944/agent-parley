@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -22,6 +23,14 @@ from agent_parley import (
 from agent_parley.checkpoints import checkpoint
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
+
+OVERLOADED = (
+    "API Error: 529 Overloaded. This is a server-side issue, usually temporary."
+)
+SESSION_LIMIT = (
+    "You've hit your session limit · resets 3:30am (Asia/Dubai) "
+    "(error type rate_limit, HTTP 429)"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +67,27 @@ def turn_ended(directory, name, ago):
     (directory / f"{name}-events.jsonl").write_text(
         json.dumps({"ts": time.time() - ago, "event": "Stop"}) + "\n"
     )
+
+
+def tool_used(directory, name):
+    """Appends one tool-use event of the kind a working lane records."""
+    with (directory / f"{name}-events.jsonl").open("a") as stream:
+        stream.write(
+            json.dumps({"ts": time.time(), "event": "PostToolUse"}) + "\n"
+        )
+
+
+def unthrottle(directory, name):
+    """Ages the wake spacing so the next attempt is admitted immediately."""
+    path = directory / f"{name}-wake.json"
+    if path.exists():
+        record = json.loads(path.read_text())
+        record["at"] = 0
+        write_json(path, record)
+    published = supervision.published_work(directory, name)
+    if published.get("dispatch"):
+        published["dispatch"]["updated_at"] = 0
+        write_json(directory / f"{name}-work.json", published)
 
 
 def refused(paired, name, ago, text="API Error: usage limit reached"):
@@ -158,6 +188,30 @@ def codex_capacity_record(
 def offer_for(directory, name):
     """Returns the advisory offer published for one lane, if any."""
     return supervision.published_work(directory, name)["offer"]
+
+
+def holding_a_backlog(bridge, paired, monkeypatch, count):
+    """Leaves claude holding one claim with a stated remaining-work count."""
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude")
+    alive(directory, "codex")
+    bridge.issue(lane, "claim", "2")
+    if count is not None:
+        bridge.report(
+            lane,
+            "partial",
+            "Processing families.",
+            "families still to convert",
+            "",
+            backlog=count,
+        )
+    turn_ended(directory, "claude", 3600)
+    turn_ended(directory, "codex", 3600)
+    return lane, peer, directory
 
 
 def test_unclaimed_work_is_ordered_by_the_peers_that_wait_on_it(
@@ -261,6 +315,155 @@ def test_transient_rate_limit_is_distinct_from_exhaustion(bridge, repo, paired):
     assert published["checks"]["capacity"] is False
     assert published["capacity"]["state"] == "retryable"
     assert "retryable transient failure" in published["reason"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "Rate limit reached for claude-opus-5 in organization org-x",
+            "retryable",
+        ),
+        (SESSION_LIMIT, "exhausted"),
+        (OVERLOADED, "retryable"),
+        ("overloaded; usage limit reached", "exhausted"),
+        ("You've hit your weekly limit", "exhausted"),
+        ("quota exceeded", "exhausted"),
+        ("limit reached", "exhausted"),
+        ("API Error: rate limit", "retryable"),
+        ("the 500 records we wrote", None),
+        ("http://127.0.0.1:5000/health", None),
+        ("API Error: 400 Bad Request", None),
+    ],
+)
+def test_refusal_text_is_read_by_evidence_strength(text, expected):
+    assert records._capacity_state(text) == expected
+
+
+def test_a_transient_api_error_is_classified_retryable(bridge, repo, paired):
+    refused(paired, "claude", 30, OVERLOADED)
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "retryable"
+
+
+def test_a_bare_server_status_report_is_a_transient_block(bridge, repo, paired):
+    refused(paired, "claude", 30, "API Error: 503")
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "retryable"
+
+
+def test_a_session_limit_beside_a_status_report_is_exhausted(
+    bridge, repo, paired
+):
+    refused(paired, "claude", 30, SESSION_LIMIT)
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+
+
+def test_a_session_limit_carries_its_named_reset_instant(bridge, repo, paired):
+    refused(paired, "claude", 30, SESSION_LIMIT)
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["reset_at"] > observation["observed_at"]
+    reset = datetime.datetime.fromtimestamp(
+        observation["reset_at"], ZoneInfo("Asia/Dubai")
+    )
+    assert (reset.hour, reset.minute, reset.second) == (3, 30, 0)
+
+
+def test_a_qualified_weekly_limit_is_exhausted(bridge, repo, paired):
+    refused(paired, "claude", 30, "You've hit your weekly limit")
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+    assert "reset_at" not in observation
+
+
+def test_a_named_reset_holds_the_lane_until_it_passes(bridge, repo, paired):
+    directory = Path(paired["lanes"]["claude"]).parent
+    refused(paired, "claude", 30, SESSION_LIMIT)
+    observed = supervision.capacity(bridge.home, directory, paired, "claude")
+    assert observed["state"] == "exhausted"
+    assert observed["reset_at"] > observed["observed_at"]
+    published = supervision.published_capacity(directory, "claude")
+    assert published["reset_at"] == observed["reset_at"]
+
+
+def test_a_status_report_beside_a_usage_limit_stays_exhausted(
+    bridge, repo, paired
+):
+    refused(paired, "claude", 30, "API Error: 429 usage limit reached")
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+
+
+def test_a_transient_api_error_makes_a_lane_unfit_and_unoffered(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude")
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    refused(paired, "claude", 30, OVERLOADED)
+    supervision.poll(bridge.home, directory)
+    published = supervision.published_work(directory, "claude")
+    assert published["capacity"]["state"] == "retryable"
+    assert published["checks"]["capacity"] is False
+    assert published["failed"] == ["capacity"]
+    assert published["fit"] is False
+    assert published["offer"] is None
+
+
+def test_a_transient_block_resumes_on_the_wake_backoff(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    alive(directory, "claude", updated=time.time() - 500)
+    refused(paired, "claude", 30, OVERLOADED)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    requested = []
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda path, name: requested.append(name) or "accepted",
+    )
+
+    supervision.wake(
+        bridge.home,
+        directory,
+        manifest,
+        "claude",
+        supervision.presence(directory, "claude", config["inactive_after"]),
+        config,
+    )
+
+    blocked = supervision.published_capacity(directory, "claude")
+    record = json.loads((directory / "claude-wake.json").read_text())
+    assert requested == ["claude"]
+    assert record["backlog"] == [f"capacity:{blocked['observation_id']}"]
+    assert record["attempts"] == 1
 
 
 def test_codex_structured_limit_preserves_reliable_reset(bridge, repo, paired):
@@ -668,6 +871,56 @@ def test_a_busy_lane_is_told_which_fit_peer_has_been_idle(bridge, repo, paired):
     assert issues.snapshot(directory)["issues"]["2"]["owner"] == "claude"
 
 
+def test_an_idle_claim_with_a_countable_backlog_offers_one_split(
+    bridge, repo, paired, monkeypatch
+):
+    _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, 129)
+
+    supervision.poll(bridge.home, directory)
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "split"
+    assert offer["issues"] == ["2"]
+    assert "129 units" in offer["text"]
+    assert "codex" in offer["text"]
+    first = supervision.published_work(directory, "claude")["dispatch"]
+
+    supervision.poll(bridge.home, directory)
+    repeated = supervision.published_work(directory, "claude")
+    assert repeated["offer"]["id"] == offer["id"]
+    assert repeated["dispatch"]["generation"] == first["generation"]
+    assert issues.snapshot(directory)["issues"]["2"]["owner"] == "claude"
+    view = dashboard.collect(bridge.home, False, {})
+    rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
+    assert rows["claude"]["offer_kind"] == "split"
+    assert "split offer pending" in "\n".join(dashboard.render(view))
+    reported = views.frame(view)["projects"][0]["participants"]
+    holder = next(row for row in reported if row["participant"] == "claude")
+    assert holder["work_offer"] == "split"
+    assert holder["work_dispatch"]["state"] == repeated["dispatch"]["state"]
+
+
+def test_a_claim_with_no_recorded_backlog_offers_no_split(
+    bridge, repo, paired, monkeypatch
+):
+    _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, None)
+
+    supervision.poll(bridge.home, directory)
+    assert offer_for(directory, "claude")["kind"] == "continue"
+
+
+def test_a_split_names_no_recipient_parked_on_a_dialog(
+    bridge, repo, paired, monkeypatch
+):
+    _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, 129)
+    write_json(
+        directory / "codex-wake.json",
+        {"result": sorted(supervision.DIALOG_WAKES)[0]},
+    )
+
+    supervision.poll(bridge.home, directory)
+    assert offer_for(directory, "claude")["kind"] == "continue"
+
+
 def test_the_checkpoint_carries_one_offer_and_then_stays_quiet(
     bridge, repo, paired
 ):
@@ -927,6 +1180,84 @@ def test_delivery_without_work_progress_retries_then_escalates(
     restarted = supervision.published_work(directory, "claude")["dispatch"]
     assert restarted["state"] == "escalated"
     assert restarted["attempts"] == 3
+
+
+def test_a_lane_working_between_wakes_is_never_escalated(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+    supervision.poll(bridge.home, directory)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    for _ in range(5):
+        tool_used(directory, "claude")
+        unthrottle(directory, "claude")
+        supervision.wake(
+            bridge.home, directory, manifest, "claude", observed, config
+        )
+        record = json.loads((directory / "claude-wake.json").read_text())
+        assert record["attempts"] <= 1
+
+    dispatch = supervision.published_work(directory, "claude")["dispatch"]
+    assert dispatch["state"] == "awaiting_progress"
+
+
+def test_an_escalation_holds_until_the_lane_records_activity(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude", updated=time.time() - 500)
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+    supervision.poll(bridge.home, directory)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    for _ in range(4):
+        unthrottle(directory, "claude")
+        supervision.wake(
+            bridge.home, directory, manifest, "claude", observed, config
+        )
+    wake_path = directory / "claude-wake.json"
+    escalated = json.loads(wake_path.read_text())
+    dispatch = supervision.published_work(directory, "claude")["dispatch"]
+    assert dispatch["state"] == "escalated"
+
+    unthrottle(directory, "claude")
+    supervision.wake(
+        bridge.home, directory, manifest, "claude", observed, config
+    )
+    held = json.loads(wake_path.read_text())
+    assert held["escalated_at"] == escalated["escalated_at"]
+
+    tool_used(directory, "claude")
+    unthrottle(directory, "claude")
+    supervision.wake(
+        bridge.home, directory, manifest, "claude", observed, config
+    )
+
+    cleared = supervision.published_work(directory, "claude")["dispatch"]
+    assert cleared["state"] == "awaiting_progress"
+    assert cleared["attempts"] == 1
+    record = json.loads(wake_path.read_text())
+    assert "escalated_at" not in record
+    assert record["attempts"] == 1
 
 
 def test_issue_progress_resets_a_rebalance_dispatch_generation(

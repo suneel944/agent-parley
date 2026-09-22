@@ -1,9 +1,12 @@
 """Checks queued reservation requests and the grant a release performs."""
 
+import time
+from pathlib import Path
+
 import pytest
 
-from agent_parley import cli, dashboard, store
-from agent_parley.state import BridgeError
+from agent_parley import checkpoints, cli, dashboard, store
+from agent_parley.state import BridgeError, write_json
 
 
 def actor(bridge, root, name):
@@ -45,6 +48,53 @@ def inbox(bridge, lane):
     return store.call(
         bridge.home, lane, "fetch_inbox", {"include_bodies": True}
     )["messages"]
+
+
+def expire(bridge, holder, seconds):
+    """Backdates one lane's lease deadlines by a number of seconds."""
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET expires_ts=datetime('now',?) "
+            "WHERE agent_id=? AND released_ts IS NULL",
+            (f"-{seconds} seconds", holder["id"]),
+        )
+
+
+def unreachable(bridge, holder):
+    """Records the last observation of a lane as a gone session process."""
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "INSERT INTO participant_presence(agent_id,state,process_alive,"
+            "observed_ts,last_active) VALUES (?,'stopped',0,?,NULL)",
+            (holder["id"], time.time()),
+        )
+
+
+def held(bridge, holder):
+    """Reports how many leases a lane holds and how many have expired."""
+    with store.connect(bridge.home) as db:
+        return dict(
+            db.execute(
+                "SELECT count(*) AS leases,coalesce(sum(expires_ts IS NOT "
+                "NULL AND expires_ts<=CURRENT_TIMESTAMP),0) AS expired "
+                "FROM file_reservations WHERE agent_id=? "
+                "AND released_ts IS NULL",
+                (holder["id"],),
+            ).fetchone()
+        )
+
+
+def hook(bridge, paired, name):
+    """Runs one lifecycle checkpoint for a lane and reports its output."""
+    directory = Path(paired["lanes"][name]).parent
+    write_json(directory / f"{name}-identity.json", {"name": name})
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "test",
+        "cwd": paired["lanes"][name],
+        "tool_name": "Bash",
+    }
+    return checkpoints.checkpoint(bridge.home, directory, name, payload)
 
 
 def test_a_free_key_is_granted_without_queueing(bridge, repo, paired):
@@ -244,3 +294,105 @@ def test_status_and_top_report_the_queue_under_the_holder(
     assert holding["queued"] == 1
     assert holding["queued_by"] == ["codex"]
     assert any("1+1" in line for line in dashboard.render(view))
+
+
+def test_an_expired_lease_without_a_live_session_goes_to_the_queue(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=30)
+    assert request(bridge, peer, "src/engine.py")["granted"] == []
+    expire(bridge, holder, 60)
+    unreachable(bridge, holder)
+    reclaimed = store.reclaim_expired(bridge.home, paired["root"])
+    assert [entry["agent"] for entry in reclaimed] == ["claude"]
+    assert reclaimed[0]["paths"] == ["src/engine.py"]
+    assert [entry["agent"] for entry in reclaimed[0]["granted"]] == ["codex"]
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "codex": ["src/engine.py"]
+    }
+    granted = inbox(bridge, peer)[0]
+    assert granted["subject"] == "Reservation granted: src/engine.py"
+    assert "expired unrenewed and was released" in granted["body_md"]
+    told = inbox(bridge, holder)[0]
+    assert told["sender"] == "operator"
+    assert told["id"] == reclaimed[0]["message_id"]
+    assert "codex took it from the queue" in told["body_md"]
+    assert "nothing on disk was locked" in told["body_md"]
+
+
+def test_a_second_sweep_reclaims_nothing_and_writes_no_second_notice(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=30)
+    expire(bridge, holder, 60)
+    unreachable(bridge, holder)
+    assert len(store.reclaim_expired(bridge.home, paired["root"])) == 1
+    assert store.reclaim_expired(bridge.home, paired["root"]) == []
+    assert len(inbox(bridge, holder)) == 1
+
+
+def test_a_live_holder_renews_its_expired_lease_at_the_next_checkpoint(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=3600)
+    request(bridge, peer, "src/engine.py")
+    expire(bridge, holder, 60)
+    assert held(bridge, holder) == {"leases": 1, "expired": 1}
+    hook(bridge, paired, "claude")
+    assert held(bridge, holder) == {"leases": 1, "expired": 0}
+    assert store.reclaim_expired(bridge.home, paired["root"]) == []
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "claude": ["src/engine.py"]
+    }
+    assert inbox(bridge, peer) == []
+
+
+def test_a_checkpoint_releases_a_lease_whose_claim_is_closed(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=30)
+    request(bridge, peer, "src/engine.py")
+    expire(bridge, holder, 60)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET claim_id='issue-7' WHERE agent_id=?",
+            (holder["id"],),
+        )
+    hook(bridge, paired, "claude")
+    assert held(bridge, holder) == {"leases": 0, "expired": 0}
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "codex": ["src/engine.py"]
+    }
+    told = inbox(bridge, holder)[0]
+    assert told["sender"] == "operator"
+    assert told["subject"] == (
+        "Reservation released with its claim: src/engine.py"
+    )
+    assert "a claim you no longer hold" in told["body_md"]
+
+
+def test_status_lists_an_expired_lease_apart_from_the_live_ones(
+    bridge, repo, paired, capsys
+):
+    holder = actor(bridge, paired["root"], "claude")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=30)
+    reserve(bridge, holder, "docs/guide.md")
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET expires_ts=datetime('now','-90 "
+            "seconds') WHERE path_pattern='src/engine.py'"
+        )
+    bridge.status(cli.Selection(participant="claude"))
+    output = capsys.readouterr().out
+    assert "active reservations: 1; expired: 1, oldest " in output
+    assert "s past its deadline" in output
+    stats = store.usage(bridge.home, paired["root"])["claude"]
+    assert stats["stale_leases"] == 1
+    assert stats["stale_lease_age"] >= 90

@@ -91,6 +91,16 @@ command is already tracked, and tell me if someone is holding it."
   pass project/agent names as tool arguments. Send concise state changes with an
   idempotency key; reuse that key only when retrying the same send. Use checkpoint
   previews, fetch bodies only when needed, and avoid repeated empty inbox polling.
+- `ack_required` on `send_message` always carries a deadline. Set `ack_within`
+  in seconds when the answer is needed sooner or later than the project
+  default; omit it to take that default. Past the deadline the request comes
+  back to you naming the recipients that did not acknowledge and what the
+  runtime could read about why, and the expectation is retired, so a silent
+  peer never leaves a permanent row. Send it again only if you still need it.
+- A share you sent returns sooner when no recipient can act on it at all: no
+  live session, a dialog on its screen, exhausted capacity, or a blocked claim
+  of its own. The notice names each recipient and its reason. You still hold
+  the work, so offer it to a lane that reads as fit instead of waiting.
 - Retry a failed write with the `idempotency_key` it first carried. The repeat
   returns the first result and writes nothing further. A retry without a key can
   reserve twice, so `file_reservation_paths`, `request_reservation`,
@@ -137,6 +147,14 @@ Record outcomes with `agent-parley report --state partial|blocked|ready --summar
 Every `issue` transition and `report` accepts `--idempotency-key KEY`; a script
 that retries with the key it first used records one attempt, not two.
 
+Add `--backlog COUNT` whenever your claim has countable work left — families,
+files, subtasks, whatever that claim counts. The count is what lets the runtime
+see that a held claim still has work in it: once you go quiet on that claim past
+the stall interval, you are offered a split of the backlog naming the peers that
+can take part of it, with no operator asking for one. You decide what to split,
+you send it with `send_message` and `ack_required` or hand the whole claim over
+with `agent-parley issue offer`, and nothing moves until a recipient answers.
+
 When you check a peer's work, record what you found against the report itself:
 the `review_report` MCP tool, or `agent-parley report review ID --verdict
 pass|fail --evidence "what you checked"`. A lane cannot review its own report.
@@ -153,6 +171,26 @@ issue and the remaining work; accepting moves those reservations to you with
 the issue. Handoffs never acknowledge mail: acknowledge reviewed messages
 explicitly through MCP. Coordinate integration separately; do not infer
 merge or push authority from issue ownership.
+
+## Retire when there is nothing left to do
+
+Call the `retire` MCP tool when this lane is finished, or when the operator or a
+peer has asked it to stand down. Going quiet instead is read as a stall and the
+lane is woken again, so retiring is how a lane ends its own participation.
+
+Retirement returns everything first. Each issue this lane holds is released
+back to the pool, each handoff offered to it is declined so the offering lane
+owns that work again, and every lane that had handed it work is told by mail
+where that work went. The advisory reservations are released, any key a peer
+was queued for is granted to that peer, and the credential is invalidated last,
+so the retiring call is the final one this lane can serve.
+
+Report before retiring, with `agent-parley report`, so the state you reached is
+recorded while you can still record it. Commit or hand off work you want kept:
+a lane with uncommitted changes keeps its worktree and its changed paths are
+reported to the operator, while a clean worktree is removed. Retirement is not
+a way to drop work you were asked to finish, and only the operator returns a
+retired lane to service.
 
 ## Read mail and inspect evidence
 
