@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agent_parley import (
@@ -418,6 +419,100 @@ def test_a_stale_service_answers_the_hook_with_a_fallback_status(
     logged = capsys.readouterr()
     assert "Traceback" not in logged.out + logged.err
     assert logged.out.count(server.DRIFTED) == 1
+    assert service.stopping.is_set()
+
+
+@pytest.fixture
+def watched_service(bridge):
+    """Serves on a thread the test watches return when the service stops."""
+    with server.Server(bridge.home, bridge.config) as instance:
+        thread = threading.Thread(target=instance.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield instance, thread
+        finally:
+            instance.shutdown()
+            thread.join(timeout=2)
+
+
+def hook_request(bridge, lane, payload):
+    """Posts one hook event over the transport the hook client uses."""
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    with httpx.Client(base_url=bridge.url, trust_env=False) as client:
+        return client.post(
+            hook.PATH,
+            json={
+                "directory": str(lane.parent),
+                "participant": "codex",
+                "hook_pid": os.getpid(),
+                "payload": payload,
+            },
+            headers={
+                "Authorization": f"Bearer {identity['registration_token']}"
+            },
+            timeout=hook.REPLY_TIMEOUT,
+        )
+
+
+def test_drift_stops_a_busy_service_within_one_revision_interval(
+    bridge, repo, paired, watched_service, monkeypatch
+):
+    instance, serving = watched_service
+    statuses = []
+    entries = []
+    finished = threading.Event()
+    stalled = threading.Event()
+    released = threading.Event()
+    written = server.log
+
+    def entry(home, event, detail=""):
+        if event == "drifted":
+            entries.append(detail)
+            stalled.set()
+            released.wait(10)
+        written(home, event, detail)
+
+    def busy():
+        headers = {"Authorization": f"Bearer {bridge.config['token']}"}
+        with httpx.Client(base_url=bridge.url, trust_env=False) as client:
+            while not finished.is_set():
+                try:
+                    reading = client.get("/health/readiness", headers=headers)
+                except httpx.HTTPError:
+                    return
+                statuses.append(reading.json().get("status"))
+
+    monkeypatch.setattr(server, "log", entry)
+    callers = [threading.Thread(target=busy, daemon=True) for _ in range(3)]
+    for caller in callers:
+        caller.start()
+    monkeypatch.setattr(server.protocol, "revision", lambda: "moved")
+    instance.checked = time.monotonic() - server.REVISION_SECONDS
+    serving.join(timeout=server.REVISION_SECONDS)
+    finished.set()
+    released.set()
+    for caller in callers:
+        caller.join(timeout=2)
+    assert stalled.is_set()
+    assert not serving.is_alive()
+    assert entries == [server.DRIFTED]
+    assert protocol.STALE in statuses
+
+
+def test_a_hook_call_in_the_drift_window_answers_inside_the_budget(
+    bridge, repo, paired, service, monkeypatch
+):
+    moved_sources(monkeypatch)
+    lane = Path(paired["lanes"]["codex"])
+    started = time.monotonic()
+    answered = hook_request(bridge, lane, DENY)
+    elapsed = time.monotonic() - started
+    assert answered.status_code == 503
+    assert answered.json() == {
+        "status": protocol.STALE,
+        "detail": server.DRIFTED,
+    }
+    assert elapsed < hook.REPLY_TIMEOUT
     assert service.stopping.is_set()
 
 

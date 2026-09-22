@@ -289,9 +289,15 @@ consistent with no service running. `ok` means the service is answering
 from the sources on disk. `stale` means the checkout moved after the service
 started, so it is answering from modules the tree no longer holds, and a module
 a merge added is missing from that process for as long as it runs. A service
-that reads itself stale logs one line, refuses further calls with the status
-its clients already treat as an outage, so hooks decide in-process, and stops
-once its in-flight calls finish. `status` prints the same drift as a
+that reads itself stale stops accepting connections first, logs one line
+naming the drift, and refuses further calls with the status its clients
+already treat as an outage, so hooks decide in-process. The stop is started
+before the line is written, so the window in which calls are refused is
+bounded by the revision interval rather than by an append to a log file, and
+the whole exit is bounded by that same interval once in-flight calls finish.
+The first hook to read the published record of that gone process asks for a
+new service, so the relaunch follows the stop. `status` prints the same drift
+as a
 `Code: stale` line, and `agent-parley up` then starts a service on the code in
 the checkout.
 

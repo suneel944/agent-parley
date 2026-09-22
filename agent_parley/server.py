@@ -370,10 +370,17 @@ class Server(ThreadingHTTPServer):
         because the caller is a hook decision whose whole budget is a few
         milliseconds and a merge is not an event worth paying for on every
         request. The first reading that differs from the one taken at start
-        is final: it is logged once as a single line, the service stops
-        accepting connections so in-flight requests finish and the process
-        exits, and every request until then is answered as stale rather than
+        is final: the service stops accepting connections so in-flight
+        requests finish and the process exits, it is logged once as a single
+        line, and every request until then is answered as stale rather than
         with a traceback from a module that is no longer importable.
+
+        The stop is started before that line is written, because the flag
+        every other request reads is already set and the line is an append to
+        a file this runtime rewrites in place. A stop whose start waits for
+        that append is a stop that can trail the stale answers it explains by
+        as long as the append takes, and a stale answer is only usable to a
+        hook because the relaunch behind it is already on its way.
 
         Returns:
             Whether the service is serving code the checkout has moved past.
@@ -390,8 +397,8 @@ class Server(ThreadingHTTPServer):
             if protocol.revision() == self.revision:
                 return False
             self.stopping.set()
-        log(self.home, "drifted", DRIFTED)
         threading.Thread(target=self.shutdown, daemon=True).start()
+        log(self.home, "drifted", DRIFTED)
         return True
 
     @contextlib.contextmanager
@@ -1044,7 +1051,15 @@ def stop_on_signal(home: Path, service: Server) -> None:
 
 
 def main() -> None:
-    """Runs the detached coordination service using its private config."""
+    """Runs the detached coordination service using its private config.
+
+    The background workers are joined against one deadline rather than one
+    deadline each, so the whole exit is bounded by `REVISION_SECONDS`. A
+    service that stopped because its sources moved is replaced by the hook
+    that finds its published record dead, and every native call until then
+    pays an in-process decision, so the interval that bounds the detection
+    also bounds the leaving.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, required=True)
     args = parser.parse_args()
@@ -1067,8 +1082,9 @@ def main() -> None:
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
+        deadline = time.monotonic() + REVISION_SECONDS
         for worker in workers:
-            worker.join(timeout=2)
+            worker.join(timeout=max(deadline - time.monotonic(), 0.0))
 
 
 if __name__ == "__main__":
