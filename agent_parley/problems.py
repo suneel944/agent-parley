@@ -32,6 +32,7 @@ STALLED = "stalled"
 INACTIVE = "inactive"
 OVERDUE = "overdue claim"
 OFFER = "unanswered offer"
+UNRESOLVED = "unresolved completion"
 ACK = "awaiting acknowledgement"
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
@@ -258,6 +259,53 @@ def _claim_rows(record: dict, name: str, repo: str, root: str) -> list[dict]:
     ]
 
 
+def _unresolved_rows(
+    record: dict, name: str, repo: str, root: str, now: float
+) -> list[dict]:
+    """Groups one lane's unresolved completions into a single row.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+        now: Unix time the observation ages are measured against.
+
+    Returns:
+        One row naming the oldest observed-complete claim its holder never
+        released and counting the rest, or no row when the lane holds none.
+        Ownership never moves on an observation, so the resolution stays the
+        operator's.
+    """
+    unresolved = sorted(
+        (claim for claim in record["claims"] if claim.get("unresolved")),
+        key=lambda claim: float(claim.get("observed_at") or now),
+    )
+    if not unresolved:
+        return []
+    oldest = unresolved[0]
+    numbers = ", ".join(f"#{claim['issue']}" for claim in unresolved)
+    detail = (
+        f"issue #{oldest['issue']}: {oldest.get('reason', '')}"
+        if len(unresolved) == 1
+        else f"{len(unresolved)} claims are complete but never released: "
+        f"{numbers}"
+    )
+    observed = float(oldest.get("observed_at") or now)
+    return [
+        _row(
+            UNRESOLVED,
+            detail,
+            f"agent-parley issue resolve {oldest['issue']} {repo}",
+            max(0, int(now - observed)),
+            name,
+            root,
+            BY_OPERATOR,
+            len(unresolved),
+        )
+    ]
+
+
 def _ack_rows(
     record: dict,
     name: str,
@@ -315,7 +363,12 @@ def _ack_rows(
 
 
 def _lane_rows(
-    record: dict, participant: dict, root: str, config: dict, ack_after: float
+    record: dict,
+    participant: dict,
+    root: str,
+    config: dict,
+    ack_after: float,
+    now: float,
 ) -> list[dict]:
     """Derives the rows one lane record carries, one per cause.
 
@@ -325,6 +378,7 @@ def _lane_rows(
         root: Canonical project key.
         config: Resolved supervision settings for the project.
         ack_after: Seconds after which an unacknowledged message is a row.
+        now: Unix time the observation ages are measured against.
 
     Returns:
         Zero or more rows, one per cause the record shows, each carrying how
@@ -380,6 +434,7 @@ def _lane_rows(
             )
         )
     rows.extend(_claim_rows(record, name, repo, root))
+    rows.extend(_unresolved_rows(record, name, repo, root, now))
     rows.extend(_ack_rows(record, name, repo, root, ack_after, waking))
     if record["drift"]:
         rows.append(
@@ -523,6 +578,7 @@ def derive(
                     project["root"],
                     config,
                     after,
+                    stamp,
                 )
             )
         aged.extend(_offer_rows(project, stamp))

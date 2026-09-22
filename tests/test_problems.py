@@ -637,6 +637,18 @@ LANE_CAUSES = [
     },
     {"claims": [{"issue": 42, "overdue": True, "overdue_seconds": 900}]},
     {
+        "claims": [
+            {
+                "issue": 42,
+                "overdue": False,
+                "overdue_seconds": 0,
+                "unresolved": True,
+                "reason": "the lane pull request is merged",
+                "observed_at": 0,
+            }
+        ]
+    },
+    {
         "mail": {
             "outstanding_ack": [
                 {"message_id": 3, "sender": "operator", "age_seconds": 900}
@@ -684,6 +696,7 @@ def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
                         "/root",
                         {**supervision.DEFAULTS, "wake": waking},
                         600,
+                        time.time(),
                     )
                 )
     assert {row["condition"] for row in emitted} == {
@@ -692,6 +705,7 @@ def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
         problems.STALLED,
         problems.INACTIVE,
         problems.OVERDUE,
+        problems.UNRESOLVED,
         problems.OFFER,
         problems.ACK,
         problems.DRIFT,

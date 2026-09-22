@@ -818,6 +818,12 @@ def lane_detail(record: dict, data: dict) -> None:
                 "--take-orphaned"
                 + (f"; holds {', '.join(held)}" if held else "")
             )
+        if claim.get("unresolved"):
+            print(
+                f"    Issue #{claim['issue']} has an unresolved completion: "
+                f"{claim.get('reason', '')}; still owned until the operator "
+                f"runs issue resolve {claim['issue']}"
+            )
         if claim["overdue"]:
             print(
                 f"    Issue #{claim['issue']} is overdue by "
@@ -5660,6 +5666,95 @@ reported.
         result.update(recorded="offer", to=offer["to"], offer_id=offer["id"])
         return result
 
+    def issue_resolve(
+        self,
+        repo: Path,
+        number: str,
+        *,
+        reason: str = "",
+        release: bool = False,
+    ) -> dict:
+        """Ends a claim whose holder never filed the completion it landed.
+
+        A claim can otherwise only be ended by the lane that holds it, so work
+        that is merged on the forge stays open in the ledger forever once that
+        lane stops answering, and every capacity and load decision downstream
+        reads the stale row. This is the operator's way out, and it is bounded
+        on both sides. The forge is read here, now, and the pull request it
+        reports must have been opened inside the current ownership generation,
+        so an unverified claim is never ended this way. The supervisor must
+        already have escalated the claim as an unresolved completion, so a
+        holder that is answering is never resolved out from under it. The
+        transition is recorded as the operator's own, never as the lane's.
+
+        Peers gain nothing here. The escalation goes to the operator, and no
+        lane is given any power over another lane's claim.
+
+        Args:
+            repo: Any checkout of the target repository.
+            number: Repository issue number being resolved.
+            reason: Operator rationale kept beside the forge evidence.
+            release: Whether to return the work to the queue instead of
+                recording it complete. It is required for a pull request that
+                was closed without merging, because nothing was integrated.
+
+        Returns:
+            The issue, the outcome recorded, the lane the claim was held by,
+            the forge evidence that justified it and the resulting execution
+            state.
+
+        Raises:
+            BridgeError: If the issue is unheld, no merged or closed pull
+                request names the current claim, the evidence is closed and
+                unmerged without `release`, or the claim carries no
+                unresolved-completion escalation.
+        """
+        _, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        issue = parse_issue(number)
+        record = snapshot(directory)["issues"].get(issue) or {}
+        holder = record.get("owner")
+        if not holder:
+            raise BridgeError(f"Issue #{issue} has no owner.")
+        participant = data["participants"].get(holder) or {}
+        forge.select(repo, data)
+        evidence = forge.branch_evidence(
+            Path(data["root"]), str(participant.get("branch", ""))
+        )
+        if not evidence or evidence["state"] not in ("MERGED", "CLOSED"):
+            raise BridgeError(
+                f"No merged or closed pull request was observed for {holder}, "
+                f"so issue #{issue} has no evidence to resolve it on."
+            )
+        if evidence["created_at"] < supervision.claimed_since(record):
+            raise BridgeError(
+                f"The newest pull request on {evidence['branch']} predates "
+                f"the current claim on issue #{issue}, so it does not name "
+                "this work."
+            )
+        if evidence["state"] != "MERGED" and not release:
+            raise BridgeError(
+                f"The pull request on {evidence['branch']} was closed without "
+                "merging, so nothing was integrated; add --release to return "
+                "the work to the queue."
+            )
+        resolved = lifecycle.resolve(
+            directory,
+            issue,
+            evidence={**evidence, "observed_at": time.time()},
+            outcome="release" if release else "complete",
+            actor=roster.OPERATOR,
+            reason=reason,
+        )
+        return {
+            "issue": int(issue),
+            "outcome": resolved["resolution"]["outcome"],
+            "holder": holder,
+            "owner": resolved["owner"],
+            "state": lifecycle.state(resolved)["state"],
+            "evidence": resolved["resolution"]["evidence"],
+        }
+
     def _request_notice(
         self, data: dict, owner: str, issue: str, request: dict
     ) -> dict:
@@ -6642,6 +6737,7 @@ reported.
                     "orphan_reservations": list(
                         (record.get("orphan") or {}).get("reservations", [])
                     ),
+                    **issues.unresolved_completion(record),
                 }
                 for number, record in sorted(
                     ledger["issues"].items(), key=lambda i: int(i[0])
@@ -8134,6 +8230,30 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         required=True,
         help="Operator rationale persisted with this exact claim approval.",
     )
+    resolving = actions.add_parser(
+        "resolve",
+        help=(
+            "End a claim whose holder never filed the completion its pull "
+            "request already landed, recording the forge evidence."
+        ),
+    )
+    resolving.add_argument("number")
+    resolving.add_argument("--repo", type=Path, default=Path.cwd())
+    resolving.add_argument(
+        "--reason",
+        default="",
+        metavar="TEXT",
+        help="Operator rationale kept beside the forge evidence.",
+    )
+    resolving.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "Return the work to the queue instead of recording it complete. "
+            "It is required when the pull request was closed without merging, "
+            "because nothing was integrated."
+        ),
+    )
     choosing = actions.add_parser(
         "next",
         help=(
@@ -9111,6 +9231,14 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "issue" and args.action == "resolve":
+            ended = bridge.issue_resolve(
+                args.repo.resolve(),
+                args.number,
+                reason=args.reason,
+                release=args.release,
+            )
+            print(json.dumps(ended, indent=2))
         elif args.command == "issue" and args.action == "recover":
             approved = bridge.authorize_recovery(
                 args.repo.resolve(), args.number, args.reason

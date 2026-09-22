@@ -86,9 +86,35 @@ def released(record: dict) -> bool:
         Whether the issue is explicitly released or completed.
     """
     history = record.get("history") or []
-    if history and history[-1].get("action") == "release":
+    if history and history[-1].get("action") in ("release", "resolve"):
         return True
     return lifecycle.state(record)["state"] == lifecycle.COMPLETE
+
+
+def unresolved_completion(record: dict) -> dict:
+    """Derives the unresolved-completion escalation a claim reads as.
+
+    The marker belongs to the ownership generation it was recorded against, so
+    a claim that was released and taken again reads as resolved until the
+    supervisor observes the new generation the same way.
+
+    Args:
+        record: Published ledger record for one issue, or an empty mapping.
+
+    Returns:
+        Whether the current generation carries an escalation, the clause that
+        states why, the observed pull request state, the unanswered reminders
+        counted and the instant that state was observed.
+    """
+    marker = record.get("unresolved_completion") or {}
+    standing = bool(marker) and marker.get("claim_id") == record.get("claim_id")
+    return {
+        "unresolved": standing,
+        "reason": marker.get("reason", "") if standing else "",
+        "branch_state": marker.get("state", "") if standing else "",
+        "reminders": int(marker.get("reminders", 0) or 0) if standing else 0,
+        "observed_at": marker.get("observed_at") if standing else None,
+    }
 
 
 def offer_source(offer: dict | None) -> str:

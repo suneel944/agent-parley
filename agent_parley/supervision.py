@@ -27,11 +27,14 @@ DEFAULTS = {
     "interval": 30,
     "inactive_after": 300,
     "stalled_after": 600,
+    "completion_reminders": 3,
     "prompts": True,
     "wake": True,
     "reclaim": True,
 }
 
+MAX_COMPLETION_REMINDERS = 100
+ENDED = "pull request ended"
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
 
@@ -93,6 +96,15 @@ def settings(value: dict) -> dict:
             or not 1 <= result[field] <= 86400
         ):
             raise BridgeError(f"{field} must be between 1 and 86400 seconds.")
+    reminders_before = result["completion_reminders"]
+    if (
+        type(reminders_before) is not int
+        or not 1 <= reminders_before <= MAX_COMPLETION_REMINDERS
+    ):
+        raise BridgeError(
+            "completion_reminders must be between 1 and "
+            f"{MAX_COMPLETION_REMINDERS} reminders."
+        )
     for field in ("prompts", "wake", "reclaim"):
         if type(result[field]) is not bool:
             raise BridgeError(f"{field} must be a boolean.")
@@ -1419,7 +1431,7 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
                 continue
             if not released and number not in closed:
                 continue
-            trigger = "claim released" if released else "pull request ended"
+            trigger = "claim released" if released else ENDED
             identifier = f"{number}:{history[-1]['at']}:{trigger}"
             if record.get("handoff_prompt", {}).get("id") == identifier:
                 continue
@@ -1440,6 +1452,80 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
                 ),
             }
             changed = True
+        if changed:
+            ledger["revision"] += 1
+            write_json(directory / "issues.json", ledger)
+
+
+def unresolved_reason(holder: str, reminders: int, observed: dict) -> str:
+    """States why an observed-complete claim is unresolved, in one clause."""
+    return (
+        f"{holder} left {reminders} completion "
+        f"{'reminder' if reminders == 1 else 'reminders'} unanswered while "
+        f"{observed.get('branch', 'its branch')} reads "
+        f"{str(observed.get('state', '')).lower() or 'ended'}"
+    )
+
+
+def completion_escalations(
+    directory: Path, manifest: dict, observed: dict, threshold: int
+) -> None:
+    """Escalates to the operator when a holder ignores completion reminders.
+
+    Repeating a reminder at a lane that has stopped answering changes nothing,
+    so the supervisor counts the reminders it re-observes unanswered and, past
+    the project's threshold, records that the completion is unresolved. The
+    marker is an observation the operator acts on. Nothing moves here: the
+    issue keeps its owner, its offer and its reservations, no peer gains any
+    power over another lane's claim, and only an explicit operator resolution
+    ends the claim.
+
+    A holder that answers before the threshold clears its own escalation,
+    because the reminder it answered is no longer unanswered.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        observed: Forge observation per issue number whose lane branch ended
+            inside the current ownership generation, carrying the branch, the
+            pull request state and the instant it was observed.
+        threshold: Unanswered reminders this project escalates after.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        changed = False
+        for number, record in ledger["issues"].items():
+            prompt = record.get("handoff_prompt") or {}
+            holder = record.get("owner")
+            current = record.get("unresolved_completion") or {}
+            if (
+                holder not in manifest["participants"]
+                or holder != prompt.get("holder")
+                or prompt.get("trigger") != ENDED
+                or prompt.get("responded_at")
+                or current.get("claim_id") not in (None, record.get("claim_id"))
+            ):
+                if record.pop("unresolved_completion", None):
+                    changed = True
+                continue
+            seen = observed.get(number) or {}
+            if current or not seen:
+                continue
+            counted = int(prompt.get("reminders", 0) or 0) + 1
+            prompt["reminders"] = counted
+            changed = True
+            if counted < threshold:
+                continue
+            record["unresolved_completion"] = {
+                "claim_id": record.get("claim_id"),
+                "holder": holder,
+                "prompt": prompt.get("id", ""),
+                "branch": seen.get("branch", ""),
+                "state": seen.get("state", ""),
+                "reminders": counted,
+                "observed_at": seen.get("observed_at") or time.time(),
+                "reason": unresolved_reason(holder, counted, seen),
+            }
         if changed:
             ledger["revision"] += 1
             write_json(directory / "issues.json", ledger)
@@ -1995,6 +2081,7 @@ def poll(home: Path, directory: Path) -> None:
     deliveries(home, directory, manifest)
     if config["prompts"]:
         closed: set[str] = set()
+        ended: dict[str, dict] = {}
         ledger = issues.snapshot(directory)
         for name, participant in manifest["participants"].items():
             claimed = {
@@ -2009,17 +2096,31 @@ def poll(home: Path, directory: Path) -> None:
             )
             if completion is None or completion[0] not in {"MERGED", "CLOSED"}:
                 continue
-            closed.update(
-                number
-                for number, since in claimed.items()
-                if completion[1] >= since
-            )
+            for number, since in claimed.items():
+                if completion[1] < since:
+                    continue
+                closed.add(number)
+                ended[number] = {
+                    "branch": participant["branch"],
+                    "state": completion[0],
+                    "observed_at": time.time(),
+                }
         reminders(directory, manifest, closed)
         deadline_notices(directory, manifest)
         orphans(home, directory, manifest, config)
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
         observe_responses(home, directory, manifest)
+        completion_escalations(
+            directory,
+            manifest,
+            ended,
+            int(
+                config.get(
+                    "completion_reminders", DEFAULTS["completion_reminders"]
+                )
+            ),
+        )
         work(home, directory, manifest, config)
     if config["wake"]:
         for name, participant in manifest["participants"].items():

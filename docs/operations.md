@@ -359,6 +359,7 @@ condition, that count, its age and what clears it:
 | `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `overdue claim` | One or more held issues are past their recorded deadline. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
 | `unanswered offer` | One or more handoff offers to the same lane have no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
+| `unresolved completion` | One or more claims read merged or closed on the lane branch and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
 | `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
 | `dirty worktree` | The lane holds uncommitted work and is not active. | Commit or stash the named files in the named worktree. |
@@ -1374,8 +1375,9 @@ reports that native process identity is unavailable and requires manual
 attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
-30 seconds), `inactive_after` (300 seconds), `prompts`, `wake` and `reclaim`
-(all true). Numeric values range from 1 to 86400 seconds. The same keys in
+30 seconds), `inactive_after` (300 seconds), `completion_reminders` (3
+reminders, 1 to 100), `prompts`, `wake` and `reclaim` (all true). Numeric
+second values range from 1 to 86400 seconds. The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
 `wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
 entry may set
@@ -1388,6 +1390,27 @@ forge cannot establish completion. Reminders appear in issue/status output and
 at checkpoints. An explicit subsequent message reaching every waiting peer
 marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
+
+Repeating a reminder at a lane that has stopped answering changes nothing, so
+the supervisor counts the reminders it re-observes unanswered on a claim whose
+lane branch is merged or closed. Past `completion_reminders` it records the
+claim as an unresolved completion once, which `status` carries on the claim and
+`problems` lists for the operator. A holder that answers before the threshold
+clears its own escalation. Nothing moves on the marker: the issue keeps its
+owner, its offer and its reservations, and the escalation goes to the operator,
+never to the other lanes.
+
+`agent-parley issue resolve NUMBER` is the terminating transition for such a
+claim. It reads the forge at that moment, refuses unless a merged or closed
+pull request was opened inside the current ownership generation, and refuses a
+claim the supervisor has not escalated, so an answering holder is never
+resolved out from under it and an unverified claim is never ended this way. It
+records the branch, the pull request state, its merge commit and the instant it
+was observed beside the operator's reason, and history shows a `resolve` by
+`operator`, never a completion filed by the lane. A merged pull request records
+the work complete and frees the issues waiting on it; a pull request closed
+without merging integrated nothing, so `--release` is required there and
+returns the work to the queue.
 
 For eligible idle sessions, the launcher owns a native pseudo-terminal and a
 private wake socket. It admits a coordination prompt at a native idle checkpoint,
