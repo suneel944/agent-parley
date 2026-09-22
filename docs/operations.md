@@ -1204,7 +1204,8 @@ project holding
 carries the service reading the `Code:` line prints, so a stale service is
 readable without parsing text. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
-`session`, `availability` as `active`, `idle` or `stopped`, `branch`,
+`session`, `availability` as `active`, `idle` or `stopped` with the derived
+`activity`, its `evidence` and whether that evidence is `stale`, `branch`,
 `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
@@ -1321,14 +1322,31 @@ same records `top` reads, takes no lock and writes no coordination state.
 ### Availability, reminders and waking
 
 The local service observes each launcher's process identity and native checkpoint
-age. Observed availability is one of four states. `active` is a live launcher
-whose latest checkpoint is younger than `inactive_after`; `idle` is a live
-launcher whose checkpoint has aged past it, which is what a lane between turns
-looks like; `stopped` is a launcher whose recorded session process is gone. A
-lane without a trustworthy native process identity is `unknown`, because it may
-still be a live session. A lane that is only idle is never reported with the word
-a dead launcher gets. `status` reports that state beside process liveness and
-lists outstanding acknowledgement IDs, senders and ages.
+age, and derives one lane state from them. That derivation runs once per reading
+and every column reports from it, so the session cell, availability and the
+`problems` rows cannot describe the same lane differently in the same frame. The
+derived state is `working`, `idle`, `waiting` on a prompt or an approval,
+`stopped` when no session process answers, or `unknown` when no trustworthy
+process identity was recorded. Each reading carries the evidence it was derived
+from and that evidence's age.
+
+A `PreToolUse` that has not yet been closed by its `PostToolUse` counts as work
+in flight until the longest tool call the runtime tolerates, so a lane inside a
+long command reads as working rather than as the activity before it. Published
+activity older than `inactive_after` is reported as stale with its age, not as
+the present. A lane whose session process still answers is never described as
+stopped: a finished session under a live process is a client waiting for
+whoever owns its terminal.
+
+Observed availability is that derived state read coarsely, not a second
+derivation. It is one of four values. `active` is a live launcher that is
+working or waiting on a prompt; `idle` is a live launcher whose evidence has
+aged past `inactive_after`, which is what a lane between turns looks like;
+`stopped` is a launcher whose recorded session process is gone. A lane without a
+trustworthy native process identity is `unknown`, because it may still be a live
+session. A lane that is only idle is never reported with the word a dead
+launcher gets. `status` reports that state beside process liveness and lists
+outstanding acknowledgement IDs, senders and ages.
 
 A lane that has recorded no native activity yet has no age to report, so
 `last_active_at` and `age_seconds` are both `null` rather than an age measured
@@ -1350,10 +1368,11 @@ reports that native process identity is unavailable and requires manual
 attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
-30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
-Numeric values range from 1 to 86400 seconds. The same keys in
+30 seconds), `inactive_after` (300 seconds), `prompts`, `wake` and `reclaim`
+(all true). Numeric values range from 1 to 86400 seconds. The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
-`wake` and `prompts` cannot be enabled by a project. A participant entry may set
+`wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
+entry may set
 `"wake": false` to opt out individually. These settings remain outside source.
 
 Releasing a claim with waiting peers creates a visible handoff reminder.
@@ -1494,6 +1513,34 @@ accounts need no relationship to each other. Sign in to each directory with the
 native CLI once. Agent Parley stores directory paths and
 variable names; it never stores tokens or keys, and rejects `--env` values whose
 names look like credentials.
+
+### Reclaiming landed lanes
+
+Every lane owns a worktree in the private project state directory and a branch
+in the repository, and both outlive the claim they were created for. The
+service sweeps them at most once every 900 seconds, after the rest of a poll,
+and `agent-parley gc` runs the same sweep on demand: without `--apply` it
+reports what it would do, with `--apply` it removes what it may. The outcome
+of the service's own sweep is published in `reclaim.json` in the project state
+directory, so the next sweep is bounded even when one fails.
+
+A lane is reclaimed only when every one of these holds: its worktree is a
+registered worktree directly inside this project's state directory; no session
+is running in it; the ledger records no claim it still owns; it has nothing
+uncommitted; the base checkout's head already carries every commit on its
+branch; its branch carries nothing its configured upstream lacks; its branch
+has moved at all since the lane was created; and the forge reports the newest
+pull request from that branch as merged, or, with no pull request to read, the
+upstream no longer carries the branch. Removal is the ordinary retirement,
+followed by `git branch -d`, which deletes the branch under Git's own
+merged-branch rule and refuses otherwise.
+
+Anything else is kept and reported with the one condition that held it, and
+uncommitted files and unmerged or unpushed commits are reported by name. A
+pull request closed without merging, an open one, an unreachable forge, a
+worktree Git cannot inspect and a path outside the project's own lanes all
+decide against reclaiming. The sweep never touches a remote branch, and it
+never fails because the remote branch is already gone.
 
 ## Other agent CLIs
 

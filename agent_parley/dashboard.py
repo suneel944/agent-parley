@@ -297,7 +297,7 @@ def _row(
     except (BridgeError, OSError, sqlite3.Error):
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
-    liveness = participant_liveness(directory, agent)
+    liveness = participant_liveness(directory, agent, context["inactive_after"])
     stalled = supervision.stall(
         home, directory, data, agent, context["stalled_after"]
     )
@@ -487,15 +487,15 @@ def collect(
             usage = store.usage(home, data["root"])
         except sqlite3.Error:
             usage = {}
+        supervised = supervision.configuration(home, data)
         context = {
             "usage": usage,
             "issues": snapshot(path.parent),
             "branches": branches,
             "records": cache,
             "since": since,
-            "stalled_after": supervision.configuration(home, data)[
-                "stalled_after"
-            ],
+            "stalled_after": supervised["stalled_after"],
+            "inactive_after": supervised["inactive_after"],
             "operator_edits": (
                 supervision.operator_edits(home, data) if operator_edits else {}
             ),
