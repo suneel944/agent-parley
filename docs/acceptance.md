@@ -27,9 +27,12 @@ read its log:
 
 ```sh
 setsid nohup sh -c 'python -m scripts.acceptance run \
-  --home ~/.local/state/agent-parley --hours 24' \
+  --home ~/.local/state/agent-parley --hours 24 --trust' \
   > /tmp/acceptance.log 2>&1 &
 ```
+
+`--trust` is what lets the lanes start at all; it is described under what
+the estate is given below.
 
 Everything the run produces lands in `acceptance/` inside the throwaway
 project: `launch/<lane>.log` per launcher, `launched.json` with each
@@ -64,6 +67,35 @@ question it asks.
 
 Launches are spaced by twenty seconds, because eight native clients
 starting at once contend for the same credential refresh.
+
+Each launcher is given a pseudo-terminal of its own. A launcher started
+with no terminal runs its client without one, which `codex` refuses with
+`Error: stdin is not a terminal` and which leaves a `claude` lane with no
+screen for the dialog watcher to read. Nothing ever writes to the
+controlling side of those terminals; the run holds them open only so a
+client's terminal never reports end of file.
+
+## What the estate is given before it is left alone
+
+Two decisions are recorded before the period starts, and they are the only
+two.
+
+The project manifest is given `supervision.approve_bridge_tools`. A resumed
+session asks again for permission to use this bridge's own MCP tools and no
+operator is there to answer, so the launch adds one native permission rule
+scoped to those coordination tools and nothing else. Every other permission
+the clients ask for is left exactly as the operator configured it, because
+the run measures a day without an operator, not a day without permissions.
+
+`--trust` records the throwaway project and each lane worktree in the
+native clients' own trust records: `hasTrustDialogAccepted` for `claude` in
+`~/.claude.json`, and a `[projects."<path>"] trust_level = "trusted"` entry
+for `codex` in `~/.codex/config.toml`. Without it every lane parks on the
+client's directory trust screen at startup, which the launcher can neither
+name nor answer, and the estate spends the whole period at `not started; no
+native hook`. That gap is issue #383; until it closes, an unattended run
+needs the flag, and the flag writes nothing but the directories of a
+project the run itself seeded. Leave it off to watch the gap instead.
 
 ## The observation rule
 
@@ -195,8 +227,10 @@ returning a third time after two answers all escalate instead.
 Carrying a permission decision forward across a resume is a separate
 opt-in, `approve_bridge_tools`, recorded the same way and scoped to this
 bridge's own MCP server. Neither setting weakens a native permission
-decision or adds a way around one, and neither belongs in an acceptance
-run that is measuring what happens when nobody answers.
+decision or adds a way around one. The run records that opt-in and no
+dialog answer at all, so a lane that meets one of the three screens still
+holds it, publishes it and escalates it, which is what the period is
+measuring.
 
 ## Reading the evidence
 
