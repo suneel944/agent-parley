@@ -9,6 +9,7 @@ import signal
 import socket
 import socketserver
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -38,8 +39,10 @@ REVISION_SECONDS = 2.0
 LOG_NAME = "server.log"
 WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
-UNDECIDED_LIMIT = 2
+SLOW_DECISION = DECISION_SECONDS / 2
+UNDECIDED_LIMIT = 1
 REFUSAL_SECONDS = 5.0
+GONE = (BrokenPipeError, ConnectionResetError)
 UNDECIDED = (
     "A decision for this lane is still running; this event was answered "
     "without context injection so the running decision is not repeated."
@@ -508,10 +511,25 @@ class Server(ThreadingHTTPServer):
     ) -> None:
         """Records an unexpected request failure as one timestamped entry.
 
+        A hook process is killed by its native client at the hook timeout and
+        its shell client stops reading at its own, so a reply written after
+        either deadline meets a socket nobody holds. That is the client's
+        contract working, not a service failure, and recording it as a
+        traceback per event buried the entries an operator needs. Such a
+        connection is recorded as one line naming the lane's own budget
+        instead.
+
         Args:
             request: Connection whose handling raised; never logged.
             client_address: Loopback peer, which identifies nothing here.
         """
+        if isinstance(sys.exception(), GONE):
+            log(
+                self.home,
+                "unanswered",
+                "hook client stopped reading before the reply was written",
+            )
+            return
         log(self.home, "failed", "request handling\n" + traceback.format_exc())
 
 
@@ -774,11 +792,20 @@ class Handler(BaseHTTPRequestHandler):
         decision is held here: it emits no context and exits successfully
         rather than repeating the event.
 
-        The abandoned decisions of a lane are counted for the same reason.
-        A lane already at `UNDECIDED_LIMIT` is answered without starting
-        another decision, so a host slow enough to expire every decision
-        costs a bounded number of threads and lock waiters instead of one
-        per native event.
+        Only the decisions a lane abandoned are counted, and a lane that
+        already holds `UNDECIDED_LIMIT` of them is answered without starting
+        another. A lane's first minutes are where this matters: its
+        checkpoint, roster and mail scans all run for the first time inside
+        one hook budget, and without the bound every following event started
+        a decision that queued behind the slow one and expired in its turn.
+        Concurrent decisions that are merely in flight are not counted, so
+        parallel native calls in a healthy lane keep their context
+        injection.
+
+        Every decision is timed. One past `SLOW_DECISION` is logged with the
+        step that spent the time, and an abandoned one names the step it was
+        holding when the deadline passed, which is the measurement the log
+        was missing while these expiries were diagnosed.
 
         Args:
             request: Hook request the credential was accepted for.
@@ -786,57 +813,77 @@ class Handler(BaseHTTPRequestHandler):
 
         Returns:
             The decision, or None once the client has been answered because
-            the decision failed, was already running, or ran past its
+            the decision failed, was already abandoned, or ran past its
             deadline.
         """
         outcome: dict = {}
+        stages = checkpoints.Stages()
 
         def decide() -> None:
             """Records the decision or the failure that ended it."""
             try:
-                outcome["served"] = checkpoints.serve(self.server.home, request)
+                outcome["served"] = checkpoints.serve(
+                    self.server.home, request, stages
+                )
             except Exception:
                 outcome["failed"] = traceback.format_exc()
             finally:
                 with self.server.counting:
-                    remaining = self.server.deciding.get(participant, 1) - 1
-                    if remaining > 0:
-                        self.server.deciding[participant] = remaining
-                    else:
-                        self.server.deciding.pop(participant, None)
+                    if outcome.pop("abandoned", False):
+                        held = self.server.deciding.get(participant, 1)
+                        if held > 1:
+                            self.server.deciding[participant] = held - 1
+                        else:
+                            self.server.deciding.pop(participant, None)
+                    outcome["finished"] = True
 
         with self.server.counting:
             undecided = self.server.deciding.get(participant, 0)
-            if undecided >= UNDECIDED_LIMIT:
-                log(
-                    self.server.home,
-                    "undecided",
-                    f"{self.path} {participant} already has {undecided} "
-                    "decisions past their deadline; answered without "
-                    "starting another",
-                )
-                self._reply(hook.DECIDING, {"detail": UNDECIDED})
-                return None
-            self.server.deciding[participant] = undecided + 1
+        if undecided >= UNDECIDED_LIMIT:
+            log(
+                self.server.home,
+                "undecided",
+                f"{self.path} {participant} already has {undecided} "
+                "decision(s) past their deadline; answered without "
+                "starting another",
+            )
+            self._reply(hook.DECIDING, {"detail": UNDECIDED})
+            return None
         worker = threading.Thread(target=decide, daemon=True)
+        started = time.monotonic()
         worker.start()
         worker.join(DECISION_SECONDS)
+        spent = time.monotonic() - started
         served = outcome.get("served")
         if isinstance(served, dict):
+            if spent >= SLOW_DECISION:
+                log(
+                    self.server.home,
+                    "decided",
+                    f"{self.path} {participant} in {spent:.3f} seconds: "
+                    + stages.report(),
+                )
             return served
         if "failed" in outcome:
             log(
                 self.server.home,
                 "failed",
-                f"{self.path} {participant}\n{outcome['failed']}",
+                f"{self.path} {participant} after {spent:.3f} seconds\n"
+                + outcome["failed"],
             )
             self._reply(500)
             return None
+        with self.server.counting:
+            if not outcome.get("finished"):
+                outcome["abandoned"] = True
+                self.server.deciding[participant] = (
+                    self.server.deciding.get(participant, 0) + 1
+                )
         log(
             self.server.home,
             "expired",
-            f"{self.path} {participant} undecided after "
-            f"{DECISION_SECONDS} seconds; answered as still deciding",
+            f"{self.path} {participant} undecided after {spent:.3f} "
+            "seconds; answered as still deciding: " + stages.report(),
         )
         self._reply(hook.DECIDING, {"detail": UNDECIDED})
         return None
