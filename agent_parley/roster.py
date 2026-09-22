@@ -956,6 +956,8 @@ def normalize(manifest: dict) -> dict:
             raise BridgeError("Participant wake setting must be a boolean.")
         if type(participant.get("paused", False)) is not bool:
             raise BridgeError("Participant paused setting must be a boolean.")
+        if "dialogs" in participant:
+            participant["dialogs"] = dialog_answers(participant["dialogs"])
         if participant.setdefault("scheme", "participant") not in SCHEMES:
             raise BridgeError(
                 "Participant branch scheme must be one of: "
@@ -964,6 +966,9 @@ def normalize(manifest: dict) -> dict:
             )
         if "budget" in participant:
             participant["budget"] = budget(dict(participant["budget"] or {}))
+    project = dict(manifest.get("supervision", {}))
+    if "dialogs" in project:
+        project["dialogs"] = dialog_answers(project["dialogs"])
     return {
         "version": MANIFEST_VERSION,
         "root": manifest["root"],
@@ -979,9 +984,39 @@ def normalize(manifest: dict) -> dict:
         "forge": forge_choice(manifest.get("forge")),
         "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
-        "supervision": dict(manifest.get("supervision", {})),
+        "supervision": project,
         "participants": participants,
     }
+
+
+def dialog_answers(value: object) -> dict[str, str]:
+    """Validates the native-dialog answers an operator recorded.
+
+    An answer names the option text to choose on one recognized dialog. The
+    dialog names themselves are checked where the screens are recognized, so a
+    name this bridge does not know leaves that screen escalating rather than
+    failing the whole manifest.
+
+    Args:
+        value: Recorded mapping of dialog name to option text.
+
+    Returns:
+        The answers, with surrounding whitespace removed.
+
+    Raises:
+        BridgeError: If the value is not a mapping of names to option text.
+    """
+    if not isinstance(value, dict) or any(
+        not isinstance(name, str)
+        or not isinstance(answer, str)
+        or not answer.strip()
+        for name, answer in value.items()
+    ):
+        raise BridgeError(
+            "Dialog answers must map a dialog name to the option text to "
+            "choose."
+        )
+    return {name: answer.strip() for name, answer in value.items()}
 
 
 def forge_choice(value: object) -> str | None:

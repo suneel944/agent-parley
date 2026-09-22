@@ -1,0 +1,408 @@
+"""Answers or escalates the native dialogs recorded from live clients."""
+
+import datetime
+import json
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import zoneinfo
+from pathlib import Path
+
+import pytest
+
+from agent_parley import dialogs, terminal
+from agent_parley.state import write_json
+
+USAGE_LIMIT = (
+    "\x1b[38;2;80;80;80m❯ Review pending coordination messages and handoff "
+    "reminders.                     ⎿  You've hit your weekly limit · resets "
+    "Sep 21, 6am (Asia/Dubai)    /upgrade or /usage-credits to finish what "
+    "you're working on.✻Sautéed for 0s · done Saturday, 2:33 pm\x1b[38;2;153"
+)
+
+USAGE_LIMIT_RESUMED = (
+    "\x1b[38;2;153;153;153mPushed to feat/824-martin-round-ab, read 1 file, "
+    "ran 5 shell commands   ⎿  You've hit your weekly limit · resets Sep 21, "
+    "6am (Asia/Dubai)    /usage-credits to finish what you're workng on."
+    "✻Brewed for 1m 58· done 2:30 pm\x1b["
+)
+
+TOOL_PERMISSION = (
+    ")unacknowledged: true  limit: 5  About the agent_parley — Fetch Inbox "
+    "Tool:   │ Read incremental mail. Bodies opt-in; page long bodies. Do you "
+    "want to proceed? ❯ 1. Yes   2. NoEsc to cancel · Tabto amend\x1b[?2026l"
+)
+
+HOOK_REVIEW = (
+    "\x1b[0;3H\x1b[?25h\x1b[?2026l\x1b[?2026h\x1b[0 q╭\x1b[?25h   Hooks need "
+    "review  7 hooks are new or changed.  Hooks can run outside the sandbox "
+    "after you trust them. › 1. Review hooks  2. Trust all and continue  3. "
+    "Continue without trusting (hooks won't run) Press enter to confirm or "
+    "esc to go back            "
+)
+
+UNKNOWN_PROMPT = (
+    "\x1b[2J\x1b[H  Do you trust the files in this folder?  "
+    "1. Yes, proceed   2. No, exit  "
+)
+
+WORKING = "  ⎿  Read 4 files, ran 2 shell commands ✻ Brewing for 3s  "
+
+HARNESS = (
+    "import os, sys\nfrom pathlib import Path\n"
+    "from agent_parley import dialogs\n"
+    "from agent_parley.terminal import run\n"
+    "dialogs.ESCALATE_AFTER = float(sys.argv[3])\n"
+    "raise SystemExit(run([sys.executable, '-c', sys.argv[2], sys.argv[4]], "
+    "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False))"
+)
+
+CLIENT = (
+    "import os, sys, tty\ntty.setraw(0)\n"
+    "os.write(1, sys.argv[1].encode())\n"
+    "print('DRAWN', flush=True)\n"
+    "seen = b''\n"
+    "while b'\\r' not in seen:\n"
+    "    seen += os.read(0, 4096)\n"
+    "print('PRESSED:' + repr(seen), flush=True)\n"
+    "os.read(0, 4096)\n"
+)
+
+HOLDING_CLIENT = (
+    "import os, sys, tty\ntty.setraw(0)\n"
+    "os.write(1, sys.argv[1].encode())\n"
+    "print('DRAWN', flush=True)\n"
+    "os.read(0, 4096)\n"
+)
+
+
+def dubai(month: int, day: int, hour: int, year: int = 2026) -> float:
+    """Returns a Unix time in the zone the recorded screen named."""
+    zone = zoneinfo.ZoneInfo("Asia/Dubai")
+    return datetime.datetime(year, month, day, hour, tzinfo=zone).timestamp()
+
+
+def project(directory: Path, answers: dict) -> None:
+    """Writes a minimal manifest carrying one lane's dialog answers."""
+    write_json(
+        directory / "project.json",
+        {
+            "root": str(directory / "repo"),
+            "base": "main",
+            "participants": {
+                "lane": {
+                    "provider": "claude",
+                    "display": "Lane",
+                    "lane": str(directory / "lane"),
+                    "branch": "parley/lane",
+                    "credential": None,
+                    "dialogs": answers,
+                }
+            },
+        },
+    )
+
+
+def launch(directory: Path, screen: str, client: str, deadline: str):
+    """Starts a launcher whose fake client draws one recorded screen."""
+    lane = directory / "lane"
+    lane.mkdir(exist_ok=True)
+    write_json(
+        directory / "lane-activity.json",
+        {"activity": "starting; awaiting native hook", "updated": 1},
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            HARNESS,
+            str(lane),
+            client,
+            deadline,
+            screen,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+
+def read_line(child, timeout: float = 10) -> str:
+    """Returns the next line the launcher forwarded from its client."""
+    if not select.select([child.stdout], [], [], timeout)[0]:
+        return ""
+    return child.stdout.readline().decode(errors="replace")
+
+
+def published(directory: Path, timeout: float = 10) -> dict:
+    """Waits for the launcher to publish a dialog on the lane's state."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = json.loads((directory / "lane-activity.json").read_text())
+        if isinstance(state.get("dialog"), dict):
+            return state
+        time.sleep(0.1)
+    raise AssertionError("no dialog was published")
+
+
+def test_the_recorded_usage_limit_screens_are_recognized():
+    for capture in (USAGE_LIMIT, USAGE_LIMIT_RESUMED):
+        screen = dialogs.flatten(capture.encode())
+        found = dialogs.match(screen)
+        assert found is not None
+        assert found.name == "usage-limit"
+        assert found.action == dialogs.EXHAUSTED
+
+
+@pytest.mark.parametrize("capture", [USAGE_LIMIT, USAGE_LIMIT_RESUMED])
+def test_the_usage_limit_screen_names_a_parseable_reset(capture):
+    screen = dialogs.flatten(capture.encode())
+    assert dialogs.reset_at(screen, dubai(9, 22, 12)) == dubai(9, 21, 6)
+
+
+def test_a_usage_limit_screen_without_a_reset_reports_none():
+    screen = dialogs.flatten(b"  You've hit your weekly limit  /upgrade  ")
+    assert dialogs.match(screen) is not None
+    assert dialogs.reset_at(screen, dubai(9, 22, 12)) is None
+
+
+def test_the_recorded_permission_prompt_answers_by_option_text():
+    screen = dialogs.flatten(TOOL_PERMISSION.encode())
+    found = dialogs.match(screen)
+    assert found is not None
+    assert found.name == "tool-permission"
+    assert dialogs.options(screen) == {"1": "Yes", "2": "No"}
+    assert dialogs.keys(screen, "yes") == b"1\r"
+    assert dialogs.keys(screen, "no") == b"2\r"
+    assert dialogs.keys(screen, "trust all") == b""
+
+
+def test_the_recorded_hook_review_answers_by_option_text():
+    screen = dialogs.flatten(HOOK_REVIEW.encode())
+    found = dialogs.match(screen)
+    assert found is not None
+    assert found.name == "hook-review"
+    assert dialogs.keys(screen, "review hooks") == b"1\r"
+    assert dialogs.keys(screen, "trust all and continue") == b"2\r"
+    assert dialogs.keys(screen, "continue without trusting") == b"3\r"
+
+
+def test_an_ordinary_working_screen_is_no_dialog():
+    screen = dialogs.flatten(WORKING.encode())
+    assert dialogs.match(screen) is None
+    assert dialogs.prompted(screen) is False
+
+
+def test_a_dialog_split_across_reads_is_still_recognized(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", {"hook-review": "review hooks"})
+    half = len(HOOK_REVIEW) // 2
+    assert watch.advance(HOOK_REVIEW[:half].encode(), 0.0) == b""
+    assert watch.advance(HOOK_REVIEW[half:].encode(), 0.1) == b""
+    assert watch.advance(b"", 0.2) == b"1\r"
+    assert watch.holding is True
+
+
+def test_the_answers_an_operator_recorded_are_read_per_lane():
+    manifest = {
+        "supervision": {"dialogs": {"hook-review": "review hooks"}},
+        "participants": {
+            "lane": {"dialogs": {"tool-permission": "no", "unknown": "yes"}},
+            "other": {},
+        },
+    }
+    assert dialogs.configured(manifest, "lane") == {
+        "hook-review": "review hooks",
+        "tool-permission": "no",
+    }
+    assert dialogs.configured(manifest, "other") == {
+        "hook-review": "review hooks"
+    }
+
+
+def test_a_recorded_dialog_without_an_answer_escalates(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane")
+    assert watch.advance(HOOK_REVIEW.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "dialog: native hook trust review"
+    assert state["dialog"]["escalated"] is True
+    assert state["dialog"]["name"] == "hook-review"
+    assert "Hooks need review" in " ".join(state["dialog"]["screen"])
+
+
+def test_an_unknown_prompt_escalates_only_after_the_deadline(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    assert watch.advance(UNKNOWN_PROMPT.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    assert watch.holding is False
+    assert not (tmp_path / "lane-activity.json").exists()
+
+    assert watch.advance(b"", 1.5) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["name"] == "unknown"
+    assert state["dialog"]["escalated"] is True
+    assert state["activity"] == "dialog: an unrecognized native prompt"
+    assert watch.holding is True
+
+
+def test_the_usage_limit_dialog_records_exhausted_capacity(tmp_path):
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane")
+    assert watch.advance(USAGE_LIMIT.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    capacity = json.loads((tmp_path / "lane-capacity.json").read_text())
+    assert capacity["state"] == "exhausted"
+    assert capacity["source"] == "native-dialog"
+    assert capacity["reset_at"] == pytest.approx(dubai(9, 21, 6))
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "dialog: provider usage limit"
+    assert state["dialog"]["previous"] == "working"
+    assert "updated" not in state
+
+
+def test_a_cleared_screen_restores_the_previous_activity(tmp_path):
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(HOOK_REVIEW.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    assert watch.holding is True
+
+    watch.advance((WORKING * 200).encode(), 1.0)
+    assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "working"
+    assert "dialog" not in state
+
+
+def test_an_answer_that_never_dismisses_the_dialog_escalates(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", {"hook-review": "review hooks"})
+    for round_number in range(dialogs.REPEAT_LIMIT):
+        watch.advance(HOOK_REVIEW.encode(), round_number * 10.0)
+        assert watch.advance(b"", round_number * 10.0 + 1) == b"1\r"
+        watch.advance((WORKING * 200).encode(), round_number * 10.0 + 2)
+    watch.advance(HOOK_REVIEW.encode(), 100.0)
+    assert watch.advance(b"", 101.0) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
+
+
+def test_the_launcher_answers_a_configured_dialog_and_refuses_wakes():
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        project(directory, {"hook-review": "continue without trusting"})
+        child = launch(directory, HOOK_REVIEW, CLIENT, "30")
+        try:
+            assert "DRAWN" in read_line(child)
+            state = published(directory)
+            assert state["activity"] == "dialog: native hook trust review"
+            assert state["dialog"]["previous"] == (
+                "starting; awaiting native hook"
+            )
+            assert state["dialog"]["keys"] == "3"
+            assert state["dialog"]["answer"] == "continue without trusting"
+            assert (
+                terminal.request(directory, "lane")
+                == "manual attention required"
+            )
+            assert "PRESSED:" + repr(b"3\r") in read_line(child)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_the_launcher_parks_a_lane_on_the_usage_limit_dialog():
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        project(directory, {})
+        child = launch(directory, USAGE_LIMIT, HOLDING_CLIENT, "30")
+        try:
+            state = published(directory)
+            assert state["activity"] == "dialog: provider usage limit"
+            assert state["dialog"]["name"] == "usage-limit"
+            assert state["dialog"]["screen"]
+            capacity = json.loads(
+                (directory / "lane-capacity.json").read_text()
+            )
+            assert capacity["state"] == "exhausted"
+            assert capacity["reset_at"] == pytest.approx(dubai(9, 21, 6))
+            assert (
+                terminal.request(directory, "lane")
+                == "manual attention required"
+            )
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_the_launcher_escalates_an_unknown_prompt_within_the_deadline():
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        project(directory, {})
+        child = launch(directory, UNKNOWN_PROMPT, HOLDING_CLIENT, "0.5")
+        try:
+            state = published(directory)
+            assert state["dialog"]["name"] == "unknown"
+            assert state["dialog"]["escalated"] is True
+            assert state["activity"].startswith("dialog: ")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        project(directory, {"hook-review": "review hooks"})
+        write_json(
+            directory / "lane-activity.json", {"activity": "idle", "updated": 1}
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2], "
+            "sys.argv[3]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=True))"
+        )
+        client = (
+            "import os, sys, tty\ntty.setraw(0)\n"
+            "seen = b''\n"
+            "while b'go' not in seen:\n"
+            "    seen += os.read(0, 4096)\n"
+            "os.write(1, sys.argv[1].encode())\n"
+            "print('DRAWN', flush=True)\n"
+            "rest = os.read(0, 4096)\n"
+            "print('PRESSED:' + repr(rest), flush=True)\n"
+            "os.read(0, 4096)\n"
+        )
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvp(
+                sys.executable,
+                [sys.executable, "-c", harness, str(lane), client, HOOK_REVIEW],
+            )
+        try:
+            os.write(master, b"typed")
+            time.sleep(0.2)
+            os.write(master, b"go")
+            time.sleep(2.0)
+            state = json.loads((directory / "lane-activity.json").read_text())
+            assert "dialog" not in state
+
+            os.write(master, b"\r")
+            state = published(directory)
+            assert state["dialog"]["name"] == "hook-review"
+            assert state["dialog"]["keys"] == "1"
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)

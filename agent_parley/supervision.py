@@ -545,6 +545,8 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
         activity yet reports None, which is no opinion rather than a refusal.
         A launch that passed its start deadline without a native hook fails
         here, which is what keeps it out of offers and out of share targets.
+        A lane whose launcher published a native dialog fails the check as
+        well: its client is alive and reading nothing but a keypress.
     """
     from agent_parley import checkpoints
 
@@ -560,6 +562,9 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
         return False, "its session ended"
     if state.get("activity") == "waiting for approval":
         return False, "it is waiting for a native approval"
+    if isinstance(state.get("dialog"), dict):
+        label = str(state["dialog"].get("label", "a native dialog"))
+        return False, f"its client is held by {label}"
     return True, ""
 
 

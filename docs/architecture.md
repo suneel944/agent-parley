@@ -304,7 +304,17 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. `gemini.py`, `copilot.py`, `opencode.py` and
+the existing session lock. Because it owns that stream, it is also the only
+place that can see a dialog the client draws on its own screen, so it passes
+every chunk it forwards to `dialogs.py`. That module recognizes the screens
+recorded from live clients, records an exhausted provider capacity with the
+reset instant a usage limit names, sends the option the operator configured for
+an answerable prompt, and escalates anything else that holds the screen. It
+publishes through the lane surfaces a reader already has: the activity record
+gains a `dialog` entry and its `activity` string is prefixed `dialog: `, so
+status reports the dialog instead of `working` or `starting`. It sends the
+keystrokes an operator would press and never a flag that skips a permission
+decision. `gemini.py`, `copilot.py`, `opencode.py` and
 `amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in

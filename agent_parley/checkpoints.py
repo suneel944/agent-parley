@@ -1302,7 +1302,9 @@ def checkpoint(
 
     Any observed event republishes the lane's activity, so an event that arrives
     after the launch passed its start deadline clears the not-started mark the
-    supervision poll published, however late it is.
+    supervision poll published, however late it is. It also clears any dialog
+    the launcher published for the lane: a client that reached a hook is running
+    again rather than waiting on a keypress.
 
     Args:
         home: Private bridge state root.
@@ -1428,6 +1430,7 @@ def checkpoint(
             state["resumable_session"] = session
         state.pop("checkpoint_error", None)
         state.pop("not_started", None)
+        state.pop("dialog", None)
         if event == "SessionEnd":
             state["activity"] = "stopped"
         elif event == "Stop":

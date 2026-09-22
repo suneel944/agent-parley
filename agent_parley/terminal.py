@@ -15,6 +15,7 @@ import time
 import tty
 from pathlib import Path
 
+from agent_parley import dialogs
 from agent_parley.state import BridgeError, lock
 
 PROMPT = "Review pending coordination messages and handoff reminders."
@@ -344,6 +345,12 @@ def run(
     the return together treats the burst as pasted input and leaves the prompt
     unsent in its composer.
 
+    The same output the launcher forwards is read back by the dialog watcher,
+    which publishes a blocking native screen on the lane's activity state and
+    refuses wakes while one holds. It answers only a dialog the operator named
+    for this lane, only with an option the client itself is offering, and never
+    while the operator holds a partially entered line.
+
     Args:
         command: Native argument vector, without a shell.
         lane: Assigned participant worktree.
@@ -392,10 +399,12 @@ def run(
         wake_checkpoint_at = 0.0
         wake_retried = False
         submit_at = 0.0
+        watch = dialogs.watcher(lane.parent, name)
         try:
             if attached:
                 tty.setraw(0)
             while True:
+                screen = b""
                 descriptors = [master, listener.fileno()]
                 if attached:
                     descriptors.append(0)
@@ -424,12 +433,21 @@ def run(
                     if not output:
                         break
                     os.write(1, output)
+                    screen = output
                     if not attached:
                         replies, detached_control = detached_terminal_replies(
                             output, detached_control
                         )
                         if replies:
                             os.write(master, replies)
+                answer = watch.advance(
+                    screen,
+                    time.monotonic(),
+                    bool(pending_input or pending_control),
+                )
+                if answer:
+                    with contextlib.suppress(OSError):
+                        os.write(master, answer)
                 if listener.fileno() in ready:
                     connection, _ = listener.accept()
                     with connection:
@@ -442,6 +460,8 @@ def run(
                             result = "busy:turn"
                             if requested != b"wake\n":
                                 result = "unavailable"
+                            elif watch.holding:
+                                result = "manual attention required"
                             elif state.get("activity") != "idle":
                                 result = "busy:turn"
                             elif pending_input or pending_control:
