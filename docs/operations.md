@@ -289,9 +289,15 @@ consistent with no service running. `ok` means the service is answering
 from the sources on disk. `stale` means the checkout moved after the service
 started, so it is answering from modules the tree no longer holds, and a module
 a merge added is missing from that process for as long as it runs. A service
-that reads itself stale logs one line, refuses further calls with the status
-its clients already treat as an outage, so hooks decide in-process, and stops
-once its in-flight calls finish. `status` prints the same drift as a
+that reads itself stale stops accepting connections first, logs one line
+naming the drift, and refuses further calls with the status its clients
+already treat as an outage, so hooks decide in-process. The stop is started
+before the line is written, so the window in which calls are refused is
+bounded by the revision interval rather than by an append to a log file, and
+the whole exit is bounded by that same interval once in-flight calls finish.
+The first hook to read the published record of that gone process asks for a
+new service, so the relaunch follows the stop. `status` prints the same drift
+as a
 `Code: stale` line, and `agent-parley up` then starts a service on the code in
 the checkout.
 
@@ -339,35 +345,55 @@ The command derives its rows from the same reading `status` and `top` print,
 the supervision thresholds and the store classification, and writes nothing.
 Rows are ordered by how long each has held, longest first; a store or service
 row carries no age and leads the list, because no lane can be acted on until
-the store is usable and the service is up. Each row names the lane, the
-condition, its age and the one command that clears it:
+the store is usable and the service is up. One lane holding twenty messages,
+three overdue claims or four changed files is one row per cause, carrying how
+many items that row covers and the age of the oldest, so the list is as long
+as the work rather than as long as the backlog. Each row names the lane, the
+condition, that count, its age and what clears it:
 
 | Condition | When | Clears with |
 | --- | --- | --- |
 | `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
 | `service` | The coordination server is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
-| `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
-| `inactive` | A live lane published no native activity inside `inactive_after`. | `agent-parley say NAME "<text>"`, or typing into the lane's terminal. |
-| `overdue claim` | A held issue is past its recorded deadline. | `agent-parley issue release NUMBER` |
-| `unanswered offer` | A handoff offer has no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
-| `unresolved completion` | A claim's lane branch reads merged or closed and its holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER`, with `--release` when the pull request was closed without merging. |
-| `awaiting acknowledgement` | A message needing acknowledgement has waited past `--ack-after`, which defaults to `stalled_after`. | `agent-parley say NAME "<text>"` while the launcher is alive; `agent-parley run NAME --resume` once it is stopped. |
+| `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | Whatever the lane's state allows, from the remedy table below. |
+| `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
+| `overdue claim` | One or more held issues are past their recorded deadline. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
+| `unanswered offer` | One or more handoff offers to the same lane have no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
+| `unresolved completion` | One or more claims read merged or closed on the lane branch and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
+| `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
-| `dirty worktree` | The lane holds uncommitted work and is not active. | `agent-parley participant retire NAME` |
+| `dirty worktree` | The lane holds uncommitted work and is not active. | Commit or stash the named files in the named worktree. |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
 
-A lane row's command follows the lane's presence state. While the recorded
-session process is alive the row names a wake, because `run NAME --resume`
-would collide with the session lock the running launcher holds; once the
-process is gone the same row names the resume. The printed command is
-therefore how an operator tells a lane between turns from a lane whose
-launcher exited.
+A lane row's remedy follows the lane's state rather than the condition alone,
+because a lane that cannot read mail does not become reachable by being sent
+more of it:
+
+| Lane state | Remedy | Why |
+| --- | --- | --- |
+| `stopped` | `agent-parley run NAME --resume` | The launcher exited, so nothing is holding the session lock. |
+| Waiting on a native prompt | Answer the prompt in the lane's own client. | The client reads no mail until the prompt is cleared. |
+| Refused every wake | Take the turn waiting in the lane's own client. | The service stopped asking after its refusals. |
+| Paused | `agent-parley participant resume NAME` | Delivery resumes with the lane, not before it. |
+| The service is still waking it | Nothing yet; the row says how many wakes the loop has already made and that it wakes again on its next poll. | The supervision loop owns this row. |
+| Otherwise reachable | `agent-parley say NAME "<text>"` | The lane is alive and reading. |
+
+A row an operator must act on and a row the supervision loop is already
+working are therefore different rows. The wake, the delivery, the orphan
+reclaim and the lease bounce belong to that loop, which runs them on its own
+interval; `problems` reports what it has attempted and what it will do next,
+and the closing line counts how many rows need an operator against how many
+the service is handling. An active lane is never told to leave its session,
+and a dirty worktree row names the worktree and the changed files rather than
+offering to retire the lane, because retiring it would drop the claims it
+holds to clean one directory.
 
 An empty list prints one line saying so and exits zero; any row exits 1, so a
 shell or a cron can gate on it. `--json` prints the same rows inside the shared
-snapshot envelope with `count`. The `P` key in `top` shows the same rows in
+snapshot envelope, each with `count` and `actor`, alongside the totals
+`count`, `operator` and `service`. The `P` key in `top` shows the same rows in
 place of the table until any key returns. Every command named is a suggestion:
-the view revokes nothing, releases nothing and wakes nobody.
+the view itself revokes nothing, releases nothing and wakes nobody.
 
 ### Recording the work order as a plan file
 
@@ -1185,7 +1211,8 @@ project holding
 carries the service reading the `Code:` line prints, so a stale service is
 readable without parsing text. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
-`session`, `availability` as `active`, `idle` or `stopped`, `branch`,
+`session`, `availability` as `active`, `idle` or `stopped` with the derived
+`activity`, its `evidence` and whether that evidence is `stale`, `branch`,
 `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
 `report_age_seconds`, `injected_bytes`, `injections`, `claims`, `idle`,
@@ -1302,14 +1329,31 @@ same records `top` reads, takes no lock and writes no coordination state.
 ### Availability, reminders and waking
 
 The local service observes each launcher's process identity and native checkpoint
-age. Observed availability is one of four states. `active` is a live launcher
-whose latest checkpoint is younger than `inactive_after`; `idle` is a live
-launcher whose checkpoint has aged past it, which is what a lane between turns
-looks like; `stopped` is a launcher whose recorded session process is gone. A
-lane without a trustworthy native process identity is `unknown`, because it may
-still be a live session. A lane that is only idle is never reported with the word
-a dead launcher gets. `status` reports that state beside process liveness and
-lists outstanding acknowledgement IDs, senders and ages.
+age, and derives one lane state from them. That derivation runs once per reading
+and every column reports from it, so the session cell, availability and the
+`problems` rows cannot describe the same lane differently in the same frame. The
+derived state is `working`, `idle`, `waiting` on a prompt or an approval,
+`stopped` when no session process answers, or `unknown` when no trustworthy
+process identity was recorded. Each reading carries the evidence it was derived
+from and that evidence's age.
+
+A `PreToolUse` that has not yet been closed by its `PostToolUse` counts as work
+in flight until the longest tool call the runtime tolerates, so a lane inside a
+long command reads as working rather than as the activity before it. Published
+activity older than `inactive_after` is reported as stale with its age, not as
+the present. A lane whose session process still answers is never described as
+stopped: a finished session under a live process is a client waiting for
+whoever owns its terminal.
+
+Observed availability is that derived state read coarsely, not a second
+derivation. It is one of four values. `active` is a live launcher that is
+working or waiting on a prompt; `idle` is a live launcher whose evidence has
+aged past `inactive_after`, which is what a lane between turns looks like;
+`stopped` is a launcher whose recorded session process is gone. A lane without a
+trustworthy native process identity is `unknown`, because it may still be a live
+session. A lane that is only idle is never reported with the word a dead
+launcher gets. `status` reports that state beside process liveness and lists
+outstanding acknowledgement IDs, senders and ages.
 
 A lane that has recorded no native activity yet has no age to report, so
 `last_active_at` and `age_seconds` are both `null` rather than an age measured
@@ -1332,10 +1376,11 @@ attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `completion_reminders` (3
-reminders, 1 to 100), `prompts` and `wake` (both true).
-Numeric second values range from 1 to 86400 seconds. The same keys in
+reminders, 1 to 100), `prompts`, `wake` and `reclaim` (all true). Numeric
+second values range from 1 to 86400 seconds. The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
-`wake` and `prompts` cannot be enabled by a project. A participant entry may set
+`wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
+entry may set
 `"wake": false` to opt out individually. These settings remain outside source.
 
 Releasing a claim with waiting peers creates a visible handoff reminder.
@@ -1497,6 +1542,34 @@ accounts need no relationship to each other. Sign in to each directory with the
 native CLI once. Agent Parley stores directory paths and
 variable names; it never stores tokens or keys, and rejects `--env` values whose
 names look like credentials.
+
+### Reclaiming landed lanes
+
+Every lane owns a worktree in the private project state directory and a branch
+in the repository, and both outlive the claim they were created for. The
+service sweeps them at most once every 900 seconds, after the rest of a poll,
+and `agent-parley gc` runs the same sweep on demand: without `--apply` it
+reports what it would do, with `--apply` it removes what it may. The outcome
+of the service's own sweep is published in `reclaim.json` in the project state
+directory, so the next sweep is bounded even when one fails.
+
+A lane is reclaimed only when every one of these holds: its worktree is a
+registered worktree directly inside this project's state directory; no session
+is running in it; the ledger records no claim it still owns; it has nothing
+uncommitted; the base checkout's head already carries every commit on its
+branch; its branch carries nothing its configured upstream lacks; its branch
+has moved at all since the lane was created; and the forge reports the newest
+pull request from that branch as merged, or, with no pull request to read, the
+upstream no longer carries the branch. Removal is the ordinary retirement,
+followed by `git branch -d`, which deletes the branch under Git's own
+merged-branch rule and refuses otherwise.
+
+Anything else is kept and reported with the one condition that held it, and
+uncommitted files and unmerged or unpushed commits are reported by name. A
+pull request closed without merging, an open one, an unreachable forge, a
+worktree Git cannot inspect and a path outside the project's own lanes all
+decide against reclaiming. The sweep never touches a remote branch, and it
+never fails because the remote branch is already gone.
 
 ## Other agent CLIs
 

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         problems,
         process,
         protocol,
+        reclaim,
         recommend,
         retries,
         roster,
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
         describe,
         handoff_fields,
         offer_state,
+        orphan_age,
         parse_issue,
         snapshot,
     )
@@ -110,6 +112,7 @@ DEFERRED_MODULES = (
     "problems",
     "process",
     "protocol",
+    "reclaim",
     "recommend",
     "retries",
     "roster",
@@ -215,6 +218,7 @@ if not TYPE_CHECKING:
     describe = _DeferredCallable(issues, "describe")
     handoff_fields = _DeferredCallable(issues, "handoff_fields")
     offer_state = _DeferredCallable(issues, "offer_state")
+    orphan_age = _DeferredCallable(issues, "orphan_age")
     parse_issue = _DeferredCallable(issues, "parse_issue")
     snapshot = _DeferredCallable(issues, "snapshot")
     lock = _DeferredCallable(state, "lock")
@@ -806,10 +810,12 @@ def lane_detail(record: dict, data: dict) -> None:
     for claim in record["claims"]:
         if claim.get("orphaned"):
             held = claim.get("orphan_reservations") or []
+            recorded = claim.get("orphan_recorded_seconds") or 0
             print(
-                f"    Issue #{claim['issue']} is orphaned: "
-                f"{claim['orphan_reason']}; still owned until a peer runs "
-                f"issue claim {claim['issue']} --take-orphaned"
+                f"    Issue #{claim['issue']} was marked orphaned "
+                f"{recorded}s ago: {claim['orphan_reason']}; still owned "
+                f"until a peer runs issue claim {claim['issue']} "
+                "--take-orphaned"
                 + (f"; holds {', '.join(held)}" if held else "")
             )
         if claim.get("unresolved"):
@@ -2824,10 +2830,16 @@ class Bridge:
     def down(self) -> None:
         """Stops the identified server while retaining all persistent state.
 
+        A start holds the same lock until the new service answers, which is
+        bounded at thirty seconds including the wind-down of a service that
+        never became ready. Refusing the moment that lock is held reported
+        contention for a stop that was only queued behind a start, so the
+        stop waits for that span before it reports the lock busy.
+
         Raises:
             BridgeError: If locking fails or the server does not stop in time.
         """
-        with lock(self.home / "server.lock"):
+        with lock(self.home / "server.lock", timeout=30):
             running = self.server_process()
             if running:
                 running.stop()
@@ -5908,6 +5920,54 @@ reported.
         """
         return problems.derive(self.home, self.status_snapshot(), ack_after)
 
+    def reclaim(self, repo: Path, *, apply: bool = False) -> list[dict]:
+        """Reports, and optionally removes, the lanes whose work has landed.
+
+        A lane whose pull request merged holds nothing the operator still
+        needs, and a project that never reclaims one accumulates a worktree
+        and a branch for every claim it ever ran. The removal itself is the
+        ordinary retirement, so a reclaimed lane leaves exactly the state a
+        retired lane leaves and takes the same refusals: a lane that is
+        busy, dirty or ahead of the base checkout is kept and reported
+        instead of being removed.
+
+        Retirement keeps a branch that carries commits the recorded project
+        base does not, which is every branch that ever did work. The sweep
+        has already established that the base checkout and the branch's own
+        upstream carry those commits, so it then asks Git to delete the
+        branch under Git's own merged-branch rule. A branch Git refuses
+        leaves the lane reclaimed and the branch in place.
+
+        Args:
+            repo: Any checkout of the target repository.
+            apply: Whether the assessed lanes are removed; the default only
+                reports what a sweep would do.
+
+        Returns:
+            One row per lane, naming the lane, its branch, whether it was
+            removed, whether its branch was deleted, the condition that
+            decided it and any paths that condition names.
+        """
+        root, directory = self.project(repo, create=False)
+        manifest = roster.read(directory)
+        rows = reclaim.plan(directory, manifest)
+        if not apply:
+            return rows
+        for row in rows:
+            if not row["reclaim"]:
+                continue
+            try:
+                self.retire(repo, row["participant"])
+            except BridgeError as exc:
+                row.update(reclaim=False, removed=False, reason=str(exc))
+                continue
+            with contextlib.suppress(BridgeError):
+                git(root, "branch", "-d", row["branch"])
+            row.update(
+                removed=True, branch_removed=not has_branch(root, row["branch"])
+            )
+        return rows
+
     def acknowledge(self, repo: Path, identifier: int) -> dict:
         """Records the operator's acknowledgement of one awaited message.
 
@@ -6626,9 +6686,14 @@ reported.
             "identity": name,
             "provider": participant["provider"],
             "credential": participant["credential"],
-            "session": participant_liveness(directory, agent),
+            "session": participant_liveness(
+                directory, agent, configuration["inactive_after"]
+            ),
             "availability": {
                 "state": observed["state"],
+                "activity": observed["activity"],
+                "evidence": observed["evidence"],
+                "stale": observed["stale"],
                 "process_alive": observed["process_alive"],
                 "last_active_at": views.timestamp(observed["last_active"]),
                 "age_seconds": observed["age_seconds"],
@@ -6663,6 +6728,11 @@ reported.
                     "orphaned": bool(record.get("orphan")),
                     "orphan_reason": (record.get("orphan") or {}).get(
                         "reason", ""
+                    ),
+                    "orphan_recorded_seconds": (
+                        orphan_age(record["orphan"])
+                        if record.get("orphan")
+                        else None
                     ),
                     "orphan_reservations": list(
                         (record.get("orphan") or {}).get("reservations", [])
@@ -7224,6 +7294,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "run",
             "plan",
             "state",
+            "gc",
             "version",
             "completion",
         ),
@@ -8292,6 +8363,23 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     acking.add_argument("message_id", type=int)
     acking.add_argument("--repo", type=Path, default=Path.cwd())
     acking.add_argument("--json", action="store_true", help=JSON_HELP)
+    collecting = commands.add_parser(
+        "gc",
+        help=(
+            "Reclaim the lane worktrees and branches whose work has landed, "
+            "keeping and reporting every lane that still holds any."
+        ),
+    )
+    collecting.add_argument("--repo", type=Path, default=Path.cwd())
+    collecting.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Remove the reclaimable lanes; without it the sweep only reports "
+            "what it would remove and what it would keep."
+        ),
+    )
+    collecting.add_argument("--json", action="store_true", help=JSON_HELP)
     notifying = commands.add_parser(
         "notify",
         help=(
@@ -9202,6 +9290,13 @@ def main() -> int:
                 else "\n".join(problems.lines(found))
             )
             return 1 if found else 0
+        elif args.command == "gc":
+            swept = bridge.reclaim(args.repo.resolve(), apply=args.apply)
+            print(
+                views.render("gc", {"lanes": swept})
+                if args.json
+                else "\n".join(reclaim.lines(swept)) or "No lane to reclaim."
+            )
         elif args.command == "notify":
             probed = notify.probe(args.repo.resolve().name)
             print(

@@ -54,7 +54,7 @@ on standard output and export to a file.
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
 | `doctor` | Report launcher, plugin, store and running-service versions and their fit; non-zero exit on a mismatch. |
-| `problems` | List every lane, claim and store condition that needs an operator, oldest first, with the command that clears each; `--ack-after` sets the acknowledgement age, `--json` prints it for scripts, exit 1 when any row exists. |
+| `problems` | List every lane, claim and store condition that needs attention, oldest first, one row per lane per cause with its count and the remedy the lane's state allows; rows the supervision service is handling say so, `--ack-after` sets the acknowledgement age, `--json` prints it for scripts, exit 1 when any row exists. |
 | `problems ack ID` | Record your own acknowledgement of one message a lane left unanswered. It clears that condition and nothing else: no ownership moves, no reservation is released and no lane is woken. |
 | `issue ... --idempotency-key KEY` | Retry any transition safely; the repeat returns the first result. |
 | `participant list` | List the project's lanes and their identities. |
