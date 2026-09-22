@@ -258,6 +258,17 @@ committed coordination call. `participant_presence` is an additive table
 initialized with the store. The issue ledger retains reminders; only explicit
 issue transitions own claims.
 
+`reclaim.py` decides which lane worktrees and branches a project may remove
+and holds no removal of its own. It reads Git in the base checkout and in each
+lane and the forge through `forge.py`, and returns one assessment per lane
+naming the single condition that decided it. Removal stays in `cli.py`, where
+it is the ordinary retirement followed by Git's own merged-branch deletion, so
+a reclaimed lane leaves the state a retired lane leaves. `supervision.py` runs
+that sweep from a poll no more than once every fifteen minutes and publishes
+its outcome as `reclaim.json` beside the other project state, which bounds the
+next attempt whatever the last one did. The split keeps the decision testable
+without deleting anything and keeps every deletion on one path.
+
 Provider capacity is durable per lane and records available, exhausted,
 retryable and unknown states with the native evidence and session identity.
 Elapsed supervision time never restores capacity. A validated later response,
@@ -811,13 +822,30 @@ decision keeps the lane's checkpoint lock and still writes the lane's activity
 file and event record, so deciding the same event again in the hook process
 would contend with it and could deny a native call over coordination work
 already in progress. The client therefore injects no context and exits
-successfully, and the service counts a lane's decisions that are past their
-deadline and starts no further decision for it beyond that bound. Contention on
+successfully, and the service counts the decisions a lane abandoned at that
+deadline and starts no further decision for it while it holds one. A lane's
+first minutes are where that bound earns its place: the first checkpoint,
+roster, mail and recovery scans all run inside one hook budget, and without it
+each following event started a decision that queued behind the slow one and
+expired in its turn. Decisions merely in flight are not counted, so parallel
+native calls in a healthy lane keep their context injection. Contention on
 a lane's own checkpoint lock is likewise never an enforcement result: the loser
 of the bounded wait records a `lock_contended` event and degrades to no
 injection. The bounded worst case is one connection attempt, one service
 deadline and one lock wait, which is 2.75 seconds against the 3-second hook
 timeout the launcher registers.
+
+Every decision is timed by the step it is walking: the roster read, the stale
+session check, the Git branch guard, the wait for the lane's checkpoint lock,
+the activity read, the mailbox read, the coordination scans, the recovery
+capture and the record it writes. A decision slower than half the service
+deadline is logged as `decided` with those durations, and an abandoned one is
+logged as `expired` with the step it was holding when the deadline passed, so
+the slow step at a launch is named rather than inferred. A hook process is
+killed by its client at the hook timeout and its shell client stops reading at
+its own, so a reply written after either deadline meets a socket nobody holds;
+that is the client's contract working and is recorded as a single `unanswered`
+entry rather than a traceback for every event.
 
 Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,
