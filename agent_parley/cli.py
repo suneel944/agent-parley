@@ -2822,10 +2822,16 @@ class Bridge:
     def down(self) -> None:
         """Stops the identified server while retaining all persistent state.
 
+        A start holds the same lock until the new service answers, which is
+        bounded at thirty seconds including the wind-down of a service that
+        never became ready. Refusing the moment that lock is held reported
+        contention for a stop that was only queued behind a start, so the
+        stop waits for that span before it reports the lock busy.
+
         Raises:
             BridgeError: If locking fails or the server does not stop in time.
         """
-        with lock(self.home / "server.lock"):
+        with lock(self.home / "server.lock", timeout=30):
             running = self.server_process()
             if running:
                 running.stop()
