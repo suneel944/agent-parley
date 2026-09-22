@@ -261,31 +261,44 @@ def trust(home: Path, repo: Path, lanes: list[str]) -> list[str]:
     decision itself stays the operator's: this writes only the
     directories of a project the run seeded, into each client's own trust
     record, and only when the operator asked for it on the command line.
+
+    A lane launched on a credential profile reads a configuration
+    directory of its own, so its trust belongs in that profile's record
+    rather than the operator's: a lane on the default account and a lane
+    on a second account are two clients with two trust records.
     """
     directory = _directory(home, repo)
+    profiles = _read(home / "credentials.json").get("entries") or {}
     paths = [str(repo)]
-    providers: dict[str, list[str]] = {}
+    accounts: dict[tuple[str, str], list[str]] = {}
     for lane in lanes:
-        name, provider, _ = _lane(lane)
+        name, provider, credentials = _lane(lane)
         paths.append(str(directory / name))
-        providers.setdefault(provider, []).append(str(directory / name))
-    if "claude" in providers:
-        record = Path.home() / ".claude.json"
-        data = _read(record)
-        projects = data.setdefault("projects", {})
-        for path in [str(repo), *providers["claude"]]:
-            entry = projects.setdefault(path, {})
-            entry["hasTrustDialogAccepted"] = True
-        _replace(record, json.dumps(data, indent=2) + "\n")
-    if "codex" in providers:
-        record = Path.home() / ".codex" / "config.toml"
-        text = record.read_text() if record.exists() else ""
-        added = ""
-        for path in [str(repo), *providers["codex"]]:
-            if f'[projects."{path}"]' not in text:
-                added += f'\n[projects."{path}"]\ntrust_level = "trusted"\n'
-        if added:
-            _replace(record, text + added)
+        account = str((profiles.get(credentials) or {}).get("home") or "")
+        accounts.setdefault((provider, account), []).append(
+            str(directory / name)
+        )
+    for (provider, account), lanes_of in accounts.items():
+        configuration = Path(account) if account else None
+        if provider == "claude":
+            record = (configuration or Path.home()) / ".claude.json"
+            data = _read(record)
+            projects = data.setdefault("projects", {})
+            for path in [str(repo), *lanes_of]:
+                entry = projects.setdefault(path, {})
+                entry["hasTrustDialogAccepted"] = True
+            record.parent.mkdir(parents=True, exist_ok=True)
+            _replace(record, json.dumps(data, indent=2) + "\n")
+        if provider == "codex":
+            record = (configuration or Path.home() / ".codex") / "config.toml"
+            text = record.read_text() if record.exists() else ""
+            added = ""
+            for path in [str(repo), *lanes_of]:
+                if f'[projects."{path}"]' not in text:
+                    added += f'\n[projects."{path}"]\ntrust_level = "trusted"\n'
+            if added:
+                record.parent.mkdir(parents=True, exist_ok=True)
+                _replace(record, text + added)
     return paths
 
 

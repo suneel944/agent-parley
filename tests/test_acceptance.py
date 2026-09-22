@@ -234,6 +234,26 @@ def test_trust_is_recorded_for_every_lane_directory(tmp_path, monkeypatch):
     assert str(home / "projects" / "one" / "codex") in recorded
 
 
+def test_a_lane_on_a_second_account_is_trusted_in_its_own_record(
+    tmp_path, monkeypatch
+):
+    home, repo = estate(tmp_path, ["claude:claude", "second:claude:profile"])
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    account = tmp_path / "second-account"
+    (home / "credentials.json").write_text(
+        json.dumps({"entries": {"profile": {"home": str(account)}}})
+    )
+    acceptance.trust(home, repo, ["claude:claude", "second:claude:profile"])
+    directory = home / "projects" / "one"
+    written = json.loads((tmp_path / "operator" / ".claude.json").read_text())
+    operator = written["projects"]
+    second = json.loads((account / ".claude.json").read_text())["projects"]
+    assert str(directory / "claude") in operator
+    assert str(directory / "second") not in operator
+    assert second[str(directory / "second")]["hasTrustDialogAccepted"] is True
+    assert second[str(repo)]["hasTrustDialogAccepted"] is True
+
+
 def test_the_bridge_tool_opt_in_is_the_only_one_recorded(tmp_path):
     home, repo = estate(tmp_path)
     manifest = home / "projects" / "one" / "project.json"
