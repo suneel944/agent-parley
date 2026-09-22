@@ -147,17 +147,24 @@ def read_line(child, timeout: float = 10) -> str:
     return child.stdout.readline().decode(errors="replace")
 
 
-def drawn(master: int, timeout: float = 30) -> None:
-    """Waits for an attached client to report the screen it drew."""
+def marked(master: int, marker: bytes, timeout: float = 30) -> None:
+    """Waits for an attached client to report a marker of its own progress.
+
+    Typing at a client that has not put its terminal in raw mode leaves the
+    keystrokes in the line discipline's canonical buffer, where they stay
+    until a newline completes the line. A test that types on a timer rather
+    than on a marker therefore reads as a single late line instead of the
+    keystrokes it meant to send.
+    """
     deadline = time.monotonic() + timeout
     seen = b""
     while time.monotonic() < deadline:
         if not select.select([master], [], [], 0.5)[0]:
             continue
         seen += os.read(master, 4096)
-        if b"DRAWN" in seen:
+        if marker in seen:
             return
-    raise AssertionError("the client never drew its screen")
+    raise AssertionError(f"the client never reported {marker.decode()}")
 
 
 def published(directory: Path, timeout: float = 10) -> dict:
@@ -396,6 +403,7 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
         )
         client = (
             "import os, sys, tty\ntty.setraw(0)\n"
+            "print('READY', flush=True)\n"
             "seen = b''\n"
             "while b'go' not in seen:\n"
             "    seen += os.read(0, 4096)\n"
@@ -412,10 +420,11 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
                 [sys.executable, "-c", harness, str(lane), client, HOOK_REVIEW],
             )
         try:
+            marked(master, b"READY")
             os.write(master, b"typed")
             time.sleep(0.2)
             os.write(master, b"go")
-            drawn(master)
+            marked(master, b"DRAWN")
             time.sleep(1.0)
             state = json.loads((directory / "lane-activity.json").read_text())
             assert "dialog" not in state
