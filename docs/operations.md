@@ -1403,11 +1403,29 @@ reports that native process identity is unavailable and requires manual
 attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
-30 seconds), `inactive_after` (300 seconds), `prompts` and `wake` (both true).
+30 seconds), `inactive_after` (300 seconds), `start_deadline` (30 seconds),
+`prompts` and `wake` (both true).
 Numeric values range from 1 to 86400 seconds. The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
 `wake` and `prompts` cannot be enabled by a project. A participant entry may set
 `"wake": false` to opt out individually. These settings remain outside source.
+
+`agent-parley run NAME` publishes the lane's activity as `starting; awaiting
+native hook` before it starts a client, and the client's first hook event
+replaces that label. A client parked on a native trust, authentication or update
+dialog fires no hook, so `start_deadline` bounds how long that label may stand.
+A launch still carrying it `start_deadline` seconds later is published as
+`not started; no native hook`, with the deadline and the observed wait in the
+lane's private activity state. The mark is an observation: nothing is killed,
+no claim moves and no dialog is answered. It fails the lane's session fitness
+check, so such a lane is neither offered work nor named as a share target for a
+peer's rebalance, and a wake is refused with the cause
+`it never started within Ns of its launch` rather than spending an attempt on a
+client that cannot read an injected prompt. Answering the dialog produces the
+first native hook event, which republishes the real activity and clears the mark
+however late it arrives. Client startup on a developer machine is a few seconds;
+raise `start_deadline` on a slow machine or a cold cache, where a legitimate
+launch can take longer than the default.
 
 Releasing a claim with waiting peers creates a visible handoff reminder.
 The service also checks claimed lane PRs on each poll and reminds holders when

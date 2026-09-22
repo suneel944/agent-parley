@@ -27,6 +27,7 @@ DEFAULTS = {
     "interval": 30,
     "inactive_after": 300,
     "stalled_after": 600,
+    "start_deadline": 30,
     "prompts": True,
     "wake": True,
 }
@@ -34,6 +35,8 @@ DEFAULTS = {
 ACTIVE = "active"
 IDLE = "idle"
 STOPPED = "stopped"
+STARTING = "starting; awaiting native hook"
+NOT_STARTED = "not started; no native hook"
 WORK_WAKE_ATTEMPTS = 3
 UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
@@ -77,7 +80,12 @@ def settings(value: dict) -> dict:
     if not isinstance(value, dict) or set(value) - set(DEFAULTS):
         raise BridgeError("Invalid supervision settings.")
     result = {**DEFAULTS, **value}
-    for field in ("interval", "inactive_after", "stalled_after"):
+    for field in (
+        "interval",
+        "inactive_after",
+        "stalled_after",
+        "start_deadline",
+    ):
         if (
             type(result[field]) not in (int, float)
             or not 1 <= result[field] <= 86400
@@ -144,6 +152,81 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "last_active": recorded,
         "age_seconds": None if age is None else int(age),
     }
+
+
+def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
+    """Records that one launch produced no native hook inside its deadline.
+
+    The launcher's own activity write is the evidence: it clears the live
+    session field and publishes `STARTING` before it starts a client, so a lane
+    still carrying that label owns a client that has reported nothing. Only the
+    label and the observation are written. The recorded launch time, the live
+    session field and the resumable session are left exactly as the launcher
+    and any earlier session left them, and no native process is signalled.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        deadline: Seconds a launch may take before it reads as not started.
+
+    Returns:
+        Whether this call published the mark.
+    """
+    from agent_parley import checkpoints
+
+    path = directory / f"{name}-activity.json"
+    started = checkpoints.activity(directory, name).get("session_started")
+    if (
+        not isinstance(started, (int, float))
+        or isinstance(started, bool)
+        or time.time() - float(started) < deadline
+    ):
+        return False
+    with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+        state = checkpoints.activity(directory, name)
+        if state.get("activity") != STARTING or state.get(
+            "session_started"
+        ) != float(started):
+            return False
+        state["activity"] = NOT_STARTED
+        state["not_started"] = {
+            "at": time.time(),
+            "deadline": float(deadline),
+            "waited": int(time.time() - float(started)),
+        }
+        write_json(path, state)
+        return True
+
+
+def launches(directory: Path, manifest: dict, config: dict) -> list[str]:
+    """Marks the launches that never reported a native hook event.
+
+    A client can sit on a native trust, authentication or update dialog that
+    fires no hook, and the launch label alone would then describe that lane as
+    starting for as long as the dialog stands. The deadline turns that silence
+    into an observation with a time on it. The mark says only what was
+    observed: no native hook inside `start_deadline` seconds of the launch. It
+    ends nothing, moves no claim and answers no dialog, and the next native
+    hook event republishes the lane's real activity, which is what clears it.
+
+    Contention is not a failure here. A lane whose checkpoint lock is held is
+    being written by its own hook, which is the outcome this pass is watching
+    for, so it is left to the next poll.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+
+    Returns:
+        The lanes this pass marked, in manifest order.
+    """
+    marked = []
+    for name in sorted(manifest.get("participants", {})):
+        with contextlib.suppress(BridgeError, OSError):
+            if _mark_unstarted(directory, name, config["start_deadline"]):
+                marked.append(name)
+    return marked
 
 
 def stall(
@@ -460,12 +543,17 @@ def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
     Returns:
         The check result and, when it failed, why. A lane that published no
         activity yet reports None, which is no opinion rather than a refusal.
+        A launch that passed its start deadline without a native hook fails
+        here, which is what keeps it out of offers and out of share targets.
     """
     from agent_parley import checkpoints
 
     state = checkpoints.activity(directory, name)
     if not state:
         return None, ""
+    if state.get("activity") == NOT_STARTED:
+        waited = (state.get("not_started") or {}).get("deadline", 0)
+        return False, f"it never started within {int(waited)}s of its launch"
     if not process.alive(state.get("session_pid"), state.get("session_ticks")):
         return False, "its session process is not running"
     if state.get("activity") == "stopped":
@@ -2136,9 +2224,14 @@ def poll(home: Path, directory: Path) -> None:
     Recorded operator items are delivered here, before reminders and waking,
     so a message whose time or condition has just arrived is part of the
     backlog this same poll may wake the lane for.
+
+    Launches are judged against their start deadline first, so a lane whose
+    client never reported a native hook is published as not started before this
+    same poll reads presence, publishes fitness and considers a wake.
     """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
+    launches(directory, manifest, config)
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
@@ -2521,6 +2614,13 @@ def _wake_block(
     its first attempt has already recorded that, so the refusal is reported
     before the cause starts sparing the budget.
 
+    A launch marked not started is blocked before any of that. It has no session
+    to resume and no client that could read an injected prompt, so it is a lane
+    with no session however alive its launcher still is, and nothing a wake can
+    do reaches the dialog that is holding it. The operator answering that dialog
+    produces a native hook event, which republishes the activity and clears the
+    cause here with no change of its own.
+
     Args:
         directory: Private project state directory.
         name: Participant that owns the lane.
@@ -2543,6 +2643,9 @@ def _wake_block(
     ):
         return reason, float(reset_at)
     activity = str(state.get("activity", "")) or UNKNOWN
+    if activity == NOT_STARTED:
+        waited = (state.get("not_started") or {}).get("deadline", 0)
+        return f"it never started within {int(waited)}s of its launch", 0.0
     if activity not in WAKE_READY and observed["process_alive"]:
         return f"its screen state is {activity}", 0.0
     if (

@@ -7076,7 +7076,7 @@ reported.
                 else:
                     command[1:1] = ["--resume", session]
             previous.update(
-                activity="starting; awaiting native hook",
+                activity=supervision.STARTING,
                 launcher_managed=True,
                 task=task,
                 updated=time.time(),

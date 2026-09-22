@@ -1300,6 +1300,10 @@ def checkpoint(
     attempted launch from a session that actually reported itself, and it is
     what a later resume reads.
 
+    Any observed event republishes the lane's activity, so an event that arrives
+    after the launch passed its start deadline clears the not-started mark the
+    supervision poll published, however late it is.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -1423,6 +1427,7 @@ def checkpoint(
         if session:
             state["resumable_session"] = session
         state.pop("checkpoint_error", None)
+        state.pop("not_started", None)
         if event == "SessionEnd":
             state["activity"] = "stopped"
         elif event == "Stop":
