@@ -258,6 +258,17 @@ committed coordination call. `participant_presence` is an additive table
 initialized with the store. The issue ledger retains reminders; only explicit
 issue transitions own claims.
 
+`reclaim.py` decides which lane worktrees and branches a project may remove
+and holds no removal of its own. It reads Git in the base checkout and in each
+lane and the forge through `forge.py`, and returns one assessment per lane
+naming the single condition that decided it. Removal stays in `cli.py`, where
+it is the ordinary retirement followed by Git's own merged-branch deletion, so
+a reclaimed lane leaves the state a retired lane leaves. `supervision.py` runs
+that sweep from a poll no more than once every fifteen minutes and publishes
+its outcome as `reclaim.json` beside the other project state, which bounds the
+next attempt whatever the last one did. The split keeps the decision testable
+without deleting anything and keeps every deletion on one path.
+
 Provider capacity is durable per lane and records available, exhausted,
 retryable and unknown states with the native evidence and session identity.
 Elapsed supervision time never restores capacity. A validated later response,
