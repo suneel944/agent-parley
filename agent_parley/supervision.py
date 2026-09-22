@@ -40,6 +40,16 @@ IDLE = "idle"
 STOPPED = "stopped"
 WORK_WAKE_ATTEMPTS = 3
 UNKNOWN = "unknown"
+WORKING = "working"
+WAITING = "waiting"
+TOOL_TIMEOUT = 600
+AVAILABILITY = {
+    WORKING: ACTIVE,
+    WAITING: ACTIVE,
+    IDLE: IDLE,
+    STOPPED: STOPPED,
+    UNKNOWN: UNKNOWN,
+}
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
@@ -89,6 +99,93 @@ def settings(value: dict) -> dict:
     return result
 
 
+def lane_state(
+    published: dict,
+    inactive_after: float = DEFAULTS["inactive_after"],
+    tool_timeout: float = TOOL_TIMEOUT,
+    now: float = 0.0,
+) -> dict:
+    """Derives the one lane state every operator column reports from.
+
+    The published activity file names the last hook event a lane served, and
+    nothing else observes the client. Reading that record as the lane's
+    current state made three separate claims untrue: a tool call that had
+    served its `PreToolUse` and owed its `PostToolUse` read as the activity
+    before it, a record left behind hours ago read as current, and a lane
+    whose session process identity was lost read as gone. The state is
+    derived once here so the session cell, availability and the problems rows
+    cannot disagree about the same lane in the same frame.
+
+    A `PreToolUse` with no closing event is counted as work in flight until
+    the longest tool call the runtime tolerates, because a long command is
+    the ordinary reason the pair is still open. Past that span the record is
+    no longer evidence of anything current, and past the inactive threshold
+    any record reads as stale with its age rather than as the present.
+
+    A living session process is never described as stopped. A record that
+    names a finished session while its process still answers means the client
+    is up and waiting for whoever owns its terminal, which is a prompt to
+    answer rather than a session to resume.
+
+    Args:
+        published: Activity record published for the lane, or an empty
+            mapping when the lane has published none.
+        inactive_after: Age past which a record reads as stale.
+        tool_timeout: Longest span an open tool call counts as work.
+        now: Unix time the record is compared against, or zero for the
+            current time.
+
+    Returns:
+        The derived state, the process liveness it was read from, the last
+        published activity time and its age, the evidence the state was
+        derived from, and whether that evidence is stale. The state is one of
+        `WORKING`, `IDLE`, `WAITING`, `STOPPED` or `UNKNOWN`.
+    """
+    moment = now or time.time()
+    pid = published.get("session_pid")
+    ticks = published.get("session_ticks")
+    identified = (
+        type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
+    )
+    alive = process.alive(pid, ticks) if identified else None
+    recorded = published.get("updated")
+    age = None if recorded is None else max(0.0, moment - recorded)
+    activity = str(published.get("activity", ""))
+    in_flight = published.get("event") == "PreToolUse" and (
+        age is None or age <= tool_timeout
+    )
+    stale = age is not None and age > inactive_after and not in_flight
+
+    def reading(state: str, evidence: str) -> dict:
+        """Pairs one derived state with the record it was read from."""
+        return {
+            "state": state,
+            "process_alive": alive,
+            "last_active": recorded,
+            "age_seconds": None if age is None else int(age),
+            "evidence": evidence,
+            "stale": stale and state != STOPPED,
+        }
+
+    if alive is not True:
+        if alive is False or activity == "stopped" or not published:
+            return reading(STOPPED, "stopped")
+        return reading(UNKNOWN, "unknown; no session process recorded")
+    if in_flight:
+        return reading(WORKING, "working; tool call in flight")
+    if not activity:
+        return reading(WORKING, "running; checkpoints unavailable (relaunch)")
+    if stale:
+        return reading(IDLE, f"stale; last {activity}")
+    if activity == "waiting for approval":
+        return reading(WAITING, activity)
+    if activity == "stopped":
+        return reading(WAITING, "session ended; client process alive")
+    if activity == "idle":
+        return reading(IDLE, activity)
+    return reading(WORKING, activity)
+
+
 def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     """Derives availability from the recorded process and native checkpoints.
 
@@ -99,50 +196,43 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     situations with different remedies, so they are never given the same word.
     Collapsing them told peers and operators that a healthy lane was gone.
 
+    Availability is the coarse reading `lane_state` was derived into, not a
+    second derivation: a lane working or waiting on a prompt is available,
+    a lane whose evidence has gone stale is idle, and only a lane with no
+    session process is stopped.
+
     Args:
         directory: Private project state directory.
         name: Participant name.
         inactive_after: Checkpoint age after which a live lane reads as idle.
 
     Returns:
-        State, process liveness, last native activity time and observed age.
-        The state is `ACTIVE` while the recorded session process is alive and
-        its latest native checkpoint is no older than the threshold, `IDLE`
-        once that checkpoint has aged past the threshold while the process is
-        still alive, and `STOPPED` when the recorded session process is gone.
-        A session with no trustworthy process identity is `UNKNOWN`, and its
-        `process_alive` value is `None`; it is never inferred dead from age.
-        A lane that has recorded no native activity yet reports `last_active`
-        and `age_seconds` as `None` rather than an age measured from the Unix
-        epoch, and reads as `ACTIVE` while its process is alive, because a
-        lane that has never checked in has not been quiet for any span a
-        threshold can be compared against.
+        State, process liveness, last native activity time and observed age,
+        together with the derived lane activity, the evidence it was read
+        from and whether that evidence is stale. The state is `ACTIVE` while
+        the recorded session process is alive and its latest native
+        checkpoint is current, `IDLE` once that checkpoint has aged past the
+        threshold while the process is still alive, and `STOPPED` when the
+        recorded session process is gone. A session with no trustworthy
+        process identity is `UNKNOWN`, and its `process_alive` value is
+        `None`; it is never inferred dead from age. A lane that has recorded
+        no native activity yet reports `last_active` and `age_seconds` as
+        `None` rather than an age measured from the Unix epoch, and reads as
+        `ACTIVE` while its process is alive, because a lane that has never
+        checked in has not been quiet for any span a threshold can be
+        compared against.
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
-    pid = value.get("session_pid")
-    ticks = value.get("session_ticks")
-    identified = (
-        type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
-    )
-    alive = process.alive(pid, ticks) if identified else None
-    recorded = value.get("updated")
-    age = None if recorded is None else max(0.0, time.time() - recorded)
-    if value.get("activity") == "stopped":
-        state = STOPPED
-    elif alive is False:
-        state = STOPPED
-    elif alive is None:
-        state = UNKNOWN if value else STOPPED
-    elif age is None or age <= inactive_after:
-        state = ACTIVE
-    else:
-        state = IDLE
+    derived = lane_state(value, inactive_after)
     return {
-        "state": state,
-        "process_alive": alive,
-        "last_active": recorded,
-        "age_seconds": None if age is None else int(age),
+        "state": AVAILABILITY[derived["state"]],
+        "process_alive": derived["process_alive"],
+        "last_active": derived["last_active"],
+        "age_seconds": derived["age_seconds"],
+        "activity": derived["state"],
+        "evidence": derived["evidence"],
+        "stale": derived["stale"],
     }
 
 
