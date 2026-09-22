@@ -287,7 +287,14 @@ issue transitions own claims.
 Provider capacity is durable per lane and records available, exhausted,
 retryable and unknown states with the native evidence and session identity.
 Elapsed supervision time never restores capacity. A validated later response,
-a structured provider reset or a recorded bounded probe does. Exhaustion is
+a structured provider reset or a recorded bounded probe does. A throttle or
+overload report, including a bare status report such as `API Error: 529` or
+`HTTP 429` next to an explicit API, HTTP or status label, records a retryable
+block; text that names a usage or quota limit stays exhausted even when it
+also carries a status number. A retryable block makes the lane unfit, so no
+work or share is offered to it, and it is a wake backlog reason keyed by its
+observation, so the resume runs on the bounded wake backoff rather than on the
+inactivity budget. Exhaustion is
 shared across lanes only when an explicit credential profile identifies the
 same provider account. An exhausted owner's unfinished claims remain visible
 as recovery candidates even when it owns only one claim or no eligible peer is

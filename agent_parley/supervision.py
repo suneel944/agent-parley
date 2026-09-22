@@ -2827,6 +2827,14 @@ def wake(
     its whole budget is recorded as exhausted, and it keeps the last cause and
     result for the operator instead of a next time it will never have.
 
+    A durable retryable capacity observation is itself a backlog reason, so a
+    lane whose client stopped on a transient provider error resumes on this
+    bounded backoff rather than on the silence budget. The reason is keyed by
+    the observation that recorded the block, so a newer transient failure
+    schedules its own attempts and a restored capacity drops the reason. An
+    exhausted lane is never woken this way, because only a later success, a
+    reliable reset or a recorded probe can clear exhaustion.
+
     The launcher still owns native authentication, trust and approval prompts.
     A resumed process uses a real terminal, not an unattended permission mode.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
@@ -2893,6 +2901,9 @@ def wake(
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
     )
+    capacity = published_capacity(directory, name)
+    if capacity["state"] == "retryable":
+        backlog.append(f"capacity:{capacity['observation_id']}")
     with lock(directory / f"{name}-wake.lock"):
         work_item = _work_backlog(
             home,

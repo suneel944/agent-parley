@@ -23,6 +23,10 @@ from agent_parley.checkpoints import checkpoint
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
 
+OVERLOADED = (
+    "API Error: 529 Overloaded. This is a server-side issue, usually temporary."
+)
+
 
 @pytest.fixture(autouse=True)
 def quiet_forge(monkeypatch):
@@ -306,6 +310,88 @@ def test_transient_rate_limit_is_distinct_from_exhaustion(bridge, repo, paired):
     assert published["checks"]["capacity"] is False
     assert published["capacity"]["state"] == "retryable"
     assert "retryable transient failure" in published["reason"]
+
+
+def test_a_transient_api_error_is_classified_retryable(bridge, repo, paired):
+    refused(paired, "claude", 30, OVERLOADED)
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "retryable"
+
+
+def test_a_bare_server_status_report_is_a_transient_block(bridge, repo, paired):
+    refused(paired, "claude", 30, "API Error: 503")
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "retryable"
+
+
+def test_a_status_report_beside_a_usage_limit_stays_exhausted(
+    bridge, repo, paired
+):
+    refused(paired, "claude", 30, "API Error: 429 usage limit reached")
+    observation = records.capacity_observation(
+        bridge.home, paired["participants"]["claude"]
+    )
+    assert observation is not None
+    assert observation["state"] == "exhausted"
+
+
+def test_a_transient_api_error_makes_a_lane_unfit_and_unoffered(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    alive(directory, "claude")
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    refused(paired, "claude", 30, OVERLOADED)
+    supervision.poll(bridge.home, directory)
+    published = supervision.published_work(directory, "claude")
+    assert published["capacity"]["state"] == "retryable"
+    assert published["checks"]["capacity"] is False
+    assert published["failed"] == ["capacity"]
+    assert published["fit"] is False
+    assert published["offer"] is None
+
+
+def test_a_transient_block_resumes_on_the_wake_backoff(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    alive(directory, "claude", updated=time.time() - 500)
+    refused(paired, "claude", 30, OVERLOADED)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = supervision.configuration(bridge.home, manifest)
+    supervision.work(bridge.home, directory, manifest, config)
+    requested = []
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda path, name: requested.append(name) or "accepted",
+    )
+
+    supervision.wake(
+        bridge.home,
+        directory,
+        manifest,
+        "claude",
+        supervision.presence(directory, "claude", config["inactive_after"]),
+        config,
+    )
+
+    blocked = supervision.published_capacity(directory, "claude")
+    record = json.loads((directory / "claude-wake.json").read_text())
+    assert requested == ["claude"]
+    assert record["backlog"] == [f"capacity:{blocked['observation_id']}"]
+    assert record["attempts"] == 1
 
 
 def test_codex_structured_limit_preserves_reliable_reset(bridge, repo, paired):

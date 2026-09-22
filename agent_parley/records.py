@@ -44,7 +44,12 @@ EXHAUSTION = re.compile(
     re.IGNORECASE,
 )
 TRANSIENT = re.compile(
-    r"rate[ _-]?limit|too many requests|temporarily overloaded",
+    r"rate[ _-]?limit|too many requests|overloaded",
+    re.IGNORECASE,
+)
+THROTTLED = re.compile(
+    r"\b(?:api|http|status)\b[\W_]{0,3}(?:error|code)?[\W_]{0,3}"
+    r"(?:429|5\d\d)\b",
     re.IGNORECASE,
 )
 
@@ -188,11 +193,29 @@ def _stamp(value: object) -> float | None:
 
 
 def _capacity_state(text: str) -> str | None:
-    """Classifies provider-authored refusal text without reading user prose."""
+    """Classifies provider-authored refusal text without reading user prose.
+
+    A named refusal decides first: a throttle or overload report is retryable,
+    and an account or quota limit is exhausted. A bare status report such as
+    ``API Error: 529`` or ``HTTP 429`` is read only once the exhaustion
+    phrases are ruled out, because a provider that names its usage limit
+    beside a status code is exhausted rather than briefly blocked. A status
+    number counts only next to an explicit API, HTTP or status label, so
+    ordinary error prose that merely mentions a number is no evidence.
+
+    Args:
+        text: Provider-authored refusal text from one error envelope.
+
+    Returns:
+        The capacity state this text establishes, or None when it establishes
+        none.
+    """
     if TRANSIENT.search(text):
         return "retryable"
     if EXHAUSTION.search(text):
         return "exhausted"
+    if THROTTLED.search(text):
+        return "retryable"
     return None
 
 
