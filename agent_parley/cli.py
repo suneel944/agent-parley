@@ -52,6 +52,7 @@ if TYPE_CHECKING:
         problems,
         process,
         protocol,
+        reclaim,
         recommend,
         retries,
         roster,
@@ -79,6 +80,7 @@ if TYPE_CHECKING:
         describe,
         handoff_fields,
         offer_state,
+        orphan_age,
         parse_issue,
         snapshot,
     )
@@ -112,6 +114,7 @@ DEFERRED_MODULES = (
     "problems",
     "process",
     "protocol",
+    "reclaim",
     "recommend",
     "retries",
     "roster",
@@ -217,6 +220,7 @@ if not TYPE_CHECKING:
     describe = _DeferredCallable(issues, "describe")
     handoff_fields = _DeferredCallable(issues, "handoff_fields")
     offer_state = _DeferredCallable(issues, "offer_state")
+    orphan_age = _DeferredCallable(issues, "orphan_age")
     parse_issue = _DeferredCallable(issues, "parse_issue")
     snapshot = _DeferredCallable(issues, "snapshot")
     lock = _DeferredCallable(state, "lock")
@@ -830,11 +834,19 @@ def lane_detail(record: dict, data: dict) -> None:
     for claim in record["claims"]:
         if claim.get("orphaned"):
             held = claim.get("orphan_reservations") or []
+            recorded = claim.get("orphan_recorded_seconds") or 0
             print(
-                f"    Issue #{claim['issue']} is orphaned: "
-                f"{claim['orphan_reason']}; still owned until a peer runs "
-                f"issue claim {claim['issue']} --take-orphaned"
+                f"    Issue #{claim['issue']} was marked orphaned "
+                f"{recorded}s ago: {claim['orphan_reason']}; still owned "
+                f"until a peer runs issue claim {claim['issue']} "
+                "--take-orphaned"
                 + (f"; holds {', '.join(held)}" if held else "")
+            )
+        if claim.get("unresolved"):
+            print(
+                f"    Issue #{claim['issue']} has an unresolved completion: "
+                f"{claim.get('reason', '')}; still owned until the operator "
+                f"runs issue resolve {claim['issue']}"
             )
         if claim["overdue"]:
             print(
@@ -2854,10 +2866,16 @@ class Bridge:
     def down(self) -> None:
         """Stops the identified server while retaining all persistent state.
 
+        A start holds the same lock until the new service answers, which is
+        bounded at thirty seconds including the wind-down of a service that
+        never became ready. Refusing the moment that lock is held reported
+        contention for a stop that was only queued behind a start, so the
+        stop waits for that span before it reports the lock busy.
+
         Raises:
             BridgeError: If locking fails or the server does not stop in time.
         """
-        with lock(self.home / "server.lock"):
+        with lock(self.home / "server.lock", timeout=30):
             running = self.server_process()
             if running:
                 running.stop()
@@ -5744,6 +5762,95 @@ reported.
         result.update(recorded="offer", to=offer["to"], offer_id=offer["id"])
         return result
 
+    def issue_resolve(
+        self,
+        repo: Path,
+        number: str,
+        *,
+        reason: str = "",
+        release: bool = False,
+    ) -> dict:
+        """Ends a claim whose holder never filed the completion it landed.
+
+        A claim can otherwise only be ended by the lane that holds it, so work
+        that is merged on the forge stays open in the ledger forever once that
+        lane stops answering, and every capacity and load decision downstream
+        reads the stale row. This is the operator's way out, and it is bounded
+        on both sides. The forge is read here, now, and the pull request it
+        reports must have been opened inside the current ownership generation,
+        so an unverified claim is never ended this way. The supervisor must
+        already have escalated the claim as an unresolved completion, so a
+        holder that is answering is never resolved out from under it. The
+        transition is recorded as the operator's own, never as the lane's.
+
+        Peers gain nothing here. The escalation goes to the operator, and no
+        lane is given any power over another lane's claim.
+
+        Args:
+            repo: Any checkout of the target repository.
+            number: Repository issue number being resolved.
+            reason: Operator rationale kept beside the forge evidence.
+            release: Whether to return the work to the queue instead of
+                recording it complete. It is required for a pull request that
+                was closed without merging, because nothing was integrated.
+
+        Returns:
+            The issue, the outcome recorded, the lane the claim was held by,
+            the forge evidence that justified it and the resulting execution
+            state.
+
+        Raises:
+            BridgeError: If the issue is unheld, no merged or closed pull
+                request names the current claim, the evidence is closed and
+                unmerged without `release`, or the claim carries no
+                unresolved-completion escalation.
+        """
+        _, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        issue = parse_issue(number)
+        record = snapshot(directory)["issues"].get(issue) or {}
+        holder = record.get("owner")
+        if not holder:
+            raise BridgeError(f"Issue #{issue} has no owner.")
+        participant = data["participants"].get(holder) or {}
+        forge.select(repo, data)
+        evidence = forge.branch_evidence(
+            Path(data["root"]), str(participant.get("branch", ""))
+        )
+        if not evidence or evidence["state"] not in ("MERGED", "CLOSED"):
+            raise BridgeError(
+                f"No merged or closed pull request was observed for {holder}, "
+                f"so issue #{issue} has no evidence to resolve it on."
+            )
+        if evidence["created_at"] < supervision.claimed_since(record):
+            raise BridgeError(
+                f"The newest pull request on {evidence['branch']} predates "
+                f"the current claim on issue #{issue}, so it does not name "
+                "this work."
+            )
+        if evidence["state"] != "MERGED" and not release:
+            raise BridgeError(
+                f"The pull request on {evidence['branch']} was closed without "
+                "merging, so nothing was integrated; add --release to return "
+                "the work to the queue."
+            )
+        resolved = lifecycle.resolve(
+            directory,
+            issue,
+            evidence={**evidence, "observed_at": time.time()},
+            outcome="release" if release else "complete",
+            actor=roster.OPERATOR,
+            reason=reason,
+        )
+        return {
+            "issue": int(issue),
+            "outcome": resolved["resolution"]["outcome"],
+            "holder": holder,
+            "owner": resolved["owner"],
+            "state": lifecycle.state(resolved)["state"],
+            "evidence": resolved["resolution"]["evidence"],
+        }
+
     def _request_notice(
         self, data: dict, owner: str, issue: str, request: dict
     ) -> dict:
@@ -5908,6 +6015,54 @@ reported.
             it has held and the command that clears it.
         """
         return problems.derive(self.home, self.status_snapshot(), ack_after)
+
+    def reclaim(self, repo: Path, *, apply: bool = False) -> list[dict]:
+        """Reports, and optionally removes, the lanes whose work has landed.
+
+        A lane whose pull request merged holds nothing the operator still
+        needs, and a project that never reclaims one accumulates a worktree
+        and a branch for every claim it ever ran. The removal itself is the
+        ordinary retirement, so a reclaimed lane leaves exactly the state a
+        retired lane leaves and takes the same refusals: a lane that is
+        busy, dirty or ahead of the base checkout is kept and reported
+        instead of being removed.
+
+        Retirement keeps a branch that carries commits the recorded project
+        base does not, which is every branch that ever did work. The sweep
+        has already established that the base checkout and the branch's own
+        upstream carry those commits, so it then asks Git to delete the
+        branch under Git's own merged-branch rule. A branch Git refuses
+        leaves the lane reclaimed and the branch in place.
+
+        Args:
+            repo: Any checkout of the target repository.
+            apply: Whether the assessed lanes are removed; the default only
+                reports what a sweep would do.
+
+        Returns:
+            One row per lane, naming the lane, its branch, whether it was
+            removed, whether its branch was deleted, the condition that
+            decided it and any paths that condition names.
+        """
+        root, directory = self.project(repo, create=False)
+        manifest = roster.read(directory)
+        rows = reclaim.plan(directory, manifest)
+        if not apply:
+            return rows
+        for row in rows:
+            if not row["reclaim"]:
+                continue
+            try:
+                self.retire(repo, row["participant"])
+            except BridgeError as exc:
+                row.update(reclaim=False, removed=False, reason=str(exc))
+                continue
+            with contextlib.suppress(BridgeError):
+                git(root, "branch", "-d", row["branch"])
+            row.update(
+                removed=True, branch_removed=not has_branch(root, row["branch"])
+            )
+        return rows
 
     def acknowledge(self, repo: Path, identifier: int) -> dict:
         """Records the operator's acknowledgement of one awaited message.
@@ -6628,9 +6783,14 @@ reported.
             "identity": name,
             "provider": participant["provider"],
             "credential": participant["credential"],
-            "session": participant_liveness(directory, agent),
+            "session": participant_liveness(
+                directory, agent, configuration["inactive_after"]
+            ),
             "availability": {
                 "state": observed["state"],
+                "activity": observed["activity"],
+                "evidence": observed["evidence"],
+                "stale": observed["stale"],
                 "process_alive": observed["process_alive"],
                 "last_active_at": views.timestamp(observed["last_active"]),
                 "age_seconds": observed["age_seconds"],
@@ -6675,9 +6835,15 @@ reported.
                     "orphan_reason": (record.get("orphan") or {}).get(
                         "reason", ""
                     ),
+                    "orphan_recorded_seconds": (
+                        orphan_age(record["orphan"])
+                        if record.get("orphan")
+                        else None
+                    ),
                     "orphan_reservations": list(
                         (record.get("orphan") or {}).get("reservations", [])
                     ),
+                    **issues.unresolved_completion(record),
                 }
                 for number, record in sorted(
                     ledger["issues"].items(), key=lambda i: int(i[0])
@@ -7255,6 +7421,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "run",
             "plan",
             "state",
+            "gc",
             "version",
             "completion",
         ),
@@ -8201,6 +8368,30 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         required=True,
         help="Operator rationale persisted with this exact claim approval.",
     )
+    resolving = actions.add_parser(
+        "resolve",
+        help=(
+            "End a claim whose holder never filed the completion its pull "
+            "request already landed, recording the forge evidence."
+        ),
+    )
+    resolving.add_argument("number")
+    resolving.add_argument("--repo", type=Path, default=Path.cwd())
+    resolving.add_argument(
+        "--reason",
+        default="",
+        metavar="TEXT",
+        help="Operator rationale kept beside the forge evidence.",
+    )
+    resolving.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "Return the work to the queue instead of recording it complete. "
+            "It is required when the pull request was closed without merging, "
+            "because nothing was integrated."
+        ),
+    )
     choosing = actions.add_parser(
         "next",
         help=(
@@ -8310,6 +8501,23 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     acking.add_argument("message_id", type=int)
     acking.add_argument("--repo", type=Path, default=Path.cwd())
     acking.add_argument("--json", action="store_true", help=JSON_HELP)
+    collecting = commands.add_parser(
+        "gc",
+        help=(
+            "Reclaim the lane worktrees and branches whose work has landed, "
+            "keeping and reporting every lane that still holds any."
+        ),
+    )
+    collecting.add_argument("--repo", type=Path, default=Path.cwd())
+    collecting.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Remove the reclaimable lanes; without it the sweep only reports "
+            "what it would remove and what it would keep."
+        ),
+    )
+    collecting.add_argument("--json", action="store_true", help=JSON_HELP)
     notifying = commands.add_parser(
         "notify",
         help=(
@@ -9162,6 +9370,14 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "issue" and args.action == "resolve":
+            ended = bridge.issue_resolve(
+                args.repo.resolve(),
+                args.number,
+                reason=args.reason,
+                release=args.release,
+            )
+            print(json.dumps(ended, indent=2))
         elif args.command == "issue" and args.action == "recover":
             approved = bridge.authorize_recovery(
                 args.repo.resolve(), args.number, args.reason
@@ -9213,6 +9429,13 @@ def main() -> int:
                 else "\n".join(problems.lines(found))
             )
             return 1 if found else 0
+        elif args.command == "gc":
+            swept = bridge.reclaim(args.repo.resolve(), apply=args.apply)
+            print(
+                views.render("gc", {"lanes": swept})
+                if args.json
+                else "\n".join(reclaim.lines(swept)) or "No lane to reclaim."
+            )
         elif args.command == "notify":
             probed = notify.probe(args.repo.resolve().name)
             print(

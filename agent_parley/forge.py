@@ -134,6 +134,29 @@ def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
         None when the forge is unavailable, the branch has no pull request, or
         the response cannot be read.
     """
+    evidence = branch_evidence(repo, branch)
+    return (evidence["state"], evidence["created_at"]) if evidence else None
+
+
+def branch_evidence(repo: Path, branch: str) -> dict | None:
+    """Reports the newest pull request from a lane branch and how it ended.
+
+    This is the same observation :func:`branch_completion` correlates with a
+    claim, kept whole so a caller that must justify a decision can record what
+    it saw rather than the verdict alone. The merge commit is present only for
+    a merged pull request; a closed one carries an empty commit, because
+    nothing was integrated and naming a commit would overstate the evidence.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        branch: Lane branch whose pull requests are read.
+
+    Returns:
+        The branch, the pull request's state, number and URL, its creation
+        time in Unix seconds, and the merge commit where one exists. None when
+        the forge is unavailable, the branch has no pull request, or the
+        response cannot be read.
+    """
     if _implementation(repo) != "github":
         return None
     project = _reachable(repo)
@@ -153,7 +176,7 @@ def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
             "--limit",
             "10",
             "--json",
-            "state,createdAt",
+            "state,createdAt,mergeCommit,number,url",
         ],
         5,
     )
@@ -161,16 +184,25 @@ def branch_completion(repo: Path, branch: str) -> tuple[str, float] | None:
         records = json.loads(output or "[]")
         newest = max(
             (
-                (str(record["state"]), _epoch(record["createdAt"]))
+                record
                 for record in records
                 if record.get("state") and record.get("createdAt")
             ),
-            key=lambda entry: entry[1],
+            key=lambda record: _epoch(record["createdAt"]),
             default=None,
         )
+        if not newest:
+            return None
+        return {
+            "branch": branch,
+            "state": str(newest["state"]),
+            "created_at": _epoch(newest["createdAt"]),
+            "commit": str((newest.get("mergeCommit") or {}).get("oid") or ""),
+            "pull_request": int(newest.get("number") or 0),
+            "url": str(newest.get("url") or ""),
+        }
     except (ValueError, TypeError, AttributeError, KeyError):
         return None
-    return newest
 
 
 def _epoch(value: str) -> float:

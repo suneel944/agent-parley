@@ -109,9 +109,16 @@ the reservations that lane still holds.
 
 Ownership does not move on the marker. A peer takes the work explicitly, and
 the take records the previous owner and the reason, then releases the
-reservations that owner held so the paths read as free. A lane that comes back
-regains nothing by restarting: it claims its own issue again, which clears the
-marker and starts a new claim.
+reservations that owner held so the paths read as free.
+
+A marker is withdrawn as soon as the observation behind it stops holding. The
+next poll after the lane's recorded session process answers again removes the
+marker from its claims, keeps those claims with that lane and tells every peer
+that received the notice once that the work is no longer available to take. The
+readings state when the marker was recorded rather than what is true now, so an
+operator never reads a stored observation as a live one. A marker published by
+an authorized live recovery is not withdrawn this way: it records an approved
+stop with a checkpoint, not a crash.
 
 ```sh
 agent-parley issue claim 42 --take-orphaned

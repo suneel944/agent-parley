@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agent_parley import (
@@ -35,6 +36,7 @@ STOP = {"hook_event_name": "Stop", "stop_hook_active": False}
 START = {"hook_event_name": "SessionStart", "session_id": "s1"}
 PROMPT = {"hook_event_name": "UserPromptSubmit", "prompt": "continue"}
 STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} ")
+SLEEPER = "import time; time.sleep(120)"
 
 
 def events(directory, agent="codex"):
@@ -258,29 +260,93 @@ def test_new_session_clears_an_unrelated_live_process(
 ):
     lane = Path(paired["lanes"]["codex"])
     directory = lane.parent
-    native = process.ServerProcess(
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEPER])
+    try:
+        write_json(
+            directory / "codex-activity.json",
+            {
+                "session_id": "previous",
+                "session_pid": unrelated.pid,
+                "session_ticks": process.start_ticks(unrelated.pid),
+            },
+        )
+        monkeypatch.setattr(
+            checkpoints.process, "foreground_process", lambda hook_pid: None
+        )
+        started = run_hook(
+            bridge,
+            directory,
+            {**START, "cwd": str(lane)},
+        )
+    finally:
+        unrelated.kill()
+        unrelated.wait(10)
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert "session_pid" not in state
+    assert "session_ticks" not in state
+
+
+def test_a_new_session_id_keeps_a_live_client_and_reports_it_live(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    client = process.ServerProcess(
         os.getpid(), process.start_ticks(os.getpid())
     )
     write_json(
         directory / "codex-activity.json",
         {
-            "session_id": "previous",
-            "session_pid": native.pid,
-            "session_ticks": native.ticks,
+            "session_id": "cleared",
+            "session_pid": client.pid,
+            "session_ticks": client.ticks,
+            "activity": "working",
+            "updated": time.time(),
         },
     )
     monkeypatch.setattr(
         checkpoints.process, "foreground_process", lambda hook_pid: None
     )
-    started = run_hook(
-        bridge,
-        directory,
-        {**START, "cwd": str(lane)},
+    started = run_hook(bridge, directory, {**START, "cwd": str(lane)})
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_id"] == "s1"
+    assert state["session_pid"] == client.pid
+    assert state["session_ticks"] == client.ticks
+    liveness = checkpoints.participant_liveness(directory, "codex")
+    assert not liveness.startswith("stopped")
+
+
+def test_a_new_session_id_on_a_dead_client_still_reports_stopped(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    gone = subprocess.Popen([sys.executable, "-c", SLEEPER])
+    ticks = process.start_ticks(gone.pid)
+    gone.kill()
+    gone.wait(10)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "cleared",
+            "session_pid": gone.pid,
+            "session_ticks": ticks,
+            "activity": "working",
+            "updated": time.time(),
+        },
     )
+    monkeypatch.setattr(
+        checkpoints.process, "foreground_process", lambda hook_pid: None
+    )
+    started = run_hook(bridge, directory, {**START, "cwd": str(lane)})
     assert started.returncode == 0, started.stderr
     state = json.loads((directory / "codex-activity.json").read_text())
     assert "session_pid" not in state
     assert "session_ticks" not in state
+    liveness = checkpoints.participant_liveness(directory, "codex")
+    assert liveness.startswith("stopped")
 
 
 def test_a_down_service_falls_back_in_process(bridge, repo, paired):
@@ -328,7 +394,7 @@ def test_a_reply_without_a_status_line_falls_back_in_process(
 def test_a_failure_inside_the_served_decision_answers_500(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request):
+    def broken(home, request, stages=None):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -344,7 +410,9 @@ def test_a_failure_inside_the_served_decision_answers_500(
     logged = capsys.readouterr().out
     entry = next(line for line in logged.splitlines() if " failed " in line)
     assert STAMP.match(entry)
-    assert entry.endswith(f"failed {hook.PATH} codex")
+    assert re.search(
+        rf"failed {hook.PATH} codex after \d+\.\d{{3}} seconds$", entry
+    )
     assert "cannot import name 'budgets'" in logged
 
 
@@ -370,6 +438,100 @@ def test_a_stale_service_answers_the_hook_with_a_fallback_status(
     logged = capsys.readouterr()
     assert "Traceback" not in logged.out + logged.err
     assert logged.out.count(server.DRIFTED) == 1
+    assert service.stopping.is_set()
+
+
+@pytest.fixture
+def watched_service(bridge):
+    """Serves on a thread the test watches return when the service stops."""
+    with server.Server(bridge.home, bridge.config) as instance:
+        thread = threading.Thread(target=instance.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield instance, thread
+        finally:
+            instance.shutdown()
+            thread.join(timeout=2)
+
+
+def hook_request(bridge, lane, payload):
+    """Posts one hook event over the transport the hook client uses."""
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    with httpx.Client(base_url=bridge.url, trust_env=False) as client:
+        return client.post(
+            hook.PATH,
+            json={
+                "directory": str(lane.parent),
+                "participant": "codex",
+                "hook_pid": os.getpid(),
+                "payload": payload,
+            },
+            headers={
+                "Authorization": f"Bearer {identity['registration_token']}"
+            },
+            timeout=hook.REPLY_TIMEOUT,
+        )
+
+
+def test_drift_stops_a_busy_service_within_one_revision_interval(
+    bridge, repo, paired, watched_service, monkeypatch
+):
+    instance, serving = watched_service
+    statuses = []
+    entries = []
+    finished = threading.Event()
+    stalled = threading.Event()
+    released = threading.Event()
+    written = server.log
+
+    def entry(home, event, detail=""):
+        if event == "drifted":
+            entries.append(detail)
+            stalled.set()
+            released.wait(10)
+        written(home, event, detail)
+
+    def busy():
+        headers = {"Authorization": f"Bearer {bridge.config['token']}"}
+        with httpx.Client(base_url=bridge.url, trust_env=False) as client:
+            while not finished.is_set():
+                try:
+                    reading = client.get("/health/readiness", headers=headers)
+                except httpx.HTTPError:
+                    return
+                statuses.append(reading.json().get("status"))
+
+    monkeypatch.setattr(server, "log", entry)
+    callers = [threading.Thread(target=busy, daemon=True) for _ in range(3)]
+    for caller in callers:
+        caller.start()
+    monkeypatch.setattr(server.protocol, "revision", lambda: "moved")
+    instance.checked = time.monotonic() - server.REVISION_SECONDS
+    serving.join(timeout=server.REVISION_SECONDS)
+    finished.set()
+    released.set()
+    for caller in callers:
+        caller.join(timeout=2)
+    assert stalled.is_set()
+    assert not serving.is_alive()
+    assert entries == [server.DRIFTED]
+    assert protocol.STALE in statuses
+
+
+def test_a_hook_call_in_the_drift_window_answers_inside_the_budget(
+    bridge, repo, paired, service, monkeypatch
+):
+    moved_sources(monkeypatch)
+    lane = Path(paired["lanes"]["codex"])
+    started = time.monotonic()
+    answered = hook_request(bridge, lane, DENY)
+    elapsed = time.monotonic() - started
+    assert answered.status_code == 503
+    assert answered.json() == {
+        "status": protocol.STALE,
+        "detail": server.DRIFTED,
+    }
+    assert elapsed < hook.REPLY_TIMEOUT
     assert service.stopping.is_set()
 
 
@@ -575,10 +737,10 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     release = threading.Event()
     finished = threading.Event()
 
-    def stalling(home, request):
+    def stalling(home, request, stages=None):
         release.wait(20)
         try:
-            return deciding(home, request)
+            return deciding(home, request, stages)
         finally:
             finished.set()
 
@@ -603,7 +765,12 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     monkeypatch.setattr(server.checkpoints, "serve", deciding)
     release.set()
     assert finished.wait(20)
-    assert hook.request(bridge.config["port"], token, body)[0] == 200
+    deadline = time.monotonic() + 30
+    answered = hook.DECIDING
+    while answered != 200 and time.monotonic() < deadline:
+        answered = hook.request(bridge.config["port"], token, body)[0]
+        time.sleep(0.05)
+    assert answered == 200
 
 
 def test_the_connection_past_the_worker_cap_is_refused_in_the_log(
@@ -755,7 +922,7 @@ def test_the_shell_client_starts_python_when_the_service_is_down(
 def test_the_shell_client_starts_python_when_the_service_fails(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request):
+    def broken(home, request, stages=None):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -789,7 +956,7 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
 def test_the_shell_client_forwards_both_served_streams_and_the_status(
     bridge, repo, paired, service, monkeypatch
 ):
-    def loud(home, request):
+    def loud(home, request, stages=None):
         return {"stdout": '{"ok": true}\n', "stderr": "warned\n", "status": 2}
 
     monkeypatch.setattr(server.checkpoints, "serve", loud)
@@ -965,10 +1132,10 @@ def stalling(monkeypatch, seconds):
     served = server.checkpoints.serve
     asked = []
 
-    def slow(home, request):
+    def slow(home, request, stages=None):
         asked.append(request)
         time.sleep(seconds)
-        return served(home, request)
+        return served(home, request, stages)
 
     monkeypatch.setattr(server.checkpoints, "serve", slow)
     return asked
@@ -990,39 +1157,157 @@ def test_a_decision_past_its_deadline_is_never_decided_again(
     assert len(events(lane.parent)) == 1
 
 
-def test_a_lane_stops_starting_decisions_at_the_undecided_bound(
-    bridge, repo, paired, service, monkeypatch
+def hook_body(lane, payload=ALLOW):
+    """Builds the hook request body the service accepts for a lane."""
+    return json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**payload, "cwd": str(lane), "session_id": "s1"},
+        }
+    ).encode()
+
+
+def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
+    bridge, repo, paired, service, monkeypatch, capsys
 ):
-    asked = stalling(monkeypatch, server.DECISION_SECONDS * 4)
+    deciding = checkpoints.serve
+    asked = stalling(monkeypatch, server.DECISION_SECONDS * 2)
     lane = Path(paired["lanes"]["codex"])
     identity = json.loads((lane.parent / "codex-identity.json").read_text())
-    body = json.dumps(
+    token = identity["registration_token"]
+    body = hook_body(lane)
+    port = bridge.config["port"]
+    answers = [
+        hook.request(port, token, body)
+        for _ in range(server.UNDECIDED_LIMIT + 2)
+    ]
+    assert [status for status, _ in answers] == [hook.DECIDING] * len(answers)
+    assert json.loads(answers[-1][1])["detail"] == server.UNDECIDED
+    assert len(asked) == server.UNDECIDED_LIMIT
+    entries = capsys.readouterr().out.splitlines()
+    assert sum(" expired " in line for line in entries) == 1
+    held = [line for line in entries if "already has" in line]
+    assert len(held) == len(answers) - 1
+    assert "answered without starting another" in held[0]
+    assert token not in held[0]
+    monkeypatch.setattr(server.checkpoints, "serve", deciding)
+    deadline = time.monotonic() + 30
+    answered = hook.DECIDING
+    while answered != 200 and time.monotonic() < deadline:
+        answered = hook.request(port, token, body)[0]
+        time.sleep(0.05)
+    assert answered == 200
+
+
+def test_an_expired_decision_names_the_step_that_held_it(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    release = threading.Event()
+
+    def holding(home, request, stages=None):
+        stages.enter("mail")
+        release.wait(20)
+        return {"status": 0, "stdout": "{}\n", "stderr": ""}
+
+    monkeypatch.setattr(server.checkpoints, "serve", holding)
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    try:
+        status, _ = hook.request(
+            bridge.config["port"],
+            identity["registration_token"],
+            hook_body(lane),
+        )
+    finally:
+        release.set()
+    assert status == hook.DECIDING
+    entry = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " expired " in line
+    )
+    assert re.search(r"undecided after \d+\.\d{3} seconds", entry)
+    assert re.search(r"in mail \d+\.\d{3}s$", entry)
+
+
+def test_a_slow_served_decision_is_logged_with_its_duration(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    def unhurried(home, request, stages=None):
+        stages.enter("scan")
+        time.sleep(0.2)
+        return {"status": 0, "stdout": "{}\n", "stderr": ""}
+
+    monkeypatch.setattr(server, "SLOW_DECISION", 0.05)
+    monkeypatch.setattr(server.checkpoints, "serve", unhurried)
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    status, _ = hook.request(
+        bridge.config["port"], identity["registration_token"], hook_body(lane)
+    )
+    assert status == 200
+    entry = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " decided " in line
+    )
+    assert STAMP.match(entry)
+    assert re.search(r"codex in \d+\.\d{3} seconds: ", entry)
+    assert re.search(r"in scan \d+\.\d{3}s$", entry)
+
+
+def test_a_served_decision_times_every_step_it_walked(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    stages = checkpoints.Stages()
+    served = checkpoints.serve(
+        bridge.home,
         {
             "directory": str(lane.parent),
             "participant": "codex",
             "payload": {**ALLOW, "cwd": str(lane), "session_id": "s1"},
-        }
-    ).encode()
-    together = threading.Barrier(server.UNDECIDED_LIMIT + 1)
-    answers: list[int] = []
-
-    def ask():
-        together.wait(10)
-        status, _ = hook.request(
-            bridge.config["port"], identity["registration_token"], body
-        )
-        answers.append(status)
-
-    callers = [
-        threading.Thread(target=ask, daemon=True)
-        for _ in range(server.UNDECIDED_LIMIT + 1)
+        },
+        stages,
+    )
+    assert served["status"] == 0
+    assert [name for name, _ in stages.spent] == [
+        "start",
+        "process",
+        "roster",
+        "session",
+        "guard",
+        "lock",
+        "state",
+        "mail",
+        "scan",
     ]
-    for caller in callers:
-        caller.start()
-    for caller in callers:
-        caller.join(timeout=30)
-    assert answers == [hook.DECIDING] * (server.UNDECIDED_LIMIT + 1)
-    assert len(asked) == server.UNDECIDED_LIMIT
+    assert all(seconds >= 0 for _, seconds in stages.spent)
+    assert re.search(r"^start \d+\.\d{3}s ", stages.report())
+    assert re.search(r"in record \d+\.\d{3}s$", stages.report())
+
+
+def test_a_client_that_stopped_reading_is_recorded_as_one_line(
+    bridge, service, capsys
+):
+    try:
+        raise BrokenPipeError(32, "Broken pipe")
+    except BrokenPipeError:
+        service.handle_error(None, ("127.0.0.1", 0))
+    entry = next(
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if " unanswered " in line
+    )
+    assert STAMP.match(entry)
+    assert "stopped reading before the reply was written" in entry
+    assert "BrokenPipeError" not in entry
+    try:
+        raise ValueError("an unexpected failure")
+    except ValueError:
+        service.handle_error(None, ("127.0.0.1", 0))
+    recorded = capsys.readouterr().out
+    assert " failed request handling" in recorded
+    assert "ValueError: an unexpected failure" in recorded
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")

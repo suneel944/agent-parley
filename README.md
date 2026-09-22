@@ -149,6 +149,22 @@ agent-parley participant merge claude-2
 agent-parley participant pr claude-2
 ```
 
+Once a lane's pull request has merged, its worktree and branch are dead
+weight, and a long-lived project accumulates one of each per claim. The
+service reclaims them on its own, and `agent-parley gc` runs the same sweep on
+demand:
+
+```sh
+agent-parley gc           # what would be reclaimed, and what is kept and why
+agent-parley gc --apply   # reclaim the lanes whose work has landed
+```
+
+A lane is reclaimed only when it is idle, holds no claim, has nothing
+uncommitted, carries no commit the base checkout or its own upstream lacks,
+and the forge shows its pull request merged or its branch already gone. Every
+other lane is kept and reported with the condition that held it, including a
+pull request that was closed without merging.
+
 A repository can also authorize the second of those for the lane itself, with
 `pull_request.self_service` in its private project settings. It is off by
 default; with it on, a lane opens the pull request for its own work only after

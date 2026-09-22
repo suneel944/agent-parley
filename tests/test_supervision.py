@@ -18,7 +18,7 @@ from agent_parley import (
     supervision,
     terminal,
 )
-from agent_parley.checkpoints import mailbox
+from agent_parley.checkpoints import mailbox, participant_liveness
 from agent_parley.state import write_json
 
 
@@ -70,6 +70,84 @@ def test_presence_separates_an_idle_lane_from_a_stopped_one(tmp_path):
     unknown = supervision.presence(tmp_path, "lane")
     assert unknown["state"] == supervision.UNKNOWN
     assert unknown["process_alive"] is None
+
+
+def live(tmp_path, **extra):
+    """Publishes an activity record whose session process is alive."""
+    write_json(
+        tmp_path / "lane-activity.json",
+        {
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+            **extra,
+        },
+    )
+
+
+def test_an_open_tool_call_reads_as_working_until_the_tool_timeout(tmp_path):
+    live(
+        tmp_path,
+        activity="working",
+        event="PreToolUse",
+        updated=time.time() - 359,
+    )
+    derived = supervision.lane_state(
+        json.loads((tmp_path / "lane-activity.json").read_text()), 300
+    )
+    assert derived["state"] == supervision.WORKING
+    assert derived["evidence"] == "working; tool call in flight"
+    assert derived["stale"] is False
+    assert derived["age_seconds"] == 359
+    observed = supervision.presence(tmp_path, "lane", 300)
+    assert observed["state"] == supervision.ACTIVE
+    assert observed["activity"] == supervision.WORKING
+    assert (
+        participant_liveness(tmp_path, "lane", 300)
+        == "working; tool call in flight; event 359s ago"
+    )
+    live(
+        tmp_path,
+        activity="working",
+        event="PreToolUse",
+        updated=time.time() - supervision.TOOL_TIMEOUT - 1,
+    )
+    assert supervision.presence(tmp_path, "lane", 300)["stale"] is True
+
+
+def test_an_aged_record_reads_as_stale_with_its_age_not_as_current(tmp_path):
+    live(tmp_path, activity="working", updated=time.time() - 108363)
+    derived = supervision.lane_state(
+        json.loads((tmp_path / "lane-activity.json").read_text()), 300
+    )
+    assert derived["state"] == supervision.IDLE
+    assert derived["stale"] is True
+    assert derived["evidence"] == "stale; last working"
+    assert derived["age_seconds"] == 108363
+    assert supervision.presence(tmp_path, "lane", 300)["state"] == (
+        supervision.IDLE
+    )
+    assert (
+        participant_liveness(tmp_path, "lane", 300)
+        == "stale; last working; event 108363s ago"
+    )
+
+
+def test_a_lane_with_a_live_process_is_never_reported_stopped(tmp_path):
+    for recorded in ("stopped", "idle", "waiting for approval", "working"):
+        live(tmp_path, activity=recorded, updated=time.time())
+        derived = supervision.lane_state(
+            json.loads((tmp_path / "lane-activity.json").read_text()), 300
+        )
+        assert derived["state"] != supervision.STOPPED
+        assert derived["process_alive"] is True
+        assert supervision.presence(tmp_path, "lane", 300)["state"] != (
+            supervision.STOPPED
+        )
+        assert "stopped" not in participant_liveness(tmp_path, "lane", 300)
+    live(tmp_path, activity="stopped", updated=time.time() - 108363)
+    assert supervision.lane_state(
+        json.loads((tmp_path / "lane-activity.json").read_text()), 300
+    )["state"] == (supervision.IDLE)
 
 
 def test_presence_reports_no_age_before_the_first_checkpoint(tmp_path):

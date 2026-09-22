@@ -500,41 +500,189 @@ def complete(
                 "commit": commit,
             }
         )
-        for waiting in ledger["issues"].values():
-            blockers = waiting.get("blocked_by", [])
-            if issue not in blockers:
-                continue
-            waiting["blocked_by"] = [
-                number for number in blockers if number != issue
-            ]
-            waiting_execution = state(waiting)
-            condition = waiting_execution.get("resume_when") or {}
-            dependency = (
-                ledger["issues"].get(str(condition.get("issue")))
-                if isinstance(condition, dict)
-                and condition.get("kind") == "issue"
-                else None
-            )
-            if (
-                not waiting["blocked_by"]
-                and waiting_execution["state"] == BLOCKED
-                and dependency
-                and state(dependency)["state"] == COMPLETE
-            ):
-                waiting_execution.update(
-                    state=RUNNING if waiting.get("owner") else QUEUED,
-                    next_action=("resume" if waiting.get("owner") else "claim"),
-                    updated_at=now,
-                    blocker="",
-                    resume_when="",
-                )
-                waiting["execution"] = waiting_execution
+        _reconcile_dependents(ledger, issue, now)
         ledger["revision"] += 1
         write_json(directory / "issues.json", ledger)
     from agent_parley import store
 
     store.supersede_project_claim(
         directory, claim_id, f"issue #{issue} completed"
+    )
+    return record
+
+
+def _reconcile_dependents(ledger: dict, issue: str, now: float) -> None:
+    """Frees the issues that waited on one that has reached a terminal state.
+
+    Args:
+        ledger: Mutable issue ledger being written.
+        issue: Issue number that has just become complete.
+        now: Instant the terminal transition was recorded at.
+    """
+    for waiting in ledger["issues"].values():
+        blockers = waiting.get("blocked_by", [])
+        if issue not in blockers:
+            continue
+        waiting["blocked_by"] = [
+            number for number in blockers if number != issue
+        ]
+        waiting_execution = state(waiting)
+        condition = waiting_execution.get("resume_when") or {}
+        dependency = (
+            ledger["issues"].get(str(condition.get("issue")))
+            if isinstance(condition, dict) and condition.get("kind") == "issue"
+            else None
+        )
+        if (
+            not waiting["blocked_by"]
+            and waiting_execution["state"] == BLOCKED
+            and dependency
+            and state(dependency)["state"] == COMPLETE
+        ):
+            waiting_execution.update(
+                state=RUNNING if waiting.get("owner") else QUEUED,
+                next_action=("resume" if waiting.get("owner") else "claim"),
+                updated_at=now,
+                blocker="",
+                resume_when="",
+            )
+            waiting["execution"] = waiting_execution
+
+
+def resolve(
+    directory: Path,
+    issue: str,
+    *,
+    evidence: dict,
+    outcome: str,
+    actor: str,
+    reason: str = "",
+) -> dict:
+    """Ends a claim whose holder never answered its completion reminder.
+
+    This is the operator's transition, not the holder's, and it is recorded as
+    its own action so history never reads as though the lane filed the work
+    itself. It is reachable only for a claim the supervisor has escalated as
+    an unresolved completion, so a holder that answers is never resolved out
+    from under it, and only for evidence the caller has already correlated
+    with the current ownership generation.
+
+    A merged pull request names the commit that carries the work, so the
+    ``complete`` outcome records that commit and frees the issues waiting on
+    it. A closed pull request integrated nothing, so the ``release`` outcome
+    returns the work to the queue instead; it supersedes a stale ready state,
+    because the generation that reported ready has ended on the forge.
+
+    Args:
+        directory: Private project state directory.
+        issue: Issue number being resolved.
+        evidence: Forge observation justifying the transition, carrying the
+            branch, the pull request state, its merge commit where one exists
+            and the instant it was observed.
+        outcome: ``complete`` for merged work, ``release`` to requeue it.
+        actor: Operator identity recording the transition.
+        reason: Operator rationale kept beside the evidence.
+
+    Returns:
+        The resolved issue record.
+
+    Raises:
+        BridgeError: If the issue is unheld, carries no escalation for its
+            current generation, or the evidence does not support the outcome.
+    """
+    if outcome not in ("complete", "release"):
+        raise BridgeError("Resolution outcome must be complete or release.")
+    commit = str(evidence.get("commit") or "")
+    if outcome == "complete" and (
+        evidence.get("state") != "MERGED" or not COMMIT.fullmatch(commit)
+    ):
+        raise BridgeError(
+            "Completion needs a merged pull request naming its merge commit; "
+            "release the claim instead."
+        )
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = _snapshot(directory)
+        record = ledger["issues"].get(issue)
+        if not record or not record.get("owner"):
+            raise BridgeError(f"Issue #{issue} has no owner.")
+        escalation = record.get("unresolved_completion") or {}
+        if escalation.get("claim_id") != record.get("claim_id"):
+            raise BridgeError(
+                f"Issue #{issue} has no unresolved completion; the supervisor "
+                "escalates only after the holder leaves its completion "
+                "reminders unanswered."
+            )
+        holder = record["owner"]
+        now = time.time()
+        execution = state(record)
+        if outcome == "complete":
+            execution.update(
+                state=COMPLETE,
+                next_action="none",
+                updated_at=now,
+                commit=commit,
+                integrated_commit=commit,
+                gate={
+                    "command": [],
+                    "status": "observed on the forge",
+                    "commit": commit,
+                    "at": now,
+                },
+                blocker="",
+                resume_when="",
+            )
+            record.update(completed_by=holder, completed_at=now)
+        else:
+            execution.update(
+                state=QUEUED,
+                claim_id=None,
+                next_action="claim",
+                updated_at=now,
+                blocker="",
+                resume_when="",
+                commit="",
+                gate=None,
+            )
+        record.update(
+            owner=None,
+            offer=None,
+            request=None,
+            deadline=None,
+            execution=execution,
+            resolution={
+                "outcome": outcome,
+                "actor": actor,
+                "holder": holder,
+                "reason": reason,
+                "at": now,
+                "claim_id": record.get("claim_id"),
+                "evidence": dict(evidence),
+            },
+        )
+        record.pop("unresolved_completion", None)
+        record.setdefault("history", []).append(
+            {
+                "action": "resolve",
+                "actor": actor,
+                "at": now,
+                "owner": None,
+                "offer": None,
+                "request": None,
+                "offer_id": None,
+                "claim_id": record.get("claim_id"),
+                "outcome": outcome,
+                "holder": holder,
+                "evidence": dict(evidence),
+            }
+        )
+        if outcome == "complete":
+            _reconcile_dependents(ledger, issue, now)
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+    from agent_parley import store
+
+    store.supersede_project_claim(
+        directory, str(record.get("claim_id") or ""), f"issue #{issue} resolved"
     )
     return record
 

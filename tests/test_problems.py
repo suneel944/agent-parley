@@ -9,7 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, dashboard, issues, problems, protocol, store
+from agent_parley import (
+    cli,
+    completion,
+    dashboard,
+    issues,
+    problems,
+    protocol,
+    store,
+    supervision,
+)
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
 
@@ -36,18 +45,39 @@ def stopped(directory, name):
     )
 
 
-def deliver(bridge, repo, paired, *, ack=False, aged=0):
-    """Delivers one operator message and ages it in the store."""
+def deliver(bridge, repo, paired, *, ack=False, aged=0, count=1):
+    """Delivers operator messages and ages them in the store."""
     store.initialize(bridge.home)
     store.register(bridge.home, paired["root"], "claude")
-    delivered = bridge.say(repo, "claude", "Answer this", ack=ack)
+    sent = [
+        bridge.say(repo, "claude", f"Answer this {number}", ack=ack)
+        for number in range(count)
+    ]
     if aged:
         with store.connect(bridge.home, write=True) as db:
-            db.execute(
+            db.executemany(
                 "UPDATE messages SET created_ts=datetime('now',?) WHERE id=?",
-                (f"-{aged} seconds", delivered["id"]),
+                [(f"-{aged} seconds", item["id"]) for item in sent],
             )
-    return delivered
+    return sent[0]
+
+
+def unwoken(bridge):
+    """Turns the coordination service's wake loop off for the estate."""
+    write_json(bridge.home / "supervision.json", {"wake": False})
+
+
+def refuse(directory, name, result, attempts=0):
+    """Records one wake refusal for a lane."""
+    write_json(
+        directory / f"{name}-wake.json",
+        {
+            "at": time.time(),
+            "attempts": attempts,
+            "backlog": ["1"],
+            "result": result,
+        },
+    )
 
 
 @pytest.fixture
@@ -121,7 +151,7 @@ def test_a_store_behind_the_build_names_the_migration(
     assert bridge.problems()[0] == row
 
 
-def test_a_stalled_lane_names_the_waiting_item_and_the_resume(
+def test_a_stalled_lane_the_service_still_wakes_is_reported_as_its_work(
     bridge, repo, paired, served
 ):
     directory = bridge.project(repo)[1]
@@ -131,11 +161,44 @@ def test_a_stalled_lane_names_the_waiting_item_and_the_resume(
     assert row["participant"] == "claude"
     assert row["detail"].startswith("idle; message")
     assert row["seconds"] >= 1800
+    assert row["actor"] == problems.BY_SERVICE
+    assert row["command"] == (
+        "the coordination service wakes claude on its next poll; no "
+        "operator action yet"
+    )
+    assert "agent-parley" not in row["command"]
+    assert not rows(bridge, problems.INACTIVE)
+
+
+def test_a_stalled_lane_the_service_cannot_wake_names_the_say(
+    bridge, repo, paired, served
+):
+    unwoken(bridge)
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    deliver(bridge, repo, paired, aged=1800)
+    [row] = rows(bridge, problems.STALLED)
+    assert row["actor"] == problems.BY_OPERATOR
     assert row["command"] == (
         f'agent-parley say claude "<text>" --repo {paired["root"]}'
     )
     assert "--resume" not in row["command"]
-    assert not rows(bridge, problems.INACTIVE)
+
+
+def test_a_lane_the_service_has_woken_reports_the_attempts_it_made(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    refuse(directory, "claude", "busy:turn", attempts=2)
+    deliver(bridge, repo, paired, aged=1800)
+    [row] = rows(bridge, problems.STALLED)
+    assert row["actor"] == problems.BY_SERVICE
+    assert row["command"] == (
+        "the coordination service has woken claude 2 times and wakes it "
+        "again on its next poll; no operator action yet"
+    )
+    assert not rows(bridge, problems.WAKE)
 
 
 def test_a_stopped_lane_awaiting_acknowledgement_names_the_resume(
@@ -158,32 +221,53 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     alive(bridge.project(repo)[1], "claude")
     [row] = rows(bridge, problems.INACTIVE)
     assert row["participant"] == "claude"
-    assert row["command"].startswith('agent-parley say claude "<text>"')
+    assert row["actor"] == problems.BY_SERVICE
+    assert row["command"].startswith("the coordination service wakes claude")
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
 
 
-@pytest.mark.parametrize(
-    "result,detail",
-    [
-        ("busy:input", "operator input is pending"),
-        ("busy:repeat", "produced no checkpoint"),
-        ("manual attention required", "requires operator attention"),
-    ],
-)
-def test_a_wake_refusal_names_its_reason_and_terminal_remedy(
-    bridge, repo, paired, served, result, detail
+def test_a_paused_lane_is_resumed_rather_than_spoken_to(
+    bridge, repo, paired, served
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    write_json(
-        directory / "claude-wake.json",
-        {
-            "at": time.time(),
-            "attempts": 0,
-            "backlog": ["1"],
-            "result": result,
-        },
+    bridge.pause(repo, "claude")
+    [row] = rows(bridge, problems.INACTIVE)
+    assert row["actor"] == problems.BY_OPERATOR
+    assert row["command"] == (
+        f"agent-parley participant resume claude --repo {paired['root']}"
     )
+
+
+@pytest.mark.parametrize(
+    "result,detail,remedy",
+    [
+        (
+            problems.DIALOG,
+            "operator input is pending",
+            "answer the prompt open in claude's own client; it reads no "
+            "mail until that prompt is cleared",
+        ),
+        (
+            problems.ATTENTION,
+            "requires operator attention",
+            "take the turn waiting in claude's own client; the service "
+            "stopped asking after its refusals",
+        ),
+        (
+            problems.RETRY,
+            "produced no checkpoint",
+            "the coordination service wakes claude on its next poll; no "
+            "operator action yet",
+        ),
+    ],
+)
+def test_a_wake_refusal_names_its_reason_and_an_actor_who_can_clear_it(
+    bridge, repo, paired, served, result, detail, remedy
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    refuse(directory, "claude", result)
     [record] = [
         row
         for row in bridge.status_snapshot()["projects"][0]["participants"]
@@ -192,9 +276,39 @@ def test_a_wake_refusal_names_its_reason_and_terminal_remedy(
     assert record["wake"]["result"] == result
     [row] = rows(bridge, problems.WAKE)
     assert detail in row["detail"]
+    assert row["command"] == remedy
+    assert "complete or stop the session" not in row["command"]
+
+
+def test_a_lane_that_cannot_read_mail_is_never_offered_say(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    refuse(directory, "claude", problems.DIALOG)
+    deliver(bridge, repo, paired, ack=True, aged=1800)
+    found = rows(bridge, ack_after=600)
+    assert found
+    assert all("agent-parley say" not in row["command"] for row in found)
+    [row] = [item for item in found if item["condition"] == problems.ACK]
+    assert row["actor"] == problems.BY_OPERATOR
+    assert "reads no mail" in row["command"]
+
+
+def test_a_live_working_lane_is_never_told_to_stop_its_session(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude", updated=time.time())
+    refuse(directory, "claude", problems.RETRY)
+    [row] = rows(bridge, problems.WAKE)
+    assert row["actor"] == problems.BY_SERVICE
     assert row["command"] == (
-        "return to claude's terminal and complete or stop the session"
+        "the coordination service wakes claude once it goes idle; the lane "
+        "is active and needs no operator now"
     )
+    assert "terminal" not in row["command"]
+    assert not rows(bridge, problems.INACTIVE)
 
 
 def test_an_overdue_claim_names_the_release(bridge, repo, paired, served):
@@ -207,6 +321,27 @@ def test_an_overdue_claim_names_the_release(bridge, repo, paired, served):
     [row] = rows(bridge, problems.OVERDUE)
     assert row["participant"] == "claude"
     assert row["seconds"] >= 300
+    assert row["command"] == (
+        f"agent-parley issue release 42 --repo {paired['root']}"
+    )
+    assert row["count"] == 1
+
+
+def test_two_overdue_claims_on_one_lane_are_one_row(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    for number in ("42", "43"):
+        bridge.issue(paired["lanes"]["claude"], "claim", number, within=60)
+    state = issues.snapshot(directory)
+    state["issues"]["42"]["deadline"] = time.time() - 900
+    state["issues"]["43"]["deadline"] = time.time() - 300
+    state["revision"] += 1
+    write_json(directory / "issues.json", state)
+    [row] = rows(bridge, problems.OVERDUE)
+    assert row["count"] == 2
+    assert row["seconds"] >= 900
+    assert row["detail"] == "2 claims are past their deadline: #42, #43"
     assert row["command"] == (
         f"agent-parley issue release 42 --repo {paired['root']}"
     )
@@ -233,6 +368,32 @@ def test_an_unanswered_offer_names_its_recipient_and_the_cancel(
     )
 
 
+def test_two_offers_waiting_on_one_lane_are_one_row(
+    bridge, repo, paired, served
+):
+    for number in ("1", "2"):
+        bridge.issue(paired["lanes"]["claude"], "claim", number)
+        bridge.issue(
+            paired["lanes"]["claude"],
+            "offer",
+            number,
+            to="codex",
+            summary="Take it",
+        )
+    directory = bridge.project(repo)[1]
+    state = issues.snapshot(directory)
+    state["issues"]["1"]["offer"]["created"] = time.time() - 900
+    state["revision"] += 1
+    write_json(directory / "issues.json", state)
+    [row] = rows(bridge, problems.OFFER)
+    assert row["count"] == 2
+    assert row["seconds"] >= 900
+    assert row["detail"] == "2 offers await codex, the oldest issue #1 by peer"
+    assert row["command"] == (
+        f"agent-parley issue cancel 1 --repo {paired['root']}"
+    )
+
+
 def test_a_message_awaiting_acknowledgement_past_the_age_is_a_row(
     bridge, repo, paired, served
 ):
@@ -243,7 +404,26 @@ def test_a_message_awaiting_acknowledgement_past_the_age_is_a_row(
     [row] = rows(bridge, problems.ACK, ack_after=600)
     assert f"message {delivered['id']} from operator" in row["detail"]
     assert row["seconds"] >= 1800
-    assert row["command"].startswith('agent-parley say claude "<text>"')
+    assert row["count"] == 1
+    assert row["actor"] == problems.BY_SERVICE
+    assert row["command"].startswith("the coordination service wakes claude")
+
+
+def test_a_parked_lane_with_twenty_awaited_messages_is_one_row(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    stopped(directory, "claude")
+    deliver(bridge, repo, paired, ack=True, aged=1800, count=20)
+    found = rows(bridge, ack_after=600)
+    assert [row["condition"] for row in found] == [problems.ACK]
+    [row] = found
+    assert row["count"] == 20
+    assert row["seconds"] >= 1800
+    assert row["detail"].startswith("20 messages await acknowledgement, ")
+    assert row["command"] == (
+        f"agent-parley run claude --resume --repo {paired['root']}"
+    )
 
 
 def test_a_broadcast_costs_one_row_per_parked_lane(
@@ -322,13 +502,23 @@ def test_a_drifted_lane_names_the_restore(bridge, repo, paired, served):
     assert not rows(bridge, problems.DIRTY)
 
 
-def test_a_quiet_dirty_worktree_names_the_retire(bridge, repo, paired, served):
-    (Path(paired["lanes"]["claude"]) / "draft.txt").write_text("unfinished\n")
+def test_a_quiet_dirty_worktree_names_its_path_and_files_without_retiring(
+    bridge, repo, paired, served
+):
+    lane = Path(paired["lanes"]["claude"])
+    (lane / "draft.txt").write_text("unfinished\n")
+    (lane / "notes.md").write_text("unfinished\n")
     [row] = rows(bridge, problems.DIRTY)
     assert row["participant"] == "claude"
+    assert row["count"] == 2
+    assert str(lane) in row["detail"]
+    assert "draft.txt" in row["detail"] and "notes.md" in row["detail"]
+    assert row["actor"] == problems.BY_OPERATOR
     assert row["command"] == (
-        f"agent-parley participant retire claude --repo {paired['root']}"
+        f"commit or stash the work in {lane}; retiring claude would drop "
+        "the claims it holds to clean one directory"
     )
+    assert "agent-parley" not in row["command"]
 
 
 def test_a_lane_over_its_budget_names_the_budget_command(
@@ -382,6 +572,8 @@ def test_the_json_document_carries_every_row(
     document = json.loads(out)
     assert document["kind"] == "problems"
     assert document["count"] == 2
+    assert document["operator"] == 1
+    assert document["service"] == 1
     assert [row["condition"] for row in document["problems"]] == [
         problems.SERVICE,
         problems.INACTIVE,
@@ -392,6 +584,8 @@ def test_the_json_document_carries_every_row(
         "condition",
         "detail",
         "seconds",
+        "count",
+        "actor",
         "command",
     }
 
@@ -399,6 +593,7 @@ def test_the_json_document_carries_every_row(
 def test_every_printed_row_names_the_lane_the_age_and_the_command(
     bridge, repo, paired, served, monkeypatch, capsys
 ):
+    unwoken(bridge)
     alive(bridge.project(repo)[1], "claude")
     code, out = run(monkeypatch, capsys, bridge)
     assert code == 1
@@ -407,6 +602,197 @@ def test_every_printed_row_names_the_lane_the_age_and_the_command(
     assert problems.INACTIVE in line
     assert line.endswith(f"--repo {paired['root']}")
     assert line.split()[0].endswith("h")
+
+
+def test_the_report_closes_by_counting_what_the_service_is_handling(
+    bridge, repo, paired, served, monkeypatch, capsys
+):
+    alive(bridge.project(repo)[1], "claude")
+    code, out = run(monkeypatch, capsys, bridge)
+    assert code == 1
+    printed = out.splitlines()
+    assert len(printed) == 2
+    assert printed[-1] == (
+        "0 need an operator; 1 the coordination service is handling."
+    )
+
+
+def declared():
+    """Maps every command path the CLI declares to its subcommands."""
+    parser, _ = cli.root_parser(None)
+    return {path: names for path, names, _ in completion.tree(parser)}
+
+
+def cited(remedy):
+    """Lists the command words each `agent-parley` mention in a remedy names."""
+    words = [word.strip(",.;") for word in remedy.split()]
+    return [
+        words[index + 1 : index + 3]
+        for index, word in enumerate(words)
+        if word == "agent-parley"
+    ]
+
+
+def lane_record(**extra):
+    """Shapes one participant record carrying no condition."""
+    return {
+        "participant": "claude",
+        "availability": {
+            "state": supervision.IDLE,
+            "process_alive": True,
+            "age_seconds": 900,
+        },
+        "idle": {
+            "stalled": False,
+            "kind": None,
+            "message_id": None,
+            "sender": "",
+            "age_seconds": 0,
+            "served_age_seconds": None,
+        },
+        "claims": [],
+        "mail": {"outstanding_ack": []},
+        "drift": False,
+        "branch": "work",
+        "assigned_branch": "work",
+        "paused": False,
+        "budget": {"over": False, "marker": "over budget; hours 2h of 1h"},
+        "wake": None,
+        **extra,
+    }
+
+
+LANE_STATES = [
+    {},
+    {"paused": True},
+    {
+        "availability": {
+            "state": supervision.ACTIVE,
+            "process_alive": True,
+            "age_seconds": 10,
+        }
+    },
+    {
+        "availability": {
+            "state": supervision.STOPPED,
+            "process_alive": False,
+            "age_seconds": 900,
+        }
+    },
+    {"wake": {"result": problems.DIALOG, "attempts": 1, "age_seconds": 60}},
+    {"wake": {"result": problems.ATTENTION, "attempts": 3, "age_seconds": 60}},
+    {"wake": {"result": problems.RETRY, "attempts": 0, "age_seconds": 60}},
+    {"wake": {"result": problems.RETRY, "attempts": 9, "age_seconds": 60}},
+]
+
+LANE_CAUSES = [
+    {},
+    {
+        "idle": {
+            "stalled": True,
+            "kind": "unread",
+            "message_id": 3,
+            "sender": "operator",
+            "age_seconds": 900,
+            "served_age_seconds": None,
+        }
+    },
+    {"claims": [{"issue": 42, "overdue": True, "overdue_seconds": 900}]},
+    {
+        "claims": [
+            {
+                "issue": 42,
+                "overdue": False,
+                "overdue_seconds": 0,
+                "unresolved": True,
+                "reason": "the lane pull request is merged",
+                "observed_at": 0,
+            }
+        ]
+    },
+    {
+        "mail": {
+            "outstanding_ack": [
+                {"message_id": 3, "sender": "operator", "age_seconds": 900}
+            ]
+        }
+    },
+    {"drift": True, "branch": "elsewhere"},
+    {"budget": {"over": True, "marker": "over budget; hours 2h of 1h"}},
+]
+
+OFFERED = {
+    "root": "/root",
+    "issues": [
+        {"issue": 7, "offer": {"to": "codex", "created_at": None}},
+        {
+            "issue": 8,
+            "offer": {
+                "to": "mimi",
+                "created_at": "2026-09-20T10:00:00Z",
+                "source": "operator",
+            },
+        },
+    ],
+}
+
+
+def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
+    monkeypatch,
+):
+    monkeypatch.setattr(supervision, "dirty_paths", lambda lane: ["draft.txt"])
+    tree = declared()
+    emitted = [
+        problems._row(problems.STORE, "schema is behind", protocol.MIGRATE),
+        problems._row(problems.STORE, "schema is ahead", protocol.UPGRADE),
+        problems._row(problems.SERVICE, "not ready", "agent-parley up"),
+        *problems._offer_rows(OFFERED, time.time()),
+    ]
+    for waking in (True, False):
+        for state in LANE_STATES:
+            for cause in LANE_CAUSES:
+                emitted.extend(
+                    problems._lane_rows(
+                        lane_record(**{**cause, **state}),
+                        {"lane": "/lane", "branch": "work"},
+                        "/root",
+                        {**supervision.DEFAULTS, "wake": waking},
+                        600,
+                        time.time(),
+                    )
+                )
+    assert {row["condition"] for row in emitted} == {
+        problems.STORE,
+        problems.SERVICE,
+        problems.STALLED,
+        problems.INACTIVE,
+        problems.OVERDUE,
+        problems.UNRESOLVED,
+        problems.OFFER,
+        problems.ACK,
+        problems.DRIFT,
+        problems.DIRTY,
+        problems.BUDGET,
+        problems.WAKE,
+    }
+    for row in emitted:
+        assert row["actor"] in (problems.BY_OPERATOR, problems.BY_SERVICE)
+        assert row["command"]
+        remedy = row["command"]
+        pasteable = remedy.startswith("agent-parley")
+        assert not (pasteable and row["actor"] == problems.BY_SERVICE), remedy
+        for words in cited(remedy):
+            if words[0] not in tree[""]:
+                assert not pasteable, remedy
+                continue
+            if tree[words[0]]:
+                assert words[1:2] and words[1] in tree[words[0]], remedy
+        if not pasteable:
+            assert " " in remedy
+            assert any(
+                named in remedy
+                for named in ("claude", "/lane", "agent-parley", "service")
+            ), remedy
 
 
 class Screen:
@@ -473,6 +859,8 @@ def test_top_shows_the_problem_rows_in_place_on_p(monkeypatch, tmp_path):
                 "condition": problems.STALLED,
                 "detail": "idle; message 3 from operator waiting 900s",
                 "seconds": 900,
+                "count": 1,
+                "actor": problems.BY_OPERATOR,
                 "command": "agent-parley run claude --resume --repo /repo",
             }
         ]

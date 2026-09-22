@@ -86,9 +86,35 @@ def released(record: dict) -> bool:
         Whether the issue is explicitly released or completed.
     """
     history = record.get("history") or []
-    if history and history[-1].get("action") == "release":
+    if history and history[-1].get("action") in ("release", "resolve"):
         return True
     return lifecycle.state(record)["state"] == lifecycle.COMPLETE
+
+
+def unresolved_completion(record: dict) -> dict:
+    """Derives the unresolved-completion escalation a claim reads as.
+
+    The marker belongs to the ownership generation it was recorded against, so
+    a claim that was released and taken again reads as resolved until the
+    supervisor observes the new generation the same way.
+
+    Args:
+        record: Published ledger record for one issue, or an empty mapping.
+
+    Returns:
+        Whether the current generation carries an escalation, the clause that
+        states why, the observed pull request state, the unanswered reminders
+        counted and the instant that state was observed.
+    """
+    marker = record.get("unresolved_completion") or {}
+    standing = bool(marker) and marker.get("claim_id") == record.get("claim_id")
+    return {
+        "unresolved": standing,
+        "reason": marker.get("reason", "") if standing else "",
+        "branch_state": marker.get("state", "") if standing else "",
+        "reminders": int(marker.get("reminders", 0) or 0) if standing else 0,
+        "observed_at": marker.get("observed_at") if standing else None,
+    }
 
 
 def offer_source(offer: dict | None) -> str:
@@ -1065,6 +1091,27 @@ def _carried(source: dict) -> str:
     return "".join(f"\n{line}" for line in lines)
 
 
+def orphan_age(orphan: dict) -> int:
+    """Reports how long ago an orphan marker recorded its observation.
+
+    A marker states what the supervisor saw when it was written, which is not
+    a reading of the owner at the moment it is displayed. Readers carry the
+    age so an operator sees the observation together with its instant instead
+    of a claim about the present.
+
+    Args:
+        orphan: Orphan marker a ledger record carries.
+
+    Returns:
+        Whole seconds since the marker was written, and zero for a marker
+        that recorded no instant.
+    """
+    created = float(orphan.get("created") or 0.0)
+    if not created:
+        return 0
+    return int(max(0.0, time.time() - created))
+
+
 def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
     """Formats active ownership and pending offers without changing state.
 
@@ -1080,9 +1127,10 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         issue, or a notice that none are claimed. An unclaimed issue appears
         only while an offer waits on it, reported as unclaimed and naming the
         operator as the source when the command line recorded that offer. A
-        claim whose owner the supervisor marked orphaned states that marker,
-        the reservations that owner still holds and the command a peer takes
-        it with; the issue stays owned until that take is recorded.
+        claim whose owner the supervisor marked orphaned states that marker
+        and how long ago it was recorded rather than a reading of that owner
+        now, the reservations that owner still holds and the command a peer
+        takes it with; the issue stays owned until that take is recorded.
     """
     lines = []
     for number, record in sorted(
@@ -1103,8 +1151,9 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             line += f" — {title}"
         if orphan := record.get("orphan"):
             line += (
-                f"; orphaned, {orphan['reason']}; still owned until a peer "
-                f"runs issue claim {number} --take-orphaned"
+                f"; marked orphaned {orphan_age(orphan)}s ago, "
+                f"{orphan['reason']}; still owned until a peer runs issue "
+                f"claim {number} --take-orphaned"
             )
             if keys := orphan.get("reservations"):
                 line += "\n  Held reservations: " + ", ".join(keys)

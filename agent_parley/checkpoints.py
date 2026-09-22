@@ -50,6 +50,53 @@ OUTAGE_GUIDANCE = (
     "spawns until coordination answers again."
 )
 HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
+FIRST_STAGE = "start"
+
+
+class Stages:
+    """Times the named steps one decision walks through.
+
+    A hook decision is a sequence of steps against the lane's state: the
+    roster read, the Git branch inspection, the wait for the lane's
+    checkpoint lock, the mailbox read, the coordination scans and the
+    recovery capture. When a decision runs past the hook's budget the
+    operator needs the step that spent the time, not the total, because the
+    total is already known to be the deadline.
+
+    A step is closed by the entry of the next one, so a decision still
+    running is reported as its finished steps plus the step it is holding
+    and how long it has held it. The open step is a single attribute so a
+    reader on the service's own thread sees a step and its start together
+    rather than one of each.
+
+    Durations are wall-clock seconds from a monotonic source, and no step
+    name carries a path, a credential or peer content.
+    """
+
+    def __init__(self) -> None:
+        """Opens the first step of a decision that starts now."""
+        self.spent: list[tuple[str, float]] = []
+        self.open: tuple[str, float] = (FIRST_STAGE, time.monotonic())
+
+    def enter(self, name: str) -> None:
+        """Closes the open step and opens the one starting now.
+
+        Args:
+            name: Single word naming the step that is starting.
+        """
+        now = time.monotonic()
+        step, started = self.open
+        self.spent.append((step, now - started))
+        self.open = (name, now)
+
+    def report(self) -> str:
+        """Describes the finished steps and the one still running."""
+        finished = " ".join(
+            f"{name} {seconds:.3f}s" for name, seconds in self.spent[:]
+        )
+        step, started = self.open
+        held = time.monotonic() - started
+        return f"{finished} in {step} {held:.3f}s".strip()
 
 
 def clip(text: str, budget: int) -> str:
@@ -969,41 +1016,45 @@ def work_offer(directory: Path, agent: str) -> dict | None:
     return offer
 
 
-def participant_liveness(directory: Path, agent: str) -> str:
+def participant_liveness(
+    directory: Path, agent: str, inactive_after: float = 300
+) -> str:
     """Summarizes one lane's session state and last observed checkpoint.
 
     The launcher owns its lane's session lock for the whole session, so
     liveness is decided from the recorded session process instead. Probing
     that lock would make a concurrent launch fail while merely reporting.
 
+    The words come from the single lane derivation in `supervision`, so this
+    cell reports the same state as availability and the problems rows instead
+    of replaying the raw activity record as if it were current.
+
     Args:
         directory: Private state directory for the common repository.
         agent: Participant that owns the lane.
+        inactive_after: Age past which the published record reads as stale.
 
     Returns:
-        Session activity followed by the age of its last checkpoint event. A
+        The derived state's evidence followed by the age of that evidence. A
         lane held by a native approval prompt also reports how long that
         prompt has stood unanswered, which a repeated request does not reset.
     """
-    from agent_parley import dialogs
+    from agent_parley import dialogs, supervision
 
     state = activity(directory, agent)
-    running = process.alive(
-        state.get("session_pid"), state.get("session_ticks")
-    )
-    reported = state.get(
-        "activity", "running; checkpoints unavailable (relaunch)"
-    )
+    derived = supervision.lane_state(state, inactive_after)
     approval = dialogs.waited(state, time.time())
     waiting = (
-        f"; waiting {approval}s" if running and approval is not None else ""
-    )
-    age = (
-        f"; event {int(time.time() - state['updated'])}s ago"
-        if state.get("updated")
+        f"; waiting {approval}s"
+        if derived["process_alive"] and approval is not None
         else ""
     )
-    return f"{reported if running else 'stopped'}{waiting}{age}"
+    age = (
+        f"; event {derived['age_seconds']}s ago"
+        if derived["last_active"]
+        else ""
+    )
+    return f"{derived['evidence']}{waiting}{age}"
 
 
 def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
@@ -1316,6 +1367,13 @@ def native_process(
     identity is never eligible for work, so the launcher's own recorded
     identity is used to find the client it started instead.
 
+    A client that starts a new session identity in place, as clearing the
+    conversation does, sends that event from the process the lane already
+    recorded. When neither earlier reading answers, and a launcher that
+    has exited or was never recorded is the common reason, that recorded
+    process is confirmed through the hook's ancestry, so a live lane keeps
+    its identity across a new session instead of reading as stopped.
+
     Args:
         directory: Common project state directory.
         agent: Assigned native lane name.
@@ -1335,8 +1393,13 @@ def native_process(
         return None
     if not isinstance(state, dict):
         return None
-    return process.launched_process(
+    launched = process.launched_process(
         pid, state.get("launcher_pid"), state.get("launcher_ticks")
+    )
+    if launched is not None:
+        return launched
+    return process.recorded_process(
+        pid, state.get("session_pid"), state.get("session_ticks")
     )
 
 
@@ -1346,6 +1409,7 @@ def checkpoint(
     agent: str,
     payload: dict,
     session_process: process.ServerProcess | None = None,
+    stages: Stages | None = None,
 ) -> dict:
     """Observes a native event and prepares bounded coordination context.
 
@@ -1364,6 +1428,13 @@ def checkpoint(
     the dialog record naming the tool it asked about and the instant that wait
     began.
 
+    A session identity dropped because the process it named is gone records
+    the lane as stopped, so the state derivation still reads positive
+    evidence of an ended session. Dropping the identity alone would leave a
+    record no reader can tell from a lane that never recorded one, and that
+    reads as unknown rather than stopped, which is the state an operator is
+    told to return to a terminal for instead of relaunching.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -1371,6 +1442,8 @@ def checkpoint(
         payload: Native lifecycle event, including cwd and session identity.
         session_process: Native process identity derived from the generated
             hook's foreground terminal, when one is available.
+        stages: Timer the steps of this decision are recorded in, so a
+            decision past the hook's budget can name the step holding it.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -1384,6 +1457,8 @@ def checkpoint(
     ):
         record(directory, agent, payload, Reason.IGNORED_EVENT, None)
         return {}
+    stages = stages or Stages()
+    stages.enter("roster")
     manifest = roster.read(directory)
     participant = manifest["participants"].get(agent)
     if participant is None:
@@ -1393,6 +1468,7 @@ def checkpoint(
         raise BridgeError("Hook cwd does not belong to this agent's worktree.")
     from agent_parley import recovery
 
+    stages.enter("session")
     if fenced := recovery.stale_session(directory, agent, payload):
         record(
             directory,
@@ -1407,6 +1483,7 @@ def checkpoint(
         refusal = paused_output(event)
         record(directory, agent, payload, Reason.PAUSED, refusal, "paused")
         return refusal or {}
+    stages.enter("guard")
     try:
         guarded, guard_reason = branch_guard(
             event, payload, lane, participant["branch"]
@@ -1453,7 +1530,9 @@ def checkpoint(
         return {}
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
     state_path = directory / f"{agent}-activity.json"
+    stages.enter("lock")
     with lock(directory / f"{agent}-checkpoint.lock", timeout=LOCK_SECONDS):
+        stages.enter("state")
         state = (
             json.loads(state_path.read_text()) if state_path.exists() else {}
         )
@@ -1468,6 +1547,9 @@ def checkpoint(
         new_session = event == "SessionStart" and session != state.get(
             "session_id"
         )
+        ended = state.get("session_pid") is not None and not process.alive(
+            state.get("session_pid"), state.get("session_ticks")
+        )
         if new_session:
             state["cursor"] = 0
             state["issue_revision"] = -1
@@ -1475,9 +1557,7 @@ def checkpoint(
             state.pop("work_offer", None)
             state.pop("session_pid", None)
             state.pop("session_ticks", None)
-        elif event == "SessionStart" and not process.alive(
-            state.get("session_pid"), state.get("session_ticks")
-        ):
+        elif event == "SessionStart" and ended:
             state.pop("session_pid", None)
             state.pop("session_ticks", None)
         state.update(session_id=session, updated=time.time(), event=event)
@@ -1507,6 +1587,8 @@ def checkpoint(
             state["activity"] = (
                 "testing (command observed)" if testing else "working"
             )
+        if ended and session_process is None:
+            state["activity"] = "stopped"
         if event == "UserPromptSubmit":
             prompt = str(payload.get("prompt", ""))
             if operator_prompt(prompt):
@@ -1517,6 +1599,7 @@ def checkpoint(
         if event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
             from agent_parley import budgets
 
+            stages.enter("mail")
             try:
                 mail = mailbox(
                     home,
@@ -1534,6 +1617,7 @@ def checkpoint(
                         state.get("cursor", 0),
                     )
                 messages = mail["messages"]
+                stages.enter("scan")
                 issues = snapshot(directory)
                 ledger = issues
                 issue_notice = issues["revision"] != state.get(
@@ -1734,12 +1818,14 @@ def checkpoint(
                         }
                     }
         if event in ("SessionStart", "PostToolUse", "Stop", "SessionEnd"):
+            stages.enter("recovery")
             try:
                 saved = recovery.capture(directory, manifest, agent, payload)
                 state["recovery_checkpoints"] = [item["id"] for item in saved]
                 state.pop("recovery_error", None)
             except (BridgeError, OSError, ValueError) as exc:
                 state["recovery_error"] = clip(str(exc), MAX_CAUSE_BYTES)
+        stages.enter("record")
         write_json(state_path, state)
         record(
             directory,
@@ -1764,7 +1850,7 @@ def checkpoint(
         return output
 
 
-def serve(home: Path, request: dict) -> dict:
+def serve(home: Path, request: dict, stages: Stages | None = None) -> dict:
     """Decides one hook event and returns the hook process's contract.
 
     The same code answers the in-process hook and the service's loopback
@@ -1786,6 +1872,9 @@ def serve(home: Path, request: dict) -> dict:
             received them, an optional ``adapter``, an optional declared
             ``protocol``, and an optional ``fallback`` cause naming why the
             hook process could not use the service.
+        stages: Timer the steps of this decision are recorded in, so a
+            caller that abandons the decision at its own deadline can name
+            the step that was holding it.
 
     Returns:
         ``status``, ``stdout`` and ``stderr`` for the hook process to emit.
@@ -1830,11 +1919,13 @@ def serve(home: Path, request: dict) -> dict:
             from agent_parley import amp as adapter
         if adapter is not None:
             payload = adapter.payload(payload)
+        stages = stages or Stages()
+        stages.enter("process")
         session_process = native_process(
             directory, participant, request.get("hook_pid")
         )
         output = checkpoint(
-            home, directory, participant, payload, session_process
+            home, directory, participant, payload, session_process, stages
         )
         if adapter is not None:
             output = adapter.response(output)
