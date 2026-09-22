@@ -33,6 +33,7 @@ from pathlib import Path
 
 BACKLOG = 20
 HOURS = 24.0
+IDENTITY = ("Acceptance run", "acceptance@localhost")
 INTERVAL = 300.0
 SETTLE = 20.0
 LANES = (
@@ -108,17 +109,17 @@ def _document(cli: str, home: Path, args: list[str]) -> dict:
 
     Returns:
         The parsed document, or an ``error`` record when the command
-        failed or printed something that is not JSON. A sampling failure
-        is recorded rather than raised, because the run must survive one
-        bad frame.
+        printed nothing that parses. A document is taken whatever the
+        command's status was, because a view that reports conditions
+        exits non-zero while still printing the conditions. A sampling
+        failure is recorded rather than raised, because the run must
+        survive one bad frame.
     """
     result = _run([cli, "--home", str(home), *args, "--json"])
-    if result.returncode:
-        return {"error": result.stderr.strip() or result.stdout.strip()}
     try:
         return json.loads(result.stdout)
     except ValueError:
-        return {"error": result.stdout[:400]}
+        return {"error": result.stderr.strip() or result.stdout[:400].strip()}
 
 
 def workspace(path: Path, issues: int) -> None:
@@ -130,7 +131,11 @@ def workspace(path: Path, issues: int) -> None:
 
     Raises:
         SystemExit: The directory already holds a repository, which would
-            put the run on somebody's real work.
+            put the run on somebody's real work, or the seed commit failed.
+            The identity is set on this repository alone, because a machine
+            that keeps its identity per repository leaves the commit with
+            none and the whole run then fails later with a registration
+            error that names nothing.
     """
     if (path / ".git").exists():
         raise SystemExit(f"{path} already holds a repository")
@@ -152,11 +157,16 @@ def workspace(path: Path, issues: int) -> None:
                 behaviour=BEHAVIOURS[(number - 1) % len(BEHAVIOURS)],
             )
         )
-    _run(["git", "init", "-b", "main"], cwd=path)
-    _run(["git", "add", "-A"], cwd=path)
-    _run(
-        ["git", "commit", "-m", "chore: seed the acceptance backlog"], cwd=path
-    )
+    for command in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.name", IDENTITY[0]],
+        ["git", "config", "user.email", IDENTITY[1]],
+        ["git", "add", "-A"],
+        ["git", "commit", "-m", "chore: seed the acceptance backlog"],
+    ):
+        result = _run(command, cwd=path)
+        if result.returncode:
+            raise SystemExit(result.stderr.strip() or result.stdout.strip())
 
 
 def register(cli: str, home: Path, repo: Path, lanes: list[str]) -> None:
@@ -587,6 +597,8 @@ def verdict(
         for row in rows
         if row.get("actor") != "operator" or not row.get("command")
     ]
+    if "error" in final:
+        unattended.append({"condition": "unreadable", "detail": final})
     faults = _log_faults(home)
     stranded = _worktrees(repo, endings)
     counters = lane_counters(home, repo, lanes)

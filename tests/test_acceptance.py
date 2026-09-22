@@ -32,8 +32,15 @@ if command[0] == "issue" and command[1] == "show":
     )
 elif command[0] == "problems":
     print(json.dumps({{"problems": []}}))
+    sys.exit(1)
 else:
     print(json.dumps({{}}))
+"""
+BLIND = """#!{executable}
+import sys
+
+sys.stderr.write("the service is not ready\\n")
+sys.exit(1)
 """
 
 
@@ -58,10 +65,10 @@ def estate(tmp_path, lanes=LANES):
     return home, repo
 
 
-def shim(tmp_path):
+def shim(tmp_path, template=SHIM):
     """Writes a coordination CLI that answers the verdict's readings."""
     path = tmp_path / "parley-shim"
-    path.write_text(SHIM.format(executable=sys.executable))
+    path.write_text(template.format(executable=sys.executable))
     path.chmod(0o755)
     return str(path)
 
@@ -96,12 +103,20 @@ def test_seeding_refuses_a_directory_that_holds_a_repository(tmp_path):
         acceptance.workspace(tmp_path, 2)
 
 
-def test_seeding_writes_one_task_per_backlog_issue(tmp_path):
+def test_seeding_writes_one_task_per_backlog_issue(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-identity"))
     acceptance.workspace(tmp_path, 3)
     tasks = sorted(path.name for path in (tmp_path / "tasks").glob("*.md"))
     assert tasks == ["1.md", "2.md", "3.md"]
-    assert (tmp_path / ".git").is_dir()
     assert "task_2" in (tmp_path / "tasks" / "2.md").read_text()
+    committed = subprocess.run(
+        ["git", "log", "--oneline"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "seed the acceptance backlog" in committed.stdout
 
 
 def test_frames_survive_a_line_written_while_the_run_was_killed(tmp_path):
@@ -156,6 +171,20 @@ def test_a_broken_pipe_in_the_service_log_fails_the_run(tmp_path):
     record(frames, [lane_frame(False, [], 0, True)])
     decided = acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
     assert decided["conditions"]["service log is clean"]["passed"] is False
+
+
+def test_a_problems_view_that_cannot_be_read_fails_the_run(tmp_path):
+    home, repo = estate(tmp_path)
+    frames = repo / "acceptance" / "frames.jsonl"
+    record(frames, [lane_frame(False, [], 0, True)])
+    decided = acceptance.verdict(
+        shim(tmp_path, BLIND), home, repo, LANES, 1, frames
+    )
+    condition = decided["conditions"]["problems holds only operator rows"]
+    assert condition["passed"] is False
+    assert decided["conditions"]["every backlog issue reported"]["passed"] is (
+        False
+    )
 
 
 def test_the_status_reading_of_another_project_is_ignored(tmp_path):
