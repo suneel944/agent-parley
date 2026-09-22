@@ -215,8 +215,12 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         threshold while the process is still alive, and `STOPPED` when the
         recorded session process is gone. A session with no trustworthy
         process identity is `UNKNOWN`, and its `process_alive` value is
-        `None`; it is never inferred dead from age. A lane that has recorded
-        no native activity yet reports `last_active` and `age_seconds` as
+        `None`; it is never inferred dead from age. A lane that reported its
+        turn ended moments ago is `ACTIVE`, because availability measures
+        whether the lane can take a turn rather than what it reported last;
+        only the age of the evidence moves it to `IDLE`. A lane that has
+        recorded no native activity yet reports `last_active` and
+        `age_seconds` as
         `None` rather than an age measured from the Unix epoch, and reads as
         `ACTIVE` while its process is alive, because a lane that has never
         checked in has not been quiet for any span a threshold can be
@@ -225,8 +229,9 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
     derived = lane_state(value, inactive_after)
+    current = derived["state"] == IDLE and not derived["stale"]
     return {
-        "state": AVAILABILITY[derived["state"]],
+        "state": ACTIVE if current else AVAILABILITY[derived["state"]],
         "process_alive": derived["process_alive"],
         "last_active": derived["last_active"],
         "age_seconds": derived["age_seconds"],
