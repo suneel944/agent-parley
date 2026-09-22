@@ -704,6 +704,57 @@ def launched_process(
     return None
 
 
+def recorded_process(
+    hook_pid: int | None, session_pid: object, session_ticks: object
+) -> ServerProcess | None:
+    """Confirms a lane's recorded session from the hook's own ancestry.
+
+    A native client can start a new session identity inside the same
+    process, and a provider that starts its hooks without a controlling
+    terminal leaves no reading that names that process again. The client
+    still starts every hook of the session it serves, so a recorded
+    session process that is both unchanged and an ancestor of the hook is
+    the process that sent the event, and the lane keeps the identity it
+    already had instead of reading as stopped until the next launch.
+
+    The recorded creation identity is rechecked before the walk, so a
+    recycled process ID is never adopted, and the walk is bounded, so a
+    long or looping chain cannot hold the hook. A live process the hook
+    does not descend from is never confirmed.
+
+    Args:
+        hook_pid: Process ID of the generated hook client while it waits
+            for the checkpoint response.
+        session_pid: Process ID recorded for the lane's native session.
+        session_ticks: Creation ticks recorded beside that process ID.
+
+    Returns:
+        Verified native process identity, or ``None`` when the recorded
+        session is missing, gone, recycled, or not an ancestor of the
+        hook.
+    """
+    if type(hook_pid) is not int or hook_pid <= 1:
+        return None
+    if type(session_pid) is not int or session_pid <= 1:
+        return None
+    if not isinstance(session_ticks, str) or not alive(
+        session_pid, session_ticks
+    ):
+        return None
+    try:
+        pid = hook_pid
+        for _ in range(ANCESTRY_LIMIT):
+            parent = PLATFORM.parent_pid(pid)
+            if parent == session_pid:
+                return ServerProcess(session_pid, session_ticks)
+            if parent <= 1:
+                return None
+            pid = parent
+    except (OSError, IndexError, ValueError, TypeError):
+        pass
+    return None
+
+
 def identify(record: dict, home: Path) -> ServerProcess | None:
     """Matches creation identity, module, and home before accepting a PID.
 

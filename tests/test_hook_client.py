@@ -35,6 +35,7 @@ STOP = {"hook_event_name": "Stop", "stop_hook_active": False}
 START = {"hook_event_name": "SessionStart", "session_id": "s1"}
 PROMPT = {"hook_event_name": "UserPromptSubmit", "prompt": "continue"}
 STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} ")
+SLEEPER = "import time; time.sleep(120)"
 
 
 def events(directory, agent="codex"):
@@ -239,29 +240,93 @@ def test_new_session_clears_an_unrelated_live_process(
 ):
     lane = Path(paired["lanes"]["codex"])
     directory = lane.parent
-    native = process.ServerProcess(
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEPER])
+    try:
+        write_json(
+            directory / "codex-activity.json",
+            {
+                "session_id": "previous",
+                "session_pid": unrelated.pid,
+                "session_ticks": process.start_ticks(unrelated.pid),
+            },
+        )
+        monkeypatch.setattr(
+            checkpoints.process, "foreground_process", lambda hook_pid: None
+        )
+        started = run_hook(
+            bridge,
+            directory,
+            {**START, "cwd": str(lane)},
+        )
+    finally:
+        unrelated.kill()
+        unrelated.wait(10)
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert "session_pid" not in state
+    assert "session_ticks" not in state
+
+
+def test_a_new_session_id_keeps_a_live_client_and_reports_it_live(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    client = process.ServerProcess(
         os.getpid(), process.start_ticks(os.getpid())
     )
     write_json(
         directory / "codex-activity.json",
         {
-            "session_id": "previous",
-            "session_pid": native.pid,
-            "session_ticks": native.ticks,
+            "session_id": "cleared",
+            "session_pid": client.pid,
+            "session_ticks": client.ticks,
+            "activity": "working",
+            "updated": time.time(),
         },
     )
     monkeypatch.setattr(
         checkpoints.process, "foreground_process", lambda hook_pid: None
     )
-    started = run_hook(
-        bridge,
-        directory,
-        {**START, "cwd": str(lane)},
+    started = run_hook(bridge, directory, {**START, "cwd": str(lane)})
+    assert started.returncode == 0, started.stderr
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_id"] == "s1"
+    assert state["session_pid"] == client.pid
+    assert state["session_ticks"] == client.ticks
+    liveness = checkpoints.participant_liveness(directory, "codex")
+    assert not liveness.startswith("stopped")
+
+
+def test_a_new_session_id_on_a_dead_client_still_reports_stopped(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    gone = subprocess.Popen([sys.executable, "-c", SLEEPER])
+    ticks = process.start_ticks(gone.pid)
+    gone.kill()
+    gone.wait(10)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "cleared",
+            "session_pid": gone.pid,
+            "session_ticks": ticks,
+            "activity": "working",
+            "updated": time.time(),
+        },
     )
+    monkeypatch.setattr(
+        checkpoints.process, "foreground_process", lambda hook_pid: None
+    )
+    started = run_hook(bridge, directory, {**START, "cwd": str(lane)})
     assert started.returncode == 0, started.stderr
     state = json.loads((directory / "codex-activity.json").read_text())
     assert "session_pid" not in state
     assert "session_ticks" not in state
+    liveness = checkpoints.participant_liveness(directory, "codex")
+    assert liveness.startswith("stopped")
 
 
 def test_a_down_service_falls_back_in_process(bridge, repo, paired):

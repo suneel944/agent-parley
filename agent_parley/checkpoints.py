@@ -1308,6 +1308,13 @@ def native_process(
     identity is never eligible for work, so the launcher's own recorded
     identity is used to find the client it started instead.
 
+    A client that starts a new session identity in place, as clearing the
+    conversation does, sends that event from the process the lane already
+    recorded. When neither earlier reading answers, and a launcher that
+    has exited or was never recorded is the common reason, that recorded
+    process is confirmed through the hook's ancestry, so a live lane keeps
+    its identity across a new session instead of reading as stopped.
+
     Args:
         directory: Common project state directory.
         agent: Assigned native lane name.
@@ -1327,8 +1334,13 @@ def native_process(
         return None
     if not isinstance(state, dict):
         return None
-    return process.launched_process(
+    launched = process.launched_process(
         pid, state.get("launcher_pid"), state.get("launcher_ticks")
+    )
+    if launched is not None:
+        return launched
+    return process.recorded_process(
+        pid, state.get("session_pid"), state.get("session_ticks")
     )
 
 
