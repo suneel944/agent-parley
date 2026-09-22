@@ -1363,6 +1363,13 @@ def checkpoint(
     attempted launch from a session that actually reported itself, and it is
     what a later resume reads.
 
+    A session identity dropped because the process it named is gone records
+    the lane as stopped, so the state derivation still reads positive
+    evidence of an ended session. Dropping the identity alone would leave a
+    record no reader can tell from a lane that never recorded one, and that
+    reads as unknown rather than stopped, which is the state an operator is
+    told to return to a terminal for instead of relaunching.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -1475,6 +1482,9 @@ def checkpoint(
         new_session = event == "SessionStart" and session != state.get(
             "session_id"
         )
+        ended = state.get("session_pid") is not None and not process.alive(
+            state.get("session_pid"), state.get("session_ticks")
+        )
         if new_session:
             state["cursor"] = 0
             state["issue_revision"] = -1
@@ -1482,9 +1492,7 @@ def checkpoint(
             state.pop("work_offer", None)
             state.pop("session_pid", None)
             state.pop("session_ticks", None)
-        elif event == "SessionStart" and not process.alive(
-            state.get("session_pid"), state.get("session_ticks")
-        ):
+        elif event == "SessionStart" and ended:
             state.pop("session_pid", None)
             state.pop("session_ticks", None)
         state.update(session_id=session, updated=time.time(), event=event)
@@ -1508,6 +1516,8 @@ def checkpoint(
             state["activity"] = (
                 "testing (command observed)" if testing else "working"
             )
+        if ended and session_process is None:
+            state["activity"] = "stopped"
         if event == "UserPromptSubmit":
             prompt = str(payload.get("prompt", ""))
             if operator_prompt(prompt):
