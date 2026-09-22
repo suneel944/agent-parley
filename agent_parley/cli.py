@@ -79,6 +79,7 @@ if TYPE_CHECKING:
         describe,
         handoff_fields,
         offer_state,
+        orphan_age,
         parse_issue,
         snapshot,
     )
@@ -217,6 +218,7 @@ if not TYPE_CHECKING:
     describe = _DeferredCallable(issues, "describe")
     handoff_fields = _DeferredCallable(issues, "handoff_fields")
     offer_state = _DeferredCallable(issues, "offer_state")
+    orphan_age = _DeferredCallable(issues, "orphan_age")
     parse_issue = _DeferredCallable(issues, "parse_issue")
     snapshot = _DeferredCallable(issues, "snapshot")
     lock = _DeferredCallable(state, "lock")
@@ -808,10 +810,12 @@ def lane_detail(record: dict, data: dict) -> None:
     for claim in record["claims"]:
         if claim.get("orphaned"):
             held = claim.get("orphan_reservations") or []
+            recorded = claim.get("orphan_recorded_seconds") or 0
             print(
-                f"    Issue #{claim['issue']} is orphaned: "
-                f"{claim['orphan_reason']}; still owned until a peer runs "
-                f"issue claim {claim['issue']} --take-orphaned"
+                f"    Issue #{claim['issue']} was marked orphaned "
+                f"{recorded}s ago: {claim['orphan_reason']}; still owned "
+                f"until a peer runs issue claim {claim['issue']} "
+                "--take-orphaned"
                 + (f"; holds {', '.join(held)}" if held else "")
             )
         if claim["overdue"]:
@@ -2820,10 +2824,16 @@ class Bridge:
     def down(self) -> None:
         """Stops the identified server while retaining all persistent state.
 
+        A start holds the same lock until the new service answers, which is
+        bounded at thirty seconds including the wind-down of a service that
+        never became ready. Refusing the moment that lock is held reported
+        contention for a stop that was only queued behind a start, so the
+        stop waits for that span before it reports the lock busy.
+
         Raises:
             BridgeError: If locking fails or the server does not stop in time.
         """
-        with lock(self.home / "server.lock"):
+        with lock(self.home / "server.lock", timeout=30):
             running = self.server_process()
             if running:
                 running.stop()
@@ -6623,6 +6633,11 @@ reported.
                     "orphaned": bool(record.get("orphan")),
                     "orphan_reason": (record.get("orphan") or {}).get(
                         "reason", ""
+                    ),
+                    "orphan_recorded_seconds": (
+                        orphan_age(record["orphan"])
+                        if record.get("orphan")
+                        else None
                     ),
                     "orphan_reservations": list(
                         (record.get("orphan") or {}).get("reservations", [])

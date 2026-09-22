@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -962,25 +963,101 @@ def test_a_peer_without_the_flag_is_told_how_to_take_it(bridge, repo, paired):
     assert issues.snapshot(directory)["issues"]["42"]["owner"] == "claude"
 
 
-def test_a_returning_owner_regains_nothing_without_claiming_again(
+def test_a_returning_owner_loses_the_marker_and_keeps_the_claim(
     bridge, repo, paired
 ):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
     directory = lane.parent
     bridge.issue(lane, "claim", "42")
     killed(directory, "claude", STALLED + 100)
     running(directory, "codex")
     supervision.poll(bridge.home, directory)
     marked = issues.snapshot(directory)["issues"]["42"]
+    assert marked["orphan"]["owner"] == "claude"
 
     running(directory, "claude")
     supervision.poll(bridge.home, directory)
-    restarted = issues.snapshot(directory)["issues"]["42"]
-    assert restarted["orphan"]["id"] == marked["orphan"]["id"]
 
-    reclaimed = bridge.issue(lane, "claim", "42")
-    assert "orphan" not in reclaimed
-    assert reclaimed["claim_id"] != marked["claim_id"]
-    assert reclaimed["history"][-1]["action"] == "claim"
+    returned = issues.snapshot(directory)["issues"]["42"]
+    assert "orphan" not in returned
+    assert returned["owner"] == "claude"
+    assert returned["claim_id"] == marked["claim_id"]
     assert lifecycle.actionable(issues.snapshot(directory), "claude") == ["42"]
+    delivered = {
+        subject: body for subject, body in inbox(bridge, paired, "codex")
+    }
+    withdrawal = delivered["Orphan marker withdrawn for claude"]
+    assert "#42" in withdrawal
+    assert "no longer available to take" in withdrawal
+    assert not inbox(bridge, paired, "claude")
+
+    with pytest.raises(BridgeError) as refusal:
+        bridge.issue(peer, "claim", "42", take_orphaned=True)
+
+    assert "does not read as orphaned" in str(refusal.value)
+    assert issues.snapshot(directory)["issues"]["42"]["owner"] == "claude"
+
+
+def test_an_authorized_capacity_marker_survives_a_returning_owner(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    claimed = bridge.issue(lane, "claim", "42")
+    ledger = issues.snapshot(directory)
+    ledger["issues"]["42"]["orphan"] = {
+        "id": f"capacity:{claimed['claim_id']}:observation",
+        "owner": "claude",
+        "claim_id": claimed["claim_id"],
+        "reason": "capacity exhausted",
+        "reservations": [],
+        "created": time.time(),
+        "checkpoint": "checkpoint-1",
+        "authorization": {
+            "id": "authorization-1",
+            "actor": "operator",
+            "reason": "Exercise the saved work",
+            "approved_at": time.time(),
+        },
+    }
+    write_json(directory / "issues.json", ledger)
+    running(directory, "claude")
+    running(directory, "codex")
+
+    supervision.poll(bridge.home, directory)
+
+    kept = issues.snapshot(directory)["issues"]["42"]["orphan"]
+    assert kept["id"] == f"capacity:{claimed['claim_id']}:observation"
+    assert kept["authorization"]["id"] == "authorization-1"
+
+
+def test_the_printed_remedy_takes_the_orphaned_claim(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+
+    listing = issues.describe(issues.snapshot(directory))
+    remedy = listing.split("still owned until a peer runs ")[1].splitlines()[0]
+    monkeypatch.chdir(peer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), *shlex.split(remedy)],
+    )
+
+    assert cli.main() == 0
+
+    taken = json.loads(capsys.readouterr().out)
+    assert taken["owner"] == "codex"
+    assert taken["taken"]["from"] == "claude"
+    assert issues.snapshot(directory)["issues"]["42"]["owner"] == "codex"
