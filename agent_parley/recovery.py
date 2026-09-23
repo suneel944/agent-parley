@@ -1106,8 +1106,40 @@ def preflight(directory: Path, lane: Path, saved: dict) -> None:
     )
 
 
+def current_take(record: dict) -> dict:
+    """Returns the take that minted the record's current ownership generation.
+
+    A take is acted on only by the generation it created. A record whose
+    ownership moved on since, by an accepted handoff or a later claim, may
+    still carry an older take, and restoring that checkpoint would lay a dead
+    owner's patches over work handed on since. The take transition's history
+    entry names the generation it minted, so the check also holds for ledgers
+    written before ownership changes cleared the field.
+
+    Args:
+        record: Persisted issue record.
+
+    Returns:
+        The recorded take, or an empty mapping when none belongs to the
+        current generation.
+    """
+    taken = record.get("taken") or {}
+    takes = [
+        entry
+        for entry in record.get("history", [])
+        if entry.get("action") == "take"
+    ]
+    if not taken or not takes:
+        return {}
+    if takes[-1].get("claim_id") != record.get("claim_id"):
+        return {}
+    return taken
+
+
 def restore(directory: Path, lane: Path, record: dict) -> dict:
     """Restores one taken checkpoint into a clean recipient worktree.
+
+    A take that belongs to an earlier ownership generation restores nothing.
 
     Args:
         directory: Private project state directory.
@@ -1121,8 +1153,7 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
         BridgeError: If the artifact is invalid or destination has work that
             could be overwritten.
     """
-    taken = record.get("taken") or {}
-    saved = taken.get("checkpoint") or {}
+    saved = current_take(record).get("checkpoint") or {}
     if not saved:
         return record
     recipient = str(record.get("owner") or "")

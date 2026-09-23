@@ -511,6 +511,27 @@ def _drop_offer(directory: Path, record: dict) -> None:
             attachments.remove(directory, str(offer[field]))
 
 
+def _clear_recovery(record: dict) -> dict:
+    """Removes the previous generation's take and orphan marker.
+
+    Both describe one ownership generation. Left on the record past a change
+    of owner, a take makes the next claim restore a dead owner's checkpoint
+    over work handed on since, and an orphan marker hides the new owner's
+    continue offers and names an owner that no longer holds the issue.
+
+    Args:
+        record: Mutable issue record whose ownership is changing.
+
+    Returns:
+        The removed fields, for the transition's history entry.
+    """
+    return {
+        field: record.pop(field)
+        for field in ("taken", "orphan")
+        if record.get(field)
+    }
+
+
 def _unseen() -> dict:
     """Returns an empty record for an issue the ledger has not seen yet."""
     return {
@@ -792,8 +813,10 @@ def _change(
             orphan take.
 
     A transition that ends an ownership generation, by releasing it, by
-    handing it to another lane or by taking it from an orphaned owner, also
-    retires the mail that generation sent. Supersession is written where the
+    handing it to another lane, by taking it from an orphaned owner or by the
+    owner re-claiming its own orphan-marked issue, also retires the mail that
+    generation sent, and moves the generation's take and orphan marker into
+    the transition's history entry. Supersession is written where the
     claim changes rather than derived when a lane is woken, because only the
     transition knows which generation stopped mattering and why.
 
@@ -809,6 +832,7 @@ def _change(
     blocker = ""
     retired = ""
     retired_reason = ""
+    cleared: dict = {}
     if action in ("block", "unblock"):
         blocker = parse_issue(on or "", "Blocker")
         if blocker == issue:
@@ -852,6 +876,12 @@ def _change(
                     "claim it without --take-orphaned."
                 )
             previous = record or {}
+            if not taken:
+                cleared = _clear_recovery(dict(previous))
+            reclaimed = previous.get("owner") == agent
+            if reclaimed:
+                retired = str(previous.get("claim_id") or "")
+                retired_reason = f"issue #{issue} re-claimed by {agent}"
             budget = budgets.get("attempts")
             expected = within if within is not None else budgets.get("claim")
             record = {
@@ -870,10 +900,13 @@ def _change(
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
-            if taken:
-                record["taken"] = taken
+            if taken or reclaimed:
                 if inherited := previous.get("handoff"):
                     record["handoff"] = inherited
+            if reclaimed and previous.get("attachment"):
+                record["attachment"] = previous["attachment"]
+            if taken:
+                record["taken"] = taken
         elif action == "assign":
             record = _assign(
                 record,
@@ -926,6 +959,7 @@ def _change(
                         claim_id=uuid.uuid4().hex[:16],
                     )
                     lifecycle.claimed(record, record["claim_id"])
+                    cleared = _clear_recovery(record)
                     if offer.get("attachment"):
                         record["attachment"] = offer["attachment"]
                     record["handoff"] = inherited
@@ -995,6 +1029,7 @@ def _change(
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
+                    cleared = _clear_recovery(record)
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
                     if blocker in waiting:
@@ -1028,6 +1063,8 @@ def _change(
         }
         if logged == "take":
             history["taken"] = dict(record["taken"])
+        if cleared:
+            history["cleared"] = cleared
         record["history"].append(history)
         state["issues"][issue] = record
         if scope:

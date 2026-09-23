@@ -5390,9 +5390,9 @@ reported.
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
-            if record.get("taken"):
-                from agent_parley import recovery
+            from agent_parley import recovery
 
+            if recovery.current_take(record):
                 record = recovery.restore(directory, repo, record)
             record = self._free_orphaned(data, record)
             forge.assign(repo, parse_issue(number))
@@ -5528,7 +5528,9 @@ reported.
         """
         import sqlite3
 
-        taken = record.get("taken") or {}
+        from agent_parley import recovery
+
+        taken = recovery.current_take(record)
         previous = taken.get("from")
         if previous not in data["participants"]:
             return record

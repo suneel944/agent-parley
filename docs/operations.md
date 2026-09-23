@@ -1094,7 +1094,12 @@ the captured index and working tree into a clean destination. It permits
 unrelated ignored caches, but refuses dirty or untracked content and ignored
 content at a path recovery would change. Both worktrees stay intact. Restore
 progress is durable; after interruption, the new owner reruns
-`issue claim 42` to resume the exact recorded phase.
+`issue claim 42` to resume the exact recorded phase. Only the ownership
+generation the take created restores anything: an accepted handoff, a release
+or any later claim moves the take and any orphan marker into that transition's
+history entry, so a lane that accepts the work never replays the dead owner's
+checkpoint. An owner that re-claims its own orphan-marked issue keeps its
+accepted handoff and attachment and retires its previous generation's mail.
 
 The checkpoint and its Git bundle live in the private Agent Parley state
 directory. The bundle carries an exact size and SHA-256 digest, so binary and
