@@ -228,7 +228,11 @@ def test_a_failed_start_publishes_no_server_record(bridge, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", start)
     with pytest.raises(BridgeError, match="failed to start"):
         bridge.up()
-    assert not (bridge.home / "server.json").exists()
+    recorded = json.loads((bridge.home / "server.json").read_text())
+    assert recorded["state"] == "failed"
+    assert recorded["failures"] == 1
+    assert "pid" not in recorded
+    assert "port" not in recorded
 
 
 def test_stale_pid_record_cannot_stop_an_unrelated_process(bridge):
