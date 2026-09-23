@@ -7403,6 +7403,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "status",
             "top",
+            "title",
             "watch",
             "metrics",
             "history",
@@ -7866,6 +7867,13 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     health.add_argument("--json", action="store_true", help=JSON_HELP)
     add_status_filters(health)
+    commands.add_parser(
+        "title",
+        help=(
+            "Print the current lane's name, state and claim progress for "
+            "a native status line; prints nothing outside a lane."
+        ),
+    )
     watch = commands.add_parser(
         "top",
         help=(
@@ -9038,10 +9046,26 @@ def _plain_status() -> int:
     return 0
 
 
+def _title() -> int:
+    """Prints the working directory's lane summary for a native status line.
+
+    A status line runs this on every refresh, so it reads only the lane's
+    private records and never builds the full parser. Outside a lane it
+    prints nothing and still succeeds, so a status line configured for every
+    session stays empty in sessions the bridge did not launch.
+    """
+    summary = terminal.lane_summary(Path.cwd())
+    if summary:
+        print(summary)
+    return 0
+
+
 def main() -> int:
     """Dispatches the CLI and returns an operational exit status."""
     if sys.argv[1:] == ["status"]:
         return _plain_status()
+    if sys.argv[1:] == ["title"]:
+        return _title()
     typed = selected_command(sys.argv[1:])
     parser, commands = root_parser(typed)
     if typed is not None and typed not in commands.declared:
@@ -9060,6 +9084,8 @@ def main() -> int:
     if args.command == "__complete":
         print("\n".join(completion.candidates(home, args.kind)))
         return 0
+    if args.command == "title":
+        return _title()
     if args.command == "version":
         installed = protocol.launcher_version()
         print(

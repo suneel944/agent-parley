@@ -707,3 +707,41 @@ def test_attached_launcher_relays_the_lane_title(titles):
         finally:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
+
+
+def test_the_status_line_command_prints_the_lane_summary():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        nested = directory / "lane" / "src"
+        nested.mkdir(parents=True)
+        write_json(directory / "project.json", {"participants": {"lane": {}}})
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "dialog: trust folder", "updated": 1},
+        )
+        write_json(
+            directory / "issues.json", {"issues": {"7": {"owner": "lane"}}}
+        )
+        expected = "[lane] blocked: dialog #7 - 0/1 done"
+        assert terminal.lane_summary(nested) == expected
+        assert terminal.lane_summary(directory) == ""
+        assert terminal.lane_summary(Path("/")) == ""
+        printed = subprocess.run(
+            [sys.executable, "-m", "agent_parley.cli", "title"],
+            cwd=nested,
+            input="{}",
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        assert printed.stdout == expected + "\n"
+        outside = subprocess.run(
+            [sys.executable, "-m", "agent_parley.cli", "title"],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        assert outside.stdout == ""

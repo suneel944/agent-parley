@@ -1568,6 +1568,24 @@ for itself follows after ` | ` and is truncated first. The title is refreshed
 when the lane's activity record or the issue ledger changes or a dialog holds
 the screen, and the terminal's previous title is restored on exit. Set the
 supervision key `titles` to false to keep the client's native title.
+
+`agent-parley title` prints the same line for the lane that contains the
+current directory, without the client's title, and prints nothing outside a
+lane. It reads only the lane's private records, so a status line can run it on
+every refresh. Per provider:
+
+- Claude Code: add a command status line to the user settings
+  (`~/.claude/settings.json`) or the project's `.claude/settings.local.json`:
+
+  ```json
+  {"statusLine": {"type": "command", "command": "agent-parley title"}}
+  ```
+
+  The command runs in the session's directory, so every lane shows its own
+  line and sessions outside a lane show an empty one.
+- Codex, Gemini CLI, GitHub Copilot CLI, OpenCode and Amp: not supported. Agent
+  Parley configures no command-driven status line for them; their lanes carry
+  the summary in the tab title only.
 Lanes launched before wake sockets were introduced require relaunching. A live
 native session started outside `agent-parley run` has no wake socket. Exit that
 session and launch it through `agent-parley run` before automatic waking can

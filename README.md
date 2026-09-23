@@ -124,6 +124,7 @@ own lane, so a second account of the same provider, or another provider, is one
 more terminal. Each tab's title names its lane, its state and its claim
 progress, such as `[codex] idle with claim #412 - 2/5 done`, so the tab strip
 tells the lanes apart; the supervision key `titles` turns this off.
+`agent-parley title` prints the same line for a Claude Code status line.
 
 Then watch the work, and steer a lane without taking over its terminal:
 

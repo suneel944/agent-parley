@@ -375,7 +375,7 @@ def lane_title(
     )
     done = sum(1 for _, issue in records if issue.get("completed_by") == name)
     state = str((activity or {}).get("activity", ""))
-    if holding:
+    if holding or state.startswith(dialogs.MARKER):
         word = "blocked: dialog"
     elif state.startswith(dialogs.APPROVAL):
         word = "blocked: approval"
@@ -482,6 +482,38 @@ def _read_json(path: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def lane_summary(start: Path) -> str:
+    """Summarizes the lane containing a directory for a native status line.
+
+    A lane worktree sits directly under its project's private state
+    directory, named for its participant, so the nearest ancestor whose
+    parent holds a manifest naming it is the lane. The summary is the same
+    line `compose_title` gives the tab, without a client title.
+
+    Args:
+        start: Working directory of the native client.
+
+    Returns:
+        The lane summary, or an empty string outside a lane.
+    """
+    for lane in (start, *start.parents):
+        manifest = _read_json(lane.parent / "project.json")
+        if manifest is None:
+            continue
+        if lane.name not in (manifest.get("participants") or {}):
+            return ""
+        return compose_title(
+            lane_title(
+                lane.name,
+                _read_json(lane.parent / f"{lane.name}-activity.json"),
+                _read_json(lane.parent / "issues.json"),
+                False,
+            ),
+            "",
+        )
+    return ""
 
 
 def _changed_at(path: Path) -> int:
