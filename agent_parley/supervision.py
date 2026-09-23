@@ -2637,6 +2637,7 @@ def poll(home: Path, directory: Path) -> None:
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
     deliveries(home, directory, manifest)
+    lifecycle.settle_dependencies(directory)
     if config["prompts"]:
         closed: set[str] = set()
         ended: dict[str, dict] = {}

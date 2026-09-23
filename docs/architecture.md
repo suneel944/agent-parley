@@ -715,7 +715,11 @@ version carrying the file's digest and the identity that applied it, bounded to
 the twenty most recent versions in `plan.json` beside the issue ledger. A plan
 is refused before any edge is written when it names a malformed issue, exceeds a
 bound, or describes a cycle, so an operator never has to unpick a half-applied
-order by hand. Applying adds edges and never removes one, so an edge recorded
+order by hand. The cycle check reads the recorded edges too, so plans applied
+in turn cannot close a cycle together, and an edge to a complete issue is
+skipped. Each supervisor poll drops an edge whose blocker is complete or no
+longer recorded, because completion reconciles dependents only once, at the
+instant it is recorded. Applying adds edges and never removes one, so an edge recorded
 after the apply is reported as entered by hand and a narrowed plan shows its
 dropped edges as unlisted until `issue unblock` removes them. Groups are advice
 a later offer or integration path may read; this layer only records them.

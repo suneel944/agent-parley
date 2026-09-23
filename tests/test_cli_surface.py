@@ -198,6 +198,7 @@ def test_issue_show_reports_owner_blockers_and_history(
     bridge, repo, paired, monkeypatch, capsys
 ):
     lane = paired["lanes"]["claude"]
+    bridge.issue(paired["lanes"]["codex"], "claim", "7")
     bridge.issue(lane, "claim", "42")
     bridge.issue(lane, "block", "42", on="7")
     document = envelope(

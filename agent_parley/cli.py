@@ -5261,6 +5261,10 @@ reported.
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
+        An unblock run from the project base checkout is the operator's: it
+        drops the edge whether or not any lane owns the waiting issue, because
+        a released issue has no owner who could drop it.
+
         A claim additionally attempts a read-only forge lookup for the issue
         title. That lookup is optional context: an unavailable forge resolves
         to no title and never blocks or fails the claim.
@@ -5318,7 +5322,10 @@ reported.
         if action == "list":
             return snapshot(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = roster.resolve(data, lane)
+        if action == "unblock" and lane == Path(data["root"]).resolve():
+            agent = roster.OPERATOR
+        else:
+            agent = roster.resolve(data, lane)
         if action == "offer" and when_released:
             recipient = to or ""
             if recipient not in data["participants"] or recipient == agent:

@@ -921,8 +921,9 @@ def _change(
             record = _withdraw(record, issue)
         else:
             answering = action in ("accept", "decline")
+            operating = action == "unblock" and agent == OPERATOR
             if not record or not (
-                record["owner"] or (answering and record["offer"])
+                record["owner"] or (answering and record["offer"]) or operating
             ):
                 raise BridgeError(f"Issue #{issue} has no owner.")
             request = record.get("request")
@@ -967,7 +968,7 @@ def _change(
                     _drop_offer(directory, record)
                 record["offer"] = None
             else:
-                if record["owner"] != agent:
+                if record["owner"] != agent and not operating:
                     raise BridgeError(
                         f"Only {record['owner']} can change issue #{issue}."
                     )
@@ -1032,8 +1033,21 @@ def _change(
                     cleared = _clear_recovery(record)
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
-                    if blocker in waiting:
+                    known = state["issues"].get(blocker)
+                    if known is None:
+                        raise BridgeError(
+                            f"Issue #{blocker} is not in the issue ledger; "
+                            "block only on recorded work."
+                        )
+                    if blocker in waiting or (
+                        lifecycle.state(known)["state"] == lifecycle.COMPLETE
+                    ):
                         return record
+                    if lifecycle.reaches(state["issues"], blocker, issue):
+                        raise BridgeError(
+                            f"Issue #{issue} waiting on #{blocker} would form "
+                            "a dependency cycle."
+                        )
                     if len(waiting) >= MAX_BLOCKERS:
                         raise BridgeError(
                             f"Issue #{issue} already waits on {MAX_BLOCKERS} "
