@@ -394,7 +394,7 @@ def test_a_reply_without_a_status_line_falls_back_in_process(
 def test_a_failure_inside_the_served_decision_answers_500(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None):
+    def broken(home, request, stages=None, settle=0.0):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -737,10 +737,10 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     release = threading.Event()
     finished = threading.Event()
 
-    def stalling(home, request, stages=None):
+    def stalling(home, request, stages=None, settle=0.0):
         release.wait(20)
         try:
-            return deciding(home, request, stages)
+            return deciding(home, request, stages, settle)
         finally:
             finished.set()
 
@@ -922,7 +922,7 @@ def test_the_shell_client_starts_python_when_the_service_is_down(
 def test_the_shell_client_starts_python_when_the_service_fails(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None):
+    def broken(home, request, stages=None, settle=0.0):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -956,7 +956,7 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
 def test_the_shell_client_forwards_both_served_streams_and_the_status(
     bridge, repo, paired, service, monkeypatch
 ):
-    def loud(home, request, stages=None):
+    def loud(home, request, stages=None, settle=0.0):
         return {"stdout": '{"ok": true}\n', "stderr": "warned\n", "status": 2}
 
     monkeypatch.setattr(server.checkpoints, "serve", loud)
@@ -1127,15 +1127,70 @@ def test_a_held_checkpoint_lock_defers_rather_than_denying(
     ]
 
 
+def stopped_under_a_held_lock(bridge, lane, meanwhile):
+    """Sends Stop while the checkpoint lock is held for 1.5 seconds."""
+    prompted = run_hook(
+        bridge, lane.parent, {**PROMPT, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert prompted.returncode == 0, prompted.stderr
+    release = threading.Event()
+    keeper = held_lock(lane.parent / "codex-checkpoint.lock", release)
+
+    def later():
+        time.sleep(0.5)
+        meanwhile()
+        time.sleep(1.0)
+        release.set()
+
+    threading.Thread(target=later, daemon=True).start()
+    try:
+        stopped = run_hook(
+            bridge,
+            lane.parent,
+            {**STOP, "cwd": str(lane), "session_id": "s1"},
+        )
+    finally:
+        release.set()
+        keeper.join(timeout=10)
+    assert stopped.returncode == 0, stopped.stderr
+    settled(lane.parent, 2)
+    return events(lane.parent)[-1]["reason_class"]
+
+
+def test_a_served_stop_outlasts_a_held_checkpoint_lock(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    reason = stopped_under_a_held_lock(bridge, lane, lambda: None)
+    state = json.loads((lane.parent / "codex-activity.json").read_text())
+    assert reason != "lock_contended"
+    assert state["activity"] == "idle"
+
+
+def test_a_served_stop_yields_to_a_newer_event(bridge, repo, paired, service):
+    lane = Path(paired["lanes"]["codex"])
+    path = lane.parent / "codex-activity.json"
+
+    def newer():
+        state = json.loads(path.read_text())
+        state["updated"] = time.time()
+        state["activity"] = "working"
+        write_json(path, state)
+
+    reason = stopped_under_a_held_lock(bridge, lane, newer)
+    assert reason == "superseded"
+    assert json.loads(path.read_text())["activity"] == "working"
+
+
 def stalling(monkeypatch, seconds):
     """Delays every served decision past the service's own deadline."""
     served = server.checkpoints.serve
     asked = []
 
-    def slow(home, request, stages=None):
+    def slow(home, request, stages=None, settle=0.0):
         asked.append(request)
         time.sleep(seconds)
-        return served(home, request, stages)
+        return served(home, request, stages, settle)
 
     monkeypatch.setattr(server.checkpoints, "serve", slow)
     return asked
@@ -1205,7 +1260,7 @@ def test_an_expired_decision_names_the_step_that_held_it(
 ):
     release = threading.Event()
 
-    def holding(home, request, stages=None):
+    def holding(home, request, stages=None, settle=0.0):
         stages.enter("mail")
         release.wait(20)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1234,7 +1289,7 @@ def test_an_expired_decision_names_the_step_that_held_it(
 def test_a_slow_served_decision_is_logged_with_its_duration(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def unhurried(home, request, stages=None):
+    def unhurried(home, request, stages=None, settle=0.0):
         stages.enter("scan")
         time.sleep(0.2)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}

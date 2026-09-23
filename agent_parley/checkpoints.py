@@ -26,6 +26,10 @@ MAX_EVENT_LOG_AGE = 1209600
 EVENT_LOCK_TIMEOUT = 2.0
 EVENT_LOCK_POLL = 0.01
 LOCK_SECONDS = 1.0
+SETTLE_SECONDS = 30.0
+SETTLING = frozenset(
+    {"Stop", "SessionEnd", "PermissionRequest", "Notification"}
+)
 HOOK_TIMEOUT = 3
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
@@ -157,6 +161,7 @@ class Reason(StrEnum):
     NOTIFICATION_FAILED = "notification_failed"
     STALE_GENERATION = "stale_generation"
     LOCK_CONTENDED = "lock_contended"
+    SUPERSEDED = "superseded"
 
 
 def decision_of(output: dict | None) -> str:
@@ -1410,6 +1415,7 @@ def checkpoint(
     payload: dict,
     session_process: process.ServerProcess | None = None,
     stages: Stages | None = None,
+    settle: float = LOCK_SECONDS,
 ) -> dict:
     """Observes a native event and prepares bounded coordination context.
 
@@ -1428,6 +1434,17 @@ def checkpoint(
     the dialog record naming the tool it asked about and the instant that wait
     began.
 
+    An event that ends or pauses a turn (`SETTLING`) is the only evidence
+    that the lane stopped, and no later hook arrives to correct a label it
+    failed to write. It therefore waits `settle` seconds for the lane's
+    checkpoint lock rather than the bounded wait every other event takes. The
+    service passes `SETTLE_SECONDS`, because it answers the client at its own
+    deadline and lets the decision finish on its thread; the in-process
+    fallback keeps `LOCK_SECONDS`, because the client kills that process at
+    the hook's budget. Such an event that finds a later event already
+    applied is recorded as superseded and changes nothing, so a turn that
+    started while it waited is not labelled idle.
+
     A session identity dropped because the process it named is gone records
     the lane as stopped, so the state derivation still reads positive
     evidence of an ended session. Dropping the identity alone would leave a
@@ -1444,6 +1461,8 @@ def checkpoint(
             hook's foreground terminal, when one is available.
         stages: Timer the steps of this decision are recorded in, so a
             decision past the hook's budget can name the step holding it.
+        settle: Seconds an event that ends or pauses a turn waits for the
+            lane's checkpoint lock.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -1451,6 +1470,7 @@ def checkpoint(
     Raises:
         BridgeError: If the event targets another lane or locking fails.
     """
+    arrived = time.time()
     event = payload.get("hook_event_name")
     if event not in EVENTS or (
         payload.get("agent_id") and event != "PreToolUse"
@@ -1531,11 +1551,20 @@ def checkpoint(
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
     state_path = directory / f"{agent}-activity.json"
     stages.enter("lock")
-    with lock(directory / f"{agent}-checkpoint.lock", timeout=LOCK_SECONDS):
+    waits = settle if event in SETTLING else LOCK_SECONDS
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=waits):
         stages.enter("state")
         state = (
             json.loads(state_path.read_text()) if state_path.exists() else {}
         )
+        applied = state.get("updated")
+        if (
+            event in SETTLING
+            and isinstance(applied, (int, float))
+            and applied > arrived
+        ):
+            record(directory, agent, payload, Reason.SUPERSEDED, None)
+            return {}
         session = payload.get("session_id", "")
         if (
             state.get("session_id")
@@ -1850,7 +1879,12 @@ def checkpoint(
         return output
 
 
-def serve(home: Path, request: dict, stages: Stages | None = None) -> dict:
+def serve(
+    home: Path,
+    request: dict,
+    stages: Stages | None = None,
+    settle: float = LOCK_SECONDS,
+) -> dict:
     """Decides one hook event and returns the hook process's contract.
 
     The same code answers the in-process hook and the service's loopback
@@ -1875,6 +1909,8 @@ def serve(home: Path, request: dict, stages: Stages | None = None) -> dict:
         stages: Timer the steps of this decision are recorded in, so a
             caller that abandons the decision at its own deadline can name
             the step that was holding it.
+        settle: Seconds an event that ends or pauses a turn waits for the
+            lane's checkpoint lock; see `checkpoint`.
 
     Returns:
         ``status``, ``stdout`` and ``stderr`` for the hook process to emit.
@@ -1925,7 +1961,13 @@ def serve(home: Path, request: dict, stages: Stages | None = None) -> dict:
             directory, participant, request.get("hook_pid")
         )
         output = checkpoint(
-            home, directory, participant, payload, session_process, stages
+            home,
+            directory,
+            participant,
+            payload,
+            session_process,
+            stages,
+            settle,
         )
         if adapter is not None:
             output = adapter.response(output)

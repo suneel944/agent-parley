@@ -916,7 +916,15 @@ expired in its turn. Decisions merely in flight are not counted, so parallel
 native calls in a healthy lane keep their context injection. Contention on
 a lane's own checkpoint lock is likewise never an enforcement result: the loser
 of the bounded wait records a `lock_contended` event and degrades to no
-injection. The bounded worst case is one connection attempt, one service
+injection. An event that ends or pauses a turn (`Stop`, `SessionEnd`,
+`PermissionRequest`, `Notification`) is the only record that the lane went
+idle or stopped on a prompt, so the service waits up to 30 seconds for the lock
+on it. The service answers the client at its own deadline either way, and the
+abandoned decision finishes on its thread. When the lock comes free after a
+newer event already wrote the lane's state, the late event records
+`superseded` and changes nothing. Delivery polling reads the mailbox, issue
+snapshot and work offer before taking the lock, so it holds the lock only for
+its own writes. The bounded worst case is one connection attempt, one service
 deadline and one lock wait, which is 2.75 seconds against the 3-second hook
 timeout the launcher registers.
 
