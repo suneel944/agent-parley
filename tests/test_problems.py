@@ -226,6 +226,32 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
 
 
+def test_an_escalated_native_dialog_is_a_row_naming_it(
+    bridge, repo, paired, served
+):
+    alive(
+        bridge.project(repo)[1],
+        "claude",
+        activity="dialog: native directory trust prompt",
+        dialog={
+            "name": "directory-trust",
+            "label": "native directory trust prompt",
+            "action": "answer",
+            "escalated": True,
+            "options": ["1. Yes, continue", "2. No, quit"],
+            "at": time.time() - 40,
+        },
+    )
+    [row] = rows(bridge, problems.HELD)
+    assert row["participant"] == "claude"
+    assert row["detail"] == (
+        "the client is held by native directory trust prompt "
+        "(1. Yes, continue; 2. No, quit)"
+    )
+    assert row["command"] == "answer the prompt in claude's terminal"
+    assert row["seconds"] >= 40
+
+
 def test_a_paused_lane_is_resumed_rather_than_spoken_to(
     bridge, repo, paired, served
 ):

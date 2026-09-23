@@ -847,7 +847,10 @@ class Handler(BaseHTTPRequestHandler):
             """Records the decision or the failure that ended it."""
             try:
                 outcome["served"] = checkpoints.serve(
-                    self.server.home, request, stages
+                    self.server.home,
+                    request,
+                    stages,
+                    checkpoints.SETTLE_SECONDS,
                 )
             except Exception:
                 outcome["failed"] = traceback.format_exc()

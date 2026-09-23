@@ -43,8 +43,31 @@ exhausted with the reset instant the screen names, so the lane is parked with
 that reason and restored when the reset passes. No lane on a dialog is ever
 reported as `working` or `starting`.
 
-Three dialogs are recognized, recorded from `claude` CLI 2.1.270 and Codex CLI
-0.153.4: `usage-limit`, `hook-review` and `tool-permission`. Answering one is
+Five dialogs are recognized, recorded from `claude` CLI 2.1.270 and Codex CLI
+0.153.4: `usage-limit`, `question`, `hook-review`, `directory-trust` and
+`tool-permission`. Only the bottom of the screen, where a client draws its
+dialog, is read. A framed dialog counts only while it shows at least two
+numbered options and its own footer (`Esc to cancel`, `Enter to select` and
+similar), and a usage limit counts only on the client's own notice line. Text
+that merely quotes a dialog, in scrollback or in the agent's output, never
+parks the lane. Once a dialog is answered, by the launcher or by a key you type
+in the lane's terminal, the next screen output releases the lane.
+
+`directory-trust` is the screen that asks whether you trust the folder. Codex
+records that trust for the repository root, so trusting a lane's worktree also
+covers the shared project. `question` is the client asking you a question
+through its own picker. The notification and the `dialog` entry name the
+question and every option it offers, and `status` lists the lane as held by
+that dialog. To let a lane answer questions without you, set a standing reply;
+it is typed into the picker's free-text option:
+
+```json
+{"participants": {"claude": {"answer_questions": "Use your best judgement."}}}
+```
+
+The reply is one line of printable text of at most 500 characters, set per
+participant or under `supervision` for the whole project. Answering any other
+dialog is
 your decision, so nothing is answered until you say which option to press. Name
 the option's own text, not its position, because the clients reorder options
 between versions:
@@ -60,8 +83,8 @@ between versions:
 
 A participant entry overrides the project entry for that dialog name. An
 unanswered dialog, a dialog whose configured option the screen does not offer,
-an answer the screen survives twice, and any prompt that is not one of the three
-and holds the screen for 30 seconds are all escalated to you instead. The
+an answer the screen survives twice, and any prompt that is not a recognized
+dialog and holds the screen for 30 seconds are all escalated to you instead. The
 keystrokes sent are the ones you would press on an option the client itself
 offered; no permission check is skipped and no bypass flag exists.
 

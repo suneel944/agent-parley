@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pty
+import re
 import select
 import signal
 import socket
@@ -21,6 +22,7 @@ from agent_parley.state import BridgeError, lock
 PROMPT = "Review pending coordination messages and handoff reminders."
 MAX_WORK_PROMPT = 2_000
 SUBMIT_DELAY = 0.2
+ANSWERING = re.compile(rb"[\r\n0-9]")
 DETACHED_ROWS = 24
 DETACHED_COLUMNS = 80
 STRING_SEQUENCES = frozenset({ord("]"), ord("P"), ord("X"), ord("^"), ord("_")})
@@ -349,7 +351,9 @@ def run(
     which publishes a blocking native screen on the lane's activity state and
     refuses wakes while one holds. It answers only a dialog the operator named
     for this lane, only with an option the client itself is offering, and never
-    while the operator holds a partially entered line.
+    while the operator holds a partially entered line. An operator's Enter or
+    option digit while a dialog holds is an answer, so the watcher releases
+    that dialog on the client's next output rather than once it scrolls away.
 
     A lane the client itself reported as waiting for approval refuses the wake
     as busy and names that prompt, because injecting a turn cannot answer it and
@@ -430,6 +434,8 @@ def run(
                     )
                     pending_input = pending(operator, pending_input)
                     os.write(master, entered)
+                    if watch.holding and ANSWERING.search(entered):
+                        watch.answered()
                 if master in ready:
                     try:
                         output = os.read(master, 65536)
