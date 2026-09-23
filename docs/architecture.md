@@ -899,10 +899,23 @@ that sends no such `Accept` header is answered with the original JSON reply.
 
 A refused connection, a timeout, a refused credential, any other reply the
 client cannot use, or a reply it cannot frame falls back to `checkpoints.main`
-in the hook process, which records the cause as a `service_fallback` event
-before deciding; `python -m agent_parley.checkpoints` remains a valid hook
-command. A status the shell client already read travels into that fallback, so
-one refusal is never posted to the service twice.
+in the hook process, which records the cause in a `fallback` field of the
+event's own record, so an outage never counts an event twice;
+`python -m agent_parley.checkpoints` remains a valid hook command. A decision
+that fails and writes no record gets one `service_fallback` record instead. A
+status the shell client already read travels into that fallback, so one
+refusal is never posted to the service twice.
+
+A state write that fails because storage is full, over quota, read-only or
+failing allows the call and names the failure on stderr, because a denial
+would also refuse the `rm` or `du` that frees the space. Other decision
+failures keep their denial for gating events. A write killed between its
+temporary file and the rename leaves a `tmp*` file in the project state
+directory; the service removes those older than a minute when it starts.
+
+The launcher takes the lane's checkpoint lock for its activity write, as every
+hook decision does, so a slow `SessionEnd` finishing after a relaunch cannot
+restore the old session or drop the launcher's process identity.
 
 A native payload over 1,000,000 characters, as a `Write` of a large file
 carries in both `PreToolUse` and `PostToolUse`, is never posted: the clients

@@ -1,6 +1,7 @@
 """Checks the hook client against the service and its in-process fallback."""
 
 import asyncio
+import errno
 import json
 import os
 import re
@@ -43,6 +44,11 @@ SLEEPER = "import time; time.sleep(120)"
 def events(directory, agent="codex"):
     path = directory / f"{agent}-events.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def fell_back(entry):
+    """Reports whether one record was decided after a service failure."""
+    return "fallback" in entry or entry["reason_class"] == "service_fallback"
 
 
 @pytest.fixture(autouse=True)
@@ -125,10 +131,7 @@ def test_a_served_decision_equals_the_in_process_decision(
         local.stdout,
         local.stderr,
     )
-    assert not any(
-        entry["reason_class"] == "service_fallback"
-        for entry in events(lane.parent)
-    )
+    assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
 def test_a_served_decision_carries_context_and_blocks_completion(
@@ -358,9 +361,9 @@ def test_a_down_service_falls_back_in_process(bridge, repo, paired):
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "ConnectionRefusedError" in recorded[0]["cause"]
-    assert recorded[-1]["decision"] == "deny"
+    assert len(recorded) == 1
+    assert "ConnectionRefusedError" in recorded[0]["fallback"]
+    assert recorded[0]["decision"] == "deny"
 
 
 def test_a_reply_without_a_status_line_falls_back_in_process(
@@ -388,8 +391,7 @@ def test_a_reply_without_a_status_line_falls_back_in_process(
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "ValueError: reply has no status line" in recorded[0]["cause"]
+    assert "reply has no status line" in recorded[0]["fallback"]
 
 
 def test_a_failure_inside_the_served_decision_answers_500(
@@ -406,8 +408,7 @@ def test_a_failure_inside_the_served_decision_answers_500(
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 500" in recorded[0]["cause"]
+    assert "service answered 500" in recorded[0]["fallback"]
     logged = capsys.readouterr().out
     entry = next(line for line in logged.splitlines() if " failed " in line)
     assert STAMP.match(entry)
@@ -434,8 +435,7 @@ def test_a_stale_service_answers_the_hook_with_a_fallback_status(
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 503" in recorded[0]["cause"]
+    assert "service answered 503" in recorded[0]["fallback"]
     logged = capsys.readouterr()
     assert "Traceback" not in logged.out + logged.err
     assert logged.out.count(server.DRIFTED) == 1
@@ -635,9 +635,9 @@ def test_a_wrong_credential_is_refused_and_falls_back(
     assert served.returncode == 0
     assert "Participants" in json.dumps(json.loads(served.stdout))
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 401" in recorded[0]["cause"]
-    assert recorded[-1]["reason_class"] == "coordination_pending"
+    assert len(recorded) == 1
+    assert "service answered 401" in recorded[0]["fallback"]
+    assert recorded[0]["reason_class"] == "coordination_pending"
 
 
 def test_a_credential_for_another_lane_is_refused(
@@ -900,10 +900,7 @@ def test_the_shell_client_serves_the_decision_the_module_serves(
         served.stdout,
         served.stderr,
     ), shell_diagnosis(bridge, lane.parent, {**payload, **cwd})
-    assert not any(
-        entry["reason_class"] == "service_fallback"
-        for entry in events(lane.parent)
-    )
+    assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
@@ -916,7 +913,7 @@ def test_the_shell_client_starts_python_when_the_service_is_down(
     assert shell.returncode == 0, shell.stderr
     decision = json.loads(shell.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
-    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    assert "fallback" in events(lane.parent)[0]
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
@@ -934,8 +931,7 @@ def test_the_shell_client_starts_python_when_the_service_fails(
     decision = json.loads(shell.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 500" in recorded[0]["cause"]
+    assert "service answered 500" in recorded[0]["fallback"]
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
@@ -950,7 +946,7 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
     shell = run_shell(bridge, lane.parent, {**ALLOW, **cwd})
     assert shell.returncode == 0, shell.stderr
     assert "Participants" in json.dumps(json.loads(shell.stdout))
-    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    assert "fallback" in events(lane.parent)[0]
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
@@ -1043,7 +1039,7 @@ def test_an_outage_brings_the_service_back_on_the_next_hook(
         bridge, lane.parent, {**ALLOW, "cwd": str(lane), "session_id": "s1"}
     )
     assert decided.returncode == 0, decided.stderr
-    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    assert "fallback" in events(lane.parent)[0]
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline and bridge.server_process() is None:
         time.sleep(0.2)
@@ -1588,10 +1584,7 @@ def test_the_shell_client_leaves_a_running_decision_alone(
     assert json.loads(shell.stdout) == {}
     settled(lane.parent, 1)
     assert len(asked) == 1
-    assert not any(
-        entry["reason_class"] == "service_fallback"
-        for entry in events(lane.parent)
-    )
+    assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
 def test_the_hook_budget_covers_the_worst_bounded_path():
@@ -1678,3 +1671,60 @@ def test_an_unparsable_payload_is_allowed_in_process(bridge, repo, paired):
     entry = events(lane.parent)[-1]
     assert entry["reason_class"] == "unreadable_payload"
     assert entry["event"] == "PreToolUse"
+
+
+def served_in_process(lane, payload, fallback=""):
+    """Decides one event for the codex lane the way the hook fallback does."""
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "payload": {**payload, "cwd": str(lane), "session_id": "s1"},
+    }
+    if fallback:
+        request["fallback"] = fallback
+    return request
+
+
+def test_a_fallback_stop_is_recorded_once(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    served = checkpoints.serve(
+        bridge.home, served_in_process(lane, STOP, "ConnectionRefusedError")
+    )
+    assert served["status"] == 0
+    recorded = events(lane.parent)
+    assert [entry["event"] for entry in recorded] == ["Stop"]
+    assert recorded[0]["reason_class"] != "service_fallback"
+    assert recorded[0]["fallback"] == "ConnectionRefusedError"
+
+
+def test_a_full_disk_allows_the_call_and_reports_it(
+    bridge, repo, paired, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(checkpoints, "write_json", full)
+    served = checkpoints.serve(bridge.home, served_in_process(lane, ALLOW))
+    assert served["status"] == 0
+    assert served["stdout"] == "{}\n"
+    assert "No space left on device" in served["stderr"]
+    assert "call allowed" in served["stderr"]
+
+
+def test_a_service_start_sweeps_only_old_temporary_state_files(tmp_path):
+    project = tmp_path / "projects" / "one"
+    project.mkdir(parents=True)
+    old = project / "tmpabc123"
+    fresh = project / "tmpdef456"
+    kept = project / "codex-activity.json"
+    for path in (old, fresh, kept):
+        path.write_text("{}")
+    stale = time.time() - server.TEMPORARY_SECONDS - 5
+    os.utime(old, (stale, stale))
+    os.utime(kept, (stale, stale))
+    assert server.sweep(tmp_path) == 1
+    assert not old.exists()
+    assert fresh.exists()
+    assert kept.exists()

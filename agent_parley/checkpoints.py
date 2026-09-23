@@ -1,6 +1,8 @@
 """Observes native checkpoints and reads coordination without model calls."""
 
 import contextlib
+import contextvars
+import errno
 import fcntl
 import json
 import os
@@ -34,6 +36,12 @@ CONTEXT_EVENTS = frozenset(
     {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"}
 )
 HOOK_TIMEOUT = 3
+STORAGE_ERRORS = frozenset(
+    (errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EFBIG, errno.EIO)
+)
+FALLBACK: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "fallback", default=None
+)
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
         "-C",
@@ -259,6 +267,11 @@ def record(
     afterwards. The text is bounded, because an exception carrying an entire
     statement would otherwise set the log's rotation pace.
 
+    A decision made in process because the service failed carries that
+    failure in a ``fallback`` field of its own record, set through
+    `FALLBACK` by `serve`. The event is then counted once, under the
+    reason that decided it, rather than once more as a separate fallback.
+
     Args:
         directory: Common project state directory.
         agent: Assigned native lane name.
@@ -278,6 +291,9 @@ def record(
         "cause": cause[:MAX_CAUSE_BYTES],
         "injected_bytes": injected_bytes(output),
     }
+    if (fallback := FALLBACK.get()) is not None:
+        entry["fallback"] = fallback["cause"][:MAX_CAUSE_BYTES]
+        fallback["recorded"] = True
     path = directory / f"{agent}-events.jsonl"
     with contextlib.suppress(OSError):
         size = 0
@@ -2044,6 +2060,14 @@ def serve(
     a deferral is counted afterwards and the winner records only its own
     decision.
 
+    A state write that fails because storage is full, over quota, read-only
+    or failing (`STORAGE_ERRORS`) allows the call and says so on stderr.
+    Denying it would also deny the ``rm`` or ``du`` that frees the space.
+
+    A ``fallback`` cause is attached to the records the decision writes,
+    so the event is recorded once. A decision that wrote no record, as one
+    that failed does, gets a single ``service_fallback`` record instead.
+
     Args:
         home: Private bridge state root.
         request: ``directory``, ``participant`` and ``payload`` as the hook
@@ -2082,19 +2106,15 @@ def serve(
             + "\n",
         }
     payload = request.get("payload")
+    fallback = (
+        {"cause": str(request["fallback"]), "recorded": False}
+        if request.get("fallback")
+        else None
+    )
+    marked = FALLBACK.set(fallback)
     try:
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object")
-        if request.get("fallback"):
-            record(
-                directory,
-                participant,
-                payload,
-                Reason.SERVICE_FALLBACK,
-                None,
-                "",
-                str(request["fallback"]),
-            )
         adapter: ModuleType | None = None
         if request.get("adapter") == "gemini":
             from agent_parley import gemini as adapter
@@ -2149,16 +2169,51 @@ def serve(
             "stdout": "{}\n",
             "stderr": f"Agent Parley checkpoint deferred: {exc}\n",
         }
-    except (OSError, ValueError, KeyError, BridgeError) as exc:
-        stderr = f"Agent Parley checkpoint failed: {exc}\n"
-        if isinstance(payload, dict) and payload.get("hook_event_name") in (
-            "PostToolUse",
-            "PermissionRequest",
-            "Stop",
-            "SessionEnd",
-        ):
-            return {"status": 0, "stdout": "{}\n", "stderr": stderr}
-        return {"status": 2, "stdout": "", "stderr": stderr}
+    except OSError as exc:
+        if exc.errno not in STORAGE_ERRORS:
+            return failed(payload, exc)
+        return {
+            "status": 0,
+            "stdout": "{}\n",
+            "stderr": "Agent Parley checkpoint could not write its state, "
+            f"call allowed: {exc}\n",
+        }
+    except (ValueError, KeyError, BridgeError) as exc:
+        return failed(payload, exc)
+    finally:
+        FALLBACK.reset(marked)
+        if fallback and not fallback["recorded"] and isinstance(payload, dict):
+            record(
+                directory,
+                participant,
+                payload,
+                Reason.SERVICE_FALLBACK,
+                None,
+                "",
+                str(fallback["cause"]),
+            )
+
+
+def failed(payload: object, exc: Exception) -> dict:
+    """Returns the hook contract for a decision that could not be made.
+
+    Args:
+        payload: Native hook payload, or whatever arrived in its place.
+        exc: Why the decision failed.
+
+    Returns:
+        ``status``, ``stdout`` and ``stderr``: an allow for an event that
+        reports after the fact, a denial for one that gates the call.
+    """
+    stderr = f"Agent Parley checkpoint failed: {exc}\n"
+    if isinstance(payload, dict) and payload.get("hook_event_name") in (
+        "PostToolUse",
+        "PermissionRequest",
+        "Stop",
+        "SessionEnd",
+    ):
+        return {"status": 0, "stdout": "{}\n", "stderr": stderr}
+    return {"status": 2, "stdout": "", "stderr": stderr}
 
 
 def _hook_pid() -> int:

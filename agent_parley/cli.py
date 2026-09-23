@@ -267,6 +267,7 @@ COPILOT_EVENTS = frozenset(
 GIT_SECONDS = 30
 MAX_HEALTH_BYTES = 65536
 START_SECONDS = 25.0
+LAUNCH_LOCK_SECONDS = 10.0
 
 
 def git(repo: Path, *args: str) -> str:
@@ -7100,7 +7101,11 @@ reported.
         When the native process exits, its last process generation remains in
         the stopped activity record. Orphan recovery needs that PID together
         with its kernel start ticks to prove the exact generation ended; the
-        next launch replaces both before starting its client.
+        next launch replaces both before starting its client. It rewrites the
+        activity record under the lane's checkpoint lock, as every hook
+        decision does, so a decision still finishing the previous session
+        cannot write last and restore that session's identity over the
+        launch.
 
         A resumed session asks again for permission to use this bridge's own
         MCP tools, and a service-driven resume has nobody at the keyboard to
@@ -7124,7 +7129,8 @@ reported.
         Raises:
             BridgeError: If the provider, account, or lane cannot be used, or
                 the participant already has a launcher, or the repository
-                lies on a mounted Windows drive under WSL.
+                lies on a mounted Windows drive under WSL, or the lane's
+                checkpoint lock stays held for `LAUNCH_LOCK_SECONDS`.
         """
         process.check_repository_host(repo)
         data = self.add_participant(repo, agent, provider, credential)
@@ -7322,43 +7328,52 @@ reported.
                 flush=True,
             )
             activity_path = lane.parent / f"{agent}-activity.json"
-            previous = (
-                json.loads(activity_path.read_text())
-                if activity_path.exists()
-                else {}
-            )
-            previous.setdefault(
-                "resumable_session", previous.get("session_id", "")
-            )
-            if resume:
-                session = previous["resumable_session"]
-                if not session or session.startswith("-") or len(session) > 128:
-                    raise BridgeError(
-                        "No usable native session to resume; launch manually."
-                    )
-                if entry["adapter"] == "codex":
-                    command[1:1] = ["resume", session]
-                elif entry["adapter"] == "opencode":
-                    command[1:1] = ["--session", session]
-                elif entry["adapter"] == "amp":
-                    command[1:1] = ["threads", "continue", session]
-                else:
-                    command[1:1] = ["--resume", session]
-            previous.update(
-                activity=supervision.STARTING,
-                launcher_managed=True,
-                task=task,
-                updated=time.time(),
-                session_id="",
-                cursor=0,
-                session_pid=os.getpid(),
-                session_ticks=process.start_ticks(os.getpid()),
-                launcher_pid=os.getpid(),
-                launcher_ticks=process.start_ticks(os.getpid()),
-                session_started=time.time(),
-            )
-            previous.pop("last_prompt", None)
-            write_json(activity_path, previous)
+            with lock(
+                lane.parent / f"{agent}-checkpoint.lock",
+                timeout=LAUNCH_LOCK_SECONDS,
+            ):
+                previous = (
+                    json.loads(activity_path.read_text())
+                    if activity_path.exists()
+                    else {}
+                )
+                previous.setdefault(
+                    "resumable_session", previous.get("session_id", "")
+                )
+                if resume:
+                    session = previous["resumable_session"]
+                    if (
+                        not session
+                        or session.startswith("-")
+                        or len(session) > 128
+                    ):
+                        raise BridgeError(
+                            "No usable native session to resume; "
+                            "launch manually."
+                        )
+                    if entry["adapter"] == "codex":
+                        command[1:1] = ["resume", session]
+                    elif entry["adapter"] == "opencode":
+                        command[1:1] = ["--session", session]
+                    elif entry["adapter"] == "amp":
+                        command[1:1] = ["threads", "continue", session]
+                    else:
+                        command[1:1] = ["--resume", session]
+                previous.update(
+                    activity=supervision.STARTING,
+                    launcher_managed=True,
+                    task=task,
+                    updated=time.time(),
+                    session_id="",
+                    cursor=0,
+                    session_pid=os.getpid(),
+                    session_ticks=process.start_ticks(os.getpid()),
+                    launcher_pid=os.getpid(),
+                    launcher_ticks=process.start_ticks(os.getpid()),
+                    session_started=time.time(),
+                )
+                previous.pop("last_prompt", None)
+                write_json(activity_path, previous)
             try:
                 with delivery.polling(
                     self.home, lane.parent, agent, entry["adapter"]

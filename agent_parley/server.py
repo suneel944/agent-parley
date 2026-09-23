@@ -41,6 +41,7 @@ WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
 SLOW_DECISION = DECISION_SECONDS / 2
 DELIVERY_SECONDS = 0.25
+TEMPORARY_SECONDS = 60.0
 UNDECIDED_LIMIT = 1
 REFUSAL_SECONDS = 5.0
 REPEAT_SECONDS = 60.0
@@ -100,6 +101,31 @@ def log(home: Path, event: str, detail: str = "") -> None:
         except OSError:
             return
         trim_log(rotated)
+
+
+def sweep(home: Path) -> int:
+    """Removes temporary files that interrupted state writes left behind.
+
+    Every state write goes through a ``tmp*`` file in the target's
+    directory and renames it into place, so a writer killed between the
+    two leaves that file for good. Only files older than
+    `TEMPORARY_SECONDS` are removed, because a hook deciding in process
+    while the service starts may be writing one right now.
+
+    Args:
+        home: Private bridge state root holding the project directories.
+
+    Returns:
+        Number of temporary files removed.
+    """
+    cutoff = time.time() - TEMPORARY_SECONDS
+    removed = 0
+    for path in (home / "projects").glob("*/tmp*"):
+        with contextlib.suppress(OSError):
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+    return removed
 
 
 def _tool(
@@ -1225,6 +1251,8 @@ def main() -> None:
     os.umask(0o077)
     config = json.loads((args.home / "config.json").read_text())
     store.initialize(args.home)
+    if removed := sweep(args.home):
+        log(args.home, "swept", f"{removed} temporary state files")
     from agent_parley import inbound, supervision
 
     stopped = threading.Event()
