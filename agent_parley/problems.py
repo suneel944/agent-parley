@@ -40,6 +40,7 @@ DIRTY = "dirty worktree"
 BUDGET = "over budget"
 WAKE = "wake attention"
 APPROVAL = "waiting on approval"
+HELD = "held by a native dialog"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -395,10 +396,12 @@ def _lane_rows(
         oldest, so a broadcast costs one row per lane rather than one per
         message it created. A native approval prompt is reported once it has
         stood unanswered past the same bound an unacknowledged message uses,
-        because a prompt the operator is about to answer needs no row. A lane
-        that retired reports only the worktree it kept, because its quiet is
-        the state the operator asked for and every other remedy here would
-        wake a lane that has given its work back.
+        because a prompt the operator is about to answer needs no row. A
+        native dialog the launcher escalated is reported at once by name,
+        with the options it offers, because nothing will answer it but the
+        operator. A lane that retired reports only the worktree it kept,
+        because its quiet is the state the operator asked for and every
+        other remedy here would wake a lane that has given its work back.
     """
     name = record["participant"]
     repo = f"--repo {root}"
@@ -452,6 +455,26 @@ def _lane_rows(
                     root,
                 )
             )
+    elif held.get("escalated"):
+        shown = str(held.get("label", "")) or "a native prompt"
+        offered = [str(item) for item in held.get("options") or []]
+        if offered:
+            shown = f"{shown} ({'; '.join(offered)})"
+        at = held.get("at")
+        rows.append(
+            _row(
+                HELD,
+                f"the client is held by {shown}",
+                f"answer the prompt in {name}'s terminal",
+                (
+                    max(0, int(now - float(at)))
+                    if isinstance(at, (int, float))
+                    else None
+                ),
+                name,
+                root,
+            )
+        )
     if idle["stalled"]:
         command, actor = _remedy(name, repo, record, waking)
         rows.append(

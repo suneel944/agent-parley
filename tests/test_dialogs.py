@@ -23,7 +23,7 @@ from agent_parley import (
     roster,
     terminal,
 )
-from agent_parley.state import write_json
+from agent_parley.state import BridgeError, lock, write_json
 
 USAGE_LIMIT = (
     "\x1b[38;2;80;80;80m❯ Review pending coordination messages and handoff "
@@ -60,6 +60,56 @@ UNKNOWN_PROMPT = (
 
 WORKING = "  ⎿  Read 4 files, ran 2 shell commands ✻ Brewing for 3s  "
 
+CODEX_TRUST = (
+    "\x1b[2J\x1b[HYou are in /home/operator/.local/state/agent-parley/"
+    "projects/abc/lane\r\n\r\nNote: You're in a subdirectory of a Git "
+    "project. Trusting will apply to the\r\nrepository root: "
+    "/tmp/parley-probe-20260922\r\n\r\nDo you trust the contents of this "
+    "directory? Working with untrusted contents\r\ncomes with higher risk "
+    "of prompt injection.\r\n\r\n\x1b[1m› 1. Yes, continue\x1b[0m\r\n  2. "
+    "No, quit\r\n\r\n  Press enter to continue\r\n"
+)
+
+CLAUDE_TRUST = (
+    "\x1b[2J\x1b[H╭────╮\r\n│ Do you trust the files in this folder? │\r\n"
+    "│ /home/operator/lane │\r\n│ Claude Code may read, write, or execute "
+    "files contained in this directory. │\r\n│ ❯ 1. Yes, I trust this "
+    "folder │\r\n│   2. No, exit │\r\n╰────╯\r\n  Enter to confirm · Esc "
+    "to cancel\r\n"
+)
+
+QUESTION_PICKER = (
+    "\x1b[2J\x1b[H☐ Layout\r\n\r\nHow should the rename stay under the "
+    "module ceilings?\r\n\r\n❯ 1. Shrink the three modules instead\r\n     "
+    "Cut 5 lines of unrelated code from those three files to stay under "
+    "the\r\n     existing ceilings.\r\n  2. Re-export from replay/__init__.py"
+    "\r\n     Keep a re-export so grouped imports survive and no file grows."
+    "\r\n  3. Type something.\r\n  4. Chat about this\r\n\r\nEnter to select "
+    "· ↑/↓ to navigate · Esc to cancel\r\n"
+)
+
+REPORTED_PICKER = (
+    "Shrink the three modules instead\r\nCut 5 lines of unrelated code from "
+    "those three files to stay under the\r\nexisting ceilings. Puts "
+    "refactoring I did not plan into a rename PR, and\r\nthe cuts would be "
+    "arbitrary.\r\nRe-export from replay/__init__.py\r\nKeep a re-export so "
+    "grouped imports survive and no file grows. Reverses\r\nParley decisions "
+    "616/618 and the 're-exports nothing' rule that fill/ and\r\nguarded/ "
+    "already follow.\r\n4. Type something.\r\n5. Chat about this\r\nEnter to "
+    "select · ↑/↓ to navigate · Esc to cancel\r\n"
+)
+
+STANDING = (
+    "No operator is watching. Choose the option that keeps every guard, "
+    "record the choice in your report, and continue."
+)
+
+QUOTED_LIMIT = (
+    "  ⎿  Read tests/fixtures/limits.log\r\n```\r\n2026-09-22 provider said: "
+    "usage limit reached; you've hit your weekly limit · resets Sep 21, 6am"
+    "\r\n```\r\n"
+)
+
 HARNESS = (
     "import os, sys\nfrom pathlib import Path\n"
     "from agent_parley import dialogs\n"
@@ -77,6 +127,17 @@ CLIENT = (
     "while b'\\r' not in seen:\n"
     "    seen += os.read(0, 4096)\n"
     "print('PRESSED:' + repr(seen), flush=True)\n"
+    "os.read(0, 4096)\n"
+)
+
+SILENT_CLIENT = (
+    "import os, sys, tty\ntty.setraw(0)\n"
+    "os.write(1, sys.argv[1].encode())\n"
+    "print('DRAWN', flush=True)\n"
+    "seen = b''\n"
+    "while b'\\r' not in seen:\n"
+    "    seen += os.read(0, 4096)\n"
+    "open('pressed', 'w').write(repr(seen))\n"
     "os.read(0, 4096)\n"
 )
 
@@ -194,7 +255,9 @@ def test_the_usage_limit_screen_names_a_parseable_reset(capture):
 
 
 def test_a_usage_limit_screen_without_a_reset_reports_none():
-    screen = dialogs.flatten(b"  You've hit your weekly limit  /upgrade  ")
+    screen = dialogs.flatten(
+        "  ⎿  You've hit your weekly limit  /upgrade  ".encode()
+    )
     assert dialogs.match(screen) is not None
     assert dialogs.reset_at(screen, dubai(9, 22, 12)) is None
 
@@ -323,7 +386,7 @@ def test_the_launcher_answers_a_configured_dialog_and_refuses_wakes():
     with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
         directory = Path(temporary)
         project(directory, {"hook-review": "continue without trusting"})
-        child = launch(directory, HOOK_REVIEW, CLIENT, "30")
+        child = launch(directory, HOOK_REVIEW, SILENT_CLIENT, "30")
         try:
             assert "DRAWN" in read_line(child)
             state = published(directory)
@@ -337,7 +400,39 @@ def test_the_launcher_answers_a_configured_dialog_and_refuses_wakes():
                 terminal.request(directory, "lane")
                 == "manual attention required"
             )
+            pressed = directory / "lane" / "pressed"
+            deadline = time.monotonic() + 10
+            while not pressed.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert pressed.read_text() == repr(b"3\r")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+
+def test_the_launcher_releases_an_answered_dialog_on_the_next_output():
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        project(directory, {"hook-review": "continue without trusting"})
+        child = launch(directory, HOOK_REVIEW, CLIENT, "30")
+        try:
+            assert "DRAWN" in read_line(child)
             assert "PRESSED:" + repr(b"3\r") in read_line(child)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                state = json.loads(
+                    (directory / "lane-activity.json").read_text()
+                )
+                if "dialog" not in state:
+                    break
+                time.sleep(0.1)
+            assert "dialog" not in state
+            assert state["activity"] == "starting; awaiting native hook"
+            assert (
+                terminal.request(directory, "lane")
+                != "manual attention required"
+            )
         finally:
             if child.poll() is None:
                 child.kill()
@@ -410,7 +505,7 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
             "os.write(1, sys.argv[1].encode())\n"
             "print('DRAWN', flush=True)\n"
             "rest = os.read(0, 4096)\n"
-            "print('PRESSED:' + repr(rest), flush=True)\n"
+            "open('pressed', 'w').write(repr(rest))\n"
             "os.read(0, 4096)\n"
         )
         pid, master = pty.fork()
@@ -547,3 +642,174 @@ def test_the_launch_approves_this_bridge_and_nothing_else(
         assert settings["permissions"] == {"allow": allowed}
     assert "bypass" not in " ".join(argv).lower()
     assert "--dangerously-skip-permissions" not in argv
+
+
+@pytest.mark.parametrize(
+    "capture,answer,pressed",
+    [
+        (CODEX_TRUST, "yes, continue", b"1\r"),
+        (CLAUDE_TRUST, "no, exit", b"2\r"),
+    ],
+)
+def test_the_directory_trust_screens_are_named(capture, answer, pressed):
+    screen = dialogs.flatten(capture.encode())
+    found = dialogs.locate(screen)
+    assert found is not None
+    assert found.dialog.name == dialogs.TRUST
+    assert dialogs.keys(found.text, answer) == pressed
+
+
+def test_a_trust_screen_escalates_by_name_until_an_answer_is_recorded(
+    tmp_path,
+):
+    write_json(tmp_path / "lane-activity.json", {"activity": "starting"})
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(CODEX_TRUST.encode(), 0.0)
+    assert watch.advance(b"", 0.5) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "dialog: native directory trust prompt"
+    assert state["dialog"]["name"] == dialogs.TRUST
+    assert state["dialog"]["escalated"] is True
+    manifest = {"supervision": {"dialogs": {dialogs.TRUST: "yes, continue"}}}
+    answers = dialogs.configured(manifest, "lane")
+    assert answers == {dialogs.TRUST: "yes, continue"}
+
+
+def test_the_question_picker_is_named_by_its_question(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        dialogs.Watch,
+        "_notify",
+        lambda self, label, detail: sent.append((label, detail)),
+    )
+    screen = dialogs.flatten(QUESTION_PICKER.encode())
+    found = dialogs.locate(screen)
+    assert found is not None
+    assert found.dialog.name == dialogs.QUESTION
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(QUESTION_PICKER.encode(), 0.0)
+    assert watch.advance(b"", 0.5) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    label = (
+        "asks the operator: Layout How should the rename stay under the "
+        "module ceilings?"
+    )
+    assert state["activity"] == f"dialog: {label}"
+    record = state["dialog"]
+    assert record["name"] == dialogs.QUESTION
+    assert record["question"] == label.removeprefix("asks the operator: ")
+    assert record["options"][0].startswith(
+        "1. Shrink the three modules instead"
+    )
+    assert record["options"][2:] == ["3. Type something.", "4. Chat about this"]
+    [(notified, detail)] = sent
+    assert notified == label
+    assert "1. Shrink the three modules instead" in detail
+    assert "4. Chat about this" in detail
+
+
+def test_the_reported_picker_capture_is_a_question():
+    screen = dialogs.flatten(REPORTED_PICKER.encode())
+    assert dialogs.match(screen) is dialogs.BY_NAME[dialogs.QUESTION]
+
+
+def test_numbered_lines_without_the_picker_footer_are_no_dialog(tmp_path):
+    bare = QUESTION_PICKER.rsplit("Enter to select", 1)[0]
+    screen = dialogs.flatten(bare.encode())
+    assert dialogs.match(screen) is None
+    assert dialogs.prompted(screen) is False
+    watch = dialogs.Watch(tmp_path, "lane", deadline=0.0)
+    watch.advance(bare.encode(), 0.0)
+    watch.advance(b"", 5.0)
+    assert watch.holding is False
+
+
+def test_a_standing_reply_answers_the_question_as_free_text(tmp_path):
+    manifest = {
+        "supervision": {dialogs.STANDING_REPLY: "project reply"},
+        "participants": {"lane": {dialogs.STANDING_REPLY: STANDING}},
+    }
+    assert dialogs.standing_reply(manifest, "lane") == STANDING
+    assert dialogs.standing_reply(manifest, "other") == "project reply"
+    assert dialogs.standing_reply({}, "lane") == ""
+    watch = dialogs.Watch(tmp_path, "lane", reply=STANDING)
+    watch.advance(QUESTION_PICKER.encode(), 0.0)
+    assert watch.advance(b"", 0.5) == f"3{STANDING}\r".encode()
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["answer"] == STANDING
+    assert "escalated" not in state["dialog"]
+
+
+@pytest.mark.parametrize(
+    "reply", ["", "   ", "line one\nline two", "\x1b[A", "x" * 501, 7]
+)
+def test_a_standing_reply_must_be_one_printable_line(reply):
+    with pytest.raises(BridgeError):
+        roster.standing_reply(reply)
+
+
+def test_a_quoted_usage_limit_in_output_is_no_dialog(tmp_path):
+    screen = dialogs.flatten(QUOTED_LIMIT.encode())
+    assert dialogs.match(screen) is None
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(QUOTED_LIMIT.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    assert not (tmp_path / "lane-capacity.json").exists()
+    assert watch.holding is False
+
+
+def test_dialog_words_in_scrollback_are_no_dialog():
+    screen = dialogs.flatten((TOOL_PERMISSION + WORKING * 40).encode())
+    assert dialogs.match(screen) is None
+    assert dialogs.prompted(screen) is False
+
+
+def test_an_answered_permission_dialog_clears_holding_on_the_next_read(
+    tmp_path,
+):
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane", {"tool-permission": "yes"})
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    assert watch.advance(b"", 0.5) == b"1\r"
+    assert watch.holding is True
+
+    watch.advance("  ⎿  Fetched 2 messages ".encode(), 1.0)
+    assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "working"
+    assert "dialog" not in state
+
+    watch.advance(TOOL_PERMISSION.encode(), 2.0)
+    assert watch.advance(b"", 2.5) == b"1\r"
+    assert watch.holding is True
+
+
+def test_an_operator_answer_releases_the_dialog_on_the_next_output(tmp_path):
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(HOOK_REVIEW.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    assert watch.holding is True
+    watch.answered()
+    watch.advance(b"", 1.0)
+    assert watch.holding is True
+    watch.advance(b" Continuing ", 1.5)
+    assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "working"
+
+
+def test_a_release_that_meets_a_held_lock_is_retried(tmp_path):
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(HOOK_REVIEW.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    assert watch.holding is True
+    with lock(tmp_path / "lane-checkpoint.lock"):
+        watch.advance((WORKING * 200).encode(), 1.0)
+        assert watch.holding is True
+    watch.advance(b"", 2.0)
+    assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "working"
+    assert "dialog" not in state
