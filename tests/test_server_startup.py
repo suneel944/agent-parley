@@ -3,6 +3,7 @@
 import contextlib
 import re
 import socket
+import threading
 
 from agent_parley import server
 from agent_parley.server import Server
@@ -54,3 +55,59 @@ def test_the_service_log_stays_under_its_rotation_bound(tmp_path):
     written = path.read_text()
     assert path.stat().st_size < MAX_LOG_BYTES
     assert "5999 connection(s)" in written.splitlines()[-1]
+
+
+def test_a_refusal_burst_writes_one_line_per_lane_per_window(
+    tmp_path, monkeypatch
+):
+    clock = [1000.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    path = tmp_path / "server.log"
+    lane = ("/work/project", "claude-p2-4")
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        with path.open("a", encoding="utf-8") as stream:
+            with contextlib.redirect_stdout(stream):
+                for _ in range(5000):
+                    instance.coalesce("undecided", lane, "claude-p2-4 held")
+                instance.coalesce("undecided", ("/other", "claude"), "other")
+                clock[0] += server.REPEAT_SECONDS
+                instance.coalesce("undecided", lane, "claude-p2-4 held")
+    lines = [
+        line for line in path.read_text().splitlines() if " undecided " in line
+    ]
+    assert len(lines) == 3
+    assert lines[0].endswith("undecided claude-p2-4 held")
+    assert lines[1].endswith("undecided other")
+    assert lines[2].endswith("; 4999 more since the previous entry")
+
+
+def test_a_rotation_under_concurrent_writes_loses_no_line(tmp_path):
+    path = tmp_path / "server.log"
+    writers = 8
+    count = 400
+    pad = "x" * 80
+
+    def write(writer):
+        for number in range(count):
+            server.log(tmp_path, "refused", f"{writer}:{number} {pad}")
+
+    with path.open("a", encoding="utf-8") as stream:
+        with contextlib.redirect_stdout(stream):
+            threads = [
+                threading.Thread(target=write, args=(writer,))
+                for writer in range(writers)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+    rotated = tmp_path / server.ROTATED_NAME
+    kept = rotated.read_text().splitlines() + path.read_text().splitlines()
+    assert rotated.stat().st_size > 0
+    assert path.stat().st_size < MAX_LOG_BYTES
+    written = sorted(line.split()[2] for line in kept)
+    assert written == sorted(
+        f"{writer}:{number}"
+        for writer in range(writers)
+        for number in range(count)
+    )

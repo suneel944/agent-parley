@@ -1244,7 +1244,7 @@ def test_a_lane_only_records_events_while_one_is_abandoned(
     assert asked == [False] * limit + [True] * (len(answers) - limit)
     entries = capsys.readouterr().out.splitlines()
     held = [line for line in entries if "already has" in line]
-    assert len(held) == len(answers) - limit
+    assert len(held) == 1
     root = roster.read(lane.parent)["root"]
     assert f"codex of {root} already has" in held[0]
     assert "recorded without building context" in held[0]

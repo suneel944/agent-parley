@@ -2238,7 +2238,8 @@ states how many units of work the claim still has left.
 
 `up` starts the detached service; `down` stops its verified process and retains
 state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in
-`server.log`. Set `AGENT_PARLEY_HOME` or pass `--home` for another private root.
+`server.log`, with the previous window in `server.log.1`; repeated per-lane
+`undecided` and `unanswered` entries are coalesced to one per minute. Set `AGENT_PARLEY_HOME` or pass `--home` for another private root.
 Set `AGENT_PARLEY_PORT` before first initialization to override port 8876.
 
 `server.json` names a service that answered: `up` publishes it only once the
