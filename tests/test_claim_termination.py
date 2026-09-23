@@ -85,11 +85,21 @@ def record(lane):
     return issues.snapshot(lane.parent)["issues"]["1"]
 
 
-def escalated(bridge, lane, monkeypatch, state="MERGED", polls=3):
+def unanswered(lane, windows):
+    """Ages the completion reminder by whole default inactive windows."""
+    path = lane.parent / "issues.json"
+    ledger = json.loads(path.read_text())
+    prompt = ledger["issues"]["1"]["handoff_prompt"]
+    prompt["created"] -= windows * supervision.DEFAULTS["inactive_after"]
+    path.write_text(json.dumps(ledger))
+
+
+def escalated(bridge, lane, monkeypatch, state="MERGED"):
     """Drives the supervisor until the claim reads as unresolved."""
     completion(monkeypatch, state, time.time() + 1)
-    for _ in range(polls):
-        supervision.poll(bridge.home, lane.parent)
+    supervision.poll(bridge.home, lane.parent)
+    unanswered(lane, 2)
+    supervision.poll(bridge.home, lane.parent)
     return record(lane)
 
 
@@ -97,10 +107,14 @@ def test_a_merged_branch_and_silence_escalate_exactly_once(
     bridge, claimed, monkeypatch
 ):
     completion(monkeypatch, "MERGED", time.time() + 1)
+    for _ in range(4):
+        supervision.poll(bridge.home, claimed.parent)
+    assert record(claimed).get("unresolved_completion") is None
+    assert record(claimed)["handoff_prompt"]["reminders"] == 1
+    unanswered(claimed, 1)
     supervision.poll(bridge.home, claimed.parent)
     assert record(claimed).get("unresolved_completion") is None
-    supervision.poll(bridge.home, claimed.parent)
-    assert record(claimed).get("unresolved_completion") is None
+    unanswered(claimed, 1)
     supervision.poll(bridge.home, claimed.parent)
     marker = record(claimed)["unresolved_completion"]
     assert marker["holder"] == "claude"

@@ -2,7 +2,7 @@
 
 import pytest
 
-from agent_parley import issues, store
+from agent_parley import issues, lifecycle, store
 from agent_parley.state import BridgeError, LockBusy
 
 
@@ -186,6 +186,20 @@ def test_a_repeated_report_counts_one_attempt(bridge, repo, paired):
             key="stuck",
         )
     assert issues.snapshot(directory)["issues"]["42"]["attempts"] == 1
+
+
+def test_a_late_replayed_report_leaves_the_lifecycle_alone(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "42")
+    stuck = ("blocked", "Waiting on schema.", "Apply the migration.", "")
+    bridge.report(lane, *stuck, key="stuck")
+    bridge.report(lane, "ready", "Migration applied.", "", "make check", "go")
+    bridge.report(lane, *stuck, key="stuck")
+    record = issues.snapshot(directory)["issues"]["42"]
+    assert lifecycle.state(record)["state"] == lifecycle.READY
 
 
 def test_a_report_key_reused_for_other_content_is_refused(bridge, repo, paired):

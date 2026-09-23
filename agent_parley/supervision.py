@@ -1704,13 +1704,23 @@ def unresolved_reason(holder: str, reminders: int, observed: dict) -> str:
 
 
 def completion_escalations(
-    directory: Path, manifest: dict, observed: dict, threshold: int
+    directory: Path,
+    manifest: dict,
+    observed: dict,
+    threshold: int,
+    window: float,
 ) -> None:
     """Escalates to the operator when a holder ignores completion reminders.
 
     Repeating a reminder at a lane that has stopped answering changes nothing,
-    so the supervisor counts the reminders it re-observes unanswered and, past
-    the project's threshold, records that the completion is unresolved. The
+    so the supervisor counts the reminders it left unanswered and, past the
+    project's threshold, records that the completion is unresolved. A
+    reminder is written once per identifier, then stays in the holder's wake
+    backlog, and a silent lane is asked for a turn at most once per inactive
+    window. The count is therefore the windows elapsed since the reminder
+    was first written, counting the first, and never the polls that
+    re-observed it: a poll every few seconds would otherwise escalate a
+    reminder the lane has had one chance to answer. The
     marker is an observation the operator acts on. Nothing moves here: the
     issue keeps its owner, its offer and its reservations, no peer gains any
     power over another lane's claim, and only an explicit operator resolution
@@ -1726,6 +1736,8 @@ def completion_escalations(
             inside the current ownership generation, carrying the branch, the
             pull request state and the instant it was observed.
         threshold: Unanswered reminders this project escalates after.
+        window: Seconds of silence after which a lane is asked again, the
+            span one unanswered reminder is counted over.
     """
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
@@ -1747,9 +1759,11 @@ def completion_escalations(
             seen = observed.get(number) or {}
             if current or not seen:
                 continue
-            counted = int(prompt.get("reminders", 0) or 0) + 1
-            prompt["reminders"] = counted
-            changed = True
+            elapsed = max(0.0, time.time() - float(prompt.get("created", 0)))
+            counted = 1 + int(elapsed // window)
+            if prompt.get("reminders") != counted:
+                prompt["reminders"] = counted
+                changed = True
             if counted < threshold:
                 continue
             record["unresolved_completion"] = {
@@ -2666,6 +2680,7 @@ def poll(home: Path, directory: Path) -> None:
                     "completion_reminders", DEFAULTS["completion_reminders"]
                 )
             ),
+            float(config["inactive_after"]),
         )
         work(home, directory, manifest, config)
     if config["wake"]:

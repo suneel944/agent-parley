@@ -5045,14 +5045,13 @@ reported.
                 "backlog": backlog,
             },
         )
-        replayed = False
         path = directory / f"{agent}-activity.json"
         with lock(directory / f"{agent}-report.lock", timeout=1):
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
                 if key and (recorded := state.get("retries", {}).get(scope)):
                     retries.replayed(recorded, "report", key, fingerprint)
-                    replayed = True
+                    return
             lifecycle.record_report(
                 directory,
                 agent,
@@ -5064,8 +5063,6 @@ reported.
                 resume_on,
                 backlog,
             )
-            if replayed:
-                return
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
                 arrived = outcome == "ready" and state.get("outcome") != "ready"

@@ -1501,8 +1501,12 @@ marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
 
 Repeating a reminder at a lane that has stopped answering changes nothing, so
-the supervisor counts the reminders it re-observes unanswered on a claim whose
-lane branch is merged or closed. Past `completion_reminders` it records the
+the supervisor counts the reminders left unanswered on a claim whose lane branch
+is merged or closed. The reminder is written once and a silent lane is asked
+again at most once per `inactive_after` window, so the count is one plus the
+whole windows elapsed since the reminder was written, never the number of
+polls. With the defaults a claim escalates about ten minutes after its first
+reminder. Past `completion_reminders` it records the
 claim as an unresolved completion once, which `status` carries on the claim and
 `problems` lists for the operator. A holder that answers before the threshold
 clears its own escalation. Nothing moves on the marker: the issue keeps its
@@ -2228,7 +2232,10 @@ credential. Unlike `participant retire` it keeps the manifest entry, marked with
 the time it retired: `status` and `top` show the lane as `retired AGE ago`, the
 JSON views carry `retired_at`, and the service neither wakes it nor names it in
 a work offer. A lane whose worktree is dirty keeps it, and the changed paths are
-reported in the tool result. Return that lane to service with the same
+reported in the tool result. A lane that holds ready work is refused before
+anything is released, naming those issues: ready work stays claimed until
+`agent-parley merge LANE` lands it, or the lane offers it to a peer. Return
+that lane to service with the same
 `participant add NAME` command that created it, which restores its worktree on
 its own branch; the next launch registers a fresh credential.
 
