@@ -395,7 +395,7 @@ def test_a_reply_without_a_status_line_falls_back_in_process(
 def test_a_failure_inside_the_served_decision_answers_500(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None, settle=0.0, record_only=False):
+    def broken(home, request, stages=None, *args, **kwargs):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -738,10 +738,10 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     release = threading.Event()
     finished = threading.Event()
 
-    def stalling(home, request, stages=None, settle=0.0, record_only=False):
+    def stalling(home, request, stages=None, *args, **kwargs):
         release.wait(20)
         try:
-            return deciding(home, request, stages, settle, record_only)
+            return deciding(home, request, stages, *args, **kwargs)
         finally:
             finished.set()
 
@@ -923,7 +923,7 @@ def test_the_shell_client_starts_python_when_the_service_is_down(
 def test_the_shell_client_starts_python_when_the_service_fails(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None, settle=0.0, record_only=False):
+    def broken(home, request, stages=None, *args, **kwargs):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -957,7 +957,7 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
 def test_the_shell_client_forwards_both_served_streams_and_the_status(
     bridge, repo, paired, service, monkeypatch
 ):
-    def loud(home, request, stages=None, settle=0.0, record_only=False):
+    def loud(home, request, stages=None, *args, **kwargs):
         return {"stdout": '{"ok": true}\n', "stderr": "warned\n", "status": 2}
 
     monkeypatch.setattr(server.checkpoints, "serve", loud)
@@ -1188,10 +1188,12 @@ def stalling(monkeypatch, seconds):
     served = server.checkpoints.serve
     asked = []
 
-    def slow(home, request, stages=None, settle=0.0, record_only=False):
+    def slow(
+        home, request, stages=None, settle=0.0, record_only=False, **kwargs
+    ):
         asked.append(record_only)
         time.sleep(seconds)
-        return served(home, request, stages, settle, record_only)
+        return served(home, request, stages, settle, record_only, **kwargs)
 
     monkeypatch.setattr(server.checkpoints, "serve", slow)
     return asked
@@ -1211,6 +1213,64 @@ def test_a_decision_past_its_deadline_is_never_decided_again(
     settled(lane.parent, 1)
     assert len(asked) == 1
     assert len(events(lane.parent)) == 1
+
+
+def test_an_abandoned_stop_leaves_its_coordination_undelivered(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "claude-identity.json").read_text())
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Unseen change",
+            "body_md": "Read this.",
+            "idempotency_key": "unseen",
+        },
+    )
+    write_json(
+        lane.parent / "codex-work.json",
+        {"offer": {"id": "offer-1", "text": "Take issue #9 next."}},
+    )
+    deciding = checkpoints.serve
+    stalling(monkeypatch, server.DECISION_SECONDS + 0.5)
+    stop = {**STOP, "cwd": str(lane), "session_id": "s1"}
+    abandoned = run_hook(bridge, lane.parent, stop)
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert json.loads(abandoned.stdout) == {}
+    settled(lane.parent, 1)
+    state = checkpoints.activity(lane.parent, "codex")
+    assert state["activity"] == "idle"
+    assert state.get("cursor", 0) == 0
+    assert "work_offer" not in state
+    monkeypatch.setattr(server.checkpoints, "serve", deciding)
+    served = run_hook(bridge, lane.parent, stop)
+    reason = json.loads(served.stdout)["reason"]
+    assert "Unseen change" in reason
+    assert "Take issue #9 next." in reason
+    state = checkpoints.activity(lane.parent, "codex")
+    assert state["cursor"] > 0
+    assert state["work_offer"] == "offer-1"
+    assert state["activity"] == "working"
+
+
+def test_a_delivery_for_an_ended_session_is_discarded(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    write_json(
+        lane.parent / "codex-activity.json",
+        {"session_id": "s2", "cursor": 0, "updated": 2.0},
+    )
+    pending = {
+        "markers": {"cursor": 7, "activity": "working"},
+        "session_id": "s1",
+        "updated": 1.0,
+    }
+    assert not checkpoints.deliver(lane.parent, "codex", pending)
+    assert checkpoints.activity(lane.parent, "codex")["cursor"] == 0
 
 
 def hook_body(lane, payload=ALLOW):
@@ -1326,11 +1386,13 @@ def test_an_abandoned_decision_holds_only_its_own_project(
     asked = []
     release = threading.Event()
 
-    def selective(home, request, stages=None, settle=0.0, record_only=False):
+    def selective(
+        home, request, stages=None, settle=0.0, record_only=False, **kwargs
+    ):
         asked.append((request["directory"], record_only))
         if request["directory"] == str(first.parent):
             release.wait(20)
-        return served(home, request, stages, settle, record_only)
+        return served(home, request, stages, settle, record_only, **kwargs)
 
     monkeypatch.setattr(server.checkpoints, "serve", selective)
     port = bridge.config["port"]
@@ -1355,7 +1417,7 @@ def test_an_expired_decision_names_the_step_that_held_it(
 ):
     release = threading.Event()
 
-    def holding(home, request, stages=None, settle=0.0, record_only=False):
+    def holding(home, request, stages=None, *args, **kwargs):
         stages.enter("mail")
         release.wait(20)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1384,7 +1446,7 @@ def test_an_expired_decision_names_the_step_that_held_it(
 def test_a_slow_served_decision_is_logged_with_its_duration(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def unhurried(home, request, stages=None, settle=0.0, record_only=False):
+    def unhurried(home, request, stages=None, *args, **kwargs):
         stages.enter("scan")
         time.sleep(0.2)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1485,4 +1547,7 @@ def test_the_hook_budget_covers_the_worst_bounded_path():
         + server.DECISION_SECONDS
         + checkpoints.LOCK_SECONDS
         <= checkpoints.HOOK_TIMEOUT
+    )
+    assert (
+        server.DECISION_SECONDS + server.DELIVERY_SECONDS < hook.REPLY_TIMEOUT
     )

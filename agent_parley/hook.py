@@ -13,7 +13,9 @@ budget:
 * Served: `CONNECT_TIMEOUT` to reach the service, then at most
   `server.DECISION_SECONDS` until it answers with a decision or with
   `DECIDING`. `DECIDING` ends the hook immediately with no context, so a
-  slow decision costs 0.25 + 1.5 seconds and is never repeated.
+  slow decision costs 0.25 + 1.5 seconds and is never repeated. A decision
+  that injected coordination closes the reply after at most
+  `server.DELIVERY_SECONDS` more, once the lane records it as delivered.
 * Outage: the connection fails within `CONNECT_TIMEOUT`, then the in-process
   decision runs, which waits at most `checkpoints.LOCK_SECONDS` for the
   lane's checkpoint lock.

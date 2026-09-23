@@ -929,7 +929,18 @@ when no current reading exists, as in the in-process fallback. Measured on 12
 lanes, the median hook fell from 22.7 to 4.4 ms and the median time the lock
 is held from 19.6 to 0.9 ms. An event that finds a newer event already applied
 still writes its record and delivers its context, but leaves the newer
-activity label in place. Contention on
+activity label in place.
+
+An abandoned decision records what it observed, with the activity label the
+event itself implies, but never marks the coordination it prepared as
+delivered. The mail cursor, the issue revision, the work offer, the roster and
+notice fields, and the `working` label a blocked `Stop` carries are written
+only after the reply carrying them was written to the client: the service
+records them before closing the connection, waiting at most
+`server.DELIVERY_SECONDS` for the lane's checkpoint lock, and the in-process
+path records them after flushing its output. A reply the client never received
+therefore leaves the same mail and offer for the lane's next event, and a
+delivery for a session that has since restarted is discarded. Contention on
 a lane's own checkpoint lock is likewise never an enforcement result: the loser
 of the bounded wait records a `lock_contended` event and degrades to no
 injection. An event that ends or pauses a turn (`Stop`, `SessionEnd`,

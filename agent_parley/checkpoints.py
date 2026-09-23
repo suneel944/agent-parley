@@ -1456,8 +1456,16 @@ def checkpoint(
     stages: Stages | None = None,
     settle: float = LOCK_SECONDS,
     record_only: bool = False,
+    pending: dict | None = None,
 ) -> dict:
     """Observes a native event and prepares bounded coordination context.
+
+    What the event observed is saved here. What the reply delivers, the
+    mail cursor, the notice revisions and the working label a blocked
+    ``Stop`` carries, is saved here only when no ``pending`` mapping is
+    given. With one, those delivery markers are left in it for `deliver`,
+    which the caller runs once the reply reached the native client, so a
+    reply the client never received leaves them to be delivered again.
 
     A native event carrying a session identity confirms that identity as the
     lane's resumable session. The launcher clears the live session field
@@ -1516,6 +1524,8 @@ def checkpoint(
         settle: Seconds an event that ends or pauses a turn waits for the
             lane's checkpoint lock.
         record_only: Whether to record the event without mail or scans.
+        pending: Mapping that receives the delivery markers instead of the
+            activity file, for a caller that commits them after its reply.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -1691,6 +1701,7 @@ def checkpoint(
         output: dict = {}
         reason = Reason.OBSERVED
         ledger: dict = {}
+        markers: dict = {}
         if context:
             from agent_parley import budgets
 
@@ -1850,7 +1861,7 @@ def checkpoint(
                         output = {}
                     elif event == "Stop":
                         output = {"decision": "block", "reason": text}
-                        state["activity"] = "working"
+                        markers["activity"] = "working"
                     else:
                         details = {
                             "hookEventName": event,
@@ -1873,20 +1884,18 @@ def checkpoint(
                     if output:
                         reason = Reason.COORDINATION_PENDING
                         if delivered:
-                            state["cursor"] = delivered[-1]["id"]
-                        state["issue_revision"] = issues["revision"]
-                        state["roster"] = names
+                            markers["cursor"] = delivered[-1]["id"]
+                        markers["issue_revision"] = issues["revision"]
+                        markers["roster"] = names
                         if offer:
-                            state["work_offer"] = offer["id"]
+                            markers["work_offer"] = offer["id"]
                         if edit_notice:
-                            state["operator_edits"] = edited
+                            markers["operator_edits"] = edited
                         if advance_notice:
-                            state["base_advance"] = advanced
-                        state["budget_notified"] = standing["crossed"]
-                        state["injected_bytes"] = state.get(
-                            "injected_bytes", 0
-                        ) + len(text.encode())
-                        state["injections"] = state.get("injections", 0) + 1
+                            markers["base_advance"] = advanced
+                        markers["budget_notified"] = standing["crossed"]
+                        markers["injected_bytes"] = len(text.encode())
+                        markers["injections"] = 1
             except (OSError, sqlite3.Error, BridgeError) as exc:
                 cause = clip(str(exc), MAX_CAUSE_BYTES)
                 state["coordination_error"] = cause
@@ -1916,6 +1925,14 @@ def checkpoint(
             except (BridgeError, OSError, ValueError) as exc:
                 state["recovery_error"] = clip(str(exc), MAX_CAUSE_BYTES)
         stages.enter("record")
+        if pending is None:
+            mark_delivered(state, markers, True)
+        elif markers:
+            pending.update(
+                markers=markers,
+                session_id=state["session_id"],
+                updated=state["updated"],
+            )
         write_json(state_path, state)
         record(
             directory,
@@ -1940,12 +1957,75 @@ def checkpoint(
         return output
 
 
+def mark_delivered(state: dict, markers: dict, current: bool) -> None:
+    """Applies one reply's delivery markers to a lane's activity state.
+
+    Args:
+        state: Activity state to update in place.
+        markers: Delivery markers a decision prepared for its reply.
+        current: Whether the decision that prepared them is still the last
+            event the state records; only then does its label apply.
+    """
+    for key, value in markers.items():
+        if key == "activity":
+            if current:
+                state[key] = value
+        elif key in ("injected_bytes", "injections"):
+            state[key] = state.get(key, 0) + value
+        elif key == "cursor":
+            state[key] = max(int(state.get(key, 0) or 0), value)
+        else:
+            state[key] = value
+
+
+def deliver(
+    directory: Path,
+    agent: str,
+    pending: dict,
+    timeout: float = LOCK_SECONDS,
+) -> bool:
+    """Records that a reply carrying coordination reached the native client.
+
+    A decision's delivery markers wait in ``pending`` until its reply was
+    written. They apply only to the session that decision observed: a new
+    session reset the cursor on purpose, and advancing it again would hide
+    that session's mail. The working label a blocked ``Stop`` carries
+    applies only while that decision is still the lane's latest event.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        pending: Mapping `checkpoint` filled for the reply.
+        timeout: Seconds to wait for the lane's checkpoint lock.
+
+    Returns:
+        Whether the markers were recorded.
+
+    Raises:
+        LockBusy: If the lane's checkpoint lock stays held.
+        OSError: If the activity file cannot be read or written.
+    """
+    markers = pending.get("markers")
+    if not markers:
+        return False
+    path = directory / f"{agent}-activity.json"
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=timeout):
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if state.get("session_id", "") != pending.get("session_id", ""):
+            return False
+        current = state.get("updated") == pending.get("updated")
+        mark_delivered(state, markers, current)
+        write_json(path, state)
+    return True
+
+
 def serve(
     home: Path,
     request: dict,
     stages: Stages | None = None,
     settle: float = LOCK_SECONDS,
     record_only: bool = False,
+    deferred: bool = False,
 ) -> dict:
     """Decides one hook event and returns the hook process's contract.
 
@@ -1975,9 +2055,14 @@ def serve(
             lane's checkpoint lock; see `checkpoint`.
         record_only: Whether to record the event without building context;
             see `checkpoint`.
+        deferred: Whether the caller records delivery itself, through
+            `deliver`, once the reply was written. An abandoned decision
+            then never marks its coordination as delivered.
 
     Returns:
-        ``status``, ``stdout`` and ``stderr`` for the hook process to emit.
+        ``status``, ``stdout`` and ``stderr`` for the hook process to emit,
+        and for a deferred decision that injected coordination, the
+        ``delivery`` mapping `deliver` takes.
     """
     directory = Path(str(request.get("directory", "")))
     participant = str(request.get("participant", ""))
@@ -2024,6 +2109,7 @@ def serve(
         session_process = native_process(
             directory, participant, request.get("hook_pid")
         )
+        pending: dict | None = {} if deferred else None
         output = checkpoint(
             home,
             directory,
@@ -2033,10 +2119,18 @@ def serve(
             stages,
             settle,
             record_only,
+            pending,
         )
         if adapter is not None:
             output = adapter.response(output)
-        return {"status": 0, "stdout": json.dumps(output) + "\n", "stderr": ""}
+        served: dict = {
+            "status": 0,
+            "stdout": json.dumps(output) + "\n",
+            "stderr": "",
+        }
+        if pending:
+            served["delivery"] = pending
+        return served
     except LockBusy as exc:
         if isinstance(payload, dict):
             record(
@@ -2078,7 +2172,10 @@ def main(fallback: str = "") -> int:
     """Handles native hook input without replaying completed side effects.
 
     The argument parser is imported here so the module import that every
-    native tool call pays stays as small as the hook's own work.
+    native tool call pays stays as small as the hook's own work. The
+    coordination a decision injected is marked delivered only after its
+    output was flushed, so a hook the native client kills before that point
+    leaves the same coordination for the next event.
 
     Args:
         fallback: Cause recorded when the hook client could not reach the
@@ -2121,9 +2218,14 @@ def main(fallback: str = "") -> int:
             "payload": payload,
             "fallback": fallback,
         },
+        deferred=True,
     )
     sys.stdout.write(served["stdout"])
     sys.stderr.write(served["stderr"])
+    if delivery := served.get("delivery"):
+        with contextlib.suppress(OSError, BridgeError):
+            sys.stdout.flush()
+            deliver(args.directory, args.participant, delivery)
     return served["status"]
 
 
