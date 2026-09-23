@@ -81,6 +81,35 @@ def test_a_refusal_burst_writes_one_line_per_lane_per_window(
     assert lines[2].endswith("; 4999 more since the previous entry")
 
 
+def test_a_stopped_burst_still_writes_its_count(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    path = tmp_path / "server.log"
+    first = ("/work/project", "claude-p2-4")
+    second = ("/work/other", "codex")
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        with path.open("a", encoding="utf-8") as stream:
+            with contextlib.redirect_stdout(stream):
+                for _ in range(30):
+                    instance.coalesce("undecided", first, "first held")
+                for _ in range(7):
+                    instance.coalesce("unanswered", second, "second held")
+                clock[0] += server.REPEAT_SECONDS
+                instance.coalesce("undecided", ("/new", "gemini"), "new")
+                instance.coalesce("undecided", ("/new", "gemini"), "new")
+                instance.flush_repeats()
+                instance.flush_repeats()
+    lines = path.read_text().splitlines()
+    assert [line.split(" ", 1)[1] for line in lines] == [
+        "undecided first held",
+        "unanswered second held",
+        "undecided first held; 29 more since the previous entry",
+        "unanswered second held; 6 more since the previous entry",
+        "undecided new",
+        "undecided new; 1 more since the previous entry",
+    ]
+
+
 def test_a_rotation_under_concurrent_writes_loses_no_line(tmp_path):
     path = tmp_path / "server.log"
     writers = 8

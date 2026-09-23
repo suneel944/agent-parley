@@ -952,8 +952,10 @@ killed by its client at the hook timeout and its shell client stops reading at
 its own, so a reply written after either deadline meets a socket nobody holds;
 that is the client's contract working and is recorded as a single `unanswered`
 entry rather than a traceback for every event. Repeated `undecided` and
-`unanswered` entries for one lane are coalesced to one per minute, and the next
-written entry carries the count it stands for. The service log is bounded like
+`unanswered` entries for one lane are coalesced to one per minute. The count is
+never dropped when a burst stops: the lane's next entry carries it, any other
+lane's entry first writes every count whose minute has passed, and the service
+writes the rest as it stops. The service log is bounded like
 every line log here; the lines a rotation drops move to `server.log.1`, and
 every entry and rotation is taken under one lock so no line is lost to a
 rewrite.

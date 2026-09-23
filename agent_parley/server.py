@@ -388,7 +388,9 @@ class Server(ThreadingHTTPServer):
         self.stopping = threading.Event()
         self.counting = threading.Lock()
         self.deciding: dict[tuple[str, str], int] = {}
-        self.repeats: dict[tuple[str, tuple[str, str]], tuple[float, int]] = {}
+        self.repeats: dict[
+            tuple[str, tuple[str, str]], tuple[float, int, str]
+        ] = {}
         self.serving = threading.local()
         self.refusals = 0
         self.reported: float | None = None
@@ -555,24 +557,71 @@ class Server(ThreadingHTTPServer):
         `unanswered` line, and those lines filled the log's bound within
         minutes, so the log kept under an hour when it was needed most. The
         first entry of a window is written; later ones for the same event
-        and lane are counted, and the next written entry carries the count
-        of the ones it stands for.
+        and lane are counted. The count is never lost when a burst stops:
+        the next entry for the same lane carries it, any other lane's entry
+        first writes every count whose window has closed, and
+        `flush_repeats` writes the rest at shutdown.
 
         Args:
             event: Single word naming what happened.
             lane: Project key and participant name the entry is about.
             detail: Remainder of the entry, already free of credentials.
         """
+        key = (event, lane)
         with self.counting:
             now = time.monotonic()
-            opened, skipped = self.repeats.get((event, lane), (None, 0))
+            entries = self._pending(now, key)
+            opened, skipped, _ = self.repeats.get(key, (None, 0, ""))
             if opened is not None and now - opened < REPEAT_SECONDS:
-                self.repeats[(event, lane)] = (opened, skipped + 1)
-                return
-            self.repeats[(event, lane)] = (now, 0)
-        if skipped:
-            detail += f"; {skipped} more since the previous entry"
-        log(self.home, event, detail)
+                self.repeats[key] = (opened, skipped + 1, detail)
+            else:
+                self.repeats[key] = (now, 0, detail)
+                if skipped:
+                    detail += f"; {skipped} more since the previous entry"
+                entries.append((event, detail))
+        for written, text in entries:
+            log(self.home, written, text)
+
+    def flush_repeats(self) -> None:
+        """Writes every repeat count still held, as the service stops."""
+        with self.counting:
+            entries = self._pending(None, None)
+        for event, text in entries:
+            log(self.home, event, text)
+
+    def _pending(
+        self,
+        now: float | None,
+        keep: tuple[str, tuple[str, str]] | None,
+    ) -> list[tuple[str, str]]:
+        """Removes closed repeat windows and returns their unwritten counts.
+
+        Callers hold `counting`. A window closes when `REPEAT_SECONDS` have
+        passed since it opened, or always when `now` is None. The window
+        named by `keep` stays, because its own next entry carries the count.
+
+        Args:
+            now: Monotonic time to judge windows by, or None for all.
+            keep: Event and lane whose window the caller handles itself.
+
+        Returns:
+            Event and detail pairs, one per closed window with a count.
+        """
+        entries = []
+        for key, (opened, skipped, detail) in list(self.repeats.items()):
+            if key == keep:
+                continue
+            if now is not None and now - opened < REPEAT_SECONDS:
+                continue
+            del self.repeats[key]
+            if skipped:
+                entries.append(
+                    (
+                        key[0],
+                        f"{detail}; {skipped} more since the previous entry",
+                    )
+                )
+        return entries
 
     def handle_error(
         self,
@@ -1154,6 +1203,7 @@ def main() -> None:
         with Server(args.home, config) as server:
             stop_on_signal(args.home, server)
             server.serve_forever(poll_interval=0.2)
+            server.flush_repeats()
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
