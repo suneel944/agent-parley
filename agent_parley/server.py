@@ -1244,6 +1244,10 @@ def main() -> None:
     that finds its published record dead, and every native call until then
     pays an in-process decision, so the interval that bounds the detection
     also bounds the leaving.
+
+    Wake sockets left behind by launchers that did not exit cleanly are
+    removed at start, so each start begins with only the sockets a live
+    launcher still listens on.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, required=True)
@@ -1253,7 +1257,9 @@ def main() -> None:
     store.initialize(args.home)
     if removed := sweep(args.home):
         log(args.home, "swept", f"{removed} temporary state files")
-    from agent_parley import inbound, supervision
+    from agent_parley import inbound, supervision, terminal
+
+    terminal.sweep_sockets(args.home)
 
     stopped = threading.Event()
     workers = [

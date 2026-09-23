@@ -368,6 +368,7 @@ condition, that count, its age and what clears it:
 | `unresolved completion` | One or more claims read merged or closed on the lane branch and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
 | `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `bounced share` | A share the sender is still waiting on reached a recipient that cannot act on it. The row sits on the sender's lane. | Whatever the first blocked recipient's state allows, from the remedy table below. |
+| `ready to retire` | Every claim the lane holds has been orphaned for longer than `orphan_retire_after` and no peer took it. | `agent-parley participant retire NAME` |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
 | `dirty worktree` | The lane holds uncommitted work and is not active, or it retired and its uncommitted work kept the worktree. | Commit or stash the named files in the named worktree; `agent-parley participant add NAME` returns a retired lane to service with that work still in place. |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
@@ -1480,7 +1481,8 @@ attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `start_deadline` (30 seconds),
-`completion_reminders` (3 reminders, 1 to 100), `prompts`, `wake`,
+`completion_reminders` (3 reminders, 1 to 100), `orphan_retire_after`
+(3600 seconds), `prompts`, `wake`,
 `reclaim` and `titles` (all true). Numeric second values range from 1 to 86400 seconds.
 The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
@@ -1745,6 +1747,33 @@ pull request closed without merging, an open one, an unreachable forge, a
 worktree Git cannot inspect and a path outside the project's own lanes all
 decide against reclaiming. The sweep never touches a remote branch, and it
 never fails because the remote branch is already gone.
+
+A lane that never did any work is retired too. When its runtime state reads
+`stopped`, its branch is still at the project base, it has nothing
+uncommitted, the ledger records no claim or pending offer for it, it holds no
+reservation, and neither its last activity nor its worktree changed inside
+`inactive_after`, the sweep retires it with reason `stopped`. A lane already
+retired whose worktree is gone is dropped with reason `vanished`, which
+takes it out of `status` and `top`. Retiring a lane supersedes the mail still
+addressed to it, so no share bounces off a lane that no longer exists.
+
+Worktrees a lane made for itself, such as one per pull request, are swept in
+the same pass and published under `worktrees` in `reclaim.json`. One is
+removed with `git worktree remove`, never forced, only when it sits inside
+the project state directory, is not locked, has no session running, has
+nothing uncommitted, its head is already on the base checkout, its branch
+carries nothing its upstream lacks, and it has not changed inside
+`inactive_after`. A registered worktree whose directory is gone is pruned.
+Its branch is kept. A worktree outside the state directory is only reported.
+`agent-parley gc` without `--apply` adds each worktree's size on disk.
+
+When the project root itself disappears, the first poll records
+`root-missing.json` in the project state directory. One interval later every
+lane still registered is captured for recovery, retired and has its
+reservations revoked, and the marker names the state directory for the
+operator to remove. The project then leaves `status` and `top`; a root that
+returns clears the marker on the next poll. When the service starts, it
+removes every wake socket in its home that no launcher is listening on.
 
 ## Other agent CLIs
 
