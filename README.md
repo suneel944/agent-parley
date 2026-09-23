@@ -168,6 +168,13 @@ and the forge shows its pull request merged or its branch already gone. Every
 other lane is kept and reported with the condition that held it, including a
 pull request that was closed without merging.
 
+The same sweep retires a lane that stopped, never moved its branch, holds no
+claim, lease or offer and stayed untouched past `inactive_after`, and it
+removes worktrees a lane made for itself inside the state directory once
+their head is already on the base. Uncommitted files, unpushed commits and
+a worktree outside the state directory are never removed, only reported,
+and `gc` without `--apply` shows how much disk each one holds.
+
 A repository can also authorize the second of those for the lane itself, with
 `pull_request.self_service` in its private project settings. It is off by
 default; with it on, a lane opens the pull request for its own work only after

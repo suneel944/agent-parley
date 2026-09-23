@@ -492,6 +492,8 @@ def collect(
             data = roster.read(path.parent)
         except (BridgeError, OSError, ValueError):
             continue
+        if supervision.root_retired(path.parent):
+            continue
         try:
             usage = store.usage(home, data["root"])
         except sqlite3.Error:

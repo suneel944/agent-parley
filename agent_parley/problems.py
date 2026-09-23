@@ -41,6 +41,7 @@ BUDGET = "over budget"
 WAKE = "wake attention"
 APPROVAL = "waiting on approval"
 HELD = "held by a native dialog"
+READY = "ready to retire"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -262,6 +263,52 @@ def _claim_rows(record: dict, name: str, repo: str, root: str) -> list[dict]:
             root,
             BY_OPERATOR,
             len(overdue),
+        )
+    ]
+
+
+def _retire_rows(
+    record: dict, name: str, repo: str, root: str, ceiling: float
+) -> list[dict]:
+    """Reports once that a lane holding only orphaned claims may retire.
+
+    A lane whose session died keeps its claims, and the supervisor marks
+    them orphaned so a peer can take them. A marker that has stood past the
+    ceiling means nobody took them and the lane did not return, so the
+    lane is ready to retire. The row only names the command: the sweep
+    never releases held work on its own.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+        ceiling: Seconds an orphan marker stands before the row appears.
+
+    Returns:
+        One row naming the orphaned claims and the age of the oldest
+        marker, or no row while the lane holds any claim not orphaned or
+        every marker is younger than the ceiling.
+    """
+    claims = record["claims"]
+    if not claims or not all(claim.get("orphaned") for claim in claims):
+        return []
+    oldest = max(
+        int(claim.get("orphan_recorded_seconds") or 0) for claim in claims
+    )
+    if oldest <= ceiling:
+        return []
+    numbers = ", ".join(f"#{claim['issue']}" for claim in claims)
+    return [
+        _row(
+            READY,
+            f"orphaned claims {numbers} stood unclaimed past the ceiling",
+            f"agent-parley participant retire {name} {repo}",
+            oldest,
+            name,
+            root,
+            BY_OPERATOR,
+            len(claims),
         )
     ]
 
@@ -502,6 +549,9 @@ def _lane_rows(
             )
         )
     rows.extend(_claim_rows(record, name, repo, root))
+    rows.extend(
+        _retire_rows(record, name, repo, root, config["orphan_retire_after"])
+    )
     rows.extend(_unresolved_rows(record, name, repo, root, now))
     rows.extend(_ack_rows(record, name, repo, root, ack_after, waking))
     if record["drift"]:

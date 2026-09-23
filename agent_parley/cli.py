@@ -3243,6 +3243,10 @@ class Bridge:
     def retire(self, repo: Path, name: str) -> str:
         """Removes a participant's lane while preserving any work it holds.
 
+        Deliveries still unread or unacknowledged by the lane are marked
+        superseded, because a lane that left answers nothing; the messages
+        themselves stay readable.
+
         Args:
             repo: Any checkout of the target repository.
             name: Participant whose lane is retired.
@@ -3293,6 +3297,12 @@ class Bridge:
                         git(root, "branch", "-d", branch)
                         note = f"Branch {branch} deleted; it added no commits."
                 store.revoke(self.home, data["root"], participant["display"])
+                store.supersede_recipient(
+                    self.home,
+                    data["root"],
+                    participant["display"],
+                    f"{name} retired",
+                )
                 metrics.record_report(
                     directory,
                     name,
@@ -6086,6 +6096,36 @@ reported.
             )
         return rows
 
+    def reclaim_worktrees(
+        self, repo: Path, *, apply: bool = False, sizes: bool = False
+    ) -> list[dict]:
+        """Reports, and optionally removes, worktrees lanes made themselves.
+
+        Lanes add worktrees for pull requests and sub-tasks that no lane
+        root accounts for. Each one the project repository registers is
+        assessed by `reclaim.strays`, and only the ones inside the project
+        state directory whose every commit the base checkout and upstream
+        already carry are removed. Git's own removal refuses a dirty or
+        locked worktree, so nothing with uncommitted work is ever lost.
+
+        Args:
+            repo: Any checkout of the target repository.
+            apply: Whether the reclaimable worktrees are removed.
+            sizes: Whether each worktree's size on disk is measured.
+
+        Returns:
+            One row per worktree, as `reclaim.strays` shapes it, carrying
+            whether it was removed when applied.
+        """
+        root, directory = self.project(repo, create=False)
+        rows = reclaim.strays(directory, roster.read(directory), sizes=sizes)
+        if not apply:
+            return rows
+        return [
+            reclaim.remove(str(root), row) if row["reclaim"] else row
+            for row in rows
+        ]
+
     def acknowledge(self, repo: Path, identifier: int) -> dict:
         """Records the operator's acknowledgement of one awaited message.
 
@@ -6981,7 +7021,8 @@ reported.
             for and the configuration fault that stops them, and one record
             per registered project holding its issue ledger and its lanes. A
             service that reports itself stale is not ready, and the state
-            names why.
+            names why. A project the supervisor retired because its root is
+            gone is left out.
         """
         usable = (
             store.schema_state(store.schema_version(self.home))
@@ -6993,6 +7034,8 @@ reported.
         projects = []
         for path in sorted((self.home / "projects").glob("*/project.json")):
             data = roster.normalize(json.loads(path.read_text()))
+            if supervision.root_retired(path.parent):
+                continue
             edits = supervision.operator_edits(self.home, data)
             advances = supervision.base_advances(self.home, data)
             with self._project_reading() as db:
@@ -9493,10 +9536,14 @@ def main() -> int:
             return 1 if found else 0
         elif args.command == "gc":
             swept = bridge.reclaim(args.repo.resolve(), apply=args.apply)
+            made = bridge.reclaim_worktrees(
+                args.repo.resolve(), apply=args.apply, sizes=not args.apply
+            )
             print(
-                views.render("gc", {"lanes": swept})
+                views.render("gc", {"lanes": swept, "worktrees": made})
                 if args.json
-                else "\n".join(reclaim.lines(swept)) or "No lane to reclaim."
+                else "\n".join(reclaim.lines(swept + made))
+                or "No lane to reclaim."
             )
         elif args.command == "notify":
             probed = notify.probe(args.repo.resolve().name)

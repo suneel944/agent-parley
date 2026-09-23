@@ -29,6 +29,7 @@ DEFAULTS = {
     "stalled_after": 600,
     "start_deadline": 30,
     "completion_reminders": 3,
+    "orphan_retire_after": 3600,
     "prompts": True,
     "wake": True,
     "reclaim": True,
@@ -39,6 +40,7 @@ MAX_COMPLETION_REMINDERS = 100
 ENDED = "pull request ended"
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
+ROOT_PUBLICATION = "root-missing.json"
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -105,6 +107,7 @@ def settings(value: dict) -> dict:
         "inactive_after",
         "stalled_after",
         "start_deadline",
+        "orphan_retire_after",
     ):
         if (
             type(result[field]) not in (int, float)
@@ -2619,7 +2622,9 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     it never runs on the ordinary thirty second cadence. Its outcome is
     published whether it succeeded, refused or failed, which both bounds the
     next attempt and gives the operator the account of what was removed and
-    what was kept.
+    what was kept. The worktrees lanes made for themselves are swept in the
+    same pass and published beside the lanes, without their sizes, because
+    measuring them walks every file they hold.
 
     Args:
         home: Private bridge state root.
@@ -2632,16 +2637,99 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     if not reclaim_due(directory, now, RECLAIM_INTERVAL):
         return
     rows: list[dict] = []
+    made: list[dict] = []
+    bridge = cli.Bridge(home)
     try:
-        rows = cli.Bridge(home).reclaim(Path(manifest["root"]), apply=True)
+        rows = bridge.reclaim(Path(manifest["root"]), apply=True)
+        made = bridge.reclaim_worktrees(Path(manifest["root"]), apply=True)
     except BridgeError:
-        rows = []
+        pass
     finally:
         with contextlib.suppress(OSError):
             write_json(
                 directory / RECLAIM_PUBLICATION,
-                {"swept": now, "lanes": rows},
+                {"swept": now, "lanes": rows, "worktrees": made},
             )
+
+
+def root_retired(directory: Path) -> bool:
+    """Reports whether the supervisor retired a project whose root is gone.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        True once `missing_root` published the project's retirement.
+    """
+    try:
+        published = json.loads((directory / ROOT_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(published, dict) and bool(published.get("retired"))
+
+
+def missing_root(
+    home: Path, directory: Path, manifest: dict, config: dict
+) -> None:
+    """Retires a project whose root checkout has been gone an interval.
+
+    A root removed under a live project, such as a temporary directory a
+    reboot wiped, leaves every lane reported as an unavailable worktree and
+    every status poll walking it. The first poll that finds the root gone
+    only records when; a root still gone one supervision interval later is
+    a root that is not coming back. Each lane that has not retired is then
+    captured into a recovery checkpoint where Git can still read it,
+    retired through `retirement.withdraw`, which releases its claims and
+    declines offers made to it, and its credential is invalidated. The
+    publication names the state directory for the operator to remove;
+    nothing here deletes it. A root that reappears clears the record on the
+    next poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+    """
+    from agent_parley import recovery, retirement
+
+    path = directory / ROOT_PUBLICATION
+    now = time.time()
+    try:
+        recorded = json.loads(path.read_text())
+    except (OSError, ValueError):
+        recorded = {}
+    since = recorded.get("since") if isinstance(recorded, dict) else None
+    if not isinstance(since, int | float) or isinstance(since, bool):
+        write_json(
+            path,
+            {"since": now, "retired": None, "state_directory": str(directory)},
+        )
+        return
+    if recorded.get("retired") or now - since < config["interval"]:
+        return
+    lanes = []
+    for name, participant in manifest["participants"].items():
+        if roster.retired(participant):
+            continue
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            recovery.capture(directory, manifest, name)
+        try:
+            report = retirement.withdraw(directory, name)
+        except BridgeError:
+            continue
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.revoke(home, manifest["root"], participant["display"])
+        lanes.append({"participant": name, "released": report["released"]})
+    write_json(
+        path,
+        {
+            "since": since,
+            "retired": now,
+            "state_directory": str(directory),
+            "lanes": lanes,
+        },
+    )
 
 
 def poll(home: Path, directory: Path) -> None:
@@ -2659,9 +2747,17 @@ def poll(home: Path, directory: Path) -> None:
     the sweep decides on this poll's observation of each holder rather than
     the previous one. A store that is busy or unreadable reclaims nothing
     this round rather than failing the poll.
+
+    A project whose root checkout no longer exists is handed to
+    `missing_root` and polled no further, because every other step reads
+    Git or wakes a lane that has no repository left to work in.
     """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
+    if not Path(manifest["root"]).exists():
+        missing_root(home, directory, manifest, config)
+        return
+    (directory / ROOT_PUBLICATION).unlink(missing_ok=True)
     launches(directory, manifest, config)
     refresh_readings(home, manifest, 2 * config["interval"])
     observations = {
