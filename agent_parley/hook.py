@@ -34,10 +34,15 @@ import os
 import socket
 import sys
 
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import TextIO
+
 CONNECT_TIMEOUT = 0.25
 REPLY_TIMEOUT = 2.0
 SHELL_TIMEOUT = int(REPLY_TIMEOUT) + (REPLY_TIMEOUT % 1 > 0)
-MAX_INPUT_BYTES = 1_000_001
+MAX_INPUT_BYTES = 1_000_000
+READ_BLOCK = 65536
 PATH = "/hook/"
 RAW_REPLY = "application/vnd.agent-parley.hook+raw"
 STATUS_HEADER = "X-Parley-Status"
@@ -71,13 +76,14 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-payload=""
-IFS= read -r -d '' payload || true
+payload="$(</dev/stdin)"
 
 decide_in_process() {
   printf '%s' "$payload" | "@PYTHON@" -m agent_parley.hook "${arguments[@]}"
   exit "$?"
 }
+
+[ "${#payload}" -gt @MAX_INPUT@ ] && decide_in_process
 
 quote() {
   local text="$1"
@@ -171,6 +177,12 @@ def write_client(home: str, python: str) -> str:
     was already sent and served, and the fallback then asks a second time for
     a decision the service has already recorded as delivered.
 
+    The payload is read with a ``$(</dev/stdin)`` substitution, which reads
+    the pipe in blocks. ``read -d ''`` reads a pipe one byte per system call
+    and spent about 1.5 seconds of the hook budget on a 2 MB payload. A
+    payload past `MAX_INPUT_BYTES` goes straight to the in-process path,
+    which records it as oversize and allows the call.
+
     Args:
         home: Private bridge state root the client is written into.
         python: Interpreter the client runs on its fallback path.
@@ -186,6 +198,7 @@ def write_client(home: str, python: str) -> str:
         .replace("@ACCEPT@", RAW_REPLY)
         .replace("@TIMEOUT@", str(SHELL_TIMEOUT))
         .replace("@DECIDING@", str(DECIDING))
+        .replace("@MAX_INPUT@", str(MAX_INPUT_BYTES))
         .replace("@ANSWERED@", ANSWERED_ENV)
         .replace("@status_header@", STATUS_HEADER)
         .replace("@stdout_header@", STDOUT_HEADER)
@@ -217,6 +230,28 @@ def options(argv: list[str]) -> dict:
     if "agent" in values:
         values["participant"] = values.pop("agent")
     return values
+
+
+def read_input(stream: "TextIO") -> tuple[str, int]:
+    """Reads a native hook payload, keeping at most `MAX_INPUT_BYTES` of it.
+
+    A payload past the bound is still read to its end, in blocks, so the
+    native client never blocks on a full pipe and its full size can be
+    reported, but only the bounded head is kept.
+
+    Args:
+        stream: Standard input of the hook process.
+
+    Returns:
+        The kept text, one character longer than the bound when the payload
+        exceeded it, and the payload's full size in characters.
+    """
+    kept = stream.read(MAX_INPUT_BYTES + 1)
+    size = len(kept)
+    if size > MAX_INPUT_BYTES:
+        while block := stream.read(READ_BLOCK):
+            size += len(block)
+    return kept, size
 
 
 def hook_pid() -> int:
@@ -332,15 +367,16 @@ def relaunch(home: str) -> None:
         return
 
 
-def fallback(raw: str, cause: str, home: str = "") -> int:
+def fallback(raw: str, cause: str, home: str = "", size: int = 0) -> int:
     """Decides in-process, recording why the service was not used.
 
     Args:
-        raw: Native hook input exactly as it was read from standard input.
+        raw: Native hook input as `read_input` kept it from standard input.
         cause: Bounded text naming the failure that skipped the service.
         home: Private bridge state root, when the command line named one,
             so an outage can ask for the service back while this call is
             decided here.
+        size: Characters the native input held in full.
 
     Returns:
         The hook process exit status.
@@ -352,7 +388,7 @@ def fallback(raw: str, cause: str, home: str = "") -> int:
     if home:
         relaunch(home)
     sys.stdin = io.StringIO(raw)
-    return checkpoints.main(fallback=cause)
+    return checkpoints.main(fallback=cause, size=size)
 
 
 def main() -> int:
@@ -376,9 +412,15 @@ def main() -> int:
     The service has answered once; asking it again would spend the rest of
     the hook's budget on the same refusal, so that case goes straight to the
     in-process decision.
+
+    A payload past `MAX_INPUT_BYTES` is never posted: the service would
+    refuse it, and the in-process path records it as oversize and allows
+    the call.
     """
-    raw = sys.stdin.read(MAX_INPUT_BYTES)
+    raw, size = read_input(sys.stdin)
     selected = options(sys.argv[1:])
+    if size > MAX_INPUT_BYTES:
+        return fallback(raw, "oversize payload", size=size)
     if refused := os.environ.get(ANSWERED_ENV, ""):
         return fallback(
             raw,

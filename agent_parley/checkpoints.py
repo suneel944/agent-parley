@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
 
-from agent_parley import policy, process, protocol, roster, store
+from agent_parley import hook, policy, process, protocol, roster, store
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
@@ -165,6 +165,8 @@ class Reason(StrEnum):
     STALE_GENERATION = "stale_generation"
     LOCK_CONTENDED = "lock_contended"
     SUPERSEDED = "superseded"
+    OVERSIZE_PAYLOAD = "oversize_payload"
+    UNREADABLE_PAYLOAD = "unreadable_payload"
 
 
 def decision_of(output: dict | None) -> str:
@@ -2168,7 +2170,43 @@ def _hook_pid() -> int:
     return value if value > 1 else os.getpid()
 
 
-def main(fallback: str = "") -> int:
+def unreadable(
+    directory: Path, agent: str, raw: str, size: int, cause: Exception
+) -> int:
+    """Allows a native event whose payload could not be read, and records it.
+
+    A payload past `hook.MAX_INPUT_BYTES`, as a ``Write`` of a large file
+    carries, or one that is not a JSON hook object, cannot be decided. It
+    is observed and allowed rather than denied: a denial would refuse the
+    same call on every retry, and no coordination rule needs the content
+    of a file being written. The event name is read from the text that was
+    kept, which precedes the tool input in the native payload.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        raw: Payload text that was kept, at most `hook.MAX_INPUT_BYTES`.
+        size: Characters the payload held in full.
+        cause: Why the payload could not be decided.
+
+    Returns:
+        Exit status 0, after writing an empty decision.
+    """
+    found = re.search(r'"hook_event_name"\s*:\s*"([A-Za-z]{1,64})"', raw)
+    event = found.group(1) if found else ""
+    reason = (
+        Reason.OVERSIZE_PAYLOAD
+        if size > hook.MAX_INPUT_BYTES
+        else Reason.UNREADABLE_PAYLOAD
+    )
+    detail = f"{event or 'unnamed'} payload of {size} characters: {cause}"
+    record(directory, agent, {"hook_event_name": event}, reason, {}, "", detail)
+    sys.stdout.write("{}\n")
+    sys.stderr.write(f"Agent Parley checkpoint skipped: {detail}\n")
+    return 0
+
+
+def main(fallback: str = "", size: int = 0) -> int:
     """Handles native hook input without replaying completed side effects.
 
     The argument parser is imported here so the module import that every
@@ -2180,6 +2218,8 @@ def main(fallback: str = "") -> int:
     Args:
         fallback: Cause recorded when the hook client could not reach the
             service and decided here instead; empty for a direct call.
+        size: Characters the native payload held when a caller already read
+            it from the real input and hands on only the part it kept.
     """
     import argparse
 
@@ -2201,12 +2241,16 @@ def main(fallback: str = "") -> int:
             file=sys.stderr,
         )
         return 2
-    raw = sys.stdin.read(1_000_001)
+    raw, read = hook.read_input(sys.stdin)
+    size = max(size, read)
     try:
+        if size > hook.MAX_INPUT_BYTES:
+            raise ValueError("larger than the hook reads")
         payload = json.loads(raw)
-    except ValueError as exc:
-        print(f"Agent Parley checkpoint failed: {exc}", file=sys.stderr)
-        return 2
+        if not isinstance(payload, dict):
+            raise ValueError("not a hook object")
+    except (ValueError, RecursionError) as exc:
+        return unreadable(args.directory, args.participant, raw, size, exc)
     served = serve(
         args.home,
         {

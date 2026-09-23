@@ -1551,3 +1551,77 @@ def test_the_hook_budget_covers_the_worst_bounded_path():
     assert (
         server.DECISION_SECONDS + server.DELIVERY_SECONDS < hook.REPLY_TIMEOUT
     )
+
+
+def written(lane, size, event="PreToolUse"):
+    """Builds a native Write event whose content is the given size."""
+    content = "x" * size
+    payload = {
+        "hook_event_name": event,
+        "session_id": "s1",
+        "cwd": str(lane),
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(lane / "big.json"), "content": content},
+    }
+    if event == "PostToolUse":
+        payload["tool_response"] = {"content": content}
+    return payload
+
+
+@pytest.mark.parametrize("client", ["python", "shell"])
+def test_an_oversize_payload_is_allowed_and_recorded(
+    bridge, repo, paired, service, client
+):
+    if client == "shell" and not shutil.which("bash"):
+        pytest.skip("requires bash")
+    lane = Path(paired["lanes"]["codex"])
+    payload = written(lane, 2_000_000)
+    runner = run_shell if client == "shell" else run_hook
+    answered = runner(bridge, lane.parent, payload)
+    assert answered.returncode == 0, answered.stderr
+    assert json.loads(answered.stdout) == {}
+    entry = events(lane.parent)[-1]
+    assert entry["reason_class"] == "oversize_payload"
+    assert entry["event"] == "PreToolUse"
+    assert entry["decision"] == "allow"
+    assert (
+        f"PreToolUse payload of {len(json.dumps(payload))}" in (entry["cause"])
+    )
+
+
+def test_a_post_tool_use_carrying_a_large_write_exits_zero(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    answered = run_hook(
+        bridge, lane.parent, written(lane, 600_000, "PostToolUse")
+    )
+    assert answered.returncode == 0, answered.stderr
+    assert events(lane.parent)[-1]["event"] == "PostToolUse"
+
+
+def test_an_unparsable_payload_is_allowed_in_process(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    answered = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_parley.checkpoints",
+            "--home",
+            str(bridge.home),
+            "--directory",
+            str(lane.parent),
+            "--participant",
+            "codex",
+        ],
+        input='{"hook_event_name": "PreToolUse", "tool_input": ',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=importable(),
+    )
+    assert answered.returncode == 0, answered.stderr
+    entry = events(lane.parent)[-1]
+    assert entry["reason_class"] == "unreadable_payload"
+    assert entry["event"] == "PreToolUse"

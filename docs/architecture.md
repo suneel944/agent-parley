@@ -904,6 +904,14 @@ before deciding; `python -m agent_parley.checkpoints` remains a valid hook
 command. A status the shell client already read travels into that fallback, so
 one refusal is never posted to the service twice.
 
+A native payload over 1,000,000 characters, as a `Write` of a large file
+carries in both `PreToolUse` and `PostToolUse`, is never posted: the clients
+read it in blocks, keep its head, and the in-process path records one
+`oversize_payload` event naming the event and the full size, then allows the
+call with exit status 0. A payload that is not a JSON hook object is recorded
+as `unreadable_payload` and allowed the same way. Neither can be decided, and
+denying one would refuse the same call on every retry.
+
 Status 202 is the exception, and it is not an outage. It means the service is
 still running a decision for this lane and abandoned only the reply. Such a
 decision keeps the lane's checkpoint lock and still writes the lane's activity
