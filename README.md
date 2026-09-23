@@ -121,7 +121,9 @@ That is the whole setup. The first run registers the repository, creates that
 participant's worktree and branch, starts the coordination service, and hands
 you the native CLI. Prompt it exactly as you always do. A new name creates its
 own lane, so a second account of the same provider, or another provider, is one
-more terminal.
+more terminal. Each tab's title names its lane, its state and its claim
+progress, such as `[codex] idle with claim #412 - 2/5 done`, so the tab strip
+tells the lanes apart; the supervision key `titles` turns this off.
 
 Then watch the work, and steer a lane without taking over its terminal:
 

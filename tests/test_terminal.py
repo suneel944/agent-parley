@@ -393,3 +393,317 @@ def test_stale_selected_work_is_refused_without_terminal_injection():
             if child.poll() is None:
                 child.kill()
             child.communicate(timeout=10)
+
+
+DETACHED_HARNESS = (
+    "import os, sys\nfrom pathlib import Path\n"
+    "from agent_parley.terminal import run\n"
+    "try:\n"
+    "    code = run([sys.executable, '-c', sys.argv[2]], Path(sys.argv[1]), "
+    "dict(os.environ), 'lane', attached=False)\n"
+    "finally:\n"
+    "    print('CLEANUP', flush=True)\n"
+    "raise SystemExit(code)\n"
+)
+
+
+def _detached(lane: Path, script: str, stdout=subprocess.PIPE):
+    """Starts a detached launcher around a stub client script."""
+    return subprocess.Popen(
+        [sys.executable, "-c", DETACHED_HARNESS, str(lane), script],
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+
+def _finish(child: subprocess.Popen) -> None:
+    """Kills a launcher a failed assertion left running."""
+    if child.poll() is None:
+        child.kill()
+    child.communicate(timeout=10)
+
+
+def test_the_launcher_ends_when_its_client_exits_under_a_held_terminal():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        lane = Path(temporary) / "lane"
+        lane.mkdir()
+        holder = Path(temporary) / "holder"
+        script = (
+            "import subprocess, sys\n"
+            "held = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)'], start_new_session=True)\n"
+            f"open({str(holder)!r}, 'w').write(str(held.pid))\n"
+            "print('BYE', flush=True)\n"
+        )
+        child = _detached(lane, script)
+        try:
+            output, error = child.communicate(timeout=10)
+            assert child.returncode == 0, error
+            assert b"BYE" in output
+            assert output.count(b"CLEANUP") == 1
+            assert not (Path(temporary) / "lane-wake.sock").exists()
+        finally:
+            _finish(child)
+            if holder.exists():
+                os.kill(int(holder.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGHUP])
+def test_a_stop_signal_runs_cleanup_and_reaches_the_client(number):
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        marker = directory / "signalled"
+        script = (
+            "import signal, sys, time\n"
+            "def handle(signum, frame):\n"
+            f"    open({str(marker)!r}, 'w').write(str(signum))\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, handle)\n"
+            "signal.signal(signal.SIGHUP, handle)\n"
+            "print('READY', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        child = _detached(lane, script)
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert b"READY" in child.stdout.readline()
+            assert (directory / "lane-wake.sock").exists()
+            child.send_signal(number)
+            output, error = child.communicate(timeout=10)
+            assert b"CLEANUP" in output, error
+            assert not (directory / "lane-wake.sock").exists()
+            assert marker.exists()
+        finally:
+            _finish(child)
+
+
+def test_an_unreadable_activity_record_gets_an_explicit_wake_reply():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        script = "print('READY', flush=True)\ninput()\n"
+        child = _detached(lane, script)
+        try:
+            assert select.select([child.stdout], [], [], 10)[0]
+            assert b"READY" in child.stdout.readline()
+            assert terminal.request(directory, "lane") == "unknown"
+            (directory / "lane-activity.json").write_text("{")
+            assert terminal.request(directory, "lane") == "unknown"
+            assert child.poll() is None
+        finally:
+            _finish(child)
+
+
+def test_a_failed_exec_never_runs_the_launcher_cleanup():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "try:\n"
+            "    code = run([str(Path(sys.argv[1]) / 'missing')], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False)\n"
+            "finally:\n"
+            "    print('CLEANUP', os.getpid(), flush=True)\n"
+            "raise SystemExit(code)\n"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", harness, str(lane)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            output, error = child.communicate(timeout=10)
+            assert child.returncode == terminal.EXEC_FAILED, error
+            assert output.count(b"CLEANUP") == 1, output
+            assert b"Traceback" not in output + error
+        finally:
+            _finish(child)
+
+
+def test_a_resumed_lane_keeps_its_wake_log_under_the_cap():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        log = directory / "lane-wake.log"
+        script = (
+            "import os\nline = b'x' * 1023 + b'\\n'\n"
+            "for _ in range(10240):\n"
+            "    os.write(1, line)\n"
+            "print('DONE', flush=True)\n"
+        )
+        with log.open("ab") as output:
+            child = _detached(lane, script, stdout=output)
+        try:
+            _, error = child.communicate(timeout=60)
+            assert child.returncode == 0, error
+            assert 0 < log.stat().st_size <= terminal.LOG_LIMIT
+            assert b"CLEANUP" in log.read_bytes()
+        finally:
+            _finish(child)
+
+
+@pytest.mark.skipif(
+    not Path("/dev/full").exists(), reason="needs a device that fills"
+)
+def test_a_failing_log_write_keeps_the_session():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        received = directory / "received"
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        script = (
+            "import os\nos.write(1, b'output\\n' * 100)\n"
+            "line = input()\n"
+            f"open({str(received)!r}, 'w').write(line)\n"
+        )
+        with open("/dev/full", "wb") as full:
+            child = _detached(lane, script, stdout=full)
+        try:
+            deadline = time.monotonic() + 10
+            while not (directory / "lane-wake.sock").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            time.sleep(0.5)
+            assert child.poll() is None
+            assert terminal.request(directory, "lane") == "accepted"
+            child.communicate(timeout=10)
+            assert received.read_text() == terminal.PROMPT
+        finally:
+            _finish(child)
+
+
+def test_lane_title_names_lane_state_and_claim_progress():
+    ledger = {
+        "issues": {
+            "12": {"owner": "claude-a"},
+            "9": {"owner": "claude-a"},
+            "3": {"completed_by": "claude-a"},
+            "4": {"owner": "codex-b"},
+        }
+    }
+    working = {"activity": "PreToolUse"}
+    idle = {"activity": "idle"}
+    approval = {"activity": "waiting for approval: Bash"}
+    assert (
+        terminal.lane_title("claude-a", working, ledger, False)
+        == "[claude-a] working #9 - 1/3 done"
+    )
+    assert (
+        terminal.lane_title("claude-a", idle, ledger, False)
+        == "[claude-a] idle with claim #9 - 1/3 done"
+    )
+    assert (
+        terminal.lane_title("codex-c", idle, ledger, False)
+        == "[codex-c] idle - 0 open"
+    )
+    assert terminal.lane_title("claude-a", idle, ledger, True).startswith(
+        "[claude-a] blocked: dialog #9"
+    )
+    assert terminal.lane_title("claude-a", approval, None, False) == (
+        "[claude-a] blocked: approval - 0 open"
+    )
+    assert terminal.lane_title("x", None, None, False) == "[x] unknown - 0 open"
+    assert terminal.lane_title("claude-a", idle, ledger, False) != (
+        terminal.lane_title("codex-b", idle, ledger, False)
+    )
+
+
+def test_retitle_keeps_the_client_title_as_a_suffix_across_reads():
+    first, carry, title = terminal.retitle(b"a\x1b]0;Sha", b"", "[l] idle")
+    assert (first, title) == (b"a", None)
+    second, carry, title = terminal.retitle(
+        b"red\x1b\\b\x1b]8;;u\x07", carry, "[l] idle"
+    )
+    assert carry == b""
+    assert title == "Shared"
+    assert second == b"\x1b]0;[l] idle | Shared\x07b\x1b]8;;u\x07"
+    wide = terminal.compose_title("[l] idle", "y" * 500)
+    assert wide.startswith("[l] idle | y")
+    assert len(wide) == terminal.TITLE_LIMIT
+    assert terminal.compose_title("[l] idle", "a\x07\x1bb") == "[l] idle | ab"
+
+
+def test_titles_setting_must_be_a_boolean():
+    from agent_parley import supervision
+    from agent_parley.state import BridgeError
+
+    assert supervision.settings({})["titles"] is True
+    assert supervision.settings({"titles": False})["titles"] is False
+    with pytest.raises(BridgeError):
+        supervision.settings({"titles": "off"})
+
+
+@pytest.mark.parametrize("titles", [True, False])
+def test_attached_launcher_relays_the_lane_title(titles):
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "PreToolUse", "updated": 1},
+        )
+        write_json(
+            directory / "issues.json", {"issues": {"7": {"owner": "lane"}}}
+        )
+        script = (
+            "import sys\n"
+            "sys.stdout.write('\\x1b]2;native\\x07READY\\n')\n"
+            "sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    sys.stdout.write('\\x1b]0;again\\x07ECHO\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=True, "
+            f"titles={titles}))"
+        )
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvp(
+                sys.executable,
+                [sys.executable, "-c", harness, str(lane), script],
+            )
+        try:
+            output = _read_until(master, b"READY")
+            if not titles:
+                assert b"\x1b]2;native\x07" in output
+                assert b"[lane]" not in output
+                return
+            assert output.startswith(terminal.TITLE_SAVE)
+            assert b"\x1b]0;[lane] working #7 - 0/1 done\x07" in output
+            assert b"\x1b]0;[lane] working #7 - 0/1 done | native\x07" in output
+            assert b"\x1b]2;native" not in output
+            write_json(
+                directory / "lane-activity.json",
+                {"activity": "idle", "updated": 2},
+            )
+            changed = _read_until(master, b"idle with claim")
+            assert (
+                b"\x1b]0;[lane] idle with claim #7 - 0/1 done | native\x07"
+                in changed
+            )
+            os.write(master, b"go\r")
+            echoed = _read_until(master, b"ECHO")
+            assert b"[lane] idle with claim #7 - 0/1 done | again" in echoed
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)

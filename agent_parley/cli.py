@@ -7349,16 +7349,16 @@ reported.
                     self.home, lane.parent, agent, entry["adapter"]
                 ):
                     if sys.stdin.isatty() or resume:
+                        supervised = supervision.configuration(self.home, data)
                         return terminal.run(
                             command,
                             lane,
                             env,
                             agent,
                             attached=sys.stdin.isatty(),
-                            inactive_after=supervision.configuration(
-                                self.home, data
-                            )["inactive_after"],
+                            inactive_after=supervised["inactive_after"],
                             home=self.home,
+                            titles=supervised["titles"],
                         )
                     return subprocess.call(command, cwd=lane, env=env)
             finally:

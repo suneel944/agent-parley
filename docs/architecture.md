@@ -347,7 +347,10 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. Because it owns that stream, it is also the only
+the existing session lock. It reaps the client itself, ends the session on
+`SIGTERM` or `SIGHUP` through its normal cleanup, bounds a detached launcher's
+output log, and rewrites the titles the client sets into a lane-first tab title
+read from the activity record and the issue ledger. Because it owns that stream, it is also the only
 place that can see a dialog the client draws on its own screen, so it passes
 every chunk it forwards to `dialogs.py`. That module recognizes the screens
 recorded from live clients, records an exhausted provider capacity with the

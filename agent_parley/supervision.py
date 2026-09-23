@@ -32,6 +32,7 @@ DEFAULTS = {
     "prompts": True,
     "wake": True,
     "reclaim": True,
+    "titles": True,
 }
 
 MAX_COMPLETION_REMINDERS = 100
@@ -118,7 +119,7 @@ def settings(value: dict) -> dict:
             "completion_reminders must be between 1 and "
             f"{MAX_COMPLETION_REMINDERS} reminders."
         )
-    for field in ("prompts", "wake", "reclaim"):
+    for field in ("prompts", "wake", "reclaim", "titles"):
         if type(result[field]) is not bool:
             raise BridgeError(f"{field} must be a boolean.")
     return result
