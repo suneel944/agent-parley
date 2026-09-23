@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from agent_parley import process
-from agent_parley.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, Transient, lock, write_json
 
 GIT_SECONDS = 30
 MAX_STEP_BYTES = 400
@@ -216,7 +216,7 @@ def _require_dead(activity: dict, issue: str, owner: str) -> None:
             "confirm that generation before takeover."
         )
     if process.alive(pid, ticks):
-        raise BridgeError(
+        raise Transient(
             f"Issue #{issue} owner {owner} has a live session; stop and "
             "confirm that generation before takeover."
         )
@@ -687,7 +687,7 @@ def commit_takeover(
         or evidence.get("claim_id") != record.get("claim_id")
         or evidence.get("orphan_id") != orphan.get("id")
     ):
-        raise BridgeError(f"Issue #{issue} recovery evidence is invalid.")
+        raise Transient(f"Issue #{issue} recovery evidence is invalid.")
     activity_path = directory / f"{owner}-activity.json"
     with lock(directory / f"{owner}-checkpoint.lock", timeout=1):
         try:

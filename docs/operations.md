@@ -544,7 +544,9 @@ changes nothing further: one offer, one recorded attempt, one forge comment. The
 same key with different arguments is refused by name, so a stale retry cannot
 release a different issue or hand off to a different lane. A command that was
 refused replays as the same refusal, even if ownership changed in between, so a
-retry never gains authority the first call was denied.
+retry never gains authority the first call was denied. A refusal that says to
+retry, such as a busy ledger lock or recovery evidence that changed, is not
+recorded against the key, so retrying with the same key is evaluated afresh.
 
 Every `issue` transition and `report` accepts `--idempotency-key`. Over MCP the
 same contract is carried by the optional `idempotency_key` argument on

@@ -742,8 +742,13 @@ key is recorded afterwards. That ordering costs a repeated evaluation when a
 process dies between the two, and never a replayed effect. A recorded refusal
 is replayed as the same refusal: authorization granted after the first call
 never reaches a retry carrying the refused key, so a replay cannot widen
-authority. Transitions that were already idempotent, such as reclaiming an
-issue this lane owns, stay correct without a key.
+authority. Only refusals that describe the ledger are recorded this way. An
+issue transition refused by a transient condition, lock contention or
+recovery evidence that changed while it was read, raises `state.Transient`
+and records nothing, so a retry with the same key is evaluated again rather
+than refused until the key ages out. Transitions that were already
+idempotent, such as reclaiming an issue this lane owns, stay correct without
+a key.
 
 Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer

@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from agent_parley import attachments, lifecycle, retries
-from agent_parley.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, Transient, lock, write_json
 
 MAX_BLOCKERS = 10
 SUPERVISION_ERROR = "supervision-error.json"
@@ -359,6 +359,10 @@ def unclaimed(state: dict) -> list[str]:
 def _refuse(directory: Path, scope: str, fingerprint: str, detail: str) -> None:
     """Records a refused transition so a retry is refused identically.
 
+    Only refusals that describe the ledger reach this record. A transient
+    refusal, such as lock contention or recovery evidence that changed, is
+    raised without it, so a retry with the same key is evaluated again.
+
     A refusal changed no ownership, so its ledger write never happened and the
     key is recorded afterwards under the lock again. An interruption before
     that record leaves the key absent, and the retry is evaluated and refused
@@ -484,6 +488,8 @@ def change(
             takeover=takeover,
             **transition,
         )
+    except Transient:
+        raise
     except BridgeError as exc:
         _refuse(directory, scope, fingerprint, str(exc))
         raise
@@ -561,7 +567,7 @@ def _taken(
         or takeover.get("orphan_id") != orphan.get("id")
         or not takeover.get("checkpoint")
     ):
-        raise BridgeError(
+        raise Transient(
             f"Issue #{issue} recovery evidence changed; inspect and retry."
         )
     from agent_parley import recovery

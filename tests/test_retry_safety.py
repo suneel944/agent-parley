@@ -3,7 +3,7 @@
 import pytest
 
 from agent_parley import issues, store
-from agent_parley.state import BridgeError
+from agent_parley.state import BridgeError, LockBusy
 
 
 def actor(bridge, root, name):
@@ -196,3 +196,32 @@ def test_a_report_key_reused_for_other_content_is_refused(bridge, repo, paired):
         bridge.report(
             lane, "partial", "Parser done.", "Wire the server.", "", "step"
         )
+
+
+def test_a_claim_refused_by_contention_is_evaluated_again(
+    bridge, repo, paired, monkeypatch
+):
+    lane = paired["lanes"]["claude"]
+    applied = issues._change
+    contended = []
+
+    def busy_once(*arguments, **options):
+        if not contended:
+            contended.append(True)
+            raise LockBusy("Another operation owns a lock; retry later.")
+        return applied(*arguments, **options)
+
+    monkeypatch.setattr(issues, "_change", busy_once)
+    with pytest.raises(LockBusy):
+        bridge.issue(lane, "claim", "42", key="k1")
+    assert bridge.issue(lane, "claim", "42", key="k1")["owner"] == "claude"
+
+
+def test_a_claim_refused_by_another_owner_stays_refused(bridge, repo, paired):
+    lanes = paired["lanes"]
+    bridge.issue(lanes["codex"], "claim", "42")
+    with pytest.raises(BridgeError, match="is owned by codex"):
+        bridge.issue(lanes["claude"], "claim", "42", key="k2")
+    bridge.issue(lanes["codex"], "release", "42")
+    with pytest.raises(BridgeError, match="is owned by codex"):
+        bridge.issue(lanes["claude"], "claim", "42", key="k2")
