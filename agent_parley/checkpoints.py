@@ -30,6 +30,9 @@ SETTLE_SECONDS = 30.0
 SETTLING = frozenset(
     {"Stop", "SessionEnd", "PermissionRequest", "Notification"}
 )
+CONTEXT_EVENTS = frozenset(
+    {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"}
+)
 HOOK_TIMEOUT = 3
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
@@ -1408,6 +1411,42 @@ def native_process(
     )
 
 
+def scan(home: Path, directory: Path, manifest: dict, agent: str) -> dict:
+    """Reads the project context a lane's hook may inject.
+
+    Nothing here reads or writes the lane's own record, so a decision runs
+    it before taking the lane's checkpoint lock. Operator edits and base
+    advances come from the reading the supervision poll keeps, rather than
+    from Git on every hook of every lane.
+
+    Args:
+        home: Private bridge state root.
+        directory: Common project state directory.
+        manifest: Project manifest holding the lane.
+        agent: Assigned native lane name.
+
+    Returns:
+        ``issues`` (the ledger snapshot), ``offer`` (the lane's work offer or
+        None), ``edited`` and ``advanced`` (the lane's operator edit and base
+        advance paths) and ``standing`` (its budget comparison).
+
+    Raises:
+        BridgeError: If the ledger or the store cannot be read.
+        OSError: If published project state cannot be read.
+        sqlite3.Error: If the store cannot be read.
+    """
+    from agent_parley import budgets, supervision
+
+    edits, advances = supervision.readings(home, manifest)
+    return {
+        "issues": snapshot(directory),
+        "offer": work_offer(directory, agent),
+        "edited": edits.get(agent, []),
+        "advanced": advances.get(agent, []),
+        "standing": budgets.standing(home, directory, manifest, agent),
+    }
+
+
 def checkpoint(
     home: Path,
     directory: Path,
@@ -1416,6 +1455,7 @@ def checkpoint(
     session_process: process.ServerProcess | None = None,
     stages: Stages | None = None,
     settle: float = LOCK_SECONDS,
+    record_only: bool = False,
 ) -> dict:
     """Observes a native event and prepares bounded coordination context.
 
@@ -1445,6 +1485,18 @@ def checkpoint(
     applied is recorded as superseded and changes nothing, so a turn that
     started while it waited is not labelled idle.
 
+    The context scans (issue ledger, work offer, operator edits, base
+    advances and budget standing) run before the lane's checkpoint lock is
+    taken, so the lock guards only the lane's record and mail cursor and a
+    slow scan in one decision never holds another event's record behind it.
+    Any other event that finds a later event already applied still delivers
+    its context and writes its record, but leaves the later event's activity
+    label and dialog in place. A `record_only` decision, which the service
+    starts while an earlier decision of the lane is past its deadline,
+    skips the mail and scans entirely: the label, the event record, the
+    session process identity and the recovery checkpoint are what must not
+    be lost, and the context is what the client no longer waits for.
+
     A session identity dropped because the process it named is gone records
     the lane as stopped, so the state derivation still reads positive
     evidence of an ended session. Dropping the identity alone would leave a
@@ -1463,6 +1515,7 @@ def checkpoint(
             decision past the hook's budget can name the step holding it.
         settle: Seconds an event that ends or pauses a turn waits for the
             lane's checkpoint lock.
+        record_only: Whether to record the event without mail or scans.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -1550,21 +1603,31 @@ def checkpoint(
         return {}
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
     state_path = directory / f"{agent}-activity.json"
+    context = not record_only and event in CONTEXT_EVENTS
+    scanned: dict | Exception = {}
+    if context:
+        stages.enter("scan")
+        try:
+            scanned = scan(home, directory, manifest, agent)
+        except (OSError, sqlite3.Error, BridgeError) as exc:
+            scanned = exc
     stages.enter("lock")
-    waits = settle if event in SETTLING else LOCK_SECONDS
+    waits = settle if event in SETTLING or record_only else LOCK_SECONDS
     with lock(directory / f"{agent}-checkpoint.lock", timeout=waits):
         stages.enter("state")
         state = (
             json.loads(state_path.read_text()) if state_path.exists() else {}
         )
         applied = state.get("updated")
-        if (
-            event in SETTLING
-            and isinstance(applied, (int, float))
-            and applied > arrived
-        ):
+        stale = isinstance(applied, (int, float)) and applied > arrived
+        if event in SETTLING and stale:
             record(directory, agent, payload, Reason.SUPERSEDED, None)
             return {}
+        prior = {
+            key: state[key]
+            for key in ("activity", "event", "dialog")
+            if key in state
+        }
         session = payload.get("session_id", "")
         if (
             state.get("session_id")
@@ -1618,6 +1681,9 @@ def checkpoint(
             )
         if ended and session_process is None:
             state["activity"] = "stopped"
+        if stale:
+            state.pop("dialog", None)
+            state.update(prior, updated=applied)
         if event == "UserPromptSubmit":
             prompt = str(payload.get("prompt", ""))
             if operator_prompt(prompt):
@@ -1625,7 +1691,7 @@ def checkpoint(
         output: dict = {}
         reason = Reason.OBSERVED
         ledger: dict = {}
-        if event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
+        if context:
             from agent_parley import budgets
 
             stages.enter("mail")
@@ -1646,37 +1712,32 @@ def checkpoint(
                         state.get("cursor", 0),
                     )
                 messages = mail["messages"]
-                stages.enter("scan")
-                issues = snapshot(directory)
+                if isinstance(scanned, Exception):
+                    raise scanned
+                issues = scanned["issues"]
                 ledger = issues
                 issue_notice = issues["revision"] != state.get(
                     "issue_revision", 0
                 )
                 names = sorted(manifest["participants"])
                 roster_notice = names != state.get("roster")
-                offer = work_offer(directory, agent)
+                offer = scanned["offer"]
                 work_notice = bool(
                     offer and offer["id"] != state.get("work_offer")
                 )
-                from agent_parley import supervision
-
-                edited = supervision.operator_edits(home, manifest).get(
-                    agent, []
-                )
+                edited = scanned["edited"]
                 if not edited:
                     state.pop("operator_edits", None)
                 edit_notice = bool(edited) and edited != state.get(
                     "operator_edits"
                 )
-                advanced = supervision.base_advances(home, manifest).get(
-                    agent, []
-                )
+                advanced = scanned["advanced"]
                 if not advanced:
                     state.pop("base_advance", None)
                 advance_notice = bool(advanced) and advanced != state.get(
                     "base_advance"
                 )
-                standing = budgets.standing(home, directory, manifest, agent)
+                standing = scanned["standing"]
                 notified = [
                     field
                     for field in state.get("budget_notified") or []
@@ -1884,6 +1945,7 @@ def serve(
     request: dict,
     stages: Stages | None = None,
     settle: float = LOCK_SECONDS,
+    record_only: bool = False,
 ) -> dict:
     """Decides one hook event and returns the hook process's contract.
 
@@ -1911,6 +1973,8 @@ def serve(
             the step that was holding it.
         settle: Seconds an event that ends or pauses a turn waits for the
             lane's checkpoint lock; see `checkpoint`.
+        record_only: Whether to record the event without building context;
+            see `checkpoint`.
 
     Returns:
         ``status``, ``stdout`` and ``stderr`` for the hook process to emit.
@@ -1968,6 +2032,7 @@ def serve(
             session_process,
             stages,
             settle,
+            record_only,
         )
         if adapter is not None:
             output = adapter.response(output)

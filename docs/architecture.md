@@ -907,13 +907,26 @@ decision keeps the lane's checkpoint lock and still writes the lane's activity
 file and event record, so deciding the same event again in the hook process
 would contend with it and could deny a native call over coordination work
 already in progress. The client therefore injects no context and exits
-successfully, and the service counts the decisions a lane abandoned at that
-deadline and starts no further decision for it while it holds one. A lane's
-first minutes are where that bound earns its place: the first checkpoint,
-roster, mail and recovery scans all run inside one hook budget, and without it
-each following event started a decision that queued behind the slow one and
-expired in its turn. Decisions merely in flight are not counted, so parallel
-native calls in a healthy lane keep their context injection. Contention on
+successfully. The service counts the decisions a lane abandoned at that
+deadline, keyed by project and lane name because one service serves every
+project and lane names repeat across them. While a lane holds one, its later
+events are decided record-only: the activity label, event record, session
+process identity and recovery checkpoint are written, and the mail and
+context scans are skipped. No event is discarded, so a `PostToolUse` or `Stop`
+that arrives behind a slow decision still closes the tool call or the turn.
+Decisions merely in flight are not counted, so parallel native calls in a
+healthy lane keep their context injection.
+
+The context scans (issue ledger, work offer, operator edits, base advances and
+budget standing) run before the checkpoint lock is taken, so the lock guards
+only the lane's record and mail cursor. Operator edits and base advances are
+Git readings the supervision poll takes once per project per interval and
+keeps for twice that interval; the hook path reads that copy and asks Git only
+when no current reading exists, as in the in-process fallback. Measured on 12
+lanes, the median hook fell from 22.7 to 4.4 ms and the median time the lock
+is held from 19.6 to 0.9 ms. An event that finds a newer event already applied
+still writes its record and delivers its context, but leaves the newer
+activity label in place. Contention on
 a lane's own checkpoint lock is likewise never an enforcement result: the loser
 of the bounded wait records a `lock_contended` event and degrades to no
 injection. An event that ends or pauses a turn (`Stop`, `SessionEnd`,
@@ -929,8 +942,8 @@ deadline and one lock wait, which is 2.75 seconds against the 3-second hook
 timeout the launcher registers.
 
 Every decision is timed by the step it is walking: the roster read, the stale
-session check, the Git branch guard, the wait for the lane's checkpoint lock,
-the activity read, the mailbox read, the coordination scans, the recovery
+session check, the Git branch guard, the coordination scans, the wait for the
+lane's checkpoint lock, the activity read, the mailbox read, the recovery
 capture and the record it writes. A decision slower than half the service
 deadline is logged as `decided` with those durations, and an abandoned one is
 logged as `expired` with the step it was holding when the deadline passed, so
@@ -938,7 +951,12 @@ the slow step at a launch is named rather than inferred. A hook process is
 killed by its client at the hook timeout and its shell client stops reading at
 its own, so a reply written after either deadline meets a socket nobody holds;
 that is the client's contract working and is recorded as a single `unanswered`
-entry rather than a traceback for every event.
+entry rather than a traceback for every event. Repeated `undecided` and
+`unanswered` entries for one lane are coalesced to one per minute, and the next
+written entry carries the count it stands for. The service log is bounded like
+every line log here; the lines a rotation drops move to `server.log.1`, and
+every entry and rotation is taken under one lock so no line is lost to a
+rewrite.
 
 Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,

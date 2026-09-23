@@ -369,7 +369,7 @@ class Server(ThreadingHTTPServer):
         self.reading = threading.Lock()
         self.stopping = threading.Event()
         self.counting = threading.Lock()
-        self.deciding: dict[str, int] = {}
+        self.deciding: dict[tuple[str, str], int] = {}
         self.refusals = 0
         self.reported: float | None = None
         super().__init__(("127.0.0.1", config["port"]), Handler)
@@ -788,7 +788,8 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._reply(403)
             return
-        served = self._decide(request, actor["name"])
+        lane = (str(actor["project"]), str(actor["name"]))
+        served = self._decide(request, lane)
         if served is None:
             return
         if self.headers.get("Accept") == hook.RAW_REPLY:
@@ -796,7 +797,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._reply(200, served)
 
-    def _decide(self, request: dict, participant: str) -> dict | None:
+    def _decide(self, request: dict, lane: tuple[str, str]) -> dict | None:
         """Produces one hook decision under a deadline of its own.
 
         The client stops reading after `hook.REPLY_TIMEOUT`, so a decision
@@ -816,15 +817,17 @@ class Handler(BaseHTTPRequestHandler):
         decision is held here: it emits no context and exits successfully
         rather than repeating the event.
 
-        Only the decisions a lane abandoned are counted, and a lane that
-        already holds `UNDECIDED_LIMIT` of them is answered without starting
-        another. A lane's first minutes are where this matters: its
-        checkpoint, roster and mail scans all run for the first time inside
-        one hook budget, and without the bound every following event started
-        a decision that queued behind the slow one and expired in its turn.
-        Concurrent decisions that are merely in flight are not counted, so
-        parallel native calls in a healthy lane keep their context
-        injection.
+        Only the decisions a lane abandoned are counted, keyed by the lane's
+        project and name because one service serves every project and lane
+        names repeat across them. A lane that already holds `UNDECIDED_LIMIT`
+        of them has its next events decided with `record_only`: the activity
+        label, event record, session process identity and recovery
+        checkpoint are written, and the mail and context scans are skipped.
+        Refusing those events outright used to drop the `PostToolUse` and
+        `Stop` that end a turn for as long as the slow decision ran, which
+        left the lane labelled as working and parked it for good. Concurrent
+        decisions that are merely in flight are not counted, so parallel
+        native calls in a healthy lane keep their context injection.
 
         Every decision is timed. One past `SLOW_DECISION` is logged with the
         step that spent the time, and an abandoned one names the step it was
@@ -833,12 +836,12 @@ class Handler(BaseHTTPRequestHandler):
 
         Args:
             request: Hook request the credential was accepted for.
-            participant: Registered identity the credential resolved to.
+            lane: Project key and participant name the credential resolved
+                to.
 
         Returns:
             The decision, or None once the client has been answered because
-            the decision failed, was already abandoned, or ran past its
-            deadline.
+            the decision failed or ran past its deadline.
         """
         outcome: dict = {}
         stages = checkpoints.Stages()
@@ -851,31 +854,32 @@ class Handler(BaseHTTPRequestHandler):
                     request,
                     stages,
                     checkpoints.SETTLE_SECONDS,
+                    record_only,
                 )
             except Exception:
                 outcome["failed"] = traceback.format_exc()
             finally:
                 with self.server.counting:
                     if outcome.pop("abandoned", False):
-                        held = self.server.deciding.get(participant, 1)
+                        held = self.server.deciding.get(lane, 1)
                         if held > 1:
-                            self.server.deciding[participant] = held - 1
+                            self.server.deciding[lane] = held - 1
                         else:
-                            self.server.deciding.pop(participant, None)
+                            self.server.deciding.pop(lane, None)
                     outcome["finished"] = True
 
+        project, participant = lane
         with self.server.counting:
-            undecided = self.server.deciding.get(participant, 0)
-        if undecided >= UNDECIDED_LIMIT:
+            undecided = self.server.deciding.get(lane, 0)
+        record_only = undecided >= UNDECIDED_LIMIT
+        if record_only:
             log(
                 self.server.home,
                 "undecided",
-                f"{self.path} {participant} already has {undecided} "
-                "decision(s) past their deadline; answered without "
-                "starting another",
+                f"{self.path} {participant} of {project} already has "
+                f"{undecided} decision(s) past their deadline; recorded "
+                "without building context",
             )
-            self._reply(hook.DECIDING, {"detail": UNDECIDED})
-            return None
         worker = threading.Thread(target=decide, daemon=True)
         started = time.monotonic()
         worker.start()
@@ -903,8 +907,8 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.counting:
             if not outcome.get("finished"):
                 outcome["abandoned"] = True
-                self.server.deciding[participant] = (
-                    self.server.deciding.get(participant, 0) + 1
+                self.server.deciding[lane] = (
+                    self.server.deciding.get(lane, 0) + 1
                 )
         log(
             self.server.home,
