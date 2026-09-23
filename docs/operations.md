@@ -2281,12 +2281,16 @@ state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in
 Set `AGENT_PARLEY_PORT` before first initialization to override port 8876.
 
 `server.json` names a service that answered: `up` publishes it only once the
-new process reports itself ready, removes a record left by a process that is
-gone, and leaves none behind when a start fails. A lane launch runs `up` first,
-so a lane never starts against a service that is not there, and a hook that
-falls back to the in-process decision asks for the service back when the
-recorded one has gone, at most once a minute and never waiting for the answer.
-A machine that has never started a service is left alone: the first start
+new process reports itself ready, and removes a record left by a process that
+is gone. A start that fails, on an occupied port or a process not ready within
+25 seconds, publishes a record with `state: failed`, `failed_at` and the count
+of consecutive `failures`, which names no process. A lane launch runs `up`
+first, so a lane never starts against a service that is not there, and a hook
+that falls back to the in-process decision asks for the service back when the
+recorded one has gone or failed, never waiting for the answer. It asks at most
+once a minute, and after repeated failed starts the wait doubles per failure
+up to 16 minutes. A relaunch stamp dated in the future, as a backward clock
+step leaves, does not hold the next request off. A machine that has never started a service is left alone: the first start
 belongs to the launch or to the operator.
 
 ### Keeping the service across reboots

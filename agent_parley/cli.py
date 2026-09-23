@@ -266,6 +266,7 @@ COPILOT_EVENTS = frozenset(
 
 GIT_SECONDS = 30
 MAX_HEALTH_BYTES = 65536
+START_SECONDS = 25.0
 
 
 def git(repo: Path, *args: str) -> str:
@@ -2785,20 +2786,27 @@ class Bridge:
     def up(self) -> None:
         """Starts the mail server with bounded readiness checking.
 
-        The published record names a service that answered. A process that
-        is spawned and never becomes ready leaves none, and a record found
+        The published record names a service that answered. A record found
         naming a process that is gone, as a reboot or a drift exit leaves
-        behind, is removed before the new service is started. Every reader
-        of the record therefore learns of a service only once it serves.
+        behind, is removed before the new service is started. A start that
+        fails, on an occupied port or a process never ready within
+        `START_SECONDS`, publishes a record with ``state: failed``, the time
+        and the count of consecutive failures instead, and names no process.
+        Every reader of the record therefore learns of a service only once it
+        serves, and the hooks' relaunch still finds a record to retry from,
+        with a backoff the failure count sets.
 
         Raises:
             BridgeError: If the port is occupied or startup fails.
         """
         with lock(self.home / "server.lock"):
             published = self.home / "server.json"
+            failures = 0
             if published.exists():
                 record = json.loads(published.read_text())
-                legacy = "start_ticks" not in record
+                if record.get("state") == "failed":
+                    failures = int(record.get("failures", 0))
+                legacy = "pid" in record and "start_ticks" not in record
                 if legacy and process.running(record["pid"]):
                     raise BridgeError(
                         "A service from an older installation is running. "
@@ -2813,12 +2821,18 @@ class Bridge:
                         f"Inspect {self.home}/server.log"
                     )
                 return
+            failed = {
+                "state": "failed",
+                "failed_at": time.time(),
+                "failures": failures + 1,
+            }
             published.unlink(missing_ok=True)
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     probe.bind(("127.0.0.1", self.config["port"]))
                 except OSError:
+                    write_json(published, failed)
                     raise BridgeError(
                         f"Port {self.config['port']} "
                         "is occupied by another service."
@@ -2843,7 +2857,7 @@ class Bridge:
                 "pid": child.pid,
                 "start_ticks": process.start_ticks(child.pid),
             }
-            deadline = time.monotonic() + 25
+            deadline = time.monotonic() + START_SECONDS
             while time.monotonic() < deadline:
                 if child.poll() is not None:
                     break
@@ -2858,6 +2872,7 @@ class Bridge:
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait(timeout=5)
+            write_json(published, failed)
             raise BridgeError(
                 "Coordination server failed to start. "
                 f"Inspect {self.home}/server.log"

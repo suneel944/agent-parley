@@ -331,6 +331,13 @@ def relaunch(home: str) -> None:
     ``RELAUNCH_INTERVAL`` seconds later, so a start that keeps failing
     costs one detached process a minute rather than one per hook.
 
+    A start that failed publishes a record naming no process, with the
+    count of consecutive failures, so relaunch keeps retrying after a
+    failed start. The interval doubles with each failure up to sixteen
+    times ``RELAUNCH_INTERVAL``. A stamp dated in the future, as a
+    backward clock step leaves, is read as expired rather than holding
+    relaunch off until the clock catches up.
+
     A home with no record is left alone: nothing claimed to serve it, and
     the first start belongs to the lane launch or to the operator. The
     request is detached and never waited on, so the hook that made it
@@ -350,9 +357,12 @@ def relaunch(home: str) -> None:
             record = json.load(stream)
         if process.alive(record.get("pid"), record.get("start_ticks")):
             return
+        failures = int(record.get("failures", 0) or 0)
+        interval = RELAUNCH_INTERVAL * 2 ** min(max(failures - 1, 0), 4)
         stamp = os.path.join(home, RELAUNCH_STAMP)
         if os.path.exists(stamp):
-            if time.time() - os.stat(stamp).st_mtime < RELAUNCH_INTERVAL:
+            age = time.time() - os.stat(stamp).st_mtime
+            if 0 <= age < interval:
                 return
         with open(stamp, "w"):
             pass

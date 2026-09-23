@@ -1078,6 +1078,59 @@ def test_no_relaunch_is_asked_for_without_a_recorded_service(
     assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
 
 
+def test_a_start_that_times_out_is_retried_after_the_backoff(
+    bridge, monkeypatch
+):
+    monkeypatch.setattr(cli, "START_SECONDS", 0.3)
+    monkeypatch.setattr(type(bridge), "ready", lambda self: False)
+    with pytest.raises(cli.BridgeError, match="failed to start"):
+        bridge.up()
+    record = json.loads((bridge.home / "server.json").read_text())
+    assert record["state"] == "failed"
+    assert record["failures"] == 1
+    assert bridge.server_process() is None
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    past = time.time() - hook.RELAUNCH_INTERVAL - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 2
+
+
+def test_a_repeated_failure_backs_off_further(bridge, monkeypatch):
+    write_json(
+        bridge.home / "server.json",
+        {"state": "failed", "failed_at": time.time(), "failures": 3},
+    )
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    past = time.time() - hook.RELAUNCH_INTERVAL * 2 - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+    past = time.time() - hook.RELAUNCH_INTERVAL * 4 - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 2
+
+
+def test_a_stamp_dated_in_the_future_does_not_hold_relaunch(
+    bridge, monkeypatch
+):
+    gone(bridge)
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    stamp.touch()
+    future = time.time() + 3600
+    os.utime(stamp, (future, future))
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+
+
 def held_lock(path, release):
     """Holds one lock from its own thread until the caller releases it."""
     taken = threading.Event()
