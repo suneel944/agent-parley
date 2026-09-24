@@ -36,6 +36,7 @@ SETTLING = frozenset(
 CONTEXT_EVENTS = frozenset(
     {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"}
 )
+RENEWING_EVENTS = frozenset({"PreToolUse"})
 HOOK_TIMEOUT = 3
 STORAGE_ERRORS = frozenset(
     (errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EFBIG, errno.EIO)
@@ -1625,10 +1626,13 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
 def renewed_leases(home: Path, root: str, name: str, after: int = 0) -> dict:
     """Renews this lane's expired reservations and reads the mailbox again.
 
-    A checkpoint is the lane saying it is alive and still working, so it is
+    A tool call is the lane proving it is alive and still working, so it is
     where a lease that outlived its declared window is restored to that
     window. Without it the runtime would reclaim a working lane's keys for a
-    peer, and with it a lane that has stopped coordinating loses them. Only a
+    peer, and with it a lane that has stopped coordinating loses them. A
+    session start, a turn end or a supervisor resume proves neither, so only
+    the events in `RENEWING_EVENTS` call this; a parked lane that is resumed
+    or typed into keeps its expired leases expired. Only a
     lane that already holds an expired lease pays for this; the mailbox is
     read again afterwards so the checkpoint reports what is true after the
     renewal rather than before it.
@@ -2038,7 +2042,9 @@ def checkpoint(
                 )
                 state["pending_ack"] = mail["pending_ack"]
                 state.pop("coordination_error", None)
-                if mail.get("stale_reservations", 0):
+                if event in RENEWING_EVENTS and mail.get(
+                    "stale_reservations", 0
+                ):
                     mail = renewed_leases(
                         home,
                         manifest["root"],

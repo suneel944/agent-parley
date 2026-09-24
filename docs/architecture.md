@@ -697,12 +697,14 @@ from the live ones and names the age of the oldest, and both surfaces report
 that age in seconds past the deadline.
 
 An expired lease is renewed by its holder or reclaimed from it. A holder that
-is still coordinating renews its own expired leases at its next checkpoint,
+is still working renews its own expired leases at its next `PreToolUse`,
 restoring the window that holder declared, so live work never loses a key it
-is using. A lease correlated with a claim that holder no longer holds is
-released at that checkpoint instead, and the holder is told which keys it lost.
-A lease whose holder was last observed without a live session process, or that
-has been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
+is using. A session start, a prompt, a turn end or a supervisor resume proves
+no work and renews nothing. A lease correlated with a claim that holder no
+longer holds is released at that checkpoint instead, and the holder is told
+which keys it lost. A lease whose holder was last observed without a live
+session process, or idle past the project's inactive threshold, or that has
+been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
 is released by the next reservation call or supervision poll: the oldest queued
 request for each key is granted, the lane that took it is told who lost it, and
 the former holder is told what was released and why. The grace sits above the

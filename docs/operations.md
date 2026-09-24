@@ -897,10 +897,11 @@ reports as stale. Once a declared time to live passes, the LEASES count in
 from the live ones and names the age of the oldest in seconds past its
 deadline, and a conflict names that holder as stale.
 
-An expired lease does not stay expired. A holder that is still coordinating
-renews it at that lane's next checkpoint, restoring the window the holder
-declared, so a lane working under a key keeps it. A holder whose last
-observation found no live session process, or whose lease has been expired
+An expired lease does not stay expired. A holder that is still working renews
+it at that lane's next tool call, restoring the window the holder declared, so
+a lane working under a key keeps it; a session start, a prompt, a turn end or a
+supervisor resume renews nothing. A holder whose last observation found no live
+session process, or found it idle past the inactive threshold, or whose lease has been expired
 longer than the 1800-second grace, loses it: the runtime releases the lease,
 grants the oldest queued request for each key, tells the lane that took the key
 who lost it, and tells the former holder what was released and why. A lease

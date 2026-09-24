@@ -1769,12 +1769,15 @@ def _expired_leases(
     """Names the leases of one project that no longer describe live work.
 
     A lease is reclaimable once its declared deadline has passed and either
-    the last observation of its holder found no live session process, or it
-    has been past that deadline longer than ``RESERVATION_GRACE``. The grace
-    is longer than the runtime's whole wake budget, so a holder that can be
-    woken is woken, and renews the lease from its next checkpoint, before any
-    peer takes the key. A holder never observed at all is not assumed dead:
-    only the grace reclaims its lease.
+    the last observation of its holder found no live session process, found
+    the holder idle past the project's inactive threshold, or it has been
+    past that deadline longer than ``RESERVATION_GRACE``. A lane idle that
+    long is not working under the lease, and only a tool call renews one, so
+    a lane parked on a dialog or resumed without working loses the key to
+    the queue rather than holding it for the whole grace. The grace covers
+    a holder observed as active, which is woken and renews the lease from
+    its next tool call before any peer takes the key. A holder never
+    observed at all is not assumed dead: only the grace reclaims its lease.
 
     Args:
         db: Open transaction owned by the caller.
@@ -1791,7 +1794,7 @@ def _expired_leases(
         "LEFT JOIN participant_presence s ON s.agent_id=f.agent_id "
         "WHERE f.project_id=? AND f.released_ts IS NULL "
         "AND f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP "
-        "AND (s.process_alive=0 "
+        "AND (s.process_alive=0 OR s.state='idle' "
         "OR unixepoch('now')-unixepoch(f.expires_ts)>=?) "
         "ORDER BY a.name,f.path_pattern",
         (project_id, RESERVATION_GRACE),
