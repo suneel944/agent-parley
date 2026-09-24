@@ -792,8 +792,22 @@ branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
 the oldest, delivered context, denials against retained hook events, served
 MCP calls with rejections, and the tokens that lane's own native client
-recorded. The header carries server health and the project's
-denial rate. The view is read-only and makes no model call; `q` leaves it.
+recorded. The header carries server health, the project's denial rate and
+how long the frame took to read. The view is read-only and makes no model
+call; `q` leaves it.
+
+Like a task manager, the view lists what is live. A lane whose session is
+stopped or retired and which owns no issue, holds or waits on no lease and
+has no unread or unacknowledged mail is left out. So is every lane of a
+project whose root no longer exists, such as a run under `/tmp` after a
+reboot. The header counts what was left out. `a` in the live view and
+`--all` on the command line show it again, and `--json` always reports every
+lane. A stopped lane that still holds work stays on screen, because that work
+needs the operator.
+
+Git readings dominate a frame, so the live view reads each lane's branch
+and each project's operator edits and base advances at most once every five
+seconds. The rest of the frame is read on every redraw.
 
 The table is fitted to the terminal rather than fixed. Each column is as
 wide as the widest value in that frame and never narrower than its declared
@@ -823,6 +837,7 @@ Keys in the live view:
 | `f` | Narrow to participants, comma separated; empty clears. |
 | `o` | Narrow to projects, comma separated; empty clears. |
 | `c` | Choose the columns shown; empty shows all. |
+| `a` | Show or hide stopped lanes and projects whose root is gone. |
 | `?` | Show the key map and the column legend. |
 | `q` | Leave. The view never writes state. |
 

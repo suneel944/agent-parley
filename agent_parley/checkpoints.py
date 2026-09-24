@@ -1487,7 +1487,12 @@ def participant_liveness(
     return f"{derived['evidence']}{waiting}{age}"
 
 
-def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
+def event_summary(
+    directory: Path,
+    agent: str,
+    since: float = 0.0,
+    entries: list[dict] | None = None,
+) -> dict:
     """Summarizes the retained hook event log for one participant.
 
     Counts cover the rotated file and then the current one, oldest record
@@ -1505,6 +1510,9 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
         agent: Participant that owns the lane.
         since: Unix time floor; only records at or after it are counted.
             Zero counts everything retained.
+        entries: Records the caller already read from this lane's log for
+            the same window, so one frame parses the log once; read here
+            when None.
 
     Returns:
         Observed event count, denials, denials counted by reason class and
@@ -1516,7 +1524,8 @@ def event_summary(directory: Path, agent: str, since: float = 0.0) -> dict:
         succeeds.
     """
     try:
-        entries = read_events(directory, agent, since)
+        if entries is None:
+            entries = read_events(directory, agent, since)
     except BridgeError:
         return {
             "events": 0,

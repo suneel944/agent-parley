@@ -8249,6 +8249,15 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "paths, for a repository whose base checkout is always dirty."
         ),
     )
+    watch.add_argument(
+        "--all",
+        dest="everything",
+        action="store_true",
+        help=(
+            "Also show stopped lanes that hold nothing and projects whose "
+            "root is gone. The view counts them in its header otherwise."
+        ),
+    )
     measured = commands.add_parser(
         "metrics",
         help="Print the counters and gauges the live view computes.",
@@ -9482,6 +9491,7 @@ def main() -> int:
                     names,
                     not args.no_operator_edits,
                     lambda: problems.lines(bridge.problems()),
+                    args.everything,
                 )
         elif args.command == "metrics":
             from agent_parley import dashboard
