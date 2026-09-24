@@ -1,5 +1,6 @@
 """Runs a real local pseudo-terminal and its private wake transport."""
 
+import contextlib
 import json
 import os
 import pty
@@ -447,7 +448,8 @@ def test_the_launcher_ends_when_its_client_exits_under_a_held_terminal():
         finally:
             _finish(child)
             if holder.exists():
-                os.kill(int(holder.read_text()), signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(int(holder.read_text()), signal.SIGKILL)
 
 
 @pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGHUP])
