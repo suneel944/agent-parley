@@ -290,6 +290,35 @@ def test_a_lane_outside_the_state_directory_is_never_touched(
     assert assessed["reason"] == reclaim.OUTSIDE
 
 
+def test_an_idle_session_names_the_real_hold_and_its_remedy(
+    bridge, repo, landed, monkeypatch
+):
+    completion(monkeypatch, "MERGED")
+    manifest = roster.read(landed["directory"])
+    registered = reclaim.worktrees(manifest["root"])
+
+    def assessed(idle):
+        return reclaim.assess(
+            landed["directory"],
+            manifest,
+            "claude",
+            registered=registered,
+            claimed=False,
+            busy=True,
+            idle=idle,
+        )
+
+    assert assessed(False)["reason"] == reclaim.SESSION
+    kept = assessed(True)
+    assert kept["reclaim"] is False
+    assert kept["reason"] == reclaim.IDLE
+    assert "agent-parley participant stop claude" in kept["remedy"]
+    (landed["lane"] / "scratch.txt").write_text("unsaved\n")
+    dirty = assessed(True)
+    assert dirty["reason"] == reclaim.UNCOMMITTED
+    assert "participant stop claude" in reclaim.lines([dirty])[0]
+
+
 def test_the_supervision_tick_reclaims_a_merged_lane(
     bridge, repo, landed, monkeypatch
 ):

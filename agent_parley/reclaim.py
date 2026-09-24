@@ -71,6 +71,7 @@ OUTSIDE = "its worktree is outside the project state directory"
 UNREGISTERED = "the base checkout does not register its worktree"
 UNREADABLE = "Git could not inspect it"
 SESSION = "a session is running in it"
+IDLE = "an idle session is still running in it"
 CLAIMED = "it still holds a claim"
 UNCOMMITTED = "it holds uncommitted changes"
 UNMERGED = "its branch holds commits the base checkout does not have"
@@ -275,6 +276,7 @@ def assess(
     busy: bool,
     held: str = "",
     quiet: bool = False,
+    idle: bool = False,
 ) -> dict:
     """Decides what may be done with one lane, and why.
 
@@ -290,6 +292,13 @@ def assess(
     the forge. The base checkout is read at its own head, which is the
     branch the project's own integration merges a lane into.
 
+    A session that is alive but idle past the project's inactivity window
+    does not count as running: the lane is judged on everything else, so
+    the report names the condition that actually holds it. A worktree is
+    still never removed from under a live process, so a lane that would
+    otherwise be reclaimed is kept with that reason, and every such row
+    names the command that ends the idle session.
+
     Args:
         directory: Private project state directory holding the lanes.
         manifest: Project manifest naming the root, base and participants.
@@ -302,12 +311,32 @@ def assess(
             lane still holds, or empty when it holds neither.
         quiet: Whether the lane's session stopped and nothing in the lane
             changed for longer than the inactivity threshold.
+        idle: Whether that session has been idle past the inactivity window.
 
     Returns:
         The participant, its lane, its branch, whether the lane may be
         reclaimed, the condition that decided it and any paths that
-        condition names.
+        condition names. A lane with an idle session also carries the
+        remedy that ends it.
     """
+    if busy and idle:
+        row = assess(
+            directory,
+            manifest,
+            name,
+            registered=registered,
+            claimed=claimed,
+            busy=False,
+            held=held,
+            quiet=quiet,
+        )
+        if row["reclaim"]:
+            row.update(_outcome(IDLE))
+        row["remedy"] = (
+            "its session is idle but alive; `agent-parley participant "
+            f"stop {name}` ends it"
+        )
+        return row
     participant = manifest["participants"][name]
     lane = Path(participant["lane"])
     branch = participant["branch"]
@@ -392,12 +421,16 @@ def _holds(
     return ""
 
 
-def plan(directory: Path, manifest: dict) -> list[dict]:
+def plan(
+    directory: Path, manifest: dict, idle: frozenset[str] = frozenset()
+) -> list[dict]:
     """Assesses every lane a project registers.
 
     Args:
         directory: Private project state directory holding the lanes.
         manifest: Project manifest naming the root, base and participants.
+        idle: Participants whose session is alive but idle past the
+            project's inactivity window.
 
     Returns:
         One assessment per participant, in manifest order.
@@ -431,6 +464,7 @@ def plan(directory: Path, manifest: dict) -> list[dict]:
                 busy=_busy(directory, name),
                 held=held,
                 quiet=_quiet(directory, name, Path(participant["lane"]), after),
+                idle=name in idle,
             )
         )
     return rows
@@ -772,6 +806,8 @@ def lines(rows: list[dict]) -> list[str]:
             detail += f"; {row['bytes'] / 1_000_000:.1f} MB"
         if "checkpoint" in row:
             detail += f"; forced after checkpoint {row['checkpoint']}"
+        if row.get("remedy"):
+            detail += f"; {row['remedy']}"
         label = row["participant"]
         if "worktree" in row:
             label = f"worktree {row['worktree']}"

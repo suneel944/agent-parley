@@ -65,7 +65,7 @@ on standard output and export to a file.
 | `participant pause NAME` | Refuse a lane's calls and tool use; keep its session and claims. |
 | `participant resume NAME` | Let a paused lane act again. |
 | `participant stop NAME` | End a lane's session from the base checkout; keep its claims. |
-| `participant restart NAME` | Start a stopped lane again from a clean worktree. |
+| `participant restart NAME` | Start a crashed, wedged or stopped lane again; keep its uncommitted work. |
 | `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
 | `participant budget NAME` | Show or set the lane's advisory `--tokens`, `--calls` and `--hours` limits; `0` removes one. Crossing a limit marks the lane and stops nothing. |
