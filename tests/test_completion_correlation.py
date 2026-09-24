@@ -1,6 +1,7 @@
 """Checks that completion reminders follow the current claim, not a branch."""
 
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -220,6 +221,38 @@ def test_a_peer_lane_that_landed_the_claim_is_named_to_the_owner(
     closing(monkeypatch, closed_by(peer["branch"]))
     supervision.poll(bridge.home, claimed.parent)
     assert "codex landed the pull request" in prompt(claimed)["text"]
+
+
+def test_a_per_issue_branch_is_attributed_to_the_lane_that_checked_it_out(
+    bridge, claimed, monkeypatch
+):
+    peer = supervision.roster.read(claimed.parent)["participants"]["codex"]
+    for step in (["-b", "codex/1-fix"], [peer["branch"]]):
+        subprocess.run(
+            ["git", "-C", peer["lane"], "checkout", "-q", *step],
+            check=True,
+        )
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by("codex/1-fix"))
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    assert ended["1"]["landed_by"] == "codex"
+    supervision.poll(bridge.home, claimed.parent)
+    assert "codex landed the pull request" in prompt(claimed)["text"]
+
+
+def test_a_branch_no_lane_checked_out_is_attributed_to_nobody(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by("elsewhere/1"))
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    assert "landed_by" not in ended["1"]
 
 
 def test_the_issue_reading_names_its_closing_pull_request(

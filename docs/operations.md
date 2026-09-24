@@ -1531,7 +1531,11 @@ Releasing a claim with waiting peers creates a visible handoff reminder.
 The service also checks each claimed issue on the forge and reminds the holder
 when the issue closed inside the current claim, recording the pull request that
 closed it, its head branch and merge commit, whichever branch it came from. A
-closing pull request from another lane's branch is named in the reminder. Only
+closing pull request from another lane's branch is named in the reminder, and
+so is one from a per-issue branch that exactly one other lane's worktree
+checked out. Every lane pushes as the same forge account, so the pull request
+author cannot tell lanes apart; the worktree's own HEAD reflog can. A branch
+no lane's reflog moved to, or several did, is attributed to nobody. Only
 when the forge cannot say anything about the issue does the newest pull request
 on the lane branch speak for it, and a lane branch merge never marks a claimed
 issue the forge still reads as open. Issue readings are reused for five

@@ -3147,7 +3147,8 @@ def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
         from, the pull request state, the instant it was observed and, when
         the forge named one, the closing pull request's number, URL and merge
         commit. `landed_by` names another lane whose lane branch carried the
-        closing pull request.
+        closing pull request, or whose worktree alone checked out the
+        per-issue branch it came from.
     """
     root = Path(manifest["root"])
     lanes = {
@@ -3194,10 +3195,60 @@ def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
                 "commit": reading["commit"],
             }
             landed = lanes.get(reading["branch"])
+            if not landed and reading["branch"]:
+                landed = branch_lane(manifest, reading["branch"])
             if landed and landed != name:
                 seen["landed_by"] = landed
             ended[number] = seen
     return ended
+
+
+def branch_lane(manifest: dict, branch: str) -> str:
+    """Names the one lane whose worktree checked out a per-issue branch.
+
+    Every lane shares one repository and pushes as the same forge account,
+    so neither the branch ref nor the pull request author says which lane
+    made a branch. Each worktree keeps its own HEAD reflog, though, and a
+    checkout records the branch it moved to. A branch exactly one lane's
+    reflog moved to is that lane's; a branch no lane or several lanes moved
+    to is attributed to nobody.
+
+    Args:
+        manifest: Current participant manifest.
+        branch: Head branch of the closing pull request.
+
+    Returns:
+        The participant name, or an empty string when the branch cannot be
+        attributed to exactly one lane.
+    """
+    moved = f" to {branch}"
+    owners = []
+    for name, participant in manifest["participants"].items():
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(participant["lane"]),
+                    "reflog",
+                    "show",
+                    "--format=%gs",
+                    "HEAD",
+                    "--",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and any(
+            line.startswith("checkout: moving from ") and line.endswith(moved)
+            for line in result.stdout.splitlines()
+        ):
+            owners.append(name)
+    return owners[0] if len(owners) == 1 else ""
 
 
 def reported_since(directory: Path, name: str, since: float) -> bool:
