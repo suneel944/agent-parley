@@ -1758,20 +1758,39 @@ takes it out of `status` and `top`. Retiring a lane supersedes the mail still
 addressed to it, so no share bounces off a lane that no longer exists.
 
 Worktrees a lane made for itself, such as one per pull request, are swept in
-the same pass and published under `worktrees` in `reclaim.json`. One is
-removed with `git worktree remove`, never forced, only when it sits inside
-the project state directory, is not locked, has no session running, has
-nothing uncommitted, its head is already on the base checkout, its branch
-carries nothing its upstream lacks, and it has not changed inside
-`inactive_after`. A registered worktree whose directory is gone is pruned.
-Its branch is kept. A worktree outside the state directory is only reported.
-`agent-parley gc` without `--apply` adds each worktree's size on disk.
+the same pass and published under `worktrees` in `reclaim.json`. Every
+worktree `git worktree list` reports is attributed to a lane by path, when it
+sits inside a lane's worktree, or by branch, when its branch is the lane's
+name or branch followed by `-` or `/`, such as `claude-pr-12`. One inside the
+project state directory belongs to the project. A worktree nothing accounts
+for is reported with reason `no lane made it` and never touched, even with
+`--force`.
+
+An attributed worktree is removed with `git worktree remove` when it is not
+locked, has no session running in its lane, has nothing uncommitted, and
+every commit it holds beyond the base checkout is on its upstream; and then
+only when its head is already on the base, its lane retired, or it has not
+changed inside `inactive_after`. A registration whose directory is gone is
+dropped. Its branch is kept. Uncommitted changes, unpushed commits and a
+recent change keep it and are reported by name. `agent-parley gc --apply
+--force` removes those too, but only after writing a recovery checkpoint
+bundle of the whole worktree, index and untracked files included, to the
+project's `recovery` folder; a checkpoint that fails removes nothing.
+`agent-parley gc`, `gc --dry-run` and its alias `agent-parley reclaim`
+without `--apply` add each worktree's size on disk.
+
+Each sweep also records the project state directory's size and how many
+worktrees a reclaim, and a forced reclaim, would still remove.
+`agent-parley status` prints them under the project heading and carries them
+as `reclaim` in its JSON document, reading the sweep's record instead of
+walking the disk.
 
 When the project root itself disappears, the first poll records
 `root-missing.json` in the project state directory. One interval later every
 lane still registered is captured for recovery, retired and has its
-reservations revoked, and the marker names the state directory for the
-operator to remove. The project then leaves `status` and `top`; a root that
+reservations revoked. The marker names, per lane, the claims released and the
+checkpoint each one left, and the state directory for the operator to remove.
+The project then leaves `status`, `top` and `metrics`; a root that
 returns clears the marker on the next poll. When the service starts, it
 removes every wake socket in its home that no launcher is listening on.
 

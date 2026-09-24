@@ -6097,32 +6097,40 @@ reported.
         return rows
 
     def reclaim_worktrees(
-        self, repo: Path, *, apply: bool = False, sizes: bool = False
+        self,
+        repo: Path,
+        *,
+        apply: bool = False,
+        sizes: bool = False,
+        force: bool = False,
     ) -> list[dict]:
         """Reports, and optionally removes, worktrees lanes made themselves.
 
         Lanes add worktrees for pull requests and sub-tasks that no lane
         root accounts for. Each one the project repository registers is
-        assessed by `reclaim.strays`, and only the ones inside the project
-        state directory whose every commit the base checkout and upstream
-        already carry are removed. Git's own removal refuses a dirty or
-        locked worktree, so nothing with uncommitted work is ever lost.
+        assessed by `reclaim.strays`, and a worktree no lane made is never
+        removed. Git's own removal refuses a dirty or locked worktree, so
+        nothing with uncommitted work is lost unless the operator forces
+        it, and a forced removal writes a recovery checkpoint first.
 
         Args:
             repo: Any checkout of the target repository.
             apply: Whether the reclaimable worktrees are removed.
             sizes: Whether each worktree's size on disk is measured.
+            force: Whether a worktree kept only for uncommitted changes,
+                unpushed commits or a recent change is removed as well,
+                after its checkpoint. Applies only with `apply`.
 
         Returns:
             One row per worktree, as `reclaim.strays` shapes it, carrying
-            whether it was removed when applied.
+            whether it was removed when applied and any checkpoint written.
         """
         root, directory = self.project(repo, create=False)
         rows = reclaim.strays(directory, roster.read(directory), sizes=sizes)
         if not apply:
             return rows
         return [
-            reclaim.remove(str(root), row) if row["reclaim"] else row
+            reclaim.remove(str(root), directory, row, force=force)
             for row in rows
         ]
 
@@ -7043,6 +7051,7 @@ reported.
                 projects.append(
                     {
                         "root": data["root"],
+                        "reclaim": supervision.reclaim_summary(path.parent),
                         **views.ledger(context["ledger"]),
                         "ready_groups": plan.ready_groups(
                             plan.groups(path.parent),
@@ -7114,6 +7123,8 @@ reported.
                 continue
             print(f"\nProject: {data['root']}")
             print(describe(snapshot(path.parent)))
+            if measured := reclaim.summary_line(project.get("reclaim") or {}):
+                print(measured)
             if groups := project.get("ready_groups") or []:
                 print(
                     "Every member reported ready in: "
@@ -8590,18 +8601,37 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     acking.add_argument("--json", action="store_true", help=JSON_HELP)
     collecting = commands.add_parser(
         "gc",
+        aliases=["reclaim"],
         help=(
             "Reclaim the lane worktrees and branches whose work has landed, "
             "keeping and reporting every lane that still holds any."
         ),
     )
     collecting.add_argument("--repo", type=Path, default=Path.cwd())
-    collecting.add_argument(
+    sweeping = collecting.add_mutually_exclusive_group()
+    sweeping.add_argument(
         "--apply",
         action="store_true",
         help=(
             "Remove the reclaimable lanes; without it the sweep only reports "
             "what it would remove and what it would keep."
+        ),
+    )
+    sweeping.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Only report what would be removed and what would be kept, with "
+            "each worktree's size on disk; the default."
+        ),
+    )
+    collecting.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "With --apply, also remove lane worktrees kept only for "
+            "uncommitted changes, unpushed commits or a recent change, after "
+            "writing a recovery checkpoint of each."
         ),
     )
     collecting.add_argument("--json", action="store_true", help=JSON_HELP)
@@ -9534,10 +9564,15 @@ def main() -> int:
                 else "\n".join(problems.lines(found))
             )
             return 1 if found else 0
-        elif args.command == "gc":
+        elif args.command in ("gc", "reclaim"):
+            if args.force and not args.apply:
+                parser.error("--force needs --apply.")
             swept = bridge.reclaim(args.repo.resolve(), apply=args.apply)
             made = bridge.reclaim_worktrees(
-                args.repo.resolve(), apply=args.apply, sizes=not args.apply
+                args.repo.resolve(),
+                apply=args.apply,
+                sizes=not args.apply,
+                force=args.force,
             )
             print(
                 views.render("gc", {"lanes": swept, "worktrees": made})

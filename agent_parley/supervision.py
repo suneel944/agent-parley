@@ -16,6 +16,7 @@ from agent_parley import (
     lifecycle,
     notify,
     process,
+    reclaim,
     records,
     roster,
     store,
@@ -2624,7 +2625,9 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     next attempt and gives the operator the account of what was removed and
     what was kept. The worktrees lanes made for themselves are swept in the
     same pass and published beside the lanes, without their sizes, because
-    measuring them walks every file they hold.
+    measuring them walks every file they hold. The state directory's total
+    size and the count of worktrees still left for a reclaim are measured
+    here once, so `status` reports both without walking the disk itself.
 
     Args:
         home: Private bridge state root.
@@ -2645,11 +2648,42 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     except BridgeError:
         pass
     finally:
+        left = [row for row in made if not row.get("removed")]
         with contextlib.suppress(OSError):
             write_json(
                 directory / RECLAIM_PUBLICATION,
-                {"swept": now, "lanes": rows, "worktrees": made},
+                {
+                    "swept": now,
+                    "lanes": rows,
+                    "worktrees": made,
+                    "state_bytes": reclaim.size(directory),
+                    "reclaimable": sum(row["reclaim"] for row in left),
+                    "forceable": sum(reclaim.forceable(row) for row in left),
+                },
             )
+
+
+def reclaim_summary(directory: Path) -> dict:
+    """Reads what the last sweep measured for one project.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        The state directory's size in bytes, the worktrees a reclaim would
+        remove and the further ones only a forced reclaim would, and when
+        they were measured; every value is None before the first sweep.
+    """
+    try:
+        published = json.loads((directory / RECLAIM_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        published = {}
+    if not isinstance(published, dict):
+        published = {}
+    return {
+        key: published.get(key)
+        for key in ("state_bytes", "reclaimable", "forceable", "swept")
+    }
 
 
 def root_retired(directory: Path) -> bool:
@@ -2681,7 +2715,10 @@ def missing_root(
     captured into a recovery checkpoint where Git can still read it,
     retired through `retirement.withdraw`, which releases its claims and
     declines offers made to it, and its credential is invalidated. The
-    publication names the state directory for the operator to remove;
+    publication names, per lane, the claims released and the checkpoint
+    each one left, fresh or from an earlier capture, so whoever takes the
+    issue next can restore the work. It names the state directory for the
+    operator to remove;
     nothing here deletes it. A root that reappears clears the record on the
     next poll.
 
@@ -2714,13 +2751,27 @@ def missing_root(
             continue
         with contextlib.suppress(BridgeError, OSError, ValueError):
             recovery.capture(directory, manifest, name)
+        checkpoints = {}
+        for number, record in issues.snapshot(directory)["issues"].items():
+            if record.get("owner") != name or not record.get("claim_id"):
+                continue
+            with contextlib.suppress(BridgeError):
+                checkpoints[number] = recovery.checkpoint(
+                    directory, number, str(record["claim_id"])
+                )["id"]
         try:
             report = retirement.withdraw(directory, name)
         except BridgeError:
             continue
         with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
             store.revoke(home, manifest["root"], participant["display"])
-        lanes.append({"participant": name, "released": report["released"]})
+        lanes.append(
+            {
+                "participant": name,
+                "released": report["released"],
+                "checkpoints": checkpoints,
+            }
+        )
     write_json(
         path,
         {

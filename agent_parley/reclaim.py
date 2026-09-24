@@ -25,11 +25,15 @@ commits, so no work leaves with the row.
 
 Lanes also make worktrees of their own, for pull requests and sub-tasks, and
 Git registers each against the project repository. Those are read from
-`git worktree list` and removed only when they sit inside the project state
-directory, are clean, carry no commit the base checkout lacks and no commit
-their upstream lacks, and have not changed within the inactivity threshold.
-A worktree outside the state directory is reported and never touched,
-because nothing distinguishes it from one the operator made by hand.
+`git worktree list` and attributed to a lane by path, when they sit inside a
+lane or the project state directory, or by branch, when their branch is
+named after a lane. A worktree no lane accounts for is the operator's and is
+never touched. An attributed one is removed when it is clean, carries no
+commit that neither the base checkout nor its upstream has, and either the
+base already holds its head, its lane retired, or it has been untouched past
+the inactivity threshold. Uncommitted changes and unpushed commits keep it
+unless the operator forces the removal, and a forced removal first writes a
+recovery checkpoint holding both.
 """
 
 import os
@@ -56,7 +60,12 @@ LOCKED = "Git holds a lock on it"
 MISSING = "its directory is gone"
 RECENT = "it changed within the inactivity threshold"
 CONTAINED = "its commits are all in the base checkout"
-DETACHED = "its commits are not in the base checkout"
+ABANDONED = "its lane retired and its commits are all on its upstream"
+STALE = (
+    "it has been untouched past the inactivity threshold and its commits "
+    "are all on its upstream"
+)
+FOREIGN = "no lane made it"
 GONE = "its branch is gone from its upstream"
 OUTSIDE = "its worktree is outside the project state directory"
 UNREGISTERED = "the base checkout does not register its worktree"
@@ -71,7 +80,10 @@ PULL_OPEN = "its pull request is still open"
 PUBLISHED = "its upstream still carries its branch"
 PULL_CLOSED = "its pull request was closed without merging"
 UNLANDED = "nothing shows its branch landed"
-REMOVABLE = frozenset({MERGED, GONE, STOPPED, VANISHED, MISSING, CONTAINED})
+REMOVABLE = frozenset(
+    {MERGED, GONE, STOPPED, VANISHED, MISSING, CONTAINED, ABANDONED, STALE}
+)
+FORCEABLE = frozenset({UNCOMMITTED, UNPUSHED, RECENT})
 
 
 def _read(root: str, *arguments: str) -> str | None:
@@ -483,30 +495,51 @@ def _within(path: Path, parent: Path) -> bool:
     return path == parent or parent in path.parents
 
 
+def _unpushed(root: str, entry: dict, ahead: list[str]) -> list[str] | None:
+    """Returns the commits beyond the base that no upstream carries either.
+
+    Args:
+        root: Base checkout the worktree is registered with.
+        entry: Parsed worktree entry.
+        ahead: Commits the worktree's head has and the base checkout lacks.
+
+    Returns:
+        The commits only this worktree holds, or None when Git could not
+        answer. Without an upstream every commit beyond the base counts.
+    """
+    tracking = _upstream(root, entry["branch"]) if entry["branch"] else None
+    if tracking is None:
+        return ahead
+    remote, branch = tracking
+    reference = f"refs/remotes/{remote}/{branch}"
+    if _read(root, "rev-parse", "--verify", "--quiet", reference) is None:
+        return ahead
+    return _ahead(root, reference, entry["head"])
+
+
 def _stray(
     root: str,
-    directory: Path,
     entry: dict,
     *,
     busy: bool,
+    retired: bool,
     after: float,
 ) -> tuple[str, list[str]]:
     """Decides whether one worktree a lane made may be removed, and why.
 
     Args:
         root: Base checkout the worktree is registered with.
-        directory: Private project state directory.
         entry: Parsed worktree entry.
         busy: Whether a session runs in that owning lane.
+        retired: Whether the owning lane retired.
         after: Inactivity threshold in seconds.
 
     Returns:
         The condition that decided it and any paths or commits it names.
-        Only a condition in `REMOVABLE` allows a removal.
+        Only a condition in `REMOVABLE` allows a removal, and only one in
+        `FORCEABLE` allows a forced one.
     """
     path = Path(entry["path"])
-    if not _within(path, directory.resolve()):
-        return OUTSIDE, []
     if entry["locked"]:
         return LOCKED, []
     if not path.exists():
@@ -525,29 +558,59 @@ def _stray(
     if ahead is None:
         return UNREADABLE, []
     if ahead:
-        return DETACHED, ahead
-    tracking = _upstream(root, entry["branch"]) if entry["branch"] else None
-    if tracking is not None:
-        remote, branch = tracking
-        unpushed = _ahead(root, f"refs/remotes/{remote}/{branch}", head)
+        unpushed = _unpushed(root, entry, ahead)
+        if unpushed is None:
+            return UNREADABLE, []
         if unpushed:
             return UNPUSHED, unpushed
+    if retired:
+        return ABANDONED, []
     if time.time() - _changed(path) <= after:
         return RECENT, []
-    return CONTAINED, []
+    return (STALE if ahead else CONTAINED), []
+
+
+def _owner(
+    path: Path,
+    branch: str,
+    lanes: dict[str, str],
+    prefixes: list[tuple[str, str]],
+) -> str:
+    """Attributes one worktree to the lane that made it.
+
+    Args:
+        path: Resolved worktree path.
+        branch: Its checked-out branch, empty when detached.
+        lanes: Resolved lane worktree path to participant name.
+        prefixes: Branch prefix and the participant it names, longest
+            prefix first; each lane contributes its name and its branch.
+
+    Returns:
+        The lane whose worktree contains it, else the lane its branch is
+        named after, else an empty string.
+    """
+    for lane, name in lanes.items():
+        if _within(path, Path(lane)):
+            return name
+    for prefix, name in prefixes:
+        if branch == prefix or branch.startswith((f"{prefix}-", f"{prefix}/")):
+            return name
+    return ""
 
 
 def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
     """Assesses the worktrees lanes made beside their own lane worktrees.
 
     Every worktree the project repository registers is read, except the
-    base checkout and the participants' own lanes. Each is attributed to
-    the lane whose worktree contains it, and removed only when it sits
-    inside the project state directory, Git holds no lock on it, no session
-    runs in its lane, it is clean, the base checkout carries every commit it
-    has, its upstream carries every commit its branch has, and it has not
-    changed within the inactivity threshold. A registration whose directory
-    is already gone is reclaimed by pruning it.
+    base checkout and the participants' own lanes. Each is attributed to a
+    lane by path or branch; one inside the project state directory belongs
+    to the project even when no single lane accounts for it, and one
+    nothing accounts for is the operator's and is never removed. An
+    attributed worktree is removed only when Git holds no lock on it, no
+    session runs in its lane, it is clean, every commit beyond the base is
+    on its upstream, and the base holds its head, its lane retired, or it
+    has not changed within the inactivity threshold. A registration whose
+    directory is already gone is reclaimed by dropping that registration.
 
     Args:
         directory: Private project state directory holding the lanes.
@@ -570,27 +633,39 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
         "inactive_after"
     ]
     base = str(Path(manifest["root"]).resolve())
+    participants = manifest["participants"]
     lanes = {
         str(Path(participant["lane"]).resolve()): name
-        for name, participant in manifest["participants"].items()
+        for name, participant in participants.items()
     }
+    prefixes = sorted(
+        {
+            (prefix, name)
+            for name, participant in participants.items()
+            for prefix in (name, participant.get("branch") or name)
+        },
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+    state = directory.resolve()
     rows = []
     for entry in entries:
         if entry["path"] == base or entry["path"] in lanes:
             continue
         path = Path(entry["path"])
-        owner = next(
-            (name for lane, name in lanes.items() if _within(path, Path(lane))),
-            "",
-        )
-        busy = bool(owner) and _busy(directory, owner)
-        reason, paths = _stray(
-            manifest["root"],
-            directory,
-            entry,
-            busy=busy,
-            after=after,
-        )
+        owner = _owner(path, entry["branch"], lanes, prefixes)
+        paths: list[str]
+        if not owner and not _within(path, state):
+            reason, paths = FOREIGN, []
+        else:
+            reason, paths = _stray(
+                manifest["root"],
+                entry,
+                busy=bool(owner) and _busy(directory, owner),
+                retired=bool(owner)
+                and bool(participants[owner].get("retired")),
+                after=after,
+            )
         row = {
             "worktree": entry["path"],
             "branch": entry["branch"],
@@ -603,31 +678,75 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
     return rows
 
 
-def remove(root: str, row: dict) -> dict:
-    """Removes one reclaimable worktree through Git's own refusals.
+def forceable(row: dict) -> bool:
+    """Reports whether a forced sweep may remove one kept worktree."""
+    return "worktree" in row and row["reason"] in FORCEABLE
+
+
+def remove(
+    root: str, directory: Path, row: dict, *, force: bool = False
+) -> dict:
+    """Removes one worktree through Git's own refusals.
 
     `git worktree remove` without force refuses a worktree that is dirty or
     locked, so a change made between the assessment and the removal keeps
-    the worktree. A registration whose directory is gone is pruned instead.
+    the worktree. A registration whose directory is gone is dropped by the
+    same command, which touches no other registration.
+    A forced removal of a worktree kept for its uncommitted changes, its
+    unpushed commits or a recent change first writes a recovery checkpoint
+    holding all of them, and removes nothing when that checkpoint fails.
     Branches are left in place.
 
     Args:
         root: Base checkout the worktree is registered with.
-        row: One assessment `strays` decided in favour of a reclaim.
+        directory: Private project state directory holding checkpoints.
+        row: One assessment `strays` produced.
+        force: Whether a worktree in `FORCEABLE` is removed as well.
 
     Returns:
-        The row with whether Git removed it.
+        The row with whether Git removed it, and the checkpoint written
+        before a forced removal.
     """
-    if row["reason"] == MISSING:
-        removed = _read(root, "worktree", "prune") is not None
-    else:
-        removed = _read(root, "worktree", "remove", row["worktree"]) is not None
-    return {**row, "removed": removed}
+    from agent_parley import recovery
+
+    if row["reclaim"]:
+        removed = _read(root, "worktree", "remove", row["worktree"])
+        return {**row, "removed": removed is not None}
+    if not (force and forceable(row)):
+        return row
+    try:
+        saved = recovery.preserve(directory, Path(row["worktree"]))
+    except (BridgeError, OSError):
+        return {**row, "removed": False}
+    removed = _read(root, "worktree", "remove", "--force", row["worktree"])
+    return {**row, "removed": removed is not None, "checkpoint": saved["id"]}
 
 
 def reclaimable(rows: list[dict]) -> list[dict]:
     """Returns only the assessments that decided in favour of a reclaim."""
     return [row for row in rows if row["reclaim"]]
+
+
+def summary_line(summary: dict) -> str:
+    """Renders what the last sweep measured for one project.
+
+    Args:
+        summary: The state directory size and worktree counts the last
+            sweep published.
+
+    Returns:
+        One line naming the state directory's size and the worktrees a
+        reclaim would remove, or an empty string before the first sweep.
+    """
+    if summary.get("state_bytes") is None:
+        return ""
+    line = (
+        f"State directory: {summary['state_bytes'] / 1_000_000:.1f} MB; "
+        f"{summary.get('reclaimable') or 0} worktrees to reclaim"
+    )
+    if forced := summary.get("forceable"):
+        line += f", {forced} more with --force"
+    return line
 
 
 def lines(rows: list[dict]) -> list[str]:
@@ -651,6 +770,8 @@ def lines(rows: list[dict]) -> list[str]:
         detail = f"; {', '.join(row['paths'])}" if row["paths"] else ""
         if "bytes" in row:
             detail += f"; {row['bytes'] / 1_000_000:.1f} MB"
+        if "checkpoint" in row:
+            detail += f"; forced after checkpoint {row['checkpoint']}"
         label = row["participant"]
         if "worktree" in row:
             label = f"worktree {row['worktree']}"

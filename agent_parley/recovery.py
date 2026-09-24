@@ -384,6 +384,65 @@ def capture(
     return published
 
 
+def preserve(directory: Path, worktree: Path) -> dict:
+    """Captures one worktree's whole content before it is force-removed.
+
+    The same index and worktree commits a claim checkpoint takes are built
+    for a worktree no claim owns, and published as a private bundle beside
+    the claim checkpoints, so uncommitted files and unpushed commits both
+    survive the removal.
+
+    Args:
+        directory: Private project state directory.
+        worktree: Worktree about to be removed.
+
+    Returns:
+        The checkpoint record, naming its bundle and the commits that
+        restore the worktree.
+
+    Raises:
+        BridgeError: If Git could not capture the worktree.
+    """
+    folder = _folder(directory)
+    descriptor, index_name = tempfile.mkstemp(dir=folder)
+    os.close(descriptor)
+    temporary_index = Path(index_name)
+    temporary_index.unlink()
+    try:
+        index_commit, worktree_commit = _snapshot_commits(
+            worktree, temporary_index
+        )
+    finally:
+        temporary_index.unlink(missing_ok=True)
+    identifier = (
+        "worktree-"
+        + hashlib.sha256(
+            f"{worktree.resolve()}\0{worktree_commit}".encode()
+        ).hexdigest()[:24]
+    )
+    bundle = folder / f"{identifier}.bundle"
+    size, digest = _publish_bundle(
+        worktree, bundle, identifier, worktree_commit
+    )
+    record = {
+        "id": identifier,
+        "source_worktree": str(worktree.resolve()),
+        "branch": _text(worktree, "branch", "--show-current"),
+        "head": _text(worktree, "rev-parse", "HEAD"),
+        "index_commit": index_commit,
+        "worktree_commit": worktree_commit,
+        "captured_at": time.time(),
+        "artifact": {
+            "kind": "git-bundle",
+            "reference": bundle.name,
+            "bytes": size,
+            "sha256": digest,
+        },
+    }
+    write_json(folder / f"{identifier}.json", record)
+    return record
+
+
 def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
     """Reads the checkpoint for one exact ownership generation."""
     identifier = _identifier(issue, claim_id)
