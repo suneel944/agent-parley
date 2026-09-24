@@ -598,7 +598,11 @@ def test_status_names_the_prompt_and_how_long_it_has_waited(tmp_path):
 
 @pytest.mark.parametrize(
     "opt_in,allowed",
-    [(None, None), (False, None), (True, [protocol.TOOL_PREFIX])],
+    [
+        (None, None),
+        (False, None),
+        (True, [protocol.TOOL_PREFIX, protocol.cli_rule()]),
+    ],
 )
 def test_the_launch_approves_this_bridge_and_nothing_else(
     bridge, repo, monkeypatch, tmp_path, opt_in, allowed
@@ -813,3 +817,66 @@ def test_a_release_that_meets_a_held_lock_is_retried(tmp_path):
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert state["activity"] == "working"
     assert "dialog" not in state
+
+
+def _shell_prompt(command: str) -> str:
+    """Draws the shell permission prompt recorded on lane claude-2."""
+    return (
+        "\x1b[2J ╭──────────╮ │ Bash command │   "
+        f"{command}   List Agent Parley issue ownership  "
+        "This command requires approval  Do you want to proceed? ❯ 1. Yes"
+        "  2. Yes, and don't ask again for: "
+        f"{command}  3. No  Esc to cancel · Tab to amend"
+    )
+
+
+def test_the_prompt_and_the_launch_rule_spell_one_command():
+    """Keeps the allow rule on the exact string the prompt orders."""
+    assert protocol.cli_rule() == f"Bash({protocol.cli_command()} *)"
+    assert protocol.cli_command().endswith(" -m agent_parley.cli")
+
+
+def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):
+    """Unparks a lane on the command the protocol prompt ordered."""
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    screen = _shell_prompt(protocol.cli_command() + " issue list")
+    watch = dialogs.Watch(tmp_path, "lane", bridge=True)
+    watch.advance(screen.encode(), 0.0)
+    assert watch.advance(b"", 0.5) == b"1\r"
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["answer"] == dialogs.BRIDGE_ANSWER
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 12",
+        "python3 -m agent_parley.cli issue list",
+        protocol.cli_command() + " issue list && rm -rf build",
+        protocol.cli_command() + " report > /tmp/out",
+        "cd x; " + protocol.cli_command() + " issue list",
+    ],
+)
+def test_any_other_shell_prompt_escalates(tmp_path, command):
+    """Answers nothing beyond this bridge's own CLI."""
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane", bridge=True)
+    watch.advance(_shell_prompt(command).encode(), 0.0)
+    assert watch.advance(b"", 0.5) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
+
+
+def test_the_opt_in_is_read_when_the_prompt_is_drawn(bridge, repo):
+    """Covers a lane launched before the operator recorded the opt-in."""
+    data = bridge.add_participant(repo, "lane", "claude")
+    directory = Path(data["participants"]["lane"]["lane"]).parent
+    write_json(directory / "lane-activity.json", {"activity": "working"})
+    screen = _shell_prompt(protocol.cli_command() + " issue list").encode()
+    before = dialogs.watcher(directory, "lane")
+    before.advance(screen, 0.0)
+    assert before.advance(b"", 0.5) == b""
+    manifest = json.loads((directory / "project.json").read_text())
+    manifest["supervision"] = {dialogs.PRE_APPROVE: True}
+    write_json(directory / "project.json", manifest)
+    assert before.advance(b"", 1.0) == b"1\r"

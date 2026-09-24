@@ -120,10 +120,26 @@ server there, and only when you record the opt-in:
 ```
 
 The default is off and changes nothing about the client's configuration. With it
-on, the launch adds one native permission rule, `mcp__agent_parley`, which allows
-this bridge's own coordination tools and nothing else: no file tool, no shell, no
-other MCP server, no bypass flag and no weakened decision. A participant entry
-overrides the project entry, so one lane can stay fully interactive. Codex CLI
+on, the launch adds two native permission rules: `mcp__agent_parley`, which
+allows this bridge's own coordination tools, and
+`Bash(<interpreter> -m agent_parley.cli *)`, which allows the exact interpreter
+and module the protocol prompt orders every lane to run for `issue claim`,
+`issue list`, `report` and the other CLI commands. Both are spelled from the
+same string the prompt prints, so they cannot drift apart. Nothing else is
+allowed: no file tool, no other shell command, no other MCP server, no bypass
+flag and no weakened decision. A lane launched before you recorded the opt-in
+still draws the shell prompt for that command; its watcher reads the opt-in
+again while the prompt holds the screen and answers `Yes` when the prompt's
+command begins with that interpreter and module and chains no second command.
+A prompt for any other command escalates as before. A participant entry
+overrides the project entry, so one lane can stay fully interactive.
+
+A lane the supervisor launches or resumes runs in the client's default
+permission mode; no permission mode is passed. A lane you started by hand and
+switched to the client's auto mode does not carry that choice into a
+supervisor-driven resume, so a resumed lane parks on the first shell command
+outside your own allow list and the two rules above. Record that command in
+the client's own permission settings to keep such a lane moving. Codex CLI
 0.153.4 has no per-tool approval surface of its own — its approval settings are
 whole-session policies — so its launch is left untouched and its prompts are
 reported for you to answer.

@@ -4869,7 +4869,7 @@ class Bridge:
     def protocol(self, agent: str, data: dict) -> str:
         """Builds coordination instructions without embedding tokens."""
         participant = data["participants"][agent]
-        command = shlex.join([sys.executable, "-m", "agent_parley.cli"])
+        command = protocol.cli_command()
         peers = (
             ", ".join(
                 f"{other['display']} ({other['provider']})"
@@ -7283,7 +7283,9 @@ reported.
                 )
                 native: dict = {"hooks": hooks}
                 if dialogs.pre_approved(data, agent):
-                    native["permissions"] = {"allow": [protocol.TOOL_PREFIX]}
+                    native["permissions"] = {
+                        "allow": [protocol.TOOL_PREFIX, protocol.cli_rule()]
+                    }
                 command = [
                     executable,
                     "--mcp-config",
