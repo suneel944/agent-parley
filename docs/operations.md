@@ -1610,8 +1610,10 @@ operator input, so they do not refuse the wake. Complete replies are removed
 from the input-state check without hiding operator bytes that arrived in the
 same read; incomplete replies are carried until the next read and refuse a wake
 until they complete.
-Results appear in `status`, the retained event log and
-private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`,
+Wake attempts, backoff, the last result and escalation are fields of the
+lane's state in the store, and every wake decision reads them there. Results
+appear in `status`, the retained event log and private `<name>-wake.json`,
+which is a published copy of those fields that no decision reads; resumed terminal output stays in `<name>-wake.log`,
 which the launcher truncates before a write would take it past 1 MiB. A failed
 write to that log, including a full disk, is dropped and never ends the resumed
 session. A wake request whose lane activity record is missing or unreadable is

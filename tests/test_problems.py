@@ -67,10 +67,14 @@ def unwoken(bridge):
     write_json(bridge.home / "supervision.json", {"wake": False})
 
 
-def refuse(directory, name, result, attempts=0):
-    """Records one wake refusal for a lane."""
-    write_json(
-        directory / f"{name}-wake.json",
+def refuse(bridge, directory, name, result, attempts=0):
+    """Records one wake refusal in a lane's state."""
+    root = json.loads((directory / "project.json").read_text())["root"]
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        root,
+        name,
         {
             "at": time.time(),
             "attempts": attempts,
@@ -216,7 +220,7 @@ def test_a_lane_the_service_has_woken_reports_the_attempts_it_made(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    refuse(directory, "claude", "busy:turn", attempts=2)
+    refuse(bridge, directory, "claude", "busy:turn", attempts=2)
     deliver(bridge, repo, paired, aged=1800)
     [row] = rows(bridge, problems.STALLED)
     assert row["actor"] == problems.BY_SERVICE
@@ -361,7 +365,7 @@ def test_a_wake_refusal_names_its_reason_and_an_actor_who_can_clear_it(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    refuse(directory, "claude", result)
+    refuse(bridge, directory, "claude", result)
     [record] = [
         row
         for row in bridge.status_snapshot()["projects"][0]["participants"]
@@ -379,7 +383,7 @@ def test_a_lane_that_cannot_read_mail_is_never_offered_say(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    refuse(directory, "claude", problems.DIALOG)
+    refuse(bridge, directory, "claude", problems.DIALOG)
     deliver(bridge, repo, paired, ack=True, aged=1800)
     found = rows(bridge, ack_after=600)
     assert found
@@ -394,7 +398,7 @@ def test_a_live_working_lane_is_never_told_to_stop_its_session(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude", updated=time.time())
-    refuse(directory, "claude", problems.RETRY)
+    refuse(bridge, directory, "claude", problems.RETRY)
     [row] = rows(bridge, problems.WAKE)
     assert row["actor"] == problems.BY_SERVICE
     assert row["command"] == (

@@ -2646,16 +2646,17 @@ def overdue_claims(
             )
 
 
-def dialog_waiting(directory: Path, name: str) -> bool:
+def dialog_waiting(home: Path, root: str, name: str) -> bool:
     """Reports whether the lane's own state reads as a dialog on its screen.
 
     The lane's last wake outcome is the only local reading that distinguishes
     a session waiting for the operator from one working, so it is the
-    predicate every caller uses. A screen watcher that records a dialog
-    through the same lane state is read here without further change.
+    predicate every caller uses. It is read from the wake fields of the
+    lane's state.
 
     Args:
-        directory: Private project state directory.
+        home: Private bridge state root.
+        root: Canonical project key.
         name: Participant that owns the lane.
 
     Returns:
@@ -2663,14 +2664,12 @@ def dialog_waiting(directory: Path, name: str) -> bool:
         no recorded wake outcome reads as not waiting, because an absent
         record is no evidence of a dialog.
     """
-    try:
-        wake = json.loads((directory / f"{name}-wake.json").read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(wake, dict) and wake.get("result") in DIALOG_WAKES
+    return wake_record(home, root, name).get("result") in DIALOG_WAKES
 
 
-def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
+def unacknowledged_reason(
+    home: Path, directory: Path, root: str, name: str, observed: dict
+) -> str:
     """States in one clause why a lane did not acknowledge in time.
 
     Only what the runtime can read locally is reported: the recorded session
@@ -2679,7 +2678,9 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     itself, so a lane that reads as available is reported as exactly that.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
+        root: Canonical project key.
         name: Participant that owes the acknowledgement.
         observed: That lane's presence reading.
 
@@ -2688,7 +2689,7 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     """
     if observed.get("state") == STOPPED:
         return "has no running session"
-    if dialog_waiting(directory, name):
+    if dialog_waiting(home, root, name):
         return "has a native dialog waiting for the operator"
     state = published_capacity(directory, name)["state"]
     if state == "exhausted":
@@ -2735,7 +2736,13 @@ def acknowledgement_deadlines(
             for display in breach["recipients"]:
                 observed = observations.get(named.get(display, display))
                 reason = (
-                    unacknowledged_reason(directory, named[display], observed)
+                    unacknowledged_reason(
+                        home,
+                        directory,
+                        manifest["root"],
+                        named[display],
+                        observed,
+                    )
                     if observed
                     else "is not a participant in this project"
                 )
@@ -2794,7 +2801,7 @@ def share_blocker(
     """
     if observed.get("state") == STOPPED:
         return "has no live session process"
-    if dialog_waiting(directory, name):
+    if dialog_waiting(home, manifest["root"], name):
         return "has a native dialog waiting for the operator"
     if capacity(home, directory, manifest, name)["state"] == "exhausted":
         return "has exhausted its provider capacity"
@@ -3982,6 +3989,45 @@ def account_lanes(home: Path, directory: Path, manifest: dict) -> None:
             )
 
 
+def wake_record(home: Path, root: str, name: str) -> dict:
+    """Reads the wake fields of one lane's state for a wake decision.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+
+    Returns:
+        The fields `lanes.read_wake` returns, or an empty mapping when none
+        was recorded or the store cannot be read.
+    """
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error, ValueError):
+        with store.connect(home) as db:
+            return lanes.read_wake(db, root, name)
+    return {}
+
+
+def store_wake(
+    home: Path, directory: Path, root: str, name: str, record: dict
+) -> None:
+    """Writes the wake fields of one lane's state and publishes a copy.
+
+    The store holds the fields every wake decision reads. The lane's
+    `-wake.json` is rewritten from the same record only as a published copy
+    for an operator reading the state directory; nothing decides from it.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        record: Wake fields to store.
+    """
+    with store.connect(home, write=True) as db:
+        lanes.write_wake(db, root, name, record)
+    write_json(directory / f"{name}-wake.json", record)
+
+
 def condition(home: Path, root: str, name: str) -> dict | None:
     """Reads one lane's state record for a supervision decision.
 
@@ -4495,23 +4541,40 @@ def _wake_block(
     return "", 0.0
 
 
-def _park_wake(path: Path, record: dict, cause: str, due: float | None) -> None:
-    """Publishes the blocking cause and next attempt time on a wake record.
+def _park_wake(
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    record: dict,
+    cause: str,
+    due: float | None,
+) -> None:
+    """Records the blocking cause and next attempt time in the wake fields.
 
     Args:
-        path: The lane's durable wake record.
-        record: That record as read.
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        record: The lane's wake fields as read.
         cause: Why no attempt was made, empty when only spacing applies.
         due: Unix time of the next attempt, None once the budget is spent.
     """
     if record.get("blocked") == cause and record.get("next_at") == due:
         return
     record.update(blocked=cause, next_at=due)
-    write_json(path, record)
+    store_wake(home, directory, root, name, record)
 
 
 def _defer_wake(
-    directory: Path, name: str, cause: str, ready_at: float, window: float
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    cause: str,
+    ready_at: float,
+    window: float,
 ) -> None:
     """Keeps a blocked lane's next attempt visible without spending one.
 
@@ -4520,23 +4583,23 @@ def _defer_wake(
     being observed.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
+        root: Canonical project key.
         name: Participant that owns the lane.
         cause: Why no attempt was made.
         ready_at: Earliest time the cause can clear, 0 when unknown.
         window: Inactivity window the attempts are spaced by.
     """
-    path = directory / f"{name}-wake.json"
-    if not path.exists():
-        return
     with lock(directory / f"{name}-wake.lock"):
-        record: dict = {}
-        with contextlib.suppress(OSError, ValueError):
-            record = json.loads(path.read_text())
-        if not isinstance(record, dict) or not record.get("result"):
+        record = wake_record(home, root, name)
+        if not record.get("result"):
             return
         _park_wake(
-            path,
+            home,
+            directory,
+            root,
+            name,
             record,
             cause,
             _wake_due(
@@ -4663,14 +4726,10 @@ def wake(
     state = json.loads(path.read_text()) if path.exists() else {}
     if rebooted(state):
         return
-    wake_path = directory / f"{name}-wake.json"
+    root = manifest["root"]
     window = config["inactive_after"]
-    parked: dict = {}
-    with contextlib.suppress(OSError, ValueError):
-        if wake_path.exists():
-            published = json.loads(wake_path.read_text())
-            parked = published if isinstance(published, dict) else {}
-    recorded = condition(home, manifest["root"], name)
+    parked = wake_record(home, root, name)
+    recorded = condition(home, root, name)
     if not lanes.wakes(recorded):
         return
     blocked, ready_at = _wake_block(
@@ -4679,7 +4738,7 @@ def wake(
     if not blocked and recorded and recorded["state"] == lanes.BLOCKED:
         blocked, ready_at = f"blocked: {recorded['cause']}", 0.0
     if blocked:
-        _defer_wake(directory, name, blocked, ready_at, window)
+        _defer_wake(home, directory, root, name, blocked, ready_at, window)
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -4744,7 +4803,7 @@ def wake(
             work_offer = None
         if not backlog:
             return
-        record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
+        record = wake_record(home, root, name)
         same_backlog = record.get("backlog") == backlog
         marker = _lane_activity(home, directory, manifest, name)
         worked = bool(record.get("activity")) and record["activity"] != marker
@@ -4768,18 +4827,18 @@ def wake(
             record.pop("escalated_at", None)
             record.pop("exhausted_at", None)
             record.update(attempts=0, activity=marker, blocked="", next_at=None)
-            write_json(wake_path, record)
+            store_wake(home, directory, root, name, record)
         spent_before = attempts >= WORK_WAKE_ATTEMPTS
         if spent_before:
             if not record.get("exhausted_at"):
                 record.update(exhausted_at=time.time())
-                write_json(wake_path, record)
+                store_wake(home, directory, root, name, record)
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
                     work_offer, attempts, str(record.get("result", ""))
                 )
                 record.update(result=result, escalated_at=time.time())
-                write_json(wake_path, record)
+                store_wake(home, directory, root, name, record)
                 _write_work_dispatch(
                     directory,
                     name,
@@ -4791,7 +4850,7 @@ def wake(
         due = _wake_due(float(throttle_at), int(attempts), ready_at, window)
         if time.time() < due:
             if record.get("result"):
-                _park_wake(wake_path, record, "", due)
+                _park_wake(home, directory, root, name, record, "", due)
             return
         result = WAKE_ATTENTION
         selected = _select_work_prompt(home, directory, name, work_offer)
@@ -4838,8 +4897,11 @@ def wake(
         counted = attempts + (not result.startswith("busy"))
         now = time.time()
         spent = counted >= WORK_WAKE_ATTEMPTS
-        write_json(
-            wake_path,
+        store_wake(
+            home,
+            directory,
+            root,
+            name,
             {
                 "at": now,
                 "backlog": backlog,

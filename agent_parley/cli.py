@@ -6998,8 +6998,9 @@ reported.
             with store.reading(self.home, frame["db"]) as db:
                 condition = lanes.read(db, data["root"], agent)
                 accounts = lanes.read_accounts(db, data["root"])
-        except (sqlite3.Error, BridgeError, OSError):
-            condition, accounts = None, {}
+                wake = lanes.read_wake(db, data["root"], agent)
+        except (sqlite3.Error, BridgeError, OSError, ValueError):
+            condition, accounts, wake = None, {}, {}
         liveness = participant_liveness(
             directory, agent, configuration["inactive_after"]
         )
@@ -7115,9 +7116,7 @@ reported.
             "wake": None,
             "mail": None,
         }
-        wake_path = directory / f"{agent}-wake.json"
-        if wake_path.exists():
-            wake = json.loads(wake_path.read_text())
+        if wake:
             next_at = wake.get("next_at")
             record["wake"] = {
                 "result": wake["result"],

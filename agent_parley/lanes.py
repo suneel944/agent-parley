@@ -97,7 +97,26 @@ SCHEMA = (
     " state TEXT NOT NULL, has_work INTEGER NOT NULL,"
     " owns INTEGER NOT NULL, accounted REAL NOT NULL,"
     " PRIMARY KEY(project,lane))",
+    "CREATE TABLE IF NOT EXISTS lane_wakes ("
+    " project TEXT NOT NULL, lane TEXT NOT NULL, at REAL NOT NULL,"
+    " attempts INTEGER NOT NULL, backlog TEXT NOT NULL,"
+    " superseded INTEGER NOT NULL, result TEXT NOT NULL,"
+    " activity TEXT NOT NULL, blocked TEXT NOT NULL, next_at REAL,"
+    " exhausted_at REAL, escalated_at REAL, PRIMARY KEY(project,lane))",
 )
+WAKE_FIELDS = (
+    "at",
+    "attempts",
+    "backlog",
+    "superseded",
+    "result",
+    "activity",
+    "blocked",
+    "next_at",
+    "exhausted_at",
+    "escalated_at",
+)
+WAKE_JSON = frozenset({"backlog", "activity"})
 FIELDS = ("state", "cause", "evidence", "session", "since", "updated")
 UNUSED = frozenset({IDLE, BLOCKED, STOPPED, DEAD})
 ACCOUNT_FIELDS = (
@@ -322,6 +341,77 @@ def transition(
         "source": source,
         "record": record,
     }
+
+
+def read_wake(db: sqlite3.Connection, root: str, lane: str) -> dict:
+    """Reads the wake fields of one lane's state.
+
+    The wake attempts spent on the current backlog, the backoff that spaces
+    the next one, the cause a wake is parked on and its escalation are part
+    of the lane's state, so they are kept here beside the state record
+    rather than in a file only the wake path reads.
+
+    Args:
+        db: Open transaction on the coordination store.
+        root: Canonical project key.
+        lane: Participant that owns the lane.
+
+    Returns:
+        The last attempt's time, the attempts counted, the backlog and the
+        superseded mail they were counted against, the last result, the
+        progress marker, the parked cause, the next attempt time and the
+        times the budget was exhausted and escalated; empty when no wake
+        was ever recorded.
+    """
+    try:
+        row = db.execute(
+            f"SELECT {','.join(WAKE_FIELDS)} FROM lane_wakes "
+            "WHERE project=? AND lane=?",
+            (root, lane),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if _absent(exc):
+            return {}
+        raise
+    if row is None:
+        return {}
+    record = dict(zip(WAKE_FIELDS, row, strict=True))
+    for key in WAKE_JSON:
+        record[key] = json.loads(record[key])
+    return record
+
+
+def write_wake(
+    db: sqlite3.Connection, root: str, lane: str, record: dict
+) -> None:
+    """Replaces the wake fields of one lane's state.
+
+    Args:
+        db: Open write transaction on the coordination store.
+        root: Canonical project key.
+        lane: Participant that owns the lane.
+        record: Wake fields as `read_wake` returns them; a missing field is
+            stored as its empty value.
+    """
+    ensure(db)
+    values = (
+        float(record.get("at") or 0.0),
+        int(record.get("attempts") or 0),
+        json.dumps(record.get("backlog") or [], default=str),
+        int(record.get("superseded") or 0),
+        str(record.get("result") or ""),
+        json.dumps(record.get("activity") or {}, sort_keys=True, default=str),
+        str(record.get("blocked") or ""),
+        record.get("next_at"),
+        record.get("exhausted_at"),
+        record.get("escalated_at"),
+    )
+    db.execute(
+        f"INSERT INTO lane_wakes(project,lane,{','.join(WAKE_FIELDS)}) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project,lane) DO UPDATE "
+        "SET " + ",".join(f"{key}=excluded.{key}" for key in WAKE_FIELDS),
+        (root, lane, *values),
+    )
 
 
 def from_liveness(

@@ -45,6 +45,14 @@ def place(bridge, paired, name, state, cause=""):
         lanes.transition(db, paired["root"], name, state, cause=cause)
 
 
+def unthrottle(bridge, paired, directory, name):
+    """Ages a lane's recorded wake spacing and returns the new fields."""
+    record = {**supervision.wake_record(bridge.home, paired["root"], name)}
+    record["at"] = 0
+    supervision.store_wake(bridge.home, directory, paired["root"], name, record)
+    return record
+
+
 def recorded(bridge, paired, name):
     """Reads one lane's record."""
     with store.connect(bridge.home) as db:
@@ -199,7 +207,7 @@ def test_a_blocked_lane_is_deferred_under_its_cause(
     assert len(calls) == 1
     place(bridge, paired, "codex", lanes.BLOCKED, lanes.CAPACITY)
     path = directory / "codex-wake.json"
-    write_json(path, {**json.loads(path.read_text()), "at": 0})
+    unthrottle(bridge, paired, directory, "codex")
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     assert len(calls) == 1
     assert json.loads(path.read_text())["blocked"] == "blocked: capacity"
@@ -225,7 +233,7 @@ def test_a_lane_answering_wakes_with_a_bare_stop_still_escalates(
         )
         place(bridge, paired, "codex", lanes.WORKING)
         place(bridge, paired, "codex", lanes.IDLE)
-        write_json(path, {**json.loads(path.read_text()), "at": 0})
+        unthrottle(bridge, paired, directory, "codex")
     record = json.loads(path.read_text())
     assert len(calls) == 5
     assert record["attempts"] == 5 and record["exhausted_at"]
@@ -316,3 +324,28 @@ def test_a_bare_stop_does_not_renew_an_expired_lease(bridge, repo, paired):
     assert expired(bridge, holder) == 1
     hooked(bridge, paired, "PreToolUse")
     assert expired(bridge, holder) == 0
+
+
+def test_wake_spacing_lives_in_the_lane_state_not_its_published_copy(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    mail(bridge, actors)
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert len(calls) == 1
+    path = directory / "codex-wake.json"
+    write_json(path, {**json.loads(path.read_text()), "at": 0})
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert len(calls) == 1
+    with store.connect(bridge.home) as db:
+        stored = lanes.read_wake(db, paired["root"], "codex")
+    assert stored["attempts"] == 1
+    assert stored["result"] == "accepted"

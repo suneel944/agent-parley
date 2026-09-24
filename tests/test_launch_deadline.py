@@ -164,8 +164,11 @@ def test_a_wake_spends_no_attempt_on_a_lane_that_never_started(
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     path = directory / "codex-wake.json"
-    write_json(
-        path,
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        paired["root"],
+        "codex",
         {
             "at": 0,
             "backlog": ["1"],

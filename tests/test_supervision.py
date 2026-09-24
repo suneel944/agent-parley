@@ -37,6 +37,15 @@ def registered(bridge, paired):
     }
 
 
+def rewake(bridge, paired, directory, name, **changes):
+    """Rewrites a lane's recorded wake fields and returns them as they were."""
+    record = supervision.wake_record(bridge.home, paired["root"], name)
+    supervision.store_wake(
+        bridge.home, directory, paired["root"], name, {**record, **changes}
+    )
+    return record
+
+
 def send(bridge, actor, recipient, key="pending"):
     return store.call(
         bridge.home,
@@ -285,13 +294,11 @@ def test_live_idle_wakes_back_off_without_acknowledging(
         supervision.wake(
             bridge.home, lane.parent, paired, "codex", observed, config
         )
-        path = lane.parent / "codex-wake.json"
-        record = json.loads(path.read_text())
-        write_json(path, {**record, "at": 0})
+        record = rewake(bridge, paired, lane.parent, "codex", at=0)
     assert len(calls) == 5
     assert record["attempts"] == 5 and record["exhausted_at"]
     assert record["next_at"] - record["at"] == 16
-    write_json(path, record)
+    rewake(bridge, paired, lane.parent, "codex", **record)
     supervision.wake(
         bridge.home, lane.parent, paired, "codex", observed, config
     )
@@ -331,16 +338,13 @@ def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     observed = supervision.presence(lane.parent, "codex", 1)
-    path = lane.parent / "codex-wake.json"
     for _ in range(9):
         supervision.wake(
             bridge.home, lane.parent, paired, "codex", observed, config
         )
-        record = json.loads(path.read_text())
-        record["at"] = 0
-        write_json(path, record)
+        rewake(bridge, paired, lane.parent, "codex", at=0)
     assert len(calls) == 9
-    assert json.loads(path.read_text())["attempts"] == 5
+    assert rewake(bridge, paired, lane.parent, "codex")["attempts"] == 5
 
 
 def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
@@ -396,8 +400,7 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
     assert first["result"] == "manual attention required"
     assert first["attempts"] == 1
     assert first["next_at"] == pytest.approx(first["at"] + 1)
-    first["at"] = 0
-    write_json(path, first)
+    rewake(bridge, paired, directory, "codex", at=0)
 
     supervision.wake(
         bridge.home,
@@ -468,14 +471,15 @@ def test_a_wake_blocked_by_exhausted_capacity_is_retried_at_the_reset(
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     observed = supervision.presence(directory, "codex", 1)
     path = directory / "codex-wake.json"
-    write_json(
-        path,
-        {
-            "at": 0,
-            "backlog": [str(message["id"])],
-            "attempts": 1,
-            "result": "manual attention required",
-        },
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=0,
+        backlog=[str(message["id"])],
+        attempts=1,
+        result="manual attention required",
     )
 
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
@@ -511,16 +515,17 @@ def test_status_reports_the_next_wake_or_the_exhausted_budget(
 ):
     registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent
-    write_json(
-        directory / "codex-wake.json",
-        {
-            "at": time.time() - 10,
-            "backlog": ["1"],
-            "attempts": 1,
-            "result": "manual attention required",
-            "blocked": "its screen state is waiting for approval",
-            "next_at": time.time() + 120,
-        },
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 10,
+        backlog=["1"],
+        attempts=1,
+        result="manual attention required",
+        blocked="its screen state is waiting for approval",
+        next_at=time.time() + 120,
     )
 
     bridge.status(cli.Selection(participant="codex"))
@@ -528,17 +533,18 @@ def test_status_reports_the_next_wake_or_the_exhausted_budget(
     scheduled = capsys.readouterr().out
     assert "Next wake in 1" in scheduled
     assert "blocked: its screen state is waiting for approval" in scheduled
-    write_json(
-        directory / "codex-wake.json",
-        {
-            "at": time.time() - 10,
-            "backlog": ["1"],
-            "attempts": supervision.WORK_WAKE_ATTEMPTS,
-            "result": "manual attention required",
-            "blocked": "its session process is not running",
-            "next_at": None,
-            "exhausted_at": time.time() - 5,
-        },
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 10,
+        backlog=["1"],
+        attempts=supervision.WORK_WAKE_ATTEMPTS,
+        result="manual attention required",
+        blocked="its session process is not running",
+        next_at=None,
+        exhausted_at=time.time() - 5,
     )
 
     bridge.status(cli.Selection(participant="codex"))
@@ -968,9 +974,14 @@ def test_a_current_working_label_still_blocks_the_wake(
     directory = Path(paired["lanes"]["codex"]).parent
     idle_lane(directory, "codex", 120, activity="working")
     send(bridge, actors["claude"], "codex")
-    write_json(
-        directory / "codex-wake.json",
-        {"at": time.time() - 1000, "attempts": 1, "result": "accepted"},
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 1000,
+        attempts=1,
+        result="accepted",
     )
     monkeypatch.setattr(
         terminal, "request", lambda *args: pytest.fail("woke a working lane")
@@ -1034,15 +1045,12 @@ def test_bare_stops_escalate_and_a_commit_resets_the_budget(
     monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     observed = supervision.presence(directory, "codex", 1)
-    path = directory / "codex-wake.json"
 
     def woken():
         supervision.wake(
             bridge.home, directory, paired, "codex", observed, config
         )
-        record = json.loads(path.read_text())
-        aged = {**record, "at": 0}
-        write_json(path, aged)
+        record = rewake(bridge, paired, directory, "codex", at=0)
         with (directory / "codex-events.jsonl").open("a") as stream:
             stream.write(json.dumps({"ts": time.time(), "event": "Stop"}))
             stream.write("\n")
