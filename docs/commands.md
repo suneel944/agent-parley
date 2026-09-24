@@ -26,7 +26,7 @@ on standard output and export to a file.
 | `up` | Start the local coordination server. |
 | `down` | Stop the server while retaining state and worktrees. |
 | `completion SHELL` | Print a `bash`, `zsh` or `fish` completion script generated from the installed command tree. |
-| `status` | Show server health, whether the running service is behind the installed code, and one table per project; `NAME` reports one lane in full, and `--repo`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since`, `--over-budget` and `--issue` narrow the rows. |
+| `status` | Show server health, whether the running service is behind the installed code, and one table per project, each lane's condition read from its authoritative state record; `NAME` reports one lane in full, and `--repo`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since`, `--over-budget` and `--issue` narrow the rows. |
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | The dashboard of every lane; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |

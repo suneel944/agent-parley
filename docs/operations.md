@@ -1360,11 +1360,17 @@ place.
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory` and one entry per
 project holding
-`root`, the issue ledger as `revision` and `issues`, and `participants`. `server`
+`root`, the issue ledger as `revision` and `issues`, `participants` and
+`accounting`, the project's idle and unaccountable lane-minutes merged across
+its lanes as `lanes.summary` shapes them, or null until any lane has been
+accounted. `server`
 carries the service reading the `Code:` line prints, so a stale service is
 readable without parsing text. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
-`session`, `availability` as `active`, `idle` or `stopped` with the derived
+`session`, `condition` as the lane's state, cause, evidence, `since` and held
+`seconds` from its state record, or null with no record yet, `accounting` as
+that lane's own `lanes.summary`, or null until it has been accounted,
+`availability` as `active`, `idle` or `stopped` with the derived
 `activity`, its `evidence` and whether that evidence is `stale`, `branch`,
 `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
