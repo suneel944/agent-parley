@@ -540,7 +540,10 @@ the thread reads the same mailbox `checkpoints.mailbox` reads, composes the
 same bounded notice the checkpoint composes, publishes it to a lane-private
 file under the state root that the coordination prompt tells the lane to read
 each turn, and records the delivery through `checkpoints.record` so a polled
-lane's delivered context is counted where every other lane's is. A read that
+lane's delivered context is counted where every other lane's is. The feed,
+owed-acknowledgement and relevance-ordered mail digest come from the same
+`checkpoints` builders, and the mail it previews is marked read as a hook
+delivery marks it. A read that
 fails is retried on the next interval rather than raised, because losing
 delivery must never end a native session, and delivery decides nothing: a
 missing guard still refuses the launch.

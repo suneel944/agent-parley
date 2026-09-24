@@ -858,6 +858,128 @@ def relevance(message: dict, name: str, stems: list[str]) -> int:
     )
 
 
+def feed_notice(news: dict) -> str:
+    """Builds the project feed part of one delivery.
+
+    Args:
+        news: Result of `store.feed` for the reading lane.
+
+    Returns:
+        The bounded feed line, or an empty string when nothing is new.
+    """
+    if not news["items"]:
+        return ""
+    return clip(
+        "Project feed, newest first: "
+        + "; ".join(
+            f"{item['sender']}: {item['subject']}" for item in news["items"]
+        )
+        + f" ({news['superseded']} superseded)",
+        400,
+    )
+
+
+def owed_acknowledgements(mail: dict, shown: set) -> list[str]:
+    """Names the acknowledgements a lane still owes outside one delivery.
+
+    Args:
+        mail: Mailbox reading from `mailbox`.
+        shown: Message ids the same delivery already previews.
+
+    Returns:
+        One label per owed request that is not previewed and not overdue,
+        since an overdue request has already gone back to its sender.
+    """
+    return [
+        f"message {item['id']} from {item['sender']}"
+        for item in mail.get("outstanding_ack") or []
+        if item["id"] not in shown and not item.get("overdue_seconds")
+    ]
+
+
+def owed_notice(owed: list[str]) -> str:
+    """Builds the owed-acknowledgement part of one delivery.
+
+    Args:
+        owed: Labels from `owed_acknowledgements`.
+
+    Returns:
+        The bounded notice, or an empty string when nothing is owed.
+    """
+    if not owed:
+        return ""
+    return (
+        clip("Acknowledgements owed: " + ", ".join(owed), 300)
+        + "\nAcknowledge each once reviewed."
+    )
+
+
+def digest(
+    parts: list[str],
+    messages: list,
+    mail: dict,
+    name: str,
+    footer: str,
+) -> tuple[list[str], list]:
+    """Fits mail previews into one delivery, most relevant first.
+
+    Previews are admitted in mailbox order until the context bound, so the
+    lane's cursor can advance past exactly the admitted ones, and are then
+    ordered by `relevance` under a header that says how much was left out.
+
+    Args:
+        parts: Parts already in the delivery, before any mail.
+        messages: Mailbox preview rows in ascending id order.
+        mail: Mailbox reading carrying unread, superseded and reserved.
+        name: Registered identity of the reading lane.
+        footer: Closing line the delivery ends with.
+
+    Returns:
+        The header and ordered previews to append, and the admitted rows in
+        ascending id order.
+    """
+    previews: dict[int, str] = {}
+    delivered = []
+    for message in messages:
+        ack = " [ACK REQUIRED]" if message["ack_required"] else ""
+        preview = (
+            f"Message {message['id']} from {message['sender']}{ack}: "
+            f"{clip(message['subject'], 80)}\n"
+            f"{clip(message['body_md'], 160)}"
+        )
+        tail = str(dict(message).get("body_tail") or "")
+        if "[attachment " in tail:
+            from agent_parley import attachments
+
+            attached = attachments.find(tail)
+            if attached:
+                preview += "\n" + attachments.marker(*attached)
+        candidate = "\n\n".join([*parts, *previews.values(), preview, footer])
+        if len(candidate.encode()) + DIGEST_HEADER_BYTES > MAX_CONTEXT_BYTES:
+            break
+        previews[message["id"]] = preview
+        delivered.append(message)
+    if not delivered:
+        return [], []
+    stems = [
+        store.reservation_stem(pattern)
+        for pattern in mail.get("reserved") or []
+    ]
+    header = (
+        f"Mail: {len(delivered)} of "
+        f"{max(len(delivered), mail.get('unread', 0))} unread, most relevant "
+        f"first; {mail.get('superseded', 0)} superseded."
+    )
+    ordered = sorted(
+        delivered,
+        key=lambda message: (
+            -relevance(message, name, stems),
+            -message["id"],
+        ),
+    )
+    return [header, *(previews[item["id"]] for item in ordered)], delivered
+
+
 def hazard(
     payload: dict, lane: Path, agent: str, mail: dict, issues: dict
 ) -> tuple[Reason, str] | None:
@@ -1959,12 +2081,7 @@ def checkpoint(
                 budget_notice = bool(set(standing["crossed"]) - set(notified))
                 shown = {message["id"] for message in messages}
                 owed = (
-                    [
-                        f"message {item['id']} from {item['sender']}"
-                        for item in mail.get("outstanding_ack") or []
-                        if item["id"] not in shown
-                        and not item.get("overdue_seconds")
-                    ]
+                    owed_acknowledgements(mail, shown)
                     if event in ("SessionStart", "UserPromptSubmit")
                     else []
                 )
@@ -2054,83 +2171,20 @@ def checkpoint(
                         )
                     if budget_notice:
                         parts.append(clip(budgets.notice(standing), 300))
-                    if news["items"]:
-                        parts.append(
-                            clip(
-                                "Project feed, newest first: "
-                                + "; ".join(
-                                    f"{item['sender']}: {item['subject']}"
-                                    for item in news["items"]
-                                )
-                                + f" ({news['superseded']} superseded)",
-                                400,
-                            )
-                        )
-                    if owed:
-                        parts.append(
-                            clip(
-                                "Acknowledgements owed: " + ", ".join(owed),
-                                300,
-                            )
-                            + "\nAcknowledge each once reviewed."
-                        )
+                    parts.extend(
+                        part
+                        for part in (feed_notice(news), owed_notice(owed))
+                        if part
+                    )
                     footer = (
                         "Previews only. Fetch needed bodies via MCP; "
                         "acknowledge after review. "
                         "Delivery is not acknowledgement."
                     )
-                    previews: dict[int, str] = {}
-                    delivered = []
-                    for message in messages:
-                        ack = (
-                            " [ACK REQUIRED]" if message["ack_required"] else ""
-                        )
-                        preview = (
-                            f"Message {message['id']} "
-                            f"from {message['sender']}{ack}: "
-                            f"{clip(message['subject'], 80)}\n"
-                            f"{clip(message['body_md'], 160)}"
-                        )
-                        tail = str(dict(message).get("body_tail") or "")
-                        if "[attachment " in tail:
-                            from agent_parley import attachments
-
-                            attached = attachments.find(tail)
-                            if attached:
-                                preview += "\n" + attachments.marker(*attached)
-                        candidate = "\n\n".join(
-                            [*parts, *previews.values(), preview, footer]
-                        )
-                        if (
-                            len(candidate.encode()) + DIGEST_HEADER_BYTES
-                            > MAX_CONTEXT_BYTES
-                        ):
-                            break
-                        previews[message["id"]] = preview
-                        delivered.append(message)
-                    if delivered:
-                        stems = [
-                            store.reservation_stem(pattern)
-                            for pattern in mail.get("reserved") or []
-                        ]
-                        parts.append(
-                            f"Mail: {len(delivered)} of "
-                            f"{max(len(delivered), mail.get('unread', 0))} "
-                            "unread, most relevant first; "
-                            f"{mail.get('superseded', 0)} superseded."
-                        )
-                        parts.extend(
-                            previews[message["id"]]
-                            for message in sorted(
-                                delivered,
-                                key=lambda message: (
-                                    -relevance(
-                                        message, identity["name"], stems
-                                    ),
-                                    -message["id"],
-                                ),
-                            )
-                        )
+                    mailed, delivered = digest(
+                        parts, messages, mail, identity["name"], footer
+                    )
+                    parts.extend(mailed)
                     parts.append(footer)
                     text = "\n\n".join(parts)
                     if event == "Stop" and not (issue_notice or work_notice):
