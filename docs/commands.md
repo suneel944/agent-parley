@@ -171,6 +171,12 @@ was never addressed in. Nothing else widens: mail without the flag stays
 readable by its sender and its recipients alone, and a decision obeys the same
 body cap and attachment rules as any other message.
 
+`send_message` takes an optional `topic` of at most 80 characters. A newer
+message on the same topic supersedes the recipient's unread older one, and
+`status` counts unread mail per topic. A project note such as `Merged #12` goes
+to the project feed instead of any mailbox, and a broadcast to every live lane
+reaches only the lanes it concerns; the result lists the others as `withheld`.
+
 Inbox rows include `read_ts` and `ack_ts`. Fetching changes neither. Both
 filters can be combined; `unacknowledged` selects messages that requested an
 acknowledgement and have not received it. The result budget is 8,192 UTF-8

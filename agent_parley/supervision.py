@@ -1053,15 +1053,27 @@ def _worktree_check(participant: dict) -> tuple[bool | None, str]:
 
 
 def _mail_check(
-    home: Path, manifest: dict, name: str, after: float
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float,
 ) -> tuple[bool | None, str]:
-    """Reads whether the lane owes an old acknowledgement.
+    """Reads whether the lane owes a live, old acknowledgement.
+
+    Acknowledgement debt expires: a request past its recorded deadline or
+    superseded by a closed claim or a newer message no longer counts, and a
+    lane whose activity record is stale past ``inactive_after`` has its debt
+    suspended, since the lane is not reading mail at all.
 
     Args:
         home: Private bridge state root.
+        directory: Private project state directory.
         manifest: Project manifest holding this participant.
         name: Participant that owns the lane.
         after: Seconds after which an unanswered acknowledgement counts.
+        inactive_after: Age past which the lane's activity reads as stale.
 
     Returns:
         The check result and, when it failed, the age of the oldest item. An
@@ -1069,6 +1081,10 @@ def _mail_check(
     """
     from agent_parley import checkpoints
 
+    if lane_state(checkpoints.activity(directory, name), inactive_after)[
+        "stale"
+    ]:
+        return True, ""
     try:
         mail = checkpoints.mailbox(
             home, manifest["root"], manifest["participants"][name]["display"]
@@ -1076,7 +1092,11 @@ def _mail_check(
     except (BridgeError, OSError, sqlite3.Error):
         return None, ""
     oldest = max(
-        (int(item["age_seconds"]) for item in mail["outstanding_ack"]),
+        (
+            int(item["age_seconds"])
+            for item in mail["outstanding_ack"]
+            if not item.get("overdue_seconds")
+        ),
         default=0,
     )
     if oldest >= after:
@@ -1085,7 +1105,12 @@ def _mail_check(
 
 
 def fit(
-    home: Path, directory: Path, manifest: dict, name: str, after: float
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float = DEFAULTS["inactive_after"],
 ) -> dict:
     """Reports whether a lane could take more work right now.
 
@@ -1104,6 +1129,8 @@ def fit(
         manifest: Project manifest holding this participant.
         name: Participant whose lane is being considered.
         after: Seconds after which an unanswered item blocks an offer.
+        inactive_after: Age past which the lane's activity reads as stale,
+            which suspends its acknowledgement debt.
 
     Returns:
         Whether the lane is fit, each check's result, the names of the failed
@@ -1115,7 +1142,9 @@ def fit(
         "session": _session_check(directory, name),
         "capacity": _capacity_check(observed_capacity),
         "worktree": _worktree_check(participant),
-        "mail": _mail_check(home, manifest, name, after),
+        "mail": _mail_check(
+            home, directory, manifest, name, after, inactive_after
+        ),
     }
     failed = [check for check in FIT_CHECKS if results[check][0] is False]
     return {
@@ -1641,8 +1670,10 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         for name, participant in manifest["participants"].items()
         if not roster.retired(participant)
     ]
+    idle = config["inactive_after"]
     results = {
-        name: fit(home, directory, manifest, name, after) for name in serving
+        name: fit(home, directory, manifest, name, after, idle)
+        for name in serving
     }
     record_stranded_claims(
         directory, stranded_claims(manifest, ledger, results)
@@ -1663,7 +1694,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         owned = issues.holders(ledger)
         available = lifecycle.actionable(ledger)
         results = {
-            name: fit(home, directory, manifest, name, after)
+            name: fit(home, directory, manifest, name, after, idle)
             for name in serving
         }
         record_stranded_claims(
@@ -3482,7 +3513,14 @@ def _work_backlog(
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
     results = {
-        peer: fit(home, directory, manifest, peer, config["stalled_after"])
+        peer: fit(
+            home,
+            directory,
+            manifest,
+            peer,
+            config["stalled_after"],
+            config["inactive_after"],
+        )
         for peer in manifest["participants"]
     }
     stretches = {

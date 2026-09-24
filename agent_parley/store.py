@@ -4,6 +4,7 @@ import contextlib
 import fnmatch
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -23,7 +24,7 @@ from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 SCHEMA_ABSENT = "absent"
 SCHEMA_BEHIND = "needs migration"
 SCHEMA_CURRENT = "ok"
@@ -44,6 +45,17 @@ MAX_QUEUED_REQUESTS = 32
 MAX_NOTICE_CHARACTERS = 1000
 DEFAULT_ACK_SECONDS = 240
 RESERVATION_GRACE = 1800
+BASE_TOPIC = "base"
+DIRECT_TOPIC = "direct"
+MAX_TOPIC = 80
+MIN_STEM = 3
+BROADCAST_MIN = 3
+MARK_READ_TIMEOUT = 0.5
+BASE_NOTE = re.compile(
+    r"^\W*(?:main|master|trunk|base|integration\S*|origin/\S+)\s+"
+    r"(?:is|now|at|moved|advanced)\b|\bmerged\b",
+    re.IGNORECASE,
+)
 SCHEDULE_FIELDS = (
     "id",
     "kind",
@@ -113,6 +125,7 @@ CREATE TABLE IF NOT EXISTS messages (
  subject TEXT NOT NULL, body_md TEXT NOT NULL, ack_required INTEGER DEFAULT 0,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
  ack_deadline_ts TEXT, claim_id TEXT, decision INTEGER NOT NULL DEFAULT 0,
+ topic TEXT NOT NULL DEFAULT '', feed INTEGER NOT NULL DEFAULT 0,
  UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
@@ -295,6 +308,10 @@ def initialize(home: Path) -> None:
     and its receipts, and mail delivered before the upgrade reads as live
     until the claim it was sent under closes, so no backlog is retired by
     being upgraded.
+
+    Upgrading a store written before topics and the project feed gives every
+    stored message an empty topic and keeps it out of the feed, so routing
+    and supersession apply only to mail sent after the upgrade.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -323,6 +340,7 @@ def initialize(home: Path) -> None:
                 _add_claim_correlation(db)
                 _add_reservation_ttl(db)
                 _add_supersession(db)
+                _add_topic(db)
                 _add_message_search(db)
                 legacy = home / "mail.sqlite3"
                 if version == 0 and legacy.exists():
@@ -436,6 +454,31 @@ def _add_supersession(db: sqlite3.Connection) -> None:
             db.execute(
                 f"ALTER TABLE message_recipients ADD COLUMN {column} TEXT"
             )
+
+
+def _add_topic(db: sqlite3.Connection) -> None:
+    """Adds the message topic and the project feed marker to an older store.
+
+    Both columns are additive with empty defaults, so a message stored before
+    the upgrade carries no topic, supersedes nothing, stays in the mailboxes
+    it was delivered to and never appears in the project feed.
+
+    Args:
+        db: Open upgrade transaction owned by the caller.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+    if "topic" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN topic TEXT NOT NULL DEFAULT ''"
+        )
+    if "feed" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN feed INTEGER NOT NULL DEFAULT 0"
+        )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS feed ON messages(project_id,id) "
+        "WHERE feed=1"
+    )
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -757,6 +800,261 @@ def _answered_thread(db: sqlite3.Connection, actor: dict, value: object) -> str:
     return row[0]
 
 
+def ack_seconds(manifest: dict | None) -> float:
+    """Reads the acknowledgement deadline one project records.
+
+    Args:
+        manifest: Project manifest, or None when none was read.
+
+    Returns:
+        The project's recorded ``ack`` deadline in seconds, or
+        ``DEFAULT_ACK_SECONDS`` when it records none.
+    """
+    recorded = ((manifest or {}).get("deadlines") or {}).get("ack")
+    return float(DEFAULT_ACK_SECONDS if recorded is None else recorded)
+
+
+def message_topic(subject: str, explicit: str = "") -> str:
+    """Names the topic a message supersedes earlier mail under.
+
+    A sender may name a topic. Without one, a subject announcing where a base
+    branch now points or that work merged is a base note, whose newest copy
+    is the only one worth reading; any other subject has no topic and so
+    replaces nothing.
+
+    Args:
+        subject: Message subject.
+        explicit: Topic the sender named, or an empty string.
+
+    Returns:
+        The topic, ``BASE_TOPIC`` for a base note, or an empty string.
+    """
+    if explicit:
+        return explicit
+    return BASE_TOPIC if BASE_NOTE.search(subject) else ""
+
+
+def mentions(text: str, name: str) -> bool:
+    """Reports whether text names a lane as a word of its own.
+
+    Args:
+        text: Subject and body of a message.
+        name: Registered identity of a lane.
+
+    Returns:
+        Whether the name appears with no word character or hyphen on either
+        side, so ``claude`` is not found inside ``claude-2``.
+    """
+    return bool(re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text, re.I))
+
+
+def reservation_stem(pattern: str) -> str:
+    """Returns the literal part of a reservation key a message could quote.
+
+    Args:
+        pattern: Reservation key, a path, a glob or a named resource.
+
+    Returns:
+        The key up to its first glob character without a trailing slash, or
+        an empty string when that part is too short to identify anything.
+    """
+    stem = re.split(r"[*?\[]", pattern, maxsplit=1)[0].rstrip("/")
+    return stem if len(stem) >= MIN_STEM else ""
+
+
+def lane_work(directory: Path | None) -> dict[str, list[str]]:
+    """Maps each registered identity to the issue numbers its lane owns.
+
+    Args:
+        directory: Project state directory, or None when none is known.
+
+    Returns:
+        Registered identity to owned issue numbers. An unreadable manifest or
+        ledger yields an empty mapping, so routing falls back to mentions and
+        reserved paths alone.
+    """
+    if directory is None:
+        return {}
+    try:
+        manifest = roster.read(directory)
+        owned = issues.holders(issues.snapshot(directory))
+    except (BridgeError, OSError, ValueError, KeyError):
+        return {}
+    return {
+        participant["display"]: owned.get(name, [])
+        for name, participant in manifest["participants"].items()
+    }
+
+
+def _concerned(
+    db: sqlite3.Connection,
+    recipient: int,
+    name: str,
+    text: str,
+    claim: str,
+    owned: list[str],
+) -> bool:
+    """Reports whether one message concerns one of the lanes it addressed.
+
+    A message concerns a lane that it names, whose reserved paths it quotes,
+    whose owned issue it cites by number, or whose reservations were taken
+    under the claim the message was sent from.
+
+    Args:
+        db: Open transaction owned by the caller.
+        recipient: Store identifier of the addressed lane.
+        name: Registered identity of the addressed lane.
+        text: Subject and body of the message.
+        claim: Claim the sender held, or an empty string.
+        owned: Issue numbers the addressed lane owns.
+
+    Returns:
+        Whether the message should reach this lane's mailbox.
+    """
+    if mentions(text, name):
+        return True
+    if any(re.search(rf"#{re.escape(number)}\b", text) for number in owned):
+        return True
+    for row in db.execute(
+        "SELECT path_pattern,claim_id FROM file_reservations "
+        "WHERE agent_id=? AND released_ts IS NULL",
+        (recipient,),
+    ):
+        if claim and row["claim_id"] == claim:
+            return True
+        stem = reservation_stem(row["path_pattern"])
+        if stem and stem in text:
+            return True
+    return False
+
+
+def _routed(
+    db: sqlite3.Connection,
+    actor: dict,
+    addressed: dict[int, str],
+    text: str,
+    topic: str,
+    claim: str,
+    directory: Path | None,
+) -> set[int]:
+    """Chooses which addressed lanes a status message reaches.
+
+    A base note goes to the project feed and no mailbox. A broadcast, a note
+    addressed to every other lane that can receive mail and to at least
+    ``BROADCAST_MIN`` of them, reaches only the lanes it concerns, and the
+    feed carries it for everybody else. A note to a chosen subset of lanes
+    is an explicit address and reaches every lane it names.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated sender.
+        addressed: Store identifier to registered identity of each recipient
+            the sender named.
+        text: Subject and body of the message.
+        topic: Topic the message carries.
+        claim: Claim the sender held, or an empty string.
+        directory: Project state directory, or None when none is known.
+
+    Returns:
+        Store identifiers of the lanes whose mailboxes receive the message.
+    """
+    if topic == BASE_TOPIC:
+        return set()
+    peers = {
+        row[0]
+        for row in db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND id<>? "
+            "AND token_digest IS NOT NULL",
+            (actor["project_id"], actor["id"]),
+        )
+    }
+    if len(addressed) < BROADCAST_MIN or not peers <= set(addressed):
+        return set(addressed)
+    owned = lane_work(directory)
+    return {
+        recipient
+        for recipient, name in addressed.items()
+        if _concerned(db, recipient, name, text, claim, owned.get(name, []))
+    }
+
+
+def mark_read(home: Path, root: str, name: str, ids: list[int]) -> int:
+    """Records that a checkpoint delivered messages into a lane's context.
+
+    Only the reading time still unset is stamped, and an acknowledgement is
+    never recorded on the lane's behalf, so a message that asks for one is
+    still owed. A store that cannot be written leaves the mail unread, which
+    only means it is offered again.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity the mail was delivered to.
+        ids: Messages the delivered context carried.
+
+    Returns:
+        The number of deliveries newly marked read.
+    """
+    if not ids or not (home / DATABASE).exists():
+        return 0
+    marks = ",".join("?" * len(ids))
+    try:
+        with connect(home, write=True, timeout=MARK_READ_TIMEOUT) as db:
+            cursor = db.execute(
+                "UPDATE message_recipients SET read_ts=CURRENT_TIMESTAMP "
+                f"WHERE read_ts IS NULL AND message_id IN ({marks}) "
+                "AND agent_id=(SELECT a.id FROM agents a JOIN projects p "
+                "ON p.id=a.project_id WHERE p.human_key=? AND a.name=?)",
+                (*ids, root, name),
+            )
+            return cursor.rowcount
+    except (sqlite3.Error, OSError):
+        return 0
+
+
+def feed(home: Path, root: str, after: int = 0, limit: int = 3) -> dict:
+    """Reads the newest live project feed entries after a cursor.
+
+    An entry is live while no newer entry from the same sender carries the
+    same non-empty topic; a replaced entry is only counted.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        after: Last feed entry this reader already saw.
+        limit: Most entries to return.
+
+    Returns:
+        ``items`` newest first, each with its identifier, sender, topic,
+        subject and creation time, and ``superseded``, the number of entries
+        after the cursor that a newer one replaced.
+    """
+    if not (home / DATABASE).exists():
+        return {"items": [], "superseded": 0}
+    replaced = (
+        "EXISTS (SELECT 1 FROM messages n WHERE n.project_id=m.project_id "
+        "AND n.feed=1 AND n.sender_id=m.sender_id AND n.topic=m.topic "
+        "AND m.topic<>'' AND n.id>m.id)"
+    )
+    with connect(home) as db:
+        rows = db.execute(
+            "SELECT m.id,a.name AS sender,m.topic,substr(m.subject,1,80) "
+            "AS subject,m.created_ts FROM messages m "
+            "JOIN agents a ON a.id=m.sender_id "
+            "JOIN projects p ON p.id=m.project_id WHERE p.human_key=? "
+            f"AND m.feed=1 AND m.id>? AND NOT {replaced} "
+            "ORDER BY m.id DESC LIMIT ?",
+            (root, after, limit),
+        ).fetchall()
+        superseded = db.execute(
+            "SELECT count(*) FROM messages m JOIN projects p "
+            "ON p.id=m.project_id WHERE p.human_key=? AND m.feed=1 "
+            f"AND m.id>? AND {replaced}",
+            (root, after),
+        ).fetchone()[0]
+    return {"items": [dict(row) for row in rows], "superseded": superseded}
+
+
 def _ack_window(directory: Path | None) -> float:
     """Resolves the deadline an acknowledgement request carries by default.
 
@@ -776,9 +1074,7 @@ def _ack_window(directory: Path | None) -> float:
     """
     if directory is not None:
         with contextlib.suppress(BridgeError, OSError, ValueError):
-            recorded = roster.read(directory)["deadlines"].get("ack")
-            if recorded is not None:
-                return float(recorded)
+            return ack_seconds(roster.read(directory))
     return float(DEFAULT_ACK_SECONDS)
 
 
@@ -788,8 +1084,16 @@ def _send(
     args: dict,
     claim: str = "",
     directory: Path | None = None,
+    route: bool = False,
 ) -> dict:
     """Atomically delivers an idempotent message to authorized recipients.
+
+    A lane send (``route``) that neither requires acknowledgement nor
+    records a decision is routed by relevance: a base-advance or merge note
+    goes to the project feed alone, and a broadcast to every other lane
+    reaches only those whose claim, reserved paths or name it concerns. The
+    rest read it from the feed. A send with a topic supersedes the same
+    sender's older unread message on that topic for each recipient.
 
     A send naming ``reply_to`` joins the thread of the message it answers. A
     send naming neither ``reply_to`` nor ``thread_id`` opens its own thread,
@@ -831,6 +1135,9 @@ def _send(
             raise BridgeError("Answer with reply_to or thread_id, not both.")
         thread = _answered_thread(db, actor, args["reply_to"])
     thread = thread or _opened_thread(actor, key)
+    topic = message_topic(
+        subject, _text(args.get("topic", ""), "topic", MAX_TOPIC, empty=True)
+    )
     recipients = args.get("to", [] if decision else None)
     lowest = 0 if decision else 1
     if (
@@ -842,6 +1149,7 @@ def _send(
             "participants."
         )
     ids = []
+    addressed: dict[int, str] = {}
     for recipient in recipients:
         name = _text(recipient, "recipient", 80)
         row = db.execute(
@@ -856,6 +1164,7 @@ def _send(
                 "operator or retired participant has no active credential."
             )
         ids.append(row[0])
+        addressed[row[0]] = name
     existing = db.execute(
         "SELECT * FROM messages WHERE sender_id=? AND dedup_key=?",
         (actor["id"], key),
@@ -879,17 +1188,27 @@ def _send(
             existing["thread_id"],
             existing["ack_required"],
             bool(existing["decision"]),
-        ) != (subject, stored, thread, ack, decision) or previous != set(ids):
+        ) != (subject, stored, thread, ack, decision) or (
+            not previous <= set(ids)
+            if existing["feed"]
+            else previous != set(ids)
+        ):
             raise BridgeError("Idempotency key already names another message.")
         return {
             "id": existing["id"],
             "thread_id": existing["thread_id"],
             "duplicate": True,
         }
+    delivered = set(ids)
+    if route and not ack and not decision:
+        delivered = _routed(
+            db, actor, addressed, f"{subject}\n{body}", topic, claim, directory
+        )
+    fed = route and delivered != set(ids)
     cursor = db.execute(
         "INSERT INTO messages(project_id,sender_id,subject,body_md,"
-        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id,decision) "
-        "VALUES (?,?,?,?,?,?,?,datetime('now',?),?,?)",
+        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id,decision,"
+        "topic,feed) VALUES (?,?,?,?,?,?,?,datetime('now',?),?,?,?,?)",
         (
             actor["project_id"],
             actor["id"],
@@ -901,14 +1220,42 @@ def _send(
             None if within is None else f"+{int(within)} seconds",
             claim or None,
             decision,
+            topic,
+            fed,
         ),
     )
     message_id = cursor.lastrowid
     db.executemany(
         "INSERT INTO message_recipients(message_id,agent_id) VALUES (?,?)",
-        [(message_id, recipient) for recipient in set(ids)],
+        [(message_id, recipient) for recipient in delivered],
     )
-    result = {"id": message_id, "thread_id": thread}
+    if topic and delivered:
+        db.execute(
+            "UPDATE message_recipients SET superseded_ts=CURRENT_TIMESTAMP,"
+            "superseded_reason=? WHERE superseded_ts IS NULL AND agent_id IN "
+            "(SELECT agent_id FROM message_recipients WHERE message_id=?) "
+            "AND message_id IN (SELECT id FROM messages WHERE sender_id=? "
+            "AND topic=? AND id<?) AND (read_ts IS NULL OR (ack_ts IS NULL "
+            "AND EXISTS (SELECT 1 FROM messages m WHERE "
+            "m.id=message_recipients.message_id AND m.ack_required=1)))",
+            (
+                f"superseded by message {message_id}",
+                message_id,
+                actor["id"],
+                topic,
+                message_id,
+            ),
+        )
+    result: dict = {"id": message_id, "thread_id": thread}
+    if topic:
+        result["topic"] = topic
+    if fed:
+        result["feed"] = True
+        result["withheld"] = sorted(
+            name
+            for recipient, name in addressed.items()
+            if recipient not in delivered
+        )
     if decision:
         result["decision"] = True
     if oversized and directory is not None:
@@ -2962,7 +3309,7 @@ def _effect(
         BridgeError: If the tool is unknown or its preconditions fail.
     """
     if tool == "send_message":
-        return _send(db, actor, args, claim, directory)
+        return _send(db, actor, args, claim, directory, route=True)
     if tool == "review_report":
         if directory is None:
             raise BridgeError(NO_PROJECT)
@@ -3385,7 +3732,7 @@ def _unanswered(home: Path, root: str, deadline: str) -> list[dict]:
             "JOIN agents s ON s.id=m.sender_id "
             "JOIN projects p ON p.id=m.project_id "
             "WHERE p.human_key=? AND m.ack_required=1 AND r.ack_ts IS NULL "
-            f"AND {deadline} ORDER BY m.id,a.name",
+            f"AND r.superseded_ts IS NULL AND {deadline} ORDER BY m.id,a.name",
             (root,),
         ).fetchall()
     breaches: dict[int, dict] = {}

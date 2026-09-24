@@ -941,6 +941,11 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + supervision.base_advance_marker(advanced))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    if topics := mail.get("unread_topics"):
+        print(
+            "    Unread by topic: "
+            + ", ".join(f"{topic} {count}" for topic, count in topics.items())
+        )
     if mail.get("queued_requests"):
         print(
             "    Reservation requests queued on its keys: "
@@ -7000,6 +7005,7 @@ reported.
             "pending_operator_items": scheduled,
             "unread": mail["unread"],
             "superseded": mail.get("superseded", 0),
+            "unread_topics": dict(mail.get("unread_topics") or {}),
             "pending_ack": mail["pending_ack"],
             "reservations": mail["reservations"],
             "stale_reservations": mail.get("stale_reservations", 0),
