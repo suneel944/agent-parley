@@ -190,7 +190,12 @@ class Reason(StrEnum):
 
 
 UNOBSERVED = frozenset(
-    {Reason.IGNORED_EVENT, Reason.STALE_GENERATION, Reason.SUPERSEDED}
+    {
+        Reason.IGNORED_EVENT,
+        Reason.SESSION_MISMATCH,
+        Reason.STALE_GENERATION,
+        Reason.SUPERSEDED,
+    }
 )
 
 
@@ -291,9 +296,12 @@ def record(
     reason that decided it, rather than once more as a separate fallback.
 
     This is also the hook's one call into the lane state: an event that
-    was observed, including one from a new session, is queued through
-    `lanes.submit` as evidence of the state it shows. A session mismatch
-    therefore reaches the record as a session change with both identities.
+    was observed, including one from a session the lane adopted, is queued
+    through `lanes.submit` as evidence of the state it shows, so an adopted
+    session reaches the record as a session change with both identities. A
+    `session_mismatch` event comes from a session the lane did not adopt,
+    such as a second process sending hooks under the lane's identity, and
+    is no evidence of the lane's state.
 
     Args:
         directory: Common project state directory.

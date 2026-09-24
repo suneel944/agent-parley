@@ -127,12 +127,27 @@ def test_an_ignored_event_is_no_evidence(tmp_path):
 def test_a_session_change_is_recorded_with_both_ids(bridge, repo, paired):
     store.initialize(bridge.home)
     hooked(bridge, paired, "PreToolUse", "one")
+    hooked(bridge, paired, "SessionStart", "two")
     hooked(bridge, paired, "PreToolUse", "two")
     settle(bridge, paired)
     record, transitions = recorded(bridge, paired)
     assert record["state"] == lanes.WORKING
     assert record["session"] == "two"
-    assert transitions[-1]["detail"] == "session one -> two"
+    assert "session one -> two" in [item["detail"] for item in transitions]
+
+
+def test_a_session_the_lane_did_not_adopt_never_moves_its_state(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    hooked(bridge, paired, "PreToolUse", "one")
+    hooked(bridge, paired, "Stop", "one")
+    hooked(bridge, paired, "PreToolUse", "foreign")
+    settle(bridge, paired)
+    record, transitions = recorded(bridge, paired)
+    assert record["state"] == lanes.IDLE
+    assert record["session"] == "one"
+    assert all("foreign" not in item["detail"] for item in transitions)
 
 
 def test_evidence_waits_in_order_while_the_store_is_busy(
