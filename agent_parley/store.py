@@ -2746,6 +2746,39 @@ def supersede_claim(home: Path, root: str, claim: str, reason: str) -> int:
         return cursor.rowcount
 
 
+def supersede_recipient(home: Path, root: str, name: str, reason: str) -> int:
+    """Retires the outstanding deliveries addressed to a lane that left.
+
+    A retired lane will read nothing and acknowledge nothing, so each of its
+    deliveries still unread, or still owing an acknowledgement, is marked
+    superseded with the reason. Only that lane's own receipt is marked: a
+    peer the same message was also addressed to keeps its delivery exactly
+    as it was, and nothing is read, acknowledged or deleted.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity of the lane that left.
+        reason: Why the deliveries stopped being actionable.
+
+    Returns:
+        The number of deliveries marked superseded by this call.
+    """
+    if not (home / DATABASE).exists():
+        return 0
+    with connect(home, write=True) as db:
+        cursor = db.execute(
+            "UPDATE message_recipients SET superseded_ts=CURRENT_TIMESTAMP,"
+            "superseded_reason=? WHERE superseded_ts IS NULL AND agent_id IN ("
+            "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE p.human_key=? AND a.name=?) AND (read_ts IS NULL OR ("
+            "ack_ts IS NULL AND EXISTS (SELECT 1 FROM messages m WHERE "
+            "m.id=message_recipients.message_id AND m.ack_required=1)))",
+            (reason[:MAX_SUPERSEDE_REASON], root, name),
+        )
+        return cursor.rowcount
+
+
 def supersede_project_claim(directory: Path, claim: str, reason: str) -> int:
     """Retires the mail of a claim that a project transition just ended.
 

@@ -1,12 +1,31 @@
 """Checks that reclaiming a lane removes landed work and nothing else."""
 
+import json
+import os
+import shutil
+import socket
+import tempfile
 import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import forge, issues, reclaim, roster, store, supervision
+from agent_parley import (
+    cli,
+    dashboard,
+    forge,
+    issues,
+    problems,
+    reclaim,
+    recovery,
+    retirement,
+    roster,
+    store,
+    supervision,
+    terminal,
+)
 from agent_parley.cli import git
+from agent_parley.state import lock
 
 
 def commit(worktree, message):
@@ -302,3 +321,392 @@ def test_the_supervision_tick_sweeps_once_an_interval(
     supervision.poll(bridge.home, landed["directory"])
 
     assert sweeps == []
+
+
+def aged(path, seconds=3600):
+    """Moves a directory's change time into the past."""
+    past = time.time() - seconds
+    os.utime(path, (past, past))
+
+
+@pytest.fixture
+def idle(bridge, repo, paired, monkeypatch):
+    """Leaves the codex lane stopped, empty, clean and long untouched."""
+    directory = bridge.project(repo, create=False)[1]
+    manifest = roster.read(directory)
+    lane = Path(paired["lanes"]["codex"])
+    aged(lane)
+    completion(monkeypatch, None)
+    return {
+        "directory": directory,
+        "lane": lane,
+        "branch": manifest["participants"]["codex"]["branch"],
+    }
+
+
+def test_a_stopped_empty_clean_lane_is_retired(bridge, repo, idle):
+    swept = bridge.reclaim(repo, apply=True)
+
+    retired = row_of(swept, "codex")
+    assert retired["reason"] == reclaim.STOPPED
+    assert retired["removed"] is True
+    assert not idle["lane"].exists()
+    assert idle["branch"] not in branches(repo)
+    assert "codex" not in roster.read(idle["directory"])["participants"]
+
+
+def test_a_recently_created_lane_is_not_retired(bridge, repo, idle):
+    os.utime(idle["lane"])
+
+    swept = bridge.reclaim(repo, apply=True)
+
+    assert row_of(swept, "codex")["reason"] == reclaim.UNUSED
+    assert idle["lane"].exists()
+
+
+def test_a_live_session_keeps_the_stopped_lane(bridge, repo, idle):
+    with lock(idle["directory"] / "codex.session.lock"):
+        swept = bridge.reclaim(repo, apply=True)
+
+    assert row_of(swept, "codex")["reason"] == reclaim.SESSION
+    assert idle["lane"].exists()
+
+
+def test_a_claim_keeps_the_stopped_lane(bridge, repo, idle):
+    bridge.issue(idle["lane"], "claim", "1")
+    aged(idle["lane"])
+
+    swept = bridge.reclaim(repo, apply=True)
+
+    assert row_of(swept, "codex")["reason"] == reclaim.CLAIMED
+    assert idle["lane"].exists()
+
+
+def test_a_reservation_keeps_the_stopped_lane(bridge, repo, idle, monkeypatch):
+    monkeypatch.setattr(
+        store, "active_reservations", lambda *args: {"codex": ["src/*"]}
+    )
+
+    swept = bridge.reclaim(repo, apply=True)
+
+    assert row_of(swept, "codex")["reason"] == reclaim.LEASED
+    assert idle["lane"].exists()
+
+
+def test_one_untracked_file_keeps_the_stopped_lane(bridge, repo, idle):
+    (idle["lane"] / "notes.txt").write_text("keep me\n")
+    aged(idle["lane"])
+
+    swept = bridge.reclaim(repo, apply=True)
+
+    kept = row_of(swept, "codex")
+    assert kept["reason"] == reclaim.UNCOMMITTED
+    assert kept["paths"] == ["notes.txt"]
+    assert (idle["lane"] / "notes.txt").exists()
+
+
+def test_a_retired_lane_whose_worktree_is_gone_leaves_status(
+    bridge, repo, idle
+):
+    retirement.mark(idle["directory"], "codex", time.time())
+    git(repo, "worktree", "remove", str(idle["lane"]))
+
+    swept = bridge.reclaim(repo, apply=True)
+    listed = [
+        record["participant"]
+        for project in bridge.status_snapshot()["projects"]
+        for record in project["participants"]
+    ]
+
+    assert "codex" not in listed
+    assert "claude" in listed
+    assert row_of(swept, "codex")["reason"] == reclaim.VANISHED
+    assert "codex" not in roster.read(idle["directory"])["participants"]
+
+
+def test_mail_to_a_retired_lane_is_superseded(bridge, repo, paired, idle):
+    store.initialize(bridge.home)
+    tokens = {
+        name: store.register(bridge.home, paired["root"], name)
+        for name in ("claude", "codex")
+    }
+    actor = store.authenticate(
+        bridge.home, tokens["claude"]["registration_token"]
+    )
+    store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Share",
+            "body_md": "Take this",
+            "idempotency_key": "share-1",
+            "ack_required": True,
+        },
+    )
+
+    bridge.reclaim(repo, apply=True)
+
+    with store.connect(bridge.home) as db:
+        rows = db.execute(
+            "SELECT superseded_reason FROM message_recipients"
+        ).fetchall()
+    assert [row["superseded_reason"] for row in rows] == ["codex retired"]
+    assert not supervision.bounced_shares(
+        bridge.home,
+        idle["directory"],
+        roster.read(idle["directory"]),
+        {"claude": {"state": supervision.ACTIVE}},
+    )
+
+
+def made(repo, directory, name):
+    """Adds a worktree the way a lane does for a sub-task."""
+    path = directory / name
+    git(repo, "worktree", "add", "-b", name, str(path))
+    return path
+
+
+def worktree_of(rows, path):
+    """Returns the assessment recorded for one worktree."""
+    return next(row for row in rows if row["worktree"] == str(path.resolve()))
+
+
+def test_a_merged_worktree_a_lane_made_is_reclaimed(bridge, repo, idle):
+    path = made(repo, idle["directory"], "pr-1")
+    aged(path)
+
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    row = worktree_of(swept, path)
+    assert row["reason"] == reclaim.CONTAINED
+    assert row["removed"] is True
+    assert not path.exists()
+    assert "pr-1" in branches(repo)
+
+
+def test_a_dirty_worktree_a_lane_made_is_reported_with_its_size(
+    bridge, repo, idle
+):
+    path = made(repo, idle["directory"], "pr-2")
+    (path / "draft.txt").write_text("x" * 2048)
+    aged(path)
+
+    reported = bridge.reclaim_worktrees(repo, sizes=True)
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    row = worktree_of(reported, path)
+    assert row["reason"] == reclaim.UNCOMMITTED
+    assert row["paths"] == ["draft.txt"]
+    assert row["bytes"] >= 2048
+    assert worktree_of(swept, path)["reclaim"] is False
+    assert (path / "draft.txt").exists()
+
+
+def test_a_worktree_with_unmerged_commits_is_kept(bridge, repo, idle):
+    path = made(repo, idle["directory"], "pr-3")
+    (path / "work.txt").write_text("work\n")
+    commit(path, "Sub-task work")
+    aged(path)
+
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    kept = worktree_of(swept, path)
+    assert kept["reason"] == reclaim.UNPUSHED
+    assert len(kept["paths"]) == 1
+    assert path.exists()
+
+
+def test_a_worktree_no_lane_made_is_never_touched(bridge, repo, idle, tmp_path):
+    path = made(repo, tmp_path, "operator-wt")
+    aged(path)
+
+    swept = bridge.reclaim_worktrees(repo, apply=True, force=True)
+
+    assert worktree_of(swept, path)["reason"] == reclaim.FOREIGN
+    assert path.exists()
+
+
+def test_a_merged_lane_worktree_outside_the_state_directory_is_reclaimed(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-9")
+    aged(path)
+
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    row = worktree_of(swept, path)
+    assert row["participant"] == "codex"
+    assert row["reason"] == reclaim.CONTAINED
+    assert row["removed"] is True
+    assert not path.exists()
+
+
+def test_a_worktree_of_a_retired_lane_is_reclaimed_at_once(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-10")
+    retirement.mark(idle["directory"], "codex", time.time())
+
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    assert worktree_of(swept, path)["reason"] == reclaim.ABANDONED
+    assert not path.exists()
+
+
+def test_force_removes_a_dirty_lane_worktree_after_a_checkpoint(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-11")
+    (path / "draft.txt").write_text("unsaved\n")
+    aged(path)
+
+    unforced = bridge.reclaim_worktrees(repo, apply=True)
+    forced = bridge.reclaim_worktrees(repo, apply=True, force=True)
+
+    assert worktree_of(unforced, path)["reason"] == reclaim.UNCOMMITTED
+    row = worktree_of(forced, path)
+    assert row["removed"] is True
+    assert not path.exists()
+    folder = idle["directory"] / "recovery"
+    record = json.loads((folder / f"{row['checkpoint']}.json").read_text())
+    bundle = folder / record["artifact"]["reference"]
+    assert bundle.stat().st_size == record["artifact"]["bytes"]
+    reference = f"refs/agent-parley-recovery/{row['checkpoint']}"
+    git(repo, "fetch", str(bundle), reference)
+    assert "draft.txt" in git(
+        repo, "ls-tree", "-r", "--name-only", record["worktree_commit"]
+    )
+
+
+def test_reclaim_dry_run_lists_removals_with_sizes(
+    bridge, repo, idle, tmp_path, monkeypatch, capsys
+):
+    merged = made(repo, tmp_path, "codex-pr-12")
+    dirty = made(repo, tmp_path, "codex-pr-13")
+    (dirty / "draft.txt").write_text("x" * 4096)
+    aged(merged)
+    aged(dirty)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "reclaim",
+            "--dry-run",
+            "--repo",
+            str(repo),
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+
+    document = json.loads(capsys.readouterr().out)
+    rows = document["worktrees"]
+    assert worktree_of(rows, merged)["reclaim"] is True
+    assert worktree_of(rows, dirty)["reason"] == reclaim.UNCOMMITTED
+    assert worktree_of(rows, dirty)["bytes"] >= 4096
+    assert merged.exists() and dirty.exists()
+
+
+def test_status_reports_the_state_size_and_what_reclaim_would_remove(
+    bridge, repo, idle, tmp_path
+):
+    store.initialize(bridge.home)
+    dirty = made(repo, tmp_path, "claude-pr-14")
+    (dirty / "draft.txt").write_text("unsaved\n")
+
+    supervision.poll(bridge.home, idle["directory"])
+
+    summary = bridge.status_snapshot()["projects"][0]["reclaim"]
+    assert summary["state_bytes"] > 0
+    assert summary["reclaimable"] == 0
+    assert summary["forceable"] == 1
+    assert reclaim.summary_line(summary).endswith("1 more with --force")
+
+
+def test_the_sweep_publishes_the_worktrees_it_reclaimed(bridge, repo, idle):
+    store.initialize(bridge.home)
+    path = made(repo, idle["directory"], "pr-4")
+    aged(path)
+
+    supervision.poll(bridge.home, idle["directory"])
+
+    published = json.loads(
+        (idle["directory"] / supervision.RECLAIM_PUBLICATION).read_text()
+    )
+    assert not path.exists()
+    assert [row["worktree"] for row in published["worktrees"]] == [
+        str(path.resolve())
+    ]
+    assert row_of(published["lanes"], "codex")["reason"] == reclaim.STOPPED
+
+
+def test_a_missing_project_root_is_retired_within_one_interval(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    bridge.issue(Path(paired["lanes"]["claude"]), "claim", "1")
+    (saved,) = recovery.capture(directory, roster.read(directory), "claude")
+    shutil.rmtree(repo)
+
+    supervision.poll(bridge.home, directory)
+    first = supervision.root_retired(directory)
+    marker = directory / supervision.ROOT_PUBLICATION
+    recorded = json.loads(marker.read_text())
+    recorded["since"] -= supervision.DEFAULTS["interval"]
+    marker.write_text(json.dumps(recorded))
+    supervision.poll(bridge.home, directory)
+
+    assert first is False
+    assert supervision.root_retired(directory)
+    participants = roster.read(directory)["participants"]
+    assert all(roster.retired(entry) for entry in participants.values())
+    assert not issues.snapshot(directory)["issues"]["1"].get("owner")
+    published = json.loads(marker.read_text())
+    assert published["state_directory"] == str(directory)
+    released = next(
+        lane for lane in published["lanes"] if lane["participant"] == "claude"
+    )
+    assert released["checkpoints"] == {"1": saved["id"]}
+    assert bridge.status_snapshot()["projects"] == []
+    assert dashboard.collect(bridge.home, False, {})["projects"] == []
+
+
+def test_service_start_removes_wake_sockets_nobody_listens_on():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        home = Path(temporary)
+        stale = home / "wake-stale.sock"
+        live = home / "wake-live.sock"
+        with socket.socket(socket.AF_UNIX) as dead:
+            dead.bind(str(stale))
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(live))
+            listener.listen(1)
+
+            removed = terminal.sweep_sockets(home)
+
+            assert live.exists()
+        assert removed == ["wake-stale.sock"]
+        assert not stale.exists()
+
+
+def test_a_lane_orphaned_past_the_ceiling_is_ready_to_retire():
+    record = {
+        "claims": [
+            {"issue": 7, "orphaned": True, "orphan_recorded_seconds": 7200}
+        ]
+    }
+
+    rows = problems._retire_rows(record, "claude", "--repo /r", "/r", 3600)
+    young = problems._retire_rows(record, "claude", "--repo /r", "/r", 9000)
+
+    assert [row["condition"] for row in rows] == [problems.READY]
+    assert rows[0]["command"] == (
+        "agent-parley participant retire claude --repo /r"
+    )
+    assert young == []

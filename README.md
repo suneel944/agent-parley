@@ -160,13 +160,27 @@ demand:
 ```sh
 agent-parley gc           # what would be reclaimed, and what is kept and why
 agent-parley gc --apply   # reclaim the lanes whose work has landed
+agent-parley gc --apply --force  # also dirty lane worktrees, after a checkpoint
 ```
+
+`agent-parley reclaim` is the same command, and `--dry-run` spells out the
+default report.
 
 A lane is reclaimed only when it is idle, holds no claim, has nothing
 uncommitted, carries no commit the base checkout or its own upstream lacks,
 and the forge shows its pull request merged or its branch already gone. Every
 other lane is kept and reported with the condition that held it, including a
 pull request that was closed without merging.
+
+The same sweep retires a lane that stopped, never moved its branch, holds no
+claim, lease or offer and stayed untouched past `inactive_after`. It also
+removes clean worktrees a lane made for itself, wherever they are, once their
+head is on the base, their lane retired, or they went untouched past
+`inactive_after` with every commit on their upstream. A worktree no lane made
+is never touched. Uncommitted files and unpushed commits are only reported,
+with the worktree's size, unless `--force` removes them after writing a
+recovery checkpoint. `status` shows each project's state directory size and
+how many worktrees a reclaim would remove.
 
 A repository can also authorize the second of those for the lane itself, with
 `pull_request.self_service` in its private project settings. It is off by

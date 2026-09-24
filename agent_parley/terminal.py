@@ -162,6 +162,37 @@ def selected_prompt(
     ]
 
 
+def sweep_sockets(home: Path) -> list[str]:
+    """Removes the wake sockets no launcher is listening on any more.
+
+    A launcher unlinks its socket when it exits, but one that crashed or was
+    killed leaves the file behind, and nothing else ever removed it. A
+    socket is stale only when connecting to it is refused, which is what
+    the kernel answers for a path no process listens on. A listening
+    launcher accepts the probe, reads an empty request and answers it as
+    unavailable, so probing wakes nobody; any other failure leaves the file
+    in place.
+
+    Args:
+        home: Private bridge state root holding the wake sockets.
+
+    Returns:
+        The names of the socket files removed.
+    """
+    removed = []
+    for path in sorted(home.glob("wake-*.sock")):
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.settimeout(1)
+            try:
+                probe.connect(str(path))
+            except ConnectionRefusedError:
+                path.unlink(missing_ok=True)
+                removed.append(path.name)
+            except OSError:
+                continue
+    return removed
+
+
 def socket_path(directory: Path, name: str) -> Path:
     """Keeps control socket names short while retaining private state scope."""
     if directory.parent.name == "projects":

@@ -368,6 +368,7 @@ condition, that count, its age and what clears it:
 | `unresolved completion` | One or more claims read merged or closed on the lane branch and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
 | `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `bounced share` | A share the sender is still waiting on reached a recipient that cannot act on it. The row sits on the sender's lane. | Whatever the first blocked recipient's state allows, from the remedy table below. |
+| `ready to retire` | Every claim the lane holds has been orphaned for longer than `orphan_retire_after` and no peer took it. | `agent-parley participant retire NAME` |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
 | `dirty worktree` | The lane holds uncommitted work and is not active, or it retired and its uncommitted work kept the worktree. | Commit or stash the named files in the named worktree; `agent-parley participant add NAME` returns a retired lane to service with that work still in place. |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
@@ -1480,7 +1481,8 @@ attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `start_deadline` (30 seconds),
-`completion_reminders` (3 reminders, 1 to 100), `prompts`, `wake`,
+`completion_reminders` (3 reminders, 1 to 100), `orphan_retire_after`
+(3600 seconds), `prompts`, `wake`,
 `reclaim` and `titles` (all true). Numeric second values range from 1 to 86400 seconds.
 The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
@@ -1745,6 +1747,52 @@ pull request closed without merging, an open one, an unreachable forge, a
 worktree Git cannot inspect and a path outside the project's own lanes all
 decide against reclaiming. The sweep never touches a remote branch, and it
 never fails because the remote branch is already gone.
+
+A lane that never did any work is retired too. When its runtime state reads
+`stopped`, its branch is still at the project base, it has nothing
+uncommitted, the ledger records no claim or pending offer for it, it holds no
+reservation, and neither its last activity nor its worktree changed inside
+`inactive_after`, the sweep retires it with reason `stopped`. A lane already
+retired whose worktree is gone is dropped with reason `vanished`, which
+takes it out of `status` and `top`. Retiring a lane supersedes the mail still
+addressed to it, so no share bounces off a lane that no longer exists.
+
+Worktrees a lane made for itself, such as one per pull request, are swept in
+the same pass and published under `worktrees` in `reclaim.json`. Every
+worktree `git worktree list` reports is attributed to a lane by path, when it
+sits inside a lane's worktree, or by branch, when its branch is the lane's
+name or branch followed by `-` or `/`, such as `claude-pr-12`. One inside the
+project state directory belongs to the project. A worktree nothing accounts
+for is reported with reason `no lane made it` and never touched, even with
+`--force`.
+
+An attributed worktree is removed with `git worktree remove` when it is not
+locked, has no session running in its lane, has nothing uncommitted, and
+every commit it holds beyond the base checkout is on its upstream; and then
+only when its head is already on the base, its lane retired, or it has not
+changed inside `inactive_after`. A registration whose directory is gone is
+dropped. Its branch is kept. Uncommitted changes, unpushed commits and a
+recent change keep it and are reported by name. `agent-parley gc --apply
+--force` removes those too, but only after writing a recovery checkpoint
+bundle of the whole worktree, index and untracked files included, to the
+project's `recovery` folder; a checkpoint that fails removes nothing.
+`agent-parley gc`, `gc --dry-run` and its alias `agent-parley reclaim`
+without `--apply` add each worktree's size on disk.
+
+Each sweep also records the project state directory's size and how many
+worktrees a reclaim, and a forced reclaim, would still remove.
+`agent-parley status` prints them under the project heading and carries them
+as `reclaim` in its JSON document, reading the sweep's record instead of
+walking the disk.
+
+When the project root itself disappears, the first poll records
+`root-missing.json` in the project state directory. One interval later every
+lane still registered is captured for recovery, retired and has its
+reservations revoked. The marker names, per lane, the claims released and the
+checkpoint each one left, and the state directory for the operator to remove.
+The project then leaves `status`, `top` and `metrics`; a root that
+returns clears the marker on the next poll. When the service starts, it
+removes every wake socket in its home that no launcher is listening on.
 
 ## Other agent CLIs
 
