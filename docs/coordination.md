@@ -120,8 +120,11 @@ A lane whose recorded session process is gone and that has been silent past the
 project's stall threshold has its claims marked `orphaned` in `issue list`,
 `status` and `top`, which marks the issue `#42*`. The marker states what was
 observed: an idle lane with a live process is never marked, however long it has
-been quiet. Every other lane receives one notice naming the orphaned issues and
-the reservations that lane still holds.
+been quiet. A session that ended cleanly with `SessionEnd` and left no process
+to check counts as gone, so a lane that exited on purpose is marked like one
+that crashed; a lane that never recorded a session is left alone. Every other
+lane receives one notice naming the orphaned issues and the reservations that
+lane still holds.
 
 Ownership does not move on the marker. A peer takes the work explicitly, and
 the take records the previous owner and the reason, then releases the

@@ -83,6 +83,19 @@ def killed(directory, name, age):
     return child.pid
 
 
+def ended(directory, name, age):
+    """Records a session that ended cleanly and left no process behind."""
+    write_json(
+        directory / f"{name}-activity.json",
+        {
+            "activity": "stopped",
+            "event": "SessionEnd",
+            "updated": time.time() - age,
+            "session_id": f"{name}-session",
+        },
+    )
+
+
 def reserve(bridge, actor, path):
     """Reserves one path for a lane through the served call path."""
     return store.call(
@@ -863,6 +876,75 @@ def test_pre_stop_transition_requires_fresh_authority_after_session_restart(
             if child is not None and child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def test_a_cleanly_ended_lane_is_orphaned_and_taken_by_a_peer(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    ended(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+
+    supervision.poll(bridge.home, directory)
+
+    record = issues.snapshot(directory)["issues"]["42"]
+    assert record["owner"] == "claude"
+    assert record["orphan"]["owner"] == "claude"
+    subject, body = inbox(bridge, paired, "codex")[0]
+    assert subject == "Orphaned claims held by claude"
+    assert "#42" in body
+
+    taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
+
+    assert taken["owner"] == "codex"
+    assert taken["taken"]["from"] == "claude"
+
+
+def test_a_lane_with_no_recorded_session_end_is_never_orphaned(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    write_json(
+        directory / "claude-activity.json",
+        {
+            "activity": "working",
+            "updated": time.time() - STALLED - 100,
+            "session_id": "claude-session",
+        },
+    )
+    running(directory, "codex")
+
+    supervision.poll(bridge.home, directory)
+
+    assert "orphan" not in issues.snapshot(directory)["issues"]["42"]
+    assert not inbox(bridge, paired, "codex")
+
+
+def test_a_cleanly_ended_lane_that_starts_again_loses_the_marker(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    ended(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    assert issues.snapshot(directory)["issues"]["42"]["orphan"]
+
+    running(directory, "claude")
+    supervision.poll(bridge.home, directory)
+
+    returned = issues.snapshot(directory)["issues"]["42"]
+    assert "orphan" not in returned
+    assert returned["owner"] == "claude"
 
 
 def test_a_live_but_idle_lane_is_never_orphaned(bridge, repo, paired):

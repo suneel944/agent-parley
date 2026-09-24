@@ -338,7 +338,9 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         `None` rather than an age measured from the Unix epoch, and reads as
         `ACTIVE` while its process is alive, because a lane that has never
         checked in has not been quiet for any span a threshold can be
-        compared against.
+        compared against. `ended` is true when the last recorded event is
+        a clean `SessionEnd` that left no session process to check, which
+        is a known stop rather than an unknown process.
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
@@ -352,6 +354,8 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "activity": derived["state"],
         "evidence": derived["evidence"],
         "stale": derived["stale"],
+        "ended": value.get("event") == "SessionEnd"
+        and derived["process_alive"] is None,
     }
 
 
@@ -2772,10 +2776,14 @@ def _dead(observed: dict, after: float) -> bool:
         Whether the recorded session process is gone and the lane has been
         silent for longer than that threshold. A live lane is never dead
         however long it has been idle, and a lane that recorded no activity
-        at all has no age to measure, so it is left alone.
+        at all has no age to measure, so it is left alone. A lane whose last
+        event was a clean `SessionEnd` has no process left to check, and
+        that recorded end counts as a known stop; a lane that never recorded
+        one keeps an unknown process out of this reading.
     """
+    stopped = observed["process_alive"] is False or bool(observed.get("ended"))
     return (
-        observed["process_alive"] is False
+        stopped
         and observed["age_seconds"] is not None
         and observed["age_seconds"] >= after
     )

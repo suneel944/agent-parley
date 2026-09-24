@@ -200,10 +200,22 @@ def _refuse_untracked_collisions(
 
 
 def _require_dead(activity: dict, issue: str, owner: str) -> None:
-    """Requires one recorded process generation to be known and stopped."""
+    """Requires one recorded process generation to be known and stopped.
+
+    A session that recorded a clean `SessionEnd` and left no process to
+    check is a known stop, so it satisfies this requirement without a
+    process identity.
+    """
     session_id = activity.get("session_id")
     pid = activity.get("session_pid")
     ticks = activity.get("session_ticks")
+    if (
+        isinstance(session_id, str)
+        and session_id
+        and activity.get("event") == "SessionEnd"
+        and pid is None
+    ):
+        return
     if (
         not isinstance(session_id, str)
         or not session_id

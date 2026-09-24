@@ -355,8 +355,9 @@ candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
 the persisted issue candidate and revalidates its owner and evidence identity
 before acting.
 
-The same poll marks the claims of a lane whose session process is gone and that
-has been silent past the stall threshold, writing an orphan marker on each of
+The same poll marks the claims of a lane whose session process is gone, or
+whose last event was a clean `SessionEnd` with no process left to check, and
+that has been silent past the stall threshold, writing an orphan marker on each of
 its ledger records and sending every other lane one notice that names those
 issues and the reservations the dead lane still holds. The marker is an
 observation: the issue keeps its owner and the reservations keep their holder
