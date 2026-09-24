@@ -77,6 +77,7 @@ SPOOL = "lane-evidence.jsonl"
 DRAINING = "lane-evidence.draining.jsonl"
 SPOOL_LOCK = "lane-evidence.lock"
 SPOOL_WAIT = 2.0
+ACCOUNT_GAP = 300.0
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS lane_states ("
     " project TEXT NOT NULL, lane TEXT NOT NULL, state TEXT NOT NULL,"
@@ -89,8 +90,27 @@ SCHEMA = (
     " cause TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',"
     " detail TEXT NOT NULL DEFAULT '', ts REAL NOT NULL)",
     "CREATE INDEX IF NOT EXISTS lane_history ON lane_events(project,lane,id)",
+    "CREATE TABLE IF NOT EXISTS lane_accounts ("
+    " project TEXT NOT NULL, lane TEXT NOT NULL, observed REAL NOT NULL,"
+    " idle REAL NOT NULL, unaccountable REAL NOT NULL,"
+    " idle_causes TEXT NOT NULL, unaccountable_causes TEXT NOT NULL,"
+    " state TEXT NOT NULL, has_work INTEGER NOT NULL,"
+    " owns INTEGER NOT NULL, accounted REAL NOT NULL,"
+    " PRIMARY KEY(project,lane))",
 )
 FIELDS = ("state", "cause", "evidence", "session", "since", "updated")
+UNUSED = frozenset({IDLE, BLOCKED, STOPPED, DEAD})
+ACCOUNT_FIELDS = (
+    "observed",
+    "idle",
+    "unaccountable",
+    "idle_causes",
+    "unaccountable_causes",
+    "state",
+    "has_work",
+    "owns",
+    "accounted",
+)
 
 
 def ensure(db: sqlite3.Connection) -> None:
@@ -570,6 +590,256 @@ def apply(db: sqlite3.Connection, root: str, items: list[dict]) -> int:
         )
         changed += int(result["changed"])
     return changed
+
+
+def label(record: dict) -> str:
+    """Names a lane's state with its cause, as accounting keys it.
+
+    Args:
+        record: The lane's state record.
+
+    Returns:
+        `blocked: capacity` for a blocked lane, otherwise the state alone.
+    """
+    if record["cause"]:
+        return f"{record['state']}: {record['cause']}"
+    return str(record["state"])
+
+
+def read_accounts(db: sqlite3.Connection, root: str) -> dict[str, dict]:
+    """Reads the idle and accountability totals of every lane of a project.
+
+    Args:
+        db: Open transaction on the coordination store.
+        root: Canonical project key.
+
+    Returns:
+        Each lane's totals keyed by the participant that owns it.
+    """
+    try:
+        rows = db.execute(
+            f"SELECT lane,{','.join(ACCOUNT_FIELDS)} FROM lane_accounts "
+            "WHERE project=?",
+            (root,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if _absent(exc):
+            return {}
+        raise
+    accounts = {}
+    for row in rows:
+        values = dict(zip(ACCOUNT_FIELDS, row[1:], strict=True))
+        for key in ("idle_causes", "unaccountable_causes"):
+            values[key] = json.loads(values[key])
+        values["has_work"] = bool(values["has_work"])
+        values["owns"] = bool(values["owns"])
+        accounts[row[0]] = values
+    return accounts
+
+
+def account(
+    db: sqlite3.Connection,
+    root: str,
+    lane: str,
+    record: dict | None,
+    *,
+    has_work: bool,
+    owns: bool,
+    now: float | None = None,
+) -> dict | None:
+    """Adds the time since the last poll to a lane's idle and claim totals.
+
+    Idle time is time the lane spent `idle`, `blocked`, `stopped` or `dead`
+    while claimable or owned work existed. Unaccountable time is time the
+    lane owned a claim while it was not `working`. Each total is kept per
+    state and cause, so the largest one can be named. The span since the
+    last poll is split where the lane last changed state: the part before
+    is charged to the state and work the last poll saw, the rest to the
+    current ones. A span longer than `ACCOUNT_GAP`, a stopped service,
+    is not charged to anything. An `accounting` event is appended each
+    time either total crosses a whole minute.
+
+    Args:
+        db: Open write transaction on the coordination store.
+        root: Canonical project key.
+        lane: Participant that owns the lane.
+        record: The lane's current state record, or None.
+        has_work: Whether claimable or owned work exists for the lane.
+        owns: Whether the lane owns an open claim.
+        now: Unix time of the poll, or None for the current time.
+
+    Returns:
+        The lane's totals, or None when the lane has no state record.
+    """
+    if record is None:
+        return None
+    moment = time.time() if now is None else now
+    ensure(db)
+    previous = read_accounts(db, root).get(lane)
+    current = label(record)
+    totals: dict = {
+        "observed": 0.0,
+        "idle": 0.0,
+        "unaccountable": 0.0,
+        "idle_causes": {},
+        "unaccountable_causes": {},
+    }
+    if previous is not None:
+        totals = {
+            **{key: previous[key] for key in totals},
+            "idle_causes": dict(previous["idle_causes"]),
+            "unaccountable_causes": dict(previous["unaccountable_causes"]),
+        }
+        start = float(previous["accounted"])
+        cut = min(max(float(record["since"]), start), moment)
+        pieces = (
+            (
+                cut - start,
+                previous["state"],
+                previous["has_work"],
+                previous["owns"],
+            ),
+            (moment - cut, current, has_work, owns),
+        )
+        if moment - start <= ACCOUNT_GAP:
+            for seconds, key, work, owned in pieces:
+                _charge(totals, seconds, key, work, owned)
+    db.execute(
+        "INSERT INTO lane_accounts(project,lane,observed,idle,unaccountable,"
+        "idle_causes,unaccountable_causes,state,has_work,owns,accounted) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project,lane) DO UPDATE "
+        "SET observed=excluded.observed,idle=excluded.idle,"
+        "unaccountable=excluded.unaccountable,"
+        "idle_causes=excluded.idle_causes,"
+        "unaccountable_causes=excluded.unaccountable_causes,"
+        "state=excluded.state,has_work=excluded.has_work,"
+        "owns=excluded.owns,accounted=excluded.accounted",
+        (
+            root,
+            lane,
+            totals["observed"],
+            totals["idle"],
+            totals["unaccountable"],
+            json.dumps(totals["idle_causes"], sort_keys=True),
+            json.dumps(totals["unaccountable_causes"], sort_keys=True),
+            current,
+            int(has_work),
+            int(owns),
+            moment,
+        ),
+    )
+    minutes = (int(totals["idle"] // 60), int(totals["unaccountable"] // 60))
+    if previous is not None and minutes != (
+        int(previous["idle"] // 60),
+        int(previous["unaccountable"] // 60),
+    ):
+        report = summary(totals)
+        _event(
+            db,
+            root,
+            lane,
+            "accounting",
+            previous["state"],
+            current,
+            evidence=describe_account(report),
+            detail=json.dumps(report, sort_keys=True),
+            now=moment,
+        )
+    return totals
+
+
+def _charge(
+    totals: dict, seconds: float, key: str, work: bool, owned: bool
+) -> None:
+    """Charges one span spent in one state to a lane's totals."""
+    if seconds <= 0:
+        return
+    totals["observed"] += seconds
+    state = key.split(":", 1)[0]
+    if work and state in UNUSED:
+        totals["idle"] += seconds
+        causes = totals["idle_causes"]
+        causes[key] = causes.get(key, 0.0) + seconds
+    if owned and state != WORKING:
+        totals["unaccountable"] += seconds
+        causes = totals["unaccountable_causes"]
+        causes[key] = causes.get(key, 0.0) + seconds
+
+
+def _top(causes: dict[str, float]) -> str:
+    """Names the largest cause with its minutes, or nothing."""
+    if not causes:
+        return ""
+    key = max(sorted(causes), key=lambda name: causes[name])
+    return f"{key}, {round(causes[key] / 60)} min"
+
+
+def summary(totals: dict) -> dict:
+    """Reports idle lane-minutes per lane-hour and unaccountable minutes.
+
+    Args:
+        totals: One lane's totals, or several lanes' merged by `combine`.
+
+    Returns:
+        Observed, idle and unaccountable minutes, idle minutes per observed
+        lane-hour, and the top cause of each total.
+    """
+    observed = float(totals["observed"])
+    idle = float(totals["idle"]) / 60
+    return {
+        "observed_minutes": round(observed / 60, 1),
+        "idle_minutes": round(idle, 1),
+        "idle_per_lane_hour": round(idle / (observed / 3600), 1)
+        if observed
+        else 0.0,
+        "idle_cause": _top(totals["idle_causes"]),
+        "unaccountable_minutes": round(float(totals["unaccountable"]) / 60, 1),
+        "unaccountable_cause": _top(totals["unaccountable_causes"]),
+    }
+
+
+def combine(accounts: dict[str, dict]) -> dict:
+    """Merges every lane's totals into the project's, keyed per lane.
+
+    Args:
+        accounts: Each lane's totals keyed by participant.
+
+    Returns:
+        Totals shaped like one lane's, whose causes name their lane.
+    """
+    merged: dict = {
+        "observed": 0.0,
+        "idle": 0.0,
+        "unaccountable": 0.0,
+        "idle_causes": {},
+        "unaccountable_causes": {},
+    }
+    for lane, totals in sorted(accounts.items()):
+        for key in ("observed", "idle", "unaccountable"):
+            merged[key] += float(totals[key])
+        for key in ("idle_causes", "unaccountable_causes"):
+            for cause, seconds in totals[key].items():
+                merged[key][f"{lane} {cause}"] = seconds
+    return merged
+
+
+def describe_account(report: dict) -> str:
+    """Renders a `summary` as one status line.
+
+    Args:
+        report: Result of `summary`.
+
+    Returns:
+        Idle minutes per lane-hour and unaccountable claim-minutes, each
+        with its top cause when it has one.
+    """
+    idle = f"idle {report['idle_per_lane_hour']} min/lane-hour"
+    if report["idle_cause"]:
+        idle += f" (top: {report['idle_cause']})"
+    claims = f"unaccountable claims {report['unaccountable_minutes']} min"
+    if report["unaccountable_cause"]:
+        claims += f" (top: {report['unaccountable_cause']})"
+    return f"{idle}; {claims}"
 
 
 def history(

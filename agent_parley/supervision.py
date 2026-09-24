@@ -3772,6 +3772,7 @@ def _poll(home: Path, directory: Path) -> None:
     stage("presence", _publish_presence, home, manifest, observations)
     stage("lane evidence", settle_evidence, home, directory, manifest)
     stage("lane states", settle_lanes, home, manifest, config, observations)
+    stage("lane accounting", account_lanes, home, directory, manifest)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
     stage("deliveries", deliveries, home, directory, manifest)
@@ -3952,6 +3953,32 @@ def settle_lanes(
                 name,
                 observations[name],
                 dead_after=config["stalled_after"],
+            )
+
+
+def account_lanes(home: Path, directory: Path, manifest: dict) -> None:
+    """Charges this poll's span to every lane's idle and claim totals.
+
+    Work exists for a lane when it owns an open claim or the ledger holds
+    an unclaimed, unblocked issue any lane could take.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    ledger = issues.snapshot(directory)
+    owned = issues.holders(ledger)
+    claimable = bool(issues.unclaimed(ledger))
+    with store.connect(home, write=True) as db:
+        for name in manifest["participants"]:
+            lanes.account(
+                db,
+                manifest["root"],
+                name,
+                lanes.read(db, manifest["root"], name),
+                has_work=claimable or bool(owned.get(name)),
+                owns=bool(owned.get(name)),
             )
 
 
