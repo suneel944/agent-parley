@@ -118,6 +118,7 @@ def test_a_held_maintenance_lock_reports_the_log_unavailable(tmp_path):
     assert summary == {
         "events": 0,
         "denials": 0,
+        "denied_by": [],
         "injected_bytes": 0,
         "last_ts": 0.0,
         "last_reason": "unavailable",

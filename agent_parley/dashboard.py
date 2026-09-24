@@ -377,6 +377,7 @@ def _row(
         "injected_bytes": events["injected_bytes"],
         "hook_events": events["events"],
         "denials": events["denials"],
+        "denied_by": events.get("denied_by", []),
         "calls": stats.get("calls", 0),
         "errors": stats.get("errors", 0),
         "tokens": records.reported_tokens(

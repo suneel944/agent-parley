@@ -248,6 +248,7 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
+| 0.13.0 | 1 | 11 |
 | 0.12.0 | 1 | 10 |
 | 0.11.0 | 1 | 10 |
 | 0.10.0 | 1 | 9 |
@@ -616,6 +617,14 @@ retiring records no acknowledgement for any lane: a recipient that never
 answered still carries no acknowledgement time. A sender that holds no inbox,
 such as the supervising operator, is not mailed and the expectation is still
 retired.
+
+**Acknowledgement debt expires.** A request past its deadline, one a newer
+message on the same topic superseded, and one bound to a claim that closed no
+longer lower the lane's fitness for new work, and a checkpoint no longer lists
+them as owed. A lane that reads as stale by `inactive_after` owes nothing to
+the fitness check at all, because it cannot answer until it returns. The
+overdue request itself still appears in `status` and still goes back to its
+sender as above.
 
 **A share no recipient can act on comes back before its deadline.** A share is
 an acknowledgement request still inside its window: the sender is waiting for an
@@ -1405,6 +1414,9 @@ every project series `project`. The lane families are
 `agent_parley_project_hook_events_total` and
 `agent_parley_project_hook_denials_total`, each summed over the rows that
 project reports, so a total never counts a lane the export does not show.
+`agent_parley_lane_hook_denials_by_cause_total` splits a lane's denials by
+`reason` and `tool`, so a refusal over a reserved path or an expiring offer
+reads apart from a policy refusal.
 `tokens` is what the native client counted, not billed spend, exactly as the
 `TOKENS` column is.
 

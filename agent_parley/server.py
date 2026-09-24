@@ -177,6 +177,7 @@ TOOLS = [
                 **INTEGER,
                 "description": "Message answered; joins its thread.",
             },
+            "topic": TEXT,
             "ack_required": FLAG,
             "ack_within": {
                 "type": "number",
