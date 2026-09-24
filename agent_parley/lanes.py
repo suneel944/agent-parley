@@ -49,6 +49,18 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     DEAD: frozenset({STARTING, DEAD, RECLAIMED}),
     RECLAIMED: frozenset({STARTING, RECLAIMED}),
 }
+LIVE = frozenset({STARTING, WORKING, IDLE, BLOCKED})
+WAKEABLE = frozenset({IDLE, BLOCKED, STOPPED, DEAD})
+HELD_BLOCKS = frozenset({DIALOG, CAPACITY})
+HOOK_STATES = {
+    "SessionStart": STARTING,
+    "UserPromptSubmit": WORKING,
+    "PreToolUse": WORKING,
+    "PostToolUse": WORKING,
+    "PermissionRequest": BLOCKED,
+    "Stop": IDLE,
+    "SessionEnd": STOPPED,
+}
 MAX_EVIDENCE = 200
 MAX_EVENTS = 2000
 SCHEMA = (
@@ -276,6 +288,120 @@ def transition(
         "source": source,
         "record": record,
     }
+
+
+def from_liveness(
+    record: dict | None, observed: dict
+) -> tuple[str, str] | None:
+    """Reads the state one liveness sample is evidence of.
+
+    A sample with no trustworthy process identity is evidence of nothing
+    and moves no lane. A gone process stops a lane that was live, and a
+    running process starts a lane recorded as stopped, dead or reclaimed.
+    A lane held by a dialog or an exhausted capacity keeps that block until
+    the screen evidence that set it is withdrawn, because the activity label
+    a sample is derived from cannot see the screen.
+
+    Args:
+        record: The lane's current record, or None.
+        observed: Presence reading taken by the supervision poll, carrying
+            `process_alive`, the derived `activity` and its `evidence`.
+
+    Returns:
+        The target state and its cause, or None when the sample moves
+        nothing.
+    """
+    alive = observed.get("process_alive")
+    current = "" if record is None else record["state"]
+    if alive is None:
+        return None
+    if alive is False:
+        return None if current in (DEAD, RECLAIMED) else (STOPPED, "")
+    if current in (STOPPED, DEAD, RECLAIMED):
+        return STARTING, ""
+    if record is not None and record["cause"] in HELD_BLOCKS:
+        return None
+    activity = str(observed.get("activity", ""))
+    if activity == "waiting":
+        evidence = str(observed.get("evidence", ""))
+        return BLOCKED, APPROVAL if "approval" in evidence else PROMPT
+    if activity == IDLE:
+        return IDLE, ""
+    if activity == WORKING:
+        return WORKING, ""
+    return None
+
+
+def sample(
+    db: sqlite3.Connection,
+    root: str,
+    lane: str,
+    observed: dict,
+    *,
+    dead_after: float,
+    now: float | None = None,
+) -> dict | None:
+    """Applies one liveness sample and ages a stopped lane into `dead`.
+
+    A lane is dead once it has been stopped for `dead_after` seconds, or once
+    the evidence the sample was derived from is that old, so a lane that was
+    already long gone when this record was first written is not given a
+    second grace period.
+
+    Args:
+        db: Open write transaction on the coordination store.
+        root: Canonical project key.
+        lane: Participant that owns the lane.
+        observed: Presence reading taken by the supervision poll.
+        dead_after: Seconds a stopped lane waits before it reads as dead.
+        now: Unix time of the sample, or None for the current time.
+
+    Returns:
+        The lane's record once the sample is applied, or None when the lane
+        still has no record.
+    """
+    moment = time.time() if now is None else now
+    record = read(db, root, lane)
+    move = from_liveness(record, observed)
+    if move is not None:
+        state, cause = move
+        record = transition(
+            db,
+            root,
+            lane,
+            state,
+            cause=cause,
+            evidence=f"liveness: {observed.get('evidence', '')}",
+            now=moment,
+        )["record"]
+    if record is not None and record["state"] == STOPPED:
+        age = observed.get("age_seconds")
+        held = moment - float(record["since"])
+        if held >= dead_after or (age is not None and age >= dead_after):
+            record = transition(
+                db,
+                root,
+                lane,
+                DEAD,
+                evidence=f"stopped for {int(max(held, age or 0))}s",
+                now=moment,
+            )["record"]
+    return record
+
+
+def wakes(record: dict | None) -> bool:
+    """Reports whether a wake may act on a lane in its recorded state.
+
+    Args:
+        record: The lane's current record, or None when none exists yet.
+
+    Returns:
+        Whether the lane is idle, stopped, dead or blocked. A blocked lane is
+        let through only so the caller can defer it under its named cause
+        rather than wake it. A starting, working or reclaimed lane is never
+        woken, and a lane with no record is left to the caller's own reading.
+    """
+    return record is None or record["state"] in WAKEABLE
 
 
 def history(

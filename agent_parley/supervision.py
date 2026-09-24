@@ -18,6 +18,7 @@ from typing import TypeGuard, cast
 from agent_parley import (
     forge,
     issues,
+    lanes,
     lifecycle,
     notify,
     process,
@@ -3041,15 +3042,28 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
     }
+    states = {
+        name: (condition(home, manifest["root"], name) or {}).get("state")
+        for name in manifest["participants"]
+    }
     dead = {
         name: observed
         for name, observed in observations.items()
-        if _dead(observed, after)
+        if (
+            _dead(observed, after)
+            if states[name] is None
+            else states[name] == lanes.DEAD
+        )
     }
     returned = [
         name
         for name, observed in observations.items()
-        if name not in dead and observed["process_alive"] is True
+        if name not in dead
+        and (
+            observed["process_alive"] is True
+            if states[name] is None
+            else states[name] in lanes.LIVE
+        )
     ]
     if not dead and not returned:
         return
@@ -3756,6 +3770,7 @@ def _poll(home: Path, directory: Path) -> None:
         for name in manifest["participants"]
     }
     stage("presence", _publish_presence, home, manifest, observations)
+    stage("lane states", settle_lanes, home, manifest, config, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
     stage("deliveries", deliveries, home, directory, manifest)
@@ -3890,6 +3905,51 @@ def _publish_presence(
                     participant["display"],
                 ),
             )
+
+
+def settle_lanes(
+    home: Path, manifest: dict, config: dict, observations: dict[str, dict]
+) -> None:
+    """Records this poll's liveness sample of every lane in its state.
+
+    Every later decision of the poll reads the lane's condition from the
+    state record rather than from the presence reading, so the sample is
+    applied first and a stopped lane ages into `dead` here, after the
+    project's stall threshold, and nowhere else.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant.
+    """
+    with store.connect(home, write=True) as db:
+        for name in manifest["participants"]:
+            lanes.sample(
+                db,
+                manifest["root"],
+                name,
+                observations[name],
+                dead_after=config["stalled_after"],
+            )
+
+
+def condition(home: Path, root: str, name: str) -> dict | None:
+    """Reads one lane's state record for a supervision decision.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lane's record, or None when it has none or the store cannot be
+        read, in which case the decision keeps its own reading.
+    """
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        with store.connect(home) as db:
+            return lanes.read(db, root, name)
+    return None
 
 
 def _remind(
@@ -4562,9 +4622,14 @@ def wake(
         if wake_path.exists():
             published = json.loads(wake_path.read_text())
             parked = published if isinstance(published, dict) else {}
+    recorded = condition(home, manifest["root"], name)
+    if not lanes.wakes(recorded):
+        return
     blocked, ready_at = _wake_block(
         directory, name, state, observed, parked, window
     )
+    if not blocked and recorded and recorded["state"] == lanes.BLOCKED:
+        blocked, ready_at = f"blocked: {recorded['cause']}", 0.0
     if blocked:
         _defer_wake(directory, name, blocked, ready_at, window)
         return
