@@ -181,7 +181,10 @@ def test_a_raising_forge_reading_leaves_the_rest_of_the_poll_running(
     supervision.poll(bridge.home, claimed.parent)
     assert ran == ["reminders", "responses"]
     detail = issues.supervision_error(claimed.parent)["detail"]
-    assert detail == "completion: ValueError: forge reply unreadable"
+    assert detail.startswith(
+        "completion: ValueError: forge reply unreadable at "
+        "test_claim_termination.py:"
+    )
 
 
 def test_the_escalation_reaches_status_and_problems(
