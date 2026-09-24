@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -69,12 +70,24 @@ def turn_ended(directory, name, ago):
     )
 
 
-def tool_used(directory, name):
-    """Appends one tool-use event of the kind a working lane records."""
-    with (directory / f"{name}-events.jsonl").open("a") as stream:
-        stream.write(
-            json.dumps({"ts": time.time(), "event": "PostToolUse"}) + "\n"
-        )
+def committed(lane):
+    """Records one commit in a lane, the progress a working lane makes."""
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(lane),
+            "-c",
+            "user.name=Lane",
+            "-c",
+            "user.email=lane@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "progress",
+        ],
+        check=True,
+    )
 
 
 def unthrottle(directory, name):
@@ -1160,7 +1173,7 @@ def test_delivery_without_work_progress_retries_then_escalates(
             config,
         )
 
-    assert requested == ["claude", "claude", "claude"]
+    assert requested == ["claude"] * 4
     published = supervision.published_work(directory, "claude")
     dispatch = published["dispatch"]
     assert dispatch["state"] == "escalated"
@@ -1200,7 +1213,7 @@ def test_a_lane_working_between_wakes_is_never_escalated(
         directory, "claude", config["inactive_after"]
     )
     for _ in range(5):
-        tool_used(directory, "claude")
+        committed(lane)
         unthrottle(directory, "claude")
         supervision.wake(
             bridge.home, directory, manifest, "claude", observed, config
@@ -1246,7 +1259,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
     held = json.loads(wake_path.read_text())
     assert held["escalated_at"] == escalated["escalated_at"]
 
-    tool_used(directory, "claude")
+    committed(lane)
     unthrottle(directory, "claude")
     supervision.wake(
         bridge.home, directory, manifest, "claude", observed, config
@@ -1256,7 +1269,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
     assert cleared["state"] == "awaiting_progress"
     assert cleared["attempts"] == 1
     record = json.loads(wake_path.read_text())
-    assert "escalated_at" not in record
+    assert record.get("escalated_at") is None
     assert record["attempts"] == 1
 
 

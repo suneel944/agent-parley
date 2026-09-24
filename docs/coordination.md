@@ -88,15 +88,31 @@ enumerated reason and lands in that participant's event log; every served call
 is recorded inside the transaction that carried its effect. That is why `top`
 can show what was denied, to whom, and how often.
 
-## A deadline reports; it never transfers
+## A deadline reports until the holder stops working
 
 `issue claim 42 --within 2h`, `issue offer ... --within 30m` and
 `say ... --ack --within 15m` record a deadline, and `agent-parley deadlines set`
-gives a project defaults to inherit. Past its deadline a claim reads `overdue`
+gives a project defaults to inherit. The claim default also applies to a claim
+that was made before the default existed. Past its deadline a claim reads `overdue`
 with the seconds over, `top` marks the issue `#42!`, and a lane that reports
 `blocked` on work it still holds spends one attempt of the recorded budget.
-Ownership never moves on a timer: an overdue claim is still owned, and only an
-explicit release or an accepted handoff transfers it.
+
+An overdue claim whose holder is still working stays owned. An overdue claim
+whose holder is silent, meaning its session process is gone or it has run no
+tool call for the project's inactivity window, gets a terminating transition:
+
+1. The supervisor wakes the holder once.
+2. If the holder is still silent one window later, the supervisor offers the
+   claim to the fittest running peer, with the claim's recovery checkpoint
+   named in the summary and its commit carried in the offer. With no fit peer
+   it releases the claim instead.
+3. If the offer expires or is declined, the supervisor releases the claim to
+   the pool.
+
+Each step is recorded in the claim history as `overdue-wake`, `overdue-offer`
+or `overdue-release` and counted in the claim's attempts. A supervisor resume
+that ends without a tool call does not reset the silence, and a holder that
+runs a tool again cancels the sequence.
 
 ## A dead lane's claims are offered, never taken away
 

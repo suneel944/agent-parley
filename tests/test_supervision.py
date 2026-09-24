@@ -258,7 +258,7 @@ def test_closed_pr_reminds_holder_and_preserves_claim(
     assert record["handoff_prompt"]["trigger"] == "pull request ended"
 
 
-def test_live_idle_wakes_are_bounded_without_acknowledging(
+def test_live_idle_wakes_back_off_without_acknowledging(
     bridge, paired, monkeypatch
 ):
     actors = registered(bridge, paired)
@@ -285,9 +285,15 @@ def test_live_idle_wakes_are_bounded_without_acknowledging(
         )
         path = lane.parent / "codex-wake.json"
         record = json.loads(path.read_text())
-        record["at"] = 0
-        write_json(path, record)
-    assert len(calls) == 3
+        write_json(path, {**record, "at": 0})
+    assert len(calls) == 5
+    assert record["attempts"] == 5 and record["exhausted_at"]
+    assert record["next_at"] - record["at"] == 16
+    write_json(path, record)
+    supervision.wake(
+        bridge.home, lane.parent, paired, "codex", observed, config
+    )
+    assert len(calls) == 5
     assert (
         mailbox(bridge.home, paired["root"], "codex")["outstanding_ack"][0][
             "id"
@@ -331,8 +337,8 @@ def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
         record = json.loads(path.read_text())
         record["at"] = 0
         write_json(path, record)
-    assert len(calls) == 7
-    assert json.loads(path.read_text())["attempts"] == 3
+    assert len(calls) == 9
+    assert json.loads(path.read_text())["attempts"] == 5
 
 
 def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
@@ -750,3 +756,211 @@ def zombies_of(parent):
         if fields[0] == "Z" and fields[1] == str(parent):
             found.append(int(entry.name))
     return found
+
+
+def idle_lane(directory, name, age, activity="idle", **extra):
+    """Records a live session whose last native checkpoint is `age` old."""
+    write_json(
+        directory / f"{name}-activity.json",
+        {
+            "activity": activity,
+            "updated": time.time() - age,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+            **extra,
+        },
+    )
+
+
+def exhausted(directory, name, ago, **extra):
+    """Records a usage-limit exhaustion that named no reset."""
+    return supervision.record_capacity(
+        directory,
+        name,
+        {
+            "state": "exhausted",
+            "observed_at": time.time() - ago,
+            "reset_at": None,
+            "source": "native-dialog",
+            "observation_id": f"dialog:{ago}",
+            **extra,
+        },
+    )
+
+
+def empty_commit(lane):
+    """Records one commit in a lane, the progress a working lane makes."""
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(lane),
+            "-c",
+            "user.name=Lane",
+            "-c",
+            "user.email=lane@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "progress",
+        ],
+        check=True,
+    )
+
+
+def test_an_exhaustion_is_attributed_to_the_lanes_session(bridge, paired):
+    directory = Path(paired["lanes"]["claude"]).parent
+    idle_lane(directory, "claude", 10, session_id="claude-session")
+    assert exhausted(directory, "claude", 5)["session_id"] == "claude-session"
+
+
+def test_an_exhaustion_without_a_session_never_fails_the_poll(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "1")
+    idle_lane(directory, "claude", 1000)
+    exhausted(directory, "claude", 900)
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    supervision.poll(bridge.home, directory)
+    assert issues.supervision_error(directory) is None
+
+
+def test_a_failing_stage_is_recorded_and_the_rest_of_the_poll_runs(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+
+    def broken(*args):
+        raise ValueError("malformed record")
+
+    woken = []
+    monkeypatch.setattr(supervision, "work", broken)
+    monkeypatch.setattr(
+        supervision,
+        "wake",
+        lambda home, path, manifest, name, *rest: woken.append(name),
+    )
+    supervision.poll(bridge.home, directory)
+    assert sorted(woken) == ["claude", "codex"]
+    error = issues.supervision_error(directory)
+    assert error["detail"] == "work: ValueError: malformed record"
+    assert cli.supervision_failure(error).startswith("Supervision: failing")
+    monkeypatch.setattr(supervision, "work", lambda *args: None)
+    supervision.poll(bridge.home, directory)
+    assert issues.supervision_error(directory) is None
+
+
+def test_a_stale_working_label_on_a_live_process_is_woken(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_lane(directory, "codex", 1000, activity="working")
+    send(bridge, actors["claude"], "codex")
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 300}
+    observed = supervision.presence(directory, "codex", 300)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert len(calls) == 1
+
+
+def test_a_current_working_label_still_blocks_the_wake(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_lane(directory, "codex", 120, activity="working")
+    send(bridge, actors["claude"], "codex")
+    write_json(
+        directory / "codex-wake.json",
+        {"at": time.time() - 1000, "attempts": 1, "result": "accepted"},
+    )
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: pytest.fail("woke a working lane")
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 300}
+    observed = supervision.presence(directory, "codex", 300)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    record = json.loads((directory / "codex-wake.json").read_text())
+    assert record["blocked"] == "its screen state is working (2m)"
+
+
+def test_an_exhaustion_without_a_reset_is_probed_on_a_backoff():
+    observation = {"observed_at": 100.0, "probes": 0}
+    assert supervision.exhaustion_probe_due(observation, 60) == 160
+    later = {"observed_at": 100.0, "probed_at": 500.0, "probes": 2}
+    assert supervision.exhaustion_probe_due(later, 60) == 740
+    capped = {"observed_at": 100.0, "probes": 30}
+    assert supervision.exhaustion_probe_due(capped, 60) == 3700
+
+
+def test_an_old_exhaustion_without_a_reset_is_woken_and_cleared(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_lane(directory, "codex", 1000)
+    exhausted(directory, "codex", 1000)
+    send(bridge, actors["claude"], "codex")
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 300}
+    observed = supervision.presence(directory, "codex", 300)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert len(calls) == 1
+    capacity = supervision.published_capacity(directory, "codex")
+    assert capacity["state"] == "available"
+    assert capacity["source"] == "wake-accepted"
+
+
+def test_a_refused_probe_pushes_the_next_one_back(bridge, paired):
+    directory = Path(paired["lanes"]["codex"]).parent
+    exhausted(directory, "codex", 1000)
+    supervision.probe_exhaustion(directory, "codex", "busy:turn")
+    capacity = supervision.published_capacity(directory, "codex")
+    assert capacity["state"] == "exhausted" and capacity["probes"] == 1
+    assert supervision.exhaustion_probe_due(capacity, 300) == pytest.approx(
+        capacity["probed_at"] + 600
+    )
+
+
+def test_bare_stops_escalate_and_a_commit_resets_the_budget(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    idle_lane(directory, "codex", 1000)
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    path = directory / "codex-wake.json"
+
+    def woken():
+        supervision.wake(
+            bridge.home, directory, paired, "codex", observed, config
+        )
+        record = json.loads(path.read_text())
+        aged = {**record, "at": 0}
+        write_json(path, aged)
+        with (directory / "codex-events.jsonl").open("a") as stream:
+            stream.write(json.dumps({"ts": time.time(), "event": "Stop"}))
+            stream.write("\n")
+        return record
+
+    for _ in range(3):
+        record = woken()
+    assert record["attempts"] == 3 and record["exhausted_at"]
+    empty_commit(lane)
+    record = woken()
+    assert record["attempts"] == 1 and record["exhausted_at"] is None

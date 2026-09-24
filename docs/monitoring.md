@@ -40,7 +40,9 @@ a `dialog` entry with the last screen lines, a wake addressed to the lane is
 refused with `manual attention required`, and you get one notification with the
 screen text. A recognized usage limit also records the provider capacity as
 exhausted with the reset instant the screen names, so the lane is parked with
-that reason and restored when the reset passes. No lane on a dialog is ever
+that reason and restored when the reset passes. A screen that names no reset
+is probed on a doubling backoff capped at one hour; an accepted probe or a
+later tool call clears the exhaustion. No lane on a dialog is ever
 reported as `working` or `starting`.
 
 Five dialogs are recognized, recorded from `claude` CLI 2.1.270 and Codex CLI

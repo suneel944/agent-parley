@@ -310,8 +310,9 @@ def deadlines(value: dict) -> dict:
 
     A default is inherited by a claim, an offer or an acknowledgement that
     passes no explicit window, so lanes carry a budget without repeating a
-    flag. A deadline never transfers ownership: it only makes an overdue
-    claim, offer or acknowledgement say so.
+    flag. A deadline makes an overdue claim, offer or acknowledgement say
+    so; only the supervisor's overdue transition, which acts when the holder
+    has stopped working, moves an overdue claim.
 
     Args:
         value: Defaults recorded in the project manifest.

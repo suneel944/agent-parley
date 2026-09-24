@@ -27,9 +27,10 @@ COMMIT = re.compile(r"[0-9a-f]{7,40}")
 def deadline_state(record: dict, now: float = 0.0) -> dict:
     """Derives the deadline and retry state a claim currently reads as.
 
-    A deadline is a reporting device, never a transfer. Past it the claim is
-    overdue and says by how much; ownership stays exactly where it was, and
-    only an explicit release or an accepted handoff moves it. The state is
+    Past its deadline a claim is overdue and says by how much. Reading the
+    state moves nothing; only the supervisor's overdue transition, which acts
+    on a claim whose holder stopped working, an explicit release or an
+    accepted handoff moves ownership. The state is
     derived from the stored timestamps whenever a record is read, so the
     runtime gains no scheduler and a stopped service produces no phantom
     transitions.
@@ -1110,18 +1111,46 @@ def note_supervision_error(directory: Path, detail: str) -> None:
     released its lock, so its failure cannot undo the transition and must not
     be reported as one. The diagnostic is written where an operator and the
     supervisor can both see it, and the supervisor clears it once a later poll
-    regenerates reminders successfully. Writing the diagnostic is itself best
+    completes with no failing stage. Writing the diagnostic is itself best
     effort: failing to record a note must not fail a committed release.
 
     Args:
         directory: Private state directory for the common repository.
         detail: Operation and failure text to retain for an operator.
     """
+    now = time.time()
+    since = (supervision_error(directory) or {}).get("since", now)
     with contextlib.suppress(OSError):
         write_json(
             directory / SUPERVISION_ERROR,
-            {"at": time.time(), "detail": detail},
+            {"at": now, "since": since, "detail": detail},
         )
+
+
+def supervision_error(directory: Path) -> dict | None:
+    """Reads the supervision failure recorded beside the issue ledger.
+
+    Args:
+        directory: Private state directory for the common repository.
+
+    Returns:
+        The last failure, when it was recorded, and since when failures have
+        been recorded without a clean poll between them, or None when the
+        last poll succeeded or the record is unreadable.
+    """
+    try:
+        value = json.loads((directory / SUPERVISION_ERROR).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or not value.get("detail"):
+        return None
+    at = value.get("at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return None
+    since = value.get("since")
+    if not isinstance(since, (int, float)) or isinstance(since, bool):
+        since = at
+    return {"at": float(at), "since": float(since), "detail": value["detail"]}
 
 
 def _carried(source: dict) -> str:
@@ -1219,6 +1248,8 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         timing = deadline_state(record)
         if timing["overdue"]:
             line += f"; overdue {timing['overdue_seconds']}s, still owned"
+            if step := (record.get("overdue_recovery") or {}).get("step"):
+                line += f" (supervisor {step} step taken)"
         if timing["budget"]:
             line += f"; attempts {timing['attempts']}/{timing['budget']}"
             if timing["budget_exceeded"]:

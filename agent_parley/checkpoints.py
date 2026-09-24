@@ -950,6 +950,53 @@ def branch_head(repo: Path, branch: str) -> str:
     return "" if result.returncode else result.stdout.strip()
 
 
+def _git_directory(lane: Path) -> Path | None:
+    """Resolves the administrative directory holding a checkout's ``HEAD``.
+
+    Args:
+        lane: Assigned bridge worktree.
+
+    Returns:
+        The linked worktree's administrative directory, the plain checkout's
+        ``.git`` directory, or None when the metadata is unreadable or not in
+        the documented format.
+    """
+    marker = lane / ".git"
+    try:
+        if not marker.is_file():
+            return marker
+        pointer = marker.read_text().strip()
+    except (OSError, ValueError):
+        return None
+    if not pointer.startswith("gitdir:"):
+        return None
+    directory = Path(pointer.removeprefix("gitdir:").strip())
+    return directory if directory.is_absolute() else lane / directory
+
+
+def head_moves(lane: Path) -> int:
+    """Measures how often a lane's ``HEAD`` has moved, without running Git.
+
+    Git appends one line to the checkout's ``HEAD`` reflog for every commit,
+    reset, rebase step and branch switch, so its size grows exactly when the
+    lane moved its work. Reading the size is one stat call, which keeps the
+    wake path free of a Git process that could time out.
+
+    Args:
+        lane: Assigned bridge worktree.
+
+    Returns:
+        Size of the ``HEAD`` reflog in bytes, or zero when it is unreadable.
+    """
+    directory = _git_directory(lane)
+    if directory is None:
+        return 0
+    try:
+        return (directory / "logs" / "HEAD").stat().st_size
+    except OSError:
+        return 0
+
+
 def recorded_branch(lane: Path) -> str:
     """Reads a lane's branch from its checkout metadata without running Git.
 
@@ -967,17 +1014,10 @@ def recorded_branch(lane: Path) -> str:
         metadata is missing or is not in the documented format, which leaves
         the decision to the caller.
     """
-    marker = lane / ".git"
+    directory = _git_directory(lane)
+    if directory is None:
+        return ""
     try:
-        if marker.is_file():
-            pointer = marker.read_text().strip()
-            if not pointer.startswith("gitdir:"):
-                return ""
-            directory = Path(pointer.removeprefix("gitdir:").strip())
-            if not directory.is_absolute():
-                directory = lane / directory
-        else:
-            directory = marker
         head = (directory / "HEAD").read_text().strip()
     except (OSError, ValueError):
         return ""
