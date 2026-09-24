@@ -387,13 +387,14 @@ def recorded_presence(record: dict | None, observed: dict) -> dict:
     Returns:
         The reading with `process_alive`, `state` and `activity` taken from
         the record and the record itself under `record`. A lane with no
-        record has no trusted process identity, so its liveness is None and
-        its state is `UNKNOWN`, which no decision acts on.
+        record yet keeps the reading as it was, so the safety net that wakes
+        and orphans a lane still covers one whose record the store has not
+        seeded, for example because the store could not be written.
     """
-    state = "" if record is None else record["state"]
     if record is None:
-        alive, availability, activity = None, UNKNOWN, UNKNOWN
-    elif state in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
+        return {**observed, "record": None}
+    state = record["state"]
+    if state in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
         alive, availability, activity = False, STOPPED, STOPPED
     elif state == lanes.BLOCKED:
         alive, availability, activity = True, ACTIVE, WAITING
@@ -423,8 +424,8 @@ def recorded_observations(
 
     Returns:
         The `recorded_presence` of every participant. A store that cannot be
-        read yields no record for any lane, so nothing is decided on them
-        this poll.
+        read yields no record for any lane, so every lane is decided on its
+        presence reading this poll.
     """
     records: dict[str, dict] = {}
     with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
@@ -4759,8 +4760,9 @@ def wake(
     live lane. A lane recorded starting, working or reclaimed is never
     woken, a blocked one is deferred under its cause, an idle one is asked
     for a turn, and a stopped or dead one is resumed when its record names a
-    session. A lane with no record has no trustworthy process identity, so
-    it records a manual-attention refusal and is never presumed dead.
+    session. A lane with no record yet is decided on its presence reading
+    and the session its activity file names, as before the record existed,
+    so a store that has not seeded the record never silences a wake.
 
     The attempt bound counts wakes without progress. Each attempt records the
     lane's progress marker from `_lane_activity`: its `HEAD` moves, the state
@@ -4825,7 +4827,11 @@ def wake(
     if not lanes.wakes(recorded):
         return
     observed = recorded_presence(recorded, observed)
-    session = "" if recorded is None else recorded["session"]
+    if recorded is None:
+        session = str(state.get("session_id") or "")
+        stopped = state.get("activity") == "stopped"
+    else:
+        session, stopped = recorded["session"], False
     blocked, ready_at = _wake_block(directory, name, observed, parked, window)
     if blocked:
         _defer_wake(home, directory, root, name, blocked, ready_at, window)
@@ -4948,7 +4954,7 @@ def wake(
             result = "busy:stale"
         elif observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif observed["process_alive"] is False and session:
+        elif (observed["process_alive"] is False or stopped) and session:
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"

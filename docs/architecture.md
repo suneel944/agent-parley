@@ -372,7 +372,8 @@ Every decision of the poll after its liveness sample reads the lane's condition
 from its state record: wake, parking, orphan marking, reclaim, work fitness and
 share targets. The activity file, the wake copy and `participant_presence` are
 evidence the poll applies to that record or copies published from it, never a
-decision input.
+decision input. A lane with no state record yet falls back to its presence
+reading, so it is still woken and still orphaned.
 
 The same poll marks the claims of a lane whose state is `dead`: a session
 process gone, or a clean `SessionEnd` with no process left to check, past the

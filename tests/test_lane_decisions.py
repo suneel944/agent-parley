@@ -395,12 +395,31 @@ def test_fit_reads_the_lane_state_not_the_activity_file(bridge, paired):
     assert "is blocked (dialog)" in blocked["reason"]
 
 
-def test_a_lane_without_a_record_is_never_orphaned(bridge, repo, paired):
+def test_a_lane_without_a_record_is_still_orphaned(bridge, repo, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])
     directory = lane.parent
     bridge.issue(lane, "claim", "42")
     killed(directory, "claude", STALLED + 100)
+    assert recorded(bridge, paired, "claude") is None
     config = supervision.configuration(bridge.home, paired)
     supervision.orphans(bridge.home, directory, paired, config)
-    assert not issues.snapshot(directory)["issues"]["42"].get("orphan")
+    assert issues.snapshot(directory)["issues"]["42"]["orphan"]["owner"] == (
+        "claude"
+    )
+
+
+def test_a_lane_without_a_record_is_still_woken(bridge, paired, monkeypatch):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    mail(bridge, actors)
+    assert recorded(bridge, paired, "codex") is None
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert len(calls) == 1
