@@ -1,11 +1,14 @@
 """Replays hook, dialog and session evidence into the lane state record."""
 
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, lanes, store, supervision
+from agent_parley import checkpoints, lanes, process, store, supervision
 from agent_parley.state import write_json
 
 
@@ -148,6 +151,40 @@ def test_a_session_the_lane_did_not_adopt_never_moves_its_state(
     assert record["state"] == lanes.IDLE
     assert record["session"] == "one"
     assert all("foreign" not in item["detail"] for item in transitions)
+
+
+def test_an_adopted_session_reaches_the_record_with_both_ids(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    gone = process.ServerProcess(child.pid, process.start_ticks(child.pid))
+    child.kill()
+    child.wait()
+    live = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    for session, native in (("one", gone), ("two", live)):
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": session,
+            "cwd": paired["lanes"]["claude"],
+            "tool_name": "Bash",
+        }
+        checkpoints.checkpoint(
+            bridge.home, directory, "claude", payload, session_process=native
+        )
+    assert checkpoints.activity(directory, "claude")["session_id"] == "two"
+    settle(bridge, paired)
+    record, transitions = recorded(bridge, paired)
+    assert record["state"] == lanes.WORKING
+    assert record["session"] == "two"
+    assert "session one -> two" in [item["detail"] for item in transitions]
 
 
 def test_evidence_waits_in_order_while_the_store_is_busy(
