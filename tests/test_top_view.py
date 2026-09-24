@@ -511,6 +511,26 @@ def test_a_stopped_lane_holding_nothing_is_counted_not_drawn():
     assert "dead" in {line.split()[0] for line in everything if line.strip()}
 
 
+def test_the_lane_record_decides_whether_a_lane_is_live():
+    view = snapshot(
+        (
+            "/repo",
+            [
+                lane("crashed", state="dead 2h", lane_state="dead"),
+                lane("resumed", state="stopped", lane_state="working"),
+                lane("reclaimed", state="idle", lane_state="reclaimed"),
+            ],
+        )
+    )
+    live = dashboard.select(view, live=True)
+    rendered = dashboard.render(live)
+    drawn = {line.split()[0] for line in rendered if line.strip()}
+    assert "resumed" in drawn
+    assert "crashed" not in drawn
+    assert "reclaimed" not in drawn
+    assert live["hidden"] == {"lanes": 2, "projects": 0}
+
+
 def test_a_project_whose_root_is_gone_is_hidden_until_asked():
     view = gone("/tmp/wiped", [lane("old", state="stopped"), lane("older")])
     live = dashboard.select(view, live=True)

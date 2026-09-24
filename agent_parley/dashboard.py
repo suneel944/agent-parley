@@ -265,14 +265,22 @@ def dormant(row: dict) -> bool:
         row: Participant row produced by ``collect``.
 
     Returns:
-        True when the lane's session is stopped or retired and it owns no
+        True when the lane is retired or out of a live state and it owns no
         issue, holds no offer, holds or waits on no lease, has no unread or
-        unacknowledged mail, and no ready report awaits the operator. A
+        unacknowledged mail, and no ready report awaits the operator. A lane
+        with a state record is live while that record is in `lanes.LIVE`; a
+        lane without one falls back to its session cell reading stopped. A
         mailbox or lease store that could not be read is not dormant, so a
         failed reading stays on screen.
     """
+    recorded = row.get("lane_state")
+    ended = (
+        recorded not in lanes.LIVE
+        if recorded
+        else str(row["state"]).startswith("stopped")
+    )
     return (
-        str(row["state"]).startswith(("stopped", "retired"))
+        (str(row["state"]).startswith("retired") or ended)
         and not row["owned"]
         and not row["offers"]
         and not row["awaiting_approval"]
@@ -371,7 +379,12 @@ def _row(
     except (BridgeError, OSError, sqlite3.Error):
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
-    liveness = participant_liveness(directory, agent, context["inactive_after"])
+    condition = context.get("conditions", {}).get(agent)
+    liveness = (
+        lanes.describe(condition)
+        if condition
+        else participant_liveness(directory, agent, context["inactive_after"])
+    )
     stalled = supervision.stall(
         home, directory, data, agent, context["stalled_after"]
     )
@@ -407,6 +420,7 @@ def _row(
                 else None
             ),
         ),
+        "lane_state": condition["state"] if condition else None,
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
@@ -600,10 +614,12 @@ def collect(
         try:
             with store.connect(home) as db:
                 accounts = lanes.read_accounts(db, data["root"])
+                conditions = lanes.read_all(db, data["root"])
         except (BridgeError, OSError, sqlite3.Error):
-            accounts = {}
+            accounts, conditions = {}, {}
         context = {
             "accounts": accounts,
+            "conditions": conditions,
             "usage": usage,
             "usage_read": usage_read,
             "issues": snapshot(path.parent),
