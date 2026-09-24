@@ -29,6 +29,19 @@ requested)`. A presence row written before this release still carries
 `idle` names the oldest waiting item and how long it has waited, so a lane that
 is quiet with an empty inbox reads differently from one sitting on unread mail.
 
+## A second session in a lane
+
+A hook event from a session other than the lane's recorded one is recorded as
+`session_mismatch` with the arriving `session_id`, the lane's
+`recorded_session_id` and the arriving native `pid`, and it changes nothing.
+When the recorded session's process has exited and the event comes from a live
+native process, the new session is adopted as if it had sent `SessionStart`, so
+a lane whose start event was lost follows its real session again. Any other
+second session, such as a headless `claude -p` started inside the worktree, is
+named in the lane's `status` detail and as a `second session` row in
+`problems` while its process runs, or for ten minutes when its process cannot
+be told apart from the lane's.
+
 ## A lane held by a native dialog
 
 A native client sometimes stops on a screen of its own: a usage limit, a tool

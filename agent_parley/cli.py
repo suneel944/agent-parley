@@ -944,6 +944,12 @@ def lane_detail(record: dict, data: dict) -> None:
             + f"; {wake['age_seconds']}s ago"
         )
         print(f"    {wake_schedule(wake)}")
+    if foreign := record.get("foreign_session"):
+        print(
+            f"    Second session: {foreign['session_id'] or 'unnamed'} "
+            f"(pid {foreign['pid']}) sends hooks as this lane; "
+            "its events are ignored"
+        )
     mail = record["mail"] or {}
     if "error" in mail:
         print(f"    Coordination unavailable: {mail['error']}")
@@ -6991,6 +6997,7 @@ reported.
             "dialog": (
                 state["dialog"] if isinstance(state.get("dialog"), dict) else {}
             ),
+            "foreign_session": checkpoints.foreign_reading(state),
             "retired_at": views.timestamp(participant.get("retired")),
             "retired_age_seconds": (
                 int(time.time() - float(participant["retired"]))

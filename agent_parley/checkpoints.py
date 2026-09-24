@@ -24,6 +24,7 @@ from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
 MAX_CONTEXT_BYTES = 1536
 MAX_CAUSE_BYTES = 200
+FOREIGN_WINDOW = 600
 MAX_EVENT_LOG_BYTES = 262144
 MAX_EVENT_LOG_AGE = 1209600
 EVENT_LOCK_TIMEOUT = 2.0
@@ -262,6 +263,7 @@ def record(
     output: dict | None,
     activity: str = "",
     cause: str = "",
+    detail: dict | None = None,
 ) -> None:
     """Appends one decision record to the participant event log.
 
@@ -291,6 +293,7 @@ def record(
         output: Native hook output returned for this event.
         activity: Observed lane activity, when it is already known.
         cause: Failure that produced this decision, when one did.
+        detail: Further fields that tell this decision's cases apart.
     """
     entry = {
         "ts": time.time(),
@@ -301,6 +304,7 @@ def record(
         "reason_class": reason.value,
         "cause": cause[:MAX_CAUSE_BYTES],
         "injected_bytes": injected_bytes(output),
+        **(detail or {}),
     }
     if (fallback := FALLBACK.get()) is not None:
         entry["fallback"] = fallback["cause"][:MAX_CAUSE_BYTES]
@@ -317,6 +321,97 @@ def record(
         with event_lock(directory, agent):
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(entry) + "\n")
+
+
+def foreign_session(
+    directory: Path,
+    agent: str,
+    state: dict,
+    payload: dict,
+    session_process: process.ServerProcess | None,
+) -> None:
+    """Records an event from a session that is not the lane's own.
+
+    A second client running in the lane's worktree with the lane's hooks
+    sends events under the lane's identity. Its events must not decide the
+    lane's label, so they are still discarded, but the discarded record now
+    names the arriving session, the lane's recorded one and the arriving
+    process, and the lane state keeps the newest such session so status and
+    problems can name it. The state is rewritten only when a different
+    session arrives, and never changes the lane's label or update time.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        state: Lane activity state read under the checkpoint lock.
+        payload: Native lifecycle event being discarded.
+        session_process: Native process the event was attributed to.
+    """
+    session = str(payload.get("session_id", ""))
+    pid = session_process.pid if session_process is not None else None
+    record(
+        directory,
+        agent,
+        payload,
+        Reason.SESSION_MISMATCH,
+        None,
+        detail={
+            "session_id": session,
+            "recorded_session_id": str(state.get("session_id", "")),
+            "pid": pid,
+        },
+    )
+    if (state.get("foreign_session") or {}).get("session_id") == session:
+        return
+    state["foreign_session"] = {
+        "session_id": session,
+        "pid": pid,
+        "ticks": (
+            session_process.ticks if session_process is not None else None
+        ),
+        "seen": time.time(),
+    }
+    write_json(directory / f"{agent}-activity.json", state)
+
+
+def foreign_reading(state: dict) -> dict:
+    """Reports the second session a lane's hooks came from, while it lasts.
+
+    A foreign session attributed to its own live process is reported while
+    that process runs. One attributed to the lane's own process, or to none,
+    cannot be watched that way, so it is reported for `FOREIGN_WINDOW`
+    seconds after it first sent an event.
+
+    Args:
+        state: Lane activity state.
+
+    Returns:
+        The foreign session's identifier, process ID and age in seconds, or
+        an empty mapping when none is recorded or it has ended.
+    """
+    foreign = state.get("foreign_session")
+    if not isinstance(foreign, dict):
+        return {}
+    seen = foreign.get("seen")
+    age = (
+        max(0, int(time.time() - float(seen)))
+        if isinstance(seen, (int, float))
+        else None
+    )
+    pid = foreign.get("pid")
+    watched = type(pid) is int and pid != state.get("session_pid")
+    live = (
+        process.alive(pid, foreign.get("ticks"))
+        if watched
+        else age is not None and age < FOREIGN_WINDOW
+    )
+    if not live:
+        return {}
+    return {
+        "session_id": str(foreign.get("session_id", "")),
+        "pid": pid,
+        "age_seconds": age,
+    }
 
 
 def announce(
@@ -1842,6 +1937,14 @@ def checkpoint(
     reads as unknown rather than stopped, which is the state an operator is
     told to return to a terminal for instead of relaunching.
 
+    An event from a session other than the recorded one is discarded unless
+    it opens a session. It used to be discarded until the next session
+    start even when the recorded session's process had exited, so a lane
+    whose start event was lost ignored its real session for as long as it
+    ran. An event from a new session is now adopted as a session start when
+    the recorded process is gone and the event is attributed to a live
+    native process. Any other such event is recorded by `foreign_session`.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -1970,18 +2073,23 @@ def checkpoint(
             if key in state
         }
         session = payload.get("session_id", "")
-        if (
-            state.get("session_id")
-            and session != state["session_id"]
-            and event != "SessionStart"
-        ):
-            record(directory, agent, payload, Reason.SESSION_MISMATCH, None)
-            return {}
-        new_session = event == "SessionStart" and session != state.get(
-            "session_id"
-        )
+        recorded = state.get("session_id")
         ended = state.get("session_pid") is not None and not process.alive(
             state.get("session_pid"), state.get("session_ticks")
+        )
+        changed = bool(recorded) and session != recorded
+        adopted = (
+            changed
+            and bool(session)
+            and event != "SessionStart"
+            and ended
+            and session_process is not None
+        )
+        if changed and event != "SessionStart" and not adopted:
+            foreign_session(directory, agent, state, payload, session_process)
+            return {}
+        new_session = session != recorded and (
+            event == "SessionStart" or adopted
         )
         if new_session:
             state["cursor"] = 0
@@ -1991,6 +2099,7 @@ def checkpoint(
             state.pop("work_offer", None)
             state.pop("session_pid", None)
             state.pop("session_ticks", None)
+            state.pop("foreign_session", None)
         elif event == "SessionStart" and ended:
             state.pop("session_pid", None)
             state.pop("session_ticks", None)

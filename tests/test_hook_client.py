@@ -1769,3 +1769,110 @@ def test_the_hook_reply_excludes_the_recovery_capture(
         time.sleep(0.05)
         state = checkpoints.activity(lane.parent, "codex")
     assert len(state["recovery_checkpoints"]) == 1
+
+
+def held_process():
+    """Starts a child that runs until its input closes."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+    return child, process.ServerProcess(
+        child.pid, process.start_ticks(child.pid)
+    )
+
+
+def release(child):
+    """Ends a child started by held_process and reaps it."""
+    child.stdin.close()
+    child.wait()
+
+
+def test_a_new_session_after_its_process_exited_is_adopted(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    child, ended = held_process()
+    release(child)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": ended.pid,
+            "session_ticks": ended.ticks,
+            "activity": "idle",
+            "cursor": 7,
+            "updated": time.time() - 60,
+        },
+    )
+    native = process.ServerProcess(
+        os.getpid(), process.start_ticks(os.getpid())
+    )
+
+    checkpoints.checkpoint(
+        bridge.home,
+        directory,
+        "codex",
+        {**ALLOW, "session_id": "s2", "cwd": str(lane)},
+        native,
+        record_only=True,
+    )
+
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_id"] == "s2"
+    assert state["session_pid"] == native.pid
+    assert state["activity"] == "working"
+    assert state["cursor"] == 0
+    assert events(directory)[-1]["reason_class"] == "observed"
+
+
+def test_a_concurrent_foreign_session_is_named_and_never_relabels(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    recorded = {
+        "session_id": "s1",
+        "session_pid": own.pid,
+        "session_ticks": own.ticks,
+        "activity": "idle",
+        "updated": time.time() - 60,
+    }
+    write_json(directory / "codex-activity.json", recorded)
+    child, foreign = held_process()
+    try:
+        for _ in range(2):
+            assert (
+                checkpoints.checkpoint(
+                    bridge.home,
+                    directory,
+                    "codex",
+                    {**ALLOW, "session_id": "s2", "cwd": str(lane)},
+                    foreign,
+                )
+                == {}
+            )
+        state = json.loads((directory / "codex-activity.json").read_text())
+        assert {key: state[key] for key in recorded} == recorded
+        assert state["foreign_session"]["session_id"] == "s2"
+        assert state["foreign_session"]["pid"] == child.pid
+        dropped = events(directory)[-2:]
+        assert [entry["reason_class"] for entry in dropped] == [
+            "session_mismatch"
+        ] * 2
+        assert dropped[-1]["session_id"] == "s2"
+        assert dropped[-1]["recorded_session_id"] == "s1"
+        assert dropped[-1]["pid"] == child.pid
+        reading = checkpoints.foreign_reading(state)
+        assert reading["pid"] == child.pid
+        [record] = [
+            entry
+            for entry in bridge.status_snapshot()["projects"][0]["participants"]
+            if entry["participant"] == "codex"
+        ]
+        assert record["foreign_session"]["session_id"] == "s2"
+    finally:
+        release(child)
+    assert checkpoints.foreign_reading(state) == {}
