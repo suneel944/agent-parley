@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import tempfile
 import time
 from pathlib import Path
 
@@ -676,22 +677,22 @@ def test_a_missing_project_root_is_retired_within_one_interval(
     assert dashboard.collect(bridge.home, False, {})["projects"] == []
 
 
-def test_service_start_removes_wake_sockets_nobody_listens_on(tmp_path):
-    home = tmp_path / "state"
-    home.mkdir()
-    stale = home / "wake-stale.sock"
-    live = home / "wake-live.sock"
-    with socket.socket(socket.AF_UNIX) as dead:
-        dead.bind(str(stale))
-    with socket.socket(socket.AF_UNIX) as listener:
-        listener.bind(str(live))
-        listener.listen(1)
+def test_service_start_removes_wake_sockets_nobody_listens_on():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        home = Path(temporary)
+        stale = home / "wake-stale.sock"
+        live = home / "wake-live.sock"
+        with socket.socket(socket.AF_UNIX) as dead:
+            dead.bind(str(stale))
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(live))
+            listener.listen(1)
 
-        removed = terminal.sweep_sockets(home)
+            removed = terminal.sweep_sockets(home)
 
-        assert live.exists()
-    assert removed == ["wake-stale.sock"]
-    assert not stale.exists()
+            assert live.exists()
+        assert removed == ["wake-stale.sock"]
+        assert not stale.exists()
 
 
 def test_a_lane_orphaned_past_the_ceiling_is_ready_to_retire():
