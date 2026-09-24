@@ -163,7 +163,7 @@ def test_an_open_pull_request_never_escalates(bridge, claimed, monkeypatch):
 
 
 def test_the_escalation_reaches_status_and_problems(
-    bridge, repo, claimed, monkeypatch
+    bridge, repo, paired, claimed, monkeypatch
 ):
     escalated(bridge, claimed, monkeypatch)
     lanes = bridge.status_snapshot()["projects"][0]["participants"]
@@ -182,7 +182,9 @@ def test_the_escalation_reaches_status_and_problems(
     ]
     assert len(listed) == 1
     assert listed[0]["participant"] == "claude"
-    assert listed[0]["command"].startswith("agent-parley issue resolve 1")
+    assert listed[0]["command"] == (
+        f"agent-parley issue resolve 1 --repo {paired['root']}"
+    )
 
 
 def owed(bridge, paired, lane, monkeypatch):
