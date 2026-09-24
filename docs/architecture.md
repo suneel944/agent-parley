@@ -306,7 +306,14 @@ whichever is later. `status` prints that next time, and prints the exhausted
 budget with its last cause and the backoff for a lane that spent every
 attempt. Each poll stage runs isolated: a failing stage is recorded in
 `supervision-error.json` and `server.log`, reported by `status` and `problems`,
-and the remaining stages still run; a clean poll clears the record. An offer is
+and the remaining stages still run; a clean poll clears the record. Every
+exception is caught, each lane's wake is its own stage, and the record names
+the stage, the lane and the line that raised; the supervision thread itself
+catches every exception a poll raises, so one malformed record can no longer
+end supervision for the service. The poll's presence write waits the store's
+busy timeout like every other writer. Each poll writes
+`supervision-poll.json`, and `status` prints its age, its wall time and the
+age of the last clean poll. An offer is
 advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served

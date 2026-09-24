@@ -727,6 +727,32 @@ def supervision_failure(error: dict) -> str:
     return f"Supervision: failing for {since}s; last: {error['detail']}"
 
 
+def supervision_liveness(polled: dict) -> str:
+    """States when supervision last polled the project and how long it took.
+
+    A supervision thread that died leaves this reading ageing, so the line
+    distinguishes a supervisor that stopped from one that is merely quiet.
+
+    Args:
+        polled: Poll record written beside the project's issue ledger.
+
+    Returns:
+        One line naming the age and wall time of the last poll and the age
+        of the last poll in which no step failed.
+    """
+    now = time.time()
+    line = (
+        f"Supervision: last poll {max(int(now - polled['at']), 0)}s ago "
+        f"in {float(polled.get('seconds', 0)):.2f}s"
+    )
+    clean = polled.get("clean_at")
+    if clean is None:
+        return line + "; no clean poll recorded"
+    if clean != polled["at"]:
+        return line + f"; last clean {max(int(now - clean), 0)}s ago"
+    return line
+
+
 def wake_schedule(wake: dict) -> str:
     """States when a parked lane is asked again, or why it is not.
 
@@ -7162,6 +7188,7 @@ reported.
                         "supervision_error": issues.supervision_error(
                             path.parent
                         ),
+                        "supervision_poll": supervision.last_poll(path.parent),
                     }
                 )
         return {
@@ -7217,6 +7244,9 @@ reported.
             print(f"\nProject: {data['root']}")
             if failing := project.get("supervision_error"):
                 print(supervision_failure(failing))
+            polled = project.get("supervision_poll") or {}
+            if isinstance(polled.get("at"), (int, float)):
+                print(supervision_liveness(polled))
             print(describe(snapshot(path.parent)))
             if measured := reclaim.summary_line(project.get("reclaim") or {}):
                 print(measured)

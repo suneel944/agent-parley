@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeGuard
@@ -46,6 +47,7 @@ RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 BOOT_RECORD = "boot.json"
 READINGS_PUBLICATION = "git-readings.json"
+POLL_RECORD = "supervision-poll.json"
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -3597,7 +3599,12 @@ def poll(home: Path, directory: Path) -> None:
     the service still reported healthy. A failing stage is now recorded, the
     rest of the poll still runs, and the failures are published beside the
     issue ledger where status and problems report them; a poll in which every
-    stage succeeded clears that record.
+    stage succeeded clears that record. A stage catches every exception, and
+    its record names the stage, the lane a wake belongs to and the line that
+    raised, so one lane's failure never starves the lanes after it.
+
+    Each poll records when it finished, how long it took and when the last
+    clean poll finished, which status reports as the supervisor's liveness.
     """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
@@ -3606,13 +3613,14 @@ def poll(home: Path, directory: Path) -> None:
         return
     (directory / ROOT_PUBLICATION).unlink(missing_ok=True)
     failures: list[str] = []
+    started = time.time()
 
     def stage(label: str, call: Callable[..., object], *args: object) -> None:
         """Runs one poll stage, recording rather than raising its failure."""
         try:
             call(*args)
-        except (BridgeError, OSError, ValueError, sqlite3.Error) as exc:
-            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            failures.append(failure(label, exc))
 
     stage("reboot", settle_reboot, directory, manifest)
     stage("launches", launches, directory, manifest, config)
@@ -3627,7 +3635,16 @@ def poll(home: Path, directory: Path) -> None:
     stage("deliveries", deliveries, home, directory, manifest)
     stage("dependencies", lifecycle.settle_dependencies, directory)
     if config["prompts"]:
-        _remind(home, directory, manifest, config, observations, stage)
+        stage(
+            "completions",
+            _remind,
+            home,
+            directory,
+            manifest,
+            config,
+            observations,
+            stage,
+        )
         stage("work", work, home, directory, manifest, config)
         stage(
             "overdue claims",
@@ -3658,6 +3675,59 @@ def poll(home: Path, directory: Path) -> None:
     else:
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
+    finished = time.time()
+    with contextlib.suppress(OSError):
+        write_json(
+            directory / POLL_RECORD,
+            {
+                "at": finished,
+                "seconds": round(finished - started, 3),
+                "failed": len(failures),
+                "clean_at": (
+                    finished
+                    if not failures
+                    else last_poll(directory).get("clean_at")
+                ),
+            },
+        )
+
+
+def failure(label: str, exc: BaseException) -> str:
+    """Describes a failed poll step with the line that raised it.
+
+    Args:
+        label: Poll stage, naming the lane when the step belongs to one.
+        exc: Exception the step raised.
+
+    Returns:
+        The stage, the exception type and text, and the innermost frame that
+        raised it, so a recorded failure can be traced without the log.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = (
+        f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}"
+        if frames
+        else ""
+    )
+    return f"{label}: {type(exc).__name__}: {exc}{where}"
+
+
+def last_poll(directory: Path) -> dict:
+    """Reads when supervision last finished a poll of one project.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        The finish time, the wall seconds it took, how many steps failed and
+        when the last poll with no failed step finished, or an empty mapping
+        when no poll has been recorded or the record is unreadable.
+    """
+    try:
+        value = json.loads((directory / POLL_RECORD).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _publish_presence(
@@ -3665,12 +3735,16 @@ def _publish_presence(
 ) -> None:
     """Stores this poll's presence reading for every lane.
 
+    The write waits `store.BUSY_TIMEOUT` like every other writer. It used to
+    give up at once, so under steady hook traffic the presence reading was
+    skipped on the polls that needed it most.
+
     Args:
         home: Private bridge state root.
         manifest: Current participant manifest.
         observations: Presence reading per participant.
     """
-    with store.connect(home, write=True, timeout=0) as db:
+    with store.connect(home, write=True) as db:
         for name, participant in manifest["participants"].items():
             observed = observations[name]
             db.execute(
@@ -4578,6 +4652,11 @@ def run(home: Path, stopped: threading.Event) -> None:
     isolated, is written to the service log and to the project's supervision
     error record, which status and problems report, so a supervisor that
     fails on every tick is distinguishable from a healthy one.
+
+    Every exception a poll raises is caught, not only the expected kinds.
+    This thread is started once and serves every project, so an unexpected
+    `KeyError` from one malformed record used to end supervision for the
+    whole service with no trace until it was restarted.
     """
     from agent_parley import server
 
@@ -4593,10 +4672,8 @@ def run(home: Path, stopped: threading.Event) -> None:
                 manifest = roster.read(path.parent)
                 interval = configuration(home, manifest)["interval"]
                 poll(home, path.parent)
-            except (OSError, ValueError, BridgeError, sqlite3.Error) as exc:
-                issues.note_supervision_error(
-                    path.parent, f"poll: {type(exc).__name__}: {exc}"
-                )
+            except Exception as exc:
+                issues.note_supervision_error(path.parent, failure("poll", exc))
             if error := issues.supervision_error(path.parent):
                 server.log(
                     home,
@@ -4604,5 +4681,8 @@ def run(home: Path, stopped: threading.Event) -> None:
                     f"{path.parent.name}: {error['detail']}",
                 )
             deadlines[path] = time.monotonic() + interval
-        reap_launchers()
+        try:
+            reap_launchers()
+        except Exception as exc:
+            server.log(home, "supervision", failure("reap launchers", exc))
         stopped.wait(1)
