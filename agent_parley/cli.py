@@ -2821,6 +2821,10 @@ class Bridge:
         serves, and the hooks' relaunch still finds a record to retry from,
         with a backoff the failure count sets.
 
+        A service already serving is left running and the store is migrated
+        in place to this build's schema, so repairing a store an upgrade left
+        behind interrupts no lane.
+
         Raises:
             BridgeError: If the port is occupied or startup fails.
         """
@@ -2845,6 +2849,7 @@ class Bridge:
                         "Server is running but unhealthy. "
                         f"Inspect {self.home}/server.log"
                     )
+                store.initialize(self.home)
                 return
             failed = {
                 "state": "failed",

@@ -1044,8 +1044,9 @@ def outage(home: Path, cause: str) -> str:
 
     The failure that produced the outage is named rather than summarized away,
     because the agent reading the denial has no other view of it. A store left
-    behind the running code is the common case and has a known repair, so that
-    repair is prescribed in place of the generic status check.
+    behind the running code is the common case, and this build migrates it in
+    place here, so the denial names the schema pair and the retry instead of
+    a restart that would interrupt every lane on the machine.
 
     Args:
         home: Private bridge state root.
@@ -1057,10 +1058,7 @@ def outage(home: Path, cause: str) -> str:
     """
     action = OUTAGE_CHECK
     with contextlib.suppress(OSError, sqlite3.Error):
-        action = (
-            store.remedy(store.schema_state(store.schema_version(home)))
-            or OUTAGE_CHECK
-        )
+        action = store.reconcile(home, cause) or OUTAGE_CHECK
     return (
         f"Agent Parley cannot verify coordination: {cause} "
         f"{action} {OUTAGE_GUIDANCE}"
