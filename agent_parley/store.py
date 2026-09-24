@@ -36,6 +36,7 @@ MAX_RESULT_BYTES = 8192
 MAX_RECIPIENTS = 16
 MAX_ROSTER = 32
 MAX_EVENT_ROWS = 2000
+REFUSAL_SECONDS = 86400.0
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
@@ -154,6 +155,11 @@ CREATE TABLE IF NOT EXISTS reservation_requests (
  granted_ts TEXT, cancelled_ts TEXT, claim_id TEXT);
 CREATE INDEX IF NOT EXISTS queued ON reservation_requests(project_id,id)
  WHERE granted_ts IS NULL AND cancelled_ts IS NULL;
+CREATE TABLE IF NOT EXISTS reservation_refusals (
+ project_id INTEGER NOT NULL REFERENCES projects(id),
+ agent_id INTEGER NOT NULL REFERENCES agents(id), holder TEXT NOT NULL,
+ path_pattern TEXT NOT NULL, refused_ts REAL NOT NULL,
+ PRIMARY KEY(project_id,agent_id,holder,path_pattern));
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), tool TEXT NOT NULL,
@@ -2762,6 +2768,8 @@ def _dispatch(
         result = _serve(
             db, actor, tool, args, declared, claim, commits, directory
         )
+        if tool in RESERVING and result.get("conflicts"):
+            _record_refusals(db, actor, result["conflicts"])
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -4316,6 +4324,86 @@ def _waiting_on(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
     return waiting
 
 
+def _record_refusals(
+    db: sqlite3.Connection, actor: dict, conflicts: list[dict]
+) -> None:
+    """Records which holder refused this lane which key.
+
+    A refused lane that did not queue leaves nothing behind in the queue, so
+    an idle holder blocking it was visible only to the lane that asked. One
+    row per refused lane, holder and key is kept at its latest refusal, and
+    rows older than `REFUSAL_SECONDS` are retired on every write.
+
+    Args:
+        db: Open transaction that also carries the refused call.
+        actor: Authenticated project and the lane that was refused.
+        conflicts: Conflicts the refused batch reported.
+    """
+    now = time.time()
+    db.executemany(
+        "INSERT INTO reservation_refusals(project_id,agent_id,holder,"
+        "path_pattern,refused_ts) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(project_id,agent_id,holder,path_pattern) "
+        "DO UPDATE SET refused_ts=excluded.refused_ts",
+        [
+            (
+                actor["project_id"],
+                actor["id"],
+                conflict["owner"],
+                conflict["path"],
+                now,
+            )
+            for conflict in conflicts
+        ],
+    )
+    db.execute(
+        "DELETE FROM reservation_refusals WHERE project_id=? AND refused_ts<?",
+        (actor["project_id"], now - REFUSAL_SECONDS),
+    )
+
+
+def _refused_by(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
+    """Maps each holding lane to the lanes it refused and still blocks.
+
+    A refusal is reported under its holder only while that holder keeps a
+    live lease overlapping the refused key, so a holder that released,
+    expired into reclamation or was reclaimed drops out without a separate
+    cleanup.
+
+    Args:
+        db: Open read transaction to answer from.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        Mapping of holding identity to the sorted identities it refused.
+    """
+    refusals = db.execute(
+        "SELECT r.holder AS holder,r.path_pattern AS pattern,"
+        "a.name AS name FROM reservation_refusals r "
+        "JOIN agents a ON a.id=r.agent_id "
+        "JOIN projects p ON p.id=r.project_id WHERE p.human_key=?",
+        (root,),
+    ).fetchall()
+    if not refusals:
+        return {}
+    leases = db.execute(
+        "SELECT a.name AS name,f.path_pattern AS pattern "
+        "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
+        "JOIN projects p ON p.id=f.project_id WHERE p.human_key=? "
+        "AND f.released_ts IS NULL",
+        (root,),
+    ).fetchall()
+    refused: dict[str, set[str]] = {}
+    for refusal in refusals:
+        if any(
+            lease["name"] == refusal["holder"]
+            and overlapping(refusal["pattern"], lease["pattern"])
+            for lease in leases
+        ):
+            refused.setdefault(refusal["holder"], set()).add(refusal["name"])
+    return {holder: sorted(names) for holder, names in refused.items()}
+
+
 def usage(
     home: Path, root: str, *, db: sqlite3.Connection | None = None
 ) -> dict[str, dict]:
@@ -4331,7 +4419,8 @@ def usage(
         returned bytes, held leases, how many of those leases are past a
         declared time to live, the age of its oldest held lease, how long
         the oldest expired one has been expired, and the queued reservation
-        requests waiting on the keys it holds with the lanes that asked. An
+        requests waiting on the keys it holds with the lanes that asked,
+        and the lanes it refused a key it still holds as ``refused``. An
         expired lease is counted apart from the live ones and keeps blocking
         until it is renewed, released or reclaimed; a queued request holds
         nothing of its own. Counts cover retained events only; older events
@@ -4358,11 +4447,14 @@ def usage(
                 "stale_lease_age": 0,
                 "queued": 0,
                 "queued_by": [],
+                "refused": [],
             }
         for holder, waiting in _waiting_on(db, root).items():
             report.setdefault(holder, {}).update(
                 queued=len(waiting), queued_by=sorted(set(waiting))
             )
+        for holder, refused in _refused_by(db, root).items():
+            report.setdefault(holder, {}).update(refused=refused)
         for row in db.execute(
             "SELECT a.name AS name,count(*) AS leases,"
             "coalesce(sum(f.expires_ts IS NOT NULL "

@@ -956,6 +956,8 @@ def lane_detail(record: dict, data: dict) -> None:
                 else ""
             )
         )
+    if mail.get("refused"):
+        print("    Refused a key it holds: " + ", ".join(mail["refused"]))
     print(f"    Last coordination: {mail['last_coordination_at']}")
     for pending in mail["outstanding_ack"]:
         print(
@@ -7075,6 +7077,7 @@ reported.
             "queued_by": list(
                 frame["usage"].get(name, {}).get("queued_by", [])
             ),
+            "refused": list(frame["usage"].get(name, {}).get("refused", [])),
             "last_coordination_at": views.timestamp(mail["last_coordination"]),
             "outstanding_ack": [
                 {

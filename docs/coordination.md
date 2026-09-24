@@ -198,6 +198,12 @@ advisory like the reservation it asks for: it blocks nobody and holds nothing
 until that release. `status` names the requests queued on a lane's keys and who
 asked; `top` marks the count with `+` beside that lane's leases.
 
+Every refusal, queued or not, is also recorded against its holder for a day.
+`status` names the lanes a holder refused a key it still holds, and
+`problems` raises a `holding a refused key` row on a holder that is not
+active, with how long it has been quiet. A refusal drops out of both once
+the holder releases or loses the overlapping lease.
+
 An operator editing the base checkout is otherwise invisible to a lane until the
 merge conflicts. Every `top` and `status` frame reads `git status` of the base
 checkout once per project and matches the dirty paths against each lane's active

@@ -43,6 +43,7 @@ WAKE = "wake attention"
 APPROVAL = "waiting on approval"
 HELD = "held by a native dialog"
 READY = "ready to retire"
+HOLDING = "holding a refused key"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -447,7 +448,10 @@ def _lane_rows(
         because a prompt the operator is about to answer needs no row. A
         native dialog the launcher escalated is reported at once by name,
         with the options it offers, because nothing will answer it but the
-        operator. A lane that retired reports only the worktree it kept,
+        operator. A quiet lane that refused a peer a key it still holds is
+        reported with the lanes it refused and how long it has been quiet,
+        because the refused lane saw the refusal and nobody else did. A
+        lane that retired reports only the worktree it kept,
         because its quiet is the state the operator asked for and every
         other remedy here would wake a lane that has given its work back.
     """
@@ -555,6 +559,21 @@ def _lane_rows(
     )
     rows.extend(_unresolved_rows(record, name, repo, root, now))
     rows.extend(_ack_rows(record, name, repo, root, ack_after, waking))
+    refused = (record.get("mail") or {}).get("refused") or []
+    if quiet and refused:
+        command, actor = _remedy(name, repo, record, waking)
+        rows.append(
+            _row(
+                HOLDING,
+                f"idle while holding a key refused to {_listed(refused)}",
+                command,
+                availability["age_seconds"],
+                name,
+                root,
+                actor,
+                len(refused),
+            )
+        )
     if record["drift"]:
         rows.append(
             _row(
