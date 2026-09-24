@@ -1465,8 +1465,8 @@ attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `start_deadline` (30 seconds),
-`completion_reminders` (3 reminders, 1 to 100), `prompts`, `wake` and
-`reclaim` (all true). Numeric second values range from 1 to 86400 seconds.
+`completion_reminders` (3 reminders, 1 to 100), `prompts`, `wake`,
+`reclaim` and `titles` (all true). Numeric second values range from 1 to 86400 seconds.
 The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
 `wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
@@ -1547,7 +1547,45 @@ from the input-state check without hiding operator bytes that arrived in the
 same read; incomplete replies are carried until the next read and refuse a wake
 until they complete.
 Results appear in `status`, the retained event log and
-private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`.
+private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`,
+which the launcher truncates before a write would take it past 1 MiB. A failed
+write to that log, including a full disk, is dropped and never ends the resumed
+session. A wake request whose lane activity record is missing or unreadable is
+answered `unknown` rather than with an empty reply.
+
+The launcher ends a session when the client exits, even while a background
+process the client started still holds the terminal. `SIGTERM` and `SIGHUP`
+to the launcher run the same cleanup as a normal exit (terminal restored, wake
+socket removed, lane published `stopped`) and are then forwarded to the client.
+A client binary that cannot be started exits the launcher with status 127.
+
+An attached `agent-parley run` owns its terminal tab title. The title leads
+with the lane name, then one state word (`working`, `idle`, `idle with claim`,
+`blocked: dialog`, `blocked: approval`, `starting`, `stopped`), the lowest
+issue number the lane holds and its progress as `done/total`, or `0 open`, for
+example `[claude-a] idle with claim #412 - 2/5 done`. The title the client sets
+for itself follows after ` | ` and is truncated first. The title is refreshed
+when the lane's activity record or the issue ledger changes or a dialog holds
+the screen, and the terminal's previous title is restored on exit. Set the
+supervision key `titles` to false to keep the client's native title.
+
+`agent-parley title` prints the same line for the lane that contains the
+current directory, without the client's title, and prints nothing outside a
+lane. It reads only the lane's private records, so a status line can run it on
+every refresh. Per provider:
+
+- Claude Code: add a command status line to the user settings
+  (`~/.claude/settings.json`) or the project's `.claude/settings.local.json`:
+
+  ```json
+  {"statusLine": {"type": "command", "command": "agent-parley title"}}
+  ```
+
+  The command runs in the session's directory, so every lane shows its own
+  line and sessions outside a lane show an empty one.
+- Codex, Gemini CLI, GitHub Copilot CLI, OpenCode and Amp: not supported. Agent
+  Parley configures no command-driven status line for them; their lanes carry
+  the summary in the tab title only.
 Lanes launched before wake sockets were introduced require relaunching. A live
 native session started outside `agent-parley run` has no wake socket. Exit that
 session and launch it through `agent-parley run` before automatic waking can
