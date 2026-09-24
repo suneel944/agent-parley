@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from agent_parley import attachments, lifecycle, retries
-from agent_parley.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, Transient, lock, write_json
 
 MAX_BLOCKERS = 10
 SUPERVISION_ERROR = "supervision-error.json"
@@ -359,6 +359,10 @@ def unclaimed(state: dict) -> list[str]:
 def _refuse(directory: Path, scope: str, fingerprint: str, detail: str) -> None:
     """Records a refused transition so a retry is refused identically.
 
+    Only refusals that describe the ledger reach this record. A transient
+    refusal, such as lock contention or recovery evidence that changed, is
+    raised without it, so a retry with the same key is evaluated again.
+
     A refusal changed no ownership, so its ledger write never happened and the
     key is recorded afterwards under the lock again. An interruption before
     that record leaves the key absent, and the retry is evaluated and refused
@@ -484,6 +488,8 @@ def change(
             takeover=takeover,
             **transition,
         )
+    except Transient:
+        raise
     except BridgeError as exc:
         _refuse(directory, scope, fingerprint, str(exc))
         raise
@@ -503,6 +509,27 @@ def _drop_offer(directory: Path, record: dict) -> None:
     for field in ("attachment", "diff"):
         if offer.get(field):
             attachments.remove(directory, str(offer[field]))
+
+
+def _clear_recovery(record: dict) -> dict:
+    """Removes the previous generation's take and orphan marker.
+
+    Both describe one ownership generation. Left on the record past a change
+    of owner, a take makes the next claim restore a dead owner's checkpoint
+    over work handed on since, and an orphan marker hides the new owner's
+    continue offers and names an owner that no longer holds the issue.
+
+    Args:
+        record: Mutable issue record whose ownership is changing.
+
+    Returns:
+        The removed fields, for the transition's history entry.
+    """
+    return {
+        field: record.pop(field)
+        for field in ("taken", "orphan")
+        if record.get(field)
+    }
 
 
 def _unseen() -> dict:
@@ -561,7 +588,7 @@ def _taken(
         or takeover.get("orphan_id") != orphan.get("id")
         or not takeover.get("checkpoint")
     ):
-        raise BridgeError(
+        raise Transient(
             f"Issue #{issue} recovery evidence changed; inspect and retry."
         )
     from agent_parley import recovery
@@ -786,8 +813,10 @@ def _change(
             orphan take.
 
     A transition that ends an ownership generation, by releasing it, by
-    handing it to another lane or by taking it from an orphaned owner, also
-    retires the mail that generation sent. Supersession is written where the
+    handing it to another lane, by taking it from an orphaned owner or by the
+    owner re-claiming its own orphan-marked issue, also retires the mail that
+    generation sent, and moves the generation's take and orphan marker into
+    the transition's history entry. Supersession is written where the
     claim changes rather than derived when a lane is woken, because only the
     transition knows which generation stopped mattering and why.
 
@@ -803,6 +832,7 @@ def _change(
     blocker = ""
     retired = ""
     retired_reason = ""
+    cleared: dict = {}
     if action in ("block", "unblock"):
         blocker = parse_issue(on or "", "Blocker")
         if blocker == issue:
@@ -846,6 +876,12 @@ def _change(
                     "claim it without --take-orphaned."
                 )
             previous = record or {}
+            if not taken:
+                cleared = _clear_recovery(dict(previous))
+            reclaimed = previous.get("owner") == agent
+            if reclaimed:
+                retired = str(previous.get("claim_id") or "")
+                retired_reason = f"issue #{issue} re-claimed by {agent}"
             budget = budgets.get("attempts")
             expected = within if within is not None else budgets.get("claim")
             record = {
@@ -864,10 +900,13 @@ def _change(
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
-            if taken:
-                record["taken"] = taken
+            if taken or reclaimed:
                 if inherited := previous.get("handoff"):
                     record["handoff"] = inherited
+            if reclaimed and previous.get("attachment"):
+                record["attachment"] = previous["attachment"]
+            if taken:
+                record["taken"] = taken
         elif action == "assign":
             record = _assign(
                 record,
@@ -882,8 +921,9 @@ def _change(
             record = _withdraw(record, issue)
         else:
             answering = action in ("accept", "decline")
+            operating = action == "unblock" and agent == OPERATOR
             if not record or not (
-                record["owner"] or (answering and record["offer"])
+                record["owner"] or (answering and record["offer"]) or operating
             ):
                 raise BridgeError(f"Issue #{issue} has no owner.")
             request = record.get("request")
@@ -920,6 +960,7 @@ def _change(
                         claim_id=uuid.uuid4().hex[:16],
                     )
                     lifecycle.claimed(record, record["claim_id"])
+                    cleared = _clear_recovery(record)
                     if offer.get("attachment"):
                         record["attachment"] = offer["attachment"]
                     record["handoff"] = inherited
@@ -927,7 +968,7 @@ def _change(
                     _drop_offer(directory, record)
                 record["offer"] = None
             else:
-                if record["owner"] != agent:
+                if record["owner"] != agent and not operating:
                     raise BridgeError(
                         f"Only {record['owner']} can change issue #{issue}."
                     )
@@ -989,10 +1030,24 @@ def _change(
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
+                    cleared = _clear_recovery(record)
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
-                    if blocker in waiting:
+                    known = state["issues"].get(blocker)
+                    if known is None:
+                        raise BridgeError(
+                            f"Issue #{blocker} is not in the issue ledger; "
+                            "block only on recorded work."
+                        )
+                    if blocker in waiting or (
+                        lifecycle.state(known)["state"] == lifecycle.COMPLETE
+                    ):
                         return record
+                    if lifecycle.reaches(state["issues"], blocker, issue):
+                        raise BridgeError(
+                            f"Issue #{issue} waiting on #{blocker} would form "
+                            "a dependency cycle."
+                        )
                     if len(waiting) >= MAX_BLOCKERS:
                         raise BridgeError(
                             f"Issue #{issue} already waits on {MAX_BLOCKERS} "
@@ -1022,6 +1077,8 @@ def _change(
         }
         if logged == "take":
             history["taken"] = dict(record["taken"])
+        if cleared:
+            history["cleared"] = cleared
         record["history"].append(history)
         state["issues"][issue] = record
         if scope:

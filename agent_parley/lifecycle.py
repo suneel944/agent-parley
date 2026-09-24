@@ -361,7 +361,7 @@ def record_report(
                     f"Resume issue #{resumed_by} is already complete."
                 )
             blockers = set(record.get("blocked_by", [])) | {resumed_by}
-            if _reaches(ledger["issues"], resumed_by, number):
+            if reaches(ledger["issues"], resumed_by, number):
                 raise BridgeError(
                     f"Issue #{number} waiting on #{resumed_by} would form "
                     "a dependency cycle."
@@ -509,6 +509,54 @@ def complete(
         directory, claim_id, f"issue #{issue} completed"
     )
     return record
+
+
+def settle_dependencies(directory: Path) -> list[tuple[str, str]]:
+    """Drops dependency edges whose blocker is complete or no longer recorded.
+
+    Completion frees its dependents at the instant it is recorded, which
+    misses an edge added afterwards and an edge to an issue the ledger does
+    not hold. Such an edge can never clear on its own, and while it stands
+    the waiting issue can neither report ready nor be listed as unclaimed,
+    whether or not anybody still owns it. The supervisor calls this on every
+    poll, so the edge is reconciled whoever holds the issue.
+
+    Args:
+        directory: Private state directory for the common repository.
+
+    Returns:
+        The waiting issue and dropped blocker of every removed edge.
+
+    Raises:
+        BridgeError: If the ledger cannot be locked.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = _snapshot(directory)
+        records = ledger["issues"]
+        stale = sorted(
+            {
+                blocker
+                for record in records.values()
+                for blocker in record.get("blocked_by", [])
+                if blocker not in records
+                or state(records[blocker])["state"] == COMPLETE
+            },
+            key=int,
+        )
+        dropped = [
+            (number, blocker)
+            for number, record in records.items()
+            for blocker in record.get("blocked_by", [])
+            if blocker in stale
+        ]
+        if not dropped:
+            return []
+        now = time.time()
+        for blocker in stale:
+            _reconcile_dependents(ledger, blocker, now)
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+    return sorted(dropped, key=lambda edge: (int(edge[0]), int(edge[1])))
 
 
 def _reconcile_dependents(ledger: dict, issue: str, now: float) -> None:
@@ -695,8 +743,18 @@ def _issue_number(value: str, label: str = "Issue") -> str:
     return str(int(number))
 
 
-def _reaches(records: dict, start: str, target: str) -> bool:
-    """Reports whether dependency edges lead from start to target."""
+def reaches(records: dict, start: str, target: str) -> bool:
+    """Reports whether dependency edges lead from start to target.
+
+    Args:
+        records: Every issue record in the ledger, keyed by number.
+        start: Issue the walk starts from.
+        target: Issue whose reachability is asked about.
+
+    Returns:
+        True when following ``blocked_by`` edges from start arrives at target,
+        which is exactly when an edge from target to start closes a cycle.
+    """
     pending = [start]
     seen = set()
     while pending:

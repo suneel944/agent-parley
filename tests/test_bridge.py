@@ -1402,6 +1402,9 @@ def test_issue_dependencies_are_owner_only_and_survive_a_release(
     revision = bridge.issue(repo, "list")["revision"]
     assert bridge.issue(claude, "block", "432", on="77")["blocked_by"] == ["77"]
     assert bridge.issue(repo, "list")["revision"] == revision
+    for extra in [*range(100, 99 + MAX_BLOCKERS), 999]:
+        bridge.issue(codex, "claim", str(extra))
+        bridge.issue(codex, "release", str(extra))
     for extra in range(100, 99 + MAX_BLOCKERS):
         bridge.issue(claude, "block", "432", on=str(extra))
     with pytest.raises(BridgeError, match="drop one with issue unblock"):
@@ -1514,6 +1517,13 @@ def test_forge_mirrors_use_the_operator_account_and_absorb_refusal(
     assert forge.assign(repo, "42") is False
 
 
+def recorded(bridge, repo, number):
+    """Records one issue in the ledger through a plan, claiming nothing."""
+    path = repo.parent / f"record-{number}.toml"
+    path.write_text(f'[dependencies]\n"{int(number) + 1}" = ["{number}"]\n')
+    bridge.work_plan(repo, "apply", path)
+
+
 def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
     bridge, repo, paired, monkeypatch
 ):
@@ -1530,6 +1540,7 @@ def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
         "agent_parley.cli.forge.unassign",
         lambda directory, number: mirrored.append(("unassign", number)),
     )
+    recorded(bridge, repo, "77")
     bridge.issue(claude, "claim", "#432")
     bridge.issue(claude, "block", "432", on="77")
     bridge.issue(claude, "release", "432")
@@ -1646,6 +1657,7 @@ def test_recorded_issue_title_survives_later_transitions(
         "agent_parley.cli.forge.issue_title",
         lambda directory, number: "Resolved from the forge",
     )
+    recorded(bridge, repo, "77")
     bridge.issue(claude, "claim", "432")
     blocked = bridge.issue(claude, "block", "432", on="77")
     assert blocked["title"] == "Resolved from the forge"

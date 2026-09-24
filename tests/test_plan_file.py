@@ -133,6 +133,18 @@ def test_a_cycle_is_refused_before_any_edge_is_written(bridge, repo, paired):
     assert issues.snapshot(directory)["issues"] == {}
 
 
+def test_a_cycle_across_two_plans_is_refused(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    first = written(repo.parent, '[dependencies]\n"20" = ["10"]\n', "a.toml")
+    second = written(repo.parent, '[dependencies]\n"10" = ["20"]\n', "b.toml")
+    bridge.work_plan(repo, "apply", first)
+
+    with pytest.raises(BridgeError, match="dependency cycle"):
+        bridge.work_plan(repo, "apply", second)
+    waiting = issues.snapshot(directory)["issues"]["10"]
+    assert waiting.get("blocked_by", []) == []
+
+
 @pytest.mark.parametrize(
     ("text", "message"),
     [

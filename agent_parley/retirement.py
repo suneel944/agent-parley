@@ -12,7 +12,9 @@ owns it again rather than waiting on a lane that is gone. Work is released
 rather than offered back to its sender, because an offer leaves ownership on
 the offering lane until the recipient answers, and a retired lane can answer
 nothing; the sender is told by mail instead, and the issue is immediately
-claimable by any lane.
+claimable by any lane. Ready work is the exception: it must stay claimed until
+verified integration completes, so a lane holding any is refused before a
+single issue is released, rather than left half retired.
 
 The worktree leaves next, and only when Git reports it clean. A lane with
 uncommitted changes keeps its worktree and reports the paths, because
@@ -31,7 +33,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from agent_parley import issues, roster
+from agent_parley import issues, lifecycle, roster
 from agent_parley.state import BridgeError, lock, write_json
 
 GIT_SECONDS = 30
@@ -115,13 +117,33 @@ def _return_work(directory: Path, manifest: dict, name: str) -> dict:
         declined back to their offering lanes, and the lanes that had handed
         this one work, each with the numbers they sent, so they can be told
         where that work went.
+
+    Raises:
+        BridgeError: If the lane holds ready work, which must stay claimed
+            until verified integration completes. Every held issue is checked
+            before any is released, so a refusal leaves the lane's claims as
+            they were rather than half returned.
     """
     ledger = issues.snapshot(directory)
+    held = issues.holders(ledger).get(name, [])
+    ready = [
+        number
+        for number in held
+        if lifecycle.state(ledger["issues"][number])["state"] == lifecycle.READY
+    ]
+    if ready:
+        listed = ", ".join(f"#{number}" for number in ready)
+        raise BridgeError(
+            f"{name} holds ready work ({listed}) that must stay claimed "
+            "until verified integration completes; land it with "
+            f"agent-parley merge {name}, or hand it on with "
+            "agent-parley issue offer, before retiring."
+        )
     participants = set(manifest["participants"])
     released: list[str] = []
     declined: list[str] = []
     senders: dict[str, list[str]] = {}
-    for number in issues.holders(ledger).get(name, []):
+    for number in held:
         record = ledger["issues"][number]
         sender = str((record.get("handoff") or {}).get("from") or "")
         issues.change(

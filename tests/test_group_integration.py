@@ -1,5 +1,6 @@
 """Checks ordered integration of ready lanes and of one plan group."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -82,7 +83,10 @@ def test_ready_lanes_integrate_in_dependency_order(bridge, repo, waiting):
 
 
 def test_a_dependency_cycle_is_refused_and_named(bridge, repo, waiting):
-    bridge.issue(Path(waiting["lanes"]["claude"]), "block", "42", on="43")
+    path = bridge.project(repo)[1] / "issues.json"
+    ledger = json.loads(path.read_text())
+    ledger["issues"]["42"]["blocked_by"] = ["43"]
+    path.write_text(json.dumps(ledger))
 
     with pytest.raises(BridgeError, match="form a cycle") as refusal:
         bridge.integrate(repo)

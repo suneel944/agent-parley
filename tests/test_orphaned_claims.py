@@ -1061,3 +1061,93 @@ def test_the_printed_remedy_takes_the_orphaned_claim(
     assert taken["owner"] == "codex"
     assert taken["taken"]["from"] == "claude"
     assert issues.snapshot(directory)["issues"]["42"]["owner"] == "codex"
+
+
+def mark_orphaned(directory, number, owner):
+    """Writes a supervisor orphan marker naming one owner onto a record."""
+    path = directory / "issues.json"
+    ledger = json.loads(path.read_text())
+    ledger["issues"][number]["orphan"] = {
+        "id": "marker",
+        "owner": owner,
+        "reason": "fixture",
+        "reservations": [],
+    }
+    path.write_text(json.dumps(ledger))
+
+
+def test_an_accepted_take_restores_nothing_on_the_accepting_lane(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    bridge.issue(peer, "claim", "42", take_orphaned=True)
+    running(directory, "claude")
+    offered = bridge.issue(peer, "offer", "42", to="claude", summary="Back.")
+
+    accepted = bridge.issue(
+        lane, "accept", "42", offer_id=offered["offer"]["id"]
+    )
+    claimed = bridge.issue(lane, "claim", "42")
+
+    assert "taken" not in accepted and "orphan" not in accepted
+    assert accepted["history"][-1]["cleared"]["taken"]["from"] == "claude"
+    assert "recovery" not in claimed
+    assert "reservations_moved" not in claimed
+
+
+def test_a_take_from_an_earlier_generation_is_not_current():
+    taken = {"from": "claude", "checkpoint": {"id": "saved"}}
+    record = {
+        "claim_id": "b" * 16,
+        "taken": taken,
+        "history": [
+            {"action": "take", "claim_id": "a" * 16},
+            {"action": "accept", "claim_id": "b" * 16},
+        ],
+    }
+    assert recovery.current_take(record) == {}
+    record["claim_id"] = "a" * 16
+    assert recovery.current_take(record) == taken
+
+
+def test_an_orphan_marker_does_not_survive_accept(bridge, repo, paired):
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    offered = bridge.issue(lane, "offer", "42", to="codex", summary="Take.")
+    mark_orphaned(directory, "42", "claude")
+
+    accepted = bridge.issue(
+        peer, "accept", "42", offer_id=offered["offer"]["id"]
+    )
+
+    assert "orphan" not in accepted
+    assert accepted["history"][-1]["cleared"]["orphan"]["owner"] == "claude"
+    ledger = issues.snapshot(directory)
+    assert lifecycle.actionable(ledger, "codex") == ["42"]
+
+
+def test_a_reclaim_of_an_own_orphan_keeps_the_handoff(bridge, repo, paired):
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    offered = bridge.issue(lane, "offer", "42", to="codex", summary="Take.")
+    accepted = bridge.issue(
+        peer, "accept", "42", offer_id=offered["offer"]["id"]
+    )
+    mark_orphaned(directory, "42", "codex")
+
+    reclaimed = bridge.issue(peer, "claim", "42")
+
+    assert reclaimed["handoff"] == accepted["handoff"]
+    assert reclaimed["claim_id"] != accepted["claim_id"]
+    assert "orphan" not in reclaimed

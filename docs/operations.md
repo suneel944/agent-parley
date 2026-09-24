@@ -221,15 +221,20 @@ released offer strands nothing. Mail does not move: an acknowledgement stays
 owed by the lane that received the message.
 
 `issue block NUMBER --on OTHER` records that one issue waits on another. Only
-the current owner of NUMBER can add or drop a dependency, and an issue records
-at most ten. `issue list` then names the participant holding each blocking
-issue, or reports it unclaimed. Every ledger change bumps the revision, so the
-next checkpoint delivers the updated dependency line to each running lane
-without polling. Dependencies survive release and reclaim.
+the current owner of NUMBER can add a dependency, and an issue records at most
+ten. The blocker must already be in the issue ledger; an edge to a complete
+issue is not recorded, and an edge that would close a dependency cycle is
+refused. `issue list` then names the participant holding each blocking issue,
+or reports it unclaimed. Every ledger change bumps the revision, so the next
+checkpoint delivers the updated dependency line to each running lane without
+polling. Dependencies survive release and reclaim.
 
 A dependency is information, not a gate. Nothing prevents work on a waiting
-issue, no transition clears a dependency, and finishing the blocking issue does
-not drop the edge; the owner runs `issue unblock` when the wait is over.
+issue. Verified completion of the blocking issue drops the edge, and every
+supervisor poll also drops any edge whose blocker is complete or no longer in
+the ledger, whether or not anybody owns the waiting issue. The owner runs
+`issue unblock` to drop an edge early. The operator runs the same command from
+the project base checkout, which works on a released issue with no owner.
 
 ### Compatibility and `doctor`
 
@@ -443,7 +448,10 @@ names stays in the ledger and is reported by `plan diff` as `unlisted` until
 disagree.
 
 A plan that names a malformed issue number, exceeds a bound, or describes a
-dependency cycle is refused before any edge is written. Groups name issues that
+dependency cycle is refused before any edge is written. The cycle check covers
+the edges already in the ledger, so two plans that each look acyclic cannot
+together form one. An edge to an issue that is already complete is skipped.
+Groups name issues that
 may proceed together, and `participant merge --group NAME` integrates one.
 
 ### Integrating several lanes at once
@@ -544,7 +552,9 @@ changes nothing further: one offer, one recorded attempt, one forge comment. The
 same key with different arguments is refused by name, so a stale retry cannot
 release a different issue or hand off to a different lane. A command that was
 refused replays as the same refusal, even if ownership changed in between, so a
-retry never gains authority the first call was denied.
+retry never gains authority the first call was denied. A refusal that says to
+retry, such as a busy ledger lock or recovery evidence that changed, is not
+recorded against the key, so retrying with the same key is evaluated afresh.
 
 Every `issue` transition and `report` accepts `--idempotency-key`. Over MCP the
 same contract is carried by the optional `idempotency_key` argument on
@@ -1092,7 +1102,12 @@ the captured index and working tree into a clean destination. It permits
 unrelated ignored caches, but refuses dirty or untracked content and ignored
 content at a path recovery would change. Both worktrees stay intact. Restore
 progress is durable; after interruption, the new owner reruns
-`issue claim 42` to resume the exact recorded phase.
+`issue claim 42` to resume the exact recorded phase. Only the ownership
+generation the take created restores anything: an accepted handoff, a release
+or any later claim moves the take and any orphan marker into that transition's
+history entry, so a lane that accepts the work never replays the dead owner's
+checkpoint. An owner that re-claims its own orphan-marked issue keeps its
+accepted handoff and attachment and retires its previous generation's mail.
 
 The checkpoint and its Git bundle live in the private Agent Parley state
 directory. The bundle carries an exact size and SHA-256 digest, so binary and
@@ -1499,8 +1514,12 @@ marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
 
 Repeating a reminder at a lane that has stopped answering changes nothing, so
-the supervisor counts the reminders it re-observes unanswered on a claim whose
-lane branch is merged or closed. Past `completion_reminders` it records the
+the supervisor counts the reminders left unanswered on a claim whose lane branch
+is merged or closed. The reminder is written once and a silent lane is asked
+again at most once per `inactive_after` window, so the count is one plus the
+whole windows elapsed since the reminder was written, never the number of
+polls. With the defaults a claim escalates about ten minutes after its first
+reminder. Past `completion_reminders` it records the
 claim as an unresolved completion once, which `status` carries on the claim and
 `problems` lists for the operator. A holder that answers before the threshold
 clears its own escalation. Nothing moves on the marker: the issue keeps its
@@ -2264,7 +2283,10 @@ credential. Unlike `participant retire` it keeps the manifest entry, marked with
 the time it retired: `status` and `top` show the lane as `retired AGE ago`, the
 JSON views carry `retired_at`, and the service neither wakes it nor names it in
 a work offer. A lane whose worktree is dirty keeps it, and the changed paths are
-reported in the tool result. Return that lane to service with the same
+reported in the tool result. A lane that holds ready work is refused before
+anything is released, naming those issues: ready work stays claimed until
+`agent-parley merge LANE` lands it, or the lane offers it to a peer. Return
+that lane to service with the same
 `participant add NAME` command that created it, which restores its worktree on
 its own branch; the next launch registers a fresh credential.
 

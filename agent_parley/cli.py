@@ -5045,14 +5045,13 @@ reported.
                 "backlog": backlog,
             },
         )
-        replayed = False
         path = directory / f"{agent}-activity.json"
         with lock(directory / f"{agent}-report.lock", timeout=1):
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
                 if key and (recorded := state.get("retries", {}).get(scope)):
                     retries.replayed(recorded, "report", key, fingerprint)
-                    replayed = True
+                    return
             lifecycle.record_report(
                 directory,
                 agent,
@@ -5064,8 +5063,6 @@ reported.
                 resume_on,
                 backlog,
             )
-            if replayed:
-                return
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
                 arrived = outcome == "ready" and state.get("outcome") != "ready"
@@ -5264,6 +5261,10 @@ reported.
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
+        An unblock run from the project base checkout is the operator's: it
+        drops the edge whether or not any lane owns the waiting issue, because
+        a released issue has no owner who could drop it.
+
         A claim additionally attempts a read-only forge lookup for the issue
         title. That lookup is optional context: an unavailable forge resolves
         to no title and never blocks or fails the claim.
@@ -5321,7 +5322,10 @@ reported.
         if action == "list":
             return snapshot(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = roster.resolve(data, lane)
+        if action == "unblock" and lane == Path(data["root"]).resolve():
+            agent = roster.OPERATOR
+        else:
+            agent = roster.resolve(data, lane)
         if action == "offer" and when_released:
             recipient = to or ""
             if recipient not in data["participants"] or recipient == agent:
@@ -5393,9 +5397,9 @@ reported.
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
-            if record.get("taken"):
-                from agent_parley import recovery
+            from agent_parley import recovery
 
+            if recovery.current_take(record):
                 record = recovery.restore(directory, repo, record)
             record = self._free_orphaned(data, record)
             forge.assign(repo, parse_issue(number))
@@ -5531,7 +5535,9 @@ reported.
         """
         import sqlite3
 
-        taken = record.get("taken") or {}
+        from agent_parley import recovery
+
+        taken = recovery.current_take(record)
         previous = taken.get("from")
         if previous not in data["participants"]:
             return record
