@@ -78,6 +78,7 @@ DRAINING = "lane-evidence.draining.jsonl"
 SPOOL_LOCK = "lane-evidence.lock"
 SPOOL_WAIT = 2.0
 ACCOUNT_GAP = 300.0
+REBOOTED = "host restart"
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS lane_states ("
     " project TEXT NOT NULL, lane TEXT NOT NULL, state TEXT NOT NULL,"
@@ -422,8 +423,14 @@ def from_liveness(
     A sample with no trustworthy process identity moves no lane, unless it
     reads `stopped`: the launcher recorded that its session ended, or the
     lane never published any activity at all, so there is no session that
-    could be running. A gone process stops a lane that was live, and a
-    running process starts a lane recorded as stopped, dead or reclaimed.
+    could be running. The one exception is a lane recorded starting or
+    working whose evidence has gone stale: a client that crashed with no
+    recorded process and no `SessionEnd` would otherwise read as working
+    forever, refusing every wake and charging its silence as work. It is
+    moved to `idle`, which says only that nothing current shows it working;
+    an open tool call does not read as stale. A gone process stops a lane
+    that was live, and a running process starts a lane recorded as stopped,
+    dead or reclaimed.
     A lane held by a dialog or an exhausted capacity keeps that block until
     the screen evidence that set it is withdrawn, because the activity label
     a sample is derived from cannot see the screen. An approval label blocks
@@ -433,7 +440,8 @@ def from_liveness(
     Args:
         record: The lane's current record, or None.
         observed: Presence reading taken by the supervision poll, carrying
-            `process_alive`, the derived `activity` and its `evidence`.
+            `process_alive`, the derived `activity`, its `evidence` and
+            whether that evidence is `stale`.
 
     Returns:
         The target state and its cause, or None when the sample moves
@@ -443,6 +451,8 @@ def from_liveness(
     current = "" if record is None else record["state"]
     activity = str(observed.get("activity", ""))
     if alive is None and activity != STOPPED:
+        if current in (STARTING, WORKING) and observed.get("stale"):
+            return IDLE, ""
         return None
     if alive is not True:
         return None if current in (DEAD, RECLAIMED) else (STOPPED, "")
@@ -513,10 +523,34 @@ def sample(
                 root,
                 lane,
                 DEAD,
-                evidence=f"stopped for {int(max(held, age or 0))}s",
+                evidence=(
+                    record["evidence"]
+                    if rebooted(record)
+                    else f"stopped for {int(max(held, age or 0))}s"
+                ),
                 now=moment,
             )["record"]
     return record
+
+
+def rebooted(record: dict | None) -> bool:
+    """Reports whether a lane's record still names a session a boot ended.
+
+    `supervision.settle_reboot` records the restart as the evidence of a
+    `stopped` transition, and that evidence is carried into `dead`. The
+    next session the lane records moves it out of both, which clears it.
+
+    Args:
+        record: The lane's current record, or None.
+
+    Returns:
+        Whether the lane is stopped or dead on a host restart.
+    """
+    return (
+        record is not None
+        and record["state"] in (STOPPED, DEAD)
+        and str(record["evidence"]).startswith(REBOOTED)
+    )
 
 
 def wakes(record: dict | None) -> bool:

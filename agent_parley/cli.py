@@ -6968,6 +6968,10 @@ reported.
             mailbox counts, together with any native dialog the lane records as
             holding its client. An unreadable mailbox is reported as an error
             beside the rest of the lane rather than failing the whole report.
+            A lane with a state record has its session and availability read
+            from that record alone, through `supervision.recorded_presence`,
+            so the activity file cannot report a condition the record does
+            not hold; only a lane with no record yet is read from the file.
         """
         import sqlite3
 
@@ -7001,9 +7005,17 @@ reported.
                 wake = lanes.read_wake(db, data["root"], agent)
         except (sqlite3.Error, BridgeError, OSError, ValueError):
             condition, accounts, wake = None, {}, {}
-        liveness = participant_liveness(
-            directory, agent, configuration["inactive_after"]
-        )
+        if condition:
+            observed = supervision.recorded_presence(condition, observed)
+            observed["evidence"] = condition["evidence"]
+            age = observed["age_seconds"]
+            liveness = lanes.describe(condition) + (
+                f"; event {age}s ago" if age is not None else ""
+            )
+        else:
+            liveness = participant_liveness(
+                directory, agent, configuration["inactive_after"]
+            )
         budget = budgets.report(
             self.home, directory, data, agent, frame["usage"]
         )
@@ -7012,11 +7024,7 @@ reported.
             "identity": name,
             "provider": participant["provider"],
             "credential": participant["credential"],
-            "session": (
-                f"{lanes.describe(condition)}; {liveness}"
-                if condition
-                else liveness
-            ),
+            "session": liveness,
             "condition": lanes.view(condition),
             "accounting": (
                 lanes.summary(accounts[agent]) if agent in accounts else None

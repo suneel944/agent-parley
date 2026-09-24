@@ -2283,7 +2283,8 @@ credential profile as the previous run.
 After a host restart every recorded session is dead, even when its process ID
 now names an unrelated process. The supervision loop records the host's boot
 identifier in the project state directory; when it changes, each lane with a
-recorded session is published as stopped and marked with the session the
+recorded session has its state record moved to `stopped` with the restart as
+its evidence, and is published as stopped and marked with the session the
 restart ended. That lane is never resumed or signalled, its claims move
 through the orphan path, `participant stop` reports no verified session, and
 `participant restart` launches it without hand edits to the state directory.

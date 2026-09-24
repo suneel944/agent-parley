@@ -382,6 +382,199 @@ def test_an_activity_label_the_record_contradicts_never_decides_a_wake(
     assert len(calls) == 1
 
 
+def test_a_working_lane_with_no_process_identity_goes_idle_when_stale(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "event": "PreToolUse",
+            "updated": time.time() - supervision.TOOL_TIMEOUT - 100,
+        },
+    )
+    lanes.submit(directory, "codex", "PreToolUse", lanes.WORKING)
+    supervision.settle_evidence(bridge.home, directory, paired)
+    assert recorded(bridge, paired, "codex")["state"] == lanes.WORKING
+    mail(bridge, actors)
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    readings = {
+        name: supervision.presence(directory, name, 1)
+        for name in paired["participants"]
+    }
+    assert readings["codex"]["process_alive"] is None
+    supervision.settle_lanes(bridge.home, paired, config, readings)
+    assert recorded(bridge, paired, "codex")["state"] == lanes.IDLE
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    supervision.wake(
+        bridge.home, directory, paired, "codex", readings["codex"], config
+    )
+    assert len(calls) == 1
+
+
+def test_a_stale_blocked_lane_is_published_idle_and_loses_its_lease(
+    bridge, paired
+):
+    holder = lease_holder(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    idle_live(directory, "claude")
+    place(bridge, paired, "claude", lanes.BLOCKED, lanes.APPROVAL)
+    readings = {
+        name: supervision.presence(directory, name, 1)
+        for name in paired["participants"]
+    }
+    observations = supervision.recorded_observations(
+        bridge.home, paired, readings
+    )
+    assert observations["claude"]["state"] == supervision.IDLE
+    supervision._publish_presence(bridge.home, paired, observations)
+    store.reclaim_expired(bridge.home, paired["root"])
+    assert expired(bridge, holder) == 0
+
+
+def test_hook_evidence_newer_than_the_poll_reading_is_kept(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    activity = directory / "codex-activity.json"
+    settle = supervision.settle_evidence
+
+    def approval_first(home, state, manifest):
+        """Serves a permission request just before the spool is drained."""
+        write_json(
+            activity,
+            {
+                **json.loads(activity.read_text()),
+                "activity": "waiting for approval",
+                "event": "PermissionRequest",
+                "updated": time.time(),
+            },
+        )
+        lanes.submit(
+            directory,
+            "codex",
+            "PermissionRequest",
+            lanes.BLOCKED,
+            cause=lanes.APPROVAL,
+        )
+        settle(home, state, manifest)
+
+    monkeypatch.setattr(supervision, "settle_evidence", approval_first)
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    supervision.poll(bridge.home, directory)
+    record = recorded(bridge, paired, "codex")
+    assert (record["state"], record["cause"]) == (lanes.BLOCKED, lanes.APPROVAL)
+
+
+def test_an_upgrade_keeps_the_wake_budget_published_before_it(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.IDLE)
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    first = supervision.wake_record(bridge.home, paired["root"], "codex")
+    escalated = time.time() - 60
+    write_json(
+        directory / "codex-wake.json",
+        {
+            **first,
+            "at": 0,
+            "attempts": supervision.WORK_WAKE_ATTEMPTS,
+            "exhausted_at": escalated,
+            "escalated_at": escalated,
+        },
+    )
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("DELETE FROM lane_wakes")
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    stored = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert stored["attempts"] > supervision.WORK_WAKE_ATTEMPTS
+    assert stored["escalated_at"] == escalated
+    assert stored["exhausted_at"] == escalated
+
+
+def test_a_rebooted_record_is_not_woken_whatever_its_activity_file_says(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    mail(bridge, actors)
+    write_json(directory / supervision.BOOT_RECORD, {"boot_id": "old"})
+    monkeypatch.setattr(process, "boot_id", lambda: "new")
+    assert supervision.settle_reboot(bridge.home, directory, paired) == [
+        "codex"
+    ]
+    assert lanes.rebooted(recorded(bridge, paired, "codex"))
+    idle_live(directory, "codex")
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert not calls
+    assert supervision.wake_record(bridge.home, paired["root"], "codex") == {}
+
+
+def test_acknowledgement_debt_follows_the_record_not_the_activity_file(
+    bridge, paired
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.WORKING)
+    check = supervision._mail_check(
+        bridge.home, directory, paired, "codex", 0, 1
+    )
+    assert check[0] is False
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, paired["root"], "codex", lanes.IDLE, now=time.time() - 10
+        )
+    check = supervision._mail_check(
+        bridge.home, directory, paired, "codex", 0, 1
+    )
+    assert check == (True, "")
+
+
+def test_status_reads_the_lane_condition_from_its_record(bridge, paired):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "updated": time.time(),
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    place(bridge, paired, "codex", lanes.DEAD)
+    participants = bridge.status_snapshot()["projects"][0]["participants"]
+    codex = next(
+        record for record in participants if record["participant"] == "codex"
+    )
+    assert codex["availability"]["state"] == supervision.STOPPED
+    assert codex["availability"]["process_alive"] is False
+    assert codex["session"].startswith("dead")
+
+
 def test_fit_reads_the_lane_state_not_the_activity_file(bridge, paired):
     registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent

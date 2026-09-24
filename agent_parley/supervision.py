@@ -256,22 +256,26 @@ def rebooted(published: dict) -> bool:
     )
 
 
-def settle_reboot(directory: Path, manifest: dict) -> list[str]:
+def settle_reboot(home: Path, directory: Path, manifest: dict) -> list[str]:
     """Marks every recorded session stopped once the host has restarted.
 
     A restart ends every process without a shutdown, so the recorded session
     of each lane is dead even when its process ID now names something else.
-    Each such lane is published as stopped and marked with the session the
+    Each such lane's state record moves to `stopped` with the restart as its
+    evidence, which `lanes.rebooted` reads and `wake` refuses to resume, and
+    the lane is published as stopped and marked with the session the
     restart ended. That mark makes presence read the process as gone, so the
     lane's expired leases are released and its claims move through the
-    orphan path, and it keeps the supervisor from resuming the lane, because a
-    resume would record fresh activity and reset the silence those paths
-    measure. An operator restart records a new session and clears the mark.
+    orphan path, and the refused resume keeps fresh activity from resetting
+    the silence those paths measure. An operator restart records a new
+    session, which moves the record out of `stopped` and clears the mark.
 
-    The boot identifier is recorded only after every lane was marked, so a
-    lane whose checkpoint lock was busy is marked on the next poll.
+    The record is written before the mark, and the boot identifier only
+    after every lane was marked, so a lane whose checkpoint lock or store
+    was busy is marked on the next poll.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
         manifest: Current participant manifest.
 
@@ -297,6 +301,17 @@ def settle_reboot(directory: Path, manifest: dict) -> list[str]:
                 state = checkpoints.activity(directory, name)
                 if state.get("session_pid") is None or rebooted(state):
                     continue
+                with store.connect(home, write=True) as db:
+                    lanes.transition(
+                        db,
+                        manifest["root"],
+                        name,
+                        lanes.STOPPED,
+                        evidence=(
+                            f"{lanes.REBOOTED}: boot {previous} ended session "
+                            f"{state.get('session_pid')}"
+                        ),
+                    )
                 state["activity"] = STOPPED
                 state["rebooted"] = {
                     "boot_id": previous,
@@ -378,7 +393,10 @@ def recorded_presence(record: dict | None, observed: dict) -> dict:
     availability and activity it acts on are replaced here by the record's,
     and a label the record has not accepted cannot change a decision. The
     timing and evidence text of the reading are kept for wording and for
-    spacing wakes.
+    spacing wakes. An idle or blocked lane whose evidence has gone stale
+    is published `idle`, so the lease sweep releases its expired leases
+    rather than holding them for the whole grace: a lane parked on a
+    prompt that long is not working under them.
 
     Args:
         record: The lane's state record, or None when it has none.
@@ -397,7 +415,8 @@ def recorded_presence(record: dict | None, observed: dict) -> dict:
     if state in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
         alive, availability, activity = False, STOPPED, STOPPED
     elif state == lanes.BLOCKED:
-        alive, availability, activity = True, ACTIVE, WAITING
+        availability = IDLE if observed.get("stale") else ACTIVE
+        alive, activity = True, WAITING
     elif state == lanes.IDLE:
         availability = IDLE if observed.get("stale") else ACTIVE
         alive, activity = True, IDLE
@@ -1279,8 +1298,11 @@ def _mail_check(
 
     Acknowledgement debt expires: a request past its recorded deadline or
     superseded by a closed claim or a newer message no longer counts, and a
-    lane whose activity record is stale past ``inactive_after`` has its debt
-    suspended, since the lane is not reading mail at all.
+    lane whose state record has held a state other than starting or working
+    for ``inactive_after``, or entered it on stale evidence, has its debt
+    suspended, since the lane is not reading mail at all. The lane's state
+    record decides this, never its activity file; a lane with no record yet
+    keeps its debt.
 
     Args:
         home: Private bridge state root.
@@ -1288,7 +1310,8 @@ def _mail_check(
         manifest: Project manifest holding this participant.
         name: Participant that owns the lane.
         after: Seconds after which an unanswered acknowledgement counts.
-        inactive_after: Age past which the lane's activity reads as stale.
+        inactive_after: Seconds a lane's recorded quiet state must be held
+            before it reads as stale.
 
     Returns:
         The check result and, when it failed, the age of the oldest item. An
@@ -1296,9 +1319,15 @@ def _mail_check(
     """
     from agent_parley import checkpoints
 
-    if lane_state(checkpoints.activity(directory, name), inactive_after)[
-        "stale"
-    ]:
+    record = condition(home, manifest["root"], name)
+    if (
+        record is not None
+        and record["state"] not in (lanes.STARTING, lanes.WORKING)
+        and (
+            time.time() - float(record["since"]) >= inactive_after
+            or "stale" in str(record["evidence"])
+        )
+    ):
         return True, ""
     try:
         mail = checkpoints.mailbox(
@@ -3872,14 +3901,14 @@ def _poll(home: Path, directory: Path) -> None:
             failures.append(failure(label, exc))
         stages[label] = round(time.time() - begun, 3)
 
-    stage("reboot", settle_reboot, directory, manifest)
+    stage("reboot", settle_reboot, home, directory, manifest)
     stage("launches", launches, directory, manifest, config)
     stage("readings", refresh_readings, home, manifest, 2 * config["interval"])
+    stage("lane evidence", settle_evidence, home, directory, manifest)
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
     }
-    stage("lane evidence", settle_evidence, home, directory, manifest)
     stage("lane states", settle_lanes, home, manifest, config, observations)
     stage("lane accounting", account_lanes, home, directory, manifest)
     observations = recorded_observations(home, manifest, observations)
@@ -4051,7 +4080,10 @@ def settle_lanes(
     Every later decision of the poll reads the lane's condition from the
     state record rather than from the presence reading, so the sample is
     applied first and a stopped lane ages into `dead` here, after the
-    project's stall threshold, and nowhere else.
+    project's stall threshold, and nowhere else. The poll takes the reading
+    only after `settle_evidence` has applied the queued hook evidence, so a
+    reading of the activity file older than a hook it already applied can
+    never override that hook.
 
     Args:
         home: Private bridge state root.
@@ -4096,20 +4128,41 @@ def account_lanes(home: Path, directory: Path, manifest: dict) -> None:
             )
 
 
-def wake_record(home: Path, root: str, name: str) -> dict:
+def wake_record(
+    home: Path, root: str, name: str, directory: Path | None = None
+) -> dict:
     """Reads the wake fields of one lane's state for a wake decision.
+
+    Before the store held these fields they lived only in the lane's
+    `-wake.json`. A lane whose store has no wake row yet but still has that
+    file is seeded from it once, so an upgrade keeps the attempts spent,
+    the exhaustion and the escalation already recorded instead of spending
+    the whole budget and escalating a second time.
 
     Args:
         home: Private bridge state root.
         root: Canonical project key.
         name: Participant that owns the lane.
+        directory: Private project state directory holding the published
+            `-wake.json` to seed from, or None to read the store alone.
 
     Returns:
         The fields `lanes.read_wake` returns, or an empty mapping when none
         was recorded or the store cannot be read.
     """
-    with contextlib.suppress(BridgeError, OSError, sqlite3.Error, ValueError):
+    with contextlib.suppress(
+        BridgeError, OSError, sqlite3.Error, TypeError, ValueError
+    ):
         with store.connect(home) as db:
+            record = lanes.read_wake(db, root, name)
+        if record or directory is None:
+            return record
+        published = json.loads((directory / f"{name}-wake.json").read_text())
+        if not isinstance(published, dict) or not published:
+            return record
+        with store.connect(home, write=True) as db:
+            if not lanes.read_wake(db, root, name):
+                lanes.write_wake(db, root, name, published)
             return lanes.read_wake(db, root, name)
     return {}
 
@@ -4679,7 +4732,7 @@ def _defer_wake(
         window: Inactivity window the attempts are spaced by.
     """
     with lock(directory / f"{name}-wake.lock"):
-        record = wake_record(home, root, name)
+        record = wake_record(home, root, name, directory)
         if not record.get("result"):
             return
         _park_wake(
@@ -4807,9 +4860,9 @@ def wake(
 
     A lane that retired is never woken and never resumed. It asked to stop,
     released what it held, and only an operator re-admitting it brings it back.
-    A lane whose session a host restart ended is not resumed either, because
-    the resume would reset the silence its claims and leases are judged on;
-    `participant restart` brings it back.
+    A lane whose record `settle_reboot` stopped on a host restart is not
+    woken or resumed either, because the resume would reset the silence its
+    claims and leases are judged on; `participant restart` brings it back.
     """
     participant = manifest["participants"][name]
     if (
@@ -4819,16 +4872,18 @@ def wake(
         or roster.retired(participant)
     ):
         return
-    path = directory / f"{name}-activity.json"
-    state = json.loads(path.read_text()) if path.exists() else {}
-    if rebooted(state):
-        return
     root = manifest["root"]
     window = config["inactive_after"]
-    parked = wake_record(home, root, name)
+    parked = wake_record(home, root, name, directory)
     recorded = condition(home, root, name)
+    if lanes.rebooted(recorded):
+        return
     stopped = False
     if recorded is None:
+        path = directory / f"{name}-activity.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if rebooted(state):
+            return
         label = str(state.get("activity", ""))
         session = str(state.get("session_id") or "")
         stopped = label == lanes.STOPPED
