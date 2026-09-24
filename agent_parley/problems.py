@@ -44,6 +44,7 @@ APPROVAL = "waiting on approval"
 HELD = "held by a native dialog"
 READY = "ready to retire"
 HOLDING = "holding a refused key"
+FOREIGN = "second session"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -451,7 +452,9 @@ def _lane_rows(
         operator. A quiet lane that refused a peer a key it still holds is
         reported with the lanes it refused and how long it has been quiet,
         because the refused lane saw the refusal and nobody else did. A
-        lane that retired reports only the worktree it kept,
+        second client sending hooks under the lane's identity is named with
+        its process while it lasts, because its events are ignored. A lane
+        that retired reports only the worktree it kept,
         because its quiet is the state the operator asked for and every
         other remedy here would wake a lane that has given its work back.
     """
@@ -523,6 +526,18 @@ def _lane_rows(
                     if isinstance(at, (int, float))
                     else None
                 ),
+                name,
+                root,
+            )
+        )
+    if foreign := record.get("foreign_session"):
+        rows.append(
+            _row(
+                FOREIGN,
+                f"session {foreign['session_id'] or 'unnamed'} (pid "
+                f"{foreign['pid']}) sends hooks as this lane and is ignored",
+                f"stop that process, or run it outside {name}'s worktree",
+                foreign.get("age_seconds"),
                 name,
                 root,
             )

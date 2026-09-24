@@ -170,6 +170,32 @@ def test_a_stalled_lane_the_service_still_wakes_is_reported_as_its_work(
     assert not rows(bridge, problems.INACTIVE)
 
 
+def test_a_second_session_in_a_lane_is_named_while_it_runs(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+    foreign = {
+        "session_id": "s2",
+        "pid": child.pid,
+        "ticks": start_ticks(child.pid),
+        "seen": time.time() - 30,
+    }
+    try:
+        alive(directory, "claude", session_id="s1", foreign_session=foreign)
+        [row] = rows(bridge, problems.FOREIGN)
+        assert row["participant"] == "claude"
+        assert f"session s2 (pid {child.pid})" in row["detail"]
+        assert row["seconds"] >= 30
+    finally:
+        child.stdin.close()
+        child.wait()
+    assert not rows(bridge, problems.FOREIGN)
+
+
 def test_a_stalled_lane_the_service_cannot_wake_names_the_say(
     bridge, repo, paired, served
 ):

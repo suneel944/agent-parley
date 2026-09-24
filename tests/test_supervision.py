@@ -2,8 +2,10 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -847,11 +849,99 @@ def test_a_failing_stage_is_recorded_and_the_rest_of_the_poll_runs(
     supervision.poll(bridge.home, directory)
     assert sorted(woken) == ["claude", "codex"]
     error = issues.supervision_error(directory)
-    assert error["detail"] == "work: ValueError: malformed record"
+    assert error["detail"].startswith("work: ValueError: malformed record at ")
     assert cli.supervision_failure(error).startswith("Supervision: failing")
     monkeypatch.setattr(supervision, "work", lambda *args: None)
     supervision.poll(bridge.home, directory)
     assert issues.supervision_error(directory) is None
+
+
+def test_one_lanes_unexpected_wake_failure_never_skips_the_next(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    woken = []
+
+    def wake(home, path, manifest, name, *rest):
+        if name == "claude":
+            raise KeyError("holder")
+        woken.append(name)
+
+    monkeypatch.setattr(supervision, "wake", wake)
+    supervision.poll(bridge.home, directory)
+    assert woken == ["codex"]
+    detail = issues.supervision_error(directory)["detail"]
+    assert detail.startswith("wake claude: KeyError: 'holder' at ")
+    assert "test_supervision.py:" in detail
+    polled = supervision.last_poll(directory)
+    assert polled["failed"] == 1
+    assert polled["clean_at"] is None
+
+
+def test_a_held_write_lock_delays_the_presence_write_without_skipping_it(
+    bridge, paired
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    holder = sqlite3.connect(
+        bridge.home / store.DATABASE, check_same_thread=False
+    )
+    holder.execute("BEGIN IMMEDIATE")
+    releaser = threading.Timer(0.5, holder.commit)
+    releaser.start()
+    supervision.poll(bridge.home, directory)
+    releaser.join()
+    holder.close()
+    assert issues.supervision_error(directory) is None
+    with store.connect(bridge.home) as db:
+        assert db.execute(
+            "SELECT count(*) FROM participant_presence"
+        ).fetchone()[0] == len(paired["participants"])
+
+
+def test_an_unexpected_poll_exception_is_recorded_and_supervision_survives(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    stopped = threading.Event()
+    polls = []
+
+    def broken(home, path):
+        polls.append(path)
+        if len(polls) == 1:
+            raise KeyError("waiting")
+
+    def reap():
+        if len(polls) > 1:
+            stopped.set()
+
+    monkeypatch.setattr(supervision, "poll", broken)
+    monkeypatch.setattr(supervision, "reap_launchers", reap)
+    monkeypatch.setattr(
+        supervision,
+        "configuration",
+        lambda home, manifest: {**supervision.DEFAULTS, "interval": 0},
+    )
+    supervision.run(bridge.home, stopped)
+    assert len(polls) == 2
+    detail = issues.supervision_error(directory)["detail"]
+    assert detail.startswith("poll: KeyError: 'waiting' at ")
+
+
+def test_status_reports_when_supervision_last_polled(bridge, paired, capsys):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    supervision.poll(bridge.home, directory)
+    polled = supervision.last_poll(directory)
+    assert polled["clean_at"] == polled["at"]
+    project = bridge.status_snapshot()["projects"][0]
+    assert project["supervision_poll"] == polled
+    bridge.status()
+    assert "Supervision: last poll 0s ago in " in capsys.readouterr().out
+    polled["stages"] = {"work": 0.25, "wake claude": 4.5}
+    assert ", slowest wake claude 4.50s" in cli.supervision_liveness(polled)
 
 
 def test_a_stale_working_label_on_a_live_process_is_woken(

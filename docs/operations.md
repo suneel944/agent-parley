@@ -318,9 +318,10 @@ refused rather than downgraded.
 
 The verdict names one command per distinct cause, because a store behind this
 build and a plugin speaking another protocol need different commands. A behind
-store is resolved by restarting the service, which migrates it; a newer store
-by installing the build that wrote it; a plugin mismatch by reinstalling the
-plugin. Its exit status is non-zero on a mismatch, so a
+store is resolved by `agent-parley up`, which migrates it in place and leaves
+a running service and every lane running; a newer store by installing the
+build that wrote it; a plugin mismatch by reinstalling the plugin. Its exit
+status is non-zero on a mismatch, so a
 script can gate on it. It reads only: it opens no lane, writes no configuration,
 repairs nothing, and prints no credential or profile path.
 
@@ -336,6 +337,13 @@ mid-turn:
   header is denied with both numbers, and `top` counts that denial.
 - Opening a store written by a newer schema is refused, never migrated
   downwards, exactly as a newer project manifest already is.
+- A hook whose read fails on a store behind its build migrates the store in
+  place, under the store lock, and denies that one call with both schema
+  numbers and a retry; the next call reads the migrated store. A package
+  upgrade therefore no longer refuses every lane until a restart. A store
+  stamped current that lacks a column the failed read names is repaired the
+  same way, and every service start or `up` verifies each column the build
+  owns instead of trusting the stamp.
 
 ### Triage with `problems`
 

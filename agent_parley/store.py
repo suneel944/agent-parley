@@ -318,6 +318,18 @@ def initialize(home: Path) -> None:
     Upgrading a store written before topics and the project feed gives every
     stored message an empty topic and keeps it out of the feed, so routing
     and supersession apply only to mail sent after the upgrade.
+
+    A store already stamped with this build's schema still has every column
+    this build owns verified and added where it is missing. The stamp says
+    which upgrade ran, not that its columns are all present, and a store
+    missing one under a current stamp would otherwise fail every read that
+    names it while every restart took the same early return. Each column
+    step reads the table first, so a complete store changes nothing.
+
+    Every step a store past the lease rebuild takes is additive, so a service
+    still running an older build keeps serving from the migrated store, and a
+    newer build can migrate it in place without stopping the lanes that are
+    working.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -335,19 +347,17 @@ def initialize(home: Path) -> None:
             db.executescript(SCHEMA)
             with db:
                 db.execute("BEGIN IMMEDIATE")
-                if version == SCHEMA_VERSION:
-                    _add_message_search(db)
-                    return
                 _add_ack_deadline(db)
                 _add_decision_flag(db)
-                if version == 1:
-                    _add_reservation_created(db)
+                _add_reservation_created(db)
                 _rebuild_reservations(db)
                 _add_claim_correlation(db)
                 _add_reservation_ttl(db)
                 _add_supersession(db)
                 _add_topic(db)
                 _add_message_search(db)
+                if version == SCHEMA_VERSION:
+                    return
                 legacy = home / "mail.sqlite3"
                 if version == 0 and legacy.exists():
                     _import_legacy(db, legacy)
@@ -2628,6 +2638,69 @@ def remedy(state: str) -> str:
         return protocol.MIGRATE
     if state == SCHEMA_UNSUPPORTED:
         return protocol.UPGRADE
+    return ""
+
+
+def _layout(home: Path) -> int:
+    """Reads the counter SQLite advances on every change to the store layout.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        The store's schema cookie, or -1 when it cannot be read.
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(home / DATABASE)) as db:
+            return int(db.execute("PRAGMA schema_version").fetchone()[0])
+    except sqlite3.Error:
+        return -1
+
+
+def reconcile(home: Path, cause: str = "") -> str:
+    """Migrates a store this build has outgrown and describes the skew.
+
+    A package upgrade reaches every hook on the machine before the service
+    restarts, so the first read that names a new column used to fail with a
+    raw SQLite message and every lane was refused until an operator stopped
+    all of them. The migration is additive and serialized by the store lock,
+    so the build that found the skew performs it in place and the lanes keep
+    working. A store stamped current that is still missing a column, as the
+    failed read names it, is repaired the same way.
+
+    Args:
+        home: Private bridge state root.
+        cause: Text of the failure that exposed the store, when one did.
+
+    Returns:
+        One sentence naming the schema the store carries, the schema this
+        build needs and what was done or what closes the gap, or an empty
+        string when the store matches this build and needed no repair.
+    """
+    schema = schema_version(home)
+    state = schema_state(schema)
+    needed = f"this build needs schema {SCHEMA_VERSION}"
+    missing = state == SCHEMA_CURRENT and "no such column" in cause
+    if state == SCHEMA_BEHIND or missing:
+        before = _layout(home)
+        try:
+            initialize(home)
+        except (BridgeError, OSError, sqlite3.Error) as exc:
+            if missing:
+                return ""
+            return (
+                f"Store schema {schema} is behind; {needed}, and migrating "
+                f"it in place failed: {exc}. {protocol.MIGRATE}"
+            )
+        if missing and _layout(home) == before:
+            return ""
+        found = "lacked a column" if missing else "was behind"
+        return (
+            f"Store schema {schema} {found}; {needed}. It was migrated in "
+            "place without stopping any lane; retry the call."
+        )
+    if state == SCHEMA_UNSUPPORTED:
+        return f"Store schema {schema} is newer; {needed}. {protocol.UPGRADE}"
     return ""
 
 

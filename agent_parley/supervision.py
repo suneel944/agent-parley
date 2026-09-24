@@ -1,6 +1,8 @@
 """Observes lane availability and reminds holders about waiting peers."""
 
 import contextlib
+import contextvars
+import copy
 import hashlib
 import json
 import sqlite3
@@ -8,9 +10,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+import traceback
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import TypeGuard
+from typing import TypeGuard, cast
 
 from agent_parley import (
     forge,
@@ -46,6 +49,8 @@ RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 BOOT_RECORD = "boot.json"
 READINGS_PUBLICATION = "git-readings.json"
+POLL_RECORD = "supervision-poll.json"
+COMPLETION_TTL = 60.0
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -74,6 +79,10 @@ AVAILABILITY = {
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
 _READINGS: dict[str, tuple[float, dict, dict]] = {}
+_COMPLETIONS: dict[tuple[str, str], tuple[float, tuple[str, float] | None]] = {}
+_POLL_READINGS: contextvars.ContextVar[dict[tuple, object] | None] = (
+    contextvars.ContextVar("poll_readings", default=None)
+)
 
 
 def track_launcher(child: subprocess.Popen[bytes]) -> None:
@@ -1272,6 +1281,36 @@ def fit(
         Whether the lane is fit, each check's result, the names of the failed
         checks and one line naming the first failure.
     """
+    return _once_per_poll(
+        ("fit", str(directory), name, after, inactive_after),
+        lambda: _fit_reading(
+            home, directory, manifest, name, after, inactive_after
+        ),
+    )
+
+
+def _fit_reading(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float,
+) -> dict:
+    """Takes the readings behind `fit` for one lane.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Project manifest holding this participant.
+        name: Participant whose lane is being considered.
+        after: Seconds after which an unanswered item blocks an offer.
+        inactive_after: Age past which the lane's activity reads as stale,
+            which suspends its acknowledgement debt.
+
+    Returns:
+        The fitness record `fit` reports.
+    """
     participant = manifest["participants"][name]
     observed_capacity = capacity(home, directory, manifest, name)
     results = {
@@ -1452,16 +1491,91 @@ def idle_seconds(directory: Path, name: str) -> int:
     """
     from agent_parley import metrics
 
-    return next(
-        (
-            int(interval["seconds"])
-            for interval in reversed(
-                metrics.idle_intervals(directory, name)["intervals"]
-            )
-            if interval.get("open")
+    return _once_per_poll(
+        ("idle", str(directory), name),
+        lambda: next(
+            (
+                int(interval["seconds"])
+                for interval in reversed(
+                    metrics.idle_intervals(directory, name)["intervals"]
+                )
+                if interval.get("open")
+            ),
+            0,
         ),
-        0,
     )
+
+
+@contextlib.contextmanager
+def poll_readings() -> Iterator[None]:
+    """Shares each lane's fitness and idle readings across one poll.
+
+    Every lane's work backlog used to read fitness and idle time again for
+    every peer, so one poll took a number of `git status` calls, capacity
+    readings and event-log scans that grew with the square of the lane
+    count. Inside this scope each reading is taken once per lane and reused
+    until the scope ends or `forget_poll_readings` drops it.
+
+    Yields:
+        None; the readings are kept for the calling thread only.
+    """
+    token = _POLL_READINGS.set({})
+    try:
+        yield
+    finally:
+        _POLL_READINGS.reset(token)
+
+
+def forget_poll_readings() -> None:
+    """Drops the readings shared so far, after a step that changes them."""
+    readings = _POLL_READINGS.get()
+    if readings is not None:
+        readings.clear()
+
+
+def _once_per_poll[T](key: tuple, measure: Callable[[], T]) -> T:
+    """Returns one reading, taken once per poll when a poll scope is open.
+
+    Args:
+        key: Reading kind and the lane it belongs to.
+        measure: Takes the reading when this poll has not yet.
+
+    Returns:
+        A private copy of the reading, so no caller can alter what the next
+        caller in the same poll sees.
+    """
+    readings = _POLL_READINGS.get()
+    if readings is None:
+        return measure()
+    if key not in readings:
+        readings[key] = measure()
+    return cast(T, copy.deepcopy(readings[key]))
+
+
+def branch_completion(root: Path, branch: str) -> tuple[str, float] | None:
+    """Reads how a lane branch's newest pull request ended, briefly cached.
+
+    Each reading is one forge request that may take seconds, and a poll used
+    to repeat it for every owning lane on every poll. A reading is reused for
+    `COMPLETION_TTL` seconds per repository and branch, so a merge is
+    noticed at most that much later.
+
+    Args:
+        root: Repository that selects the forge project.
+        branch: Lane branch whose pull requests are read.
+
+    Returns:
+        The newest pull request's state and creation time, or None, as
+        `forge.branch_completion` reports them.
+    """
+    key = (str(root), branch)
+    now = time.monotonic()
+    cached = _COMPLETIONS.get(key)
+    if cached and now - cached[0] < COMPLETION_TTL:
+        return cached[1]
+    reading = forge.branch_completion(root, branch)
+    _COMPLETIONS[key] = (now, reading)
+    return reading
 
 
 def published_work(directory: Path, name: str) -> dict:
@@ -1833,6 +1947,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 )
         owned = issues.holders(ledger)
         available = lifecycle.actionable(ledger)
+        forget_poll_readings()
         results = {
             name: fit(home, directory, manifest, name, after, idle)
             for name in serving
@@ -3180,9 +3295,7 @@ def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
             reading = _issue_reading(root, number)
             if reading is None:
                 if not branch_read:
-                    branch = forge.branch_completion(
-                        root, participant["branch"]
-                    )
+                    branch = branch_completion(root, participant["branch"])
                     branch_read = True
                 if (
                     branch is None
@@ -3597,8 +3710,25 @@ def poll(home: Path, directory: Path) -> None:
     the service still reported healthy. A failing stage is now recorded, the
     rest of the poll still runs, and the failures are published beside the
     issue ledger where status and problems report them; a poll in which every
-    stage succeeded clears that record.
+    stage succeeded clears that record. A stage catches every exception, and
+    its record names the stage, the lane a wake belongs to and the line that
+    raised, so one lane's failure never starves the lanes after it.
+
+    Each poll records when it finished, how long it took and when the last
+    clean poll finished, which status reports as the supervisor's liveness.
+    The record also holds the wall seconds of each stage, so a slow poll
+    names the stage that made it slow.
+
+    Fitness and idle readings are taken once per lane per poll and shared by
+    every lane's backlog, so the poll's cost grows with the lane count rather
+    than with its square.
     """
+    with poll_readings():
+        _poll(home, directory)
+
+
+def _poll(home: Path, directory: Path) -> None:
+    """Runs one poll inside a shared reading scope, as `poll` describes."""
     manifest = roster.read(directory)
     config = configuration(home, manifest)
     if not Path(manifest["root"]).exists():
@@ -3606,13 +3736,17 @@ def poll(home: Path, directory: Path) -> None:
         return
     (directory / ROOT_PUBLICATION).unlink(missing_ok=True)
     failures: list[str] = []
+    stages: dict[str, float] = {}
+    started = time.time()
 
     def stage(label: str, call: Callable[..., object], *args: object) -> None:
         """Runs one poll stage, recording rather than raising its failure."""
+        begun = time.time()
         try:
             call(*args)
-        except (BridgeError, OSError, ValueError, sqlite3.Error) as exc:
-            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            failures.append(failure(label, exc))
+        stages[label] = round(time.time() - begun, 3)
 
     stage("reboot", settle_reboot, directory, manifest)
     stage("launches", launches, directory, manifest, config)
@@ -3627,7 +3761,16 @@ def poll(home: Path, directory: Path) -> None:
     stage("deliveries", deliveries, home, directory, manifest)
     stage("dependencies", lifecycle.settle_dependencies, directory)
     if config["prompts"]:
-        _remind(home, directory, manifest, config, observations, stage)
+        stage(
+            "completions",
+            _remind,
+            home,
+            directory,
+            manifest,
+            config,
+            observations,
+            stage,
+        )
         stage("work", work, home, directory, manifest, config)
         stage(
             "overdue claims",
@@ -3658,6 +3801,60 @@ def poll(home: Path, directory: Path) -> None:
     else:
         with contextlib.suppress(OSError):
             (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
+    finished = time.time()
+    with contextlib.suppress(OSError):
+        write_json(
+            directory / POLL_RECORD,
+            {
+                "at": finished,
+                "seconds": round(finished - started, 3),
+                "failed": len(failures),
+                "clean_at": (
+                    finished
+                    if not failures
+                    else last_poll(directory).get("clean_at")
+                ),
+                "stages": stages,
+            },
+        )
+
+
+def failure(label: str, exc: BaseException) -> str:
+    """Describes a failed poll step with the line that raised it.
+
+    Args:
+        label: Poll stage, naming the lane when the step belongs to one.
+        exc: Exception the step raised.
+
+    Returns:
+        The stage, the exception type and text, and the innermost frame that
+        raised it, so a recorded failure can be traced without the log.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = (
+        f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}"
+        if frames
+        else ""
+    )
+    return f"{label}: {type(exc).__name__}: {exc}{where}"
+
+
+def last_poll(directory: Path) -> dict:
+    """Reads when supervision last finished a poll of one project.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        The finish time, the wall seconds it took, how many steps failed and
+        when the last poll with no failed step finished, or an empty mapping
+        when no poll has been recorded or the record is unreadable.
+    """
+    try:
+        value = json.loads((directory / POLL_RECORD).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _publish_presence(
@@ -3665,12 +3862,16 @@ def _publish_presence(
 ) -> None:
     """Stores this poll's presence reading for every lane.
 
+    The write waits `store.BUSY_TIMEOUT` like every other writer. It used to
+    give up at once, so under steady hook traffic the presence reading was
+    skipped on the polls that needed it most.
+
     Args:
         home: Private bridge state root.
         manifest: Current participant manifest.
         observations: Presence reading per participant.
     """
-    with store.connect(home, write=True, timeout=0) as db:
+    with store.connect(home, write=True) as db:
         for name, participant in manifest["participants"].items():
             observed = observations[name]
             db.execute(
@@ -4578,6 +4779,11 @@ def run(home: Path, stopped: threading.Event) -> None:
     isolated, is written to the service log and to the project's supervision
     error record, which status and problems report, so a supervisor that
     fails on every tick is distinguishable from a healthy one.
+
+    Every exception a poll raises is caught, not only the expected kinds.
+    This thread is started once and serves every project, so an unexpected
+    `KeyError` from one malformed record used to end supervision for the
+    whole service with no trace until it was restarted.
     """
     from agent_parley import server
 
@@ -4593,10 +4799,8 @@ def run(home: Path, stopped: threading.Event) -> None:
                 manifest = roster.read(path.parent)
                 interval = configuration(home, manifest)["interval"]
                 poll(home, path.parent)
-            except (OSError, ValueError, BridgeError, sqlite3.Error) as exc:
-                issues.note_supervision_error(
-                    path.parent, f"poll: {type(exc).__name__}: {exc}"
-                )
+            except Exception as exc:
+                issues.note_supervision_error(path.parent, failure("poll", exc))
             if error := issues.supervision_error(path.parent):
                 server.log(
                     home,
@@ -4604,5 +4808,8 @@ def run(home: Path, stopped: threading.Event) -> None:
                     f"{path.parent.name}: {error['detail']}",
                 )
             deadlines[path] = time.monotonic() + interval
-        reap_launchers()
+        try:
+            reap_launchers()
+        except Exception as exc:
+            server.log(home, "supervision", failure("reap launchers", exc))
         stopped.wait(1)

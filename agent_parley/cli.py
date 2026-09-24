@@ -727,6 +727,36 @@ def supervision_failure(error: dict) -> str:
     return f"Supervision: failing for {since}s; last: {error['detail']}"
 
 
+def supervision_liveness(polled: dict) -> str:
+    """States when supervision last polled the project and how long it took.
+
+    A supervision thread that died leaves this reading ageing, so the line
+    distinguishes a supervisor that stopped from one that is merely quiet.
+
+    Args:
+        polled: Poll record written beside the project's issue ledger.
+
+    Returns:
+        One line naming the age and wall time of the last poll, its slowest
+        stage, and the age of the last poll in which no step failed.
+    """
+    now = time.time()
+    line = (
+        f"Supervision: last poll {max(int(now - polled['at']), 0)}s ago "
+        f"in {float(polled.get('seconds', 0)):.2f}s"
+    )
+    stages = polled.get("stages")
+    if isinstance(stages, dict) and stages:
+        slowest = max(stages, key=lambda label: float(stages[label]))
+        line += f", slowest {slowest} {float(stages[slowest]):.2f}s"
+    clean = polled.get("clean_at")
+    if clean is None:
+        return line + "; no clean poll recorded"
+    if clean != polled["at"]:
+        return line + f"; last clean {max(int(now - clean), 0)}s ago"
+    return line
+
+
 def wake_schedule(wake: dict) -> str:
     """States when a parked lane is asked again, or why it is not.
 
@@ -914,6 +944,12 @@ def lane_detail(record: dict, data: dict) -> None:
             + f"; {wake['age_seconds']}s ago"
         )
         print(f"    {wake_schedule(wake)}")
+    if foreign := record.get("foreign_session"):
+        print(
+            f"    Second session: {foreign['session_id'] or 'unnamed'} "
+            f"(pid {foreign['pid']}) sends hooks as this lane; "
+            "its events are ignored"
+        )
     mail = record["mail"] or {}
     if "error" in mail:
         print(f"    Coordination unavailable: {mail['error']}")
@@ -2821,6 +2857,10 @@ class Bridge:
         serves, and the hooks' relaunch still finds a record to retry from,
         with a backoff the failure count sets.
 
+        A service already serving is left running and the store is migrated
+        in place to this build's schema, so repairing a store an upgrade left
+        behind interrupts no lane.
+
         Raises:
             BridgeError: If the port is occupied or startup fails.
         """
@@ -2845,6 +2885,7 @@ class Bridge:
                         "Server is running but unhealthy. "
                         f"Inspect {self.home}/server.log"
                     )
+                store.initialize(self.home)
                 return
             failed = {
                 "state": "failed",
@@ -6956,6 +6997,7 @@ reported.
             "dialog": (
                 state["dialog"] if isinstance(state.get("dialog"), dict) else {}
             ),
+            "foreign_session": checkpoints.foreign_reading(state),
             "retired_at": views.timestamp(participant.get("retired")),
             "retired_age_seconds": (
                 int(time.time() - float(participant["retired"]))
@@ -7157,6 +7199,7 @@ reported.
                         "supervision_error": issues.supervision_error(
                             path.parent
                         ),
+                        "supervision_poll": supervision.last_poll(path.parent),
                     }
                 )
         return {
@@ -7212,6 +7255,9 @@ reported.
             print(f"\nProject: {data['root']}")
             if failing := project.get("supervision_error"):
                 print(supervision_failure(failing))
+            polled = project.get("supervision_poll") or {}
+            if isinstance(polled.get("at"), (int, float)):
+                print(supervision_liveness(polled))
             print(describe(snapshot(path.parent)))
             if measured := reclaim.summary_line(project.get("reclaim") or {}):
                 print(measured)
