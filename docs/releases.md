@@ -203,24 +203,42 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    when the package index already has it. Only a definite absence makes a
    version available; a check that fails to answer stops the run rather than
    choosing a number that may already be taken.
-3. `python3 -m scripts.release_publish bump` raises every version marker the
+3. A minor or major release needs acceptance evidence; a patch release does
+   not. `uv run --locked python -m scripts.release_publish evidence` runs the
+   fault-injection acceptance suite, `tests/test_fault_acceptance.py`, on the
+   release commit and reads the live acceptance record
+   `docs/acceptance/X.Y.Z.json` for the proposed version. The suite drives
+   stub clients through a lane killed mid-claim, a service restart, a usage
+   limit dialog, a permission prompt on resume, a full disk under the logs
+   and a dropped `Stop` event, and fails unless every claim completes with
+   idle lane-minutes and unaccountable claim-minutes under its limits. It
+   also runs in `make check`, so a pull request that breaks it is red before
+   any release. The live record is written from a real unattended run with
+   native clients, the run #366 describes, and holds `version`, `run` (a link
+   to the run's report), and the measured `lanes`, `claims`,
+   `claims_completed`, `idle_lane_minutes` and `unaccountable_claim_minutes`;
+   every claim the run took must have completed. A missing suite pass or a
+   missing or incomplete record fails the run before the markers are raised,
+   with one line per missing piece of evidence, so a count of release units
+   alone can never publish a minor version again.
+4. `python3 -m scripts.release_publish bump` raises every version marker the
    policy gate compares and prepends a changelog entry built from the same
    commits the measurement counted, so the published notes and the decision to
    release describe the same work. The policy gate then runs against the
    raised markers, so a marker the bump forgets fails the run instead of
    reaching a release.
-4. The release application commits `chore(main): release X.Y.Z` to `main`,
+5. The release application commits `chore(main): release X.Y.Z` to `main`,
    creates the annotated tag `vX.Y.Z` and pushes both. That commit subject is
    the loop guard: `Auto version` skips it, so a release cannot trigger another
    release. If `main` advanced between the measurement and the push, the push
    is rejected and the run fails rather than tagging a tree nothing measured.
    The next eligible push measures again and succeeds.
-5. The next step uses the repository token with `actions: write` to dispatch
+6. The next step uses the repository token with `actions: write` to dispatch
    `Release` with the pushed tag. Publication stays a
    separate top-level workflow so the index's trusted-publisher configuration
    continues to match the workflow that claims it, and so a retry is one
    dispatch rather than a repeat of the versioning path.
-6. Check the workflow result and verify the published version. A release is
+7. Check the workflow result and verify the published version. A release is
    complete only after the wheel and source archive on PyPI match the verified
    GitHub artifacts.
 

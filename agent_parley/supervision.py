@@ -1153,7 +1153,10 @@ def stranded_claims(
 
     Returns:
         One candidate per unfinished owned issue. A candidate with no eligible
-        peers remains in the result as a durable wait obligation.
+        peers remains in the result as a durable wait obligation. An
+        exhaustion that names no source, session or observation is left out:
+        recovery could never verify it, and publishing it would reject the
+        whole snapshot and stop the poll for every lane of the project.
     """
     owned = issues.holders(ledger)
     eligible = [
@@ -1164,8 +1167,9 @@ def stranded_claims(
     candidates = []
     for owner, numbers in sorted(owned.items()):
         observed = results.get(owner, {}).get("capacity", UNKNOWN_CAPACITY)
-        if observed.get("state") != "exhausted" or not observed.get(
-            "session_id"
+        if observed.get("state") != "exhausted" or not all(
+            observed.get(key)
+            for key in ("source", "session_id", "observation_id")
         ):
             continue
         peers = [name for name in eligible if name != owner]

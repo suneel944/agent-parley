@@ -770,13 +770,20 @@ class Watch:
 
         The capacity is recorded before the dialog is published, so a reader
         that sees the lane parked on a usage limit also sees the exhaustion
-        that parked it rather than a lane with no capacity record.
+        that parked it rather than a lane with no capacity record. The
+        observation names the session the lane last published, because a
+        stranded-claim candidate without one is evidence recovery refuses,
+        and supervision rejected every such candidate before it could offer
+        the claim to a peer.
         """
         observed = time.time()
         reset = reset_at(screen, observed)
-        from agent_parley import supervision
+        from agent_parley import checkpoints, supervision
 
         with contextlib.suppress(BridgeError, OSError, ValueError):
+            session = checkpoints.activity(self._directory, self._name).get(
+                "session_id"
+            )
             supervision.record_capacity(
                 self._directory,
                 self._name,
@@ -785,6 +792,7 @@ class Watch:
                     "observed_at": observed,
                     "reset_at": reset,
                     "source": "native-dialog",
+                    "session_id": str(session or ""),
                     "observation_id": self._evidence(dialog.name, reset),
                 },
             )
