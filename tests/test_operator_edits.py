@@ -179,3 +179,37 @@ def test_the_hook_reads_the_poll_reading_instead_of_asking_git(
     first = checkpoints.checkpoint(bridge.home, directory, "claude", payload)
     context = first["hookSpecificOutput"]["additionalContext"]
     assert "Operator edit on a path you reserved: shared.txt" in context
+
+
+def test_status_reads_the_published_poll_reading_instead_of_asking_git(
+    bridge, repo, paired, monkeypatch
+):
+    reserve(bridge, paired["root"], "claude", "shared.txt")
+    (repo / "shared.txt").write_text("operator change\n")
+    supervision.refresh_readings(bridge.home, paired, 60)
+    supervision._READINGS.clear()
+
+    def asked(*args, **kwargs):
+        raise AssertionError("status asked Git for a poll reading")
+
+    monkeypatch.setattr(supervision, "operator_edits", asked)
+    monkeypatch.setattr(supervision, "base_advances", asked)
+    lanes = {
+        lane["participant"]: lane
+        for lane in bridge.status_snapshot()["projects"][0]["participants"]
+    }
+    assert lanes["claude"]["operator_edits"] == ["shared.txt"]
+    view = dashboard.collect(bridge.home, False, {})
+    rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
+    assert rows["claude"]["operator_edits"] == ["shared.txt"]
+
+
+def test_an_expired_publication_is_read_from_git_again(bridge, repo, paired):
+    reserve(bridge, paired["root"], "claude", "shared.txt")
+    supervision.refresh_readings(bridge.home, paired, -1)
+    supervision._READINGS.clear()
+    (repo / "shared.txt").write_text("operator change\n")
+
+    assert supervision.readings(bridge.home, paired)[0] == {
+        "claude": ["shared.txt"]
+    }

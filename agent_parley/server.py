@@ -416,6 +416,7 @@ class Server(ThreadingHTTPServer):
         self.stopping = threading.Event()
         self.counting = threading.Lock()
         self.deciding: dict[tuple[str, str], int] = {}
+        self.recovering: dict[tuple[str, str], list[dict]] = {}
         self.repeats: dict[
             tuple[str, tuple[str, str]], tuple[float, int, str]
         ] = {}
@@ -577,6 +578,58 @@ class Server(ThreadingHTTPServer):
             f"{refused} connection(s) closed unanswered with all "
             f"{WORKERS} worker slots busy",
         )
+
+    def recover(self, lane: tuple[str, str], owed: dict) -> None:
+        """Queues a recovery checkpoint to run after its hook was answered.
+
+        One thread per lane works its queue in arrival order, so the lane's
+        checkpoints stay ordered and a burst of events never starts more
+        than one Git capture for the same worktree at once. Every request is
+        kept, because a later one may carry no gate evidence and would lose
+        the passing command an earlier one recorded.
+
+        Args:
+            lane: Project key and participant name the request is for.
+            owed: The ``recovery`` request `checkpoints.serve` returned.
+        """
+        with self.counting:
+            queued = self.recovering.get(lane)
+            if queued is not None:
+                queued.append(owed)
+                return
+            self.recovering[lane] = []
+        threading.Thread(
+            target=self._recovering, args=(lane, owed), daemon=True
+        ).start()
+
+    def _recovering(self, lane: tuple[str, str], owed: dict) -> None:
+        """Runs one lane's queued recovery checkpoints until none are left.
+
+        Args:
+            lane: Project key and participant name the queue belongs to.
+            owed: First request to run.
+        """
+        while True:
+            try:
+                checkpoints.recover(
+                    Path(owed["directory"]),
+                    owed["participant"],
+                    owed["payload"],
+                    checkpoints.SETTLE_SECONDS,
+                )
+            except Exception as exc:
+                self.coalesce(
+                    "unrecovered",
+                    lane,
+                    f"{lane[1]} recovery checkpoint not written; the next "
+                    f"event captures again: {type(exc).__name__}",
+                )
+            with self.counting:
+                queued = self.recovering.get(lane) or []
+                if not queued:
+                    self.recovering.pop(lane, None)
+                    return
+                owed = queued.pop(0)
 
     def coalesce(self, event: str, lane: tuple[str, str], detail: str) -> None:
         """Records a per-lane repeat at most once per `REPEAT_SECONDS`.
@@ -881,6 +934,11 @@ class Handler(BaseHTTPRequestHandler):
         parsing a connection that closed without a status line, as it did
         when a reinstall removed modules from under a running service.
 
+        A recovery checkpoint the decision owes is queued with
+        `Server.recover` only after the reply was written, so the commit and
+        bundle it takes never count against the client's read timeout. A
+        decision abandoned at its deadline queues its own when it finishes.
+
         Args:
             actor: Registered identity the bearer credential resolved to.
         """
@@ -920,12 +978,17 @@ class Handler(BaseHTTPRequestHandler):
         if served is None:
             return
         delivery = served.pop("delivery", None)
-        if self.headers.get("Accept") == hook.RAW_REPLY:
-            self._raw_hook(served)
-        else:
-            self._reply(200, served)
-        if delivery:
-            self._delivered(path, request["participant"], delivery)
+        owed = served.pop("recovery", None)
+        try:
+            if self.headers.get("Accept") == hook.RAW_REPLY:
+                self._raw_hook(served)
+            else:
+                self._reply(200, served)
+            if delivery:
+                self._delivered(path, request["participant"], delivery)
+        finally:
+            if owed:
+                self.server.recover(lane, owed)
 
     def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
         """Marks a written reply's coordination as delivered to the lane.
@@ -1021,13 +1084,18 @@ class Handler(BaseHTTPRequestHandler):
                 outcome["failed"] = traceback.format_exc()
             finally:
                 with self.server.counting:
-                    if outcome.pop("abandoned", False):
+                    abandoned = outcome.pop("abandoned", False)
+                    if abandoned:
                         held = self.server.deciding.get(lane, 1)
                         if held > 1:
                             self.server.deciding[lane] = held - 1
                         else:
                             self.server.deciding.pop(lane, None)
                     outcome["finished"] = True
+                late = outcome.get("served")
+                if abandoned and isinstance(late, dict):
+                    if owed := late.pop("recovery", None):
+                        self.server.recover(lane, owed)
 
         project, participant = lane
         with self.server.counting:
@@ -1066,11 +1134,16 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(500)
             return None
         with self.server.counting:
-            if not outcome.get("finished"):
+            finished = bool(outcome.get("finished"))
+            if not finished:
                 outcome["abandoned"] = True
                 self.server.deciding[lane] = (
                     self.server.deciding.get(lane, 0) + 1
                 )
+        late = outcome.get("served")
+        if finished and isinstance(late, dict):
+            if owed := late.pop("recovery", None):
+                self.server.recover(lane, owed)
         log(
             self.server.home,
             "expired",

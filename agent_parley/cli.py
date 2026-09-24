@@ -956,6 +956,8 @@ def lane_detail(record: dict, data: dict) -> None:
                 else ""
             )
         )
+    if mail.get("refused"):
+        print("    Refused a key it holds: " + ", ".join(mail["refused"]))
     print(f"    Last coordination: {mail['last_coordination_at']}")
     for pending in mail["outstanding_ack"]:
         print(
@@ -5867,8 +5869,11 @@ reported.
         that is merged on the forge stays open in the ledger forever once that
         lane stops answering, and every capacity and load decision downstream
         reads the stale row. This is the operator's way out, and it is bounded
-        on both sides. The forge is read here, now, and the pull request it
-        reports must have been opened inside the current ownership generation,
+        on both sides. The forge is read here, now: the issue's own closing
+        pull request speaks first, whichever branch it came from, and the
+        lane branch's newest pull request only when the forge cannot say. The
+        issue must have closed, or that pull request opened, inside the
+        current ownership generation,
         so an unverified claim is never ended this way. The supervisor must
         already have escalated the claim as an unresolved completion, so a
         holder that is answering is never resolved out from under it. The
@@ -5905,9 +5910,21 @@ reported.
             raise BridgeError(f"Issue #{issue} has no owner.")
         participant = data["participants"].get(holder) or {}
         forge.select(repo, data)
-        evidence = forge.branch_evidence(
-            Path(data["root"]), str(participant.get("branch", ""))
-        )
+        closing = forge.issue_completion(Path(data["root"]), issue)
+        evidence: dict | None
+        if closing and closing["state"] in ("MERGED", "CLOSED"):
+            evidence = {
+                "branch": closing["branch"] or f"issue #{issue}",
+                "state": closing["state"],
+                "created_at": closing["closed_at"],
+                "commit": closing["commit"],
+                "pull_request": closing["pull_request"],
+                "url": closing["url"],
+            }
+        else:
+            evidence = forge.branch_evidence(
+                Path(data["root"]), str(participant.get("branch", ""))
+            )
         if not evidence or evidence["state"] not in ("MERGED", "CLOSED"):
             raise BridgeError(
                 f"No merged or closed pull request was observed for {holder}, "
@@ -7060,6 +7077,7 @@ reported.
             "queued_by": list(
                 frame["usage"].get(name, {}).get("queued_by", [])
             ),
+            "refused": list(frame["usage"].get(name, {}).get("refused", [])),
             "last_coordination_at": views.timestamp(mail["last_coordination"]),
             "outstanding_ack": [
                 {
@@ -7112,8 +7130,7 @@ reported.
             data = roster.normalize(json.loads(path.read_text()))
             if supervision.root_retired(path.parent):
                 continue
-            edits = supervision.operator_edits(self.home, data)
-            advances = supervision.base_advances(self.home, data)
+            edits, advances = supervision.readings(self.home, data)
             with self._project_reading() as db:
                 context = self._project_context(path.parent, data, db)
                 projects.append(

@@ -36,6 +36,10 @@ SETTLING = frozenset(
 CONTEXT_EVENTS = frozenset(
     {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"}
 )
+RENEWING_EVENTS = frozenset({"PreToolUse"})
+RECOVERY_EVENTS = frozenset(
+    {"SessionStart", "PostToolUse", "Stop", "SessionEnd"}
+)
 HOOK_TIMEOUT = 3
 STORAGE_ERRORS = frozenset(
     (errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EFBIG, errno.EIO)
@@ -1625,10 +1629,13 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
 def renewed_leases(home: Path, root: str, name: str, after: int = 0) -> dict:
     """Renews this lane's expired reservations and reads the mailbox again.
 
-    A checkpoint is the lane saying it is alive and still working, so it is
+    A tool call is the lane proving it is alive and still working, so it is
     where a lease that outlived its declared window is restored to that
     window. Without it the runtime would reclaim a working lane's keys for a
-    peer, and with it a lane that has stopped coordinating loses them. Only a
+    peer, and with it a lane that has stopped coordinating loses them. A
+    session start, a turn end or a supervisor resume proves neither, so only
+    the events in `RENEWING_EVENTS` call this; a parked lane that is resumed
+    or typed into keeps its expired leases expired. Only a
     lane that already holds an expired lease pays for this; the mailbox is
     read again afterwards so the checkpoint reports what is true after the
     renewal rather than before it.
@@ -1788,6 +1795,9 @@ def checkpoint(
     given. With one, those delivery markers are left in it for `deliver`,
     which the caller runs once the reply reached the native client, so a
     reply the client never received leaves them to be delivered again.
+    The recovery checkpoint of a `RECOVERY_EVENTS` event is also left to
+    that caller, as ``pending["recovery"]``, which runs `recover` once the
+    reply was written, so a slow commit and bundle never holds the reply.
 
     A native event carrying a session identity confirms that identity as the
     lane's resumable session. The launcher clears the live session field
@@ -1847,7 +1857,8 @@ def checkpoint(
             lane's checkpoint lock.
         record_only: Whether to record the event without mail or scans.
         pending: Mapping that receives the delivery markers instead of the
-            activity file, for a caller that commits them after its reply.
+            activity file, and the request for a recovery checkpoint, for a
+            caller that commits both after its reply.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -2038,7 +2049,9 @@ def checkpoint(
                 )
                 state["pending_ack"] = mail["pending_ack"]
                 state.pop("coordination_error", None)
-                if mail.get("stale_reservations", 0):
+                if event in RENEWING_EVENTS and mail.get(
+                    "stale_reservations", 0
+                ):
                     mail = renewed_leases(
                         home,
                         manifest["root"],
@@ -2250,7 +2263,9 @@ def checkpoint(
                             "additionalContext": text,
                         }
                     }
-        if event in ("SessionStart", "PostToolUse", "Stop", "SessionEnd"):
+        if event in RECOVERY_EVENTS and pending is not None:
+            pending["recovery"] = True
+        elif event in RECOVERY_EVENTS:
             stages.enter("recovery")
             try:
                 saved = recovery.capture(directory, manifest, agent, payload)
@@ -2373,6 +2388,68 @@ def mark_seen(home: Path, markers: dict) -> None:
             store.mark_read(home, seen["root"], seen["name"], seen["ids"])
 
 
+def recover(
+    directory: Path,
+    agent: str,
+    payload: dict,
+    timeout: float = LOCK_SECONDS,
+) -> bool:
+    """Writes the recovery checkpoint a decision left for after its reply.
+
+    It holds the lane's checkpoint lock, as the decision did, so it never
+    interleaves with another event's record. A session whose ownership
+    generation was transferred meanwhile writes nothing, because its
+    worktree no longer backs the claims. The activity file is rewritten
+    only when the checkpoint ids or the error changed, and never created,
+    so an unchanged tree adds no write after the reply.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        payload: Native lifecycle event the decision observed.
+        timeout: Seconds to wait for the lane's checkpoint lock.
+
+    Returns:
+        Whether a checkpoint was attempted.
+
+    Raises:
+        LockBusy: If the lane's checkpoint lock stays held.
+        BridgeError: If the project manifest cannot be read.
+        OSError: If the activity file cannot be read or written.
+    """
+    from agent_parley import recovery
+
+    path = directory / f"{agent}-activity.json"
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=timeout):
+        if recovery.stale_session(directory, agent, payload):
+            return False
+        manifest = roster.read(directory)
+        try:
+            saved = recovery.capture(directory, manifest, agent, payload)
+            outcome: dict = {
+                "recovery_checkpoints": [item["id"] for item in saved]
+            }
+        except (BridgeError, OSError, ValueError) as exc:
+            outcome = {"recovery_error": clip(str(exc), MAX_CAUSE_BYTES)}
+        if not path.exists():
+            return True
+        state = json.loads(path.read_text())
+        before = {
+            "recovery_checkpoints": state.get("recovery_checkpoints", []),
+            "recovery_error": state.get("recovery_error"),
+        }
+        if "recovery_checkpoints" in outcome:
+            state.pop("recovery_error", None)
+        state.update(outcome)
+        after = {
+            "recovery_checkpoints": state.get("recovery_checkpoints", []),
+            "recovery_error": state.get("recovery_error"),
+        }
+        if after != before:
+            write_json(path, state)
+    return True
+
+
 def serve(
     home: Path,
     request: dict,
@@ -2418,13 +2495,16 @@ def serve(
         record_only: Whether to record the event without building context;
             see `checkpoint`.
         deferred: Whether the caller records delivery itself, through
-            `deliver`, once the reply was written. An abandoned decision
-            then never marks its coordination as delivered.
+            `deliver`, and the recovery checkpoint, through `recover`, once
+            the reply was written. An abandoned decision then never marks
+            its coordination as delivered.
 
     Returns:
         ``status``, ``stdout`` and ``stderr`` for the hook process to emit,
-        and for a deferred decision that injected coordination, the
-        ``delivery`` mapping `deliver` takes.
+        for a deferred decision that injected coordination, the
+        ``delivery`` mapping `deliver` takes, and for a deferred decision
+        owing a recovery checkpoint, the ``recovery`` request naming the
+        ``directory``, ``participant`` and ``payload`` `recover` takes.
     """
     directory = Path(str(request.get("directory", "")))
     participant = str(request.get("participant", ""))
@@ -2486,6 +2566,12 @@ def serve(
             "stdout": json.dumps(output) + "\n",
             "stderr": "",
         }
+        if pending is not None and pending.pop("recovery", False):
+            served["recovery"] = {
+                "directory": str(directory),
+                "participant": participant,
+                "payload": payload,
+            }
         if pending:
             served["delivery"] = pending
         return served
@@ -2661,6 +2747,10 @@ def main(fallback: str = "", size: int = 0) -> int:
         with contextlib.suppress(OSError, BridgeError):
             sys.stdout.flush()
             deliver(args.directory, args.participant, delivery)
+    if owed := served.get("recovery"):
+        with contextlib.suppress(OSError, BridgeError):
+            sys.stdout.flush()
+            recover(args.directory, args.participant, owed["payload"])
     return served["status"]
 
 

@@ -1,13 +1,24 @@
 """Exercises the terminating transition for an observed-complete claim."""
 
 import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import forge, issues, lifecycle, problems, store, supervision
-from agent_parley.state import BridgeError
+from agent_parley import (
+    delivery,
+    forge,
+    issues,
+    lifecycle,
+    problems,
+    process,
+    store,
+    supervision,
+    terminal,
+)
+from agent_parley.state import BridgeError, write_json
 
 HOUR = 3600.0
 
@@ -151,8 +162,30 @@ def test_an_open_pull_request_never_escalates(bridge, claimed, monkeypatch):
     assert record(claimed).get("unresolved_completion") is None
 
 
+def test_a_raising_forge_reading_leaves_the_rest_of_the_poll_running(
+    claimed, bridge, monkeypatch
+):
+    def broken(*args):
+        raise ValueError("forge reply unreadable")
+
+    ran = []
+    monkeypatch.setattr(forge, "issue_completion", broken)
+    monkeypatch.setattr(
+        supervision, "reminders", lambda *args: ran.append("reminders")
+    )
+    monkeypatch.setattr(
+        supervision,
+        "observe_responses",
+        lambda *args: ran.append("responses"),
+    )
+    supervision.poll(bridge.home, claimed.parent)
+    assert ran == ["reminders", "responses"]
+    detail = issues.supervision_error(claimed.parent)["detail"]
+    assert detail == "completion: ValueError: forge reply unreadable"
+
+
 def test_the_escalation_reaches_status_and_problems(
-    bridge, repo, claimed, monkeypatch
+    bridge, repo, paired, claimed, monkeypatch
 ):
     escalated(bridge, claimed, monkeypatch)
     lanes = bridge.status_snapshot()["projects"][0]["participants"]
@@ -171,7 +204,63 @@ def test_the_escalation_reaches_status_and_problems(
     ]
     assert len(listed) == 1
     assert listed[0]["participant"] == "claude"
-    assert listed[0]["command"].startswith("agent-parley issue resolve 1")
+    assert listed[0]["command"] == (
+        f"agent-parley issue resolve 1 --repo {paired['root']}"
+    )
+
+
+def owed(bridge, paired, lane, monkeypatch):
+    """Reports where the lane's completion reminder still reaches it."""
+    prompt = record(lane)["handoff_prompt"]
+    ledger = issues.snapshot(lane.parent)
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    monkeypatch.setattr(supervision, "_wake_due", lambda *args: 0.0)
+    wake_path = lane.parent / "claude-wake.json"
+    wake_path.unlink(missing_ok=True)
+    supervision.wake(
+        bridge.home,
+        lane.parent,
+        paired,
+        "claude",
+        supervision.presence(lane.parent, "claude", 1),
+        {**supervision.DEFAULTS, "inactive_after": 1},
+    )
+    backlog = (
+        json.loads(wake_path.read_text())["backlog"]
+        if wake_path.exists()
+        else []
+    )
+    return {
+        "wake": prompt["id"] in backlog,
+        "delivery": f"Issue #1: {supervision.ENDED}"
+        in "\n".join(delivery._notices("claude", ledger, None, [], {})),
+        "listing": "Handoff reminder unanswered" in issues.describe(ledger),
+    }
+
+
+def test_a_released_claim_stops_reminding_its_former_holder(
+    bridge, paired, claimed, monkeypatch
+):
+    write_json(
+        claimed.parent / "claude-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    escalated(bridge, claimed, monkeypatch)
+    everywhere = {"wake": True, "delivery": True, "listing": True}
+    assert owed(bridge, paired, claimed, monkeypatch) == everywhere
+    bridge.issue(claimed, "release", "1")
+    supervision.poll(bridge.home, claimed.parent)
+    ended = record(claimed)
+    assert ended["owner"] is None
+    assert ended.get("unresolved_completion") is None
+    assert ended["handoff_prompt"]["responded_at"]
+    nowhere = {"wake": False, "delivery": False, "listing": False}
+    assert owed(bridge, paired, claimed, monkeypatch) == nowhere
 
 
 def test_the_operator_resolves_a_merged_claim_with_its_evidence(
@@ -196,6 +285,32 @@ def test_the_operator_resolves_a_merged_claim_with_its_evidence(
     assert after["history"][-1]["action"] == "resolve"
     assert after["history"][-1]["actor"] == "operator"
     assert lifecycle.state(after)["commit"] == "abcdef1234567"
+
+
+def test_a_claim_closed_by_a_per_issue_pull_request_is_resolved(
+    bridge, repo, claimed, monkeypatch
+):
+    reading = {
+        "state": "MERGED",
+        "closed_at": time.time() + 1,
+        "pull_request": 1328,
+        "url": "https://example.invalid/pull/1328",
+        "branch": "refactor/1-replay-package",
+        "commit": "abcdef1234567",
+    }
+    monkeypatch.setattr(forge, "issue_completion", lambda *args: reading)
+    completion(monkeypatch, None, 0.0)
+    evidence(monkeypatch, None, 0.0)
+    supervision.poll(bridge.home, claimed.parent)
+    unanswered(claimed, 2)
+    supervision.poll(bridge.home, claimed.parent)
+    marker = record(claimed)["unresolved_completion"]
+    assert marker["branch"] == "refactor/1-replay-package"
+    result = bridge.issue_resolve(repo, "1", reason="landed per issue")
+    assert result["outcome"] == "complete"
+    resolution = record(claimed)["resolution"]
+    assert resolution["evidence"]["pull_request"] == 1328
+    assert resolution["evidence"]["branch"] == "refactor/1-replay-package"
 
 
 def test_a_resolution_is_not_an_owner_filed_completion(

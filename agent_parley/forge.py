@@ -205,6 +205,97 @@ def branch_evidence(repo: Path, branch: str) -> dict | None:
         return None
 
 
+def issue_completion(repo: Path, number: str) -> dict | None:
+    """Reports whether one issue is closed and which pull request closed it.
+
+    A lane may land a claim through a pull request from any branch, so the
+    lane branch cannot say whether a claimed issue ended. The issue itself
+    can: its state, when it closed, and the pull requests the forge links to
+    it as closing it. The newest linked pull request supplies the head
+    branch and merge commit that identify who landed the work. Only the
+    GitHub forge links pull requests to issues, so every other forge reports
+    None and the caller falls back to the lane branch.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        number: Bare repository issue number.
+
+    Returns:
+        None when the forge cannot say. Otherwise the issue state, `OPEN` or
+        `CLOSED`, and for a closed issue the instant it closed in Unix
+        seconds, together with the closing pull request's state, number,
+        URL, head branch and merge commit, each empty when no pull request
+        is linked or it cannot be read. A closing pull request that merged
+        reports the state `MERGED`.
+    """
+    if _implementation(repo) != "github":
+        return None
+    project = _reachable(repo)
+    if not project:
+        return None
+    output = _run(
+        [
+            "gh",
+            "issue",
+            "view",
+            number,
+            "--repo",
+            project,
+            "--json",
+            "state,closedAt,closedByPullRequestsReferences",
+        ],
+        5,
+    )
+    try:
+        record = json.loads(output or "null")
+        state = str(record["state"]).upper()
+        if state != "CLOSED":
+            return {"state": state}
+        closed_at = _epoch(record["closedAt"])
+        linked = [
+            int(entry["number"])
+            for entry in record.get("closedByPullRequestsReferences") or []
+            if entry.get("number")
+        ]
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+    reading = {
+        "state": "CLOSED",
+        "closed_at": closed_at,
+        "pull_request": 0,
+        "url": "",
+        "branch": "",
+        "commit": "",
+    }
+    if not linked:
+        return reading
+    pull = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(max(linked)),
+            "--repo",
+            project,
+            "--json",
+            "state,number,url,headRefName,mergeCommit",
+        ],
+        5,
+    )
+    try:
+        request = json.loads(pull or "null")
+        reading.update(
+            state="MERGED" if request.get("state") == "MERGED" else "CLOSED",
+            pull_request=int(request.get("number") or 0),
+            url=str(request.get("url") or ""),
+            branch=str(request.get("headRefName") or ""),
+            commit=str((request.get("mergeCommit") or {}).get("oid") or ""),
+        )
+    except (ValueError, TypeError, AttributeError):
+        reading["pull_request"] = max(linked)
+    return reading
+
+
 def _epoch(value: str) -> float:
     """Converts a forge timestamp to Unix seconds, or raises ValueError."""
     return datetime.fromisoformat(value).timestamp()

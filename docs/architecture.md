@@ -355,8 +355,9 @@ candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
 the persisted issue candidate and revalidates its owner and evidence identity
 before acting.
 
-The same poll marks the claims of a lane whose session process is gone and that
-has been silent past the stall threshold, writing an orphan marker on each of
+The same poll marks the claims of a lane whose session process is gone, or
+whose last event was a clean `SessionEnd` with no process left to check, and
+that has been silent past the stall threshold, writing an orphan marker on each of
 its ledger records and sending every other lane one notice that names those
 issues and the reservations the dead lane still holds. The marker is an
 observation: the issue keeps its owner and the reservations keep their holder
@@ -696,12 +697,14 @@ from the live ones and names the age of the oldest, and both surfaces report
 that age in seconds past the deadline.
 
 An expired lease is renewed by its holder or reclaimed from it. A holder that
-is still coordinating renews its own expired leases at its next checkpoint,
+is still working renews its own expired leases at its next `PreToolUse`,
 restoring the window that holder declared, so live work never loses a key it
-is using. A lease correlated with a claim that holder no longer holds is
-released at that checkpoint instead, and the holder is told which keys it lost.
-A lease whose holder was last observed without a live session process, or that
-has been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
+is using. A session start, a prompt, a turn end or a supervisor resume proves
+no work and renews nothing. A lease correlated with a claim that holder no
+longer holds is released at that checkpoint instead, and the holder is told
+which keys it lost. A lease whose holder was last observed without a live
+session process, or idle past the project's inactive threshold, or that has
+been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
 is released by the next reservation call or supervision poll: the oldest queued
 request for each key is granted, the lane that took it is told who lost it, and
 the former holder is told what was released and why. The grace sits above the
@@ -988,14 +991,24 @@ that arrives behind a slow decision still closes the tool call or the turn.
 Decisions merely in flight are not counted, so parallel native calls in a
 healthy lane keep their context injection.
 
+The recovery checkpoint of a `SessionStart`, `PostToolUse`, `Stop` or
+`SessionEnd` is not part of the decision. The service answers the hook first
+and then queues the capture on one thread per lane, which works the lane's
+requests in arrival order under the lane's checkpoint lock. A decision
+abandoned at its deadline queues its capture when it finishes. The in-process
+fallback writes its reply, then captures before it exits.
+
 The context scans (issue ledger, work offer, operator edits, base advances and
 budget standing) run before the checkpoint lock is taken, so the lock guards
 only the lane's record and mail cursor. Operator edits and base advances are
 Git readings the supervision poll takes once per project per interval and
-keeps for twice that interval; the hook path reads that copy and asks Git only
-when no current reading exists, as in the in-process fallback. Measured on 12
-lanes, the median hook fell from 22.7 to 4.4 ms and the median time the lock
-is held from 19.6 to 0.9 ms. An event that finds a newer event already applied
+keeps for twice that interval. It also publishes the reading as
+`git-readings.json` in the project state directory with the same expiry. The
+hook path, `status` and `top` read that copy and ask Git only when no current
+reading exists, as in the in-process fallback. Measured on 12 lanes, the
+median hook fell from 22.7 to 4.4 ms and the median time the lock is held from
+19.6 to 0.9 ms. On 15 lanes over 20,000 files with an advanced base, the
+status reading fell from 0.35 to 0.007 s. An event that finds a newer event already applied
 still writes its record and delivers its context, but leaves the newer
 activity label in place.
 

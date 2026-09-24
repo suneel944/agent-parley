@@ -120,8 +120,11 @@ A lane whose recorded session process is gone and that has been silent past the
 project's stall threshold has its claims marked `orphaned` in `issue list`,
 `status` and `top`, which marks the issue `#42*`. The marker states what was
 observed: an idle lane with a live process is never marked, however long it has
-been quiet. Every other lane receives one notice naming the orphaned issues and
-the reservations that lane still holds.
+been quiet. A session that ended cleanly with `SessionEnd` and left no process
+to check counts as gone, so a lane that exited on purpose is marked like one
+that crashed; a lane that never recorded a session is left alone. Every other
+lane receives one notice naming the orphaned issues and the reservations that
+lane still holds.
 
 Ownership does not move on the marker. A peer takes the work explicitly, and
 the take records the previous owner and the reason, then releases the
@@ -175,8 +178,9 @@ forecast is advisory and never withholds a grant or a claim.
 A reservation that declared a time to live is counted apart from the live ones
 once that deadline passes, with the age of the oldest, so a lane that died
 holding a path reads differently from one still working on it. A lane that is
-still coordinating renews its own expired leases at its next checkpoint. One
-whose last observation found no live session, or whose lease has been expired
+still working renews its own expired leases at its next tool call; a session
+start or a supervisor resume renews nothing. One whose last observation found
+no live session or found it idle past the inactive threshold, or whose lease has been expired
 longer than the 1800-second grace, has it released to the first lane queued for
 that key, and both lanes are told. Reservations stay advisory throughout:
 nothing on disk is locked or reverted.
@@ -193,6 +197,12 @@ registration expires the requests it left behind. A queued request stays
 advisory like the reservation it asks for: it blocks nobody and holds nothing
 until that release. `status` names the requests queued on a lane's keys and who
 asked; `top` marks the count with `+` beside that lane's leases.
+
+Every refusal, queued or not, is also recorded against its holder for a day.
+`status` names the lanes a holder refused a key it still holds, and
+`problems` raises a `holding a refused key` row on a holder that is not
+active, with how long it has been quiet. A refusal drops out of both once
+the holder releases or loses the overlapping lease.
 
 An operator editing the base checkout is otherwise invisible to a lane until the
 merge conflicts. Every `top` and `status` frame reads `git status` of the base

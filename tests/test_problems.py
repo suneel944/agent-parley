@@ -226,6 +226,48 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
 
 
+def test_an_idle_lane_holding_a_refused_key_names_the_refused_lane(
+    bridge, repo, paired, served
+):
+    alive(bridge.project(repo)[1], "claude")
+    store.initialize(bridge.home)
+    lanes = {
+        name: store.authenticate(
+            bridge.home,
+            store.register(bridge.home, paired["root"], name)[
+                "registration_token"
+            ],
+        )
+        for name in ("claude", "codex")
+    }
+    store.call(
+        bridge.home,
+        lanes["claude"],
+        "file_reservation_paths",
+        {"paths": ["shared.txt"]},
+    )
+    refused = store.call(
+        bridge.home,
+        lanes["codex"],
+        "file_reservation_paths",
+        {"paths": ["shared.txt"]},
+    )
+    assert refused["conflicts"]
+    [record] = [
+        lane
+        for project in bridge.status_snapshot()["projects"]
+        for lane in project["participants"]
+        if lane["participant"] == "claude"
+    ]
+    assert record["mail"]["refused"] == ["codex"]
+    [row] = rows(bridge, problems.HOLDING)
+    assert row["participant"] == "claude"
+    assert "codex" in row["detail"]
+    assert row["seconds"] is not None
+    store.call(bridge.home, lanes["claude"], "release_file_reservations", {})
+    assert not rows(bridge, problems.HOLDING)
+
+
 def test_an_escalated_native_dialog_is_a_row_naming_it(
     bridge, repo, paired, served
 ):

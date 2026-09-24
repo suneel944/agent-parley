@@ -45,6 +45,7 @@ RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 BOOT_RECORD = "boot.json"
+READINGS_PUBLICATION = "git-readings.json"
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -338,7 +339,9 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         `None` rather than an age measured from the Unix epoch, and reads as
         `ACTIVE` while its process is alive, because a lane that has never
         checked in has not been quiet for any span a threshold can be
-        compared against.
+        compared against. `ended` is true when the last recorded event is
+        a clean `SessionEnd` that left no session process to check, which
+        is a known stop rather than an unknown process.
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
@@ -352,6 +355,8 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "activity": derived["state"],
         "evidence": derived["evidence"],
         "stale": derived["stale"],
+        "ended": value.get("event") == "SessionEnd"
+        and derived["process_alive"] is None,
     }
 
 
@@ -724,6 +729,51 @@ def refresh_readings(
         edits,
         advances,
     )
+    if directory := roster.locate(home, manifest["root"]):
+        with contextlib.suppress(OSError):
+            write_json(
+                directory / READINGS_PUBLICATION,
+                {
+                    "expires": time.time() + lifetime,
+                    "edits": edits,
+                    "advances": advances,
+                },
+            )
+    return edits, advances
+
+
+def _published_readings(
+    home: Path, manifest: dict
+) -> tuple[dict[str, list[str]], dict[str, list[str]]] | None:
+    """Reads the Git readings the last supervision poll published.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout.
+
+    Returns:
+        The operator edits and the base advances, or None when no current,
+        well-formed publication exists.
+    """
+    directory = roster.locate(home, manifest["root"])
+    if directory is None:
+        return None
+    try:
+        published = json.loads((directory / READINGS_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(published, dict):
+        return None
+    expires = published.get("expires")
+    edits = published.get("edits")
+    advances = published.get("advances")
+    if (
+        not isinstance(expires, (int, float))
+        or time.time() >= expires
+        or not isinstance(edits, dict)
+        or not isinstance(advances, dict)
+    ):
+        return None
     return edits, advances
 
 
@@ -732,9 +782,13 @@ def readings(
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Returns the project's Git readings, from the poll's copy if current.
 
-    A process with no current poll reading, such as a hook deciding
-    in-process while the service is down, takes the readings itself and
-    keeps nothing, so only the poll decides how often Git is asked.
+    The poll also publishes its reading in the project state directory, so
+    a separate process such as `agent-parley status` reuses it instead of
+    asking Git for a status and a merge-base per lane again. A process with
+    neither a current copy nor a current publication, such as a hook
+    deciding in-process while the service is down, takes the readings
+    itself and keeps nothing, so only the poll decides how often Git is
+    asked.
 
     Args:
         home: Private bridge state root.
@@ -746,6 +800,8 @@ def readings(
     kept = _READINGS.get(manifest["root"])
     if kept is not None and time.monotonic() < kept[0]:
         return kept[1], kept[2]
+    if (published := _published_readings(home, manifest)) is not None:
+        return published
     return operator_edits(home, manifest), base_advances(home, manifest)
 
 
@@ -1901,13 +1957,28 @@ def configuration(home: Path, manifest: dict) -> dict:
     return config
 
 
-def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
+def reminders(
+    directory: Path,
+    manifest: dict,
+    closed: set[str],
+    landed: dict[str, str] | None = None,
+) -> None:
     """Records idempotent reminders without releasing or transferring claims.
+
+    A `pull request ended` reminder asks the lane that holds the claim to
+    report it. Once that lane no longer owns the issue, whether it released,
+    handed off, was reclaimed or was resolved, the reminder asks for nothing
+    it can still do, so it is stamped answered and leaves the lane's wake
+    backlog, delivery and listing.
 
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
-        closed: Issues whose lane pull request is observed merged or closed.
+        closed: Issues observed closed, or whose pull request is observed
+            merged or closed, inside the current ownership generation.
+        landed: Another lane that landed the closing pull request, per issue
+            number, named in the reminder so the owner and the operator
+            reading it learn a peer finished the claim.
     """
     after_message_id = 0
     home = directory.parent.parent
@@ -1920,6 +1991,14 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
         ledger = issues.snapshot(directory)
         changed = False
         for number, record in ledger["issues"].items():
+            prompt = record.get("handoff_prompt") or {}
+            if (
+                prompt.get("trigger") == ENDED
+                and not prompt.get("responded_at")
+                and record.get("owner") != prompt.get("holder")
+            ):
+                prompt["responded_at"] = time.time()
+                changed = True
             waiting = sorted(
                 {
                     other["owner"]
@@ -1959,6 +2038,12 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
                     "with the "
                     "commit, verification and remaining work. Ownership "
                     "does not move until an explicit handoff."
+                    + (
+                        f" {(landed or {})[number]} landed the pull request "
+                        "that closed it."
+                        if (landed or {}).get(number)
+                        else ""
+                    )
                 ),
             }
             changed = True
@@ -2772,10 +2857,14 @@ def _dead(observed: dict, after: float) -> bool:
         Whether the recorded session process is gone and the lane has been
         silent for longer than that threshold. A live lane is never dead
         however long it has been idle, and a lane that recorded no activity
-        at all has no age to measure, so it is left alone.
+        at all has no age to measure, so it is left alone. A lane whose last
+        event was a clean `SessionEnd` has no process left to check, and
+        that recorded end counts as a known stop; a lane that never recorded
+        one keeps an unknown process out of this reading.
     """
+    stopped = observed["process_alive"] is False or bool(observed.get("ended"))
     return (
-        observed["process_alive"] is False
+        stopped
         and observed["age_seconds"] is not None
         and observed["age_seconds"] >= after
     )
@@ -3027,6 +3116,153 @@ def claimed_since(record: dict) -> float:
         ),
         default=0.0,
     )
+
+
+ISSUE_READING_SECONDS = 300.0
+_issue_readings: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+def _issue_reading(root: Path, number: str) -> dict | None:
+    """Reads one issue's forge completion, reusing a recent reading.
+
+    The supervisor polls every few seconds and a forge round trip costs about
+    a second, so one reading per issue is reused for
+    `ISSUE_READING_SECONDS`. A failed reading is never kept, so a forge that
+    comes back is read again on the next poll.
+    """
+    key = (str(root), number)
+    kept = _issue_readings.get(key)
+    if kept and time.time() - kept[0] < ISSUE_READING_SECONDS:
+        return kept[1]
+    reading = forge.issue_completion(root, number)
+    if reading is None:
+        _issue_readings.pop(key, None)
+    else:
+        _issue_readings[key] = (time.time(), reading)
+    return reading
+
+
+def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
+    """Observes which claimed issues ended inside their ownership generation.
+
+    Completion is read per issue: the forge's issue state and the pull
+    request it links as closing the issue decide it, whichever branch that
+    pull request came from. Lanes that open one pull request per issue never
+    merge their lane branch, and a lane branch merge says nothing about which
+    claim it closed. Only when the forge cannot say anything about an issue
+    does the lane branch's newest pull request speak for it.
+
+    Args:
+        manifest: Current participant manifest.
+        ledger: Published issue ledger.
+
+    Returns:
+        One observation per ended issue number: the branch the work landed
+        from, the pull request state, the instant it was observed and, when
+        the forge named one, the closing pull request's number, URL and merge
+        commit. `landed_by` names another lane whose lane branch carried the
+        closing pull request, or whose worktree alone checked out the
+        per-issue branch it came from.
+    """
+    root = Path(manifest["root"])
+    lanes = {
+        participant["branch"]: name
+        for name, participant in manifest["participants"].items()
+    }
+    ended: dict[str, dict] = {}
+    for name, participant in manifest["participants"].items():
+        branch: tuple[str, float] | None = None
+        branch_read = False
+        for number, record in ledger["issues"].items():
+            if record.get("owner") != name:
+                continue
+            since = claimed_since(record)
+            reading = _issue_reading(root, number)
+            if reading is None:
+                if not branch_read:
+                    branch = forge.branch_completion(
+                        root, participant["branch"]
+                    )
+                    branch_read = True
+                if (
+                    branch is None
+                    or branch[0] not in {"MERGED", "CLOSED"}
+                    or branch[1] < since
+                ):
+                    continue
+                ended[number] = {
+                    "branch": participant["branch"],
+                    "state": branch[0],
+                    "observed_at": time.time(),
+                }
+                continue
+            if reading["state"] not in {"MERGED", "CLOSED"}:
+                continue
+            if reading["closed_at"] < since:
+                continue
+            seen = {
+                "branch": reading["branch"] or f"issue #{number}",
+                "state": reading["state"],
+                "observed_at": time.time(),
+                "pull_request": reading["pull_request"],
+                "url": reading["url"],
+                "commit": reading["commit"],
+            }
+            landed = lanes.get(reading["branch"])
+            if not landed and reading["branch"]:
+                landed = branch_lane(manifest, reading["branch"])
+            if landed and landed != name:
+                seen["landed_by"] = landed
+            ended[number] = seen
+    return ended
+
+
+def branch_lane(manifest: dict, branch: str) -> str:
+    """Names the one lane whose worktree checked out a per-issue branch.
+
+    Every lane shares one repository and pushes as the same forge account,
+    so neither the branch ref nor the pull request author says which lane
+    made a branch. Each worktree keeps its own HEAD reflog, though, and a
+    checkout records the branch it moved to. A branch exactly one lane's
+    reflog moved to is that lane's; a branch no lane or several lanes moved
+    to is attributed to nobody.
+
+    Args:
+        manifest: Current participant manifest.
+        branch: Head branch of the closing pull request.
+
+    Returns:
+        The participant name, or an empty string when the branch cannot be
+        attributed to exactly one lane.
+    """
+    moved = f" to {branch}"
+    owners = []
+    for name, participant in manifest["participants"].items():
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(participant["lane"]),
+                    "reflog",
+                    "show",
+                    "--format=%gs",
+                    "HEAD",
+                    "--",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and any(
+            line.startswith("checkout: moving from ") and line.endswith(moved)
+            for line in result.stdout.splitlines()
+        ):
+            owners.append(name)
+    return owners[0] if len(owners) == 1 else ""
 
 
 def reported_since(directory: Path, name: str, since: float) -> bool:
@@ -3472,33 +3708,31 @@ def _remind(
         config: Resolved supervision settings.
         observations: This poll's presence reading per participant.
         stage: Runner that records a raising stage instead of propagating it.
+
+    Completion reads the forge and each lane's reflog, so it runs as its own
+    stage. A reading that raises is recorded and leaves no claim observed
+    ended for this poll, so reminders and every later stage still run.
     """
-    closed: set[str] = set()
     ended: dict[str, dict] = {}
-    ledger = issues.snapshot(directory)
-    for name, participant in manifest["participants"].items():
-        claimed = {
-            number: claimed_since(record)
-            for number, record in ledger["issues"].items()
-            if record.get("owner") == name
-        }
-        if not claimed:
-            continue
-        completion = forge.branch_completion(
-            Path(manifest["root"]), participant["branch"]
-        )
-        if completion is None or completion[0] not in {"MERGED", "CLOSED"}:
-            continue
-        for number, since in claimed.items():
-            if completion[1] < since:
-                continue
-            closed.add(number)
-            ended[number] = {
-                "branch": participant["branch"],
-                "state": completion[0],
-                "observed_at": time.time(),
-            }
-    stage("reminders", reminders, directory, manifest, closed)
+    stage(
+        "completion",
+        lambda: ended.update(
+            completed_claims(manifest, issues.snapshot(directory))
+        ),
+    )
+    closed = set(ended)
+    stage(
+        "reminders",
+        reminders,
+        directory,
+        manifest,
+        closed,
+        {
+            number: seen["landed_by"]
+            for number, seen in ended.items()
+            if seen.get("landed_by")
+        },
+    )
     stage("deadline defaults", deadline_defaults, directory, manifest)
     stage("deadline notices", deadline_notices, directory, manifest)
     stage(

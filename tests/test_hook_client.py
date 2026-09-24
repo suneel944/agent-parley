@@ -22,6 +22,7 @@ from agent_parley import (
     hook,
     process,
     protocol,
+    recovery,
     roster,
     server,
     store,
@@ -1730,3 +1731,41 @@ def test_a_service_start_sweeps_only_old_temporary_state_files(tmp_path):
     assert not old.exists()
     assert fresh.exists()
     assert kept.exists()
+
+
+def test_the_hook_reply_excludes_the_recovery_capture(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    bridge.issue(lane, "claim", "42")
+    release = threading.Event()
+    captured = threading.Event()
+    original = recovery.capture
+
+    def slow(*args, **kwargs):
+        release.wait(20)
+        saved = original(*args, **kwargs)
+        captured.set()
+        return saved
+
+    monkeypatch.setattr(recovery, "capture", slow)
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "cwd": str(lane),
+        "session_id": "s1",
+    }
+    served = run_hook(bridge, lane.parent, payload)
+
+    assert served.returncode == 0, served.stderr
+    assert not captured.is_set()
+    assert not any(fell_back(entry) for entry in events(lane.parent))
+    release.set()
+    assert captured.wait(20)
+    deadline = time.monotonic() + 10
+    state = checkpoints.activity(lane.parent, "codex")
+    while not state.get("recovery_checkpoints"):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+        state = checkpoints.activity(lane.parent, "codex")
+    assert len(state["recovery_checkpoints"]) == 1

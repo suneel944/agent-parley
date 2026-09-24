@@ -180,9 +180,9 @@ def _compose(
             f"{mail['stale_reservations']} of your {mail['reservations']} "
             "reservations are past their declared time to live, the oldest "
             f"by {mail.get('stale_reservation_age', 0)}s. They are still "
-            "held and this checkpoint renews them; release the ones you have "
-            "finished with, or the runtime hands them to a queued peer once "
-            "this lane stops coordinating."
+            "held and your next tool call renews them; release the ones you "
+            "have finished with, or the runtime hands them to a queued peer "
+            "once this lane stops working."
         )
     parts.extend(
         part
