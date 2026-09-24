@@ -908,10 +908,31 @@ that sends no such `Accept` header is answered with the original JSON reply.
 
 A refused connection, a timeout, a refused credential, any other reply the
 client cannot use, or a reply it cannot frame falls back to `checkpoints.main`
-in the hook process, which records the cause as a `service_fallback` event
-before deciding; `python -m agent_parley.checkpoints` remains a valid hook
-command. A status the shell client already read travels into that fallback, so
-one refusal is never posted to the service twice.
+in the hook process, which records the cause in a `fallback` field of the
+event's own record, so an outage never counts an event twice;
+`python -m agent_parley.checkpoints` remains a valid hook command. A decision
+that fails and writes no record gets one `service_fallback` record instead. A
+status the shell client already read travels into that fallback, so one
+refusal is never posted to the service twice.
+
+A state write that fails because storage is full, over quota, read-only or
+failing allows the call and names the failure on stderr, because a denial
+would also refuse the `rm` or `du` that frees the space. Other decision
+failures keep their denial for gating events. A write killed between its
+temporary file and the rename leaves a `tmp*` file in the project state
+directory; the service removes those older than a minute when it starts.
+
+The launcher takes the lane's checkpoint lock for its activity write, as every
+hook decision does, so a slow `SessionEnd` finishing after a relaunch cannot
+restore the old session or drop the launcher's process identity.
+
+A native payload over 1,000,000 characters, as a `Write` of a large file
+carries in both `PreToolUse` and `PostToolUse`, is never posted: the clients
+read it in blocks, keep its head, and the in-process path records one
+`oversize_payload` event naming the event and the full size, then allows the
+call with exit status 0. A payload that is not a JSON hook object is recorded
+as `unreadable_payload` and allowed the same way. Neither can be decided, and
+denying one would refuse the same call on every retry.
 
 Status 202 is the exception, and it is not an outage. It means the service is
 still running a decision for this lane and abandoned only the reply. Such a
@@ -938,7 +959,18 @@ when no current reading exists, as in the in-process fallback. Measured on 12
 lanes, the median hook fell from 22.7 to 4.4 ms and the median time the lock
 is held from 19.6 to 0.9 ms. An event that finds a newer event already applied
 still writes its record and delivers its context, but leaves the newer
-activity label in place. Contention on
+activity label in place.
+
+An abandoned decision records what it observed, with the activity label the
+event itself implies, but never marks the coordination it prepared as
+delivered. The mail cursor, the issue revision, the work offer, the roster and
+notice fields, and the `working` label a blocked `Stop` carries are written
+only after the reply carrying them was written to the client: the service
+records them before closing the connection, waiting at most
+`server.DELIVERY_SECONDS` for the lane's checkpoint lock, and the in-process
+path records them after flushing its output. A reply the client never received
+therefore leaves the same mail and offer for the lane's next event, and a
+delivery for a session that has since restarted is discarded. Contention on
 a lane's own checkpoint lock is likewise never an enforcement result: the loser
 of the bounded wait records a `lock_contended` event and degrades to no
 injection. An event that ends or pauses a turn (`Stop`, `SessionEnd`,

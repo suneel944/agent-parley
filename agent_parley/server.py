@@ -40,6 +40,8 @@ LOG_NAME = "server.log"
 WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
 SLOW_DECISION = DECISION_SECONDS / 2
+DELIVERY_SECONDS = 0.25
+TEMPORARY_SECONDS = 60.0
 UNDECIDED_LIMIT = 1
 REFUSAL_SECONDS = 5.0
 REPEAT_SECONDS = 60.0
@@ -99,6 +101,31 @@ def log(home: Path, event: str, detail: str = "") -> None:
         except OSError:
             return
         trim_log(rotated)
+
+
+def sweep(home: Path) -> int:
+    """Removes temporary files that interrupted state writes left behind.
+
+    Every state write goes through a ``tmp*`` file in the target's
+    directory and renames it into place, so a writer killed between the
+    two leaves that file for good. Only files older than
+    `TEMPORARY_SECONDS` are removed, because a hook deciding in process
+    while the service starts may be writing one right now.
+
+    Args:
+        home: Private bridge state root holding the project directories.
+
+    Returns:
+        Number of temporary files removed.
+    """
+    cutoff = time.time() - TEMPORARY_SECONDS
+    removed = 0
+    for path in (home / "projects").glob("*/tmp*"):
+        with contextlib.suppress(OSError):
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+    return removed
 
 
 def _tool(
@@ -891,10 +918,40 @@ class Handler(BaseHTTPRequestHandler):
         served = self._decide(request, lane)
         if served is None:
             return
+        delivery = served.pop("delivery", None)
         if self.headers.get("Accept") == hook.RAW_REPLY:
             self._raw_hook(served)
-            return
-        self._reply(200, served)
+        else:
+            self._reply(200, served)
+        if delivery:
+            self._delivered(path, request["participant"], delivery)
+
+    def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
+        """Marks a written reply's coordination as delivered to the lane.
+
+        The whole reply is written before this runs, and the connection
+        closes after it, so the client reads its end of stream only once the
+        lane's state says what it was given, as the in-process path does.
+        The wait for the lane's checkpoint lock is `DELIVERY_SECONDS`, which
+        keeps the close inside the client's read timeout. A reply the
+        client stopped reading raised before this point, and a decision the
+        client was answered `hook.DECIDING` for never reaches it, so both
+        leave their coordination to the lane's next event.
+
+        Args:
+            directory: Common project state directory of the lane.
+            agent: Participant the decision was made for.
+            delivery: Delivery markers the decision prepared.
+        """
+        try:
+            checkpoints.deliver(directory, agent, delivery, DELIVERY_SECONDS)
+        except (OSError, ValueError, BridgeError) as exc:
+            log(
+                self.server.home,
+                "undelivered",
+                f"{self.path} {agent} delivery not recorded; the next event "
+                f"repeats it: {type(exc).__name__}",
+            )
 
     def _decide(self, request: dict, lane: tuple[str, str]) -> dict | None:
         """Produces one hook decision under a deadline of its own.
@@ -908,8 +965,11 @@ class Handler(BaseHTTPRequestHandler):
         An abandoned decision is not finished work. It keeps running on its
         own thread, and it still holds the lane's checkpoint lock, still
         writes the lane's activity file, and still appends the lane's event
-        record when it completes. Answering the client as though the service
-        were unavailable used to make it ask again, which started a second
+        record when it completes. It never marks the coordination it
+        prepared as delivered: that happens only after a reply carrying it
+        was written, so the lane's next event injects it again. Answering
+        the client as though the service were unavailable used to make it
+        ask again, which started a second
         decision for the same event, and the two then contended for that
         lock until one of them lost and denied a native call. Expiry is
         therefore answered with `hook.DECIDING`, which tells the client the
@@ -954,6 +1014,7 @@ class Handler(BaseHTTPRequestHandler):
                     stages,
                     checkpoints.SETTLE_SECONDS,
                     record_only,
+                    deferred=True,
                 )
             except Exception:
                 outcome["failed"] = traceback.format_exc()
@@ -1190,6 +1251,8 @@ def main() -> None:
     os.umask(0o077)
     config = json.loads((args.home / "config.json").read_text())
     store.initialize(args.home)
+    if removed := sweep(args.home):
+        log(args.home, "swept", f"{removed} temporary state files")
     from agent_parley import inbound, supervision
 
     stopped = threading.Event()

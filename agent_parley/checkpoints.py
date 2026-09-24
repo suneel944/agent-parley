@@ -1,6 +1,8 @@
 """Observes native checkpoints and reads coordination without model calls."""
 
 import contextlib
+import contextvars
+import errno
 import fcntl
 import json
 import os
@@ -15,7 +17,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
 
-from agent_parley import policy, process, protocol, roster, store
+from agent_parley import hook, policy, process, protocol, roster, store
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
@@ -34,6 +36,12 @@ CONTEXT_EVENTS = frozenset(
     {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"}
 )
 HOOK_TIMEOUT = 3
+STORAGE_ERRORS = frozenset(
+    (errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EFBIG, errno.EIO)
+)
+FALLBACK: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "fallback", default=None
+)
 GIT_OPTIONS_WITH_VALUE = frozenset(
     {
         "-C",
@@ -165,6 +173,8 @@ class Reason(StrEnum):
     STALE_GENERATION = "stale_generation"
     LOCK_CONTENDED = "lock_contended"
     SUPERSEDED = "superseded"
+    OVERSIZE_PAYLOAD = "oversize_payload"
+    UNREADABLE_PAYLOAD = "unreadable_payload"
 
 
 def decision_of(output: dict | None) -> str:
@@ -257,6 +267,11 @@ def record(
     afterwards. The text is bounded, because an exception carrying an entire
     statement would otherwise set the log's rotation pace.
 
+    A decision made in process because the service failed carries that
+    failure in a ``fallback`` field of its own record, set through
+    `FALLBACK` by `serve`. The event is then counted once, under the
+    reason that decided it, rather than once more as a separate fallback.
+
     Args:
         directory: Common project state directory.
         agent: Assigned native lane name.
@@ -276,6 +291,9 @@ def record(
         "cause": cause[:MAX_CAUSE_BYTES],
         "injected_bytes": injected_bytes(output),
     }
+    if (fallback := FALLBACK.get()) is not None:
+        entry["fallback"] = fallback["cause"][:MAX_CAUSE_BYTES]
+        fallback["recorded"] = True
     path = directory / f"{agent}-events.jsonl"
     with contextlib.suppress(OSError):
         size = 0
@@ -1456,8 +1474,16 @@ def checkpoint(
     stages: Stages | None = None,
     settle: float = LOCK_SECONDS,
     record_only: bool = False,
+    pending: dict | None = None,
 ) -> dict:
     """Observes a native event and prepares bounded coordination context.
+
+    What the event observed is saved here. What the reply delivers, the
+    mail cursor, the notice revisions and the working label a blocked
+    ``Stop`` carries, is saved here only when no ``pending`` mapping is
+    given. With one, those delivery markers are left in it for `deliver`,
+    which the caller runs once the reply reached the native client, so a
+    reply the client never received leaves them to be delivered again.
 
     A native event carrying a session identity confirms that identity as the
     lane's resumable session. The launcher clears the live session field
@@ -1516,6 +1542,8 @@ def checkpoint(
         settle: Seconds an event that ends or pauses a turn waits for the
             lane's checkpoint lock.
         record_only: Whether to record the event without mail or scans.
+        pending: Mapping that receives the delivery markers instead of the
+            activity file, for a caller that commits them after its reply.
 
     Returns:
         Native hook output; an empty mapping means no context injection.
@@ -1691,6 +1719,7 @@ def checkpoint(
         output: dict = {}
         reason = Reason.OBSERVED
         ledger: dict = {}
+        markers: dict = {}
         if context:
             from agent_parley import budgets
 
@@ -1850,7 +1879,7 @@ def checkpoint(
                         output = {}
                     elif event == "Stop":
                         output = {"decision": "block", "reason": text}
-                        state["activity"] = "working"
+                        markers["activity"] = "working"
                     else:
                         details = {
                             "hookEventName": event,
@@ -1873,20 +1902,18 @@ def checkpoint(
                     if output:
                         reason = Reason.COORDINATION_PENDING
                         if delivered:
-                            state["cursor"] = delivered[-1]["id"]
-                        state["issue_revision"] = issues["revision"]
-                        state["roster"] = names
+                            markers["cursor"] = delivered[-1]["id"]
+                        markers["issue_revision"] = issues["revision"]
+                        markers["roster"] = names
                         if offer:
-                            state["work_offer"] = offer["id"]
+                            markers["work_offer"] = offer["id"]
                         if edit_notice:
-                            state["operator_edits"] = edited
+                            markers["operator_edits"] = edited
                         if advance_notice:
-                            state["base_advance"] = advanced
-                        state["budget_notified"] = standing["crossed"]
-                        state["injected_bytes"] = state.get(
-                            "injected_bytes", 0
-                        ) + len(text.encode())
-                        state["injections"] = state.get("injections", 0) + 1
+                            markers["base_advance"] = advanced
+                        markers["budget_notified"] = standing["crossed"]
+                        markers["injected_bytes"] = len(text.encode())
+                        markers["injections"] = 1
             except (OSError, sqlite3.Error, BridgeError) as exc:
                 cause = clip(str(exc), MAX_CAUSE_BYTES)
                 state["coordination_error"] = cause
@@ -1916,6 +1943,14 @@ def checkpoint(
             except (BridgeError, OSError, ValueError) as exc:
                 state["recovery_error"] = clip(str(exc), MAX_CAUSE_BYTES)
         stages.enter("record")
+        if pending is None:
+            mark_delivered(state, markers, True)
+        elif markers:
+            pending.update(
+                markers=markers,
+                session_id=state["session_id"],
+                updated=state["updated"],
+            )
         write_json(state_path, state)
         record(
             directory,
@@ -1940,12 +1975,75 @@ def checkpoint(
         return output
 
 
+def mark_delivered(state: dict, markers: dict, current: bool) -> None:
+    """Applies one reply's delivery markers to a lane's activity state.
+
+    Args:
+        state: Activity state to update in place.
+        markers: Delivery markers a decision prepared for its reply.
+        current: Whether the decision that prepared them is still the last
+            event the state records; only then does its label apply.
+    """
+    for key, value in markers.items():
+        if key == "activity":
+            if current:
+                state[key] = value
+        elif key in ("injected_bytes", "injections"):
+            state[key] = state.get(key, 0) + value
+        elif key == "cursor":
+            state[key] = max(int(state.get(key, 0) or 0), value)
+        else:
+            state[key] = value
+
+
+def deliver(
+    directory: Path,
+    agent: str,
+    pending: dict,
+    timeout: float = LOCK_SECONDS,
+) -> bool:
+    """Records that a reply carrying coordination reached the native client.
+
+    A decision's delivery markers wait in ``pending`` until its reply was
+    written. They apply only to the session that decision observed: a new
+    session reset the cursor on purpose, and advancing it again would hide
+    that session's mail. The working label a blocked ``Stop`` carries
+    applies only while that decision is still the lane's latest event.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        pending: Mapping `checkpoint` filled for the reply.
+        timeout: Seconds to wait for the lane's checkpoint lock.
+
+    Returns:
+        Whether the markers were recorded.
+
+    Raises:
+        LockBusy: If the lane's checkpoint lock stays held.
+        OSError: If the activity file cannot be read or written.
+    """
+    markers = pending.get("markers")
+    if not markers:
+        return False
+    path = directory / f"{agent}-activity.json"
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=timeout):
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if state.get("session_id", "") != pending.get("session_id", ""):
+            return False
+        current = state.get("updated") == pending.get("updated")
+        mark_delivered(state, markers, current)
+        write_json(path, state)
+    return True
+
+
 def serve(
     home: Path,
     request: dict,
     stages: Stages | None = None,
     settle: float = LOCK_SECONDS,
     record_only: bool = False,
+    deferred: bool = False,
 ) -> dict:
     """Decides one hook event and returns the hook process's contract.
 
@@ -1962,6 +2060,14 @@ def serve(
     a deferral is counted afterwards and the winner records only its own
     decision.
 
+    A state write that fails because storage is full, over quota, read-only
+    or failing (`STORAGE_ERRORS`) allows the call and says so on stderr.
+    Denying it would also deny the ``rm`` or ``du`` that frees the space.
+
+    A ``fallback`` cause is attached to the records the decision writes,
+    so the event is recorded once. A decision that wrote no record, as one
+    that failed does, gets a single ``service_fallback`` record instead.
+
     Args:
         home: Private bridge state root.
         request: ``directory``, ``participant`` and ``payload`` as the hook
@@ -1975,9 +2081,14 @@ def serve(
             lane's checkpoint lock; see `checkpoint`.
         record_only: Whether to record the event without building context;
             see `checkpoint`.
+        deferred: Whether the caller records delivery itself, through
+            `deliver`, once the reply was written. An abandoned decision
+            then never marks its coordination as delivered.
 
     Returns:
-        ``status``, ``stdout`` and ``stderr`` for the hook process to emit.
+        ``status``, ``stdout`` and ``stderr`` for the hook process to emit,
+        and for a deferred decision that injected coordination, the
+        ``delivery`` mapping `deliver` takes.
     """
     directory = Path(str(request.get("directory", "")))
     participant = str(request.get("participant", ""))
@@ -1995,19 +2106,15 @@ def serve(
             + "\n",
         }
     payload = request.get("payload")
+    fallback = (
+        {"cause": str(request["fallback"]), "recorded": False}
+        if request.get("fallback")
+        else None
+    )
+    marked = FALLBACK.set(fallback)
     try:
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object")
-        if request.get("fallback"):
-            record(
-                directory,
-                participant,
-                payload,
-                Reason.SERVICE_FALLBACK,
-                None,
-                "",
-                str(request["fallback"]),
-            )
         adapter: ModuleType | None = None
         if request.get("adapter") == "gemini":
             from agent_parley import gemini as adapter
@@ -2024,6 +2131,7 @@ def serve(
         session_process = native_process(
             directory, participant, request.get("hook_pid")
         )
+        pending: dict | None = {} if deferred else None
         output = checkpoint(
             home,
             directory,
@@ -2033,10 +2141,18 @@ def serve(
             stages,
             settle,
             record_only,
+            pending,
         )
         if adapter is not None:
             output = adapter.response(output)
-        return {"status": 0, "stdout": json.dumps(output) + "\n", "stderr": ""}
+        served: dict = {
+            "status": 0,
+            "stdout": json.dumps(output) + "\n",
+            "stderr": "",
+        }
+        if pending:
+            served["delivery"] = pending
+        return served
     except LockBusy as exc:
         if isinstance(payload, dict):
             record(
@@ -2053,16 +2169,51 @@ def serve(
             "stdout": "{}\n",
             "stderr": f"Agent Parley checkpoint deferred: {exc}\n",
         }
-    except (OSError, ValueError, KeyError, BridgeError) as exc:
-        stderr = f"Agent Parley checkpoint failed: {exc}\n"
-        if isinstance(payload, dict) and payload.get("hook_event_name") in (
-            "PostToolUse",
-            "PermissionRequest",
-            "Stop",
-            "SessionEnd",
-        ):
-            return {"status": 0, "stdout": "{}\n", "stderr": stderr}
-        return {"status": 2, "stdout": "", "stderr": stderr}
+    except OSError as exc:
+        if exc.errno not in STORAGE_ERRORS:
+            return failed(payload, exc)
+        return {
+            "status": 0,
+            "stdout": "{}\n",
+            "stderr": "Agent Parley checkpoint could not write its state, "
+            f"call allowed: {exc}\n",
+        }
+    except (ValueError, KeyError, BridgeError) as exc:
+        return failed(payload, exc)
+    finally:
+        FALLBACK.reset(marked)
+        if fallback and not fallback["recorded"] and isinstance(payload, dict):
+            record(
+                directory,
+                participant,
+                payload,
+                Reason.SERVICE_FALLBACK,
+                None,
+                "",
+                str(fallback["cause"]),
+            )
+
+
+def failed(payload: object, exc: Exception) -> dict:
+    """Returns the hook contract for a decision that could not be made.
+
+    Args:
+        payload: Native hook payload, or whatever arrived in its place.
+        exc: Why the decision failed.
+
+    Returns:
+        ``status``, ``stdout`` and ``stderr``: an allow for an event that
+        reports after the fact, a denial for one that gates the call.
+    """
+    stderr = f"Agent Parley checkpoint failed: {exc}\n"
+    if isinstance(payload, dict) and payload.get("hook_event_name") in (
+        "PostToolUse",
+        "PermissionRequest",
+        "Stop",
+        "SessionEnd",
+    ):
+        return {"status": 0, "stdout": "{}\n", "stderr": stderr}
+    return {"status": 2, "stdout": "", "stderr": stderr}
 
 
 def _hook_pid() -> int:
@@ -2074,15 +2225,56 @@ def _hook_pid() -> int:
     return value if value > 1 else os.getpid()
 
 
-def main(fallback: str = "") -> int:
+def unreadable(
+    directory: Path, agent: str, raw: str, size: int, cause: Exception
+) -> int:
+    """Allows a native event whose payload could not be read, and records it.
+
+    A payload past `hook.MAX_INPUT_BYTES`, as a ``Write`` of a large file
+    carries, or one that is not a JSON hook object, cannot be decided. It
+    is observed and allowed rather than denied: a denial would refuse the
+    same call on every retry, and no coordination rule needs the content
+    of a file being written. The event name is read from the text that was
+    kept, which precedes the tool input in the native payload.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        raw: Payload text that was kept, at most `hook.MAX_INPUT_BYTES`.
+        size: Characters the payload held in full.
+        cause: Why the payload could not be decided.
+
+    Returns:
+        Exit status 0, after writing an empty decision.
+    """
+    found = re.search(r'"hook_event_name"\s*:\s*"([A-Za-z]{1,64})"', raw)
+    event = found.group(1) if found else ""
+    reason = (
+        Reason.OVERSIZE_PAYLOAD
+        if size > hook.MAX_INPUT_BYTES
+        else Reason.UNREADABLE_PAYLOAD
+    )
+    detail = f"{event or 'unnamed'} payload of {size} characters: {cause}"
+    record(directory, agent, {"hook_event_name": event}, reason, {}, "", detail)
+    sys.stdout.write("{}\n")
+    sys.stderr.write(f"Agent Parley checkpoint skipped: {detail}\n")
+    return 0
+
+
+def main(fallback: str = "", size: int = 0) -> int:
     """Handles native hook input without replaying completed side effects.
 
     The argument parser is imported here so the module import that every
-    native tool call pays stays as small as the hook's own work.
+    native tool call pays stays as small as the hook's own work. The
+    coordination a decision injected is marked delivered only after its
+    output was flushed, so a hook the native client kills before that point
+    leaves the same coordination for the next event.
 
     Args:
         fallback: Cause recorded when the hook client could not reach the
             service and decided here instead; empty for a direct call.
+        size: Characters the native payload held when a caller already read
+            it from the real input and hands on only the part it kept.
     """
     import argparse
 
@@ -2104,12 +2296,16 @@ def main(fallback: str = "") -> int:
             file=sys.stderr,
         )
         return 2
-    raw = sys.stdin.read(1_000_001)
+    raw, read = hook.read_input(sys.stdin)
+    size = max(size, read)
     try:
+        if size > hook.MAX_INPUT_BYTES:
+            raise ValueError("larger than the hook reads")
         payload = json.loads(raw)
-    except ValueError as exc:
-        print(f"Agent Parley checkpoint failed: {exc}", file=sys.stderr)
-        return 2
+        if not isinstance(payload, dict):
+            raise ValueError("not a hook object")
+    except (ValueError, RecursionError) as exc:
+        return unreadable(args.directory, args.participant, raw, size, exc)
     served = serve(
         args.home,
         {
@@ -2121,9 +2317,14 @@ def main(fallback: str = "") -> int:
             "payload": payload,
             "fallback": fallback,
         },
+        deferred=True,
     )
     sys.stdout.write(served["stdout"])
     sys.stderr.write(served["stderr"])
+    if delivery := served.get("delivery"):
+        with contextlib.suppress(OSError, BridgeError):
+            sys.stdout.flush()
+            deliver(args.directory, args.participant, delivery)
     return served["status"]
 
 
