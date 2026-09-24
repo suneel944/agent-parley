@@ -1497,3 +1497,46 @@ def test_top_reports_the_fit_result_and_a_pending_offer(bridge, repo, paired):
     reported = views.frame(view)["projects"][0]["participants"]
     assert reported[0]["fit"] is True
     assert reported[0]["work_offer"] == "pull"
+
+
+def test_a_poll_reads_each_lane_once_however_many_lanes(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    manifest = json.loads((directory / "project.json").read_text())
+    template = manifest["participants"]["claude"]
+    for index in range(18):
+        name = f"lane{index:02d}"
+        manifest["participants"][name] = {**template, "display": name}
+    write_json(directory / "project.json", manifest)
+    for name in manifest["participants"]:
+        if name != "codex":
+            alive(directory, name, updated=time.time() - 500)
+    counts = {"worktree": 0, "forge": 0}
+    measured = supervision._worktree_check
+
+    def worktree(participant):
+        counts["worktree"] += 1
+        return measured(participant)
+
+    def completion(*args):
+        counts["forge"] += 1
+
+    monkeypatch.setattr(supervision, "_worktree_check", worktree)
+    monkeypatch.setattr(supervision.forge, "branch_completion", completion)
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+
+    supervision.poll(bridge.home, directory)
+    first = dict(counts)
+    supervision.poll(bridge.home, directory)
+
+    assert len(manifest["participants"]) == 20
+    assert first == {"worktree": 20, "forge": 1}
+    assert counts == {"worktree": 40, "forge": 1}
+    stages = supervision.last_poll(directory)["stages"]
+    assert {"work", "completions", "wake claude"} <= set(stages)

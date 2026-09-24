@@ -312,8 +312,13 @@ the stage, the lane and the line that raised; the supervision thread itself
 catches every exception a poll raises, so one malformed record can no longer
 end supervision for the service. The poll's presence write waits the store's
 busy timeout like every other writer. Each poll writes
-`supervision-poll.json`, and `status` prints its age, its wall time and the
-age of the last clean poll. An offer is
+`supervision-poll.json` with the wall time of each stage, and `status` prints
+its age, its wall time, its slowest stage and the age of the last clean poll.
+Each lane's fitness and idle readings are taken once per poll and shared by
+every lane's backlog, so a poll's Git and capacity readings grow with the lane
+count, not its square. A branch's pull-request completion is read from the
+forge at most once a minute per branch, so a merge is noticed up to a minute
+later. An offer is
 advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served

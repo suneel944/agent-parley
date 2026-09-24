@@ -737,14 +737,18 @@ def supervision_liveness(polled: dict) -> str:
         polled: Poll record written beside the project's issue ledger.
 
     Returns:
-        One line naming the age and wall time of the last poll and the age
-        of the last poll in which no step failed.
+        One line naming the age and wall time of the last poll, its slowest
+        stage, and the age of the last poll in which no step failed.
     """
     now = time.time()
     line = (
         f"Supervision: last poll {max(int(now - polled['at']), 0)}s ago "
         f"in {float(polled.get('seconds', 0)):.2f}s"
     )
+    stages = polled.get("stages")
+    if isinstance(stages, dict) and stages:
+        slowest = max(stages, key=lambda label: float(stages[label]))
+        line += f", slowest {slowest} {float(stages[slowest]):.2f}s"
     clean = polled.get("clean_at")
     if clean is None:
         return line + "; no clean poll recorded"

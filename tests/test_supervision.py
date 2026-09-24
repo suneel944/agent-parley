@@ -940,6 +940,8 @@ def test_status_reports_when_supervision_last_polled(bridge, paired, capsys):
     assert project["supervision_poll"] == polled
     bridge.status()
     assert "Supervision: last poll 0s ago in " in capsys.readouterr().out
+    polled["stages"] = {"work": 0.25, "wake claude": 4.5}
+    assert ", slowest wake claude 4.50s" in cli.supervision_liveness(polled)
 
 
 def test_a_stale_working_label_on_a_live_process_is_woken(
