@@ -224,7 +224,7 @@ def deliver(home: Path, directory: Path, agent: str) -> int:
     if participant.get("paused", False):
         return 0
     identity = json.loads((directory / f"{agent}-identity.json").read_text())
-    edits = supervision.operator_edits(home, manifest).get(agent, [])
+    edits = supervision.readings(home, manifest)[0].get(agent, [])
     read = checkpoints.activity(directory, agent)
     mail = checkpoints.mailbox(
         home, manifest["root"], identity["name"], read.get("cursor", 0)

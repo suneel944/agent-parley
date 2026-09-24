@@ -65,6 +65,7 @@ AVAILABILITY = {
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
+_READINGS: dict[str, tuple[float, dict, dict]] = {}
 
 
 def track_launcher(child: subprocess.Popen[bytes]) -> None:
@@ -609,6 +610,56 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
         if matched:
             advances[name] = matched
     return advances
+
+
+def refresh_readings(
+    home: Path, manifest: dict, lifetime: float
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Takes the project's Git readings and keeps them for the hook path.
+
+    The supervision poll calls this once per project per interval. Every
+    hook of every lane used to run `operator_edits` and `base_advances`
+    itself, one Git status and one merge-base per participant each time,
+    which is the scan that held decisions past their deadline under load.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+        lifetime: Seconds the reading stays current for `readings`.
+
+    Returns:
+        The operator edits and the base advances, keyed by participant.
+    """
+    edits = operator_edits(home, manifest)
+    advances = base_advances(home, manifest)
+    _READINGS[manifest["root"]] = (
+        time.monotonic() + lifetime,
+        edits,
+        advances,
+    )
+    return edits, advances
+
+
+def readings(
+    home: Path, manifest: dict
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Returns the project's Git readings, from the poll's copy if current.
+
+    A process with no current poll reading, such as a hook deciding
+    in-process while the service is down, takes the readings itself and
+    keeps nothing, so only the poll decides how often Git is asked.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+
+    Returns:
+        The operator edits and the base advances, keyed by participant.
+    """
+    kept = _READINGS.get(manifest["root"])
+    if kept is not None and time.monotonic() < kept[0]:
+        return kept[1], kept[2]
+    return operator_edits(home, manifest), base_advances(home, manifest)
 
 
 def base_advance_marker(paths: list[str]) -> str:
@@ -2598,6 +2649,7 @@ def poll(home: Path, directory: Path) -> None:
     manifest = roster.read(directory)
     config = configuration(home, manifest)
     launches(directory, manifest, config)
+    refresh_readings(home, manifest, 2 * config["interval"])
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]

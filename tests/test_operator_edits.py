@@ -153,3 +153,29 @@ def test_a_git_failure_reports_nothing_without_raising(
     assert supervision.operator_edits(bridge.home, paired) == {}
     view = dashboard.collect(bridge.home, False, {})
     assert view["projects"][0]["rows"][0]["operator_edits"] == []
+
+
+def test_the_hook_reads_the_poll_reading_instead_of_asking_git(
+    bridge, repo, paired, monkeypatch
+):
+    reserve(bridge, paired["root"], "claude", "shared.txt")
+    (repo / "shared.txt").write_text("operator change\n")
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    kept = supervision.refresh_readings(bridge.home, paired, 60)
+    assert kept[0] == {"claude": ["shared.txt"]}
+
+    def asked(*args, **kwargs):
+        raise AssertionError("the hook path asked Git")
+
+    monkeypatch.setattr(supervision, "operator_edits", asked)
+    monkeypatch.setattr(supervision, "base_advances", asked)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "test",
+        "cwd": paired["lanes"]["claude"],
+        "tool_name": "Bash",
+    }
+    first = checkpoints.checkpoint(bridge.home, directory, "claude", payload)
+    context = first["hookSpecificOutput"]["additionalContext"]
+    assert "Operator edit on a path you reserved: shared.txt" in context

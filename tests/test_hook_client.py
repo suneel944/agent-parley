@@ -21,6 +21,7 @@ from agent_parley import (
     hook,
     process,
     protocol,
+    roster,
     server,
     store,
 )
@@ -394,7 +395,7 @@ def test_a_reply_without_a_status_line_falls_back_in_process(
 def test_a_failure_inside_the_served_decision_answers_500(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None, settle=0.0):
+    def broken(home, request, stages=None, settle=0.0, record_only=False):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -737,10 +738,10 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     release = threading.Event()
     finished = threading.Event()
 
-    def stalling(home, request, stages=None, settle=0.0):
+    def stalling(home, request, stages=None, settle=0.0, record_only=False):
         release.wait(20)
         try:
-            return deciding(home, request, stages, settle)
+            return deciding(home, request, stages, settle, record_only)
         finally:
             finished.set()
 
@@ -922,7 +923,7 @@ def test_the_shell_client_starts_python_when_the_service_is_down(
 def test_the_shell_client_starts_python_when_the_service_fails(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None, settle=0.0):
+    def broken(home, request, stages=None, settle=0.0, record_only=False):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -956,7 +957,7 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
 def test_the_shell_client_forwards_both_served_streams_and_the_status(
     bridge, repo, paired, service, monkeypatch
 ):
-    def loud(home, request, stages=None, settle=0.0):
+    def loud(home, request, stages=None, settle=0.0, record_only=False):
         return {"stdout": '{"ok": true}\n', "stderr": "warned\n", "status": 2}
 
     monkeypatch.setattr(server.checkpoints, "serve", loud)
@@ -1187,10 +1188,10 @@ def stalling(monkeypatch, seconds):
     served = server.checkpoints.serve
     asked = []
 
-    def slow(home, request, stages=None, settle=0.0):
-        asked.append(request)
+    def slow(home, request, stages=None, settle=0.0, record_only=False):
+        asked.append(record_only)
         time.sleep(seconds)
-        return served(home, request, stages, settle)
+        return served(home, request, stages, settle, record_only)
 
     monkeypatch.setattr(server.checkpoints, "serve", slow)
     return asked
@@ -1223,7 +1224,7 @@ def hook_body(lane, payload=ALLOW):
     ).encode()
 
 
-def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
+def test_a_lane_only_records_events_while_one_is_abandoned(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
     deciding = checkpoints.serve
@@ -1239,12 +1240,14 @@ def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
     ]
     assert [status for status, _ in answers] == [hook.DECIDING] * len(answers)
     assert json.loads(answers[-1][1])["detail"] == server.UNDECIDED
-    assert len(asked) == server.UNDECIDED_LIMIT
+    limit = server.UNDECIDED_LIMIT
+    assert asked == [False] * limit + [True] * (len(answers) - limit)
     entries = capsys.readouterr().out.splitlines()
-    assert sum(" expired " in line for line in entries) == 1
     held = [line for line in entries if "already has" in line]
-    assert len(held) == len(answers) - 1
-    assert "answered without starting another" in held[0]
+    assert len(held) == 1
+    root = roster.read(lane.parent)["root"]
+    assert f"codex of {root} already has" in held[0]
+    assert "recorded without building context" in held[0]
     assert token not in held[0]
     monkeypatch.setattr(server.checkpoints, "serve", deciding)
     deadline = time.monotonic() + 30
@@ -1255,12 +1258,104 @@ def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
     assert answered == 200
 
 
+def test_turn_ending_events_are_recorded_past_an_abandoned_decision(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    identity = json.loads((directory / "codex-identity.json").read_text())
+    token = identity["registration_token"]
+    port = bridge.config["port"]
+    scanning = checkpoints.scan
+    release = threading.Event()
+
+    def stuck(*args):
+        release.wait(20)
+        return scanning(*args)
+
+    monkeypatch.setattr(checkpoints, "scan", stuck)
+    command = {"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}
+    testing = {"hook_event_name": "PreToolUse", **command}
+    finished = {"hook_event_name": "PostToolUse", **command}
+    try:
+        assert hook.request(port, token, hook_body(lane, testing))[0] == (
+            hook.DECIDING
+        )
+        assert hook.request(port, token, hook_body(lane, finished))[0] == 200
+        assert checkpoints.activity(directory, "codex")["activity"] == (
+            "working"
+        )
+        assert hook.request(port, token, hook_body(lane, STOP))[0] == 200
+        assert checkpoints.activity(directory, "codex")["activity"] == "idle"
+    finally:
+        release.set()
+    settled(directory, 3)
+    assert [entry["event"] for entry in events(directory)] == [
+        "PostToolUse",
+        "Stop",
+        "PreToolUse",
+    ]
+    state = checkpoints.activity(directory, "codex")
+    assert state["activity"] == "idle"
+    assert state["event"] == "Stop"
+
+
+def test_an_abandoned_decision_holds_only_its_own_project(
+    bridge, repo, paired, service, monkeypatch, tmp_path
+):
+    second = tmp_path / "second"
+    second.mkdir()
+    cli.git(second, "init")
+    (second / "shared.txt").write_text("original\n")
+    cli.git(second, "add", "shared.txt")
+    cli.git(
+        second,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Second fixture",
+    )
+    other = bridge.add_participant(second, "codex", "codex")
+    asyncio.run(bridge.identity("codex", other))
+    first = Path(paired["lanes"]["codex"])
+    elsewhere = Path(other["lanes"]["codex"])
+    served = checkpoints.serve
+    asked = []
+    release = threading.Event()
+
+    def selective(home, request, stages=None, settle=0.0, record_only=False):
+        asked.append((request["directory"], record_only))
+        if request["directory"] == str(first.parent):
+            release.wait(20)
+        return served(home, request, stages, settle, record_only)
+
+    monkeypatch.setattr(server.checkpoints, "serve", selective)
+    port = bridge.config["port"]
+    tokens = [
+        json.loads((lane.parent / "codex-identity.json").read_text())[
+            "registration_token"
+        ]
+        for lane in (first, elsewhere)
+    ]
+    try:
+        held = hook.request(port, tokens[0], hook_body(first))[0]
+        status, _ = hook.request(port, tokens[1], hook_body(elsewhere))
+    finally:
+        release.set()
+    assert held == hook.DECIDING
+    assert status == 200
+    assert asked[-1] == (str(elsewhere.parent), False)
+
+
 def test_an_expired_decision_names_the_step_that_held_it(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
     release = threading.Event()
 
-    def holding(home, request, stages=None, settle=0.0):
+    def holding(home, request, stages=None, settle=0.0, record_only=False):
         stages.enter("mail")
         release.wait(20)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1289,7 +1384,7 @@ def test_an_expired_decision_names_the_step_that_held_it(
 def test_a_slow_served_decision_is_logged_with_its_duration(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def unhurried(home, request, stages=None, settle=0.0):
+    def unhurried(home, request, stages=None, settle=0.0, record_only=False):
         stages.enter("scan")
         time.sleep(0.2)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1331,10 +1426,10 @@ def test_a_served_decision_times_every_step_it_walked(bridge, repo, paired):
         "roster",
         "session",
         "guard",
+        "scan",
         "lock",
         "state",
         "mail",
-        "scan",
     ]
     assert all(seconds >= 0 for _, seconds in stages.spent)
     assert re.search(r"^start \d+\.\d{3}s ", stages.report())
