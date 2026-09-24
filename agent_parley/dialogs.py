@@ -88,6 +88,10 @@ EXHAUSTED = "exhausted"
 ANSWER = "answer"
 ASK = "ask"
 FREE_TEXT = "type something"
+SHELL_TITLE = "Bash command"
+BRIDGE_ANSWER = "Yes"
+SHELL_OPERATORS = re.compile(r"[;&|<>$`\\]")
+BOX = re.compile(r"[─-╿]")
 
 ESCAPES = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
@@ -560,6 +564,35 @@ def pre_approved(manifest: dict, name: str) -> bool:
     return chosen is True
 
 
+def bridge_shell(screen: str, text: str) -> bool:
+    """Reports whether a shell permission prompt asks for this bridge's CLI.
+
+    The protocol prompt orders every lane to run `protocol.cli_command`
+    through its shell tool, so a lane launched before the operator's opt-in
+    parks on the first such command. Only a prompt titled as a shell command
+    whose command begins with that exact interpreter and module, and whose
+    remainder carries no shell operator that could chain a second command,
+    qualifies. Any other screen escalates as before.
+
+    Args:
+        screen: Flattened screen text.
+        text: Part of the screen that draws the prompt's question and options.
+
+    Returns:
+        True when the prompt asks to run this bridge's CLI and nothing else.
+    """
+    region = screen[-REGION_CHARS:]
+    head = region[: max(0, len(region) - len(text))]
+    title = head.rfind(SHELL_TITLE)
+    if title < 0:
+        return False
+    shown = " ".join(BOX.sub(" ", head[title + len(SHELL_TITLE) :]).split())
+    command = protocol.cli_command() + " "
+    if not shown.startswith(command):
+        return False
+    return SHELL_OPERATORS.search(shown[len(command) :]) is None
+
+
 def standing_reply(manifest: dict, name: str) -> str:
     """Reads the reply an operator recorded for a lane's own questions.
 
@@ -618,6 +651,7 @@ class Watch:
         *,
         deadline: float = ESCALATE_AFTER,
         reply: str = "",
+        bridge: bool | None = None,
     ) -> None:
         """Prepares a watcher for one lane's pseudo-terminal.
 
@@ -629,12 +663,18 @@ class Watch:
                 screen before it escalates.
             reply: Standing reply typed into a question picker, empty when
                 every question escalates.
+            bridge: Whether the operator opted this lane into approving this
+                bridge's own tools, which lets a shell prompt for its CLI be
+                answered as the launch's permission rule would allow it. None
+                reads the opt-in from the manifest when such a prompt is
+                drawn, so a lane launched before the opt-in is unparked too.
         """
         self._directory = directory
         self._name = name
         self._answers = dict(answers or {})
         self._deadline = deadline
         self._reply = reply
+        self._bridge = bridge
         self._tail = b""
         self._signature = ""
         self._since = 0.0
@@ -642,6 +682,20 @@ class Watch:
         self._parked = False
         self._answered = False
         self._repeats: dict[str, int] = {}
+
+    def _opted_in(self) -> bool:
+        """Reads whether this lane's operator allows this bridge's own tools.
+
+        A manifest that cannot be read counts as no opt-in, so the prompt
+        escalates rather than being answered by guess.
+        """
+        if self._bridge is not None:
+            return self._bridge
+        from agent_parley import roster
+
+        with contextlib.suppress(BridgeError, OSError, ValueError, KeyError):
+            return pre_approved(roster.read(self._directory), self._name)
+        return False
 
     @property
     def holding(self) -> bool:
@@ -701,9 +755,26 @@ class Watch:
         if not signature:
             self._release()
             return b""
-        if self._resolved:
+        if self._resolved and not self._approvable(screen, found):
             return b""
         return self._act(screen, found, now, held)
+
+    def _approvable(self, screen: str, found: Frame | None) -> bool:
+        """Reports whether an escalated prompt became answerable in place.
+
+        A lane parked on a shell prompt for this bridge's CLI stays parked
+        until someone answers it, so the operator's later opt-in is read again
+        while that one prompt holds the screen. Any other escalated screen is
+        left as it was published.
+        """
+        return (
+            self._parked
+            and found is not None
+            and found.dialog.name == PERMISSION
+            and not self._answers.get(PERMISSION)
+            and bridge_shell(screen, found.text)
+            and self._opted_in()
+        )
 
     def _describe(self, screen: str, found: Frame | None) -> str:
         """Names the screen so a redraw of it compares equal to itself."""
@@ -744,6 +815,13 @@ class Watch:
             }
         else:
             answer = self._answers.get(dialog.name, "")
+            if (
+                not answer
+                and dialog.name == PERMISSION
+                and bridge_shell(screen, found.text)
+                and self._opted_in()
+            ):
+                answer = BRIDGE_ANSWER
             pressed = keys(found.text, answer) if answer else b""
         repeats = self._repeats.get(self._signature, 0)
         if not pressed or repeats >= REPEAT_LIMIT:

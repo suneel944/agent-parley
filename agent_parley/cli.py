@@ -3854,7 +3854,9 @@ class Bridge:
 
         The lane is told once that the operator is ending its session, then
         the recorded session process is signalled exactly as a normal exit
-        signals it and given a bounded time to leave. Identity is the recorded
+        signals it and given a bounded time to leave; a process that ignores
+        that signal is sent `SIGKILL`, and the session record is cleared only
+        once the process is verified gone. Identity is the recorded
         process ID together with its kernel creation time, checked here and
         again inside the platform's terminate step, so a recycled process ID
         is never signalled. The command-line check used to recognize the
@@ -3876,14 +3878,18 @@ class Bridge:
 
         Raises:
             BridgeError: If the participant does not exist, or the recorded
-                process did not exit within the shutdown timeout.
+                process did not exit even after `SIGKILL`.
         """
         directory, _, _ = self._lane(repo, name)
         path = directory / f"{name}-activity.json"
         state = json.loads(path.read_text()) if path.exists() else {}
         pid = state.get("session_pid")
         ticks = str(state.get("session_ticks") or "")
-        if type(pid) is not int or not process.alive(pid, ticks):
+        if (
+            type(pid) is not int
+            or not process.alive(pid, ticks)
+            or supervision.rebooted(state)
+        ):
             self._record_operator(
                 directory,
                 name,
@@ -3897,6 +3903,11 @@ class Bridge:
         with contextlib.suppress(BridgeError, OSError):
             self.say(repo, name, "The operator is ending this session.")
         process.ServerProcess(pid, ticks).stop()
+        if process.alive(pid, ticks):
+            raise BridgeError(
+                f"{name}'s session process {pid} is still running after "
+                "SIGTERM and SIGKILL; its session record is kept."
+            )
         with lock(directory / f"{name}-checkpoint.lock", timeout=1):
             state = json.loads(path.read_text()) if path.exists() else {}
             state.update(activity="stopped", updated=time.time())
@@ -3914,14 +3925,23 @@ class Bridge:
         )
 
     def restart(self, repo: Path, name: str, task: str = "") -> int:
-        """Starts one lane again from a clean worktree on its own branch.
+        """Starts one lane again in its own worktree on its own branch.
 
-        A restart is refused while a session is alive, because two clients in
-        one worktree would fight over it. The worktree must already be clean
-        and on its assigned branch: nothing here resets, cleans, stashes or
-        force-switches, so a dirty tree is a refusal naming the paths rather
-        than work thrown away. Any recorded lane initialization command runs
-        again, because a restart recreates the starting state.
+        A restart is refused while a session is alive and current, because two
+        clients in one worktree would fight over it. A session whose process
+        is alive but whose evidence is stale past the project's
+        `inactive_after` is a wedged client, such as one left in a native
+        dialog or behind a system hang, so it is ended first through the same
+        escalating stop the operator command uses.
+
+        The lane must be on its assigned branch. Uncommitted work on that
+        branch is the previous session's own and is exactly what a crash
+        leaves behind, so it is not a reason to refuse: every claim the lane
+        owns is captured into a recovery checkpoint first, the worktree is
+        left as it is, and the new session is told where the checkpoint is.
+        Nothing here resets, cleans, stashes or force-switches. Any recorded
+        lane initialization command runs again, because a restart recreates
+        the starting state.
 
         Args:
             repo: Any checkout of the target repository.
@@ -3932,28 +3952,45 @@ class Bridge:
             The native client's exit status.
 
         Raises:
-            BridgeError: If a session is alive, the worktree is dirty, or the
-                lane is not on its assigned branch.
+            BridgeError: If a current session is alive, a stale one cannot be
+                ended, the uncommitted work cannot be captured, or the lane
+                is not on its assigned branch.
         """
+        from agent_parley import recovery
+
         directory, data, participant = self._lane(repo, name)
         state = checkpoints.activity(directory, name)
-        if process.alive(state.get("session_pid"), state.get("session_ticks")):
-            raise BridgeError(
-                f"{name} still has a live session. Run `agent-parley "
-                f"participant stop {name}` first; a restart never runs two "
-                "clients in one worktree."
-            )
+        if process.alive(
+            state.get("session_pid"), state.get("session_ticks")
+        ) and not supervision.rebooted(state):
+            window = supervision.configuration(self.home, data)
+            if not supervision.lane_state(state, window["inactive_after"])[
+                "stale"
+            ]:
+                raise BridgeError(
+                    f"{name} still has a live session. Run `agent-parley "
+                    f"participant stop {name}` first; a restart never runs "
+                    "two clients in one worktree."
+                )
+            self.stop(repo, name)
         lane = Path(participant["lane"])
-        pending = git(lane, "status", "--porcelain")
-        if pending:
-            raise BridgeError(
-                f"{name}'s worktree has uncommitted changes, so it is not "
-                "restarted; nothing here resets, cleans or stashes. Commit "
-                "or move this work first:\n" + pending
-            )
         actual = current_branch(lane)
         if actual != participant["branch"]:
             raise BridgeError(drift(name, participant, actual))
+        opening = task or terminal.PROMPT
+        if git(lane, "status", "--porcelain"):
+            saved = recovery.capture(directory, data, name)
+            opening += (
+                "\nThe previous session in this worktree ended with "
+                "uncommitted changes; they were left in place, not reset. "
+            )
+            if saved:
+                opening += "Recovery checkpoints: " + "; ".join(
+                    f"#{item['issue']} {item['id']} at "
+                    f"{directory / recovery.RECOVERY_FOLDER}"
+                    f"/{item['artifact']['reference']}"
+                    for item in saved
+                )
         if data.get("initialize"):
             initialize_lane(lane, data["initialize"], Path(data["root"]))
         self._record_operator(
@@ -3962,7 +3999,7 @@ class Bridge:
         return self.launch(
             name,
             repo,
-            task or terminal.PROMPT,
+            opening,
             participant["provider"],
             participant["credential"],
         )
@@ -4869,7 +4906,7 @@ class Bridge:
     def protocol(self, agent: str, data: dict) -> str:
         """Builds coordination instructions without embedding tokens."""
         participant = data["participants"][agent]
-        command = shlex.join([sys.executable, "-m", "agent_parley.cli"])
+        command = protocol.cli_command()
         peers = (
             ", ".join(
                 f"{other['display']} ({other['provider']})"
@@ -6095,7 +6132,15 @@ reported.
         """
         root, directory = self.project(repo, create=False)
         manifest = roster.read(directory)
-        rows = reclaim.plan(directory, manifest)
+        inactive = supervision.configuration(self.home, manifest)[
+            "inactive_after"
+        ]
+        idle = set()
+        for name in manifest["participants"]:
+            observed = supervision.presence(directory, name, inactive)
+            if observed["process_alive"] is True and observed["stale"]:
+                idle.add(name)
+        rows = reclaim.plan(directory, manifest, frozenset(idle))
         if not apply:
             return rows
         for row in rows:
@@ -7283,7 +7328,9 @@ reported.
                 )
                 native: dict = {"hooks": hooks}
                 if dialogs.pre_approved(data, agent):
-                    native["permissions"] = {"allow": [protocol.TOOL_PREFIX]}
+                    native["permissions"] = {
+                        "allow": [protocol.TOOL_PREFIX, protocol.cli_rule()]
+                    }
                 command = [
                     executable,
                     "--mcp-config",

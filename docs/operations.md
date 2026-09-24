@@ -1757,6 +1757,14 @@ retired whose worktree is gone is dropped with reason `vanished`, which
 takes it out of `status` and `top`. Retiring a lane supersedes the mail still
 addressed to it, so no share bounces off a lane that no longer exists.
 
+The lane sweep does not let a session that is alive but idle past
+`inactive_after` hide the lane's real state. Such a lane is judged on every
+other condition, so the report names what actually holds it, such as its
+claim or its uncommitted files. A lane that would otherwise be reclaimed is
+still kept, because no worktree is removed from under a live process, and
+every such line names `agent-parley participant stop NAME` as the command
+that ends the idle session.
+
 Worktrees a lane made for itself, such as one per pull request, are swept in
 the same pass and published under `worktrees` in `reclaim.json`. Every
 worktree `git worktree list` reports is attributed to a lane by path, when it
@@ -2196,7 +2204,11 @@ that is already paused reports that and changes nothing.
 
 `participant stop NAME` ends the session from outside its terminal. It delivers
 one final operator notice, signals the recorded session process exactly as a
-normal exit signals it, and waits a bounded time for it to leave. Identity is the
+normal exit signals it, and waits a bounded time for it to leave. A process that
+ignores that signal, such as a client wedged in a native dialog or left behind by
+a system hang, is sent `SIGKILL` through the same pinned identity. The session
+record is cleared only once the process is verified gone; a process that
+survives both signals is reported and its record kept. Identity is the
 recorded process ID together with its kernel creation time, checked before
 signalling and again inside the platform's terminate step, so a recycled process
 ID is never signalled. The command-line check that recognizes the coordination
@@ -2205,12 +2217,25 @@ package. Claims and reservations stay owned and the command prints what the lane
 still holds, so an operator moves that work deliberately. A stop that finds no
 running session is still recorded.
 
-`participant restart NAME` starts a lane again. It refuses while a session is
-alive, because two clients in one worktree would fight over it. It refuses a
-dirty worktree and names the paths, and it refuses a lane that is not on its
-assigned branch: nothing here resets, cleans, stashes or force-switches. It
-replays the recorded lane initialization command when one exists, then launches
-the same provider and credential profile as the previous run.
+`participant restart NAME` starts a lane again. It refuses while a current
+session is alive, because two clients in one worktree would fight over it. A
+session whose process is alive but whose evidence is older than
+`inactive_after` is a wedged client and is ended first through the same
+escalating stop. It refuses a lane that is not on its assigned branch. A dirty
+worktree is what a crash leaves behind, so it is not refused: every claim the
+lane owns is captured into a recovery checkpoint, the files stay exactly where
+they are, and the new session's opening task names the checkpoints. Nothing here
+resets, cleans, stashes or force-switches. It replays the recorded lane
+initialization command when one exists, then launches the same provider and
+credential profile as the previous run.
+
+After a host restart every recorded session is dead, even when its process ID
+now names an unrelated process. The supervision loop records the host's boot
+identifier in the project state directory; when it changes, each lane with a
+recorded session is published as stopped and marked with the session the
+restart ended. That lane is never resumed or signalled, its claims move
+through the orphan path, `participant stop` reports no verified session, and
+`participant restart` launches it without hand edits to the state directory.
 
 These are command-line actions only. No MCP tool exposes them, so a participant
 cannot pause, stop or restart itself or a peer.

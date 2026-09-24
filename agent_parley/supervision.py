@@ -44,6 +44,7 @@ ENDED = "pull request ended"
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
+BOOT_RECORD = "boot.json"
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -159,7 +160,10 @@ def lane_state(
     A living session process is never described as stopped. A record that
     names a finished session while its process still answers means the client
     is up and waiting for whoever owns its terminal, which is a prompt to
-    answer rather than a session to resume.
+    answer rather than a session to resume. A session recorded before the
+    host last restarted is dead whatever its process ID now names, because
+    a boot starts every process afresh and a low process ID with matching
+    start ticks is ordinary after one.
 
     Args:
         published: Activity record published for the lane, or an empty
@@ -182,6 +186,8 @@ def lane_state(
         type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
     )
     alive = process.alive(pid, ticks) if identified else None
+    if identified and rebooted(published):
+        alive = False
     recorded = published.get("updated")
     age = None if recorded is None else max(0.0, moment - recorded)
     activity = str(published.get("activity", ""))
@@ -218,6 +224,80 @@ def lane_state(
     if activity == "idle":
         return reading(IDLE, activity)
     return reading(WORKING, activity)
+
+
+def rebooted(published: dict) -> bool:
+    """Reports whether a lane's recorded session predates a host restart.
+
+    The mark names the exact session record it was written against, so the
+    next session a launch records clears it without anyone removing it.
+
+    Args:
+        published: Activity record published for the lane.
+
+    Returns:
+        Whether the record still names the session a restart ended.
+    """
+    marker = published.get("rebooted")
+    return (
+        isinstance(marker, dict)
+        and marker.get("session_pid") == published.get("session_pid")
+        and marker.get("session_ticks") == published.get("session_ticks")
+    )
+
+
+def settle_reboot(directory: Path, manifest: dict) -> list[str]:
+    """Marks every recorded session stopped once the host has restarted.
+
+    A restart ends every process without a shutdown, so the recorded session
+    of each lane is dead even when its process ID now names something else.
+    Each such lane is published as stopped and marked with the session the
+    restart ended. That mark makes presence read the process as gone, so the
+    lane's expired leases are released and its claims move through the
+    orphan path, and it keeps the supervisor from resuming the lane, because a
+    resume would record fresh activity and reset the silence those paths
+    measure. An operator restart records a new session and clears the mark.
+
+    The boot identifier is recorded only after every lane was marked, so a
+    lane whose checkpoint lock was busy is marked on the next poll.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+
+    Returns:
+        Participants whose recorded session was marked stopped.
+    """
+    from agent_parley import checkpoints
+
+    current = process.boot_id()
+    if not current:
+        return []
+    record = directory / BOOT_RECORD
+    try:
+        previous = str(json.loads(record.read_text()).get("boot_id") or "")
+    except (OSError, ValueError, AttributeError):
+        previous = ""
+    if previous == current:
+        return []
+    marked = []
+    if previous:
+        for name in manifest["participants"]:
+            with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+                state = checkpoints.activity(directory, name)
+                if state.get("session_pid") is None or rebooted(state):
+                    continue
+                state["activity"] = STOPPED
+                state["rebooted"] = {
+                    "boot_id": previous,
+                    "at": time.time(),
+                    "session_pid": state.get("session_pid"),
+                    "session_ticks": state.get("session_ticks"),
+                }
+                write_json(directory / f"{name}-activity.json", state)
+                marked.append(name)
+    write_json(record, {"boot_id": current, "recorded": time.time()})
+    return marked
 
 
 def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
@@ -3228,6 +3308,9 @@ def poll(home: Path, directory: Path) -> None:
     so a message whose time or condition has just arrived is part of the
     backlog this same poll may wake the lane for.
 
+    A host restart since the previous poll is settled before anything else,
+    so no part of this poll reads a session the restart ended as alive.
+
     Launches are judged against their start deadline first, so a lane whose
     client never reported a native hook is published as not started before this
     same poll reads presence, publishes fitness and considers a wake.
@@ -3264,6 +3347,7 @@ def poll(home: Path, directory: Path) -> None:
         except (BridgeError, OSError, ValueError, sqlite3.Error) as exc:
             failures.append(f"{label}: {type(exc).__name__}: {exc}")
 
+    stage("reboot", settle_reboot, directory, manifest)
     stage("launches", launches, directory, manifest, config)
     stage("readings", refresh_readings, home, manifest, 2 * config["interval"])
     observations = {
@@ -3982,6 +4066,9 @@ def wake(
 
     A lane that retired is never woken and never resumed. It asked to stop,
     released what it held, and only an operator re-admitting it brings it back.
+    A lane whose session a host restart ended is not resumed either, because
+    the resume would reset the silence its claims and leases are judged on;
+    `participant restart` brings it back.
     """
     participant = manifest["participants"][name]
     if (
@@ -3993,6 +4080,8 @@ def wake(
         return
     path = directory / f"{name}-activity.json"
     state = json.loads(path.read_text()) if path.exists() else {}
+    if rebooted(state):
+        return
     wake_path = directory / f"{name}-wake.json"
     window = config["inactive_after"]
     parked: dict = {}

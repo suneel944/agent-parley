@@ -375,9 +375,12 @@ client runs its `PermissionRequest` hook while it waits; that branch publishes
 the same `dialog` record, naming the tool and the instant the wait began, so
 status, the fit checks, wake admission and `problems.py` read one surface for
 both observations. `dialogs.py` also owns the operator opt-in the launch reads
-before it carries approval of this bridge's own MCP server into a client's
-native permission settings, which is off by default and scoped to that one
-server. `gemini.py`, `copilot.py`, `opencode.py` and
+before it carries approval of this bridge's own MCP server and its own CLI
+command into a client's native permission settings, which is off by default
+and scoped to that server and the one interpreter and module
+`protocol.cli_command` spells for the prompt, the rule and the watcher alike.
+With the opt-in on, the watcher answers a shell prompt for that command and
+nothing else. `gemini.py`, `copilot.py`, `opencode.py` and
 `amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in
