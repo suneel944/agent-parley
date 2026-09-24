@@ -162,6 +162,28 @@ def test_an_open_pull_request_never_escalates(bridge, claimed, monkeypatch):
     assert record(claimed).get("unresolved_completion") is None
 
 
+def test_a_raising_forge_reading_leaves_the_rest_of_the_poll_running(
+    claimed, bridge, monkeypatch
+):
+    def broken(*args):
+        raise ValueError("forge reply unreadable")
+
+    ran = []
+    monkeypatch.setattr(forge, "issue_completion", broken)
+    monkeypatch.setattr(
+        supervision, "reminders", lambda *args: ran.append("reminders")
+    )
+    monkeypatch.setattr(
+        supervision,
+        "observe_responses",
+        lambda *args: ran.append("responses"),
+    )
+    supervision.poll(bridge.home, claimed.parent)
+    assert ran == ["reminders", "responses"]
+    detail = issues.supervision_error(claimed.parent)["detail"]
+    assert detail == "completion: ValueError: forge reply unreadable"
+
+
 def test_the_escalation_reaches_status_and_problems(
     bridge, repo, paired, claimed, monkeypatch
 ):

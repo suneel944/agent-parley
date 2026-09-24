@@ -3708,8 +3708,18 @@ def _remind(
         config: Resolved supervision settings.
         observations: This poll's presence reading per participant.
         stage: Runner that records a raising stage instead of propagating it.
+
+    Completion reads the forge and each lane's reflog, so it runs as its own
+    stage. A reading that raises is recorded and leaves no claim observed
+    ended for this poll, so reminders and every later stage still run.
     """
-    ended = completed_claims(manifest, issues.snapshot(directory))
+    ended: dict[str, dict] = {}
+    stage(
+        "completion",
+        lambda: ended.update(
+            completed_claims(manifest, issues.snapshot(directory))
+        ),
+    )
     closed = set(ended)
     stage(
         "reminders",
