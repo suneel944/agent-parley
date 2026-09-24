@@ -366,7 +366,7 @@ condition, that count, its age and what clears it:
 | `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `overdue claim` | One or more held issues are past their recorded deadline. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
 | `unanswered offer` | One or more handoff offers to the same lane have no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
-| `unresolved completion` | One or more claims read merged or closed on the lane branch and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
+| `unresolved completion` | One or more claimed issues read closed on the forge, or merged or closed on the lane branch when the forge cannot say, and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
 | `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `bounced share` | A share the sender is still waiting on reached a recipient that cannot act on it. The row sits on the sender's lane. | Whatever the first blocked recipient's state allows, from the remedy table below. |
 | `ready to retire` | Every claim the lane holds has been orphaned for longer than `orphan_retire_after` and no peer took it. | `agent-parley participant retire NAME` |
@@ -1521,16 +1521,22 @@ raise `start_deadline` on a slow machine or a cold cache, where a legitimate
 launch can take longer than the default.
 
 Releasing a claim with waiting peers creates a visible handoff reminder.
-The service also checks claimed lane PRs on each poll and reminds holders when
-one is merged or closed. Forge lookups are bounded and best effort; an offline
-forge cannot establish completion. Reminders appear in issue/status output and
+The service also checks each claimed issue on the forge and reminds the holder
+when the issue closed inside the current claim, recording the pull request that
+closed it, its head branch and merge commit, whichever branch it came from. A
+closing pull request from another lane's branch is named in the reminder. Only
+when the forge cannot say anything about the issue does the newest pull request
+on the lane branch speak for it, and a lane branch merge never marks a claimed
+issue the forge still reads as open. Issue readings are reused for five
+minutes. Forge lookups are bounded and best effort; an offline forge cannot
+establish completion. Reminders appear in issue/status output and
 at checkpoints. An explicit subsequent message reaching every waiting peer
 marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
 
 Repeating a reminder at a lane that has stopped answering changes nothing, so
-the supervisor counts the reminders left unanswered on a claim whose lane branch
-is merged or closed. The reminder is written once and a silent lane is asked
+the supervisor counts the reminders left unanswered on a claim observed
+complete. The reminder is written once and a silent lane is asked
 again at most once per `inactive_after` window, so the count is one plus the
 whole windows elapsed since the reminder was written, never the number of
 polls. With the defaults a claim escalates about ten minutes after its first
@@ -1542,8 +1548,9 @@ owner, its offer and its reservations, and the escalation goes to the operator,
 never to the other lanes.
 
 `agent-parley issue resolve NUMBER` is the terminating transition for such a
-claim. It reads the forge at that moment, refuses unless a merged or closed
-pull request was opened inside the current ownership generation, and refuses a
+claim. It reads the forge at that moment, refuses unless the issue closed, or,
+when the forge cannot say, a merged or closed lane branch pull request was
+opened, inside the current ownership generation, and refuses a
 claim the supervisor has not escalated, so an answering holder is never
 resolved out from under it and an unverified claim is never ended this way. It
 records the branch, the pull request state, its merge commit and the instant it

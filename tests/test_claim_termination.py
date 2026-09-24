@@ -198,6 +198,32 @@ def test_the_operator_resolves_a_merged_claim_with_its_evidence(
     assert lifecycle.state(after)["commit"] == "abcdef1234567"
 
 
+def test_a_claim_closed_by_a_per_issue_pull_request_is_resolved(
+    bridge, repo, claimed, monkeypatch
+):
+    reading = {
+        "state": "MERGED",
+        "closed_at": time.time() + 1,
+        "pull_request": 1328,
+        "url": "https://example.invalid/pull/1328",
+        "branch": "refactor/1-replay-package",
+        "commit": "abcdef1234567",
+    }
+    monkeypatch.setattr(forge, "issue_completion", lambda *args: reading)
+    completion(monkeypatch, None, 0.0)
+    evidence(monkeypatch, None, 0.0)
+    supervision.poll(bridge.home, claimed.parent)
+    unanswered(claimed, 2)
+    supervision.poll(bridge.home, claimed.parent)
+    marker = record(claimed)["unresolved_completion"]
+    assert marker["branch"] == "refactor/1-replay-package"
+    result = bridge.issue_resolve(repo, "1", reason="landed per issue")
+    assert result["outcome"] == "complete"
+    resolution = record(claimed)["resolution"]
+    assert resolution["evidence"]["pull_request"] == 1328
+    assert resolution["evidence"]["branch"] == "refactor/1-replay-package"
+
+
 def test_a_resolution_is_not_an_owner_filed_completion(
     bridge, repo, claimed, monkeypatch
 ):
