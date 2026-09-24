@@ -30,6 +30,7 @@ on standard output and export to a file.
 | `setup PATH` | Register a repository from committed HEAD. |
 | `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
 | `top` | The dashboard of every lane; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it. |
+| `title` | Print the current lane's name, state and claim progress for a native status line; prints nothing outside a lane. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
 | `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--idempotency-key` makes a retry safe. |
 | `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
@@ -48,11 +49,14 @@ on standard output and export to a file.
 | `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
 | `issue assign NUMBER NAME` | Offer an issue to a lane as `operator`; `--reason` travels with the offer and `--unassign` withdraws one no lane accepted. |
+| `issue recover NUMBER --reason TEXT` | As `operator`, approve stopping the live owner of a claim once a matching exhausted-capacity observation is published; the approval alone moves nothing. |
 | `issue resolve NUMBER` | End a claim whose holder never filed the completion its pull request already landed, as `operator` and never as the lane. The forge is read at that moment: the issue must have closed inside the current claim, with its closing pull request recorded whichever branch it came from, or, when the forge cannot say, the lane branch pull request must have been opened inside it, and the supervisor must already have escalated the claim as an unresolved completion, so an answering holder is never resolved out from under it. `--reason` is kept beside the recorded evidence, and `--release` returns the work to the queue instead, which a pull request closed without merging requires. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
+| `gc`, `reclaim` | Report the lanes and lane-made worktrees a reclaim would remove and keep, with each worktree's size; `--dry-run` is that default, `--apply` removes them, and `--apply --force` also removes lane-made worktrees kept for uncommitted changes, unpushed commits or a recent change after writing a recovery checkpoint of each; a lane's own worktree is never forced. |
+| `notify test` | Send one test message on each configured transport. |
 | `doctor` | Report launcher, plugin, store and running-service versions and their fit; non-zero exit on a mismatch. |
 | `problems` | List every lane, claim and store condition that needs attention, oldest first, one row per lane per cause with its count and the remedy the lane's state allows; rows the supervision service is handling say so, `--ack-after` sets the acknowledgement age, `--json` prints it for scripts, exit 1 when any row exists. |
 | `problems ack ID` | Record your own acknowledgement of one message a lane left unanswered. It clears that condition and nothing else: no ownership moves, no reservation is released and no lane is woken. |
@@ -97,6 +101,7 @@ on standard output and export to a file.
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `init show` | Show the command every new lane runs before it starts. |
 | `init set COMMAND` | Set that command; an empty string removes it. |
+| `mail show ID` | Print one message this lane received; `--full` adds the whole attachment. |
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
 | `mail list` | List this lane's mail newest first, with the same `--limit` as a search and no query to write. |

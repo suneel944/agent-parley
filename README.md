@@ -165,7 +165,7 @@ demand:
 ```sh
 agent-parley gc           # what would be reclaimed, and what is kept and why
 agent-parley gc --apply   # reclaim the lanes whose work has landed
-agent-parley gc --apply --force  # also dirty lane worktrees, after a checkpoint
+agent-parley gc --apply --force  # also dirty lane-made worktrees, checkpointed
 ```
 
 `agent-parley reclaim` is the same command, and `--dry-run` spells out the
