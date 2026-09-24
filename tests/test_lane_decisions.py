@@ -162,18 +162,18 @@ def test_a_stopped_lane_ages_into_dead(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("state", "woken"),
+    ("state", "result"),
     [
-        (lanes.STARTING, False),
-        (lanes.WORKING, False),
-        (lanes.RECLAIMED, False),
-        (lanes.IDLE, True),
-        (lanes.STOPPED, True),
-        (lanes.DEAD, True),
+        (lanes.STARTING, None),
+        (lanes.WORKING, None),
+        (lanes.RECLAIMED, None),
+        (lanes.IDLE, "accepted"),
+        (lanes.STOPPED, supervision.WAKE_ATTENTION),
+        (lanes.DEAD, supervision.WAKE_ATTENTION),
     ],
 )
 def test_a_wake_acts_only_on_a_lane_whose_state_allows_it(
-    bridge, paired, monkeypatch, state, woken
+    bridge, paired, monkeypatch, state, result
 ):
     actors = registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent
@@ -187,7 +187,9 @@ def test_a_wake_acts_only_on_a_lane_whose_state_allows_it(
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     observed = supervision.presence(directory, "codex", 1)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
-    assert bool(calls) is woken
+    parked = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert parked.get("result") == result
+    assert bool(calls) is (state == lanes.IDLE)
 
 
 def test_a_blocked_lane_is_deferred_under_its_cause(
@@ -197,6 +199,7 @@ def test_a_blocked_lane_is_deferred_under_its_cause(
     directory = Path(paired["lanes"]["codex"]).parent
     idle_live(directory, "codex")
     mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.IDLE)
     calls = []
     monkeypatch.setattr(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
@@ -220,6 +223,7 @@ def test_a_lane_answering_wakes_with_a_bare_stop_still_escalates(
     directory = Path(paired["lanes"]["codex"]).parent
     idle_live(directory, "codex")
     mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.IDLE)
     calls = []
     monkeypatch.setattr(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
@@ -333,6 +337,7 @@ def test_wake_spacing_lives_in_the_lane_state_not_its_published_copy(
     directory = Path(paired["lanes"]["codex"]).parent
     idle_live(directory, "codex")
     mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.IDLE)
     calls = []
     monkeypatch.setattr(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
@@ -349,3 +354,53 @@ def test_wake_spacing_lives_in_the_lane_state_not_its_published_copy(
         stored = lanes.read_wake(db, paired["root"], "codex")
     assert stored["attempts"] == 1
     assert stored["result"] == "accepted"
+
+
+def test_an_activity_label_the_record_contradicts_never_decides_a_wake(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    idle_live(directory, "codex")
+    activity = directory / "codex-activity.json"
+    write_json(
+        activity,
+        {
+            **json.loads(activity.read_text()),
+            "activity": "waiting for approval",
+        },
+    )
+    mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.IDLE)
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert len(calls) == 1
+
+
+def test_fit_reads_the_lane_state_not_the_activity_file(bridge, paired):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    killed(directory, "codex", 10)
+    place(bridge, paired, "codex", lanes.WORKING)
+    working = supervision.fit(bridge.home, directory, paired, "codex", STALLED)
+    assert working["checks"]["session"] is True
+    place(bridge, paired, "codex", lanes.BLOCKED, lanes.DIALOG)
+    blocked = supervision.fit(bridge.home, directory, paired, "codex", STALLED)
+    assert blocked["checks"]["session"] is False
+    assert "is blocked (dialog)" in blocked["reason"]
+
+
+def test_a_lane_without_a_record_is_never_orphaned(bridge, repo, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    config = supervision.configuration(bridge.home, paired)
+    supervision.orphans(bridge.home, directory, paired, config)
+    assert not issues.snapshot(directory)["issues"]["42"].get("orphan")

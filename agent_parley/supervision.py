@@ -64,7 +64,6 @@ UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
 WAKE_BACKOFF_CEILING = 3600.0
 TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
-WAKE_READY = frozenset({IDLE, STOPPED})
 WAKE_ATTENTION = "manual attention required"
 WORKING = "working"
 WAITING = "waiting"
@@ -370,6 +369,73 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     }
 
 
+def recorded_presence(record: dict | None, observed: dict) -> dict:
+    """Reads the presence a supervision decision acts on from the lane state.
+
+    The activity file a presence reading is derived from is evidence, and
+    `settle_lanes` has already applied it to the lane's record. Every
+    decision reads the lane's condition from that record, so the liveness,
+    availability and activity it acts on are replaced here by the record's,
+    and a label the record has not accepted cannot change a decision. The
+    timing and evidence text of the reading are kept for wording and for
+    spacing wakes.
+
+    Args:
+        record: The lane's state record, or None when it has none.
+        observed: This poll's presence reading of the lane.
+
+    Returns:
+        The reading with `process_alive`, `state` and `activity` taken from
+        the record and the record itself under `record`. A lane with no
+        record has no trusted process identity, so its liveness is None and
+        its state is `UNKNOWN`, which no decision acts on.
+    """
+    state = "" if record is None else record["state"]
+    if record is None:
+        alive, availability, activity = None, UNKNOWN, UNKNOWN
+    elif state in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
+        alive, availability, activity = False, STOPPED, STOPPED
+    elif state == lanes.BLOCKED:
+        alive, availability, activity = True, ACTIVE, WAITING
+    elif state == lanes.IDLE:
+        availability = IDLE if observed.get("stale") else ACTIVE
+        alive, activity = True, IDLE
+    else:
+        alive, availability, activity = True, ACTIVE, WORKING
+    return {
+        **observed,
+        "state": availability,
+        "process_alive": alive,
+        "activity": activity,
+        "record": record,
+    }
+
+
+def recorded_observations(
+    home: Path, manifest: dict, observations: dict[str, dict]
+) -> dict[str, dict]:
+    """Reads the presence of every lane from its state record.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        observations: This poll's presence reading per participant.
+
+    Returns:
+        The `recorded_presence` of every participant. A store that cannot be
+        read yields no record for any lane, so nothing is decided on them
+        this poll.
+    """
+    records: dict[str, dict] = {}
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        with store.connect(home) as db:
+            records = lanes.read_all(db, manifest["root"])
+    return {
+        name: recorded_presence(records.get(name), observations.get(name, {}))
+        for name in manifest["participants"]
+    }
+
+
 def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
     """Records that one launch produced no native hook inside its deadline.
 
@@ -379,6 +445,9 @@ def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
     label and the observation are written. The recorded launch time, the live
     session field and the resumable session are left exactly as the launcher
     and any earlier session left them, and no native process is signalled.
+    The same observation is queued as lane evidence, `blocked` on a dialog,
+    because the lane state is what wake and work decisions read, and the
+    next native hook the client reports moves the lane out of it.
 
     Args:
         directory: Private project state directory.
@@ -411,7 +480,15 @@ def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
             "waited": int(time.time() - float(started)),
         }
         write_json(path, state)
-        return True
+    lanes.submit(
+        directory,
+        name,
+        "launch",
+        lanes.BLOCKED,
+        cause=lanes.DIALOG,
+        evidence=f"it never started within {int(deadline)}s of its launch",
+    )
+    return True
 
 
 def launches(directory: Path, manifest: dict, config: dict) -> list[str]:
@@ -850,41 +927,32 @@ UNKNOWN_FIT: dict = {
 }
 
 
-def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
-    """Reads whether the lane's recorded session process is running.
+def _session_check(home: Path, root: str, name: str) -> tuple[bool | None, str]:
+    """Reads from the lane state whether the lane could take a turn.
 
     Args:
-        directory: Private project state directory.
+        home: Private bridge state root.
+        root: Canonical project key.
         name: Participant that owns the lane.
 
     Returns:
-        The check result and, when it failed, why. A lane that published no
-        activity yet reports None, which is no opinion rather than a refusal.
-        A launch that passed its start deadline without a native hook fails
-        here, which is what keeps it out of offers and out of share targets.
-        A lane whose launcher published a native dialog fails the check as
-        well: its client is alive and reading nothing but a keypress. A lane
-        waiting on a native approval names the tool the prompt asked about.
+        The check result and, when it failed, why. A lane with no state
+        record yet reports None, which is no opinion rather than a refusal.
+        A stopped, dead or reclaimed lane fails, and so does a blocked one,
+        named with its cause and the evidence that set it: a launch that
+        passed its start deadline without a native hook, a native dialog or
+        approval its client is held by, or a session that ended while its
+        client still runs. That is what keeps such a lane out of offers and
+        out of share targets.
     """
-    from agent_parley import checkpoints, dialogs
-
-    state = checkpoints.activity(directory, name)
-    if not state:
+    record = condition(home, root, name)
+    if record is None:
         return None, ""
-    if state.get("activity") == NOT_STARTED:
-        waited = (state.get("not_started") or {}).get("deadline", 0)
-        return False, f"it never started within {int(waited)}s of its launch"
-    if not process.alive(state.get("session_pid"), state.get("session_ticks")):
+    if record["state"] in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
         return False, "its session process is not running"
-    if state.get("activity") == "stopped":
-        return False, "its session ended"
-    if str(state.get("activity", "")).startswith(dialogs.APPROVAL):
-        tool = str((state.get("dialog") or {}).get("tool", ""))
-        named = f" of {tool}" if tool else ""
-        return False, f"it is waiting for a native approval{named}"
-    if isinstance(state.get("dialog"), dict):
-        label = str(state["dialog"].get("label", "a native dialog"))
-        return False, f"its client is held by {label}"
+    if record["state"] == lanes.BLOCKED:
+        seen = f": {record['evidence']}" if record["evidence"] else ""
+        return False, f"it is blocked ({record['cause']}){seen}"
     return True, ""
 
 
@@ -1261,8 +1329,8 @@ def fit(
     """Reports whether a lane could take more work right now.
 
     Offering work to a lane that cannot take it stalls twice, so every offer
-    is checked first against what the runtime can read locally: the recorded
-    session process, the lane's own client records, its worktree, and the
+    is checked first against what the runtime can read locally: the lane's
+    state record, its provider capacity, its worktree, and the
     acknowledgements it owes. Each check defaults to no opinion, and only a
     check that actually failed makes a lane unfit.
 
@@ -1315,7 +1383,7 @@ def _fit_reading(
     participant = manifest["participants"][name]
     observed_capacity = capacity(home, directory, manifest, name)
     results = {
-        "session": _session_check(directory, name),
+        "session": _session_check(home, manifest["root"], name),
         "capacity": _capacity_check(observed_capacity),
         "worktree": _worktree_check(participant),
         "mail": _mail_check(
@@ -1764,7 +1832,7 @@ def share_recipients(
             directory,
             manifest,
             name,
-            presence(directory, name, config["inactive_after"]),
+            recorded_presence(condition(home, manifest["root"], name), {}),
             ledger,
         )
     ]
@@ -2949,12 +3017,10 @@ def share_bounces(
             )
 
 
-def orphan_reason(name: str, observed: dict) -> str:
+def orphan_reason(name: str, record: dict) -> str:
     """States why a lane's claims read as orphaned, in one clause."""
-    return (
-        f"{name} has no running session process and has been silent for "
-        f"{int(observed['age_seconds'] or 0)}s"
-    )
+    seen = f": {record['evidence']}" if record.get("evidence") else ""
+    return f"{name} is dead and has no running session process{seen}"
 
 
 def orphan_marker(numbers: list[str], keys: list[str]) -> str:
@@ -2971,6 +3037,9 @@ def orphan_marker(numbers: list[str], keys: list[str]) -> str:
 
 def _dead(observed: dict, after: float) -> bool:
     """Reports whether a lane is gone rather than merely quiet.
+
+    Only a lane with no state record yet is judged this way; a recorded
+    lane is dead when its record says so.
 
     Args:
         observed: Presence reading for the lane.
@@ -3028,11 +3097,18 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     Nothing moves here. The issue keeps its owner, the reservations keep their
     holder, and only an explicit ``issue claim --take-orphaned`` by a peer
-    transfers either. A lane that is merely idle is never marked.
+    transfers either. A recorded lane is marked only when its state record
+    is `dead`, so a lane that is idle or stopped for less than the stall
+    threshold is never marked, whatever its activity file says. A lane with
+    no record yet, which the poll could not seed because its process
+    identity is unknown, falls back to `_dead` on its presence reading, so
+    the safety net never waits on a record. The marker is keyed by the time
+    the lane entered `dead`, so a lane that dies again is announced again.
 
     A marker is an observation, not a verdict, so it is withdrawn as soon as
-    the observation stops holding: a lane whose recorded session process is
-    running again loses the marker on its claims and keeps those claims. The
+    the observation stops holding: a lane whose state is live again, or an
+    unrecorded lane whose session process runs, loses the marker on its
+    claims and keeps those claims. The
     alternative left the ledger reporting a claim as orphaned while takeover
     read the owner as live and refused, so the remedy the marker printed could
     never succeed. A marker published by authorized live recovery survives,
@@ -3045,31 +3121,38 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         config: Resolved supervision settings.
     """
     after = config["stalled_after"]
-    observations = {
-        name: presence(directory, name, config["inactive_after"])
+    records = {
+        name: condition(home, manifest["root"], name)
         for name in manifest["participants"]
     }
-    states = {
-        name: (condition(home, manifest["root"], name) or {}).get("state")
-        for name in manifest["participants"]
+    unrecorded = {
+        name: presence(directory, name, config["inactive_after"])
+        for name, record in records.items()
+        if record is None
     }
     dead = {
-        name: observed
-        for name, observed in observations.items()
-        if (
-            _dead(observed, after)
-            if states[name] is None
-            else states[name] == lanes.DEAD
-        )
+        name: record
+        for name, record in records.items()
+        if record is not None and record["state"] == lanes.DEAD
     }
+    dead.update(
+        {
+            name: {
+                "evidence": f"silent for {int(observed['age_seconds'])}s",
+                "since": observed["last_active"] or 0,
+            }
+            for name, observed in unrecorded.items()
+            if _dead(observed, after)
+        }
+    )
     returned = [
         name
-        for name, observed in observations.items()
+        for name, record in records.items()
         if name not in dead
         and (
-            observed["process_alive"] is True
-            if states[name] is None
-            else states[name] in lanes.LIVE
+            unrecorded[name]["process_alive"] is True
+            if record is None
+            else record["state"] in lanes.LIVE
         )
     ]
     if not dead and not returned:
@@ -3094,13 +3177,13 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
         changed = False
-        for name, observed in dead.items():
+        for name, lane in dead.items():
             if name not in recoverable:
                 continue
             keys = reservations.get(
                 manifest["participants"][name]["display"], []
             )
-            reason = orphan_reason(name, observed)
+            reason = orphan_reason(name, lane)
             marked = []
             fresh = False
             for number, record in ledger["issues"].items():
@@ -3112,7 +3195,7 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                     continue
                 identifier = (
                     f"{name}:{record.get('claim_id') or number}:"
-                    f"{int(observed['last_active'] or 0)}"
+                    f"{int(lane['since'])}"
                 )
                 marked.append(number)
                 if record.get("orphan", {}).get("id") == identifier:
@@ -3735,6 +3818,11 @@ def poll(home: Path, directory: Path) -> None:
     the previous one. A store that is busy or unreadable reclaims nothing
     this round rather than failing the poll.
 
+    The presence reading is evidence only. It is applied to the lane state
+    records first, and every later stage, the published presence row the
+    lease sweep reads included, is given the reading `recorded_presence`
+    derives from those records instead.
+
     A project whose root checkout no longer exists is handed to
     `missing_root` and polled no further, because every other step reads
     Git or wakes a lane that has no repository left to work in.
@@ -3790,10 +3878,11 @@ def _poll(home: Path, directory: Path) -> None:
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
     }
-    stage("presence", _publish_presence, home, manifest, observations)
     stage("lane evidence", settle_evidence, home, directory, manifest)
     stage("lane states", settle_lanes, home, manifest, config, observations)
     stage("lane accounting", account_lanes, home, directory, manifest)
+    observations = recorded_observations(home, manifest, observations)
+    stage("presence", _publish_presence, home, manifest, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
     stage("deliveries", deliveries, home, directory, manifest)
@@ -3898,7 +3987,10 @@ def last_poll(directory: Path) -> dict:
 def _publish_presence(
     home: Path, manifest: dict, observations: dict[str, dict]
 ) -> None:
-    """Stores this poll's presence reading for every lane.
+    """Publishes every lane's presence as its state record reads it.
+
+    The row is a copy published from the lane state, so the lease sweep
+    and the send warnings that read it agree with every other decision.
 
     The write waits `store.BUSY_TIMEOUT` like every other writer. It used to
     give up at once, so under steady hook traffic the presence reading was
@@ -3907,7 +3999,7 @@ def _publish_presence(
     Args:
         home: Private bridge state root.
         manifest: Current participant manifest.
-        observations: Presence reading per participant.
+        observations: `recorded_presence` per participant.
     """
     with store.connect(home, write=True) as db:
         for name, participant in manifest["participants"].items():
@@ -4474,7 +4566,6 @@ def exhaustion_probe_due(observation: dict, window: float) -> float:
 def _wake_block(
     directory: Path,
     name: str,
-    state: dict,
     observed: dict,
     record: dict,
     window: float,
@@ -4487,34 +4578,24 @@ def _wake_block(
     named a reset still ahead, because the attempt after that reset is itself
     the evidence that the lane is back. An exhaustion that named no reset is
     given one by `exhaustion_probe_due`, so a lane parked on a usage-limit
-    dialog is probed on a bounded backoff instead of never. A lane whose
-    screen state is not idle or stopped while its recorded process runs is
-    working or parked on a native dialog it owns, and the dialog watcher
-    publishes into the same activity state, so answering the dialog clears
-    this cause with no change here. That label blocks only while the presence
-    reading is current: once it has aged past the inactivity window with no
-    tool call in flight, it is a label a dropped hook left behind rather than
-    a turn in progress, and the attempt is made. An approval prompt is the
-    exception: it records no hook until it is answered, so it blocks however
-    old it is, and a wake never types into it. The launcher still refuses a
-    lane that is genuinely busy, and a busy refusal spends no budget. The
-    cause carries the label's age, so a block that holds does not read as
-    fresh. A lane with no running process and no session to resume is
-    blocked only once its first attempt has already recorded that, so the
-    refusal is reported before the cause starts sparing the budget.
+    dialog is probed on a bounded backoff instead of never.
 
-    A launch marked not started is blocked before any of that. It has no session
-    to resume and no client that could read an injected prompt, so it is a lane
-    with no session however alive its launcher still is, and nothing a wake can
-    do reaches the dialog that is holding it. The operator answering that dialog
-    produces a native hook event, which republishes the activity and clears the
-    cause here with no change of its own.
+    Every other cause is read from the lane state record, never from the
+    activity file. A lane recorded `blocked` is deferred under its named
+    cause: a native dialog, an approval prompt, an exhausted capacity, or a
+    launch that never reported a native hook within its start deadline. The
+    evidence that answers it, a hook or the dialog watcher seeing the dialog
+    close, moves the record and clears the cause here with no change of its
+    own, and a wake never types into a dialog. The launcher still refuses a
+    lane that is genuinely busy, and a busy refusal spends no budget. A lane
+    recorded stopped or dead with no session to resume is blocked only once
+    its first attempt has already recorded that, so the refusal is reported
+    before the cause starts sparing the budget.
 
     Args:
         directory: Private project state directory.
         name: Participant that owns the lane.
-        state: The lane's published activity state.
-        observed: The lane's presence reading.
+        observed: The lane's `recorded_presence`.
         record: The lane's last durable wake record.
         window: Inactivity window the attempts are spaced by.
 
@@ -4534,21 +4615,12 @@ def _wake_block(
         and float(reset_at) > time.time()
     ):
         return reason, float(reset_at)
-    activity = str(state.get("activity", "")) or UNKNOWN
-    if activity == NOT_STARTED:
-        waited = (state.get("not_started") or {}).get("deadline", 0)
-        return f"it never started within {int(waited)}s of its launch", 0.0
-    if (
-        activity not in WAKE_READY
-        and observed["process_alive"]
-        and (not observed.get("stale") or activity == "waiting for approval")
-    ):
-        age = observed.get("age_seconds")
-        held = f" ({int(age) // 60}m)" if age is not None else ""
-        return f"its screen state is {activity}{held}", 0.0
+    lane = observed.get("record") or {}
+    if lane.get("state") == lanes.BLOCKED:
+        return f"blocked: {lane['cause']}", 0.0
     if (
         observed["process_alive"] is False
-        and not state.get("session_id")
+        and not lane.get("session")
         and str(record.get("result", "")) == WAKE_ATTENTION
     ):
         return "its session process is not running", 0.0
@@ -4679,10 +4751,16 @@ def wake(
     rather than extending the old one. A request the launcher refuses with a
     `busy` reason is spaced like any other but does not count against the
     bound, because the lane never received a turn to decline; it is asked
-    again once it is idle. A non-idle activity label blocks a wake only while
-    its recorded process remains alive and the label has not gone stale. A
-    session with no trustworthy process identity records a manual-attention
-    refusal and is never presumed dead.
+    again once it is idle.
+
+    The lane's condition is read from its state record alone. The activity
+    file and the presence reading passed in are evidence the poll already
+    applied to that record; only the reading's age still spaces a wake of a
+    live lane. A lane recorded starting, working or reclaimed is never
+    woken, a blocked one is deferred under its cause, an idle one is asked
+    for a turn, and a stopped or dead one is resumed when its record names a
+    session. A lane with no record has no trustworthy process identity, so
+    it records a manual-attention refusal and is never presumed dead.
 
     The attempt bound counts wakes without progress. Each attempt records the
     lane's progress marker from `_lane_activity`: its `HEAD` moves, the state
@@ -4696,8 +4774,8 @@ def wake(
     quiet past the inactivity window.
 
     A spent attempt is not the end of the series. Every poll re-decides the
-    lane against what it can read locally: durable provider capacity, the
-    published screen state and the recorded session process. A cause that is
+    lane against what it can read locally: durable provider capacity and the
+    lane state record. A cause that is
     still in force parks the lane with that cause and the time its next attempt
     is due, and spends nothing, so the budget is not consumed while nothing
     could have answered. When the cause clears, the next attempt is due one
@@ -4746,11 +4824,9 @@ def wake(
     recorded = condition(home, root, name)
     if not lanes.wakes(recorded):
         return
-    blocked, ready_at = _wake_block(
-        directory, name, state, observed, parked, window
-    )
-    if not blocked and recorded and recorded["state"] == lanes.BLOCKED:
-        blocked, ready_at = f"blocked: {recorded['cause']}", 0.0
+    observed = recorded_presence(recorded, observed)
+    session = "" if recorded is None else recorded["session"]
+    blocked, ready_at = _wake_block(directory, name, observed, parked, window)
     if blocked:
         _defer_wake(home, directory, root, name, blocked, ready_at, window)
         return
@@ -4872,10 +4948,7 @@ def wake(
             result = "busy:stale"
         elif observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif (
-            observed["process_alive"] is False
-            or state.get("activity") == "stopped"
-        ) and state.get("session_id"):
+        elif observed["process_alive"] is False and session:
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"

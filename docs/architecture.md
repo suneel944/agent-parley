@@ -368,16 +368,22 @@ candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
 the persisted issue candidate and revalidates its owner and evidence identity
 before acting.
 
-The same poll marks the claims of a lane whose session process is gone, or
-whose last event was a clean `SessionEnd` with no process left to check, and
-that has been silent past the stall threshold, writing an orphan marker on each of
+Every decision of the poll after its liveness sample reads the lane's condition
+from its state record: wake, parking, orphan marking, reclaim, work fitness and
+share targets. The activity file, the wake copy and `participant_presence` are
+evidence the poll applies to that record or copies published from it, never a
+decision input.
+
+The same poll marks the claims of a lane whose state is `dead`: a session
+process gone, or a clean `SessionEnd` with no process left to check, past the
+stall threshold. It writes an orphan marker on each of
 its ledger records and sending every other lane one notice that names those
 issues and the reservations the dead lane still holds. The marker is an
 observation: the issue keeps its owner and the reservations keep their holder
 until a peer records `issue claim --take-orphaned`, which writes a `take`
 transition naming the previous owner and the reason and then releases that
 owner's advisory reservations through `store.py`. The same poll withdraws a
-marker whose owner's recorded session process is alive again, under the same
+marker whose owner's lane state is live again, under the same
 `issues.lock` and with one notice to the peers that received the orphan notice,
 so a stored observation never contradicts what takeover reads. A marker
 carrying an operator authorization and a checkpoint describes an approved

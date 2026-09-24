@@ -1529,14 +1529,15 @@ replaces that label. A client parked on a native trust, authentication or update
 dialog fires no hook, so `start_deadline` bounds how long that label may stand.
 A launch still carrying it `start_deadline` seconds later is published as
 `not started; no native hook`, with the deadline and the observed wait in the
-lane's private activity state. The mark is an observation: nothing is killed,
-no claim moves and no dialog is answered. It fails the lane's session fitness
-check, so such a lane is neither offered work nor named as a share target for a
-peer's rebalance, and a wake is refused with the cause
-`it never started within Ns of its launch` rather than spending an attempt on a
+lane's private activity state, and the lane state moves to `blocked: dialog`
+with the evidence `it never started within Ns of its launch`. The mark is an
+observation: nothing is killed, no claim moves and no dialog is answered. The
+blocked state fails the lane's session fitness check, so such a lane is neither
+offered work nor named as a share target for a peer's rebalance, and a wake is
+deferred with the cause `blocked: dialog` rather than spending an attempt on a
 client that cannot read an injected prompt. Answering the dialog produces the
-first native hook event, which republishes the real activity and clears the mark
-however late it arrives. Client startup on a developer machine is a few seconds;
+first native hook event, which moves the lane state out of `blocked` and clears
+the mark however late it arrives. Client startup on a developer machine is a few seconds;
 raise `start_deadline` on a slow machine or a cold cache, where a legitimate
 launch can take longer than the default.
 

@@ -14,6 +14,7 @@ import pytest
 from agent_parley import (
     dashboard,
     issues,
+    lanes,
     records,
     roster,
     store,
@@ -467,14 +468,20 @@ def test_a_transient_block_resumes_on_the_wake_backoff(
         "request",
         lambda path, name: requested.append(name) or "accepted",
     )
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.sample(
+            db,
+            paired["root"],
+            "claude",
+            observed,
+            dead_after=config["stalled_after"],
+        )
 
     supervision.wake(
-        bridge.home,
-        directory,
-        manifest,
-        "claude",
-        supervision.presence(directory, "claude", config["inactive_after"]),
-        config,
+        bridge.home, directory, manifest, "claude", observed, config
     )
 
     blocked = supervision.published_capacity(directory, "claude")

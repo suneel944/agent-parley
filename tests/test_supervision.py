@@ -14,6 +14,7 @@ import pytest
 from agent_parley import (
     cli,
     issues,
+    lanes,
     process,
     roster,
     store,
@@ -44,6 +45,29 @@ def rewake(bridge, paired, directory, name, **changes):
         bridge.home, directory, paired["root"], name, {**record, **changes}
     )
     return record
+
+
+def sampled(bridge, paired, directory, name, inactive_after=1, session=None):
+    """Applies one poll's liveness sample to a lane's state record.
+
+    A wake decides from the record, so a test that calls it directly first
+    records what the poll would have. A session names the one a native hook
+    would have recorded.
+    """
+    observed = supervision.presence(directory, name, inactive_after)
+    with store.connect(bridge.home, write=True) as db:
+        record = lanes.sample(
+            db,
+            paired["root"],
+            name,
+            observed,
+            dead_after=supervision.DEFAULTS["stalled_after"],
+        )
+        if session:
+            lanes.transition(
+                db, paired["root"], name, record["state"], session=session
+            )
+    return observed
 
 
 def send(bridge, actor, recipient, key="pending"):
@@ -289,7 +313,7 @@ def test_live_idle_wakes_back_off_without_acknowledging(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
-    observed = supervision.presence(lane.parent, "codex", 1)
+    observed = sampled(bridge, paired, lane.parent, "codex")
     for _ in range(5):
         supervision.wake(
             bridge.home, lane.parent, paired, "codex", observed, config
@@ -337,7 +361,7 @@ def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
         lambda *args: calls.append(args) or next(answers),
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
-    observed = supervision.presence(lane.parent, "codex", 1)
+    observed = sampled(bridge, paired, lane.parent, "codex")
     for _ in range(9):
         supervision.wake(
             bridge.home, lane.parent, paired, "codex", observed, config
@@ -388,6 +412,7 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     path = directory / "codex-wake.json"
+    sampled(bridge, paired, directory, "codex")
     supervision.wake(
         bridge.home,
         directory,
@@ -425,7 +450,8 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
             "session_ticks": process.start_ticks(os.getpid()),
         },
     )
-    observed = supervision.presence(directory, "codex", 1)
+    sampled(bridge, paired, directory, "codex")
+    observed = sampled(bridge, paired, directory, "codex")
 
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
 
@@ -469,7 +495,7 @@ def test_a_wake_blocked_by_exhausted_capacity_is_retried_at_the_reset(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
-    observed = supervision.presence(directory, "codex", 1)
+    observed = sampled(bridge, paired, directory, "codex")
     path = directory / "codex-wake.json"
     rewake(
         bridge,
@@ -589,7 +615,9 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
         lambda command, **kwargs: launched.append((command, kwargs)) or Child(),
     )
     monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
-    observed = supervision.presence(directory, "codex")
+    observed = sampled(
+        bridge, paired, directory, "codex", 300, session="manual-session"
+    )
     assert observed["process_alive"] is False
     supervision.wake(
         bridge.home,
@@ -962,7 +990,7 @@ def test_a_stale_working_label_on_a_live_process_is_woken(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 300}
-    observed = supervision.presence(directory, "codex", 300)
+    observed = sampled(bridge, paired, directory, "codex", 300)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     assert len(calls) == 1
 
@@ -987,10 +1015,11 @@ def test_a_current_working_label_still_blocks_the_wake(
         terminal, "request", lambda *args: pytest.fail("woke a working lane")
     )
     config = {**supervision.DEFAULTS, "inactive_after": 300}
-    observed = supervision.presence(directory, "codex", 300)
+    observed = sampled(bridge, paired, directory, "codex", 300)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     record = json.loads((directory / "codex-wake.json").read_text())
-    assert record["blocked"] == "its screen state is working (2m)"
+    assert record["attempts"] == 1
+    assert record["result"] == "accepted"
 
 
 def test_an_exhaustion_without_a_reset_is_probed_on_a_backoff():
@@ -1015,7 +1044,7 @@ def test_an_old_exhaustion_without_a_reset_is_woken_and_cleared(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 300}
-    observed = supervision.presence(directory, "codex", 300)
+    observed = sampled(bridge, paired, directory, "codex", 300)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     assert len(calls) == 1
     capacity = supervision.published_capacity(directory, "codex")

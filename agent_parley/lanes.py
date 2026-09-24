@@ -419,12 +419,16 @@ def from_liveness(
 ) -> tuple[str, str] | None:
     """Reads the state one liveness sample is evidence of.
 
-    A sample with no trustworthy process identity is evidence of nothing
-    and moves no lane. A gone process stops a lane that was live, and a
+    A sample with no trustworthy process identity moves no lane, unless it
+    reads `stopped`: the launcher recorded that its session ended, or the
+    lane never published any activity at all, so there is no session that
+    could be running. A gone process stops a lane that was live, and a
     running process starts a lane recorded as stopped, dead or reclaimed.
     A lane held by a dialog or an exhausted capacity keeps that block until
     the screen evidence that set it is withdrawn, because the activity label
-    a sample is derived from cannot see the screen.
+    a sample is derived from cannot see the screen. An approval label blocks
+    however old it is: an approval prompt records no hook until it is
+    answered, so its age says nothing about whether it is still open.
 
     Args:
         record: The lane's current record, or None.
@@ -437,18 +441,20 @@ def from_liveness(
     """
     alive = observed.get("process_alive")
     current = "" if record is None else record["state"]
-    if alive is None:
+    activity = str(observed.get("activity", ""))
+    if alive is None and activity != STOPPED:
         return None
-    if alive is False:
+    if alive is not True:
         return None if current in (DEAD, RECLAIMED) else (STOPPED, "")
     if current in (STOPPED, DEAD, RECLAIMED):
         return STARTING, ""
     if record is not None and record["cause"] in HELD_BLOCKS:
         return None
-    activity = str(observed.get("activity", ""))
+    evidence = str(observed.get("evidence", ""))
+    if "approval" in evidence:
+        return BLOCKED, APPROVAL
     if activity == "waiting":
-        evidence = str(observed.get("evidence", ""))
-        return BLOCKED, APPROVAL if "approval" in evidence else PROMPT
+        return BLOCKED, PROMPT
     if activity == IDLE:
         return IDLE, ""
     if activity == WORKING:
