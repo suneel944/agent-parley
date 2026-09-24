@@ -1544,6 +1544,10 @@ establish completion. Reminders appear in issue/status output and
 at checkpoints. An explicit subsequent message reaching every waiting peer
 marks a response observed; that is delivery evidence, not proof of a complete
 handoff. Ownership still moves only through the explicit offer/accept protocol.
+A `pull request ended` reminder is marked answered as soon as its holder no
+longer owns the issue, whether it released, handed off, was reclaimed or was
+resolved, so the former holder is not woken, sent or listed a reminder for
+work it no longer holds.
 
 Repeating a reminder at a lane that has stopped answering changes nothing, so
 the supervisor counts the reminders left unanswered on a claim observed

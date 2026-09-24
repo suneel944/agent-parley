@@ -1965,6 +1965,12 @@ def reminders(
 ) -> None:
     """Records idempotent reminders without releasing or transferring claims.
 
+    A `pull request ended` reminder asks the lane that holds the claim to
+    report it. Once that lane no longer owns the issue, whether it released,
+    handed off, was reclaimed or was resolved, the reminder asks for nothing
+    it can still do, so it is stamped answered and leaves the lane's wake
+    backlog, delivery and listing.
+
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
@@ -1985,6 +1991,14 @@ def reminders(
         ledger = issues.snapshot(directory)
         changed = False
         for number, record in ledger["issues"].items():
+            prompt = record.get("handoff_prompt") or {}
+            if (
+                prompt.get("trigger") == ENDED
+                and not prompt.get("responded_at")
+                and record.get("owner") != prompt.get("holder")
+            ):
+                prompt["responded_at"] = time.time()
+                changed = True
             waiting = sorted(
                 {
                     other["owner"]

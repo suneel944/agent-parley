@@ -1,13 +1,24 @@
 """Exercises the terminating transition for an observed-complete claim."""
 
 import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import forge, issues, lifecycle, problems, store, supervision
-from agent_parley.state import BridgeError
+from agent_parley import (
+    delivery,
+    forge,
+    issues,
+    lifecycle,
+    problems,
+    process,
+    store,
+    supervision,
+    terminal,
+)
+from agent_parley.state import BridgeError, write_json
 
 HOUR = 3600.0
 
@@ -172,6 +183,60 @@ def test_the_escalation_reaches_status_and_problems(
     assert len(listed) == 1
     assert listed[0]["participant"] == "claude"
     assert listed[0]["command"].startswith("agent-parley issue resolve 1")
+
+
+def owed(bridge, paired, lane, monkeypatch):
+    """Reports where the lane's completion reminder still reaches it."""
+    prompt = record(lane)["handoff_prompt"]
+    ledger = issues.snapshot(lane.parent)
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    monkeypatch.setattr(supervision, "_wake_due", lambda *args: 0.0)
+    wake_path = lane.parent / "claude-wake.json"
+    wake_path.unlink(missing_ok=True)
+    supervision.wake(
+        bridge.home,
+        lane.parent,
+        paired,
+        "claude",
+        supervision.presence(lane.parent, "claude", 1),
+        {**supervision.DEFAULTS, "inactive_after": 1},
+    )
+    backlog = (
+        json.loads(wake_path.read_text())["backlog"]
+        if wake_path.exists()
+        else []
+    )
+    return {
+        "wake": prompt["id"] in backlog,
+        "delivery": f"Issue #1: {supervision.ENDED}"
+        in "\n".join(delivery._notices("claude", ledger, None, [], {})),
+        "listing": "Handoff reminder unanswered" in issues.describe(ledger),
+    }
+
+
+def test_a_released_claim_stops_reminding_its_former_holder(
+    bridge, paired, claimed, monkeypatch
+):
+    write_json(
+        claimed.parent / "claude-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    escalated(bridge, claimed, monkeypatch)
+    everywhere = {"wake": True, "delivery": True, "listing": True}
+    assert owed(bridge, paired, claimed, monkeypatch) == everywhere
+    bridge.issue(claimed, "release", "1")
+    supervision.poll(bridge.home, claimed.parent)
+    ended = record(claimed)
+    assert ended["owner"] is None
+    assert ended.get("unresolved_completion") is None
+    assert ended["handoff_prompt"]["responded_at"]
+    nowhere = {"wake": False, "delivery": False, "listing": False}
+    assert owed(bridge, paired, claimed, monkeypatch) == nowhere
 
 
 def test_the_operator_resolves_a_merged_claim_with_its_evidence(
