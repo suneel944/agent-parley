@@ -683,9 +683,11 @@ def _changed(root: str, start: str, end: str) -> list[str]:
 
     Returns:
         The changed paths, empty when nothing differs and when Git could not
-        answer.
+        answer. A rename is listed under both its old and its new path:
+        rename detection costs half a second on a large diff, and a held
+        path that the other side moved away is changed all the same.
     """
-    listing = _read(root, "diff", "--name-only", start, end)
+    listing = _read(root, "diff", "--no-renames", "--name-only", start, end)
     return [path for path in (listing or "").splitlines() if path]
 
 
@@ -720,14 +722,7 @@ def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
     collisions: dict[str, list[str]] = {}
     for name, participant in manifest["participants"].items():
         patterns = held.get(participant["display"], [])
-        matched = sorted(
-            {
-                path
-                for path in dirty
-                for pattern in patterns
-                if store.overlapping(path, pattern)
-            }
-        )
+        matched = sorted(store.overlapping_paths(dirty, patterns))
         if matched:
             collisions[name] = matched
     return collisions
@@ -789,22 +784,21 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     except (BridgeError, OSError, sqlite3.Error):
         held = {}
     advances: dict[str, list[str]] = {}
+    moved: dict[str, list[str]] = {}
     for name, fork in forks.items():
         participant = manifest["participants"][name]
         branch = participant["branch"]
-        changed = _changed(root, fork, head)
+        if fork not in moved:
+            moved[fork] = _changed(root, fork, head)
+        changed = moved[fork]
         if not changed:
             continue
         patterns = held.get(participant["display"], [])
         mine = set(_changed(root, fork, branch))
         mine.update(dirty_paths(participant["lane"]) or [])
         matched = sorted(
-            {
-                path
-                for path in changed
-                if path in mine
-                or any(store.overlapping(path, pattern) for pattern in patterns)
-            }
+            {path for path in changed if path in mine}
+            | store.overlapping_paths(changed, patterns)
         )
         if matched:
             advances[name] = matched

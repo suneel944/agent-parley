@@ -2,6 +2,7 @@
 
 import contextlib
 import curses
+import functools
 import shutil
 import sqlite3
 import sys
@@ -31,6 +32,7 @@ from agent_parley.checkpoints import (
     lane_branch,
     mailbox,
     participant_liveness,
+    read_events,
 )
 from agent_parley.issues import deadline_state, snapshot
 from agent_parley.state import BridgeError
@@ -99,6 +101,7 @@ KEYS = (
     ("f", "narrow to participants, comma separated; empty clears"),
     ("o", "narrow to projects, comma separated; empty clears"),
     ("c", "show these columns, comma separated; empty shows all"),
+    ("a", "show or hide stopped lanes and projects whose root is gone"),
     ("P", "every lane, claim and store problem, oldest first, in place"),
     ("?", "this key map and the column legend"),
     ("q", "leave; this view never writes state"),
@@ -220,6 +223,28 @@ def _fitness(row: dict) -> str:
     return value + ("+" if row["work_offer"] else "")
 
 
+def _cached(cache: dict, key: object, read: Callable[[], Any]) -> Any:
+    """Runs a Git reading at most once per branch refresh interval.
+
+    Args:
+        cache: Caller-owned mapping of key to its last reading.
+        key: What the reading is about, such as a lane or a project root.
+        read: Produces a fresh reading.
+
+    Returns:
+        The last reading when it is younger than ``BRANCH_TTL``, otherwise a
+        fresh one. Git subprocesses dominate a frame, so a live view pays for
+        them on this interval instead of on every redraw.
+    """
+    now = time.monotonic()
+    cached = cache.get(key)
+    if cached and now - cached[0] < BRANCH_TTL:
+        return cached[1]
+    value = read()
+    cache[key] = (now, value)
+    return value
+
+
 def _branch(lane: Path, cache: dict) -> str:
     """Reads a lane branch at most once per branch refresh interval.
 
@@ -230,14 +255,41 @@ def _branch(lane: Path, cache: dict) -> str:
     Returns:
         The lane's branch name or an unavailable marker.
     """
-    key = str(lane)
-    now = time.monotonic()
-    cached = cache.get(key)
-    if cached and now - cached[0] < BRANCH_TTL:
-        return str(cached[1])
-    value = lane_branch(lane)
-    cache[key] = (now, value)
-    return value
+    return str(_cached(cache, str(lane), lambda: lane_branch(lane)))
+
+
+def dormant(row: dict) -> bool:
+    """Reports whether a lane is stopped and holds nothing to act on.
+
+    Args:
+        row: Participant row produced by ``collect``.
+
+    Returns:
+        True when the lane is retired or out of a live state and it owns no
+        issue, holds no offer, holds or waits on no lease, has no unread or
+        unacknowledged mail, and no ready report awaits the operator. A lane
+        with a state record is live while that record is in `lanes.LIVE`; a
+        lane without one falls back to its session cell reading stopped. A
+        mailbox or lease store that could not be read is not dormant, so a
+        failed reading stays on screen.
+    """
+    recorded = row.get("lane_state")
+    ended = (
+        recorded not in lanes.LIVE
+        if recorded
+        else str(row["state"]).startswith("stopped")
+    )
+    return (
+        (str(row["state"]).startswith("retired") or ended)
+        and not row["owned"]
+        and not row["offers"]
+        and not row["awaiting_approval"]
+        and row.get("usage_read", True)
+        and not row["leases"]
+        and not row["queued"]
+        and row["unread"] == 0
+        and row["pending_ack"] == 0
+    )
 
 
 def _awaiting_approval(directory: Path, data: dict, agent: str) -> bool:
@@ -286,7 +338,11 @@ def _row(
     """
     participant = data["participants"][agent]
     state = activity(directory, agent)
-    events = event_summary(directory, agent, context["since"])
+    try:
+        entries = read_events(directory, agent, context["since"])
+    except BridgeError:
+        entries = None
+    events = event_summary(directory, agent, context["since"], entries)
     stats = context["usage"].get(participant["display"], {})
     issues = context["issues"]["issues"]
     owned = sorted(
@@ -323,11 +379,18 @@ def _row(
     except (BridgeError, OSError, sqlite3.Error):
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
-    liveness = participant_liveness(directory, agent, context["inactive_after"])
+    condition = context.get("conditions", {}).get(agent)
+    liveness = (
+        lanes.describe(condition)
+        if condition
+        else participant_liveness(directory, agent, context["inactive_after"])
+    )
     stalled = supervision.stall(
         home, directory, data, agent, context["stalled_after"]
     )
-    idle = metrics.idle_intervals(directory, agent, context["since"])
+    idle = metrics.idle_intervals(
+        directory, agent, context["since"], entries=entries
+    )
     published = supervision.published_work(directory, agent)
     edited = context["operator_edits"].get(agent, [])
     advanced = context["base_advances"].get(agent, [])
@@ -357,6 +420,7 @@ def _row(
                 else None
             ),
         ),
+        "lane_state": condition["state"] if condition else None,
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
@@ -391,6 +455,7 @@ def _row(
         "unread": mail.get("unread", "?"),
         "superseded": mail.get("superseded", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
+        "usage_read": context.get("usage_read", True),
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
@@ -495,7 +560,9 @@ def collect(
     Args:
         home: Private bridge state root.
         running: Whether the recorded coordination server process is alive.
-        branches: Caller-owned branch cache, refreshed on its own interval.
+        branches: Caller-owned cache of Git readings, each lane branch and
+            each project's operator edits and base advances, refreshed on
+            its own interval. A project whose root is gone is not read.
         providers: Provider names to report; every provider when empty. A
             project keeps its heading once it holds a selected participant, so
             an operator can tell an emptied selection from an empty project.
@@ -510,10 +577,13 @@ def collect(
             repository whose base checkout is always dirty.
 
     Returns:
-        Server health, per-project participant rows, the plan groups whose
-        every member is reported ready, and totals over the reported rows, so
-        a header never counts a participant the table does not show.
+        Server health, per-project participant rows with whether the
+        project's root still exists, the plan groups whose every member is
+        reported ready, totals over the reported rows, so a header never
+        counts a participant the table does not show, and how many seconds
+        the reading took.
     """
+    started = time.monotonic()
     since = time.time() - window if window else 0.0
     cache = {} if readings is None else readings
     projects = []
@@ -526,18 +596,32 @@ def collect(
             continue
         try:
             usage = store.usage(home, data["root"])
+            usage_read = True
         except sqlite3.Error:
             usage = {}
+            usage_read = False
         supervised = supervision.configuration(home, data)
-        edits, advances = supervision.readings(home, data)
+        present = Path(data["root"]).is_dir()
+        edits, advances = (
+            _cached(
+                branches,
+                ("readings", data["root"]),
+                functools.partial(supervision.readings, home, data),
+            )
+            if present
+            else ({}, {})
+        )
         try:
             with store.connect(home) as db:
                 accounts = lanes.read_accounts(db, data["root"])
+                conditions = lanes.read_all(db, data["root"])
         except (BridgeError, OSError, sqlite3.Error):
-            accounts = {}
+            accounts, conditions = {}, {}
         context = {
             "accounts": accounts,
+            "conditions": conditions,
             "usage": usage,
+            "usage_read": usage_read,
             "issues": snapshot(path.parent),
             "branches": branches,
             "records": cache,
@@ -556,6 +640,7 @@ def collect(
         projects.append(
             {
                 "root": data["root"],
+                "present": present,
                 "rows": rows,
                 "ready_groups": plan.ready_groups(
                     plan.groups(path.parent),
@@ -571,6 +656,7 @@ def collect(
         "totals": _totals(projects),
         "providers": list(providers),
         "window": window,
+        "read_seconds": time.monotonic() - started,
     }
 
 
@@ -723,6 +809,7 @@ def select(
     reverse: bool = False,
     projects: tuple[str, ...] = (),
     participants: tuple[str, ...] = (),
+    live: bool = False,
 ) -> dict:
     """Orders and narrows a snapshot without reading any state again.
 
@@ -736,11 +823,15 @@ def select(
             root also matches on its trailing path segments, so a directory
             name selects it without its whole path.
         participants: Participant names to report; every one when empty.
+        live: Whether to leave out the projects whose root is gone and the
+            lanes ``dormant`` reports, the way a task manager lists only
+            what is running. Every row is kept when False.
 
     Returns:
         A snapshot holding the selected rows, totals recounted over them,
-        and the selection itself, so a header never counts a row the table
-        does not show.
+        the selection itself, and how many lanes and projects the live
+        selection left out, so a header never counts a row the table does
+        not show and never hides one without saying so.
 
     Raises:
         BridgeError: If the sort column is not a reported column.
@@ -752,6 +843,7 @@ def select(
         )
     key = SORT_KEYS.get(sort.upper())
     selected = []
+    hidden = {"lanes": 0, "projects": 0}
     for project in view["projects"]:
         root = str(project["root"])
         if projects and not any(
@@ -764,6 +856,16 @@ def select(
             for row in project["rows"]
             if not participants or row["participant"] in participants
         ]
+        if live and not project.get("present", True):
+            hidden["projects"] += 1
+            hidden["lanes"] += len(rows)
+            continue
+        if live:
+            kept = [row for row in rows if not dormant(row)]
+            hidden["lanes"] += len(rows) - len(kept)
+            if rows and not kept:
+                continue
+            rows = kept
         if key is not None:
             rows = sorted(rows, key=key)
         if reverse:
@@ -778,7 +880,9 @@ def select(
             "reverse": reverse,
             "projects": list(projects),
             "participants": list(participants),
+            "live": live,
         },
+        "hidden": hidden,
     }
 
 
@@ -945,7 +1049,12 @@ def layout(
     lines = [
         f"agent-parley top  server: "
         f"{'running' if view['running'] else 'not running'}  "
-        f"state: {view['home']}",
+        f"state: {view['home']}"
+        + (
+            f"  read {view['read_seconds']:.2f}s"
+            if "read_seconds" in view
+            else ""
+        ),
         f"projects {len(view['projects'])}  "
         f"participants {totals['participants']}  "
         f"hook events {totals['events']}  "
@@ -975,6 +1084,12 @@ def layout(
             else "  all retained"
         ),
     ]
+    hidden = view.get("hidden") or {}
+    if hidden.get("lanes") or hidden.get("projects"):
+        lines.append(
+            f"Hidden: {hidden['lanes']} lanes (stopped, holding nothing), "
+            f"{hidden['projects']} projects (root gone); a or --all shows them"
+        )
     if omitted:
         lines.append("Hidden columns: " + ", ".join(omitted))
     choice = view.get("selection") or {}
@@ -1231,6 +1346,7 @@ def _loop(
             shaping["reverse"],
             shaping["projects"],
             shaping["participants"],
+            not shaping.get("everything", False),
         )
         frame = layout(
             view,
@@ -1278,6 +1394,8 @@ def _loop(
             ]
         elif key == ord("r"):
             shaping["reverse"] = not shaping["reverse"]
+        elif key == ord("a"):
+            shaping["everything"] = not shaping.get("everything", False)
         elif key == ord("f"):
             shaping["participants"] = _ask(screen, "participants: ", interval)
         elif key == ord("o"):
@@ -1302,6 +1420,7 @@ def run(
     columns: tuple[str, ...] = (),
     operator_edits: bool = True,
     problems: Callable[[], list[str]] | None = None,
+    everything: bool = False,
 ) -> None:
     """Shows the dashboard, printing a plain snapshot when it cannot draw.
 
@@ -1322,6 +1441,9 @@ def run(
             dirty paths that overlap a lane's reservation.
         problems: Produces the problem lines the ``P`` key shows in place
             of the table; the key does nothing when None.
+        everything: Whether to also show the stopped lanes that hold nothing
+            and the projects whose root is gone, which the view otherwise
+            counts in its header and leaves out.
 
     A snapshot is printed at the width of the terminal when one is
     attached and at the full width of the table when the output is a pipe,
@@ -1335,6 +1457,7 @@ def run(
         "projects": projects,
         "participants": participants,
         "columns": shown,
+        "everything": everything,
     }
     if once or not sys.stdout.isatty():
         view = select(
@@ -1350,6 +1473,7 @@ def run(
             reverse,
             projects,
             participants,
+            not everything,
         )
         available = (
             shutil.get_terminal_size().columns if sys.stdout.isatty() else None

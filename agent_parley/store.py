@@ -1671,7 +1671,9 @@ def overlapping(pattern: str, other: str) -> bool:
     directory, or when both are globs, which the matcher cannot compare and
     so treats as a collision. A plain path checked against a pattern uses the
     same rule, so a dirty file in a checkout is matched exactly the way a
-    competing reservation would be.
+    competing reservation would be. A key without glob characters is only
+    ever the text being matched, never a compiled pattern, which gives the
+    same answer without one regular expression per dirty path.
 
     Args:
         pattern: Reservation key or repository-relative path.
@@ -1682,16 +1684,76 @@ def overlapping(pattern: str, other: str) -> bool:
     """
     if named_resource(pattern) or named_resource(other):
         return pattern == other
-    both_globs = any(c in pattern for c in "*?[") and any(
-        c in other for c in "*?["
-    )
+    pattern_glob = any(c in pattern for c in "*?[")
+    other_glob = any(c in other for c in "*?[")
     return (
-        both_globs
-        or fnmatch.fnmatchcase(pattern, other)
-        or fnmatch.fnmatchcase(other, pattern)
+        (pattern_glob and other_glob)
+        or pattern == other
+        or (other_glob and fnmatch.fnmatchcase(pattern, other))
+        or (pattern_glob and fnmatch.fnmatchcase(other, pattern))
         or pattern.startswith(other.rstrip("/") + "/")
         or other.startswith(pattern.rstrip("/") + "/")
     )
+
+
+def overlapping_paths(paths: list[str], patterns: list[str]) -> set[str]:
+    """Names the paths that overlap any pattern, as ``overlapping`` judges.
+
+    A dirty checkout can list tens of thousands of paths, and one call per
+    path and pattern pair costs a second on every reading. A plain pattern
+    is answered instead with one set lookup for itself, one for each
+    directory above it, and one prefix scan for the paths under it. A glob
+    pattern is compiled once and matched against every plain path, and
+    collides with every globbed path. A named resource overlaps only its own
+    spelling, so either side being one is answered by a set lookup; only a
+    globbed path checked against a plain pattern uses the pairwise rule.
+
+    Args:
+        paths: Reservation keys or repository-relative paths.
+        patterns: Reservation keys each path is compared against.
+
+    Returns:
+        Every path that ``overlapping(path, pattern)`` reports for some
+        pattern.
+    """
+    if not patterns:
+        return set()
+    globbed = [
+        path for path in paths if "*" in path or "?" in path or "[" in path
+    ]
+    trimmed: dict[str, list[str]] = {}
+    for path in paths:
+        trimmed.setdefault(path.rstrip("/"), []).append(path)
+    exact = set(paths)
+    shaped = [path for path in globbed if not named_resource(path)]
+    skipped = set(globbed)
+    plain = [
+        path
+        for path in paths
+        if path not in skipped and not named_resource(path)
+    ]
+    found: set[str] = set()
+    for pattern in patterns:
+        if pattern in exact:
+            found.add(pattern)
+        if named_resource(pattern):
+            continue
+        for index, character in enumerate(pattern):
+            if character == "/":
+                found.update(trimmed.get(pattern[:index], ()))
+        prefix = pattern.rstrip("/") + "/"
+        if any(c in pattern for c in "*?["):
+            matches = re.compile(fnmatch.translate(pattern)).match
+            found.update(shaped)
+            found.update(
+                path
+                for path in plain
+                if matches(path) or path.startswith(prefix)
+            )
+            continue
+        found.update(path for path in paths if path.startswith(prefix))
+        found.update(path for path in globbed if overlapping(path, pattern))
+    return found
 
 
 def _keys(

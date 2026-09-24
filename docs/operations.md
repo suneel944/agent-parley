@@ -792,8 +792,27 @@ branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
 the oldest, delivered context, denials against retained hook events, served
 MCP calls with rejections, and the tokens that lane's own native client
-recorded. The header carries server health and the project's
-denial rate. The view is read-only and makes no model call; `q` leaves it.
+recorded. The header carries server health, the project's denial rate and
+how long the frame took to read. The view is read-only and makes no model
+call; `q` leaves it.
+
+Like a task manager, the view lists what is live. A lane is out of a live
+state when it is retired or when its lane state record is `stopped`, `dead`
+or `reclaimed`; a lane with no record yet falls back to a session cell that
+reads stopped. Such a lane which owns no issue, holds no offer, holds or
+waits on no lease, has no unread or unacknowledged mail and has no ready
+report awaiting approval is left out. So is every lane of a project whose
+root no longer exists, such as a run under `/tmp` after a reboot. A lane
+whose mailbox or lease store could not be read stays on screen. The session
+cell names the recorded state, its cause and how long it has held it. The
+header counts what was left out. `a` in the live view and
+`--all` on the command line show it again, and `--json` always reports every
+lane. A stopped lane that still holds work stays on screen, because that work
+needs the operator.
+
+Git readings dominate a frame, so the live view reads each lane's branch
+and each project's operator edits and base advances at most once every five
+seconds. The rest of the frame is read on every redraw.
 
 The table is fitted to the terminal rather than fixed. Each column is as
 wide as the widest value in that frame and never narrower than its declared
@@ -823,6 +842,7 @@ Keys in the live view:
 | `f` | Narrow to participants, comma separated; empty clears. |
 | `o` | Narrow to projects, comma separated; empty clears. |
 | `c` | Choose the columns shown; empty shows all. |
+| `a` | Show or hide stopped lanes and projects whose root is gone. |
 | `?` | Show the key map and the column legend. |
 | `q` | Leave. The view never writes state. |
 

@@ -463,3 +463,97 @@ def test_a_refused_write_is_reported_in_the_footer(monkeypatch):
     )
     footer = screen.frames[0][-1][0]
     assert "1 writes refused: addnstr() returned ERR" in footer
+
+
+def gone(root: str, rows: list[dict]) -> dict:
+    """Builds a collected view holding one project whose root is gone."""
+    view = snapshot((root, rows), ("/repo/live", [lane("worker")]))
+    view["projects"][0]["present"] = False
+    return view
+
+
+def test_a_stopped_lane_holding_nothing_is_counted_not_drawn():
+    stopped = "stopped; event 190223s ago"
+    view = snapshot(
+        (
+            "/repo",
+            [
+                lane("worker"),
+                lane("dead", state=stopped),
+                lane("owner", state=stopped, owned=["7"], issues="#7"),
+                lane("leaser", state=stopped, leases=1),
+                lane("mailed", state=stopped, unread=2),
+                lane("unreadable", state=stopped, unread="?"),
+                lane("offerer", state=stopped, offers=1),
+                lane("approval", state=stopped, awaiting_approval=True),
+                lane("unstored", state=stopped, usage_read=False),
+            ],
+        )
+    )
+    live = dashboard.select(view, live=True)
+    rendered = dashboard.render(live)
+    drawn = {line.split()[0] for line in rendered if line.strip()}
+    assert "dead" not in drawn
+    for name in (
+        "worker",
+        "owner",
+        "leaser",
+        "mailed",
+        "unreadable",
+        "offerer",
+        "approval",
+        "unstored",
+    ):
+        assert name in drawn
+    assert live["hidden"] == {"lanes": 1, "projects": 0}
+    assert "Hidden: 1 lanes" in text(rendered)
+    everything = dashboard.render(dashboard.select(view))
+    assert "dead" in {line.split()[0] for line in everything if line.strip()}
+
+
+def test_the_lane_record_decides_whether_a_lane_is_live():
+    view = snapshot(
+        (
+            "/repo",
+            [
+                lane("crashed", state="dead 2h", lane_state="dead"),
+                lane("resumed", state="stopped", lane_state="working"),
+                lane("reclaimed", state="idle", lane_state="reclaimed"),
+            ],
+        )
+    )
+    live = dashboard.select(view, live=True)
+    rendered = dashboard.render(live)
+    drawn = {line.split()[0] for line in rendered if line.strip()}
+    assert "resumed" in drawn
+    assert "crashed" not in drawn
+    assert "reclaimed" not in drawn
+    assert live["hidden"] == {"lanes": 2, "projects": 0}
+
+
+def test_a_project_whose_root_is_gone_is_hidden_until_asked():
+    view = gone("/tmp/wiped", [lane("old", state="stopped"), lane("older")])
+    live = dashboard.select(view, live=True)
+    shown = text(dashboard.render(live))
+    assert "/tmp/wiped" not in shown
+    assert live["hidden"] == {"lanes": 2, "projects": 1}
+    assert live["totals"]["participants"] == 1
+    assert "/tmp/wiped" in text(dashboard.render(dashboard.select(view)))
+
+
+def test_the_a_key_shows_and_hides_what_the_live_view_left_out(monkeypatch):
+    screen = drive(
+        monkeypatch,
+        gone("/tmp/wiped", [lane("old", state="stopped")]),
+        [ord("a"), ord("a"), ord("q")],
+    )
+    frames = [text([line for line, _ in frame]) for frame in screen.frames]
+    assert "/tmp/wiped" not in frames[0]
+    assert "a or --all shows them" in frames[0]
+    assert "/tmp/wiped" in frames[1]
+    assert "/tmp/wiped" not in frames[2]
+
+
+def test_the_header_reports_how_long_the_frame_took_to_read():
+    view = {**snapshot(("/repo", lanes(1))), "read_seconds": 0.25}
+    assert "read 0.25s" in dashboard.render(view)[0]

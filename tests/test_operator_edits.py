@@ -1,5 +1,6 @@
 """Checks the advisory notice for an operator edit on a reserved path."""
 
+import itertools
 import json
 import subprocess
 import sys
@@ -213,3 +214,33 @@ def test_an_expired_publication_is_read_from_git_again(bridge, repo, paired):
     assert supervision.readings(bridge.home, paired)[0] == {
         "claude": ["shared.txt"]
     }
+
+
+def test_the_batch_matcher_agrees_with_the_pairwise_rule():
+    keys = [
+        "a",
+        "a/",
+        "a/b",
+        "a/b/",
+        "a/b/c.py",
+        "a/*",
+        "a/b/*.py",
+        "*.py",
+        "ab",
+        "ab/c",
+        "x:y",
+        "x:y/z",
+        "[ab]/c",
+        "?",
+        "c/d/e",
+    ]
+    for size in (1, 2):
+        for patterns in itertools.combinations(keys, size):
+            expected = {
+                path
+                for path in keys
+                for pattern in patterns
+                if store.overlapping(path, pattern)
+            }
+            assert store.overlapping_paths(keys, list(patterns)) == expected
+    assert store.overlapping_paths(keys, []) == set()
