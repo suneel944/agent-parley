@@ -4497,6 +4497,44 @@ def _record_refusals(
     )
 
 
+def record_hook_refusal(
+    home: Path, root: str, agent: str, holder: str, pattern: str
+) -> None:
+    """Records one hook-refused reservation overlap outside its own lock.
+
+    The `PreToolUse` hook denies a write on a peer's exclusive reservation by
+    reading the mailbox's cached peer reservations directly, never through
+    `file_reservation_paths`, so that refusal used to leave no row in
+    `reservation_refusals` and status and problems could not name the
+    holder for it. This is best effort: a store the caller cannot reach
+    leaves the hook's own denial unaffected.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        agent: Lane the hook refused.
+        holder: Lane whose reservation caused the refusal.
+        pattern: Reserved path pattern the call overlapped.
+    """
+    with connect(home, write=True) as db:
+        project = db.execute(
+            "SELECT id FROM projects WHERE human_key=?", (root,)
+        ).fetchone()
+        if not project:
+            return
+        registered = db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND name=?",
+            (project[0], agent),
+        ).fetchone()
+        if not registered:
+            return
+        _record_refusals(
+            db,
+            {"project_id": project[0], "id": registered[0]},
+            [{"owner": holder, "path": pattern}],
+        )
+
+
 def _refused_by(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
     """Maps each holding lane to the lanes it refused and still blocks.
 

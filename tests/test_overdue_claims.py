@@ -137,6 +137,56 @@ def test_a_resume_that_ends_without_work_does_not_extend_silence(
     assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
 
 
+def test_a_closed_and_unanswered_claim_is_never_offered_or_released(
+    bridge, paired
+):
+    directory = overdue(bridge, paired)
+    edit(
+        directory,
+        "7",
+        lambda record: record.update(
+            handoff_prompt={
+                "id": "7:1:pull request ended",
+                "holder": "claude",
+                "waiting": ["codex"],
+                "created": time.time(),
+                "trigger": supervision.ENDED,
+                "text": "Issue #7: pull request ended.",
+            }
+        ),
+    )
+
+    observed = step(bridge, directory, paired)
+
+    assert observed["owner"] == "claude"
+    assert observed["offer"] is None
+    assert "overdue_recovery" not in observed
+
+
+def test_overdue_peer_selection_honors_the_configured_inactive_window(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    manifest = json.loads((directory / "project.json").read_text())
+    seen = []
+
+    def fake_fit(home, directory, manifest, name, after, inactive_after=None):
+        seen.append(inactive_after)
+        return {"fit": True}
+
+    monkeypatch.setattr(supervision, "fit", fake_fit)
+    config = {**supervision.DEFAULTS, "inactive_after": 5}
+
+    peer = supervision._overdue_peer(
+        bridge.home, directory, manifest, config, {}, "codex"
+    )
+
+    assert peer == "claude"
+    assert seen == [5]
+
+
 def test_a_claim_without_a_deadline_takes_the_project_default(bridge, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])

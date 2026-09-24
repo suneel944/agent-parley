@@ -945,9 +945,28 @@ def diagnosable(payload: dict) -> bool:
         for segment in shell_segments(command)
         if (words := invoked(segment))
     ]
-    return bool(segments) and all(
-        Path(words[0]).name == BRIDGE_COMMAND for words in segments
-    )
+    return bool(segments) and all(_bridge_call(words) for words in segments)
+
+
+def _bridge_call(words: list[str]) -> bool:
+    """Reports whether one simple command invokes this bridge's own CLI.
+
+    A lane spells its own launch as the interpreter running this code plus
+    ``-m agent_parley.cli``, never a bare ``agent-parley`` on its PATH, so
+    that form is cleared too. Only that exact interpreter and module counts;
+    a different or arbitrary Python invocation is not laundered through it.
+
+    Args:
+        words: Tokenized simple command with wrappers stripped.
+
+    Returns:
+        True when the command is the bare bridge command or the exact
+        protocol-form CLI call this build spells for a lane.
+    """
+    if Path(words[0]).name == BRIDGE_COMMAND:
+        return True
+    protocol_words = shlex.split(protocol.cli_command())
+    return words[: len(protocol_words)] == protocol_words
 
 
 def touched_path(payload: dict, lane: Path) -> str:
@@ -1117,6 +1136,29 @@ def digest(
     return [header, *(previews[item["id"]] for item in ordered)], delivered
 
 
+def _reserved_conflict(path: str, mail: dict) -> dict | None:
+    """Finds the peer reservation a touched path overlaps, if any.
+
+    Args:
+        path: Lane-relative path a call would write, or empty when the call
+            names none.
+        mail: Mailbox batch read for this decision.
+
+    Returns:
+        The pattern and holder of the first overlapping exclusive
+        reservation, or None when the path clears every one.
+    """
+    if not path:
+        return None
+    for held in mail.get("peer_reservations") or []:
+        pattern = str(held["pattern"])
+        if not store.named_resource(pattern) and store.overlapping(
+            pattern, path
+        ):
+            return {"pattern": pattern, "holder": str(held["holder"])}
+    return None
+
+
 def hazard(
     payload: dict, lane: Path, agent: str, mail: dict, issues: dict
 ) -> tuple[Reason, str] | None:
@@ -1142,17 +1184,14 @@ def hazard(
     if tool in READ_ONLY_TOOLS or diagnosable(payload):
         return None
     path = touched_path(payload, lane)
-    if path:
-        for held in mail.get("peer_reservations") or []:
-            pattern = str(held["pattern"])
-            if not store.named_resource(pattern) and store.overlapping(
-                pattern, path
-            ):
-                return Reason.RESERVED_PATH, (
-                    f"{path} overlaps {pattern}, reserved by "
-                    f"{held['holder']}. Coordinate with {held['holder']} or "
-                    "wait for the release; reservations are advisory."
-                )
+    conflict = _reserved_conflict(path, mail)
+    if conflict:
+        holder = conflict["holder"]
+        return Reason.RESERVED_PATH, (
+            f"{path} overlaps {conflict['pattern']}, reserved by "
+            f"{holder}. Coordinate with {holder} or "
+            "wait for the release; reservations are advisory."
+        )
     now = time.time()
     for number, item in (issues.get("issues") or {}).items():
         offer = item.get("offer") or {}
@@ -1162,11 +1201,12 @@ def hazard(
             and isinstance(deadline, int | float)
             and now < deadline <= now + OFFER_REPLY_SECONDS
         ):
+            command = protocol.cli_command()
             return Reason.OFFER_EXPIRING, (
                 f"Offer {offer.get('id')} for issue #{number} expires in "
                 f"{int(deadline - now)}s. Answer it first: "
-                f"{BRIDGE_COMMAND} issue accept {number} --offer-id "
-                f"{offer.get('id')} or {BRIDGE_COMMAND} issue decline "
+                f"{command} issue accept {number} --offer-id "
+                f"{offer.get('id')} or {command} issue decline "
                 f"{number} --offer-id {offer.get('id')}."
             )
     return None
@@ -1766,6 +1806,57 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         }
 
 
+def peer_reservations(home: Path, root: str, name: str) -> list[dict]:
+    """Reads only the live exclusive reservations peers hold.
+
+    A record-only decision skips the full mailbox batch `mailbox` reads, but
+    `hazard` still needs to know what a call would overlap. This runs the
+    one query that answers that, so the checkpoint lock is never held for
+    the messages, leases and topic queries a record-only decision has no use
+    for.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the bridge store.
+        name: Registered agent identity.
+
+    Returns:
+        Each peer's held pattern and holder name, the same shape `mailbox`
+        reports under `peer_reservations`.
+
+    Raises:
+        BridgeError: If the agent is not registered.
+        sqlite3.Error: If the local mailbox cannot be read.
+    """
+    path = home / store.DATABASE
+    with contextlib.closing(
+        sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.3)
+    ) as db:
+        db.row_factory = sqlite3.Row
+        agent = db.execute(
+            "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE p.human_key=? AND a.name=?",
+            (root, name),
+        ).fetchone()
+        if not agent:
+            raise BridgeError("Agent identity is not registered.")
+        held = db.execute(
+            "SELECT r.path_pattern,a.name AS holder,r.agent_id=? AS own,"
+            "r.exclusive "
+            "FROM file_reservations r JOIN agents a ON a.id=r.agent_id "
+            "WHERE r.project_id=a.project_id AND a.project_id=("
+            "SELECT project_id FROM agents WHERE id=?) "
+            "AND r.released_ts IS NULL AND (r.expires_ts IS NULL "
+            "OR r.expires_ts>datetime('now')) ORDER BY r.id LIMIT 64",
+            (agent["id"], agent["id"]),
+        ).fetchall()
+        return [
+            {"holder": row["holder"], "pattern": row["path_pattern"]}
+            for row in held
+            if row["exclusive"] and not row["own"]
+        ]
+
+
 def renewed_leases(home: Path, root: str, name: str, after: int = 0) -> dict:
     """Renews this lane's expired reservations and reads the mailbox again.
 
@@ -2190,6 +2281,7 @@ def checkpoint(
         reason = Reason.OBSERVED
         ledger: dict = {}
         markers: dict = {}
+        conflict: dict | None = None
         if context:
             from agent_parley import budgets
 
@@ -2266,6 +2358,10 @@ def checkpoint(
                     if event == "PreToolUse"
                     else None
                 )
+                if danger and danger[0] is Reason.RESERVED_PATH:
+                    conflict = _reserved_conflict(
+                        touched_path(payload, lane), mail
+                    )
                 if (
                     messages
                     or issue_notice
@@ -2417,6 +2513,38 @@ def checkpoint(
                             "additionalContext": text,
                         }
                     }
+        elif record_only and event == "PreToolUse":
+            stages.enter("hazard")
+            danger = None
+            peers: list[dict] = []
+            try:
+                ledger = snapshot(directory)
+                peers = peer_reservations(
+                    home, manifest["root"], identity["name"]
+                )
+                danger = hazard(
+                    payload,
+                    lane,
+                    agent,
+                    {"peer_reservations": peers},
+                    ledger,
+                )
+            except (OSError, sqlite3.Error, BridgeError):
+                danger = None
+            if danger:
+                reason, unsafe = danger
+                if reason is Reason.RESERVED_PATH:
+                    conflict = _reserved_conflict(
+                        touched_path(payload, lane),
+                        {"peer_reservations": peers},
+                    )
+                output = {
+                    "hookSpecificOutput": {
+                        "hookEventName": event,
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": unsafe,
+                    }
+                }
         if event in RECOVERY_EVENTS and pending is not None:
             pending["recovery"] = True
         elif event in RECOVERY_EVENTS:
@@ -2458,7 +2586,16 @@ def checkpoint(
         )
         if event in ("SessionStart", "SessionEnd"):
             prune(directory, agent)
-        return output
+    if conflict:
+        with contextlib.suppress(OSError, sqlite3.Error, BridgeError):
+            store.record_hook_refusal(
+                home,
+                manifest["root"],
+                agent,
+                conflict["holder"],
+                conflict["pattern"],
+            )
+    return output
 
 
 def mark_delivered(state: dict, markers: dict, current: bool) -> None:

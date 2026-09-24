@@ -1,11 +1,12 @@
 """Checks that pending coordination arrives as context, not as a denial."""
 
+import shlex
 import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, store
+from agent_parley import checkpoints, protocol, store
 from agent_parley.state import write_json
 
 
@@ -45,7 +46,7 @@ def send(bridge, lanes, key, **extra):
     )
 
 
-def hook(bridge, lanes, event, **extra):
+def hook(bridge, lanes, event, *, record_only=False, **extra):
     """Runs one codex checkpoint decision."""
     payload = {
         "hook_event_name": event,
@@ -54,7 +55,11 @@ def hook(bridge, lanes, event, **extra):
         **extra,
     }
     return checkpoints.checkpoint(
-        bridge.home, lanes["directory"], "codex", payload
+        bridge.home,
+        lanes["directory"],
+        "codex",
+        payload,
+        record_only=record_only,
     )
 
 
@@ -110,6 +115,42 @@ def test_a_write_on_a_peer_reservation_is_denied_naming_the_holder(
         "tool": "Write",
         "count": 1,
     } in summary["denied_by"]
+
+
+def test_a_hook_refusal_names_the_holder_in_usage(bridge, paired, lanes):
+    reserve(bridge, lanes, "src/parser.py")
+    target = str(lanes["lane"] / "src" / "parser.py")
+
+    hook(
+        bridge,
+        lanes,
+        "PreToolUse",
+        tool_name="Write",
+        tool_input={"file_path": target, "content": "x"},
+    )
+
+    report = store.usage(bridge.home, lanes["root"])
+    assert "codex" in report["claude"]["refused"]
+
+
+def test_a_record_only_decision_still_denies_a_reserved_path(
+    bridge, paired, lanes
+):
+    reserve(bridge, lanes, "src/parser.py")
+    target = str(lanes["lane"] / "src" / "parser.py")
+
+    denied = hook(
+        bridge,
+        lanes,
+        "PreToolUse",
+        record_only=True,
+        tool_name="Write",
+        tool_input={"file_path": target, "content": "x"},
+    )["hookSpecificOutput"]
+
+    assert denied["permissionDecision"] == "deny"
+    assert "src/parser.py" in denied["permissionDecisionReason"]
+    assert "claude" in denied["permissionDecisionReason"]
 
 
 def test_a_read_is_never_denied_for_coordination(bridge, paired, lanes):
@@ -173,3 +214,32 @@ def test_an_offer_about_to_expire_denies_a_mutating_call(tmp_path):
         )
         is None
     )
+
+
+def test_the_offer_deadline_never_blocks_answering_it_by_protocol_form(
+    tmp_path,
+):
+    ledger = {
+        "issues": {
+            "7": {
+                "offer": {
+                    "id": "o1",
+                    "to": "codex",
+                    "deadline": time.time() + 30,
+                }
+            }
+        }
+    }
+    accept = shlex.split(protocol.cli_command()) + [
+        "issue",
+        "accept",
+        "7",
+        "--offer-id",
+        "o1",
+    ]
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": shlex.join(accept)},
+    }
+
+    assert checkpoints.hazard(payload, tmp_path, "codex", {}, ledger) is None

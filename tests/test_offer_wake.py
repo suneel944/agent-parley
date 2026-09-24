@@ -138,7 +138,7 @@ def test_a_lane_waiting_for_approval_is_never_woken_by_an_offer(
     write_json(
         offered / "codex-activity.json",
         {
-            "activity": "waiting for approval",
+            "activity": "waiting for approval: Bash",
             "updated": time.time() - 500,
             "session_pid": os.getpid(),
             "session_ticks": process.start_ticks(os.getpid()),

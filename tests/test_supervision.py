@@ -536,6 +536,35 @@ def test_a_wake_blocked_by_exhausted_capacity_is_retried_at_the_reset(
     assert retried["result"] == "accepted"
 
 
+def test_a_watcher_held_dialog_past_inactive_after_is_not_escalated(
+    bridge, paired, monkeypatch
+):
+    from agent_parley import dialogs
+
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": dialogs.MARKER + "Codex hooks-trust",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    assert observed["process_alive"] and observed["stale"]
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    assert not calls
+
+
 def test_status_reports_the_next_wake_or_the_exhausted_budget(
     bridge, paired, capsys
 ):

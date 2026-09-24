@@ -2527,9 +2527,14 @@ def _overdue_peer(
             or observed.get("process_alive") is False
         ):
             continue
-        if not fit(home, directory, manifest, name, config["stalled_after"])[
-            "fit"
-        ]:
+        if not fit(
+            home,
+            directory,
+            manifest,
+            name,
+            config["stalled_after"],
+            config["inactive_after"],
+        )["fit"]:
             continue
         owned = sum(1 for record in ledger if record.get("owner") == name)
         candidates.append((owned, name))
@@ -2629,6 +2634,13 @@ def overdue_claims(
     claim that is no longer overdue, drops the recorded recovery, and the
     next breach starts over from the wake.
 
+    A claim already observed complete, one whose handoff prompt fired on a
+    closed pull request and has not been answered, or whose completion is
+    already escalated to the operator, is not silence: the holder is done
+    and waiting on an explicit handoff, not stalled on work. Such a claim is
+    left to `completion_escalations` and is neither woken, offered nor
+    released here.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -2646,10 +2658,15 @@ def overdue_claims(
         current = record.get("overdue_recovery") or {}
         identifier = f"{number}:{record.get('claim_id')}"
         timing = issues.deadline_state(record, now)
+        prompt = record.get("handoff_prompt") or {}
+        observed_complete = (
+            prompt.get("trigger") == ENDED and not prompt.get("responded_at")
+        ) or bool(record.get("unresolved_completion"))
         if (
             holder not in manifest["participants"]
             or not record.get("claim_id")
             or not timing["overdue"]
+            or observed_complete
             or not holder_silent(
                 directory, holder, observations.get(holder) or {}, window
             )
