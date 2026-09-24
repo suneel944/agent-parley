@@ -991,14 +991,24 @@ that arrives behind a slow decision still closes the tool call or the turn.
 Decisions merely in flight are not counted, so parallel native calls in a
 healthy lane keep their context injection.
 
+The recovery checkpoint of a `SessionStart`, `PostToolUse`, `Stop` or
+`SessionEnd` is not part of the decision. The service answers the hook first
+and then queues the capture on one thread per lane, which works the lane's
+requests in arrival order under the lane's checkpoint lock. A decision
+abandoned at its deadline queues its capture when it finishes. The in-process
+fallback writes its reply, then captures before it exits.
+
 The context scans (issue ledger, work offer, operator edits, base advances and
 budget standing) run before the checkpoint lock is taken, so the lock guards
 only the lane's record and mail cursor. Operator edits and base advances are
 Git readings the supervision poll takes once per project per interval and
-keeps for twice that interval; the hook path reads that copy and asks Git only
-when no current reading exists, as in the in-process fallback. Measured on 12
-lanes, the median hook fell from 22.7 to 4.4 ms and the median time the lock
-is held from 19.6 to 0.9 ms. An event that finds a newer event already applied
+keeps for twice that interval. It also publishes the reading as
+`git-readings.json` in the project state directory with the same expiry. The
+hook path, `status` and `top` read that copy and ask Git only when no current
+reading exists, as in the in-process fallback. Measured on 12 lanes, the
+median hook fell from 22.7 to 4.4 ms and the median time the lock is held from
+19.6 to 0.9 ms. On 15 lanes over 20,000 files with an advanced base, the
+status reading fell from 0.35 to 0.007 s. An event that finds a newer event already applied
 still writes its record and delivers its context, but leaves the newer
 activity label in place.
 

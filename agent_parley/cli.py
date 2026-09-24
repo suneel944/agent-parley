@@ -7127,8 +7127,7 @@ reported.
             data = roster.normalize(json.loads(path.read_text()))
             if supervision.root_retired(path.parent):
                 continue
-            edits = supervision.operator_edits(self.home, data)
-            advances = supervision.base_advances(self.home, data)
+            edits, advances = supervision.readings(self.home, data)
             with self._project_reading() as db:
                 context = self._project_context(path.parent, data, db)
                 projects.append(

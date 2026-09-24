@@ -1128,8 +1128,10 @@ lane's HEAD, its porcelain status and the size and modification time of every
 changed path. A hook event that finds the same fingerprint and an existing
 bundle refreshes only the step, gate and blocker fields and writes no new
 commit or bundle, so repeated tool calls on an unchanged tree stay cheap. The
-old session generation is refused by later lifecycle hooks after takeover; this
-is runtime fencing, not a filesystem security boundary against another process writing directly into the old lane.
+service takes the capture after it has answered the hook, so a slow bundle
+never delays a native call. The old session generation is refused by later
+lifecycle hooks after takeover; this is runtime fencing, not a filesystem
+security boundary against another process writing directly into the old lane.
 
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six

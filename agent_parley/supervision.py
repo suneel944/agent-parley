@@ -45,6 +45,7 @@ RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 BOOT_RECORD = "boot.json"
+READINGS_PUBLICATION = "git-readings.json"
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -728,6 +729,51 @@ def refresh_readings(
         edits,
         advances,
     )
+    if directory := roster.locate(home, manifest["root"]):
+        with contextlib.suppress(OSError):
+            write_json(
+                directory / READINGS_PUBLICATION,
+                {
+                    "expires": time.time() + lifetime,
+                    "edits": edits,
+                    "advances": advances,
+                },
+            )
+    return edits, advances
+
+
+def _published_readings(
+    home: Path, manifest: dict
+) -> tuple[dict[str, list[str]], dict[str, list[str]]] | None:
+    """Reads the Git readings the last supervision poll published.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout.
+
+    Returns:
+        The operator edits and the base advances, or None when no current,
+        well-formed publication exists.
+    """
+    directory = roster.locate(home, manifest["root"])
+    if directory is None:
+        return None
+    try:
+        published = json.loads((directory / READINGS_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(published, dict):
+        return None
+    expires = published.get("expires")
+    edits = published.get("edits")
+    advances = published.get("advances")
+    if (
+        not isinstance(expires, (int, float))
+        or time.time() >= expires
+        or not isinstance(edits, dict)
+        or not isinstance(advances, dict)
+    ):
+        return None
     return edits, advances
 
 
@@ -736,9 +782,13 @@ def readings(
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Returns the project's Git readings, from the poll's copy if current.
 
-    A process with no current poll reading, such as a hook deciding
-    in-process while the service is down, takes the readings itself and
-    keeps nothing, so only the poll decides how often Git is asked.
+    The poll also publishes its reading in the project state directory, so
+    a separate process such as `agent-parley status` reuses it instead of
+    asking Git for a status and a merge-base per lane again. A process with
+    neither a current copy nor a current publication, such as a hook
+    deciding in-process while the service is down, takes the readings
+    itself and keeps nothing, so only the poll decides how often Git is
+    asked.
 
     Args:
         home: Private bridge state root.
@@ -750,6 +800,8 @@ def readings(
     kept = _READINGS.get(manifest["root"])
     if kept is not None and time.monotonic() < kept[0]:
         return kept[1], kept[2]
+    if (published := _published_readings(home, manifest)) is not None:
+        return published
     return operator_edits(home, manifest), base_advances(home, manifest)
 
 

@@ -501,6 +501,7 @@ def collect(
         except sqlite3.Error:
             usage = {}
         supervised = supervision.configuration(home, data)
+        edits, advances = supervision.readings(home, data)
         context = {
             "usage": usage,
             "issues": snapshot(path.parent),
@@ -509,10 +510,8 @@ def collect(
             "since": since,
             "stalled_after": supervised["stalled_after"],
             "inactive_after": supervised["inactive_after"],
-            "operator_edits": (
-                supervision.operator_edits(home, data) if operator_edits else {}
-            ),
-            "base_advances": supervision.base_advances(home, data),
+            "operator_edits": edits if operator_edits else {},
+            "base_advances": advances,
         }
         rows = [
             _row(home, path.parent, data, agent, context)
