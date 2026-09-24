@@ -162,7 +162,7 @@ class Sink:
 
 def test_a_column_is_as_wide_as_its_widest_value_in_the_frame():
     view = snapshot(("/repo", [lane("codex", branch="release/candidate-77")]))
-    frame = dashboard.layout(view, 200)
+    frame = dashboard.layout(view, 210)
     assert frame["omitted"] == []
     row = next(line for line in frame["lines"] if line.startswith("codex "))
     assert "release/candidate-77" in row

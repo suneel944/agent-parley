@@ -801,8 +801,8 @@ minimum. When the set does not fit, columns are dropped in this order, and
 the header names the ones that went:
 
 ```text
-PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, LEASES, IDLE, ISSUES,
-DENIALS
+PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, UNUSED, LEASES, FIT, IDLE,
+REVIEW, ISSUES, DENIALS
 ```
 
 `PARTICIPANT`, `STATE` and `MAIL` are never dropped; if they alone still do
@@ -1033,6 +1033,11 @@ in the last two days of rollouts, so a Codex session older than that reports
 nothing. Reading is incremental: each refresh folds only the records appended
 since the previous one, up to 1 MiB per lane, so watching a long session never
 re-reads its history.
+
+`UNUSED` is the lane state accounting `status` prints on its `Lanes:` line,
+per lane: idle lane-minutes per observed lane-hour, then unaccountable
+claim-minutes, as `35.0/4.0`. Both are totals since the first poll that
+accounted the lane. The cell is `-` until a poll has accounted the lane.
 
 `FIT` is the capacity check the runtime last read for that lane, and a `+`
 after it means an advisory work offer is waiting for that lane to act on. Four

@@ -18,7 +18,15 @@ from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
 
-from agent_parley import hook, policy, process, protocol, roster, store
+from agent_parley import (
+    hook,
+    lanes,
+    policy,
+    process,
+    protocol,
+    roster,
+    store,
+)
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 

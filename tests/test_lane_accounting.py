@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import lanes, store, supervision
+from agent_parley import dashboard, lanes, store, supervision
 
 ROOT = "/repo"
 
@@ -160,6 +160,32 @@ def test_status_shows_the_accounting_of_each_lane_and_project(
         "Lanes: idle 35.0 min/lane-hour (top: claude blocked: capacity, 4 min)"
         in capsys.readouterr().out
     )
+
+
+def test_top_shows_the_accounting_of_each_lane(bridge, paired):
+    store.initialize(bridge.home)
+    root = paired["root"]
+    with store.connect(bridge.home, write=True) as db:
+        for now, state, cause, has_work, owns in STEPS:
+            lanes.transition(db, root, "claude", state, cause=cause, now=now)
+            lanes.account(
+                db,
+                root,
+                "claude",
+                lanes.read(db, root, "claude"),
+                has_work=has_work,
+                owns=owns,
+                now=now,
+            )
+    view = dashboard.collect(bridge.home, False, {})
+    rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
+    unaccountable = rows["claude"]["accounting"]["unaccountable_minutes"]
+    lines = dashboard.render(view)
+    header = next(line for line in lines if "PARTICIPANT" in line)
+    claude = next(line for line in lines if line.startswith("claude"))
+    assert "UNUSED" in header
+    assert f"35.0/{unaccountable}" in claude
+    assert rows["codex"]["accounting"] is None
 
 
 def test_a_poll_accounts_an_owned_claim(bridge, repo, paired):

@@ -13,6 +13,7 @@ from typing import Any
 from agent_parley import (
     approvals,
     budgets,
+    lanes,
     metrics,
     plan,
     process,
@@ -51,6 +52,7 @@ COLUMNS = (
     ("CALLS", 9),
     ("TOKENS", 9),
     ("IDLE", 8),
+    ("UNUSED", 7),
     ("FIT", 8),
 )
 DROP_ORDER = (
@@ -60,6 +62,7 @@ DROP_ORDER = (
     "CONTEXT",
     "CALLS",
     "TOKENS",
+    "UNUSED",
     "LEASES",
     "FIT",
     "IDLE",
@@ -82,6 +85,9 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "CALLS": lambda row: -row["calls"],
     "TOKENS": lambda row: -(row["tokens"] or 0),
     "IDLE": lambda row: -row["idle_seconds"],
+    "UNUSED": lambda row: (
+        -(row.get("accounting") or {}).get("idle_per_lane_hour", -1.0)
+    ),
     "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
 }
 KEYS = (
@@ -125,7 +131,9 @@ LEGEND = (
     "turn ends, with + when the window reaches past what retention kept. "
     "IDLE says how long a lane went without coordination activity; it "
     "does not claim to know what the native client was doing inside a "
-    "turn. A branch marked ! left "
+    "turn. UNUSED is the lane state accounting: idle lane-minutes per "
+    "observed lane-hour, then unaccountable claim-minutes, blank before "
+    "the first poll accounts the lane. A branch marked ! left "
     "its assigned bridge branch. A lease past a declared time to live is "
     "counted apart from the live ones and still held: it keeps blocking "
     "until its holder renews it at a checkpoint or releases it, and the "
@@ -180,6 +188,21 @@ def _tokens(count: int | None) -> str:
     if count < 1000000:
         return f"{count / 1000:.1f}k"
     return f"{count / 1000000:.1f}M"
+
+
+def _unused(report: dict | None) -> str:
+    """Formats a lane's accounting as idle per lane-hour and claim minutes.
+
+    Args:
+        report: The lane's `lanes.summary`, or None before any accounting.
+
+    Returns:
+        Idle lane-minutes per lane-hour and unaccountable claim-minutes
+        separated by a slash, or `-` when the lane was never accounted.
+    """
+    if report is None:
+        return "-"
+    return f"{report['idle_per_lane_hour']}/{report['unaccountable_minutes']}"
 
 
 def _fitness(row: dict) -> str:
@@ -385,6 +408,11 @@ def _row(
         ),
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
+        "accounting": (
+            lanes.summary(context["accounts"][agent])
+            if agent in context["accounts"]
+            else None
+        ),
         "budget": budget,
         "over_budget": budget["over"],
         "budget_marker": budgets.marker(budget),
@@ -502,7 +530,13 @@ def collect(
             usage = {}
         supervised = supervision.configuration(home, data)
         edits, advances = supervision.readings(home, data)
+        try:
+            with store.connect(home) as db:
+                accounts = lanes.read_accounts(db, data["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            accounts = {}
         context = {
+            "accounts": accounts,
             "usage": usage,
             "issues": snapshot(path.parent),
             "branches": branches,
@@ -599,6 +633,7 @@ def _cells(row: dict) -> tuple[str, ...]:
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         _tokens(row["tokens"]),
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
+        _unused(row.get("accounting")),
         _fitness(row),
     )
 
