@@ -10,7 +10,16 @@ runs `participant merge`, and never on an agent's behalf.
 | Module | Responsibility |
 | --- | --- |
 | `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
-| `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
+| `cli` | Argument parsing and command dispatch, the service lifecycle, lane pull requests, and the `Bridge` class that combines the command mixins below |
+| `lazy` | Deferred module and callable bindings that let `cli` and its mixins name a module at import time and execute it on first use |
+| `worktrees` | The `Worktrees` base mixin: project registration and setup, and participant worktrees with their creation, restoration, pause, restart, retirement and reclaim |
+| `settings` | Per-project settings kept beside the roster: verify and init commands, branch prefix, forge, deadlines, budgets, resources and approval steps |
+| `integration` | Lane merges into the base checkout, their preview and ordered plan, and operator approval and rejection of ready reports |
+| `claims` | Issue claims, handoffs, assignment, recommendation, resolution and applied work plans |
+| `mail` | Operator mail, recorded decisions, and reading lane mail and pending operator items |
+| `reports` | Lane reports and their review, history reading, event export and state archives |
+| `status` | Lane status, its narrowing filters, health checks, doctor and problems |
+| `launch` | One participant's native CLI launch with coordination configured into it |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
@@ -26,7 +35,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
-| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
+| `copilot` | Lane-private Copilot CLI hook configuration and its release, and translation of Copilot CLI's MCP tool names and flat hook result schema |
 | `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
 | `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
@@ -110,9 +119,10 @@ package marker: a bare `--version` or `-V` answers from that marker, and
 anything else, including a version flag mixed with other arguments, is handed
 to `cli` so argparse produces the parsing, error text and exit status. The
 package binds `cli` itself the same way, so importing the surface does not
-execute it. `cli` binds command modules, selected standard-library modules and
-its legacy direct-name callables through deferred modules, so a command loads
-only the modules it reaches. Plain, unfiltered status skips parser construction,
+execute it. `cli` and the command mixins it combines bind command modules,
+selected standard-library modules and their legacy direct-name callables
+through the deferred modules of `lazy`, so a command loads only the modules it
+reaches. Plain, unfiltered status skips parser construction,
 reads an existing configuration without taking its creation lock and sends one
 bounded HTTP request on a loopback socket rather than loading the general URL
 opener.
@@ -332,7 +342,7 @@ issue transitions own claims.
 `reclaim.py` decides which lane worktrees and branches a project may remove
 and holds no removal of its own. It reads Git in the base checkout and in each
 lane and the forge through `forge.py`, and returns one assessment per lane
-naming the single condition that decided it. Removal stays in `cli.py`, where
+naming the single condition that decided it. Removal stays in `worktrees.py`, where
 it is the ordinary retirement followed by Git's own merged-branch deletion, so
 a reclaimed lane leaves the state a retired lane leaves. `supervision.py` runs
 that sweep from a poll no more than once every fifteen minutes and publishes
