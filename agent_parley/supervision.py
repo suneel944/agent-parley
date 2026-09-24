@@ -3770,6 +3770,7 @@ def _poll(home: Path, directory: Path) -> None:
         for name in manifest["participants"]
     }
     stage("presence", _publish_presence, home, manifest, observations)
+    stage("lane evidence", settle_evidence, home, directory, manifest)
     stage("lane states", settle_lanes, home, manifest, config, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
@@ -3905,6 +3906,26 @@ def _publish_presence(
                     participant["display"],
                 ),
             )
+
+
+def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
+    """Applies the lane evidence hooks and screen watchers queued.
+
+    The queue is discarded only after the transaction that applied it
+    commits. A store that is busy raises out of this stage, so the queue is
+    kept and applied, still in order, at the next poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    items = lanes.pending(directory)
+    if not items:
+        return
+    with store.connect(home, write=True) as db:
+        lanes.apply(db, manifest["root"], items)
+    lanes.settled(directory)
 
 
 def settle_lanes(

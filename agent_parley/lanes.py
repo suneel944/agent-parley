@@ -17,12 +17,22 @@ refused, never applied. The per-lane files stay as evidence and caches.
 The tables are created by this module the first time it writes, inside the
 writing transaction, so an existing store needs no separate upgrade step
 and a reader of a store that has never held a lane state sees no record.
+
+Every observation reaches the record through this module: a supervision
+poll's liveness sample through `sample`, and hook events, dialog reads and
+session changes through `submit`, which queues them in a spool the next
+poll applies in arrival order with `apply`.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import sqlite3
 import time
+from pathlib import Path
+
+from agent_parley.state import BridgeError, lock
 
 STARTING = "starting"
 WORKING = "working"
@@ -63,6 +73,10 @@ HOOK_STATES = {
 }
 MAX_EVIDENCE = 200
 MAX_EVENTS = 2000
+SPOOL = "lane-evidence.jsonl"
+DRAINING = "lane-evidence.draining.jsonl"
+SPOOL_LOCK = "lane-evidence.lock"
+SPOOL_WAIT = 2.0
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS lane_states ("
     " project TEXT NOT NULL, lane TEXT NOT NULL, state TEXT NOT NULL,"
@@ -402,6 +416,160 @@ def wakes(record: dict | None) -> bool:
         woken, and a lane with no record is left to the caller's own reading.
     """
     return record is None or record["state"] in WAKEABLE
+
+
+def hook_evidence(event: str) -> tuple[str, str] | None:
+    """Reads the state one native hook event is evidence of.
+
+    Args:
+        event: Native hook event name.
+
+    Returns:
+        The target state and its cause, or None for an event that says
+        nothing about the lane's condition.
+    """
+    target = HOOK_STATES.get(event)
+    if target is None:
+        return None
+    return target, APPROVAL if target == BLOCKED else ""
+
+
+def submit(
+    directory: Path,
+    lane: str,
+    source: str,
+    target: str,
+    *,
+    cause: str = "",
+    evidence: str = "",
+    session: str = "",
+    now: float | None = None,
+) -> None:
+    """Queues one observation of a lane for the state module to apply.
+
+    A hook or a terminal watcher must never wait on the store write lock,
+    so evidence is appended to the project's spool instead and the next
+    supervision poll applies it, in arrival order, through `transition`.
+    Evidence that arrives while the store is busy therefore waits in the
+    spool rather than being dropped. The spool lock is held only for one
+    append or for the rename that starts a drain.
+
+    Args:
+        directory: Private project state directory.
+        lane: Participant that owns the lane.
+        source: What observed it: a hook event, dialog or session change.
+        target: State the observation is evidence of.
+        cause: Named cause of a `blocked` target.
+        evidence: Short description of what was observed.
+        session: Native session identity the observation names, if any.
+        now: Unix time of the observation, or None for the current time.
+    """
+    item = {
+        "ts": time.time() if now is None else now,
+        "lane": lane,
+        "source": source,
+        "state": target,
+        "cause": cause,
+        "evidence": evidence[:MAX_EVIDENCE],
+        "session": session,
+    }
+    with contextlib.suppress(OSError, BridgeError):
+        with lock(directory / SPOOL_LOCK, timeout=SPOOL_WAIT):
+            with (directory / SPOOL).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(item) + "\n")
+
+
+def pending(directory: Path) -> list[dict]:
+    """Takes the queued evidence of one project for a drain, oldest first.
+
+    The spool is renamed to a draining file so appends carry on into a new
+    spool while this drain runs. A draining file left by a drain the store
+    refused is taken again, whole, before any newer spool, so order holds
+    across a busy store.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        The queued observations; an unreadable line is skipped.
+    """
+    draining = directory / DRAINING
+    with contextlib.suppress(OSError, BridgeError):
+        with lock(directory / SPOOL_LOCK, timeout=SPOOL_WAIT):
+            if not draining.exists() and (directory / SPOOL).exists():
+                (directory / SPOOL).replace(draining)
+    items = []
+    with contextlib.suppress(OSError):
+        for line in draining.read_text(encoding="utf-8").splitlines():
+            with contextlib.suppress(ValueError):
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    items.append(item)
+    return items
+
+
+def settled(directory: Path) -> None:
+    """Discards the draining file once its evidence is committed.
+
+    Args:
+        directory: Private project state directory.
+    """
+    with contextlib.suppress(OSError):
+        (directory / DRAINING).unlink(missing_ok=True)
+
+
+def apply(db: sqlite3.Connection, root: str, items: list[dict]) -> int:
+    """Applies queued evidence to the lane records in arrival order.
+
+    A hook seen from a lane recorded as dead or reclaimed proves a running
+    session, so the lane is started before the observed state is applied.
+    A new session identity is passed through, so a session change becomes
+    a transition that records both identities rather than a dropped hook.
+    An observation older than the record's last update, because it waited
+    in the spool while the store was busy, is applied at that update time
+    so a record's times never run backwards.
+
+    Args:
+        db: Open write transaction on the coordination store.
+        root: Canonical project key.
+        items: Observations taken by `pending`.
+
+    Returns:
+        How many observations changed a lane's record.
+    """
+    changed = 0
+    for item in items:
+        lane = str(item.get("lane", ""))
+        target = str(item.get("state", ""))
+        cause = str(item.get("cause", ""))
+        if not lane or target not in STATES:
+            continue
+        if (target == BLOCKED) != (cause in CAUSES):
+            continue
+        evidence = f"{item.get('source', '')}: {item.get('evidence', '')}"
+        session = str(item.get("session", "")) or None
+        current = read(db, root, lane)
+        moment = float(item.get("ts") or time.time())
+        if current is not None:
+            moment = max(moment, float(current["updated"]))
+        if (
+            current is not None
+            and current["state"] in (DEAD, RECLAIMED)
+            and target in LIVE - {STARTING}
+        ):
+            transition(db, root, lane, STARTING, evidence=evidence, now=moment)
+        result = transition(
+            db,
+            root,
+            lane,
+            target,
+            cause=cause,
+            evidence=evidence,
+            session=session,
+            now=moment,
+        )
+        changed += int(result["changed"])
+    return changed
 
 
 def history(

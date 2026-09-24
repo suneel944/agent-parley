@@ -18,6 +18,7 @@ import pytest
 from agent_parley import (
     checkpoints,
     dialogs,
+    lanes,
     process,
     protocol,
     roster,
@@ -801,6 +802,37 @@ def test_an_operator_answer_releases_the_dialog_on_the_next_output(tmp_path):
     assert watch.holding is False
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert state["activity"] == "working"
+
+
+def test_a_screen_block_and_its_answer_are_lane_evidence(tmp_path):
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(USAGE_LIMIT.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    watch.answered()
+    watch.advance(b" Continuing ", 1.0)
+    moves = [
+        (item["source"], item["state"], item["cause"])
+        for item in lanes.pending(tmp_path)
+    ]
+    assert moves == [
+        ("dialog", lanes.BLOCKED, lanes.CAPACITY),
+        ("dialog", lanes.WORKING, ""),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("record", "cause"),
+    [
+        ({"name": "usage-limit", "action": dialogs.EXHAUSTED}, "capacity"),
+        ({"name": dialogs.PERMISSION, "action": "answer"}, "approval"),
+        ({"name": "question", "action": dialogs.ASK}, "prompt"),
+        ({"name": "unknown", "action": "escalate"}, "prompt"),
+        ({"name": "hook-review", "action": "answer"}, "dialog"),
+    ],
+)
+def test_a_dialog_names_its_blocked_cause(record, cause):
+    assert dialogs.lane_cause(record) == cause
 
 
 def test_a_release_that_meets_a_held_lock_is_retried(tmp_path):

@@ -62,7 +62,7 @@ import zoneinfo
 from pathlib import Path
 from typing import NamedTuple
 
-from agent_parley import protocol
+from agent_parley import lanes, protocol
 from agent_parley.state import BridgeError, lock, write_json
 
 SCREEN_BYTES = 8192
@@ -247,6 +247,26 @@ def _picker_start(region: str, end: int) -> int:
     floor = max(0, first - 2 * QUESTION_CHARS)
     lines = list(QUESTION_LINE.finditer(region, floor, first))
     return lines[-1].start() if lines else first
+
+
+def lane_cause(record: dict) -> str:
+    """Names the blocked cause a published dialog record gives its lane.
+
+    Args:
+        record: Dialog record as `Watch` publishes it.
+
+    Returns:
+        `capacity` for a usage limit, `approval` for a tool permission,
+        `prompt` for a question or an unrecognized prompt, and `dialog` for
+        any other recorded dialog.
+    """
+    if record.get("action") == EXHAUSTED:
+        return lanes.CAPACITY
+    if record.get("name") == PERMISSION:
+        return lanes.APPROVAL
+    if record.get("action") == ASK or record.get("name") == "unknown":
+        return lanes.PROMPT
+    return lanes.DIALOG
 
 
 def locate(screen: str) -> Frame | None:
@@ -947,6 +967,14 @@ class Watch:
                 write_json(path, state)
             self._parked = True
             self._resolved = True
+            lanes.submit(
+                self._directory,
+                self._name,
+                "dialog",
+                lanes.BLOCKED,
+                cause=lane_cause(record),
+                evidence=label,
+            )
             return True
         return False
 
@@ -976,6 +1004,13 @@ class Watch:
                     state.pop("dialog", None)
                     write_json(path, state)
             self._parked = False
+            lanes.submit(
+                self._directory,
+                self._name,
+                "dialog",
+                lanes.WORKING,
+                evidence="dialog released",
+            )
 
     def _notify(self, label: str, detail: str) -> None:
         """Sends the operator one message carrying what the screen shows."""
