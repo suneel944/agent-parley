@@ -4760,9 +4760,12 @@ def wake(
     live lane. A lane recorded starting, working or reclaimed is never
     woken, a blocked one is deferred under its cause, an idle one is asked
     for a turn, and a stopped or dead one is resumed when its record names a
-    session. A lane with no record yet is decided on its presence reading
-    and the session its activity file names, as before the record existed,
-    so a store that has not seeded the record never silences a wake.
+    session. A lane with no record yet is decided on the state its presence
+    reading and activity label would record, through `lanes.from_liveness`,
+    and resumed on the session its activity file names. An approval prompt
+    still defers it and an idle one is still asked for a turn, so a store
+    that has not seeded the record never silences a wake. A reading that
+    would record nothing leaves the presence reading as it is.
 
     The attempt bound counts wakes without progress. Each attempt records the
     lane's progress marker from `_lane_activity`: its `HEAD` moves, the state
@@ -4824,14 +4827,26 @@ def wake(
     window = config["inactive_after"]
     parked = wake_record(home, root, name)
     recorded = condition(home, root, name)
+    stopped = False
+    if recorded is None:
+        label = str(state.get("activity", ""))
+        session = str(state.get("session_id") or "")
+        stopped = label == lanes.STOPPED
+        seen = lanes.from_liveness(
+            None, {**observed, "activity": label, "evidence": label}
+        )
+        if seen is not None:
+            recorded = {
+                "state": seen[0],
+                "cause": seen[1],
+                "evidence": label,
+                "session": session,
+            }
+    else:
+        session = recorded["session"]
     if not lanes.wakes(recorded):
         return
     observed = recorded_presence(recorded, observed)
-    if recorded is None:
-        session = str(state.get("session_id") or "")
-        stopped = state.get("activity") == "stopped"
-    else:
-        session, stopped = recorded["session"], False
     blocked, ready_at = _wake_block(directory, name, observed, parked, window)
     if blocked:
         _defer_wake(home, directory, root, name, blocked, ready_at, window)
