@@ -18,6 +18,7 @@ from typing import TypeGuard, cast
 from agent_parley import (
     forge,
     issues,
+    lanes,
     lifecycle,
     notify,
     process,
@@ -63,7 +64,6 @@ UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
 WAKE_BACKOFF_CEILING = 3600.0
 TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
-WAKE_READY = frozenset({IDLE, STOPPED})
 WAKE_ATTENTION = "manual attention required"
 WORKING = "working"
 WAITING = "waiting"
@@ -256,22 +256,26 @@ def rebooted(published: dict) -> bool:
     )
 
 
-def settle_reboot(directory: Path, manifest: dict) -> list[str]:
+def settle_reboot(home: Path, directory: Path, manifest: dict) -> list[str]:
     """Marks every recorded session stopped once the host has restarted.
 
     A restart ends every process without a shutdown, so the recorded session
     of each lane is dead even when its process ID now names something else.
-    Each such lane is published as stopped and marked with the session the
+    Each such lane's state record moves to `stopped` with the restart as its
+    evidence, which `lanes.rebooted` reads and `wake` refuses to resume, and
+    the lane is published as stopped and marked with the session the
     restart ended. That mark makes presence read the process as gone, so the
     lane's expired leases are released and its claims move through the
-    orphan path, and it keeps the supervisor from resuming the lane, because a
-    resume would record fresh activity and reset the silence those paths
-    measure. An operator restart records a new session and clears the mark.
+    orphan path, and the refused resume keeps fresh activity from resetting
+    the silence those paths measure. An operator restart records a new
+    session, which moves the record out of `stopped` and clears the mark.
 
-    The boot identifier is recorded only after every lane was marked, so a
-    lane whose checkpoint lock was busy is marked on the next poll.
+    The record is written before the mark, and the boot identifier only
+    after every lane was marked, so a lane whose checkpoint lock or store
+    was busy is marked on the next poll.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
         manifest: Current participant manifest.
 
@@ -297,6 +301,17 @@ def settle_reboot(directory: Path, manifest: dict) -> list[str]:
                 state = checkpoints.activity(directory, name)
                 if state.get("session_pid") is None or rebooted(state):
                     continue
+                with store.connect(home, write=True) as db:
+                    lanes.transition(
+                        db,
+                        manifest["root"],
+                        name,
+                        lanes.STOPPED,
+                        evidence=(
+                            f"{lanes.REBOOTED}: boot {previous} ended session "
+                            f"{state.get('session_pid')}"
+                        ),
+                    )
                 state["activity"] = STOPPED
                 state["rebooted"] = {
                     "boot_id": previous,
@@ -369,6 +384,78 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     }
 
 
+def recorded_presence(record: dict | None, observed: dict) -> dict:
+    """Reads the presence a supervision decision acts on from the lane state.
+
+    The activity file a presence reading is derived from is evidence, and
+    `settle_lanes` has already applied it to the lane's record. Every
+    decision reads the lane's condition from that record, so the liveness,
+    availability and activity it acts on are replaced here by the record's,
+    and a label the record has not accepted cannot change a decision. The
+    timing and evidence text of the reading are kept for wording and for
+    spacing wakes. An idle or blocked lane whose evidence has gone stale
+    is published `idle`, so the lease sweep releases its expired leases
+    rather than holding them for the whole grace: a lane parked on a
+    prompt that long is not working under them.
+
+    Args:
+        record: The lane's state record, or None when it has none.
+        observed: This poll's presence reading of the lane.
+
+    Returns:
+        The reading with `process_alive`, `state` and `activity` taken from
+        the record and the record itself under `record`. A lane with no
+        record yet keeps the reading as it was, so the safety net that wakes
+        and orphans a lane still covers one whose record the store has not
+        seeded, for example because the store could not be written.
+    """
+    if record is None:
+        return {**observed, "record": None}
+    state = record["state"]
+    if state in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
+        alive, availability, activity = False, STOPPED, STOPPED
+    elif state == lanes.BLOCKED:
+        availability = IDLE if observed.get("stale") else ACTIVE
+        alive, activity = True, WAITING
+    elif state == lanes.IDLE:
+        availability = IDLE if observed.get("stale") else ACTIVE
+        alive, activity = True, IDLE
+    else:
+        alive, availability, activity = True, ACTIVE, WORKING
+    return {
+        **observed,
+        "state": availability,
+        "process_alive": alive,
+        "activity": activity,
+        "record": record,
+    }
+
+
+def recorded_observations(
+    home: Path, manifest: dict, observations: dict[str, dict]
+) -> dict[str, dict]:
+    """Reads the presence of every lane from its state record.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        observations: This poll's presence reading per participant.
+
+    Returns:
+        The `recorded_presence` of every participant. A store that cannot be
+        read yields no record for any lane, so every lane is decided on its
+        presence reading this poll.
+    """
+    records: dict[str, dict] = {}
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        with store.connect(home) as db:
+            records = lanes.read_all(db, manifest["root"])
+    return {
+        name: recorded_presence(records.get(name), observations.get(name, {}))
+        for name in manifest["participants"]
+    }
+
+
 def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
     """Records that one launch produced no native hook inside its deadline.
 
@@ -378,6 +465,9 @@ def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
     label and the observation are written. The recorded launch time, the live
     session field and the resumable session are left exactly as the launcher
     and any earlier session left them, and no native process is signalled.
+    The same observation is queued as lane evidence, `blocked` on a dialog,
+    because the lane state is what wake and work decisions read, and the
+    next native hook the client reports moves the lane out of it.
 
     Args:
         directory: Private project state directory.
@@ -410,7 +500,15 @@ def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
             "waited": int(time.time() - float(started)),
         }
         write_json(path, state)
-        return True
+    lanes.submit(
+        directory,
+        name,
+        "launch",
+        lanes.BLOCKED,
+        cause=lanes.DIALOG,
+        evidence=f"it never started within {int(deadline)}s of its launch",
+    )
+    return True
 
 
 def launches(directory: Path, manifest: dict, config: dict) -> list[str]:
@@ -849,41 +947,32 @@ UNKNOWN_FIT: dict = {
 }
 
 
-def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
-    """Reads whether the lane's recorded session process is running.
+def _session_check(home: Path, root: str, name: str) -> tuple[bool | None, str]:
+    """Reads from the lane state whether the lane could take a turn.
 
     Args:
-        directory: Private project state directory.
+        home: Private bridge state root.
+        root: Canonical project key.
         name: Participant that owns the lane.
 
     Returns:
-        The check result and, when it failed, why. A lane that published no
-        activity yet reports None, which is no opinion rather than a refusal.
-        A launch that passed its start deadline without a native hook fails
-        here, which is what keeps it out of offers and out of share targets.
-        A lane whose launcher published a native dialog fails the check as
-        well: its client is alive and reading nothing but a keypress. A lane
-        waiting on a native approval names the tool the prompt asked about.
+        The check result and, when it failed, why. A lane with no state
+        record yet reports None, which is no opinion rather than a refusal.
+        A stopped, dead or reclaimed lane fails, and so does a blocked one,
+        named with its cause and the evidence that set it: a launch that
+        passed its start deadline without a native hook, a native dialog or
+        approval its client is held by, or a session that ended while its
+        client still runs. That is what keeps such a lane out of offers and
+        out of share targets.
     """
-    from agent_parley import checkpoints, dialogs
-
-    state = checkpoints.activity(directory, name)
-    if not state:
+    record = condition(home, root, name)
+    if record is None:
         return None, ""
-    if state.get("activity") == NOT_STARTED:
-        waited = (state.get("not_started") or {}).get("deadline", 0)
-        return False, f"it never started within {int(waited)}s of its launch"
-    if not process.alive(state.get("session_pid"), state.get("session_ticks")):
+    if record["state"] in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
         return False, "its session process is not running"
-    if state.get("activity") == "stopped":
-        return False, "its session ended"
-    if str(state.get("activity", "")).startswith(dialogs.APPROVAL):
-        tool = str((state.get("dialog") or {}).get("tool", ""))
-        named = f" of {tool}" if tool else ""
-        return False, f"it is waiting for a native approval{named}"
-    if isinstance(state.get("dialog"), dict):
-        label = str(state["dialog"].get("label", "a native dialog"))
-        return False, f"its client is held by {label}"
+    if record["state"] == lanes.BLOCKED:
+        seen = f": {record['evidence']}" if record["evidence"] else ""
+        return False, f"it is blocked ({record['cause']}){seen}"
     return True, ""
 
 
@@ -1209,8 +1298,11 @@ def _mail_check(
 
     Acknowledgement debt expires: a request past its recorded deadline or
     superseded by a closed claim or a newer message no longer counts, and a
-    lane whose activity record is stale past ``inactive_after`` has its debt
-    suspended, since the lane is not reading mail at all.
+    lane whose state record has held a state other than starting or working
+    for ``inactive_after``, or entered it on stale evidence, has its debt
+    suspended, since the lane is not reading mail at all. The lane's state
+    record decides this, never its activity file; a lane with no record yet
+    keeps its debt.
 
     Args:
         home: Private bridge state root.
@@ -1218,7 +1310,8 @@ def _mail_check(
         manifest: Project manifest holding this participant.
         name: Participant that owns the lane.
         after: Seconds after which an unanswered acknowledgement counts.
-        inactive_after: Age past which the lane's activity reads as stale.
+        inactive_after: Seconds a lane's recorded quiet state must be held
+            before it reads as stale.
 
     Returns:
         The check result and, when it failed, the age of the oldest item. An
@@ -1226,9 +1319,15 @@ def _mail_check(
     """
     from agent_parley import checkpoints
 
-    if lane_state(checkpoints.activity(directory, name), inactive_after)[
-        "stale"
-    ]:
+    record = condition(home, manifest["root"], name)
+    if (
+        record is not None
+        and record["state"] not in (lanes.STARTING, lanes.WORKING)
+        and (
+            time.time() - float(record["since"]) >= inactive_after
+            or "stale" in str(record["evidence"])
+        )
+    ):
         return True, ""
     try:
         mail = checkpoints.mailbox(
@@ -1260,8 +1359,8 @@ def fit(
     """Reports whether a lane could take more work right now.
 
     Offering work to a lane that cannot take it stalls twice, so every offer
-    is checked first against what the runtime can read locally: the recorded
-    session process, the lane's own client records, its worktree, and the
+    is checked first against what the runtime can read locally: the lane's
+    state record, its provider capacity, its worktree, and the
     acknowledgements it owes. Each check defaults to no opinion, and only a
     check that actually failed makes a lane unfit.
 
@@ -1314,7 +1413,7 @@ def _fit_reading(
     participant = manifest["participants"][name]
     observed_capacity = capacity(home, directory, manifest, name)
     results = {
-        "session": _session_check(directory, name),
+        "session": _session_check(home, manifest["root"], name),
         "capacity": _capacity_check(observed_capacity),
         "worktree": _worktree_check(participant),
         "mail": _mail_check(
@@ -1763,7 +1862,7 @@ def share_recipients(
             directory,
             manifest,
             name,
-            presence(directory, name, config["inactive_after"]),
+            recorded_presence(condition(home, manifest["root"], name), {}),
             ledger,
         )
     ]
@@ -2645,16 +2744,17 @@ def overdue_claims(
             )
 
 
-def dialog_waiting(directory: Path, name: str) -> bool:
+def dialog_waiting(home: Path, root: str, name: str) -> bool:
     """Reports whether the lane's own state reads as a dialog on its screen.
 
     The lane's last wake outcome is the only local reading that distinguishes
     a session waiting for the operator from one working, so it is the
-    predicate every caller uses. A screen watcher that records a dialog
-    through the same lane state is read here without further change.
+    predicate every caller uses. It is read from the wake fields of the
+    lane's state.
 
     Args:
-        directory: Private project state directory.
+        home: Private bridge state root.
+        root: Canonical project key.
         name: Participant that owns the lane.
 
     Returns:
@@ -2662,14 +2762,12 @@ def dialog_waiting(directory: Path, name: str) -> bool:
         no recorded wake outcome reads as not waiting, because an absent
         record is no evidence of a dialog.
     """
-    try:
-        wake = json.loads((directory / f"{name}-wake.json").read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(wake, dict) and wake.get("result") in DIALOG_WAKES
+    return wake_record(home, root, name).get("result") in DIALOG_WAKES
 
 
-def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
+def unacknowledged_reason(
+    home: Path, directory: Path, root: str, name: str, observed: dict
+) -> str:
     """States in one clause why a lane did not acknowledge in time.
 
     Only what the runtime can read locally is reported: the recorded session
@@ -2678,7 +2776,9 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     itself, so a lane that reads as available is reported as exactly that.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
+        root: Canonical project key.
         name: Participant that owes the acknowledgement.
         observed: That lane's presence reading.
 
@@ -2687,7 +2787,7 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     """
     if observed.get("state") == STOPPED:
         return "has no running session"
-    if dialog_waiting(directory, name):
+    if dialog_waiting(home, root, name):
         return "has a native dialog waiting for the operator"
     state = published_capacity(directory, name)["state"]
     if state == "exhausted":
@@ -2734,7 +2834,13 @@ def acknowledgement_deadlines(
             for display in breach["recipients"]:
                 observed = observations.get(named.get(display, display))
                 reason = (
-                    unacknowledged_reason(directory, named[display], observed)
+                    unacknowledged_reason(
+                        home,
+                        directory,
+                        manifest["root"],
+                        named[display],
+                        observed,
+                    )
                     if observed
                     else "is not a participant in this project"
                 )
@@ -2793,7 +2899,7 @@ def share_blocker(
     """
     if observed.get("state") == STOPPED:
         return "has no live session process"
-    if dialog_waiting(directory, name):
+    if dialog_waiting(home, manifest["root"], name):
         return "has a native dialog waiting for the operator"
     if capacity(home, directory, manifest, name)["state"] == "exhausted":
         return "has exhausted its provider capacity"
@@ -2941,12 +3047,10 @@ def share_bounces(
             )
 
 
-def orphan_reason(name: str, observed: dict) -> str:
+def orphan_reason(name: str, record: dict) -> str:
     """States why a lane's claims read as orphaned, in one clause."""
-    return (
-        f"{name} has no running session process and has been silent for "
-        f"{int(observed['age_seconds'] or 0)}s"
-    )
+    seen = f": {record['evidence']}" if record.get("evidence") else ""
+    return f"{name} is dead and has no running session process{seen}"
 
 
 def orphan_marker(numbers: list[str], keys: list[str]) -> str:
@@ -2963,6 +3067,9 @@ def orphan_marker(numbers: list[str], keys: list[str]) -> str:
 
 def _dead(observed: dict, after: float) -> bool:
     """Reports whether a lane is gone rather than merely quiet.
+
+    Only a lane with no state record yet is judged this way; a recorded
+    lane is dead when its record says so.
 
     Args:
         observed: Presence reading for the lane.
@@ -3020,11 +3127,18 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     Nothing moves here. The issue keeps its owner, the reservations keep their
     holder, and only an explicit ``issue claim --take-orphaned`` by a peer
-    transfers either. A lane that is merely idle is never marked.
+    transfers either. A recorded lane is marked only when its state record
+    is `dead`, so a lane that is idle or stopped for less than the stall
+    threshold is never marked, whatever its activity file says. A lane with
+    no record yet, which the poll could not seed because its process
+    identity is unknown, falls back to `_dead` on its presence reading, so
+    the safety net never waits on a record. The marker is keyed by the time
+    the lane entered `dead`, so a lane that dies again is announced again.
 
     A marker is an observation, not a verdict, so it is withdrawn as soon as
-    the observation stops holding: a lane whose recorded session process is
-    running again loses the marker on its claims and keeps those claims. The
+    the observation stops holding: a lane whose state is live again, or an
+    unrecorded lane whose session process runs, loses the marker on its
+    claims and keeps those claims. The
     alternative left the ledger reporting a claim as orphaned while takeover
     read the owner as live and refused, so the remedy the marker printed could
     never succeed. A marker published by authorized live recovery survives,
@@ -3037,19 +3151,39 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         config: Resolved supervision settings.
     """
     after = config["stalled_after"]
-    observations = {
-        name: presence(directory, name, config["inactive_after"])
+    records = {
+        name: condition(home, manifest["root"], name)
         for name in manifest["participants"]
     }
-    dead = {
-        name: observed
-        for name, observed in observations.items()
-        if _dead(observed, after)
+    unrecorded = {
+        name: presence(directory, name, config["inactive_after"])
+        for name, record in records.items()
+        if record is None
     }
+    dead = {
+        name: record
+        for name, record in records.items()
+        if record is not None and record["state"] == lanes.DEAD
+    }
+    dead.update(
+        {
+            name: {
+                "evidence": f"silent for {int(observed['age_seconds'])}s",
+                "since": observed["last_active"] or 0,
+            }
+            for name, observed in unrecorded.items()
+            if _dead(observed, after)
+        }
+    )
     returned = [
         name
-        for name, observed in observations.items()
-        if name not in dead and observed["process_alive"] is True
+        for name, record in records.items()
+        if name not in dead
+        and (
+            unrecorded[name]["process_alive"] is True
+            if record is None
+            else record["state"] in lanes.LIVE
+        )
     ]
     if not dead and not returned:
         return
@@ -3073,13 +3207,13 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
         changed = False
-        for name, observed in dead.items():
+        for name, lane in dead.items():
             if name not in recoverable:
                 continue
             keys = reservations.get(
                 manifest["participants"][name]["display"], []
             )
-            reason = orphan_reason(name, observed)
+            reason = orphan_reason(name, lane)
             marked = []
             fresh = False
             for number, record in ledger["issues"].items():
@@ -3091,7 +3225,7 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                     continue
                 identifier = (
                     f"{name}:{record.get('claim_id') or number}:"
-                    f"{int(observed['last_active'] or 0)}"
+                    f"{int(lane['since'])}"
                 )
                 marked.append(number)
                 if record.get("orphan", {}).get("id") == identifier:
@@ -3526,6 +3660,9 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     measuring them walks every file they hold. The state directory's total
     size and the count of worktrees still left for a reclaim are measured
     here once, so `status` reports both without walking the disk itself.
+    Every lane the sweep removed requests the `reclaimed` transition of its
+    state; the transition table refuses it, and records the refusal, for a
+    lane whose state is not `stopped` or `dead`.
 
     Args:
         home: Private bridge state root.
@@ -3559,6 +3696,17 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
                     "forceable": sum(reclaim.forceable(row) for row in left),
                 },
             )
+    removed = [row["participant"] for row in rows if row.get("removed")]
+    if removed:
+        with store.connect(home, write=True) as db:
+            for name in removed:
+                lanes.transition(
+                    db,
+                    manifest["root"],
+                    name,
+                    lanes.RECLAIMED,
+                    evidence="reclaim removed the lane after its work landed",
+                )
 
 
 def reclaim_summary(directory: Path) -> dict:
@@ -3700,6 +3848,11 @@ def poll(home: Path, directory: Path) -> None:
     the previous one. A store that is busy or unreadable reclaims nothing
     this round rather than failing the poll.
 
+    The presence reading is evidence only. It is applied to the lane state
+    records first, and every later stage, the published presence row the
+    lease sweep reads included, is given the reading `recorded_presence`
+    derives from those records instead.
+
     A project whose root checkout no longer exists is handed to
     `missing_root` and polled no further, because every other step reads
     Git or wakes a lane that has no repository left to work in.
@@ -3748,13 +3901,17 @@ def _poll(home: Path, directory: Path) -> None:
             failures.append(failure(label, exc))
         stages[label] = round(time.time() - begun, 3)
 
-    stage("reboot", settle_reboot, directory, manifest)
+    stage("reboot", settle_reboot, home, directory, manifest)
     stage("launches", launches, directory, manifest, config)
     stage("readings", refresh_readings, home, manifest, 2 * config["interval"])
+    stage("lane evidence", settle_evidence, home, directory, manifest)
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
     }
+    stage("lane states", settle_lanes, home, manifest, config, observations)
+    stage("lane accounting", account_lanes, home, directory, manifest)
+    observations = recorded_observations(home, manifest, observations)
     stage("presence", _publish_presence, home, manifest, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
@@ -3860,7 +4017,10 @@ def last_poll(directory: Path) -> dict:
 def _publish_presence(
     home: Path, manifest: dict, observations: dict[str, dict]
 ) -> None:
-    """Stores this poll's presence reading for every lane.
+    """Publishes every lane's presence as its state record reads it.
+
+    The row is a copy published from the lane state, so the lease sweep
+    and the send warnings that read it agree with every other decision.
 
     The write waits `store.BUSY_TIMEOUT` like every other writer. It used to
     give up at once, so under steady hook traffic the presence reading was
@@ -3869,7 +4029,7 @@ def _publish_presence(
     Args:
         home: Private bridge state root.
         manifest: Current participant manifest.
-        observations: Presence reading per participant.
+        observations: `recorded_presence` per participant.
     """
     with store.connect(home, write=True) as db:
         for name, participant in manifest["participants"].items():
@@ -3890,6 +4050,160 @@ def _publish_presence(
                     participant["display"],
                 ),
             )
+
+
+def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
+    """Applies the lane evidence hooks and screen watchers queued.
+
+    The queue is discarded only after the transaction that applied it
+    commits. A store that is busy raises out of this stage, so the queue is
+    kept and applied, still in order, at the next poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    items = lanes.pending(directory)
+    if not items:
+        return
+    with store.connect(home, write=True) as db:
+        lanes.apply(db, manifest["root"], items)
+    lanes.settled(directory)
+
+
+def settle_lanes(
+    home: Path, manifest: dict, config: dict, observations: dict[str, dict]
+) -> None:
+    """Records this poll's liveness sample of every lane in its state.
+
+    Every later decision of the poll reads the lane's condition from the
+    state record rather than from the presence reading, so the sample is
+    applied first and a stopped lane ages into `dead` here, after the
+    project's stall threshold, and nowhere else. The poll takes the reading
+    only after `settle_evidence` has applied the queued hook evidence, so a
+    reading of the activity file older than a hook it already applied can
+    never override that hook.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant.
+    """
+    with store.connect(home, write=True) as db:
+        for name in manifest["participants"]:
+            lanes.sample(
+                db,
+                manifest["root"],
+                name,
+                observations[name],
+                dead_after=config["stalled_after"],
+            )
+
+
+def account_lanes(home: Path, directory: Path, manifest: dict) -> None:
+    """Charges this poll's span to every lane's idle and claim totals.
+
+    Work exists for a lane when it owns an open claim or the ledger holds
+    an unclaimed, unblocked issue any lane could take.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    ledger = issues.snapshot(directory)
+    owned = issues.holders(ledger)
+    claimable = bool(issues.unclaimed(ledger))
+    with store.connect(home, write=True) as db:
+        for name in manifest["participants"]:
+            lanes.account(
+                db,
+                manifest["root"],
+                name,
+                lanes.read(db, manifest["root"], name),
+                has_work=claimable or bool(owned.get(name)),
+                owns=bool(owned.get(name)),
+            )
+
+
+def wake_record(
+    home: Path, root: str, name: str, directory: Path | None = None
+) -> dict:
+    """Reads the wake fields of one lane's state for a wake decision.
+
+    Before the store held these fields they lived only in the lane's
+    `-wake.json`. A lane whose store has no wake row yet but still has that
+    file is seeded from it once, so an upgrade keeps the attempts spent,
+    the exhaustion and the escalation already recorded instead of spending
+    the whole budget and escalating a second time.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        directory: Private project state directory holding the published
+            `-wake.json` to seed from, or None to read the store alone.
+
+    Returns:
+        The fields `lanes.read_wake` returns, or an empty mapping when none
+        was recorded or the store cannot be read.
+    """
+    with contextlib.suppress(
+        BridgeError, OSError, sqlite3.Error, TypeError, ValueError
+    ):
+        with store.connect(home) as db:
+            record = lanes.read_wake(db, root, name)
+        if record or directory is None:
+            return record
+        published = json.loads((directory / f"{name}-wake.json").read_text())
+        if not isinstance(published, dict) or not published:
+            return record
+        with store.connect(home, write=True) as db:
+            if not lanes.read_wake(db, root, name):
+                lanes.write_wake(db, root, name, published)
+            return lanes.read_wake(db, root, name)
+    return {}
+
+
+def store_wake(
+    home: Path, directory: Path, root: str, name: str, record: dict
+) -> None:
+    """Writes the wake fields of one lane's state and publishes a copy.
+
+    The store holds the fields every wake decision reads. The lane's
+    `-wake.json` is rewritten from the same record only as a published copy
+    for an operator reading the state directory; nothing decides from it.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        record: Wake fields to store.
+    """
+    with store.connect(home, write=True) as db:
+        lanes.write_wake(db, root, name, record)
+    write_json(directory / f"{name}-wake.json", record)
+
+
+def condition(home: Path, root: str, name: str) -> dict | None:
+    """Reads one lane's state record for a supervision decision.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lane's record, or None when it has none or the store cannot be
+        read, in which case the decision keeps its own reading.
+    """
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        with store.connect(home) as db:
+            return lanes.read(db, root, name)
+    return None
 
 
 def _remind(
@@ -4306,7 +4620,6 @@ def exhaustion_probe_due(observation: dict, window: float) -> float:
 def _wake_block(
     directory: Path,
     name: str,
-    state: dict,
     observed: dict,
     record: dict,
     window: float,
@@ -4319,34 +4632,24 @@ def _wake_block(
     named a reset still ahead, because the attempt after that reset is itself
     the evidence that the lane is back. An exhaustion that named no reset is
     given one by `exhaustion_probe_due`, so a lane parked on a usage-limit
-    dialog is probed on a bounded backoff instead of never. A lane whose
-    screen state is not idle or stopped while its recorded process runs is
-    working or parked on a native dialog it owns, and the dialog watcher
-    publishes into the same activity state, so answering the dialog clears
-    this cause with no change here. That label blocks only while the presence
-    reading is current: once it has aged past the inactivity window with no
-    tool call in flight, it is a label a dropped hook left behind rather than
-    a turn in progress, and the attempt is made. An approval prompt is the
-    exception: it records no hook until it is answered, so it blocks however
-    old it is, and a wake never types into it. The launcher still refuses a
-    lane that is genuinely busy, and a busy refusal spends no budget. The
-    cause carries the label's age, so a block that holds does not read as
-    fresh. A lane with no running process and no session to resume is
-    blocked only once its first attempt has already recorded that, so the
-    refusal is reported before the cause starts sparing the budget.
+    dialog is probed on a bounded backoff instead of never.
 
-    A launch marked not started is blocked before any of that. It has no session
-    to resume and no client that could read an injected prompt, so it is a lane
-    with no session however alive its launcher still is, and nothing a wake can
-    do reaches the dialog that is holding it. The operator answering that dialog
-    produces a native hook event, which republishes the activity and clears the
-    cause here with no change of its own.
+    Every other cause is read from the lane state record, never from the
+    activity file. A lane recorded `blocked` is deferred under its named
+    cause: a native dialog, an approval prompt, an exhausted capacity, or a
+    launch that never reported a native hook within its start deadline. The
+    evidence that answers it, a hook or the dialog watcher seeing the dialog
+    close, moves the record and clears the cause here with no change of its
+    own, and a wake never types into a dialog. The launcher still refuses a
+    lane that is genuinely busy, and a busy refusal spends no budget. A lane
+    recorded stopped or dead with no session to resume is blocked only once
+    its first attempt has already recorded that, so the refusal is reported
+    before the cause starts sparing the budget.
 
     Args:
         directory: Private project state directory.
         name: Participant that owns the lane.
-        state: The lane's published activity state.
-        observed: The lane's presence reading.
+        observed: The lane's `recorded_presence`.
         record: The lane's last durable wake record.
         window: Inactivity window the attempts are spaced by.
 
@@ -4366,44 +4669,52 @@ def _wake_block(
         and float(reset_at) > time.time()
     ):
         return reason, float(reset_at)
-    activity = str(state.get("activity", "")) or UNKNOWN
-    if activity == NOT_STARTED:
-        waited = (state.get("not_started") or {}).get("deadline", 0)
-        return f"it never started within {int(waited)}s of its launch", 0.0
-    if (
-        activity not in WAKE_READY
-        and observed["process_alive"]
-        and (not observed.get("stale") or activity == "waiting for approval")
-    ):
-        age = observed.get("age_seconds")
-        held = f" ({int(age) // 60}m)" if age is not None else ""
-        return f"its screen state is {activity}{held}", 0.0
+    lane = observed.get("record") or {}
+    if lane.get("state") == lanes.BLOCKED:
+        return f"blocked: {lane['cause']}", 0.0
     if (
         observed["process_alive"] is False
-        and not state.get("session_id")
+        and not lane.get("session")
         and str(record.get("result", "")) == WAKE_ATTENTION
     ):
         return "its session process is not running", 0.0
     return "", 0.0
 
 
-def _park_wake(path: Path, record: dict, cause: str, due: float | None) -> None:
-    """Publishes the blocking cause and next attempt time on a wake record.
+def _park_wake(
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    record: dict,
+    cause: str,
+    due: float | None,
+) -> None:
+    """Records the blocking cause and next attempt time in the wake fields.
 
     Args:
-        path: The lane's durable wake record.
-        record: That record as read.
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        record: The lane's wake fields as read.
         cause: Why no attempt was made, empty when only spacing applies.
         due: Unix time of the next attempt, None once the budget is spent.
     """
     if record.get("blocked") == cause and record.get("next_at") == due:
         return
     record.update(blocked=cause, next_at=due)
-    write_json(path, record)
+    store_wake(home, directory, root, name, record)
 
 
 def _defer_wake(
-    directory: Path, name: str, cause: str, ready_at: float, window: float
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    cause: str,
+    ready_at: float,
+    window: float,
 ) -> None:
     """Keeps a blocked lane's next attempt visible without spending one.
 
@@ -4412,23 +4723,23 @@ def _defer_wake(
     being observed.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
+        root: Canonical project key.
         name: Participant that owns the lane.
         cause: Why no attempt was made.
         ready_at: Earliest time the cause can clear, 0 when unknown.
         window: Inactivity window the attempts are spaced by.
     """
-    path = directory / f"{name}-wake.json"
-    if not path.exists():
-        return
     with lock(directory / f"{name}-wake.lock"):
-        record: dict = {}
-        with contextlib.suppress(OSError, ValueError):
-            record = json.loads(path.read_text())
-        if not isinstance(record, dict) or not record.get("result"):
+        record = wake_record(home, root, name, directory)
+        if not record.get("result"):
             return
         _park_wake(
-            path,
+            home,
+            directory,
+            root,
+            name,
             record,
             cause,
             _wake_due(
@@ -4494,10 +4805,20 @@ def wake(
     rather than extending the old one. A request the launcher refuses with a
     `busy` reason is spaced like any other but does not count against the
     bound, because the lane never received a turn to decline; it is asked
-    again once it is idle. A non-idle activity label blocks a wake only while
-    its recorded process remains alive and the label has not gone stale. A
-    session with no trustworthy process identity records a manual-attention
-    refusal and is never presumed dead.
+    again once it is idle.
+
+    The lane's condition is read from its state record alone. The activity
+    file and the presence reading passed in are evidence the poll already
+    applied to that record; only the reading's age still spaces a wake of a
+    live lane. A lane recorded starting, working or reclaimed is never
+    woken, a blocked one is deferred under its cause, an idle one is asked
+    for a turn, and a stopped or dead one is resumed when its record names a
+    session. A lane with no record yet is decided on the state its presence
+    reading and activity label would record, through `lanes.from_liveness`,
+    and resumed on the session its activity file names. An approval prompt
+    still defers it and an idle one is still asked for a turn, so a store
+    that has not seeded the record never silences a wake. A reading that
+    would record nothing leaves the presence reading as it is.
 
     The attempt bound counts wakes without progress. Each attempt records the
     lane's progress marker from `_lane_activity`: its `HEAD` moves, the state
@@ -4511,8 +4832,8 @@ def wake(
     quiet past the inactivity window.
 
     A spent attempt is not the end of the series. Every poll re-decides the
-    lane against what it can read locally: durable provider capacity, the
-    published screen state and the recorded session process. A cause that is
+    lane against what it can read locally: durable provider capacity and the
+    lane state record. A cause that is
     still in force parks the lane with that cause and the time its next attempt
     is due, and spends nothing, so the budget is not consumed while nothing
     could have answered. When the cause clears, the next attempt is due one
@@ -4539,9 +4860,9 @@ def wake(
 
     A lane that retired is never woken and never resumed. It asked to stop,
     released what it held, and only an operator re-admitting it brings it back.
-    A lane whose session a host restart ended is not resumed either, because
-    the resume would reset the silence its claims and leases are judged on;
-    `participant restart` brings it back.
+    A lane whose record `settle_reboot` stopped on a host restart is not
+    woken or resumed either, because the resume would reset the silence its
+    claims and leases are judged on; `participant restart` brings it back.
     """
     participant = manifest["participants"][name]
     if (
@@ -4551,22 +4872,39 @@ def wake(
         or roster.retired(participant)
     ):
         return
-    path = directory / f"{name}-activity.json"
-    state = json.loads(path.read_text()) if path.exists() else {}
-    if rebooted(state):
-        return
-    wake_path = directory / f"{name}-wake.json"
+    root = manifest["root"]
     window = config["inactive_after"]
-    parked: dict = {}
-    with contextlib.suppress(OSError, ValueError):
-        if wake_path.exists():
-            published = json.loads(wake_path.read_text())
-            parked = published if isinstance(published, dict) else {}
-    blocked, ready_at = _wake_block(
-        directory, name, state, observed, parked, window
-    )
+    parked = wake_record(home, root, name, directory)
+    recorded = condition(home, root, name)
+    if lanes.rebooted(recorded):
+        return
+    stopped = False
+    if recorded is None:
+        path = directory / f"{name}-activity.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if rebooted(state):
+            return
+        label = str(state.get("activity", ""))
+        session = str(state.get("session_id") or "")
+        stopped = label == lanes.STOPPED
+        seen = lanes.from_liveness(
+            None, {**observed, "activity": label, "evidence": label}
+        )
+        if seen is not None:
+            recorded = {
+                "state": seen[0],
+                "cause": seen[1],
+                "evidence": label,
+                "session": session,
+            }
+    else:
+        session = recorded["session"]
+    if not lanes.wakes(recorded):
+        return
+    observed = recorded_presence(recorded, observed)
+    blocked, ready_at = _wake_block(directory, name, observed, parked, window)
     if blocked:
-        _defer_wake(directory, name, blocked, ready_at, window)
+        _defer_wake(home, directory, root, name, blocked, ready_at, window)
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -4631,7 +4969,7 @@ def wake(
             work_offer = None
         if not backlog:
             return
-        record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
+        record = wake_record(home, root, name)
         same_backlog = record.get("backlog") == backlog
         marker = _lane_activity(home, directory, manifest, name)
         worked = bool(record.get("activity")) and record["activity"] != marker
@@ -4655,18 +4993,18 @@ def wake(
             record.pop("escalated_at", None)
             record.pop("exhausted_at", None)
             record.update(attempts=0, activity=marker, blocked="", next_at=None)
-            write_json(wake_path, record)
+            store_wake(home, directory, root, name, record)
         spent_before = attempts >= WORK_WAKE_ATTEMPTS
         if spent_before:
             if not record.get("exhausted_at"):
                 record.update(exhausted_at=time.time())
-                write_json(wake_path, record)
+                store_wake(home, directory, root, name, record)
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
                     work_offer, attempts, str(record.get("result", ""))
                 )
                 record.update(result=result, escalated_at=time.time())
-                write_json(wake_path, record)
+                store_wake(home, directory, root, name, record)
                 _write_work_dispatch(
                     directory,
                     name,
@@ -4678,7 +5016,7 @@ def wake(
         due = _wake_due(float(throttle_at), int(attempts), ready_at, window)
         if time.time() < due:
             if record.get("result"):
-                _park_wake(wake_path, record, "", due)
+                _park_wake(home, directory, root, name, record, "", due)
             return
         result = WAKE_ATTENTION
         selected = _select_work_prompt(home, directory, name, work_offer)
@@ -4686,10 +5024,7 @@ def wake(
             result = "busy:stale"
         elif observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif (
-            observed["process_alive"] is False
-            or state.get("activity") == "stopped"
-        ) and state.get("session_id"):
+        elif (observed["process_alive"] is False or stopped) and session:
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"
@@ -4725,8 +5060,11 @@ def wake(
         counted = attempts + (not result.startswith("busy"))
         now = time.time()
         spent = counted >= WORK_WAKE_ATTEMPTS
-        write_json(
-            wake_path,
+        store_wake(
+            home,
+            directory,
+            root,
+            name,
             {
                 "at": now,
                 "backlog": backlog,

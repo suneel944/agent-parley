@@ -424,11 +424,21 @@ def test_a_recipient_a_dialog_or_a_blocked_claim_holds_cannot_act(
         )
 
     assert blocker() == ""
-    write_json(
-        directory / "codex-wake.json", {"result": "manual attention required"}
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        manifest["root"],
+        "codex",
+        {"result": "manual attention required"},
     )
     assert "native dialog" in blocker()
-    write_json(directory / "codex-wake.json", {"result": "delivered"})
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        manifest["root"],
+        "codex",
+        {"result": "delivered"},
+    )
     assert blocker() == ""
     state = issues.snapshot(directory)
     state["issues"]["7"] = {

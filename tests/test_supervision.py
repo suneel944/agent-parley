@@ -14,6 +14,7 @@ import pytest
 from agent_parley import (
     cli,
     issues,
+    lanes,
     process,
     roster,
     store,
@@ -35,6 +36,38 @@ def registered(bridge, paired):
         )
         for name in ("claude", "codex")
     }
+
+
+def rewake(bridge, paired, directory, name, **changes):
+    """Rewrites a lane's recorded wake fields and returns them as they were."""
+    record = supervision.wake_record(bridge.home, paired["root"], name)
+    supervision.store_wake(
+        bridge.home, directory, paired["root"], name, {**record, **changes}
+    )
+    return record
+
+
+def sampled(bridge, paired, directory, name, inactive_after=1, session=None):
+    """Applies one poll's liveness sample to a lane's state record.
+
+    A wake decides from the record, so a test that calls it directly first
+    records what the poll would have. A session names the one a native hook
+    would have recorded.
+    """
+    observed = supervision.presence(directory, name, inactive_after)
+    with store.connect(bridge.home, write=True) as db:
+        record = lanes.sample(
+            db,
+            paired["root"],
+            name,
+            observed,
+            dead_after=supervision.DEFAULTS["stalled_after"],
+        )
+        if session:
+            lanes.transition(
+                db, paired["root"], name, record["state"], session=session
+            )
+    return observed
 
 
 def send(bridge, actor, recipient, key="pending"):
@@ -280,18 +313,16 @@ def test_live_idle_wakes_back_off_without_acknowledging(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
-    observed = supervision.presence(lane.parent, "codex", 1)
+    observed = sampled(bridge, paired, lane.parent, "codex")
     for _ in range(5):
         supervision.wake(
             bridge.home, lane.parent, paired, "codex", observed, config
         )
-        path = lane.parent / "codex-wake.json"
-        record = json.loads(path.read_text())
-        write_json(path, {**record, "at": 0})
+        record = rewake(bridge, paired, lane.parent, "codex", at=0)
     assert len(calls) == 5
     assert record["attempts"] == 5 and record["exhausted_at"]
     assert record["next_at"] - record["at"] == 16
-    write_json(path, record)
+    rewake(bridge, paired, lane.parent, "codex", **record)
     supervision.wake(
         bridge.home, lane.parent, paired, "codex", observed, config
     )
@@ -330,17 +361,14 @@ def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
         lambda *args: calls.append(args) or next(answers),
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
-    observed = supervision.presence(lane.parent, "codex", 1)
-    path = lane.parent / "codex-wake.json"
+    observed = sampled(bridge, paired, lane.parent, "codex")
     for _ in range(9):
         supervision.wake(
             bridge.home, lane.parent, paired, "codex", observed, config
         )
-        record = json.loads(path.read_text())
-        record["at"] = 0
-        write_json(path, record)
+        rewake(bridge, paired, lane.parent, "codex", at=0)
     assert len(calls) == 9
-    assert json.loads(path.read_text())["attempts"] == 5
+    assert rewake(bridge, paired, lane.parent, "codex")["attempts"] == 5
 
 
 def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
@@ -384,6 +412,7 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     path = directory / "codex-wake.json"
+    sampled(bridge, paired, directory, "codex")
     supervision.wake(
         bridge.home,
         directory,
@@ -396,8 +425,7 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
     assert first["result"] == "manual attention required"
     assert first["attempts"] == 1
     assert first["next_at"] == pytest.approx(first["at"] + 1)
-    first["at"] = 0
-    write_json(path, first)
+    rewake(bridge, paired, directory, "codex", at=0)
 
     supervision.wake(
         bridge.home,
@@ -422,7 +450,8 @@ def test_a_wake_without_a_session_process_is_retried_when_it_returns(
             "session_ticks": process.start_ticks(os.getpid()),
         },
     )
-    observed = supervision.presence(directory, "codex", 1)
+    sampled(bridge, paired, directory, "codex")
+    observed = sampled(bridge, paired, directory, "codex")
 
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
 
@@ -466,16 +495,17 @@ def test_a_wake_blocked_by_exhausted_capacity_is_retried_at_the_reset(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
-    observed = supervision.presence(directory, "codex", 1)
+    observed = sampled(bridge, paired, directory, "codex")
     path = directory / "codex-wake.json"
-    write_json(
-        path,
-        {
-            "at": 0,
-            "backlog": [str(message["id"])],
-            "attempts": 1,
-            "result": "manual attention required",
-        },
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=0,
+        backlog=[str(message["id"])],
+        attempts=1,
+        result="manual attention required",
     )
 
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
@@ -511,16 +541,17 @@ def test_status_reports_the_next_wake_or_the_exhausted_budget(
 ):
     registered(bridge, paired)
     directory = Path(paired["lanes"]["codex"]).parent
-    write_json(
-        directory / "codex-wake.json",
-        {
-            "at": time.time() - 10,
-            "backlog": ["1"],
-            "attempts": 1,
-            "result": "manual attention required",
-            "blocked": "its screen state is waiting for approval",
-            "next_at": time.time() + 120,
-        },
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 10,
+        backlog=["1"],
+        attempts=1,
+        result="manual attention required",
+        blocked="its screen state is waiting for approval",
+        next_at=time.time() + 120,
     )
 
     bridge.status(cli.Selection(participant="codex"))
@@ -528,17 +559,18 @@ def test_status_reports_the_next_wake_or_the_exhausted_budget(
     scheduled = capsys.readouterr().out
     assert "Next wake in 1" in scheduled
     assert "blocked: its screen state is waiting for approval" in scheduled
-    write_json(
-        directory / "codex-wake.json",
-        {
-            "at": time.time() - 10,
-            "backlog": ["1"],
-            "attempts": supervision.WORK_WAKE_ATTEMPTS,
-            "result": "manual attention required",
-            "blocked": "its session process is not running",
-            "next_at": None,
-            "exhausted_at": time.time() - 5,
-        },
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 10,
+        backlog=["1"],
+        attempts=supervision.WORK_WAKE_ATTEMPTS,
+        result="manual attention required",
+        blocked="its session process is not running",
+        next_at=None,
+        exhausted_at=time.time() - 5,
     )
 
     bridge.status(cli.Selection(participant="codex"))
@@ -583,7 +615,9 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
         lambda command, **kwargs: launched.append((command, kwargs)) or Child(),
     )
     monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
-    observed = supervision.presence(directory, "codex")
+    observed = sampled(
+        bridge, paired, directory, "codex", 300, session="manual-session"
+    )
     assert observed["process_alive"] is False
     supervision.wake(
         bridge.home,
@@ -956,7 +990,7 @@ def test_a_stale_working_label_on_a_live_process_is_woken(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 300}
-    observed = supervision.presence(directory, "codex", 300)
+    observed = sampled(bridge, paired, directory, "codex", 300)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     assert len(calls) == 1
 
@@ -968,18 +1002,24 @@ def test_a_current_working_label_still_blocks_the_wake(
     directory = Path(paired["lanes"]["codex"]).parent
     idle_lane(directory, "codex", 120, activity="working")
     send(bridge, actors["claude"], "codex")
-    write_json(
-        directory / "codex-wake.json",
-        {"at": time.time() - 1000, "attempts": 1, "result": "accepted"},
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 1000,
+        attempts=1,
+        result="accepted",
     )
     monkeypatch.setattr(
         terminal, "request", lambda *args: pytest.fail("woke a working lane")
     )
     config = {**supervision.DEFAULTS, "inactive_after": 300}
-    observed = supervision.presence(directory, "codex", 300)
+    observed = sampled(bridge, paired, directory, "codex", 300)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     record = json.loads((directory / "codex-wake.json").read_text())
-    assert record["blocked"] == "its screen state is working (2m)"
+    assert record["attempts"] == 1
+    assert record["result"] == "accepted"
 
 
 def test_an_exhaustion_without_a_reset_is_probed_on_a_backoff():
@@ -1004,7 +1044,7 @@ def test_an_old_exhaustion_without_a_reset_is_woken_and_cleared(
         terminal, "request", lambda *args: calls.append(args) or "accepted"
     )
     config = {**supervision.DEFAULTS, "inactive_after": 300}
-    observed = supervision.presence(directory, "codex", 300)
+    observed = sampled(bridge, paired, directory, "codex", 300)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     assert len(calls) == 1
     capacity = supervision.published_capacity(directory, "codex")
@@ -1034,15 +1074,12 @@ def test_bare_stops_escalate_and_a_commit_resets_the_budget(
     monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     observed = supervision.presence(directory, "codex", 1)
-    path = directory / "codex-wake.json"
 
     def woken():
         supervision.wake(
             bridge.home, directory, paired, "codex", observed, config
         )
-        record = json.loads(path.read_text())
-        aged = {**record, "at": 0}
-        write_json(path, aged)
+        record = rewake(bridge, paired, directory, "codex", at=0)
         with (directory / "codex-events.jsonl").open("a") as stream:
             stream.write(json.dumps({"ts": time.time(), "event": "Stop"}))
             stream.write("\n")

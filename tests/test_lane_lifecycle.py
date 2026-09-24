@@ -320,15 +320,21 @@ def test_a_reboot_marks_the_lane_stopped_orphaned_and_restartable(
     )
     write_json(directory / supervision.BOOT_RECORD, {"boot_id": "old"})
     monkeypatch.setattr(process, "boot_id", lambda: "new")
-    assert supervision.settle_reboot(directory, manifest) == ["claude"]
-    assert supervision.settle_reboot(directory, manifest) == []
+    home = bridge.home
+    assert supervision.settle_reboot(home, directory, manifest) == ["claude"]
+    assert supervision.settle_reboot(home, directory, manifest) == []
     state = json.loads((directory / "claude-activity.json").read_text())
     assert state["activity"] == "stopped"
     assert supervision.rebooted(state)
     observed = supervision.presence(directory, "claude")
     assert observed["process_alive"] is False
-    config = supervision.configuration(bridge.home, manifest)
-    supervision.orphans(bridge.home, directory, manifest, config)
+    config = supervision.configuration(home, manifest)
+    readings = {
+        name: supervision.presence(directory, name)
+        for name in manifest["participants"]
+    }
+    supervision.settle_lanes(home, manifest, config, readings)
+    supervision.orphans(home, directory, manifest, config)
     assert cli.snapshot(directory)["issues"]["7"].get("orphan")
     assert "no verified running session" in bridge.stop(repo, "claude")
     captured = capture_launch(bridge, monkeypatch)

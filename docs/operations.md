@@ -801,8 +801,8 @@ minimum. When the set does not fit, columns are dropped in this order, and
 the header names the ones that went:
 
 ```text
-PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, LEASES, IDLE, ISSUES,
-DENIALS
+PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, UNUSED, LEASES, FIT, IDLE,
+REVIEW, ISSUES, DENIALS
 ```
 
 `PARTICIPANT`, `STATE` and `MAIL` are never dropped; if they alone still do
@@ -1033,6 +1033,11 @@ in the last two days of rollouts, so a Codex session older than that reports
 nothing. Reading is incremental: each refresh folds only the records appended
 since the previous one, up to 1 MiB per lane, so watching a long session never
 re-reads its history.
+
+`UNUSED` is the lane state accounting `status` prints on its `Lanes:` line,
+per lane: idle lane-minutes per observed lane-hour, then unaccountable
+claim-minutes, as `35.0/4.0`. Both are totals since the first poll that
+accounted the lane. The cell is `-` until a poll has accounted the lane.
 
 `FIT` is the capacity check the runtime last read for that lane, and a `+`
 after it means an advisory work offer is waiting for that lane to act on. Four
@@ -1524,14 +1529,15 @@ replaces that label. A client parked on a native trust, authentication or update
 dialog fires no hook, so `start_deadline` bounds how long that label may stand.
 A launch still carrying it `start_deadline` seconds later is published as
 `not started; no native hook`, with the deadline and the observed wait in the
-lane's private activity state. The mark is an observation: nothing is killed,
-no claim moves and no dialog is answered. It fails the lane's session fitness
-check, so such a lane is neither offered work nor named as a share target for a
-peer's rebalance, and a wake is refused with the cause
-`it never started within Ns of its launch` rather than spending an attempt on a
+lane's private activity state, and the lane state moves to `blocked: dialog`
+with the evidence `it never started within Ns of its launch`. The mark is an
+observation: nothing is killed, no claim moves and no dialog is answered. The
+blocked state fails the lane's session fitness check, so such a lane is neither
+offered work nor named as a share target for a peer's rebalance, and a wake is
+deferred with the cause `blocked: dialog` rather than spending an attempt on a
 client that cannot read an injected prompt. Answering the dialog produces the
-first native hook event, which republishes the real activity and clears the mark
-however late it arrives. Client startup on a developer machine is a few seconds;
+first native hook event, which moves the lane state out of `blocked` and clears
+the mark however late it arrives. Client startup on a developer machine is a few seconds;
 raise `start_deadline` on a slow machine or a cold cache, where a legitimate
 launch can take longer than the default.
 
@@ -1610,8 +1616,10 @@ operator input, so they do not refuse the wake. Complete replies are removed
 from the input-state check without hiding operator bytes that arrived in the
 same read; incomplete replies are carried until the next read and refuse a wake
 until they complete.
-Results appear in `status`, the retained event log and
-private `<name>-wake.json`; resumed terminal output stays in `<name>-wake.log`,
+Wake attempts, backoff, the last result and escalation are fields of the
+lane's state in the store, and every wake decision reads them there. Results
+appear in `status`, the retained event log and private `<name>-wake.json`,
+which is a published copy of those fields that no decision reads; resumed terminal output stays in `<name>-wake.log`,
 which the launcher truncates before a write would take it past 1 MiB. A failed
 write to that log, including a full disk, is dropped and never ends the resumed
 session. A wake request whose lane activity record is missing or unreadable is
@@ -2275,7 +2283,8 @@ credential profile as the previous run.
 After a host restart every recorded session is dead, even when its process ID
 now names an unrelated process. The supervision loop records the host's boot
 identifier in the project state directory; when it changes, each lane with a
-recorded session is published as stopped and marked with the session the
+recorded session has its state record moved to `stopped` with the restart as
+its evidence, and is published as stopped and marked with the session the
 restart ended. That lane is never resumed or signalled, its claims move
 through the orphan path, `participant stop` reports no verified session, and
 `participant restart` launches it without hand edits to the state directory.

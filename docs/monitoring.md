@@ -254,6 +254,23 @@ a `ready` report before integration. Every figure comes from records the runtime
 already keeps, so it reports observed coordination inactivity and never claims
 to know what the native client was doing inside a turn.
 
+`status` also prints two accountability numbers per project, measured from
+each lane's state record by every supervision poll:
+
+```text
+Lanes: idle 35.0 min/lane-hour (top: claude blocked: capacity, 4 min); unaccountable claims 3.5 min (top: claude blocked: capacity, 4 min)
+```
+
+Idle lane-minutes per lane-hour count the time a lane spent `idle`,
+`blocked`, `stopped` or `dead` while it owned a claim or the ledger held an
+unclaimed, unblocked issue. Unaccountable claim-minutes count the time a lane
+owned a claim while it was not `working`. Each names its largest cause. The
+totals run from the first poll that saw the lane; a gap of more than five
+minutes between polls, a stopped service, is charged to nothing. `status
+--json` carries both per lane and per project under `accounting`, and each
+time a lane's total crosses a whole minute an `accounting` event is added to
+its lane history.
+
 ## `problems`
 
 One screen says what needs you now. `agent-parley problems` lists, oldest first,

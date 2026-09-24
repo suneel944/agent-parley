@@ -14,6 +14,7 @@ import pytest
 from agent_parley import (
     dashboard,
     issues,
+    lanes,
     records,
     roster,
     store,
@@ -90,13 +91,18 @@ def committed(lane):
     )
 
 
-def unthrottle(directory, name):
+def rewake(home, directory, name, **changes):
+    """Rewrites a lane's recorded wake fields in the lane state."""
+    root = json.loads((directory / "project.json").read_text())["root"]
+    record = supervision.wake_record(home, root, name)
+    supervision.store_wake(home, directory, root, name, {**record, **changes})
+
+
+def unthrottle(home, directory, name):
     """Ages the wake spacing so the next attempt is admitted immediately."""
-    path = directory / f"{name}-wake.json"
-    if path.exists():
-        record = json.loads(path.read_text())
-        record["at"] = 0
-        write_json(path, record)
+    root = json.loads((directory / "project.json").read_text())["root"]
+    if supervision.wake_record(home, root, name):
+        rewake(home, directory, name, at=0)
     published = supervision.published_work(directory, name)
     if published.get("dispatch"):
         published["dispatch"]["updated_at"] = 0
@@ -462,14 +468,20 @@ def test_a_transient_block_resumes_on_the_wake_backoff(
         "request",
         lambda path, name: requested.append(name) or "accepted",
     )
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.sample(
+            db,
+            paired["root"],
+            "claude",
+            observed,
+            dead_after=config["stalled_after"],
+        )
 
     supervision.wake(
-        bridge.home,
-        directory,
-        manifest,
-        "claude",
-        supervision.presence(directory, "claude", config["inactive_after"]),
-        config,
+        bridge.home, directory, manifest, "claude", observed, config
     )
 
     blocked = supervision.published_capacity(directory, "claude")
@@ -925,9 +937,11 @@ def test_a_split_names_no_recipient_parked_on_a_dialog(
     bridge, repo, paired, monkeypatch
 ):
     _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, 129)
-    write_json(
-        directory / "codex-wake.json",
-        {"result": sorted(supervision.DIALOG_WAKES)[0]},
+    rewake(
+        bridge.home,
+        directory,
+        "codex",
+        result=sorted(supervision.DIALOG_WAKES)[0],
     )
 
     supervision.poll(bridge.home, directory)
@@ -1157,10 +1171,7 @@ def test_delivery_without_work_progress_retries_then_escalates(
         directory, "claude", config["inactive_after"]
     )
     for _ in range(3):
-        wake_path = directory / "claude-wake.json"
-        wake = json.loads(wake_path.read_text())
-        wake["at"] = 0
-        write_json(wake_path, wake)
+        rewake(bridge.home, directory, "claude", at=0)
         published = supervision.published_work(directory, "claude")
         published["dispatch"]["updated_at"] = 0
         write_json(directory / "claude-work.json", published)
@@ -1214,7 +1225,7 @@ def test_a_lane_working_between_wakes_is_never_escalated(
     )
     for _ in range(5):
         committed(lane)
-        unthrottle(directory, "claude")
+        unthrottle(bridge.home, directory, "claude")
         supervision.wake(
             bridge.home, directory, manifest, "claude", observed, config
         )
@@ -1243,7 +1254,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
         directory, "claude", config["inactive_after"]
     )
     for _ in range(4):
-        unthrottle(directory, "claude")
+        unthrottle(bridge.home, directory, "claude")
         supervision.wake(
             bridge.home, directory, manifest, "claude", observed, config
         )
@@ -1252,7 +1263,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
     dispatch = supervision.published_work(directory, "claude")["dispatch"]
     assert dispatch["state"] == "escalated"
 
-    unthrottle(directory, "claude")
+    unthrottle(bridge.home, directory, "claude")
     supervision.wake(
         bridge.home, directory, manifest, "claude", observed, config
     )
@@ -1260,7 +1271,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
     assert held["escalated_at"] == escalated["escalated_at"]
 
     committed(lane)
-    unthrottle(directory, "claude")
+    unthrottle(bridge.home, directory, "claude")
     supervision.wake(
         bridge.home, directory, manifest, "claude", observed, config
     )

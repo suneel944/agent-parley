@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import checkpoints, roster, store, supervision
+from agent_parley import lanes as states
 from agent_parley.state import write_json
 
 
@@ -143,11 +144,17 @@ def test_a_stale_lanes_debt_does_not_lower_its_fit(bridge, paired, lanes):
     manifest = roster.read(lanes["directory"])
     activity = lanes["directory"] / "codex-activity.json"
 
-    write_json(activity, {"updated": time.time()})
+    write_json(activity, {"updated": time.time() - 3600})
+    with store.connect(bridge.home, write=True) as db:
+        states.transition(db, manifest["root"], "codex", states.WORKING)
     fresh = supervision.fit(
         bridge.home, lanes["directory"], manifest, "codex", 0, 300
     )
-    write_json(activity, {"updated": time.time() - 3600})
+    write_json(activity, {"updated": time.time()})
+    with store.connect(bridge.home, write=True) as db:
+        states.transition(
+            db, manifest["root"], "codex", states.IDLE, now=time.time() - 3600
+        )
     stale = supervision.fit(
         bridge.home, lanes["directory"], manifest, "codex", 0, 300
     )

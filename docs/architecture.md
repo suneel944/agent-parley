@@ -15,6 +15,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
 | `issues` | Claim and handoff state transitions |
+| `lanes` | The one authoritative state record of each lane in the store (`starting`, `working`, `idle`, `blocked` with its cause, `stopped`, `dead`, `reclaimed`), its closed transition table, and the event every accepted or refused transition appends; the per-lane files are evidence it reads, never a second answer. Hooks (`checkpoints.record`) and the dialog watcher submit evidence to a per-project spool (`lane-evidence.jsonl`) instead of waiting on the store; each poll applies it in arrival order before its liveness sample, and keeps it for the next poll when the store is busy. A session change is a transition that records both session ids. Each poll also charges the time since the last one to idle lane-minutes and unaccountable claim-minutes by state and cause, which `status` reports |
 | `roster` | Providers, credential profiles and project participants |
 | `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
@@ -367,16 +368,23 @@ candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
 the persisted issue candidate and revalidates its owner and evidence identity
 before acting.
 
-The same poll marks the claims of a lane whose session process is gone, or
-whose last event was a clean `SessionEnd` with no process left to check, and
-that has been silent past the stall threshold, writing an orphan marker on each of
+Every decision of the poll after its liveness sample reads the lane's condition
+from its state record: wake, parking, orphan marking, reclaim, work fitness and
+share targets. The activity file, the wake copy and `participant_presence` are
+evidence the poll applies to that record or copies published from it, never a
+decision input. A lane with no state record yet falls back to its presence
+reading, so it is still woken and still orphaned.
+
+The same poll marks the claims of a lane whose state is `dead`: a session
+process gone, or a clean `SessionEnd` with no process left to check, past the
+stall threshold. It writes an orphan marker on each of
 its ledger records and sending every other lane one notice that names those
 issues and the reservations the dead lane still holds. The marker is an
 observation: the issue keeps its owner and the reservations keep their holder
 until a peer records `issue claim --take-orphaned`, which writes a `take`
 transition naming the previous owner and the reason and then releases that
 owner's advisory reservations through `store.py`. The same poll withdraws a
-marker whose owner's recorded session process is alive again, under the same
+marker whose owner's lane state is live again, under the same
 `issues.lock` and with one notice to the peers that received the orphan notice,
 so a stored observation never contradicts what takeover reads. A marker
 carrying an operator authorization and a checkpoint describes an approved

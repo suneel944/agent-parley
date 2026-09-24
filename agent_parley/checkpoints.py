@@ -18,7 +18,15 @@ from enum import StrEnum
 from pathlib import Path
 from types import ModuleType
 
-from agent_parley import hook, policy, process, protocol, roster, store
+from agent_parley import (
+    hook,
+    lanes,
+    policy,
+    process,
+    protocol,
+    roster,
+    store,
+)
 from agent_parley.issues import describe, snapshot
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
@@ -189,6 +197,16 @@ class Reason(StrEnum):
     UNREADABLE_PAYLOAD = "unreadable_payload"
 
 
+UNOBSERVED = frozenset(
+    {
+        Reason.IGNORED_EVENT,
+        Reason.SESSION_MISMATCH,
+        Reason.STALE_GENERATION,
+        Reason.SUPERSEDED,
+    }
+)
+
+
 def decision_of(output: dict | None) -> str:
     """Derives the enforcement outcome carried by a native hook output.
 
@@ -285,6 +303,14 @@ def record(
     `FALLBACK` by `serve`. The event is then counted once, under the
     reason that decided it, rather than once more as a separate fallback.
 
+    This is also the hook's one call into the lane state: an event that
+    was observed, including one from a session the lane adopted, is queued
+    through `lanes.submit` as evidence of the state it shows, so an adopted
+    session reaches the record as a session change with both identities. A
+    `session_mismatch` event comes from a session the lane did not adopt,
+    such as a second process sending hooks under the lane's identity, and
+    is no evidence of the lane's state.
+
     Args:
         directory: Common project state directory.
         agent: Assigned native lane name.
@@ -321,6 +347,18 @@ def record(
         with event_lock(directory, agent):
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(entry) + "\n")
+    event = str(payload.get("hook_event_name", ""))
+    seen = lanes.hook_evidence(event)
+    if seen is not None and reason not in UNOBSERVED:
+        lanes.submit(
+            directory,
+            agent,
+            event,
+            seen[0],
+            cause=seen[1],
+            evidence=reason.value,
+            session=str(payload.get("session_id", "")),
+        )
 
 
 def foreign_session(

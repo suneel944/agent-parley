@@ -43,6 +43,7 @@ if TYPE_CHECKING:
         history,
         inbound,
         issues,
+        lanes,
         lifecycle,
         metrics,
         notify,
@@ -105,6 +106,7 @@ DEFERRED_MODULES = (
     "history",
     "inbound",
     "issues",
+    "lanes",
     "lifecycle",
     "metrics",
     "notify",
@@ -6869,6 +6871,28 @@ reported.
         with transaction as db:
             yield db
 
+    def _project_accounting(
+        self, db: sqlite3.Connection | None, root: str
+    ) -> dict | None:
+        """Reads a project's idle lane-minutes and unaccountable claims.
+
+        Args:
+            db: Frame's shared read transaction, or None to open one.
+            root: Canonical project key.
+
+        Returns:
+            The `lanes.summary` of every lane's totals merged, or None when
+            no lane has been accounted or the store cannot be read.
+        """
+        import sqlite3
+
+        try:
+            with store.reading(self.home, db) as reader:
+                accounts = lanes.read_accounts(reader, root)
+        except (sqlite3.Error, BridgeError, OSError):
+            return None
+        return lanes.summary(lanes.combine(accounts)) if accounts else None
+
     def _project_context(
         self,
         directory: Path,
@@ -6944,6 +6968,10 @@ reported.
             mailbox counts, together with any native dialog the lane records as
             holding its client. An unreadable mailbox is reported as an error
             beside the rest of the lane rather than failing the whole report.
+            A lane with a state record has its session and availability read
+            from that record alone, through `supervision.recorded_presence`,
+            so the activity file cannot report a condition the record does
+            not hold; only a lane with no record yet is read from the file.
         """
         import sqlite3
 
@@ -6970,6 +6998,24 @@ reported.
             configuration["stalled_after"],
         )
         idle = metrics.idle_intervals(directory, agent)
+        try:
+            with store.reading(self.home, frame["db"]) as db:
+                condition = lanes.read(db, data["root"], agent)
+                accounts = lanes.read_accounts(db, data["root"])
+                wake = lanes.read_wake(db, data["root"], agent)
+        except (sqlite3.Error, BridgeError, OSError, ValueError):
+            condition, accounts, wake = None, {}, {}
+        if condition:
+            observed = supervision.recorded_presence(condition, observed)
+            observed["evidence"] = condition["evidence"]
+            age = observed["age_seconds"]
+            liveness = lanes.describe(condition) + (
+                f"; event {age}s ago" if age is not None else ""
+            )
+        else:
+            liveness = participant_liveness(
+                directory, agent, configuration["inactive_after"]
+            )
         budget = budgets.report(
             self.home, directory, data, agent, frame["usage"]
         )
@@ -6978,8 +7024,10 @@ reported.
             "identity": name,
             "provider": participant["provider"],
             "credential": participant["credential"],
-            "session": participant_liveness(
-                directory, agent, configuration["inactive_after"]
+            "session": liveness,
+            "condition": lanes.view(condition),
+            "accounting": (
+                lanes.summary(accounts[agent]) if agent in accounts else None
             ),
             "availability": {
                 "state": observed["state"],
@@ -7076,9 +7124,7 @@ reported.
             "wake": None,
             "mail": None,
         }
-        wake_path = directory / f"{agent}-wake.json"
-        if wake_path.exists():
-            wake = json.loads(wake_path.read_text())
+        if wake:
             next_at = wake.get("next_at")
             record["wake"] = {
                 "result": wake["result"],
@@ -7179,6 +7225,9 @@ reported.
                     {
                         "root": data["root"],
                         "reclaim": supervision.reclaim_summary(path.parent),
+                        "accounting": self._project_accounting(
+                            db, data["root"]
+                        ),
                         **views.ledger(context["ledger"]),
                         "ready_groups": plan.ready_groups(
                             plan.groups(path.parent),
@@ -7261,6 +7310,8 @@ reported.
             print(describe(snapshot(path.parent)))
             if measured := reclaim.summary_line(project.get("reclaim") or {}):
                 print(measured)
+            if accounted := project.get("accounting"):
+                print(f"Lanes: {lanes.describe_account(accounted)}")
             if groups := project.get("ready_groups") or []:
                 print(
                     "Every member reported ready in: "

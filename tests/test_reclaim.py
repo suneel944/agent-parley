@@ -15,6 +15,7 @@ from agent_parley import (
     dashboard,
     forge,
     issues,
+    lanes,
     problems,
     reclaim,
     recovery,
@@ -330,6 +331,25 @@ def test_the_supervision_tick_reclaims_a_merged_lane(
     assert not landed["lane"].exists()
     assert landed["branch"] not in branches(repo)
     assert not supervision.reclaim_due(landed["directory"], time.time(), 900)
+
+
+def test_a_reclaimed_lane_moves_its_state_to_reclaimed(
+    bridge, repo, landed, monkeypatch
+):
+    store.initialize(bridge.home)
+    completion(monkeypatch, "MERGED")
+    root = roster.read(landed["directory"])["root"]
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(db, root, "claude", lanes.STOPPED)
+
+    supervision.poll(bridge.home, landed["directory"])
+
+    with store.connect(bridge.home) as db:
+        record = lanes.read(db, root, "claude")
+        history = lanes.history(db, root, "claude")
+    assert record["state"] == lanes.RECLAIMED
+    assert history[-1]["source"] == lanes.STOPPED
+    assert history[-1]["target"] == lanes.RECLAIMED
 
 
 def test_the_supervision_tick_sweeps_once_an_interval(
