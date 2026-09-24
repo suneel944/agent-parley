@@ -28,6 +28,7 @@ from agent_parley import dialogs, issues, roster, store, supervision, tables
 
 STORE = "store"
 SERVICE = "service"
+SUPERVISING = "supervision failing"
 STALLED = "stalled"
 INACTIVE = "inactive"
 OVERDUE = "overdue claim"
@@ -747,6 +748,17 @@ def derive(
     aged: list[dict] = []
     for project in report["projects"]:
         directory, data = manifests[project["root"]]
+        if failing := issues.supervision_error(directory):
+            rows.append(
+                _row(
+                    SUPERVISING,
+                    f"supervision poll failing; last: {failing['detail']}",
+                    "read server.log in the state directory and fix the "
+                    "stage it names; the next clean poll clears this row",
+                    max(int(stamp - failing["since"]), 0),
+                    project=project["root"],
+                )
+            )
         config = supervision.configuration(home, data)
         after = ack_after or config["stalled_after"]
         for record in project["participants"]:

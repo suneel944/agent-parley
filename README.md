@@ -206,8 +206,10 @@ and the setup command every new lane runs.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
   updates only when coordination state actually changes.
-- **A deadline reports; it never transfers.** A budget informs; it does not
-  gate. Both mark the lane and stop nothing.
+- **A deadline reports until the holder stops working.** An overdue claim
+  whose holder has run no tool past the inactivity window gets one wake, then
+  an offer to the fittest peer with its recovery checkpoint, then release to
+  the pool. A budget informs; it does not gate.
 - **Reservations are advisory.** Conflicts name the blocking owner and that
   owner's declared reason; nothing on disk is locked.
 - **Mail stays private; a decision does not.** Only a message a lane marks as a

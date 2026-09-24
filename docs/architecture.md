@@ -260,22 +260,32 @@ a dispatch generation, issue-scoped progress digest, bounded attempt count and
 last result. An unchanged actionable offer joins the wake backlog even after a
 checkpoint injected it. The launcher reads the revalidated wake selection from
 private state after admitting the wake, so generated work context does not
-cross the wake socket. The attempt bound measures lane silence rather than
-elapsed wakes: each attempt records the lane's own activity marker, built from
-its tool and turn-end hook events and the last message it sent, which together
-cover the reports, commits and mail a working lane produces. Three attempts
-across which that marker never changes produce a durable escalation in the same
-publication and in `top`; any recorded lane activity resets the series and
-clears the escalation, and changed issue state starts a new bounded attempt
-series. A spent attempt is re-decided on every poll rather than being final:
-durable capacity, the published screen state and the recorded session process
-are read again, and a cause still in force parks the lane with that cause and
-the time its next attempt is due without spending one, so nothing is consumed
-while nothing could answer. A cleared cause makes the next attempt due one
-doubling inactivity window after the last, or at the provider reset the
-capacity observation named, whichever is later. `status` prints that next time,
-and prints the exhausted budget with its last cause only for a lane that spent
-every attempt. An offer is advisory: it never writes the ledger,
+cross the wake socket. The attempt bound measures lane progress rather than
+elapsed wakes: each attempt records the lane's own progress marker, built from
+its HEAD movements, the state of the claims it owns and its latest reservation.
+Hook events and turn ends do not count, because a woken lane that reads its
+prompt and stops records both without doing anything. Three attempts across
+which that marker never changes produce one durable escalation in the same
+publication and in `top`; waking then backs off by doubling to an hourly
+ceiling instead of repeating every window or stopping. Any progress resets the
+series and clears the escalation, and changed issue state starts a new bounded
+attempt series. A spent attempt is re-decided on every poll rather than being
+final: durable capacity, the published screen state and the recorded session
+process are read again, and a cause still in force parks the lane with that
+cause and the time its next attempt is due without spending one, so nothing is
+consumed while nothing could answer. A screen-state label blocks only while
+the presence reading is current; a label older than the inactivity window was
+left by a dropped hook and no longer blocks, except an approval prompt, which
+records no hook until answered. An exhaustion that named no reset is probed on
+the same doubling backoff, and an accepted probe or a later tool hook clears
+it. A cleared cause makes the next attempt due one doubling inactivity window
+after the last, or at the provider reset the capacity observation named,
+whichever is later. `status` prints that next time, and prints the exhausted
+budget with its last cause and the backoff for a lane that spent every
+attempt. Each poll stage runs isolated: a failing stage is recorded in
+`supervision-error.json` and `server.log`, reported by `status` and `problems`,
+and the remaining stages still run; a clean poll clears the record. An offer is
+advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served
 project identity to private launcher state. Its best-effort forge reads run

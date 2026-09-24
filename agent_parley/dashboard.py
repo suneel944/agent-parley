@@ -103,8 +103,9 @@ LEGEND = (
     "least that old; the line under it names the oldest waiting item. The "
     "marker only reports: nothing is revoked and no ownership moves.",
     "An issue marked ! is past its recorded deadline or its attempt "
-    "budget. It is still owned: a deadline reports, and only an explicit "
-    "release or an accepted handoff moves ownership.",
+    "budget. It stays owned while its holder works; a holder that has run "
+    "no tool past the inactivity window is woken, then the issue is offered "
+    "to a peer, then released.",
     "An issue marked * is held by a lane whose session process is gone and "
     "which has been silent past the stall threshold; the line under it "
     "names those claims and the reservations that lane still holds. It is "

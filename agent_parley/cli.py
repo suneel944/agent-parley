@@ -713,6 +713,20 @@ def reviewed_line(review: dict) -> str:
     )
 
 
+def supervision_failure(error: dict) -> str:
+    """States that the project's supervision poll is failing, and since when.
+
+    Args:
+        error: Failure record read beside the project's issue ledger.
+
+    Returns:
+        One line naming how long polls have been failing and the last failure,
+        so a supervisor that fails on every tick never reads as healthy.
+    """
+    since = max(int(time.time() - error["since"]), 0)
+    return f"Supervision: failing for {since}s; last: {error['detail']}"
+
+
 def wake_schedule(wake: dict) -> str:
     """States when a parked lane is asked again, or why it is not.
 
@@ -726,9 +740,12 @@ def wake_schedule(wake: dict) -> str:
         inventing a time.
     """
     cause = wake.get("blocked") or wake.get("result") or "unknown"
-    if wake.get("exhausted"):
-        return f"Wake budget exhausted; last cause: {cause}"
     seconds = wake.get("next_seconds")
+    if wake.get("exhausted"):
+        exhausted = f"Wake budget exhausted; last cause: {cause}"
+        if seconds is None:
+            return exhausted
+        return f"{exhausted}; backing off, next wake in {seconds}s"
     if seconds is None:
         return "Next wake: due on the next re-evaluation"
     blocked = f"; blocked: {wake['blocked']}" if wake.get("blocked") else ""
@@ -7069,6 +7086,9 @@ reported.
                             )
                             for agent in sorted(data["participants"])
                         ],
+                        "supervision_error": issues.supervision_error(
+                            path.parent
+                        ),
                     }
                 )
         return {
@@ -7122,6 +7142,8 @@ reported.
             if selection.filtered() and not reported:
                 continue
             print(f"\nProject: {data['root']}")
+            if failing := project.get("supervision_error"):
+                print(supervision_failure(failing))
             print(describe(snapshot(path.parent)))
             if measured := reclaim.summary_line(project.get("reclaim") or {}):
                 print(measured)

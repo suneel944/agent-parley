@@ -8,7 +8,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeGuard
 
 from agent_parley import (
     forge,
@@ -52,7 +54,8 @@ WORK_WAKE_ATTEMPTS = 3
 WAKE_DIGEST_THREADS = 8
 UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
-WORK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop"})
+WAKE_BACKOFF_CEILING = 3600.0
+TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 WAKE_READY = frozenset({IDLE, STOPPED})
 WAKE_ATTENTION = "manual attention required"
 WORKING = "working"
@@ -753,6 +756,12 @@ def published_capacity(directory: Path, name: str) -> dict:
 def record_capacity(directory: Path, name: str, observation: dict) -> dict:
     """Persists a newer validated capacity or bounded-probe outcome.
 
+    An observation that names no session, such as the one the native dialog
+    watcher makes from the lane's screen, is attributed to the session the
+    lane's own activity record names. Every consumer of the record then reads
+    the same session identity, so a recovery candidate derived from it can be
+    fenced to that session rather than refused as unverifiable.
+
     Args:
         directory: Private project state directory.
         name: Participant whose provider produced the observation.
@@ -767,6 +776,15 @@ def record_capacity(directory: Path, name: str, observation: dict) -> dict:
         BridgeError: If the observation does not carry a usable state, time,
             source and evidence identity.
     """
+    if not observation.get("session_id"):
+        from agent_parley import checkpoints
+
+        observation = {
+            **observation,
+            "session_id": str(
+                checkpoints.activity(directory, name).get("session_id") or ""
+            ),
+        }
     state = observation.get("state")
     observed_at = observation.get("observed_at")
     if (
@@ -831,6 +849,21 @@ def _observe_capacity(
         observation["progress"] = current.get("progress")
     if observation is not None and _native_recovery(current, observation):
         current = record_capacity(directory, name, observation)
+    if current["state"] == "exhausted" and not _instant(
+        current.get("reset_at")
+    ):
+        from agent_parley import checkpoints
+
+        activity = checkpoints.activity(directory, name)
+        updated = activity.get("updated")
+        if (
+            activity.get("event") in TOOL_EVENTS
+            and _instant(updated)
+            and float(updated) > float(current["observed_at"])
+        ):
+            current = _clear_exhaustion(
+                directory, name, current, "native-hook", float(updated)
+            )
     reset_at = current.get("reset_at")
     if (
         current["state"] == "exhausted"
@@ -851,6 +884,68 @@ def _observe_capacity(
             },
         )
     return current
+
+
+def _clear_exhaustion(
+    directory: Path, name: str, current: dict, source: str, at: float
+) -> dict:
+    """Records that a lane exhausted with no named reset is working again.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose capacity was exhausted.
+        current: Durable exhausted observation being cleared.
+        source: Evidence that cleared it, a native hook or an accepted wake.
+        at: Unix time of that evidence.
+
+    Returns:
+        The durable observation after the clear.
+    """
+    return record_capacity(
+        directory,
+        name,
+        {
+            **current,
+            "state": "available",
+            "observed_at": max(at, float(current["observed_at"])),
+            "reset_at": None,
+            "source": source,
+            "observation_id": f"{source}:{current['observation_id']}",
+            "probes": 0,
+            "probed_at": None,
+        },
+    )
+
+
+def probe_exhaustion(directory: Path, name: str, result: str) -> None:
+    """Records the outcome of a wake made while exhaustion named no reset.
+
+    An accepted wake is the evidence the usage-limit dialog is gone, so it
+    clears the exhaustion. Any other outcome counts one probe, which doubles
+    the wait before the next one.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose lane was woken.
+        result: Launcher result of the wake.
+    """
+    current = published_capacity(directory, name)
+    if current["state"] != "exhausted" or _instant(current.get("reset_at")):
+        return
+    if result == "accepted":
+        _clear_exhaustion(
+            directory, name, current, "wake-accepted", time.time()
+        )
+        return
+    record_capacity(
+        directory,
+        name,
+        {
+            **current,
+            "probes": int(current.get("probes") or 0) + 1,
+            "probed_at": time.time(),
+        },
+    )
 
 
 def _account_members(home: Path, manifest: dict, name: str) -> list[str]:
@@ -1045,6 +1140,12 @@ def stranded_claims(
     nor establish that a live owner stopped editing. Recovery must record its
     own transition and fence the prior claim generation before any transfer.
 
+    An exhausted observation that names no session, because the lane had
+    published none when its client reported the limit, yields no candidate:
+    recovery fences a transfer to the owner's session, so a candidate without
+    one could never be acted on, and it must not stop the snapshot of every
+    other lane's candidates from being recorded.
+
     Args:
         manifest: Project manifest holding every participant.
         ledger: Current issue ledger.
@@ -1063,7 +1164,9 @@ def stranded_claims(
     candidates = []
     for owner, numbers in sorted(owned.items()):
         observed = results.get(owner, {}).get("capacity", UNKNOWN_CAPACITY)
-        if observed.get("state") != "exhausted":
+        if observed.get("state") != "exhausted" or not observed.get(
+            "session_id"
+        ):
             continue
         peers = [name for name in eligible if name != owner]
         reset_at = observed.get("reset_at")
@@ -1885,15 +1988,346 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
                 "waiting": waiting,
                 "created": time.time(),
                 "text": (
-                    f"Issue #{number} {cause}. {holder} still owns it: a "
-                    "deadline reports, it never transfers. Ask for a handoff "
-                    "or release it explicitly."
+                    f"Issue #{number} {cause}. {holder} still owns it while "
+                    "it works. Hand it off or release it explicitly; a holder "
+                    "that stays silent is woken, then offered away, then "
+                    "released by the supervisor."
                 ),
             }
             changed = True
         if changed:
             ledger["revision"] += 1
             write_json(directory / "issues.json", ledger)
+
+
+def deadline_defaults(directory: Path, manifest: dict) -> None:
+    """Gives every claim that has no deadline the project's claim default.
+
+    A claim made before the project recorded defaults, or through a path that
+    did not read them, carried no deadline and could never become overdue, so
+    no overdue transition could ever reach it. The default is measured from
+    the start of the current ownership generation, as it would have been had
+    it applied at claim time. A project with no claim default changes nothing.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    window = (manifest.get("deadlines") or {}).get("claim")
+    if not window:
+        return
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        changed = False
+        for record in ledger["issues"].values():
+            if not record.get("owner") or record.get("deadline"):
+                continue
+            start = claimed_since(record) or time.time()
+            record["deadline"] = start + float(window)
+            changed = True
+        if changed:
+            ledger["revision"] += 1
+            write_json(directory / "issues.json", ledger)
+
+
+def tool_silence(directory: Path, name: str) -> float | None:
+    """Measures how long a lane has gone without running a tool.
+
+    A session that starts, reads its context and ends without a tool call
+    did no work, yet it records native events that reset the ordinary
+    activity age. Only a tool call counts here, so a resume that ends
+    without work never extends a holder's apparent activity.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose hook events are read.
+
+    Returns:
+        Seconds since the lane's latest recorded tool call, or None when no
+        tool call is retained or the event log cannot be read.
+    """
+    from agent_parley import checkpoints
+
+    try:
+        events = checkpoints.read_events(directory, name)
+    except (BridgeError, OSError, ValueError):
+        return None
+    stamps = [
+        float(entry.get("ts", 0) or 0)
+        for entry in events
+        if entry.get("event") in TOOL_EVENTS
+    ]
+    if not stamps:
+        return None
+    return max(0.0, time.time() - max(stamps))
+
+
+def holder_silent(
+    directory: Path, name: str, observed: dict, window: float
+) -> bool:
+    """Reports whether a claim holder has stopped doing work.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant holding the claim.
+        observed: Presence reading for that participant.
+        window: Seconds without a tool call that count as silence.
+
+    Returns:
+        Whether the holder's session process is gone, or its latest tool call
+        is older than the window. A holder with no retained tool call falls
+        back to whether its presence evidence is stale.
+    """
+    if observed.get("process_alive") is False:
+        return True
+    silence = tool_silence(directory, name)
+    if silence is None:
+        return bool(observed.get("stale"))
+    return silence >= window
+
+
+def _overdue_peer(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    config: dict,
+    observations: dict[str, dict],
+    holder: str,
+) -> str | None:
+    """Chooses the peer an overdue claim is offered to.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant.
+        holder: Participant holding the overdue claim.
+
+    Returns:
+        The fit, running peer that owns the fewest claims, ties broken by
+        name, or None when no peer qualifies.
+    """
+    ledger = issues.snapshot(directory)["issues"].values()
+    candidates = []
+    for name, participant in manifest["participants"].items():
+        observed = observations.get(name) or {}
+        if (
+            name == holder
+            or roster.retired(participant)
+            or participant.get("paused", False)
+            or observed.get("process_alive") is False
+        ):
+            continue
+        if not fit(home, directory, manifest, name, config["stalled_after"])[
+            "fit"
+        ]:
+            continue
+        owned = sum(1 for record in ledger if record.get("owner") == name)
+        candidates.append((owned, name))
+    return min(candidates)[1] if candidates else None
+
+
+def _overdue_summary(
+    number: str, holder: str, overdue: int, checkpoint: dict
+) -> str:
+    """Words the handoff summary of a supervisor offer for an overdue claim.
+
+    Args:
+        number: Issue number being offered.
+        holder: Participant that held the claim.
+        overdue: Seconds the claim is past its deadline.
+        checkpoint: Recovery checkpoint captured for the claim, or empty.
+
+    Returns:
+        One paragraph naming the cause and the checkpoint to resume from.
+    """
+    text = (
+        f"Supervisor offer: issue #{number} is overdue by {overdue}s and "
+        f"{holder} stayed silent after a wake."
+    )
+    if not checkpoint:
+        return f"{text} No recovery checkpoint could be captured."
+    artifact = checkpoint.get("artifact") or {}
+    return (
+        f"{text} Recovery checkpoint {checkpoint['id']} holds its work at "
+        f"{checkpoint.get('worktree_commit', '')} on branch "
+        f"{checkpoint.get('branch') or '(detached)'}; bundle "
+        f"{artifact.get('reference', '')}."
+    )
+
+
+def _overdue_step(
+    directory: Path, number: str, identifier: str, step: str | None
+) -> None:
+    """Records one overdue-claim step in the claim history and its attempts.
+
+    Args:
+        directory: Private project state directory.
+        number: Issue number the step applies to.
+        identifier: Claim generation the step belongs to.
+        step: Step taken, or None to clear the recorded recovery.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        record = ledger["issues"].get(number)
+        if not record:
+            return
+        if step is None:
+            if not record.pop("overdue_recovery", None):
+                return
+        else:
+            now = time.time()
+            record["overdue_recovery"] = {
+                "id": identifier,
+                "step": step,
+                "at": now,
+            }
+            record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+            record.setdefault("history", []).append(
+                {
+                    "action": f"overdue-{step}",
+                    "actor": "supervisor",
+                    "at": now,
+                    "owner": record.get("owner"),
+                    "offer": record.get("offer"),
+                    "claim_id": record.get("claim_id"),
+                }
+            )
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+
+
+def overdue_claims(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    config: dict,
+    observations: dict[str, dict],
+) -> None:
+    """Moves a claim that is overdue while its holder does no work.
+
+    A deadline used to report and never transfer, and the report was injected
+    into the holder's own next hook. A holder that stopped working runs no
+    hook, so the report was never read and the claim sat overdue for days
+    while fresh lanes found nothing to take. A claim that is past its deadline
+    while its holder is silent now gets a terminating transition: one wake,
+    then an offer to the fittest peer with the claim's recovery checkpoint
+    attached, then release to the pool once that offer expires. Each step is
+    recorded in the claim history and counted in its attempts.
+
+    Silence is measured from tool calls, so a supervisor resume that ends
+    without work does not reset it. A holder that runs a tool again, or a
+    claim that is no longer overdue, drops the recorded recovery, and the
+    next breach starts over from the wake.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant for this poll.
+    """
+    from agent_parley import recovery
+
+    window = config["inactive_after"]
+    now = time.time()
+    ledger = issues.snapshot(directory)["issues"]
+    for number, record in ledger.items():
+        holder = record.get("owner")
+        current = record.get("overdue_recovery") or {}
+        identifier = f"{number}:{record.get('claim_id')}"
+        timing = issues.deadline_state(record, now)
+        if (
+            holder not in manifest["participants"]
+            or not record.get("claim_id")
+            or not timing["overdue"]
+            or not holder_silent(
+                directory, holder, observations.get(holder) or {}, window
+            )
+        ):
+            if current:
+                _overdue_step(directory, number, identifier, None)
+            continue
+        elapsed = now - float(current.get("at", 0) or 0)
+        if current.get("id") != identifier:
+            _overdue_step(directory, number, identifier, "wake")
+        elif current.get("step") == "wake" and elapsed >= window:
+            peer = _overdue_peer(
+                home, directory, manifest, config, observations, holder
+            )
+            if peer is None:
+                _overdue_step(directory, number, identifier, "release")
+                issues.change(
+                    directory,
+                    holder,
+                    "release",
+                    number,
+                    participants=set(manifest["participants"]),
+                )
+                continue
+            checkpoint: dict = {}
+            with contextlib.suppress(BridgeError, OSError, ValueError):
+                checkpoint = next(
+                    (
+                        item
+                        for item in recovery.capture(
+                            directory, manifest, holder
+                        )
+                        if item.get("claim_id") == record.get("claim_id")
+                    ),
+                    {},
+                )
+            if record.get("offer"):
+                issues.change(
+                    directory,
+                    holder,
+                    "cancel",
+                    number,
+                    participants=set(manifest["participants"]),
+                )
+            issues.change(
+                directory,
+                holder,
+                "offer",
+                number,
+                participants=set(manifest["participants"]),
+                to=peer,
+                summary=_overdue_summary(
+                    number, holder, timing["overdue_seconds"], checkpoint
+                ),
+                carried={
+                    "commit": checkpoint.get("worktree_commit", ""),
+                    "remaining": checkpoint.get("remaining", []),
+                },
+                defaults=manifest.get("deadlines") or {},
+            )
+            _overdue_step(directory, number, identifier, "offer")
+        elif current.get("step") == "offer":
+            offer = record.get("offer") or {}
+            expired = (
+                issues.offer_state(offer, now)["overdue"]
+                if offer.get("deadline")
+                else elapsed >= config["stalled_after"]
+            )
+            if offer and not expired:
+                continue
+            _overdue_step(directory, number, identifier, "release")
+            if offer:
+                issues.change(
+                    directory,
+                    holder,
+                    "cancel",
+                    number,
+                    participants=set(manifest["participants"]),
+                )
+            issues.change(
+                directory,
+                holder,
+                "release",
+                number,
+                participants=set(manifest["participants"]),
+            )
 
 
 def dialog_waiting(directory: Path, name: str) -> bool:
@@ -2802,6 +3236,14 @@ def poll(home: Path, directory: Path) -> None:
     A project whose root checkout no longer exists is handed to
     `missing_root` and polled no further, because every other step reads
     Git or wakes a lane that has no repository left to work in.
+
+    Every stage after the manifest is read runs isolated from the others. One
+    stage that raises used to skip every later one, so a single malformed
+    record stopped the wake loop and lane reclaim for the whole project while
+    the service still reported healthy. A failing stage is now recorded, the
+    rest of the poll still runs, and the failures are published beside the
+    issue ledger where status and problems report them; a poll in which every
+    stage succeeded clears that record.
     """
     manifest = roster.read(directory)
     config = configuration(home, manifest)
@@ -2809,12 +3251,70 @@ def poll(home: Path, directory: Path) -> None:
         missing_root(home, directory, manifest, config)
         return
     (directory / ROOT_PUBLICATION).unlink(missing_ok=True)
-    launches(directory, manifest, config)
-    refresh_readings(home, manifest, 2 * config["interval"])
+    failures: list[str] = []
+
+    def stage(label: str, call: Callable[..., object], *args: object) -> None:
+        """Runs one poll stage, recording rather than raising its failure."""
+        try:
+            call(*args)
+        except (BridgeError, OSError, ValueError, sqlite3.Error) as exc:
+            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+
+    stage("launches", launches, directory, manifest, config)
+    stage("readings", refresh_readings, home, manifest, 2 * config["interval"])
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
     }
+    stage("presence", _publish_presence, home, manifest, observations)
+    with contextlib.suppress(BridgeError, sqlite3.Error):
+        store.reclaim_expired(home, manifest["root"])
+    stage("deliveries", deliveries, home, directory, manifest)
+    stage("dependencies", lifecycle.settle_dependencies, directory)
+    if config["prompts"]:
+        _remind(home, directory, manifest, config, observations, stage)
+        stage("work", work, home, directory, manifest, config)
+        stage(
+            "overdue claims",
+            overdue_claims,
+            home,
+            directory,
+            manifest,
+            config,
+            observations,
+        )
+    if config["wake"]:
+        for name, participant in manifest["participants"].items():
+            if participant.get("wake", True):
+                stage(
+                    f"wake {name}",
+                    wake,
+                    home,
+                    directory,
+                    manifest,
+                    name,
+                    observations[name],
+                    config,
+                )
+    if config["reclaim"]:
+        stage("reclaim lanes", reclaim_lanes, home, directory, manifest)
+    if failures:
+        issues.note_supervision_error(directory, "; ".join(failures))
+    else:
+        with contextlib.suppress(OSError):
+            (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
+
+
+def _publish_presence(
+    home: Path, manifest: dict, observations: dict[str, dict]
+) -> None:
+    """Stores this poll's presence reading for every lane.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        observations: Presence reading per participant.
+    """
     with store.connect(home, write=True, timeout=0) as db:
         for name, participant in manifest["participants"].items():
             observed = observations[name]
@@ -2834,64 +3334,78 @@ def poll(home: Path, directory: Path) -> None:
                     participant["display"],
                 ),
             )
-    with contextlib.suppress(BridgeError, sqlite3.Error):
-        store.reclaim_expired(home, manifest["root"])
-    deliveries(home, directory, manifest)
-    lifecycle.settle_dependencies(directory)
-    if config["prompts"]:
-        closed: set[str] = set()
-        ended: dict[str, dict] = {}
-        ledger = issues.snapshot(directory)
-        for name, participant in manifest["participants"].items():
-            claimed = {
-                number: claimed_since(record)
-                for number, record in ledger["issues"].items()
-                if record.get("owner") == name
-            }
-            if not claimed:
-                continue
-            completion = forge.branch_completion(
-                Path(manifest["root"]), participant["branch"]
-            )
-            if completion is None or completion[0] not in {"MERGED", "CLOSED"}:
-                continue
-            for number, since in claimed.items():
-                if completion[1] < since:
-                    continue
-                closed.add(number)
-                ended[number] = {
-                    "branch": participant["branch"],
-                    "state": completion[0],
-                    "observed_at": time.time(),
-                }
-        reminders(directory, manifest, closed)
-        deadline_notices(directory, manifest)
-        acknowledgement_deadlines(home, directory, manifest, observations)
-        share_bounces(home, directory, manifest, observations)
-        orphans(home, directory, manifest, config)
-        with contextlib.suppress(OSError):
-            (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
-        observe_responses(home, directory, manifest)
-        completion_escalations(
-            directory,
-            manifest,
-            ended,
-            int(
-                config.get(
-                    "completion_reminders", DEFAULTS["completion_reminders"]
-                )
-            ),
-            float(config["inactive_after"]),
+
+
+def _remind(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    config: dict,
+    observations: dict[str, dict],
+    stage: Callable[..., None],
+) -> None:
+    """Runs the reminder and escalation stages of one poll, each isolated.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: This poll's presence reading per participant.
+        stage: Runner that records a raising stage instead of propagating it.
+    """
+    closed: set[str] = set()
+    ended: dict[str, dict] = {}
+    ledger = issues.snapshot(directory)
+    for name, participant in manifest["participants"].items():
+        claimed = {
+            number: claimed_since(record)
+            for number, record in ledger["issues"].items()
+            if record.get("owner") == name
+        }
+        if not claimed:
+            continue
+        completion = forge.branch_completion(
+            Path(manifest["root"]), participant["branch"]
         )
-        work(home, directory, manifest, config)
-    if config["wake"]:
-        for name, participant in manifest["participants"].items():
-            if participant.get("wake", True):
-                wake(
-                    home, directory, manifest, name, observations[name], config
-                )
-    if config["reclaim"]:
-        reclaim_lanes(home, directory, manifest)
+        if completion is None or completion[0] not in {"MERGED", "CLOSED"}:
+            continue
+        for number, since in claimed.items():
+            if completion[1] < since:
+                continue
+            closed.add(number)
+            ended[number] = {
+                "branch": participant["branch"],
+                "state": completion[0],
+                "observed_at": time.time(),
+            }
+    stage("reminders", reminders, directory, manifest, closed)
+    stage("deadline defaults", deadline_defaults, directory, manifest)
+    stage("deadline notices", deadline_notices, directory, manifest)
+    stage(
+        "acknowledgements",
+        acknowledgement_deadlines,
+        home,
+        directory,
+        manifest,
+        observations,
+    )
+    stage(
+        "share bounces", share_bounces, home, directory, manifest, observations
+    )
+    stage("orphans", orphans, home, directory, manifest, config)
+    stage("responses", observe_responses, home, directory, manifest)
+    stage(
+        "completion escalations",
+        completion_escalations,
+        directory,
+        manifest,
+        ended,
+        int(
+            config.get("completion_reminders", DEFAULTS["completion_reminders"])
+        ),
+        float(config["inactive_after"]),
+    )
 
 
 def observe_responses(home: Path, directory: Path, manifest: dict) -> None:
@@ -3007,27 +3521,22 @@ def _work_backlog(
 def _lane_activity(
     home: Path, directory: Path, manifest: dict, name: str
 ) -> dict:
-    """Marks what the lane itself did, for comparison across wake attempts.
+    """Marks the progress the lane made, for comparison across wake attempts.
 
-    A lane can work for far longer than one wake window without changing the
-    state of the issue it was offered, so an offer's progress digest cannot
-    separate a busy lane from a silent one. Every signal read here is work the
-    lane performed: the newest tool or turn-end event it recorded, and the last
-    message it sent. A report, a commit on the claim branch and a message are
-    all tool calls, so the event log already carries them; the store reading is
-    kept beside it because a lane whose hooks are not installed still leaves
-    the messages it sent. Nothing here starts a process: the wake path must not
-    make a lane's own activity depend on a Git call that can time out.
+    Progress is a change in the work, never a hook event. Every wake turn a
+    lane answers ends in a `Stop`, so counting hook events reset the attempt
+    count on every wake and a lane holding a claim while waiting on CI was
+    woken every window forever with its escalation unreachable. A wake turn
+    that only reads and stops is therefore an attempt, and only these count
+    as progress: a commit or other move of the lane's `HEAD`, a lifecycle
+    transition, report or ownership change on an issue the lane holds, and a
+    file reservation it took.
 
-    Only `WORK_EVENTS` count. Session starts, prompt submissions, permission
-    requests, wake records and notification failures are produced by the
-    runtime, by a resumed launcher or by the very dialog an operator is being
-    told about, so counting them would make a stuck lane look busy and an
-    escalation unreachable.
-
+    Nothing here starts a process: the `HEAD` reading is the size of its
+    reflog, so the wake path never depends on a Git call that can time out.
     Each reading is best effort and contributes nothing when it cannot be
-    taken. An event log held by maintenance and a store that cannot be opened
-    must neither fail the wake nor invent activity the lane did not produce.
+    taken, so a store that cannot be opened neither fails the wake nor
+    invents progress the lane did not make.
 
     Args:
         home: Private bridge state root.
@@ -3036,37 +3545,42 @@ def _lane_activity(
         name: Participant that owns the lane.
 
     Returns:
-        Comparable activity marker for the lane, whose values change only when
-        the lane acts.
+        Comparable progress marker for the lane, whose values change only
+        when the lane moves its work.
     """
     from agent_parley import checkpoints
 
     participant = manifest.get("participants", {}).get(name) or {}
-    marker: dict = {"events": 0.0, "message": 0}
-    entries: list[dict] = []
-    with contextlib.suppress(BridgeError, OSError):
-        entries = checkpoints.read_events(directory, name)
-    marker["events"] = max(
-        (
-            float(entry["ts"])
-            for entry in entries
-            if str(entry.get("event", "")) in WORK_EVENTS
-            and type(entry.get("ts")) in (int, float)
-        ),
-        default=0.0,
-    )
+    marker: dict = {"head": 0, "claims": "", "reservation": 0}
+    if lane := participant.get("lane"):
+        marker["head"] = checkpoints.head_moves(Path(lane))
+    with contextlib.suppress(BridgeError, OSError, ValueError):
+        ledger = issues.snapshot(directory)
+        held = [
+            [
+                number,
+                record.get("claim_id"),
+                record.get("execution"),
+                len(record.get("history") or []),
+            ]
+            for number, record in sorted(ledger["issues"].items())
+            if record.get("owner") == name
+        ]
+        marker["claims"] = hashlib.sha256(
+            json.dumps(held, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
     display = participant.get("display", "")
     if display:
         with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
             with store.connect(home) as db:
                 row = db.execute(
-                    "SELECT MAX(m.id) AS sent FROM messages m "
-                    "JOIN agents a ON a.id=m.sender_id "
+                    "SELECT MAX(r.id) AS taken FROM file_reservations r "
+                    "JOIN agents a ON a.id=r.agent_id "
                     "JOIN projects p ON p.id=a.project_id "
                     "WHERE p.human_key=? AND a.name=?",
                     (manifest.get("root", ""), display),
                 ).fetchone()
-            marker["message"] = int((row["sent"] if row else 0) or 0)
+            marker["reservation"] = int((row["taken"] if row else 0) or 0)
     return marker
 
 
@@ -3183,6 +3697,8 @@ def _wake_due(
     The delay doubles with each attempt already spent, so a lane that answered
     nothing is asked again less often instead of being asked on every poll, and
     a cause that names its own clearing time postpones the attempt until then.
+    The delay stops doubling at `WAKE_BACKOFF_CEILING`, so a lane past its
+    budget is asked hourly rather than never.
 
     Args:
         at: Time of the last recorded attempt.
@@ -3193,12 +3709,46 @@ def _wake_due(
     Returns:
         Unix time from which the next attempt may be made.
     """
-    delay = window * 2 ** max(attempts - 1, 0)
+    delay = min(window * 2 ** max(attempts - 1, 0), WAKE_BACKOFF_CEILING)
     return max(at + delay, ready_at)
 
 
+def _instant(value: object) -> TypeGuard[float]:
+    """Reports whether a recorded value is a Unix time rather than absent."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def exhaustion_probe_due(observation: dict, window: float) -> float:
+    """Times the next probe of an exhaustion that named no reset.
+
+    A provider usage limit lasts hours, not days, but a client that shows the
+    limit without a reset time gives nothing a wake could wait for, and a
+    lane parked on that dialog produces no hook event that could clear it.
+    Such an exhaustion is probed instead: first one inactivity window after
+    it was observed, then after twice the window, doubling to one hour and
+    hourly after that, each probe measured from the last one.
+
+    Args:
+        observation: Durable exhausted capacity observation with no reset.
+        window: Inactivity window the probes are spaced by.
+
+    Returns:
+        Unix time from which the next probe wake may be made.
+    """
+    probes = int(observation.get("probes") or 0)
+    last = observation.get("probed_at")
+    if not _instant(last):
+        last = observation.get("observed_at") or 0.0
+    return float(last) + min(window * 2**probes, WAKE_BACKOFF_CEILING)
+
+
 def _wake_block(
-    directory: Path, name: str, state: dict, observed: dict, record: dict
+    directory: Path,
+    name: str,
+    state: dict,
+    observed: dict,
+    record: dict,
+    window: float,
 ) -> tuple[str, float]:
     """Names what stops a wake attempt now and when it could clear.
 
@@ -3206,13 +3756,23 @@ def _wake_block(
     only on a lane that could answer it. Capacity is read from the durable
     observation, never from elapsed time, and blocks only while the provider
     named a reset still ahead, because the attempt after that reset is itself
-    the evidence that the lane is back. A lane whose screen state is not idle
-    or stopped while its recorded process runs is working or parked on a native
-    dialog it owns, and the dialog watcher publishes into the same activity
-    state, so answering the dialog clears this cause with no change here. A
-    lane with no running process and no session to resume is blocked only once
-    its first attempt has already recorded that, so the refusal is reported
-    before the cause starts sparing the budget.
+    the evidence that the lane is back. An exhaustion that named no reset is
+    given one by `exhaustion_probe_due`, so a lane parked on a usage-limit
+    dialog is probed on a bounded backoff instead of never. A lane whose
+    screen state is not idle or stopped while its recorded process runs is
+    working or parked on a native dialog it owns, and the dialog watcher
+    publishes into the same activity state, so answering the dialog clears
+    this cause with no change here. That label blocks only while the presence
+    reading is current: once it has aged past the inactivity window with no
+    tool call in flight, it is a label a dropped hook left behind rather than
+    a turn in progress, and the attempt is made. An approval prompt is the
+    exception: it records no hook until it is answered, so it blocks however
+    old it is, and a wake never types into it. The launcher still refuses a
+    lane that is genuinely busy, and a busy refusal spends no budget. The
+    cause carries the label's age, so a block that holds does not read as
+    fresh. A lane with no running process and no session to resume is
+    blocked only once its first attempt has already recorded that, so the
+    refusal is reported before the cause starts sparing the budget.
 
     A launch marked not started is blocked before any of that. It has no session
     to resume and no client that could read an injected prompt, so it is a lane
@@ -3227,6 +3787,7 @@ def _wake_block(
         state: The lane's published activity state.
         observed: The lane's presence reading.
         record: The lane's last durable wake record.
+        window: Inactivity window the attempts are spaced by.
 
     Returns:
         The blocking cause, empty when an attempt can be made, and the earliest
@@ -3235,10 +3796,12 @@ def _wake_block(
     observation = published_capacity(directory, name)
     allowed, reason = _capacity_check(observation)
     reset_at = observation.get("reset_at")
+    if observation["state"] == "exhausted" and not _instant(reset_at):
+        reset_at = exhaustion_probe_due(observation, window)
+        reason += f"; next try at {int(reset_at)}"
     if (
         allowed is False
-        and isinstance(reset_at, (int, float))
-        and not isinstance(reset_at, bool)
+        and _instant(reset_at)
         and float(reset_at) > time.time()
     ):
         return reason, float(reset_at)
@@ -3246,8 +3809,14 @@ def _wake_block(
     if activity == NOT_STARTED:
         waited = (state.get("not_started") or {}).get("deadline", 0)
         return f"it never started within {int(waited)}s of its launch", 0.0
-    if activity not in WAKE_READY and observed["process_alive"]:
-        return f"its screen state is {activity}", 0.0
+    if (
+        activity not in WAKE_READY
+        and observed["process_alive"]
+        and (not observed.get("stale") or activity == "waiting for approval")
+    ):
+        age = observed.get("age_seconds")
+        held = f" ({int(age) // 60}m)" if age is not None else ""
+        return f"its screen state is {activity}{held}", 0.0
     if (
         observed["process_alive"] is False
         and not state.get("session_id")
@@ -3296,9 +3865,6 @@ def _defer_wake(
         with contextlib.suppress(OSError, ValueError):
             record = json.loads(path.read_text())
         if not isinstance(record, dict) or not record.get("result"):
-            return
-        if record.get("exhausted_at"):
-            _park_wake(path, record, cause, None)
             return
         _park_wake(
             path,
@@ -3368,18 +3934,20 @@ def wake(
     `busy` reason is spaced like any other but does not count against the
     bound, because the lane never received a turn to decline; it is asked
     again once it is idle. A non-idle activity label blocks a wake only while
-    its recorded process remains alive. A session with no trustworthy process
-    identity records a manual-attention refusal and is never presumed dead.
+    its recorded process remains alive and the label has not gone stale. A
+    session with no trustworthy process identity records a manual-attention
+    refusal and is never presumed dead.
 
-    The attempt bound counts silence, not elapsed wakes. A lane accepts an
-    offer and then works for as long as the work takes, which can span several
-    wake windows without moving the offer's progress digest, so the digest is
-    no longer what the bound is judged on. Each attempt records the lane's own
-    activity marker, and an attempt that finds the marker changed resets the
-    count to zero and clears any escalation on the offer, whether or not this
-    pass goes on to ask for a turn. Only a lane that recorded nothing across
-    the whole bound is escalated, because only then is there something an
-    operator has to do.
+    The attempt bound counts wakes without progress. Each attempt records the
+    lane's progress marker from `_lane_activity`: its `HEAD` moves, the state
+    of the claims it holds and the reservations it took. An attempt that finds
+    the marker changed resets the count to zero and clears any escalation on
+    the offer, whether or not this pass goes on to ask for a turn. A wake
+    turn that only reads and stops leaves the marker as it was, so it is an
+    attempt, and a lane that made no progress across the whole bound is
+    escalated once, because only then is there something an operator has to
+    do. A lane that is working is never woken, because a wake needs the lane
+    quiet past the inactivity window.
 
     A spent attempt is not the end of the series. Every poll re-decides the
     lane against what it can read locally: durable provider capacity, the
@@ -3388,9 +3956,12 @@ def wake(
     is due, and spends nothing, so the budget is not consumed while nothing
     could have answered. When the cause clears, the next attempt is due one
     doubling window after the last one, or at the provider reset the capacity
-    observation named, whichever is later. Only a lane that has actually spent
-    its whole budget is recorded as exhausted, and it keeps the last cause and
-    result for the operator instead of a next time it will never have.
+    observation named, whichever is later. A lane that has actually spent its
+    whole budget is recorded as exhausted and escalated once, and waking then
+    backs off rather than stopping: the doubling continues to one hour and
+    stays hourly, so a lane is never parked forever and never re-prompted
+    every window either. An exhausted lane's claims are also eligible for the
+    overdue-claim transition in `overdue_claims`.
 
     A durable retryable capacity observation is itself a backlog reason, so a
     lane whose client stopped on a transient provider error resumes on this
@@ -3425,7 +3996,9 @@ def wake(
         if wake_path.exists():
             published = json.loads(wake_path.read_text())
             parked = published if isinstance(published, dict) else {}
-    blocked, ready_at = _wake_block(directory, name, state, observed, parked)
+    blocked, ready_at = _wake_block(
+        directory, name, state, observed, parked, window
+    )
     if blocked:
         _defer_wake(directory, name, blocked, ready_at, window)
         return
@@ -3465,6 +4038,13 @@ def wake(
         record["offer"]["id"]
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
+    )
+    backlog.extend(
+        f"overdue:{recovery['id']}"
+        for record in ledger
+        if record.get("owner") == name
+        and (recovery := record.get("overdue_recovery") or {}).get("step")
+        == "wake"
     )
     capacity = published_capacity(directory, name)
     if capacity["state"] == "retryable":
@@ -3510,9 +4090,10 @@ def wake(
             record.pop("exhausted_at", None)
             record.update(attempts=0, activity=marker, blocked="", next_at=None)
             write_json(wake_path, record)
-        if attempts >= WORK_WAKE_ATTEMPTS:
+        spent_before = attempts >= WORK_WAKE_ATTEMPTS
+        if spent_before:
             if not record.get("exhausted_at"):
-                record.update(exhausted_at=time.time(), next_at=None)
+                record.update(exhausted_at=time.time())
                 write_json(wake_path, record)
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
@@ -3528,7 +4109,6 @@ def wake(
                     result,
                     "escalated",
                 )
-            return
         due = _wake_due(float(throttle_at), int(attempts), ready_at, window)
         if time.time() < due:
             if record.get("result"):
@@ -3575,6 +4155,7 @@ def wake(
                         )
                     track_launcher(child)
                     result = f"resume requested (launcher {child.pid})"
+        probe_exhaustion(directory, name, result)
         counted = attempts + (not result.startswith("busy"))
         now = time.time()
         spent = counted >= WORK_WAKE_ATTEMPTS
@@ -3588,13 +4169,16 @@ def wake(
                 "result": result,
                 "activity": marker,
                 "blocked": "",
-                "next_at": (
-                    None if spent else _wake_due(now, counted, 0.0, window)
+                "next_at": _wake_due(now, counted, 0.0, window),
+                "exhausted_at": (
+                    (record.get("exhausted_at") or now) if spent else None
                 ),
-                "exhausted_at": now if spent else None,
+                "escalated_at": (
+                    record.get("escalated_at") if spent_before else None
+                ),
             },
         )
-        if work_offer:
+        if work_offer and not spent_before:
             _write_work_dispatch(
                 directory,
                 name,
@@ -3624,7 +4208,14 @@ def run(home: Path, stopped: threading.Event) -> None:
 
     Per-project failures are isolated from coordination calls. Observations
     become visibly stale if polling fails; they never grant ownership.
+
+    A failure is never silent. A poll that raised, and every stage a poll
+    isolated, is written to the service log and to the project's supervision
+    error record, which status and problems report, so a supervisor that
+    fails on every tick is distinguishable from a healthy one.
     """
+    from agent_parley import server
+
     deadlines: dict[Path, float] = {}
     while not stopped.is_set():
         for path in (home / "projects").glob("*/project.json"):
@@ -3633,12 +4224,20 @@ def run(home: Path, stopped: threading.Event) -> None:
             if time.monotonic() < deadlines.get(path, 0):
                 continue
             interval = DEFAULTS["interval"]
-            with contextlib.suppress(
-                OSError, ValueError, BridgeError, sqlite3.Error
-            ):
+            try:
                 manifest = roster.read(path.parent)
                 interval = configuration(home, manifest)["interval"]
                 poll(home, path.parent)
+            except (OSError, ValueError, BridgeError, sqlite3.Error) as exc:
+                issues.note_supervision_error(
+                    path.parent, f"poll: {type(exc).__name__}: {exc}"
+                )
+            if error := issues.supervision_error(path.parent):
+                server.log(
+                    home,
+                    "supervision",
+                    f"{path.parent.name}: {error['detail']}",
+                )
             deadlines[path] = time.monotonic() + interval
         reap_launchers()
         stopped.wait(1)
