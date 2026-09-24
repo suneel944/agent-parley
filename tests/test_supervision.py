@@ -185,6 +185,21 @@ def test_a_lane_with_a_live_process_is_never_reported_stopped(tmp_path):
     )["state"] == (supervision.IDLE)
 
 
+def test_a_lane_held_on_a_published_dialog_reads_waiting(tmp_path):
+    from agent_parley import dialogs
+
+    for recorded in (
+        f"{dialogs.APPROVAL}: Bash",
+        dialogs.MARKER + "Codex hooks-trust",
+    ):
+        live(tmp_path, activity=recorded, updated=time.time())
+        derived = supervision.lane_state(
+            json.loads((tmp_path / "lane-activity.json").read_text()), 300
+        )
+        assert derived["state"] == supervision.WAITING, recorded
+        assert derived["evidence"] == recorded
+
+
 def test_presence_reports_no_age_before_the_first_checkpoint(tmp_path):
     absent = supervision.presence(tmp_path, "lane")
     assert absent["state"] == supervision.STOPPED

@@ -170,10 +170,13 @@ def lane_state(
     A living session process is never described as stopped. A record that
     names a finished session while its process still answers means the client
     is up and waiting for whoever owns its terminal, which is a prompt to
-    answer rather than a session to resume. A session recorded before the
-    host last restarted is dead whatever its process ID now names, because
-    a boot starts every process afresh and a low process ID with matching
-    start ticks is ordinary after one.
+    answer rather than a session to resume. A lane held on a dialog reads
+    as waiting, matched by the prefix each publisher writes: a native
+    approval prompt names its tool after `dialogs.APPROVAL`, and the screen
+    watcher names its dialog after `dialogs.MARKER`. A session recorded
+    before the host last restarted is dead whatever its process ID now
+    names, because a boot starts every process afresh and a low process ID
+    with matching start ticks is ordinary after one.
 
     Args:
         published: Activity record published for the lane, or an empty
@@ -189,6 +192,8 @@ def lane_state(
         derived from, and whether that evidence is stale. The state is one of
         `WORKING`, `IDLE`, `WAITING`, `STOPPED` or `UNKNOWN`.
     """
+    from agent_parley import dialogs
+
     moment = now or time.time()
     pid = published.get("session_pid")
     ticks = published.get("session_ticks")
@@ -227,7 +232,9 @@ def lane_state(
         return reading(WORKING, "running; checkpoints unavailable (relaunch)")
     if stale:
         return reading(IDLE, f"stale; last {activity}")
-    if activity == "waiting for approval":
+    if activity.startswith(f"{dialogs.APPROVAL}:") or activity.startswith(
+        dialogs.MARKER
+    ):
         return reading(WAITING, activity)
     if activity == "stopped":
         return reading(WAITING, "session ended; client process alive")
