@@ -1702,9 +1702,11 @@ def overlapping_paths(paths: list[str], patterns: list[str]) -> set[str]:
     A dirty checkout can list tens of thousands of paths, and one call per
     path and pattern pair costs a second on every reading. A plain pattern
     is answered instead with one set lookup for itself, one for each
-    directory above it, and one prefix scan for the paths under it; only a
-    glob or a named resource, on either side, falls back to the pairwise
-    rule.
+    directory above it, and one prefix scan for the paths under it. A glob
+    pattern is compiled once and matched against every plain path, and
+    collides with every globbed path. A named resource overlaps only its own
+    spelling, so either side being one is answered by a set lookup; only a
+    globbed path checked against a plain pattern uses the pairwise rule.
 
     Args:
         paths: Reservation keys or repository-relative paths.
@@ -1723,17 +1725,32 @@ def overlapping_paths(paths: list[str], patterns: list[str]) -> set[str]:
     for path in paths:
         trimmed.setdefault(path.rstrip("/"), []).append(path)
     exact = set(paths)
+    shaped = [path for path in globbed if not named_resource(path)]
+    skipped = set(globbed)
+    plain = [
+        path
+        for path in paths
+        if path not in skipped and not named_resource(path)
+    ]
     found: set[str] = set()
     for pattern in patterns:
-        if named_resource(pattern) or any(c in pattern for c in "*?["):
-            found.update(path for path in paths if overlapping(path, pattern))
-            continue
         if pattern in exact:
             found.add(pattern)
+        if named_resource(pattern):
+            continue
         for index, character in enumerate(pattern):
             if character == "/":
                 found.update(trimmed.get(pattern[:index], ()))
         prefix = pattern.rstrip("/") + "/"
+        if any(c in pattern for c in "*?["):
+            matches = re.compile(fnmatch.translate(pattern)).match
+            found.update(shaped)
+            found.update(
+                path
+                for path in plain
+                if matches(path) or path.startswith(prefix)
+            )
+            continue
         found.update(path for path in paths if path.startswith(prefix))
         found.update(path for path in globbed if overlapping(path, pattern))
     return found
