@@ -1282,13 +1282,20 @@ def fit(
         checks and one line naming the first failure.
     """
     return _once_per_poll(
-        ("fit", str(directory), name, after),
-        lambda: _fit_reading(home, directory, manifest, name, after),
+        ("fit", str(directory), name, after, inactive_after),
+        lambda: _fit_reading(
+            home, directory, manifest, name, after, inactive_after
+        ),
     )
 
 
 def _fit_reading(
-    home: Path, directory: Path, manifest: dict, name: str, after: float
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float,
 ) -> dict:
     """Takes the readings behind `fit` for one lane.
 
@@ -1298,6 +1305,8 @@ def _fit_reading(
         manifest: Project manifest holding this participant.
         name: Participant whose lane is being considered.
         after: Seconds after which an unanswered item blocks an offer.
+        inactive_after: Age past which the lane's activity reads as stale,
+            which suspends its acknowledgement debt.
 
     Returns:
         The fitness record `fit` reports.
