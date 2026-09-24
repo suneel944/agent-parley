@@ -43,6 +43,7 @@ if TYPE_CHECKING:
         history,
         inbound,
         issues,
+        lanes,
         lifecycle,
         metrics,
         notify,
@@ -105,6 +106,7 @@ DEFERRED_MODULES = (
     "history",
     "inbound",
     "issues",
+    "lanes",
     "lifecycle",
     "metrics",
     "notify",
@@ -6970,6 +6972,14 @@ reported.
             configuration["stalled_after"],
         )
         idle = metrics.idle_intervals(directory, agent)
+        try:
+            with store.reading(self.home, frame["db"]) as db:
+                condition = lanes.read(db, data["root"], agent)
+        except (sqlite3.Error, BridgeError, OSError):
+            condition = None
+        liveness = participant_liveness(
+            directory, agent, configuration["inactive_after"]
+        )
         budget = budgets.report(
             self.home, directory, data, agent, frame["usage"]
         )
@@ -6978,9 +6988,12 @@ reported.
             "identity": name,
             "provider": participant["provider"],
             "credential": participant["credential"],
-            "session": participant_liveness(
-                directory, agent, configuration["inactive_after"]
+            "session": (
+                f"{lanes.describe(condition)}; {liveness}"
+                if condition
+                else liveness
             ),
+            "condition": lanes.view(condition),
             "availability": {
                 "state": observed["state"],
                 "activity": observed["activity"],
