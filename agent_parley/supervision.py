@@ -3547,6 +3547,9 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     measuring them walks every file they hold. The state directory's total
     size and the count of worktrees still left for a reclaim are measured
     here once, so `status` reports both without walking the disk itself.
+    Every lane the sweep removed requests the `reclaimed` transition of its
+    state; the transition table refuses it, and records the refusal, for a
+    lane whose state is not `stopped` or `dead`.
 
     Args:
         home: Private bridge state root.
@@ -3580,6 +3583,17 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
                     "forceable": sum(reclaim.forceable(row) for row in left),
                 },
             )
+    removed = [row["participant"] for row in rows if row.get("removed")]
+    if removed:
+        with store.connect(home, write=True) as db:
+            for name in removed:
+                lanes.transition(
+                    db,
+                    manifest["root"],
+                    name,
+                    lanes.RECLAIMED,
+                    evidence="reclaim removed the lane after its work landed",
+                )
 
 
 def reclaim_summary(directory: Path) -> dict:
