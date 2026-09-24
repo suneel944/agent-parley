@@ -144,6 +144,11 @@ query. Every one of them accepts `--json`. The mail readers take `--as NAME`,
 so the message `problems` cites opens from the main checkout: it reads that
 lane's mail and sends, acknowledges and marks nothing on its behalf.
 
+Unread mail never blocks a lane's work: it arrives as context, most relevant
+first. A tool call is refused only when it is unsafe now, such as a write to a
+path a peer reserved. Project news goes to a feed, a broadcast reaches only the
+lanes it concerns, and a newer note on a topic replaces the older one.
+
 When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
 

@@ -772,7 +772,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(
                 )
                 assert result.returncode == 0, result.stderr
                 delivered = json.loads(result.stdout)["hookSpecificOutput"]
-                assert delivered["permissionDecision"] == "deny"
+                assert "permissionDecision" not in delivered
                 assert "session_id" in delivered["additionalContext"]
                 assert (
                     checkpoint(bridge.home, directory, "codex", payload) == {}
@@ -838,11 +838,8 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(
                     "session_id": "claude-test",
                     "cwd": data["lanes"]["claude"],
                 }
-                assert (
-                    checkpoint(bridge.home, directory, "claude", stop)[
-                        "decision"
-                    ]
-                    == "block"
+                assert "decision" not in checkpoint(
+                    bridge.home, directory, "claude", stop
                 )
                 assert (
                     checkpoint(
@@ -1267,6 +1264,9 @@ def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     summary = event_summary(directory, "claude")
     assert summary["events"] == 2
     assert summary["denials"] == 1
+    assert summary["denied_by"] == [
+        {"reason": "branch_drift", "tool": "", "count": 1}
+    ]
     assert summary["injected_bytes"] == 12
     assert summary["last_ts"] == 2.0
     assert summary["last_reason"] == "coordination_pending"
@@ -1704,7 +1704,7 @@ def test_issue_notifications_are_once_per_change_without_empty_reminders(
     notice = checkpoint(bridge.home, directory, "codex", payload)[
         "hookSpecificOutput"
     ]
-    assert notice["permissionDecision"] == "deny"
+    assert "permissionDecision" not in notice
     assert "handoff to codex" in notice["additionalContext"]
     assert checkpoint(bridge.home, directory, "codex", payload) == {}
     reminder = checkpoint(
@@ -1717,12 +1717,11 @@ def test_issue_notifications_are_once_per_change_without_empty_reminders(
     bridge.issue(claude, "cancel", "432")
     stop = {**payload, "hook_event_name": "Stop", "stop_hook_active": True}
     assert checkpoint(bridge.home, directory, "codex", stop) == {}
-    assert (
-        checkpoint(bridge.home, directory, "codex", payload)[
-            "hookSpecificOutput"
-        ]["permissionDecision"]
-        == "deny"
-    )
+    cancelled = checkpoint(bridge.home, directory, "codex", payload)[
+        "hookSpecificOutput"
+    ]
+    assert "permissionDecision" not in cancelled
+    assert cancelled["additionalContext"]
 
 
 def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):

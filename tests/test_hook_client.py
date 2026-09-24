@@ -134,7 +134,7 @@ def test_a_served_decision_equals_the_in_process_decision(
     assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
-def test_a_served_decision_carries_context_and_blocks_completion(
+def test_a_served_decision_carries_context_and_lets_mail_wait_past_stop(
     bridge, repo, paired, service
 ):
     lane = Path(paired["lanes"]["codex"])
@@ -167,10 +167,12 @@ def test_a_served_decision_carries_context_and_blocks_completion(
         },
     )
     stopped = run_hook(bridge, lane.parent, {**STOP, **cwd})
-    assert json.loads(stopped.stdout)["decision"] == "block"
+    assert "decision" not in json.loads(stopped.stdout or "{}")
     recorded = events(lane.parent)
-    assert recorded[-1]["decision"] == "block"
-    assert recorded[-1]["reason_class"] == "coordination_pending"
+    assert recorded[-1]["decision"] != "block"
+    assert (
+        checkpoints.mailbox(bridge.home, paired["root"], "codex")["unread"] == 1
+    )
 
 
 def test_a_served_hook_records_its_foreground_native_process(

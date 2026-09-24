@@ -162,6 +162,28 @@ wake backlog is a bounded digest of the newest message per live thread, capped
 at `WAKE_DIGEST_THREADS`, because the checkpoint context a woken turn receives
 is itself bounded by `MAX_CONTEXT_BYTES` and previews at most three messages.
 
+Pending coordination is context, never a refusal. A checkpoint hands unread
+mail, owed acknowledgements and project news to the turn as additional context
+and lets the tool call run; `Stop` blocks only for an issue or work notice. A
+tool call is denied only when it is unsafe now: a write to a path a peer holds
+under an exclusive reservation, or any non-read-only call while an offer to
+this lane expires within `OFFER_REPLY_SECONDS`. The denial names the path and
+holder, or the exact accept and decline commands. Read-only and diagnostic
+tools are never refused. Mail a checkpoint previewed is marked read.
+
+A message carries a `topic`, `direct` unless the sender names one. A newer
+message from the same sender on the same topic supersedes the recipient's
+unread copy of the older one. The `base` topic, which a subject such as
+`Merged #12` or `main is at abc123` selects, is project news: it goes to a
+feed each lane reads once at session start and in its advance notice, and to
+no mailbox. A broadcast, a send to every other live lane with at least
+`BROADCAST_MIN` recipients, reaches only the lanes it concerns: an
+acknowledgement request, a mention of the lane, or a reservation or claimed
+work the text touches. The rest are reported as `withheld` and read it in the
+feed. A send to a chosen subset is delivered to everyone it names. The preview
+digest orders mail by that relevance and states how many unread and
+superseded messages it left out.
+
 The supervising operator writes from the command line only. `agent-parley say`
 resolves the project and the addressed participant, then takes the ordinary
 send path, so the message is deduplicated by its key, can require an
