@@ -152,6 +152,57 @@ def _content_trees(lane: Path) -> tuple[str, str]:
     return index_tree, worktree_tree
 
 
+def _fingerprint(lane: Path) -> str:
+    """Digests what a capture would record, without writing any object.
+
+    The head commit, the status of every changed or untracked path, and each
+    such path's size and modification time change whenever the index or
+    worktree content does: staging moves a status column, and a file edited
+    again while it stays modified keeps its status line but not its size and
+    modification time, which is why both are read. The status is read
+    without optional locks so the reading itself never rewrites the index.
+    Reading all of this costs one `git status` instead of writing trees and
+    bundles for the whole worktree.
+
+    Args:
+        lane: Assigned worktree being captured.
+
+    Returns:
+        A SHA-256 hex digest of the reading.
+
+    Raises:
+        BridgeError: If Git cannot read the lane.
+    """
+    digest = hashlib.sha256()
+    digest.update(
+        _git(lane, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD")
+    )
+    status = _git(
+        lane,
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    digest.update(status)
+    paths = []
+    skip = False
+    for entry in status.split(b"\0"):
+        if skip or len(entry) < 4:
+            skip = False
+            continue
+        paths.append(lane / os.fsdecode(entry[3:]))
+        skip = entry[:1] in (b"R", b"C")
+    for path in paths:
+        try:
+            observed = path.lstat()
+            digest.update(f"{observed.st_size}:{observed.st_mtime_ns}".encode())
+        except OSError:
+            digest.update(b"absent")
+    return digest.hexdigest()
+
+
 def _tree(lane: Path, revision: str) -> str:
     """Returns the tree object for one verified revision."""
     return _text(lane, "rev-parse", f"{revision}^{{tree}}")
@@ -332,6 +383,35 @@ def capture(
     if not owned:
         return []
     folder = _folder(directory)
+    fingerprint = _fingerprint(lane)
+    step, gate = _step(payload or {})
+    unchanged = []
+    for number, record in owned:
+        identifier = _identifier(number, str(record["claim_id"]))
+        try:
+            previous = json.loads((folder / f"{identifier}.json").read_text())
+        except (OSError, ValueError):
+            break
+        if (
+            previous.get("fingerprint") != fingerprint
+            or not (folder / f"{identifier}.bundle").exists()
+        ):
+            break
+        unchanged.append((record, previous))
+    if len(unchanged) == len(owned):
+        for record, previous in unchanged:
+            handoff = record.get("handoff") or {}
+            offer = record.get("offer") or {}
+            previous["remaining"] = list(
+                handoff.get("remaining") or offer.get("remaining") or []
+            )
+            previous["blockers"] = list(record.get("blocked_by") or [])
+            if payload is not None:
+                previous["last_verified_step"] = step
+            if gate:
+                previous["gate"] = gate
+            write_json(folder / f"{previous['id']}.json", previous)
+        return [previous for _, previous in unchanged]
     descriptor, index_name = tempfile.mkstemp(dir=folder)
     os.close(descriptor)
     temporary_index = Path(index_name)
@@ -342,7 +422,6 @@ def capture(
         temporary_index.unlink(missing_ok=True)
     head = _text(lane, "rev-parse", "HEAD")
     branch = _text(lane, "branch", "--show-current")
-    step, gate = _step(payload or {})
     published = []
     for number, record in owned:
         claim_id = str(record["claim_id"])
@@ -369,6 +448,7 @@ def capture(
             "head": head,
             "index_commit": index_commit,
             "worktree_commit": worktree_commit,
+            "fingerprint": fingerprint,
             "captured_at": time.time(),
             "last_verified_step": (
                 step

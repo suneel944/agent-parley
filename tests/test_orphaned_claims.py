@@ -405,6 +405,49 @@ def test_capture_does_not_reuse_gate_evidence_for_changed_content(
     assert saved["last_verified_step"] == "PostToolUse: Bash"
 
 
+def test_an_unchanged_tree_is_captured_once(bridge, repo, paired, monkeypatch):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    manifest = roster.read(directory)
+    (lane / "draft.txt").write_text("first\n")
+    published = []
+    original = recovery._publish_bundle
+
+    def counted(*args):
+        published.append(args[-1])
+        return original(*args)
+
+    monkeypatch.setattr(recovery, "_publish_bundle", counted)
+    event = {"hook_event_name": "PostToolUse", "tool_name": "Read"}
+
+    first = recovery.capture(directory, manifest, "claude", event)[0]
+    second = recovery.capture(
+        directory,
+        manifest,
+        "claude",
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"cmd": "pytest -q"},
+            "tool_response": {"exit_code": 0},
+        },
+    )[0]
+
+    assert len(published) == 1
+    assert second["worktree_commit"] == first["worktree_commit"]
+    assert second["last_verified_step"] == "PostToolUse: Bash"
+    assert second["gate"]["exit_code"] == 0
+    assert recovery.checkpoint(directory, "42", second["claim_id"]) == second
+
+    (lane / "draft.txt").write_text("second edit, still modified\n")
+    third = recovery.capture(directory, manifest, "claude", event)[0]
+
+    assert len(published) == 2
+    assert third["worktree_commit"] != first["worktree_commit"]
+    assert third["gate"] == {}
+
+
 @pytest.mark.parametrize("boundary", ["head", "index", "worktree"])
 def test_takeover_restore_resumes_after_each_durable_phase(
     bridge, repo, paired, monkeypatch, boundary

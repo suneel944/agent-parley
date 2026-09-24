@@ -1123,9 +1123,13 @@ accepted handoff and attachment and retires its previous generation's mail.
 The checkpoint and its Git bundle live in the private Agent Parley state
 directory. The bundle carries an exact size and SHA-256 digest, so binary and
 large files are referenced rather than embedded in the issue ledger. Ignored
-untracked files are excluded. The old session generation is refused by later
-lifecycle hooks after takeover; this is runtime fencing, not a filesystem
-security boundary against another process writing directly into the old lane.
+untracked files are excluded. Each checkpoint records a fingerprint of the
+lane's HEAD, its porcelain status and the size and modification time of every
+changed path. A hook event that finds the same fingerprint and an existing
+bundle refreshes only the step, gate and blocker fields and writes no new
+commit or bundle, so repeated tool calls on an unchanged tree stay cheap. The
+old session generation is refused by later lifecycle hooks after takeover; this
+is runtime fencing, not a filesystem security boundary against another process writing directly into the old lane.
 
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six
