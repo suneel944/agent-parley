@@ -797,10 +797,11 @@ how long the frame took to read. The view is read-only and makes no model
 call; `q` leaves it.
 
 Like a task manager, the view lists what is live. A lane whose session is
-stopped or retired and which owns no issue, holds or waits on no lease and
-has no unread or unacknowledged mail is left out. So is every lane of a
-project whose root no longer exists, such as a run under `/tmp` after a
-reboot. The header counts what was left out. `a` in the live view and
+stopped or retired and which owns no issue, holds no offer, holds or waits
+on no lease, has no unread or unacknowledged mail and has no ready report
+awaiting approval is left out. So is every lane of a project whose root no
+longer exists, such as a run under `/tmp` after a reboot. A lane whose
+mailbox or lease store could not be read stays on screen. The header counts what was left out. `a` in the live view and
 `--all` on the command line show it again, and `--json` always reports every
 lane. A stopped lane that still holds work stays on screen, because that work
 needs the operator.

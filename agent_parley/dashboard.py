@@ -266,13 +266,17 @@ def dormant(row: dict) -> bool:
 
     Returns:
         True when the lane's session is stopped or retired and it owns no
-        issue, holds or waits on no lease, and has no unread or unacknowledged
-        mail. A mailbox that could not be read is not dormant, so a failed
-        reading stays on screen.
+        issue, holds no offer, holds or waits on no lease, has no unread or
+        unacknowledged mail, and no ready report awaits the operator. A
+        mailbox or lease store that could not be read is not dormant, so a
+        failed reading stays on screen.
     """
     return (
         str(row["state"]).startswith(("stopped", "retired"))
         and not row["owned"]
+        and not row["offers"]
+        and not row["awaiting_approval"]
+        and row.get("usage_read", True)
         and not row["leases"]
         and not row["queued"]
         and row["unread"] == 0
@@ -437,6 +441,7 @@ def _row(
         "unread": mail.get("unread", "?"),
         "superseded": mail.get("superseded", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
+        "usage_read": context.get("usage_read", True),
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
@@ -577,8 +582,10 @@ def collect(
             continue
         try:
             usage = store.usage(home, data["root"])
+            usage_read = True
         except sqlite3.Error:
             usage = {}
+            usage_read = False
         supervised = supervision.configuration(home, data)
         present = Path(data["root"]).is_dir()
         edits, advances = (
@@ -598,6 +605,7 @@ def collect(
         context = {
             "accounts": accounts,
             "usage": usage,
+            "usage_read": usage_read,
             "issues": snapshot(path.parent),
             "branches": branches,
             "records": cache,

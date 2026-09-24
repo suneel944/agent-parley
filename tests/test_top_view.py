@@ -484,6 +484,9 @@ def test_a_stopped_lane_holding_nothing_is_counted_not_drawn():
                 lane("leaser", state=stopped, leases=1),
                 lane("mailed", state=stopped, unread=2),
                 lane("unreadable", state=stopped, unread="?"),
+                lane("offerer", state=stopped, offers=1),
+                lane("approval", state=stopped, awaiting_approval=True),
+                lane("unstored", state=stopped, usage_read=False),
             ],
         )
     )
@@ -491,7 +494,16 @@ def test_a_stopped_lane_holding_nothing_is_counted_not_drawn():
     rendered = dashboard.render(live)
     drawn = {line.split()[0] for line in rendered if line.strip()}
     assert "dead" not in drawn
-    for name in ("worker", "owner", "leaser", "mailed", "unreadable"):
+    for name in (
+        "worker",
+        "owner",
+        "leaser",
+        "mailed",
+        "unreadable",
+        "offerer",
+        "approval",
+        "unstored",
+    ):
         assert name in drawn
     assert live["hidden"] == {"lanes": 1, "projects": 0}
     assert "Hidden: 1 lanes" in text(rendered)
