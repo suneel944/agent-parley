@@ -19,12 +19,15 @@ files it holds, because retiring the lane would drop its claims to clean one
 directory.
 """
 
+import contextlib
 import datetime
 import json
+import sqlite3
 import time
 from pathlib import Path
 
 from agent_parley import dialogs, issues, roster, store, supervision, tables
+from agent_parley.state import BridgeError
 
 STORE = "store"
 SERVICE = "service"
@@ -36,6 +39,8 @@ OFFER = "unanswered offer"
 UNRESOLVED = "unresolved completion"
 ACK = "awaiting acknowledgement"
 BOUNCE = "bounced share"
+RETIRED = "shares to a retired lane"
+RETIRED_WINDOW = 86400
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
 BUDGET = "over budget"
@@ -744,6 +749,52 @@ def _bounce_rows(
     return rows
 
 
+def _retired_rows(home: Path, project: dict) -> list[dict]:
+    """Derives one row per retired lane whose shares retirement superseded.
+
+    Retirement supersedes every delivery the lane still owed, so those
+    shares never bounce; this row says once where they went instead of
+    letting them vanish. It is informational: the shares cannot be answered
+    and nothing moves them back. It lasts only while those shares are inside
+    their acknowledgement deadline, the same bound a bounced share has, and a
+    share recorded without a deadline counts for `RETIRED_WINDOW` seconds
+    after retirement, one day, long enough for an operator returning the
+    next session to read it.
+
+    Args:
+        home: Private bridge state root.
+        project: One project's status reading.
+
+    Returns:
+        Zero or more rows, one per retired lane, carrying the share count.
+    """
+    groups: list[dict] = []
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        groups = store.superseded_shares(home, project["root"], RETIRED_WINDOW)
+    rows = []
+    for group in groups:
+        reason = group["reason"]
+        if not reason.endswith(" retired"):
+            continue
+        name = reason.removesuffix(" retired")
+        count = group["count"]
+        noun = "share" if count == 1 else "shares"
+        rows.append(
+            _row(
+                RETIRED,
+                f"{count} {noun} to {name} superseded: {reason}",
+                "nothing to run; the row clears when those shares' "
+                "acknowledgement deadlines pass",
+                group["waiting_seconds"],
+                name,
+                project["root"],
+                BY_OPERATOR,
+                count,
+            )
+        )
+    return rows
+
+
 def derive(
     home: Path, report: dict, ack_after: float = 0.0, now: float = 0.0
 ) -> list[dict]:
@@ -808,6 +859,7 @@ def derive(
             )
         aged.extend(_offer_rows(project, stamp))
         aged.extend(_bounce_rows(home, directory, data, project, config))
+        aged.extend(_retired_rows(home, project))
     aged.sort(key=lambda row: -(row["seconds"] or 0))
     return rows + aged
 

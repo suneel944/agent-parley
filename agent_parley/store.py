@@ -3939,6 +3939,51 @@ def pending_acknowledgements(home: Path, root: str) -> list[dict]:
     )
 
 
+def superseded_shares(home: Path, root: str, window: int) -> list[dict]:
+    """Groups the superseded acknowledgement requests by the recorded reason.
+
+    Only requests still unanswered and still inside their deadline count,
+    so a group ends when the requests behind it would have stopped being
+    answerable anyway. A request recorded without a deadline counts for
+    ``window`` seconds after it was superseded instead.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        window: Seconds a superseded request without a deadline counts.
+
+    Returns:
+        One entry per supersession reason naming the reason, how many
+        deliveries it covers and how long the oldest request has waited,
+        oldest reason first. A project with no store yet has nothing to
+        report.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home) as db:
+        rows = db.execute(
+            "SELECT r.superseded_reason AS reason,COUNT(*) AS count,"
+            "CAST(MAX(julianday('now')-julianday(m.created_ts))*86400 "
+            "AS INTEGER) AS waiting FROM messages m "
+            "JOIN message_recipients r ON r.message_id=m.id "
+            "JOIN projects p ON p.id=m.project_id "
+            "WHERE p.human_key=? AND m.ack_required=1 AND r.ack_ts IS NULL "
+            "AND r.superseded_ts IS NOT NULL AND ("
+            "m.ack_deadline_ts>datetime('now') OR (m.ack_deadline_ts IS NULL "
+            "AND r.superseded_ts>datetime('now',?))) "
+            "GROUP BY r.superseded_reason ORDER BY waiting DESC",
+            (root, f"-{int(window)} seconds"),
+        ).fetchall()
+    return [
+        {
+            "reason": row["reason"] or "",
+            "count": row["count"],
+            "waiting_seconds": max(0, int(row["waiting"] or 0)),
+        }
+        for row in rows
+    ]
+
+
 def retire_acknowledgement(home: Path, root: str, identifier: int) -> bool:
     """Retires one acknowledgement expectation whose deadline has passed.
 

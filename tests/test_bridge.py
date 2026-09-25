@@ -30,6 +30,7 @@ from agent_parley import (
     forge,
     metrics,
     process,
+    records,
     roster,
     store,
 )
@@ -1161,6 +1162,35 @@ def test_token_reading_survives_a_malformed_session_record(
     assert rows["claude"]["tokens"] == 100
 
 
+def test_token_reading_parses_only_records_that_carry_usage(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude_transcript(
+        tmp_path / "claude_config_dir",
+        paired["lanes"]["claude"],
+        [
+            json.dumps({"type": "user", "message": {"content": "hi"}}),
+            usage_record("msg_a", 10),
+            json.dumps({"type": "tool_result", "content": "x" * 64}),
+        ],
+    )
+    parsed = []
+    loads = json.loads
+
+    def counting(text, *args, **kwargs):
+        if isinstance(text, bytes):
+            parsed.append(text)
+        return loads(text, *args, **kwargs)
+
+    monkeypatch.setattr("agent_parley.records.json.loads", counting)
+    tokens = records.reported_tokens(
+        bridge.home, paired["participants"]["claude"], {}
+    )
+    assert tokens == 100
+    assert [line for line in parsed if b"tool_result" in line] == []
+    assert [line for line in parsed if b'"user"' in line] == []
+
+
 def test_token_reading_follows_a_relocated_credential_home(
     bridge, repo, tmp_path
 ):
@@ -1387,6 +1417,11 @@ def test_issue_crash_releases_operation_lock_but_preserves_owner(
     assert bridge.issue(codex, "claim", "432")["owner"] == "codex"
 
 
+def listed(state: dict) -> str:
+    """Renders the issue listing without its clock-dependent progress ages."""
+    return re.sub(r"; last progress \d+s ago", "", describe(state))
+
+
 def test_issue_dependencies_are_owner_only_and_survive_a_release(
     bridge, repo, paired
 ):
@@ -1418,7 +1453,7 @@ def test_issue_dependencies_are_owner_only_and_survive_a_release(
         "77",
         *(str(extra) for extra in range(100, 99 + MAX_BLOCKERS)),
     ]
-    assert "#432: claude; waits on #77 (codex)" in describe(
+    assert "#432: claude; waits on #77 (codex)" in listed(
         bridge.issue(repo, "list")
     )
     with pytest.raises(BridgeError, match="does not wait on #555"):
@@ -1629,7 +1664,7 @@ def test_issue_claim_records_and_renders_the_forge_title(
         "Title for issue 432"
     )
     assert (
-        describe(bridge.issue(repo, "list"))
+        listed(bridge.issue(repo, "list"))
         == "#432: claude — Title for issue 432"
     )
 
@@ -1646,9 +1681,7 @@ def test_issue_claim_survives_an_unavailable_forge(
         "agent_parley.cli.forge.issue_title", lambda directory, number: ""
     )
     assert "title" not in bridge.issue(claude, "claim", "433")
-    assert describe(bridge.issue(repo, "list")) == (
-        "#432: claude\n#433: claude"
-    )
+    assert listed(bridge.issue(repo, "list")) == "#432: claude\n#433: claude"
 
 
 def test_recorded_issue_title_survives_later_transitions(
@@ -1671,7 +1704,7 @@ def test_recorded_issue_title_survives_later_transitions(
     )
     reclaimed = bridge.issue(codex, "claim", "432")
     assert reclaimed["title"] == "Resolved from the forge"
-    assert "#432: codex — Resolved from the forge; waits on #77" in describe(
+    assert "#432: codex — Resolved from the forge; waits on #77" in listed(
         bridge.issue(repo, "list")
     )
 

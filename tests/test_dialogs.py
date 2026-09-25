@@ -763,6 +763,22 @@ def test_a_quoted_usage_limit_in_output_is_no_dialog(tmp_path):
     assert watch.holding is False
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "  ⎿  Error: usage limit reached\r\n",
+        "  ⎿  usage limit reached in 3 files\r\n",
+        "⏺ Bash(grep ...)\r\n  ⎿  a.log: usage limit reached",
+    ],
+)
+def test_usage_limit_wording_in_tool_output_is_no_dialog(tmp_path, output):
+    assert dialogs.match(dialogs.flatten(output.encode())) is None
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(output.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    assert not (tmp_path / "lane-capacity.json").exists()
+
+
 def test_dialog_words_in_scrollback_are_no_dialog():
     screen = dialogs.flatten((TOOL_PERMISSION + WORKING * 40).encode())
     assert dialogs.match(screen) is None
