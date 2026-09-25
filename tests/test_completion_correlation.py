@@ -289,3 +289,21 @@ def test_the_issue_reading_names_its_closing_pull_request(
     assert forge.issue_completion(tmp_path, "1216") == {"state": "OPEN"}
     monkeypatch.setattr(forge, "_run", lambda *args: None)
     assert forge.issue_completion(tmp_path, "1216") is None
+
+
+def test_a_ready_report_on_an_observed_complete_claim_asks_for_completion(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, "MERGED", time.time() + 1)
+    supervision.poll(bridge.home, claimed.parent)
+    owed = bridge.report(claimed, "ready", "Parser built", "", "make check")
+    assert owed.startswith("Issue #1 is observed complete")
+    assert "`issue resolve 1`" in owed
+
+
+def test_a_ready_report_on_an_open_claim_owes_nothing(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, "OPEN", time.time() + 1)
+    supervision.poll(bridge.home, claimed.parent)
+    assert bridge.report(claimed, "ready", "Parser built", "", "ok") == ""

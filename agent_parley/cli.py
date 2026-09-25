@@ -5102,13 +5102,19 @@ reported.
         issue: str = "",
         resume_on: str = "",
         backlog: int | None = None,
-    ) -> None:
+    ) -> str:
         """Records an explicitly reported outcome independently of activity.
 
         A lane that newly reaches the ready state also posts its account to
         the exact issue reported, so a reviewer reading the forge sees the
         same summary and evidence the lane recorded. The comment is best
         effort and is posted once per arrival at the state.
+
+        A ready report on a claim the supervisor already observed complete,
+        whose pull request ended inside the current ownership generation, is
+        the holder's turn to finish it. The report returns the completion
+        the holder still owes, so it acts in the same turn instead of waiting
+        for the reminder to reach it on a later wake.
 
         Args:
             repo: Assigned agent worktree.
@@ -5125,6 +5131,10 @@ reported.
                 claim itself counts. Recording the count is what lets the
                 supervisor offer a split once this lane goes idle on it. None
                 leaves any recorded count as it stands.
+
+        Returns:
+            The completion the holder owes on an observed-complete claim for
+            a ready report, otherwise an empty string.
 
         Raises:
             BridgeError: If the lane or required report fields are invalid, or
@@ -5181,7 +5191,7 @@ reported.
                 state = json.loads(path.read_text()) if path.exists() else {}
                 if key and (recorded := state.get("retries", {}).get(scope)):
                     retries.replayed(recorded, "report", key, fingerprint)
-                    return
+                    return ""
             lifecycle.record_report(
                 directory,
                 agent,
@@ -5235,6 +5245,25 @@ reported.
             forge.select(repo, data)
             if claim["issue"] is not None:
                 forge.comment(repo, str(claim["issue"]), body)
+        if outcome != "ready" or claim["issue"] is None:
+            return ""
+        number = str(claim["issue"])
+        record = issues.snapshot(directory)["issues"].get(number) or {}
+        prompt = record.get("handoff_prompt") or {}
+        if (
+            prompt.get("trigger") != supervision.ENDED
+            or prompt.get("responded_at")
+            or prompt.get("holder") != agent
+            or record.get("owner") != agent
+        ):
+            return ""
+        waiting = ", ".join(prompt.get("waiting") or []) or "project peers"
+        return (
+            f"Issue #{number} is observed complete: its pull request ended "
+            "during this claim. Complete it now: send the completion message "
+            f"to {waiting} with the commit, verification and remaining work. "
+            f"The operator then ends the claim with `issue resolve {number}`."
+        )
 
     def say(
         self,
@@ -9635,7 +9664,7 @@ def main() -> int:
         elif args.command == "report":
             if not args.state or not args.summary:
                 parser.error("report needs --state and --summary.")
-            bridge.report(
+            owed = bridge.report(
                 args.repo.resolve(),
                 args.state,
                 args.summary,
@@ -9647,6 +9676,8 @@ def main() -> int:
                 backlog=args.backlog,
             )
             print(f"Recorded outcome: {args.state}")
+            if owed:
+                print(owed)
         elif args.command == "say" or (
             args.command == "mail" and args.action == "send"
         ):
