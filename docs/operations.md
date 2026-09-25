@@ -348,7 +348,7 @@ mid-turn:
 ### Triage with `problems`
 
 `doctor` answers whether the installation is consistent and `top` shows every
-lane; `problems` answers what needs an operator right now.
+live lane; `problems` answers what needs an operator right now.
 
 ```sh
 agent-parley problems
