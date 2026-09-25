@@ -10,8 +10,15 @@ runs `participant merge`, and never on an agent's behalf.
 | Module | Responsibility |
 | --- | --- |
 | `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
-| `cli` | Argument parsing and dispatch, plus the `Bridge` command object: native launch, retirement, status, reports, pull requests and operator mail |
+| `cli` | Argument parsing and dispatch, plus the `Bridge` command object that joins the command groups below and keeps lane restore, pause, stop, restart, retirement, reclaim and pull requests |
 | `core` | Base of the `Bridge` command object: the private state root and its configuration, the mail server's start, stop and readiness, the project manifest and the participant lanes it records |
+| `settings` | The per-project settings commands: verification and initialization commands, approval policy, branch naming, issue tracker, declared resources and lane budgets |
+| `integration` | The merge, preview and ordered integration commands, and the operator's approve and reject decisions that gate them |
+| `claims` | The issue commands: claims, handoffs, recovery, assignment, resolution, the next-issue ranking and the recorded work plan |
+| `mail` | Operator mail: steering a lane, acknowledgements, the mailbox, and recorded decisions |
+| `reports` | Ready reports, their review, the event export, the state archive and ownership history |
+| `status` | The `status`, `problems` and `doctor` readings, lane liveness and the per-lane status rows |
+| `launch` | Native launch of a lane: registration, the coordination protocol, the lane hooks and the supervised native client |
 | `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
 | `merges` | Merge refusals, preview and the merge itself, plus the readiness, dependency and group ordering that integration follows |
 | `server` | Authenticated MCP transport and bounded tool contracts |
