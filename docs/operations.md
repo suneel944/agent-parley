@@ -46,6 +46,11 @@ generation (`1`, `2` or `none`) and whether `pidfd_open` is available, so a
 platform gap is read before a lane starts. CI runs the behaviour suite inside
 WSL on a Windows runner as an advisory job; it never blocks a merge.
 
+Native Windows is not supported. The wheel installs there, but every command
+except `--version` exits with status 2 and a line pointing to WSL2, because
+the runtime relies on POSIX file locks, pseudo-terminals and process
+primitives that native Windows does not provide.
+
 ## Daily use
 
 ```sh
