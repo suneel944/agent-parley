@@ -242,3 +242,39 @@ def test_a_claim_without_a_deadline_takes_the_project_default(bridge, paired):
     record = issues.snapshot(directory)["issues"]["7"]
     started = supervision.claimed_since(record)
     assert record["deadline"] == started + 3600
+
+
+def test_a_resume_whose_tool_call_never_completes_does_not_extend_silence(
+    bridge, paired
+):
+    directory = overdue(bridge, paired)
+    events(
+        directory,
+        "claude",
+        ("SessionStart", 40),
+        ("PreToolUse", 30),
+        ("SessionEnd", 10),
+    )
+    live(directory, "claude", 10)
+    assert supervision.tool_silence(directory, "claude") >= 3600
+    observed = supervision.presence(directory, "claude", WINDOW)
+    assert supervision.holder_silent(directory, "claude", observed, WINDOW)
+
+
+def test_a_tool_call_still_running_counts_as_work(bridge, paired):
+    directory = overdue(bridge, paired)
+    events(directory, "claude", ("SessionStart", 40), ("PreToolUse", 30))
+    assert supervision.tool_silence(directory, "claude") < WINDOW
+
+
+def test_issue_list_names_a_claim_without_a_deadline(bridge, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
+    edit(directory, "7", lambda record: record.update(deadline=None))
+    listing = issues.describe(issues.snapshot(directory))
+    assert listing.startswith("#7: claude;")
+    assert listing.endswith("; no deadline")
+    edit(directory, "7", lambda record: record.update(deadline=1e12))
+    assert "no deadline" not in issues.describe(issues.snapshot(directory))
