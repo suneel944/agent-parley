@@ -281,3 +281,36 @@ def test_the_run_never_writes_into_the_state_home(tmp_path):
     record(frames, [lane_frame(False, [], 0, True)])
     acceptance.verdict(shim(tmp_path), home, repo, LANES, 1, frames)
     assert sorted(os.listdir(home)) == before
+
+
+def test_a_rehearsal_names_every_reading_the_service_did_not_answer(
+    tmp_path,
+):
+    home, repo = estate(tmp_path)
+    faults = acceptance.rehearse(shim(tmp_path, BLIND), home, repo, LANES)
+    assert [fault.split(":")[0] for fault in faults] == [
+        "up",
+        "issues",
+        "problems",
+        "metrics",
+        "status",
+    ]
+
+
+def test_a_rehearsal_plans_every_lane_and_starts_none(tmp_path):
+    home, repo = estate(tmp_path)
+    reading = json.dumps({"projects": [{"root": str(repo)}]})
+    served = tmp_path / "served-shim"
+    served.write_text(
+        SHIM.format(executable=sys.executable).replace(
+            "else:",
+            f'elif command[0] == "status":\n    print({reading!r})\nelse:',
+        )
+    )
+    served.chmod(0o755)
+    cli = str(served)
+    assert acceptance.rehearse(cli, home, repo, LANES) == []
+    plan = json.loads((repo / "acceptance" / "plan.json").read_text())
+    assert plan["codex"][:4] == [cli, "--home", str(home), "run"]
+    assert sorted(plan) == ["claude", "codex"]
+    assert not (repo / "acceptance" / "launch").exists()
