@@ -2788,6 +2788,81 @@ def _overdue_summary(number: str, cause: str, checkpoint: dict) -> str:
     )
 
 
+def _idle_blocker(
+    directory: Path, root: str, ledger: dict, number: str, idle: int
+) -> None:
+    """Tells the operator once that other issues wait on an idle claim.
+
+    A lane parked on an issue that waits on another lane's idle claim had no
+    signal of its own, so load moved only when the operator noticed by hand.
+    The claim records which issues wait on it while it has no progress, which
+    is what `status` reports, and the operator is notified once per claim
+    generation. The marker keeps its generation after progress resumes, so a
+    later idle stretch of the same claim notifies nothing further.
+
+    Args:
+        directory: Private project state directory.
+        root: Canonical project key the notification names.
+        ledger: Issue records read at the start of this poll.
+        number: Issue number of the held claim.
+        idle: Seconds the claim has gone without progress, or zero while it
+            is not idle.
+    """
+    record = ledger[number]
+    claim = record.get("claim_id")
+    current = record.get("idle_blocker") or {}
+    waiting = (
+        sorted(
+            (
+                other
+                for other, entry in ledger.items()
+                if number in entry.get("blocked_by", [])
+            ),
+            key=int,
+        )
+        if idle
+        else []
+    )
+    marker = (
+        {"claim_id": claim, "waiting": waiting}
+        if waiting or current.get("claim_id") == claim
+        else {}
+    )
+    if marker == current:
+        return
+    with lock(directory / "issues.lock", timeout=1):
+        state = issues.snapshot(directory)
+        written = state["issues"].get(number)
+        if not written or written.get("claim_id") != claim:
+            return
+        if marker:
+            written["idle_blocker"] = marker
+        else:
+            written.pop("idle_blocker", None)
+        state["revision"] += 1
+        write_json(directory / "issues.json", state)
+    if not waiting or current.get("claim_id") == claim:
+        return
+    try:
+        notify.deliver(
+            directory,
+            str(record.get("owner")),
+            notify.Event.IDLE_BLOCKER,
+            {
+                "repo": root,
+                "issue": number,
+                "claim": claim,
+                "detail": (
+                    f"no progress for {idle}s; "
+                    + ", ".join(f"#{other}" for other in waiting)
+                    + " waiting on it"
+                ),
+            },
+        )
+    except (BridgeError, OSError) as exc:
+        issues.note_supervision_error(directory, f"Notification: {exc}")
+
+
 def _overdue_step(
     directory: Path,
     number: str,
@@ -2919,6 +2994,8 @@ def overdue_claims(
                 config["claim_idle_after"],
                 now,
             )
+        if record.get("claim_id"):
+            _idle_blocker(directory, manifest["root"], ledger, number, idle)
         if (
             holder not in manifest["participants"]
             or not record.get("claim_id")
