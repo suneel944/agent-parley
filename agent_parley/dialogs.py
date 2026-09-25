@@ -537,6 +537,30 @@ def requested(tool: str, previous: object, now: float) -> dict:
     }
 
 
+def parked(state: dict) -> bool:
+    """Reports whether a lane is held on a screen only the operator answers.
+
+    A tool approval prompt is labelled `APPROVAL` by the native hook, and a
+    dialog the watcher could not answer is labelled with `MARKER`, which
+    also carries the `asks the operator` questions. A usage-limit dialog is
+    published the same way but is provider capacity, not a question, so it
+    is left to the capacity paths.
+
+    Args:
+        state: Lane activity record.
+
+    Returns:
+        True when the lane's label is an approval prompt or a watcher-held
+        dialog other than an exhausted capacity.
+    """
+    activity = str(state.get("activity", ""))
+    if activity.startswith(APPROVAL):
+        return True
+    record = state.get("dialog")
+    action = record.get("action") if isinstance(record, dict) else None
+    return activity.startswith(MARKER) and action != EXHAUSTED
+
+
 def waited(state: dict, now: float) -> int | None:
     """Measures how long a recorded approval prompt has stood unanswered.
 
