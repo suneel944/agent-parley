@@ -8849,9 +8849,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--force",
         action="store_true",
         help=(
-            "With --apply, also remove lane worktrees kept only for "
-            "uncommitted changes, unpushed commits or a recent change, after "
-            "writing a recovery checkpoint of each."
+            "With --apply, also remove worktrees a lane made itself that "
+            "are kept only for uncommitted changes, unpushed commits or a "
+            "recent change, after writing a recovery checkpoint of each."
         ),
     )
     collecting.add_argument("--json", action="store_true", help=JSON_HELP)

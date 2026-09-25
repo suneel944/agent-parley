@@ -136,7 +136,7 @@ def _return_work(directory: Path, manifest: dict, name: str) -> dict:
         raise BridgeError(
             f"{name} holds ready work ({listed}) that must stay claimed "
             "until verified integration completes; land it with "
-            f"agent-parley merge {name}, or hand it on with "
+            f"agent-parley participant merge {name}, or hand it on with "
             "agent-parley issue offer, before retiring."
         )
     participants = set(manifest["participants"])

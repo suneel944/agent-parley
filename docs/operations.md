@@ -375,7 +375,7 @@ mid-turn:
 ### Triage with `problems`
 
 `doctor` answers whether the installation is consistent and `top` shows every
-lane; `problems` answers what needs an operator right now.
+live lane; `problems` answers what needs an operator right now.
 
 ```sh
 agent-parley problems
@@ -1387,11 +1387,17 @@ place.
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory` and one entry per
 project holding
-`root`, the issue ledger as `revision` and `issues`, and `participants`. `server`
+`root`, the issue ledger as `revision` and `issues`, `participants` and
+`accounting`, the project's idle and unaccountable lane-minutes merged across
+its lanes as `lanes.summary` shapes them, or null until any lane has been
+accounted. `server`
 carries the service reading the `Code:` line prints, so a stale service is
 readable without parsing text. Each
 participant carries `participant`, `identity`, `provider`, `credential`,
-`session`, `availability` as `active`, `idle` or `stopped` with the derived
+`session`, `condition` as the lane's state, cause, evidence, `since` and held
+`seconds` from its state record, or null with no record yet, `accounting` as
+that lane's own `lanes.summary`, or null until it has been accounted,
+`availability` as `active`, `idle` or `stopped` with the derived
 `activity`, its `evidence` and whether that evidence is `stale`, `branch`,
 `assigned_branch`, `drift`, `paused`,
 `outcome`, `summary`, `remaining`, `evidence`, `reported_at`,
@@ -1560,7 +1566,8 @@ reports that native process identity is unavailable and requires manual
 attention; the service does not wake or resume it.
 
 The private project manifest accepts `"supervision"` with `interval` (default
-30 seconds), `inactive_after` (300 seconds), `start_deadline` (30 seconds),
+30 seconds), `inactive_after` (300 seconds), `stalled_after` (600 seconds),
+`start_deadline` (30 seconds),
 `completion_reminders` (3 reminders, 1 to 100), `orphan_retire_after`
 (3600 seconds), `claim_idle_after` (3600 seconds), `takeover_grace`
 (300 seconds), `max_claims_per_lane` (2 claims, 1 to 100), `prompts`, `wake`,
@@ -1699,7 +1706,8 @@ A client binary that cannot be started exits the launcher with status 127.
 
 An attached `agent-parley run` owns its terminal tab title. The title leads
 with the lane name, then one state word (`working`, `idle`, `idle with claim`,
-`blocked: dialog`, `blocked: approval`, `starting`, `stopped`), the lowest
+`blocked: dialog`, `blocked: approval`, `starting`, `not started`, `stopped`,
+or `unknown` before the lane records any activity), the lowest
 issue number the lane holds and its progress as `done/total`, or `0 open`, for
 example `[claude-a] idle with claim #412 - 2/5 done`. The title the client sets
 for itself follows after ` | ` and is truncated first. The title is refreshed
@@ -1869,9 +1877,11 @@ A lane that never did any work is retired too. When its runtime state reads
 `stopped`, its branch is still at the project base, it has nothing
 uncommitted, the ledger records no claim or pending offer for it, it holds no
 reservation, and neither its last activity nor its worktree changed inside
-`inactive_after`, the sweep retires it with reason `stopped`. A lane already
-retired whose worktree is gone is dropped with reason `vanished`, which
-takes it out of `status` and `top`. Retiring a lane supersedes the mail still
+`inactive_after`, the sweep retires it and reports `it stopped, holds no work
+and never left the commit its lane was created from`. A lane whose worktree is
+gone and that holds no claim, session, reservation or offer is dropped and
+reported as `its worktree is gone and it holds no work`, which takes it out of
+`status` and `top`. Retiring a lane supersedes the mail still
 addressed to it, so no share bounces off a lane that no longer exists.
 
 The lane sweep does not let a session that is alive but idle past
@@ -2476,7 +2486,8 @@ JSON views carry `retired_at`, and the service neither wakes it nor names it in
 a work offer. A lane whose worktree is dirty keeps it, and the changed paths are
 reported in the tool result. A lane that holds ready work is refused before
 anything is released, naming those issues: ready work stays claimed until
-`agent-parley merge LANE` lands it, or the lane offers it to a peer. Return
+`agent-parley participant merge NAME` lands it, or the lane offers it to a
+peer. Return
 that lane to service with the same
 `participant add NAME` command that created it, which restores its worktree on
 its own branch; the next launch registers a fresh credential.
