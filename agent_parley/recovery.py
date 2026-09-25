@@ -14,6 +14,7 @@ from pathlib import Path
 from agent_parley import process
 from agent_parley.state import BridgeError, Transient, lock, write_json
 
+CAPTURE_INTERVAL = 30
 GIT_SECONDS = 30
 MAX_STEP_BYTES = 400
 RECOVERY_FOLDER = "recovery"
@@ -356,6 +357,12 @@ def capture(
     target repository keeps both commits reachable across Git maintenance.
     Source index and worktree content remain unchanged.
 
+    A tree unchanged since the last checkpoint reuses that checkpoint. A
+    capture driven by a native event also reuses a checkpoint taken less than
+    `CAPTURE_INTERVAL` seconds ago even when the tree changed, so a burst of
+    tool calls bundles each lane at most once per interval. A capture with no
+    event, such as a handoff or an overdue offer, always reflects the tree.
+
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
@@ -392,10 +399,13 @@ def capture(
             previous = json.loads((folder / f"{identifier}.json").read_text())
         except (OSError, ValueError):
             break
-        if (
-            previous.get("fingerprint") != fingerprint
-            or not (folder / f"{identifier}.bundle").exists()
-        ):
+        recent = (
+            payload is not None
+            and time.time() - float(previous.get("captured_at") or 0)
+            < CAPTURE_INTERVAL
+        )
+        changed = previous.get("fingerprint") != fingerprint and not recent
+        if changed or not (folder / f"{identifier}.bundle").exists():
             break
         unchanged.append((record, previous))
     if len(unchanged) == len(owned):

@@ -1876,3 +1876,71 @@ def test_a_concurrent_foreign_session_is_named_and_never_relabels(
     finally:
         release(child)
     assert checkpoints.foreign_reading(state) == {}
+
+
+def test_a_new_session_in_the_recorded_process_is_adopted(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": own.pid,
+            "session_ticks": own.ticks,
+            "activity": "idle",
+            "cursor": 7,
+            "updated": time.time() - 60,
+        },
+    )
+
+    checkpoints.checkpoint(
+        bridge.home,
+        directory,
+        "codex",
+        {**ALLOW, "session_id": "s2", "cwd": str(lane)},
+        own,
+    )
+
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_id"] == "s2"
+    assert "foreign_session" not in state
+    assert all(
+        entry["reason_class"] != "session_mismatch"
+        for entry in events(directory)
+    )
+
+
+def test_a_foreign_process_editing_as_the_lane_is_denied(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": own.pid,
+            "session_ticks": own.ticks,
+            "activity": "idle",
+            "updated": time.time() - 60,
+        },
+    )
+    edit = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(lane / "notes.txt")},
+        "session_id": "s2",
+        "cwd": str(lane),
+    }
+    child, foreign = held_process()
+    try:
+        output = checkpoints.checkpoint(
+            bridge.home, directory, "codex", edit, foreign
+        )
+    finally:
+        release(child)
+    decision = output["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert "session s1" in decision["permissionDecisionReason"]
+    assert "session s2" in decision["permissionDecisionReason"]
+    assert events(directory)[-1]["reason_class"] == "session_mismatch"

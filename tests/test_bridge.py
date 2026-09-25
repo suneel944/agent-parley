@@ -1453,7 +1453,7 @@ def test_issue_dependencies_are_owner_only_and_survive_a_release(
         "77",
         *(str(extra) for extra in range(100, 99 + MAX_BLOCKERS)),
     ]
-    assert "#432: claude; waits on #77 (codex)" in listed(
+    assert "#432: claude; no deadline; waits on #77 (codex)" in listed(
         bridge.issue(repo, "list")
     )
     with pytest.raises(BridgeError, match="does not wait on #555"):
@@ -1665,7 +1665,7 @@ def test_issue_claim_records_and_renders_the_forge_title(
     )
     assert (
         listed(bridge.issue(repo, "list"))
-        == "#432: claude — Title for issue 432"
+        == "#432: claude — Title for issue 432; no deadline"
     )
 
 
@@ -1681,7 +1681,9 @@ def test_issue_claim_survives_an_unavailable_forge(
         "agent_parley.cli.forge.issue_title", lambda directory, number: ""
     )
     assert "title" not in bridge.issue(claude, "claim", "433")
-    assert listed(bridge.issue(repo, "list")) == "#432: claude\n#433: claude"
+    assert listed(bridge.issue(repo, "list")) == (
+        "#432: claude; no deadline\n#433: claude; no deadline"
+    )
 
 
 def test_recorded_issue_title_survives_later_transitions(
@@ -1704,8 +1706,9 @@ def test_recorded_issue_title_survives_later_transitions(
     )
     reclaimed = bridge.issue(codex, "claim", "432")
     assert reclaimed["title"] == "Resolved from the forge"
-    assert "#432: codex — Resolved from the forge; waits on #77" in listed(
-        bridge.issue(repo, "list")
+    assert (
+        "#432: codex — Resolved from the forge; no deadline; waits on #77"
+        in listed(bridge.issue(repo, "list"))
     )
 
 

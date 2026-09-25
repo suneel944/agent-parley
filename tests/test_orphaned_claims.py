@@ -441,6 +441,12 @@ def test_an_unchanged_tree_is_captured_once(bridge, repo, paired, monkeypatch):
     assert recovery.checkpoint(directory, "42", second["claim_id"]) == second
 
     (lane / "draft.txt").write_text("second edit, still modified\n")
+    throttled = recovery.capture(directory, manifest, "claude", event)[0]
+
+    assert len(published) == 1
+    assert throttled["worktree_commit"] == first["worktree_commit"]
+
+    monkeypatch.setattr(recovery, "CAPTURE_INTERVAL", 0)
     third = recovery.capture(directory, manifest, "claude", event)[0]
 
     assert len(published) == 2

@@ -361,12 +361,65 @@ def record(
         )
 
 
+def foreign_refusal(
+    agent: str,
+    state: dict,
+    payload: dict,
+    session_process: process.ServerProcess | None,
+    ended: bool,
+) -> dict | None:
+    """Denies a tool call a second live process makes as the lane.
+
+    A session in the lane's own process is adopted before this is asked, so
+    what remains is another live client using the lane's hooks. Letting its
+    calls through would edit the lane's worktree with no mail, reservation
+    or roster notice reaching it. Only a call that can change state is
+    denied, and only when both processes are known and alive: an event with
+    no attributed process, or one arriving after the recorded process ended,
+    keeps failing open because this lane cannot tell it from its own.
+
+    Args:
+        agent: Assigned native lane name.
+        state: Lane activity state read under the checkpoint lock.
+        payload: Native lifecycle event from the foreign session.
+        session_process: Native process the event was attributed to.
+        ended: Whether the lane's recorded session process has ended.
+
+    Returns:
+        Native hook output denying the call, or None when it is let through.
+    """
+    if (
+        payload.get("hook_event_name") != "PreToolUse"
+        or session_process is None
+        or ended
+        or state.get("session_pid") is None
+        or str(payload.get("tool_name", "")) in READ_ONLY_TOOLS
+        or diagnosable(payload)
+    ):
+        return None
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": (
+                f"Agent Parley lane {agent} belongs to session "
+                f"{state.get('session_id', '')} in process "
+                f"{state.get('session_pid')}; this call comes from session "
+                f"{payload.get('session_id', '')} in process "
+                f"{session_process.pid}. A second session cannot change "
+                "state as this lane; run it in its own lane."
+            ),
+        }
+    }
+
+
 def foreign_session(
     directory: Path,
     agent: str,
     state: dict,
     payload: dict,
     session_process: process.ServerProcess | None,
+    output: dict | None = None,
 ) -> None:
     """Records an event from a session that is not the lane's own.
 
@@ -384,6 +437,7 @@ def foreign_session(
         state: Lane activity state read under the checkpoint lock.
         payload: Native lifecycle event being discarded.
         session_process: Native process the event was attributed to.
+        output: Native hook output returned for the event, if any.
     """
     session = str(payload.get("session_id", ""))
     pid = session_process.pid if session_process is not None else None
@@ -392,7 +446,7 @@ def foreign_session(
         agent,
         payload,
         Reason.SESSION_MISMATCH,
-        None,
+        output,
         detail={
             "session_id": session,
             "recorded_session_id": str(state.get("session_id", "")),
@@ -2125,16 +2179,25 @@ def checkpoint(
             state.get("session_pid"), state.get("session_ticks")
         )
         changed = bool(recorded) and session != recorded
+        same_process = session_process is not None and (
+            state.get("session_pid"),
+            state.get("session_ticks"),
+        ) == (session_process.pid, session_process.ticks)
         adopted = (
             changed
             and bool(session)
             and event != "SessionStart"
-            and ended
+            and (ended or same_process)
             and session_process is not None
         )
         if changed and event != "SessionStart" and not adopted:
-            foreign_session(directory, agent, state, payload, session_process)
-            return {}
+            denial = foreign_refusal(
+                agent, state, payload, session_process, ended
+            )
+            foreign_session(
+                directory, agent, state, payload, session_process, denial
+            )
+            return denial or {}
         new_session = session != recorded and (
             event == "SessionStart" or adopted
         )
