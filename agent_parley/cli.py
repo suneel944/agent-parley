@@ -5420,7 +5420,8 @@ reported.
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
             action: List, claim, release, offer, accept, decline, cancel,
-                block, or unblock.
+                block, unblock, or request. A claim and a takeover request
+                are refused past the project's `max_claims_per_lane`.
             number: Repository issue number for a mutation.
             to: Handoff recipient.
             summary: Handoff context supplied by the owner.
@@ -5520,6 +5521,13 @@ reported.
                 carried=carried,
                 take_orphaned=take_orphaned,
                 takeover=takeover,
+                cap=(
+                    supervision.configuration(self.home, data)[
+                        "max_claims_per_lane"
+                    ]
+                    if action in ("claim", "request")
+                    else None
+                ),
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
@@ -8586,6 +8594,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "cancel",
         "block",
         "unblock",
+        "request",
     ):
         command = actions.add_parser(action)
         command.add_argument("--repo", type=Path, default=Path.cwd())
@@ -8644,6 +8653,19 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "Record the offer and apply it once this issue is "
                     "explicitly released or its pull request is recorded as "
                     "ended."
+                ),
+            )
+        if action == "request":
+            command.add_argument(
+                "--summary",
+                default="",
+                metavar="REASON",
+                help=(
+                    "Why this lane asks to take the issue over. The holder "
+                    "answers with issue accept or decline; a holder that "
+                    "neither answers nor records progress within the "
+                    "project's takeover_grace has the request granted as an "
+                    "offer to this lane."
                 ),
             )
         if action in ("accept", "decline"):
