@@ -2521,15 +2521,19 @@ def tool_silence(directory: Path, name: str) -> float | None:
     A session that starts, reads its context and ends without a tool call
     did no work, yet it records native events that reset the ordinary
     activity age. Only a tool call counts here, so a resume that ends
-    without work never extends a holder's apparent activity.
+    without work never extends a holder's apparent activity. A
+    `PreToolUse` counts while its session is still open, since a long tool
+    call is work in progress. One followed by `SessionEnd` before any
+    `PostToolUse` never completed, so a supervisor resume that starts a
+    tool and ends does not reset the silence clock.
 
     Args:
         directory: Private project state directory.
         name: Participant whose hook events are read.
 
     Returns:
-        Seconds since the lane's latest recorded tool call, or None when no
-        tool call is retained or the event log cannot be read.
+        Seconds since the lane's latest counted tool event, or None when no
+        such event is retained or the event log cannot be read.
     """
     from agent_parley import checkpoints
 
@@ -2537,14 +2541,22 @@ def tool_silence(directory: Path, name: str) -> float | None:
         events = checkpoints.read_events(directory, name)
     except (BridgeError, OSError, ValueError):
         return None
-    stamps = [
-        float(entry.get("ts", 0) or 0)
-        for entry in events
-        if entry.get("event") in TOOL_EVENTS
-    ]
-    if not stamps:
+    latest = 0.0
+    pending = 0.0
+    for entry in events:
+        kind = entry.get("event")
+        stamp = float(entry.get("ts", 0) or 0)
+        if kind == "PostToolUse":
+            latest = max(latest, stamp)
+            pending = 0.0
+        elif kind == "PreToolUse":
+            pending = max(pending, stamp)
+        elif kind == "SessionEnd":
+            pending = 0.0
+    counted = max(latest, pending)
+    if not counted:
         return None
-    return max(0.0, time.time() - max(stamps))
+    return max(0.0, time.time() - counted)
 
 
 def holder_silent(
