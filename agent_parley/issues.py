@@ -59,6 +59,55 @@ def deadline_state(record: dict, now: float = 0.0) -> dict:
     }
 
 
+def claimed_since(record: dict) -> float:
+    """Reports when the current ownership generation of an issue began.
+
+    A lane branch is reused across claims, so a pull request that ended before
+    the current claim started describes earlier work and must not report that
+    claim as finished. The generation starts at the most recent claim or
+    accepted handoff; a record whose history no longer names one is treated as
+    having always been owned, which preserves the previous observation. A take
+    of an orphaned claim starts a generation like any other claim.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        Unix time the current ownership generation began, or zero.
+    """
+    return max(
+        (
+            float(entry.get("at", 0) or 0)
+            for entry in record.get("history", [])
+            if entry.get("action") in {"claim", "accept", "take"}
+        ),
+        default=0.0,
+    )
+
+
+def last_progress(record: dict) -> float:
+    """Reports when one claim last advanced, apart from its lane's liveness.
+
+    A lane emits hook events for whatever it is doing, so its liveness says
+    nothing about which of its claims moved. A claim advances only on evidence
+    bound to that issue: the start of its ownership generation and a report
+    the holder filed naming it. Progress recorded in an earlier generation
+    is older than the generation's start and so never counts.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        Unix time of the claim's latest progress, or zero when neither the
+        generation start nor a report is recorded.
+    """
+    progress = lifecycle.state(record).get("progress")
+    reported = (
+        float(progress.get("at", 0) or 0) if isinstance(progress, dict) else 0.0
+    )
+    return max(claimed_since(record), reported)
+
+
 def offer_state(offer: dict | None, now: float = 0.0) -> dict:
     """Derives the deadline state of one pending handoff offer."""
     stamp = now or time.time()
@@ -398,6 +447,7 @@ def change(
     carried: dict | None = None,
     take_orphaned: bool = False,
     takeover: dict | None = None,
+    cap: int | None = None,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -411,7 +461,7 @@ def change(
         agent: Acting lane, resolved by the CLI from its worktree, or the
             operator identity for an assignment.
         action: Claim, release, offer, accept, decline, cancel, block,
-            unblock, assign, or unassign.
+            unblock, assign, unassign, or request.
         issue: Positive repository issue number, optionally prefixed with #.
         participants: Every participant registered for this project.
         key: Idempotency key. Empty applies the transition without retry
@@ -439,6 +489,10 @@ def change(
         takeover: Revalidated owner generation and durable checkpoint for an
             orphan take. It is excluded from retry arguments because it is
             evidence read at execution time rather than caller intent.
+        cap: Most claims one lane may hold at once, checked on a claim and on
+            a takeover request. None applies no cap. Like a title it is
+            project configuration read at execution time, so it is excluded
+            from the arguments a key is compared against.
 
     Returns:
         The persisted issue record, including transition history.
@@ -466,6 +520,7 @@ def change(
             carried=carried,
             take_orphaned=take_orphaned,
             takeover=takeover,
+            cap=cap,
             **transition,
         )
     key = retries.validate(key)
@@ -487,6 +542,7 @@ def change(
             carried=carried,
             take_orphaned=take_orphaned,
             takeover=takeover,
+            cap=cap,
             **transition,
         )
     except Transient:
@@ -693,12 +749,152 @@ def _operator_offer(entry: dict, issue: str, budgets: dict) -> dict:
         from the moment the offer started waiting.
     """
     answer = budgets.get("offer")
+    fallback = (
+        f"Operator offered issue #{issue}."
+        if offer_source(entry) == OPERATOR
+        else f"{entry['to']} asked to take over issue #{issue}."
+    )
     return {
         **entry,
-        "summary": entry["reason"] or f"Operator offered issue #{issue}.",
+        "summary": entry["reason"] or fallback,
         "created": time.time(),
         "deadline": time.time() + answer if answer else None,
     }
+
+
+def grant_requests(directory: Path, grace: float, budgets: dict) -> list[str]:
+    """Grants a peer's takeover request its holder let lapse.
+
+    A request that needs the holder's agreement stays pending for ever when
+    the holder ignores it or never reads it. A peer's request is therefore
+    granted once the grace window has passed with no answer and no progress
+    recorded on the claim since the request was made: the supervisor turns
+    it into an offer to the peer, recorded in history, and the peer's
+    acceptance moves ownership as any accepted handoff does. An operator
+    request still waits for the holder, because the operator can withdraw or
+    restate it.
+
+    Args:
+        directory: Private state directory for the common repository.
+        grace: Seconds the holder has to answer or record progress.
+        budgets: Project deadline and attempt-budget defaults.
+
+    Returns:
+        Issue numbers whose request was granted.
+    """
+    granted = []
+    now = time.time()
+    with lock(directory / "issues.lock", timeout=1):
+        state = snapshot(directory)
+        for number, record in state["issues"].items():
+            request = record.get("request") or {}
+            if (
+                not request
+                or offer_source(request) != PEER
+                or not record.get("owner")
+                or record.get("offer")
+                or now - float(request.get("created", now)) < grace
+                or last_progress(record) > float(request["created"])
+            ):
+                continue
+            record["offer"] = _operator_offer(request, number, budgets)
+            record["request"] = None
+            record["history"].append(
+                {
+                    "action": "grant",
+                    "actor": "supervisor",
+                    "at": now,
+                    "owner": record["owner"],
+                    "offer": record["offer"],
+                    "request": None,
+                    "offer_id": request["id"],
+                    "claim_id": record.get("claim_id"),
+                }
+            )
+            granted.append(number)
+        if granted:
+            state["revision"] += 1
+            write_json(directory / "issues.json", state)
+    return granted
+
+
+def _within_cap(ledger: dict, agent: str, cap: int | None) -> None:
+    """Refuses a lane one more claim past the project's claim cap.
+
+    A lane that claims more than it can work at once keeps the surplus
+    looking held while no peer may take it, so the cap is checked where a
+    lane takes on a new issue. The refusal names every claim the lane holds
+    with how long each has gone without progress, so the lane can see which
+    one to release or offer.
+
+    Args:
+        ledger: Issue records keyed by number, read under the ledger lock.
+        agent: Lane taking on one more issue.
+        cap: Most claims one lane may hold at once, or None for no cap.
+
+    Raises:
+        BridgeError: If the lane already holds the cap.
+    """
+    held = sorted(
+        (number for number, item in ledger.items() if item["owner"] == agent),
+        key=int,
+    )
+    if not cap or len(held) < cap:
+        return
+    now = time.time()
+    named = ", ".join(
+        f"#{number} (no progress "
+        f"{max(0, int(now - last_progress(ledger[number])))}s)"
+        for number in held
+    )
+    raise BridgeError(
+        f"{agent} already holds {len(held)} claims, the project cap "
+        f"max_claims_per_lane is {cap}: {named}. Release or offer an idle "
+        "claim before taking another."
+    )
+
+
+def _request(record: dict | None, agent: str, issue: str, reason: str) -> dict:
+    """Records a peer's request to take over an issue another lane holds.
+
+    The holder answers it like an operator request, with issue accept or
+    decline and the request identifier. A holder that neither answers nor
+    records progress on the claim within the project's takeover grace window
+    has the request granted by the supervisor as an offer to the peer.
+
+    Args:
+        record: Published record for this issue, or None when it has none.
+        agent: Lane asking to take the issue over.
+        issue: Repository issue number the request names.
+        reason: Why the peer asks, travelling with the request.
+
+    Returns:
+        The record carrying the pending request.
+
+    Raises:
+        BridgeError: If the issue has no owner, the peer owns it already, the
+            reason is too long, or an offer or request is pending.
+    """
+    if not record or not record["owner"]:
+        raise BridgeError(f"Issue #{issue} has no owner; claim it instead.")
+    if record["owner"] == agent:
+        raise BridgeError(f"Issue #{issue} is already owned by {agent}.")
+    if len(reason.encode()) > MAX_REASON:
+        raise BridgeError(
+            f"Takeover reason must be at most {MAX_REASON} bytes."
+        )
+    if record["offer"] or record.get("request"):
+        raise BridgeError(
+            "An offer or request is pending on this issue; wait for its answer."
+        )
+    record["request"] = {
+        "id": uuid.uuid4().hex,
+        "to": agent,
+        "reason": reason,
+        "created": time.time(),
+        "source": PEER,
+    }
+    return record
 
 
 def _withdraw(record: dict | None, issue: str) -> dict:
@@ -776,6 +972,7 @@ def _change(
     carried: dict | None = None,
     take_orphaned: bool = False,
     takeover: dict | None = None,
+    cap: int | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -784,7 +981,7 @@ def _change(
         agent: Acting lane, resolved by the CLI from its worktree, or the
             operator identity for an assignment.
         action: Claim, release, offer, accept, decline, cancel, block,
-            unblock, assign, or unassign.
+            unblock, assign, unassign, or request.
         issue: Positive repository issue number, optionally prefixed with #.
         participants: Every participant registered for this project.
         scope: Retained key this transition is recorded under. Empty records
@@ -812,6 +1009,9 @@ def _change(
             owner and the reason the marker gave.
         takeover: Revalidated owner generation and durable checkpoint for an
             orphan take.
+        cap: Most claims one lane may hold at once. A claim of a new issue
+            and a takeover request past it are refused, naming the claims
+            the lane holds and how long each has gone without progress.
 
     A transition that ends an ownership generation, by releasing it, by
     handing it to another lane, by taking it from an orphaned owner or by the
@@ -876,6 +1076,8 @@ def _change(
                     f"Issue #{issue} has no orphaned owner to take it from; "
                     "claim it without --take-orphaned."
                 )
+            if not record or record["owner"] != agent:
+                _within_cap(state["issues"], agent, cap)
             previous = record or {}
             if not taken:
                 cleared = _clear_recovery(dict(previous))
@@ -920,6 +1122,9 @@ def _change(
             lifecycle.authorize(record)
         elif action == "unassign":
             record = _withdraw(record, issue)
+        elif action == "request":
+            _within_cap(state["issues"], agent, cap)
+            record = _request(record, agent, issue, summary.strip())
         else:
             answering = action in ("accept", "decline")
             operating = action == "unblock" and agent == OPERATOR
@@ -1235,6 +1440,10 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             line += f" ({liveness[record['owner']]})"
         if title := record.get("title"):
             line += f" — {title}"
+        if record["owner"] and (progressed := last_progress(record)):
+            line += (
+                f"; last progress {max(0, int(time.time() - progressed))}s ago"
+            )
         if orphan := record.get("orphan"):
             line += (
                 f"; marked orphaned {orphan_age(orphan)}s ago, "
@@ -1286,13 +1495,19 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             line += _carried(inherited)
         if request := record.get("request"):
             age = max(0, int(time.time() - request["created"]))
-            line += (
-                f"; operator asked {record['owner']} to hand it to "
-                f"{request['to']} {age}s ago; offer {request['id']}"
-            )
-            if request["reason"]:
-                line += "\n  Operator-stated reason: " + json.dumps(
-                    request["reason"]
+            if offer_source(request) == OPERATOR:
+                line += (
+                    f"; operator asked {record['owner']} to hand it to "
+                    f"{request['to']} {age}s ago; offer {request['id']}"
                 )
+                note = "Operator-stated reason"
+            else:
+                line += (
+                    f"; {request['to']} asked to take it over {age}s ago; "
+                    f"offer {request['id']}"
+                )
+                note = "Peer-stated reason"
+            if request["reason"]:
+                line += f"\n  {note}: " + json.dumps(request["reason"])
         lines.append(line)
     return "\n".join(lines) or "No issues claimed."

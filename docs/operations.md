@@ -58,6 +58,11 @@ except `--version` exits with status 2 and a line pointing to WSL2, because
 the runtime relies on POSIX file locks, pseudo-terminals and process
 primitives that native Windows does not provide.
 
+Native Windows is not supported. The wheel installs there, but every command
+except `--version` exits with status 2 and a line pointing to WSL2, because
+the runtime relies on POSIX file locks, pseudo-terminals and process
+primitives that native Windows does not provide.
+
 ## Daily use
 
 ```sh
@@ -1547,8 +1552,27 @@ attention; the service does not wake or resume it.
 The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `start_deadline` (30 seconds),
 `completion_reminders` (3 reminders, 1 to 100), `orphan_retire_after`
-(3600 seconds), `prompts`, `wake`,
+(3600 seconds), `claim_idle_after` (3600 seconds), `takeover_grace`
+(300 seconds), `max_claims_per_lane` (2 claims, 1 to 100), `prompts`, `wake`,
 `reclaim` and `titles` (all true). Numeric second values range from 1 to 86400 seconds.
+
+Claim liveness is measured per claim, not per lane. A claim advances on its
+own generation start and on `agent-parley report ... --issue N` naming it; a
+lane holding a single claim also advances it with every tool call. `issue list`
+prints `last progress Ns ago` beside each claim. A claim with no progress for
+`claim_idle_after` takes the overdue path even while its holder is busy with
+other work: one notice to the holder and to the lanes whose issues wait on it,
+then an offer to the fittest peer below the claim cap with the recovery
+checkpoint attached, then release once that offer expires. Each step is
+recorded in history and counted in `attempts`. Blocked and ready work is
+waiting rather than idle and is not moved. `issue claim` refuses a lane that
+already holds `max_claims_per_lane` claims and names each held claim with its
+progress age. `issue request N [--summary REASON]` asks the holder to hand the
+issue to the requesting lane; the holder answers with `issue accept` or
+`issue decline` and the request identifier, and a holder that neither answers
+nor records progress on the claim within `takeover_grace` has the request
+granted by the supervisor as an offer to the requesting lane, whose acceptance
+moves ownership.
 The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
 `wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
