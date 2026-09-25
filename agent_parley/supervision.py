@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TypeGuard, cast
 
 from agent_parley import (
+    dialogs,
     forge,
     issues,
     lanes,
@@ -167,6 +168,12 @@ def lane_state(
     no longer evidence of anything current, and past the inactive threshold
     any record reads as stale with its age rather than as the present.
 
+    A lane `dialogs.parked` on an approval prompt or a watcher-held dialog,
+    including the `asks the operator` questions, is waiting however old the
+    label is and whatever tool call it interrupted: such a screen records no
+    hook until somebody answers it, so neither its age nor the open call
+    says the lane could take a turn.
+
     A living session process is never described as stopped. A record that
     names a finished session while its process still answers means the client
     is up and waiting for whoever owns its terminal, which is a prompt to
@@ -221,14 +228,14 @@ def lane_state(
         if alive is False or activity == "stopped" or not published:
             return reading(STOPPED, "stopped")
         return reading(UNKNOWN, "unknown; no session process recorded")
+    if dialogs.parked(published):
+        return reading(WAITING, activity)
     if in_flight:
         return reading(WORKING, "working; tool call in flight")
     if not activity:
         return reading(WORKING, "running; checkpoints unavailable (relaunch)")
     if stale:
         return reading(IDLE, f"stale; last {activity}")
-    if activity == "waiting for approval":
-        return reading(WAITING, activity)
     if activity == "stopped":
         return reading(WAITING, "session ended; client process alive")
     if activity == "idle":
@@ -2270,6 +2277,33 @@ def unresolved_reason(holder: str, reminders: int, observed: dict) -> str:
     )
 
 
+def observed_complete(record: dict) -> bool:
+    """Reports whether the current claim on an issue was observed finished.
+
+    The forge closing the issue, or the pull request that closes it ending,
+    inside the current ownership generation writes an `ENDED` completion
+    reminder to the holder and, once it goes unanswered, an unresolved
+    completion. Either says the work is done, so the claim is no longer
+    work a peer could take over.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        Whether the current generation carries an unresolved completion or
+        an `ENDED` reminder addressed to its owner.
+    """
+    if issues.unresolved_completion(record)["unresolved"]:
+        return True
+    prompt = record.get("handoff_prompt") or {}
+    return (
+        prompt.get("trigger") == ENDED
+        and bool(record.get("owner"))
+        and prompt.get("holder") == record.get("owner")
+        and float(prompt.get("created", 0) or 0) >= claimed_since(record)
+    )
+
+
 def completion_escalations(
     directory: Path,
     manifest: dict,
@@ -2484,10 +2518,16 @@ def holder_silent(
     Returns:
         Whether the holder's session process is gone, or its latest tool call
         is older than the window. A holder with no retained tool call falls
-        back to whether its presence evidence is stale.
+        back to whether its presence evidence is stale. A live holder parked
+        on a screen only the operator can answer (`dialogs.parked`) is not
+        silent: its quiet is the operator's to end, not the holder's.
     """
     if observed.get("process_alive") is False:
         return True
+    path = directory / f"{name}-activity.json"
+    with contextlib.suppress(OSError, ValueError):
+        if dialogs.parked(json.loads(path.read_text())):
+            return False
     silence = tool_silence(directory, name)
     if silence is None:
         return bool(observed.get("stale"))
@@ -2527,9 +2567,14 @@ def _overdue_peer(
             or observed.get("process_alive") is False
         ):
             continue
-        if not fit(home, directory, manifest, name, config["stalled_after"])[
-            "fit"
-        ]:
+        if not fit(
+            home,
+            directory,
+            manifest,
+            name,
+            config["stalled_after"],
+            config["inactive_after"],
+        )["fit"]:
             continue
         owned = sum(1 for record in ledger if record.get("owner") == name)
         candidates.append((owned, name))
@@ -2627,7 +2672,9 @@ def overdue_claims(
     Silence is measured from tool calls, so a supervisor resume that ends
     without work does not reset it. A holder that runs a tool again, or a
     claim that is no longer overdue, drops the recorded recovery, and the
-    next breach starts over from the wake.
+    next breach starts over from the wake. A claim `observed_complete` is
+    never moved: its work is finished, and the completion reminder and the
+    operator's resolution are what end it.
 
     Args:
         home: Private bridge state root.
@@ -2650,6 +2697,7 @@ def overdue_claims(
             holder not in manifest["participants"]
             or not record.get("claim_id")
             or not timing["overdue"]
+            or observed_complete(record)
             or not holder_silent(
                 directory, holder, observations.get(holder) or {}, window
             )
@@ -4809,8 +4857,10 @@ def wake(
     for a turn, and a stopped or dead one is resumed when its record names a
     session. A lane with no record yet is decided on the state its presence
     reading and activity label would record, through `lanes.from_liveness`,
-    and resumed on the session its activity file names. An approval prompt
-    still defers it and an idle one is still asked for a turn, so a store
+    and resumed on the session its activity file names. A lane
+    `dialogs.parked` on an approval prompt or a watcher-held dialog is
+    recorded blocked under that dialog's cause and deferred, never woken,
+    and an idle one is still asked for a turn, so a store
     that has not seeded the record never silences a wake. A reading that
     would record nothing leaves the presence reading as it is.
 
@@ -4884,6 +4934,13 @@ def wake(
         seen = lanes.from_liveness(
             None, {**observed, "activity": label, "evidence": label}
         )
+        if observed.get("process_alive") and dialogs.parked(state):
+            cause = (
+                lanes.APPROVAL
+                if label.startswith(dialogs.APPROVAL)
+                else dialogs.lane_cause(state.get("dialog") or {})
+            )
+            seen = lanes.BLOCKED, cause
         if seen is not None:
             recorded = {
                 "state": seen[0],

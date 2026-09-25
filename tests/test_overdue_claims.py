@@ -5,6 +5,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from agent_parley import issues, process, store, supervision
 from agent_parley.state import write_json
 
@@ -135,6 +137,98 @@ def test_a_resume_that_ends_without_work_does_not_extend_silence(
     assert supervision.tool_silence(directory, "claude") >= 3600
     assert supervision.holder_silent(directory, "claude", observed, WINDOW)
     assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def ended(record):
+    """Records the reminder a forge-observed completion writes its holder."""
+    record["handoff_prompt"] = {
+        "id": "7:ended",
+        "holder": "claude",
+        "created": time.time(),
+        "trigger": supervision.ENDED,
+    }
+
+
+def unresolved(record):
+    """Records an unresolved completion on the claim's current generation."""
+    record["unresolved_completion"] = {
+        "claim_id": record["claim_id"],
+        "reason": "claude left 3 completion reminders unanswered",
+        "reminders": 3,
+        "observed_at": time.time(),
+    }
+
+
+@pytest.mark.parametrize("observed", [ended, unresolved])
+def test_an_observed_complete_claim_is_never_offered_or_released(
+    bridge, paired, observed
+):
+    directory = overdue(bridge, paired)
+    edit(directory, "7", observed)
+    for _ in range(3):
+        kept = step(bridge, directory, paired)
+        edit(
+            directory,
+            "7",
+            lambda record: (record.get("overdue_recovery") or {}).update(
+                at=time.time() - WINDOW - 1
+            ),
+        )
+    assert kept["owner"] == "claude"
+    assert kept["offer"] is None
+    assert "overdue_recovery" not in kept
+    assert not any(
+        entry["action"].startswith("overdue-") for entry in kept["history"]
+    )
+
+
+def test_an_overdue_peer_is_rated_on_the_projects_inactive_window(
+    bridge, paired, monkeypatch
+):
+    directory = overdue(bridge, paired)
+    manifest = json.loads((directory / "project.json").read_text())
+    config = {**supervision.DEFAULTS, "inactive_after": 900}
+    rated = []
+
+    def fit(*args):
+        rated.append(args)
+        return {"fit": True}
+
+    monkeypatch.setattr(supervision, "fit", fit)
+    peer = supervision._overdue_peer(
+        bridge.home, directory, manifest, config, {}, "claude"
+    )
+    assert peer == "codex"
+    assert [args[3:] for args in rated] == [
+        ("codex", config["stalled_after"], 900)
+    ]
+
+
+def test_a_holder_parked_on_an_operator_dialog_is_not_silent(bridge, paired):
+    directory = overdue(bridge, paired)
+    state = json.loads((directory / "claude-activity.json").read_text())
+    write_json(
+        directory / "claude-activity.json",
+        {
+            **state,
+            "activity": "dialog: asks the operator: Which branch?",
+            "dialog": {"name": "question", "action": "ask"},
+        },
+    )
+    observed = supervision.presence(directory, "claude", WINDOW)
+    assert not supervision.holder_silent(directory, "claude", observed, WINDOW)
+    kept = step(bridge, directory, paired)
+    assert "overdue_recovery" not in kept
+    write_json(
+        directory / "claude-activity.json",
+        {
+            **state,
+            "activity": "dialog: usage limit",
+            "dialog": {"name": "usage", "action": "exhausted"},
+        },
+    )
+    observed = supervision.presence(directory, "claude", WINDOW)
+    assert supervision.holder_silent(directory, "claude", observed, WINDOW)
 
 
 def test_a_claim_without_a_deadline_takes_the_project_default(bridge, paired):

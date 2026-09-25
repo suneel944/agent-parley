@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import (
+    checkpoints,
     cli,
     completion,
     dashboard,
@@ -296,6 +297,52 @@ def test_an_idle_lane_holding_a_refused_key_names_the_refused_lane(
     assert row["seconds"] is not None
     store.call(bridge.home, lanes["claude"], "release_file_reservations", {})
     assert not rows(bridge, problems.HOLDING)
+
+
+def test_a_hook_refusal_on_a_held_key_names_the_refused_lane(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    store.initialize(bridge.home)
+    holder = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, paired["root"], "claude")[
+            "registration_token"
+        ],
+    )
+    store.register(bridge.home, paired["root"], "codex")
+    store.call(
+        bridge.home,
+        holder,
+        "file_reservation_paths",
+        {"paths": ["shared.txt"], "exclusive": True},
+    )
+    lane = Path(paired["lanes"]["codex"])
+    write_json(directory / "codex-identity.json", {"name": "codex"})
+    denied = checkpoints.checkpoint(
+        bridge.home,
+        directory,
+        "codex",
+        {
+            "hook_event_name": "PreToolUse",
+            "cwd": str(lane),
+            "session_id": "s1",
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(lane / "shared.txt")},
+        },
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    [record] = [
+        lane
+        for project in bridge.status_snapshot()["projects"]
+        for lane in project["participants"]
+        if lane["participant"] == "claude"
+    ]
+    assert record["mail"]["refused"] == ["codex"]
+    [row] = rows(bridge, problems.HOLDING)
+    assert row["participant"] == "claude"
+    assert "codex" in row["detail"]
 
 
 def test_an_escalated_native_dialog_is_a_row_naming_it(

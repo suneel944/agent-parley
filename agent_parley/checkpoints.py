@@ -945,8 +945,31 @@ def diagnosable(payload: dict) -> bool:
         for segment in shell_segments(command)
         if (words := invoked(segment))
     ]
-    return bool(segments) and all(
-        Path(words[0]).name == BRIDGE_COMMAND for words in segments
+    return bool(segments) and all(map(bridge_invocation, segments))
+
+
+def bridge_invocation(words: list[str]) -> bool:
+    """Reports whether one simple command runs this bridge's own CLI.
+
+    The installed console script and the protocol form a lane is ordered to
+    run, an interpreter followed by ``-m agent_parley.cli``, reach the same
+    code, so an exemption granted to one is granted to the other.
+
+    Args:
+        words: Tokenized simple command with its wrappers already stripped.
+
+    Returns:
+        True when the command is the bridge's console script or its module
+        run through a Python interpreter.
+    """
+    if not words:
+        return False
+    executable = Path(words[0]).name
+    if executable == BRIDGE_COMMAND:
+        return True
+    return words[1:3] == ["-m", protocol.CLI_MODULE] and (
+        words[0] == sys.executable
+        or bool(re.fullmatch(r"python[0-9.]*(\.exe)?", executable))
     )
 
 
@@ -1138,21 +1161,16 @@ def hazard(
     Returns:
         The denial cause and its reason text, or None when the call is safe.
     """
-    tool = str(payload.get("tool_name", ""))
-    if tool in READ_ONLY_TOOLS or diagnosable(payload):
+    if exempt(payload):
         return None
-    path = touched_path(payload, lane)
-    if path:
-        for held in mail.get("peer_reservations") or []:
-            pattern = str(held["pattern"])
-            if not store.named_resource(pattern) and store.overlapping(
-                pattern, path
-            ):
-                return Reason.RESERVED_PATH, (
-                    f"{path} overlaps {pattern}, reserved by "
-                    f"{held['holder']}. Coordinate with {held['holder']} or "
-                    "wait for the release; reservations are advisory."
-                )
+    if conflict := reserved_conflict(payload, lane, mail):
+        path, held = conflict
+        return Reason.RESERVED_PATH, (
+            f"{path} overlaps {held['pattern']}, reserved by "
+            f"{held['holder']}. Coordinate with {held['holder']} or "
+            "wait for the release; reservations are advisory."
+        )
+    command = protocol.cli_command()
     now = time.time()
     for number, item in (issues.get("issues") or {}).items():
         offer = item.get("offer") or {}
@@ -1165,11 +1183,133 @@ def hazard(
             return Reason.OFFER_EXPIRING, (
                 f"Offer {offer.get('id')} for issue #{number} expires in "
                 f"{int(deadline - now)}s. Answer it first: "
-                f"{BRIDGE_COMMAND} issue accept {number} --offer-id "
-                f"{offer.get('id')} or {BRIDGE_COMMAND} issue decline "
+                f"{command} issue accept {number} --offer-id "
+                f"{offer.get('id')} or {command} issue decline "
                 f"{number} --offer-id {offer.get('id')}."
             )
     return None
+
+
+def exempt(payload: dict) -> bool:
+    """Reports whether a call is never refused for coordination.
+
+    Args:
+        payload: Native ``PreToolUse`` hook payload.
+
+    Returns:
+        True when the call only reads or runs the bridge's own tools.
+    """
+    tool = str(payload.get("tool_name", ""))
+    return tool in READ_ONLY_TOOLS or diagnosable(payload)
+
+
+def reserved_conflict(
+    payload: dict, lane: Path, mail: dict
+) -> tuple[str, dict] | None:
+    """Finds the peer reservation one tool call would write into.
+
+    Args:
+        payload: Native ``PreToolUse`` hook payload.
+        lane: Resolved lane worktree the call runs in.
+        mail: Mailbox batch carrying the peers' exclusive reservations.
+
+    Returns:
+        The lane-relative path the call writes and the overlapping
+        reservation with its ``pattern`` and ``holder``, or None.
+    """
+    path = touched_path(payload, lane)
+    if not path:
+        return None
+    for held in mail.get("peer_reservations") or []:
+        pattern = str(held["pattern"])
+        if not store.named_resource(pattern) and store.overlapping(
+            pattern, path
+        ):
+            return path, held
+    return None
+
+
+def hazard_denial(
+    home: Path,
+    root: str,
+    name: str,
+    payload: dict,
+    lane: Path,
+    mail: dict,
+    danger: tuple[Reason, str],
+) -> dict:
+    """Builds the native denial for a hazard and records who caused it.
+
+    A write refused for a peer's reservation is recorded against that
+    holder, so status and the problems view name the lane it blocks. A
+    store that cannot take the record does not turn the denial into an
+    outage, because the denial itself is already decided.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity of the refused lane.
+        payload: Native ``PreToolUse`` hook payload.
+        lane: Resolved lane worktree the call runs in.
+        mail: Mailbox batch the hazard was found in.
+        danger: Denial cause and reason text `hazard` returned.
+
+    Returns:
+        Native hook output that denies the call with the reason text.
+    """
+    reason, unsafe = danger
+    conflict = reserved_conflict(payload, lane, mail)
+    if reason is Reason.RESERVED_PATH and conflict:
+        path, held = conflict
+        with contextlib.suppress(OSError, sqlite3.Error, BridgeError):
+            store.record_refusal(home, root, name, str(held["holder"]), path)
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": unsafe,
+        }
+    }
+
+
+def unscanned_hazard(
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    payload: dict,
+    lane: Path,
+    agent: str,
+) -> tuple[dict, tuple[Reason, str]] | None:
+    """Finds a hazard for a call decided without the context scans.
+
+    A lane with abandoned decisions has its events decided record-only,
+    and a write into a peer's exclusive reservation or past an offer about
+    to expire must still be refused there. Only the mailbox and the issue
+    ledger are read, and only for a call that is not exempt; a store that
+    cannot answer leaves the call alone, as record-only decisions do.
+
+    Args:
+        home: Private bridge state root.
+        directory: Common project state directory.
+        root: Canonical project key registered with the store.
+        name: Registered identity of the lane.
+        payload: Native ``PreToolUse`` hook payload.
+        lane: Resolved lane worktree the call runs in.
+        agent: Assigned native lane name.
+
+    Returns:
+        The mailbox batch read and the hazard found, or None when the call
+        is safe or coordination cannot be read.
+    """
+    if exempt(payload):
+        return None
+    try:
+        mail = mailbox(home, root, name)
+        danger = hazard(payload, lane, agent, mail, snapshot(directory))
+    except (OSError, sqlite3.Error, BridgeError):
+        return None
+    return (mail, danger) if danger else None
 
 
 def outage(home: Path, cause: str) -> str:
@@ -1975,7 +2115,10 @@ def checkpoint(
     starts while an earlier decision of the lane is past its deadline,
     skips the mail and scans entirely: the label, the event record, the
     session process identity and the recovery checkpoint are what must not
-    be lost, and the context is what the client no longer waits for.
+    be lost, and the context is what the client no longer waits for. A
+    record-only tool call is still refused by `unscanned_hazard` when it
+    writes into a peer's reservation or passes an expiring offer, because
+    those refusals protect a peer rather than inform the lane.
 
     A session identity dropped because the process it named is gone records
     the lane as stopped, so the state derivation still reads positive
@@ -2102,6 +2245,18 @@ def checkpoint(
             scanned = scan(home, directory, manifest, agent)
         except (OSError, sqlite3.Error, BridgeError) as exc:
             scanned = exc
+    urgent: tuple[dict, tuple[Reason, str]] | None = None
+    if record_only and event == "PreToolUse":
+        stages.enter("hazard")
+        urgent = unscanned_hazard(
+            home,
+            directory,
+            manifest["root"],
+            identity["name"],
+            payload,
+            lane,
+            agent,
+        )
     stages.enter("lock")
     waits = settle if event in SETTLING or record_only else LOCK_SECONDS
     with lock(directory / f"{agent}-checkpoint.lock", timeout=waits):
@@ -2367,14 +2522,16 @@ def checkpoint(
                             }
                         }
                     if danger:
-                        reason, unsafe = danger
-                        output = {
-                            "hookSpecificOutput": {
-                                "hookEventName": event,
-                                "permissionDecision": "deny",
-                                "permissionDecisionReason": unsafe,
-                            }
-                        }
+                        reason = danger[0]
+                        output = hazard_denial(
+                            home,
+                            manifest["root"],
+                            identity["name"],
+                            payload,
+                            lane,
+                            mail,
+                            danger,
+                        )
                     elif output:
                         reason = Reason.COORDINATION_PENDING
                         if delivered:
@@ -2417,6 +2574,16 @@ def checkpoint(
                             "additionalContext": text,
                         }
                     }
+        elif urgent:
+            reason = urgent[1][0]
+            output = hazard_denial(
+                home,
+                manifest["root"],
+                identity["name"],
+                payload,
+                lane,
+                *urgent,
+            )
         if event in RECOVERY_EVENTS and pending is not None:
             pending["recovery"] = True
         elif event in RECOVERY_EVENTS:
