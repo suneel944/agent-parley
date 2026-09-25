@@ -1,5 +1,6 @@
 """Observes lane availability and reminds holders about waiting peers."""
 
+import collections
 import contextlib
 import contextvars
 import copy
@@ -12,6 +13,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeGuard, cast
 
@@ -37,6 +39,9 @@ DEFAULTS = {
     "start_deadline": 30,
     "completion_reminders": 3,
     "orphan_retire_after": 3600,
+    "claim_idle_after": 3600,
+    "takeover_grace": 300,
+    "max_claims_per_lane": 2,
     "prompts": True,
     "wake": True,
     "reclaim": True,
@@ -44,12 +49,14 @@ DEFAULTS = {
 }
 
 MAX_COMPLETION_REMINDERS = 100
+MAX_CLAIMS_PER_LANE = 100
 ENDED = "pull request ended"
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 BOOT_RECORD = "boot.json"
 READINGS_PUBLICATION = "git-readings.json"
+GIT_WORKERS = 8
 POLL_RECORD = "supervision-poll.json"
 COMPLETION_TTL = 60.0
 
@@ -123,12 +130,20 @@ def settings(value: dict) -> dict:
         "stalled_after",
         "start_deadline",
         "orphan_retire_after",
+        "claim_idle_after",
+        "takeover_grace",
     ):
         if (
             type(result[field]) not in (int, float)
             or not 1 <= result[field] <= 86400
         ):
             raise BridgeError(f"{field} must be between 1 and 86400 seconds.")
+    cap = result["max_claims_per_lane"]
+    if type(cap) is not int or not 1 <= cap <= MAX_CLAIMS_PER_LANE:
+        raise BridgeError(
+            "max_claims_per_lane must be between 1 and "
+            f"{MAX_CLAIMS_PER_LANE} claims."
+        )
     reminders_before = result["completion_reminders"]
     if (
         type(reminders_before) is not int
@@ -756,6 +771,10 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     itself changed, both those committed on its branch and those still
     uncommitted in its worktree.
 
+    The Git calls are read-only and independent per lane, so up to
+    `GIT_WORKERS` of them run at once. One call per lane in turn cost two to
+    three seconds a frame on a 34-lane state root.
+
     The reading is advisory. Nothing rebases, pauses or reverts, and the lane
     decides what a moved base means for its work.
 
@@ -772,32 +791,50 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     head = _read(root, "rev-parse", "HEAD")
     if not head:
         return {}
-    forks = {}
-    for name, participant in manifest["participants"].items():
-        fork = _read(root, "merge-base", head, participant["branch"])
-        if fork and fork != head:
-            forks[name] = fork
-    if not forks:
-        return {}
+    participants = manifest["participants"]
+
+    def fork_point(participant: dict) -> str | None:
+        """Reads where a lane's branch forked from the base head."""
+        return _read(root, "merge-base", head, participant["branch"])
+
+    def lane_paths(name: str) -> set[str]:
+        """Lists the paths a lane changed, committed or not, since forking."""
+        participant = participants[name]
+        mine = set(_changed(root, forks[name], participant["branch"]))
+        mine.update(dirty_paths(participant["lane"]) or [])
+        return mine
+
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        points = pool.map(fork_point, participants.values())
+        forks = {
+            name: fork
+            for name, fork in zip(participants, points, strict=True)
+            if fork and fork != head
+        }
+        if not forks:
+            return {}
+        starts = sorted(set(forks.values()))
+        moved = dict(
+            zip(
+                starts,
+                pool.map(lambda fork: _changed(root, fork, head), starts),
+                strict=True,
+            )
+        )
+        behind = [name for name, fork in forks.items() if moved[fork]]
+        held_paths = dict(
+            zip(behind, pool.map(lane_paths, behind), strict=True)
+        )
     try:
         held = store.active_reservations(home, root)
     except (BridgeError, OSError, sqlite3.Error):
         held = {}
     advances: dict[str, list[str]] = {}
-    moved: dict[str, list[str]] = {}
-    for name, fork in forks.items():
-        participant = manifest["participants"][name]
-        branch = participant["branch"]
-        if fork not in moved:
-            moved[fork] = _changed(root, fork, head)
-        changed = moved[fork]
-        if not changed:
-            continue
-        patterns = held.get(participant["display"], [])
-        mine = set(_changed(root, fork, branch))
-        mine.update(dirty_paths(participant["lane"]) or [])
+    for name in behind:
+        changed = moved[forks[name]]
+        patterns = held.get(participants[name]["display"], [])
         matched = sorted(
-            {path for path in changed if path in mine}
+            {path for path in changed if path in held_paths[name]}
             | store.overlapping_paths(changed, patterns)
         )
         if matched:
@@ -889,7 +926,8 @@ def readings(
     neither a current copy nor a current publication, such as a hook
     deciding in-process while the service is down, takes the readings
     itself and keeps nothing, so only the poll decides how often Git is
-    asked.
+    asked. It reads the operator edits on a second thread while it reads
+    the base advances, since neither waits on the other.
 
     Args:
         home: Private bridge state root.
@@ -903,7 +941,10 @@ def readings(
         return kept[1], kept[2]
     if (published := _published_readings(home, manifest)) is not None:
         return published
-    return operator_edits(home, manifest), base_advances(home, manifest)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        edits = pool.submit(operator_edits, home, manifest)
+        advances = base_advances(home, manifest)
+        return edits.result(), advances
 
 
 def base_advance_marker(paths: list[str]) -> str:
@@ -2494,6 +2535,46 @@ def holder_silent(
     return silence >= window
 
 
+def idle_claim(
+    directory: Path, record: dict, sole: bool, window: float, now: float
+) -> int:
+    """Measures how long one held claim has gone without progress of its own.
+
+    Lane liveness says nothing about which claim a lane works, so one busy
+    subagent kept every claim of its lane looking alive while all but one sat
+    untouched. A claim is measured by its own progress instead: its
+    generation start and the reports that name it. A lane that holds only
+    this claim is working on it whenever it runs a tool, so its tool calls
+    count too. Work that is blocked on a recorded condition or awaits
+    integration is waiting rather than idle, and an orphaned claim is the
+    orphan path's to move.
+
+    Args:
+        directory: Private project state directory.
+        record: Published ledger record of a held claim.
+        sole: Whether the holder holds no other claim.
+        window: Seconds without progress that make a claim idle.
+        now: Unix time the claim is measured at.
+
+    Returns:
+        Seconds the claim has gone without progress once that reaches the
+        window, else zero.
+    """
+    if record.get("orphan") or lifecycle.state(record)["state"] not in (
+        lifecycle.RUNNING,
+        lifecycle.RECOVERY,
+    ):
+        return 0
+    latest = issues.last_progress(record)
+    if (
+        sole
+        and (silence := tool_silence(directory, record["owner"])) is not None
+    ):
+        latest = max(latest, now - silence)
+    idle = int(now - latest)
+    return idle if latest and idle >= window else 0
+
+
 def _overdue_peer(
     home: Path,
     directory: Path,
@@ -2513,8 +2594,8 @@ def _overdue_peer(
         holder: Participant holding the overdue claim.
 
     Returns:
-        The fit, running peer that owns the fewest claims, ties broken by
-        name, or None when no peer qualifies.
+        The fit, running peer below the project's claim cap that owns the
+        fewest claims, ties broken by name, or None when no peer qualifies.
     """
     ledger = issues.snapshot(directory)["issues"].values()
     candidates = []
@@ -2532,28 +2613,24 @@ def _overdue_peer(
         ]:
             continue
         owned = sum(1 for record in ledger if record.get("owner") == name)
+        if owned >= config["max_claims_per_lane"]:
+            continue
         candidates.append((owned, name))
     return min(candidates)[1] if candidates else None
 
 
-def _overdue_summary(
-    number: str, holder: str, overdue: int, checkpoint: dict
-) -> str:
-    """Words the handoff summary of a supervisor offer for an overdue claim.
+def _overdue_summary(number: str, cause: str, checkpoint: dict) -> str:
+    """Words the handoff summary of a supervisor offer for a stuck claim.
 
     Args:
         number: Issue number being offered.
-        holder: Participant that held the claim.
-        overdue: Seconds the claim is past its deadline.
+        cause: Clause stating why the claim is moving.
         checkpoint: Recovery checkpoint captured for the claim, or empty.
 
     Returns:
         One paragraph naming the cause and the checkpoint to resume from.
     """
-    text = (
-        f"Supervisor offer: issue #{number} is overdue by {overdue}s and "
-        f"{holder} stayed silent after a wake."
-    )
+    text = f"Supervisor offer: issue #{number} {cause}."
     if not checkpoint:
         return f"{text} No recovery checkpoint could be captured."
     artifact = checkpoint.get("artifact") or {}
@@ -2566,7 +2643,11 @@ def _overdue_summary(
 
 
 def _overdue_step(
-    directory: Path, number: str, identifier: str, step: str | None
+    directory: Path,
+    number: str,
+    identifier: str,
+    step: str | None,
+    notice: str = "",
 ) -> None:
     """Records one overdue-claim step in the claim history and its attempts.
 
@@ -2575,6 +2656,9 @@ def _overdue_step(
         number: Issue number the step applies to.
         identifier: Claim generation the step belongs to.
         step: Step taken, or None to clear the recorded recovery.
+        notice: Text told once to the holder and to the lanes whose issues
+            wait on this one, or empty to tell nothing beyond the step. A
+            cleared recovery also drops the notice it wrote.
     """
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
@@ -2582,10 +2666,29 @@ def _overdue_step(
         if not record:
             return
         if step is None:
-            if not record.pop("overdue_recovery", None):
+            written = (record.get("deadline_notice") or {}).get("id", "")
+            dropped = written == f"idle:{identifier}" and bool(
+                record.pop("deadline_notice")
+            )
+            if not record.pop("overdue_recovery", None) and not dropped:
                 return
         else:
             now = time.time()
+            if notice:
+                record["deadline_notice"] = {
+                    "id": f"idle:{identifier}",
+                    "holder": record.get("owner"),
+                    "waiting": sorted(
+                        {
+                            other["owner"]
+                            for other in ledger["issues"].values()
+                            if number in other.get("blocked_by", [])
+                            and other.get("owner")
+                        }
+                    ),
+                    "created": now,
+                    "text": notice,
+                }
             record["overdue_recovery"] = {
                 "id": identifier,
                 "step": step,
@@ -2629,6 +2732,12 @@ def overdue_claims(
     claim that is no longer overdue, drops the recorded recovery, and the
     next breach starts over from the wake.
 
+    A live holder does not protect a claim it does not work on. A claim with
+    no progress of its own for `claim_idle_after` takes the same transition
+    while its holder stays busy elsewhere, and its wake step tells the holder
+    and the lanes waiting on the issue why. Progress recorded on the claim
+    drops the recovery as a tool call does for a silent holder.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -2641,25 +2750,68 @@ def overdue_claims(
     window = config["inactive_after"]
     now = time.time()
     ledger = issues.snapshot(directory)["issues"]
+    held = collections.Counter(
+        record.get("owner") for record in ledger.values()
+    )
     for number, record in ledger.items():
         holder = record.get("owner")
         current = record.get("overdue_recovery") or {}
         identifier = f"{number}:{record.get('claim_id')}"
         timing = issues.deadline_state(record, now)
+        idle = 0
+        if (
+            holder in manifest["participants"]
+            and record.get("claim_id")
+            and (current.get("id") == identifier or not record.get("offer"))
+        ):
+            idle = idle_claim(
+                directory,
+                record,
+                held[holder] == 1,
+                config["claim_idle_after"],
+                now,
+            )
         if (
             holder not in manifest["participants"]
             or not record.get("claim_id")
-            or not timing["overdue"]
-            or not holder_silent(
-                directory, holder, observations.get(holder) or {}, window
+            or not (
+                (
+                    timing["overdue"]
+                    and holder_silent(
+                        directory,
+                        holder,
+                        observations.get(holder) or {},
+                        window,
+                    )
+                )
+                or idle
             )
         ):
             if current:
                 _overdue_step(directory, number, identifier, None)
             continue
+        cause = (
+            f"is overdue by {timing['overdue_seconds']}s and {holder} stayed "
+            "silent after a wake"
+            if timing["overdue"] and not idle
+            else f"has recorded no progress for {idle}s while {holder} holds it"
+        )
         elapsed = now - float(current.get("at", 0) or 0)
         if current.get("id") != identifier:
-            _overdue_step(directory, number, identifier, "wake")
+            _overdue_step(
+                directory,
+                number,
+                identifier,
+                "wake",
+                (
+                    f"Issue #{number} {cause}. Record progress with "
+                    f"agent-parley report partial --issue {number}, or offer "
+                    "or release it; otherwise the supervisor offers it to an "
+                    "idle peer, then releases it."
+                )
+                if idle
+                else "",
+            )
         elif current.get("step") == "wake" and elapsed >= window:
             peer = _overdue_peer(
                 home, directory, manifest, config, observations, holder
@@ -2701,9 +2853,7 @@ def overdue_claims(
                 number,
                 participants=set(manifest["participants"]),
                 to=peer,
-                summary=_overdue_summary(
-                    number, holder, timing["overdue_seconds"], checkpoint
-                ),
+                summary=_overdue_summary(number, cause, checkpoint),
                 carried={
                     "commit": checkpoint.get("worktree_commit", ""),
                     "remaining": checkpoint.get("remaining", []),
@@ -3335,30 +3485,7 @@ def _announce_return(
             )
 
 
-def claimed_since(record: dict) -> float:
-    """Reports when the current ownership generation of an issue began.
-
-    A lane branch is reused across claims, so a pull request that ended before
-    the current claim started describes earlier work and must not report that
-    claim as finished. The generation starts at the most recent claim or
-    accepted handoff; a record whose history no longer names one is treated as
-    having always been owned, which preserves the previous observation. A take
-    of an orphaned claim starts a generation like any other claim.
-
-    Args:
-        record: Published ledger record for one issue.
-
-    Returns:
-        Unix time the current ownership generation began, or zero.
-    """
-    return max(
-        (
-            float(entry.get("at", 0) or 0)
-            for entry in record.get("history", [])
-            if entry.get("action") in {"claim", "accept", "take"}
-        ),
-        default=0.0,
-    )
+claimed_since = issues.claimed_since
 
 
 ISSUE_READING_SECONDS = 300.0
@@ -3931,6 +4058,13 @@ def _poll(home: Path, directory: Path) -> None:
             manifest,
             config,
             observations,
+        )
+        stage(
+            "takeover requests",
+            issues.grant_requests,
+            directory,
+            config["takeover_grace"],
+            manifest.get("deadlines") or {},
         )
     if config["wake"]:
         for name, participant in manifest["participants"].items():

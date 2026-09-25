@@ -193,7 +193,17 @@ the table and in `status --json`.
 
 ## `top`
 
-`top` is the live view: every lane at once, refreshed in place, `q` quits.
+`top` is the live view: every live lane at once, refreshed in place, `q`
+quits. Like a task manager, it lists what is live: a lane out of a live state
+(retired, or its state record `stopped`, `dead` or `reclaimed`; no record
+yet falls back to a stopped session cell) is left out once it owns no
+issue, holds no offer, holds or waits on no lease, has no unread or
+unacknowledged mail and has no ready report awaiting approval. A project
+whose root no longer exists, such as a run under `/tmp` after a reboot, is
+left out the same way; a lane whose mailbox or lease store could not be
+read stays on screen regardless. The header counts what was left out;
+`--all` on the command line, or `a` in the live view, shows it again, and
+`--json` always reports every lane.
 
 ```sh
 agent-parley top --provider codex
@@ -201,6 +211,7 @@ agent-parley top --provider claude --provider codex
 agent-parley top --sort IDLE --reverse
 agent-parley top --project payments --participant codex
 agent-parley top --columns PARTICIPANT,STATE,ISSUES,IDLE
+agent-parley top --all
 ```
 
 With a dozen lanes open the whole table is rarely what you want. `--provider`
@@ -226,9 +237,15 @@ The same choices are reachable from the live view with single keys:
 | `f` | Narrow to participants, comma separated; empty clears. |
 | `o` | Narrow to projects, comma separated; empty clears. |
 | `c` | Choose the columns shown; empty shows all. |
+| `a` | Show or hide stopped lanes and projects whose root is gone. |
 | `P` | Show the `problems` rows in place until any key returns. |
 | `?` | Show the key map and the column legend. |
 | `q` | Leave. The view never writes state. |
+
+The header also carries how long the frame took to read. Git reads dominate
+a frame, so the live view reads each lane's branch and each project's
+operator edits and base advances at most once every five seconds; the rest
+of the frame is read on every redraw, keeping a normal frame under a second.
 
 A lane that drifted from its branch, holds a stale lease, had a call rejected,
 owns an overdue issue or lost its session process is drawn in colour where the
@@ -279,6 +296,13 @@ supervision threshold, a claim past its deadline, a handoff offer with no
 answer, a message awaiting acknowledgement past `--ack-after`, a lane whose
 branch drifted or whose worktree is dirty with no recent activity, a lane over
 its advisory budget, a store schema behind the code, and a service that is down.
+
+Retiring a lane supersedes the shares it still owed an acknowledgement, so
+they never bounce. `problems` names that once per retired lane under `shares
+to a retired lane`, for example `3 shares to codex superseded: codex retired`.
+The row is informational and offers nothing to run; it clears when those
+shares' acknowledgement deadlines pass, or a day after retirement for a share
+sent without a deadline.
 
 Each lane contributes one row per cause, not one row per item: a lane sitting
 on twenty unacknowledged messages is a single row carrying that count and the

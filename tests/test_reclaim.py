@@ -510,6 +510,56 @@ def test_mail_to_a_retired_lane_is_superseded(bridge, repo, paired, idle):
     )
 
 
+def shared(bridge, paired, count):
+    """Sends `count` acknowledged shares from claude to codex."""
+    store.initialize(bridge.home)
+    tokens = {
+        name: store.register(bridge.home, paired["root"], name)
+        for name in ("claude", "codex")
+    }
+    actor = store.authenticate(
+        bridge.home, tokens["claude"]["registration_token"]
+    )
+    for index in range(count):
+        store.call(
+            bridge.home,
+            actor,
+            "send_message",
+            {
+                "to": ["codex"],
+                "subject": f"Share {index}",
+                "body_md": "Take this",
+                "idempotency_key": f"share-{index}",
+                "ack_required": True,
+                "ack_within": 600,
+            },
+        )
+
+
+def test_a_retired_lane_is_one_problem_row_naming_the_retirement(
+    bridge, repo, paired, idle
+):
+    shared(bridge, paired, 3)
+
+    bridge.reclaim(repo, apply=True)
+    found = bridge.problems()
+
+    [row] = [row for row in found if row["condition"] == problems.RETIRED]
+    assert row["participant"] == "codex"
+    assert row["count"] == 3
+    assert row["detail"] == "3 shares to codex superseded: codex retired"
+    assert "agent-parley" not in row["command"]
+    assert not [row for row in found if row["condition"] == problems.BOUNCE]
+
+
+def test_no_retired_lane_is_no_retirement_row(bridge, repo, paired, idle):
+    shared(bridge, paired, 3)
+
+    found = bridge.problems()
+
+    assert not [row for row in found if row["condition"] == problems.RETIRED]
+
+
 def made(repo, directory, name):
     """Adds a worktree the way a lane does for a sub-task."""
     path = directory / name
