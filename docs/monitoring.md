@@ -297,6 +297,13 @@ answer, a message awaiting acknowledgement past `--ack-after`, a lane whose
 branch drifted or whose worktree is dirty with no recent activity, a lane over
 its advisory budget, a store schema behind the code, and a service that is down.
 
+Retiring a lane supersedes the shares it still owed an acknowledgement, so
+they never bounce. `problems` names that once per retired lane under `shares
+to a retired lane`, for example `3 shares to codex superseded: codex retired`.
+The row is informational and offers nothing to run; it clears when those
+shares' acknowledgement deadlines pass, or a day after retirement for a share
+sent without a deadline.
+
 Each lane contributes one row per cause, not one row per item: a lane sitting
 on twenty unacknowledged messages is a single row carrying that count and the
 age of the oldest message. The remedy follows the lane's state, so a lane
