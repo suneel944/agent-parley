@@ -10,7 +10,8 @@ runs `participant merge`, and never on an agent's behalf.
 | Module | Responsibility |
 | --- | --- |
 | `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
-| `cli` | Argument parsing and dispatch, plus the `Bridge` command object: service lifecycle, native launch, retirement, status, reports, pull requests and operator mail |
+| `cli` | Argument parsing and dispatch, plus the `Bridge` command object: native launch, retirement, status, reports, pull requests and operator mail |
+| `core` | Base of the `Bridge` command object: the private state root and its configuration, the mail server's start, stop and readiness, the project manifest and the participant lanes it records |
 | `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
 | `merges` | Merge refusals, preview and the merge itself, plus the readiness, dependency and group ordering that integration follows |
 | `server` | Authenticated MCP transport and bounded tool contracts |
@@ -116,7 +117,11 @@ execute it. `cli` binds command modules, selected standard-library modules and
 its legacy direct-name callables through deferred modules, so a command loads
 only the modules it reaches. Helpers moved out of `cli` keep their `cli` names
 the same way, as deferred callables and, for a moved constant, a module
-attribute hook, so callers and tests that read them from `cli` are unchanged. Plain, unfiltered status skips parser construction,
+attribute hook, so callers and tests that read them from `cli` are unchanged.
+The `Bridge` command groups are base classes in their own modules. Their
+methods import the module-level names they use from `cli` when they run, so a
+name `cli` binds lazily, or a test replaces there, is the one they read, and no
+group module imports `cli` while `cli` is still loading. Plain, unfiltered status skips parser construction,
 reads an existing configuration without taking its creation lock and sends one
 bounded HTTP request on a loopback socket rather than loading the general URL
 opener.
