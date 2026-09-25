@@ -1551,3 +1551,35 @@ def test_a_poll_reads_each_lane_once_however_many_lanes(
     assert counts == {"worktree": 40, "forge": 1}
     stages = supervision.last_poll(directory)["stages"]
     assert {"work", "completions", "wake claude"} <= set(stages)
+
+
+def test_an_expired_completion_refreshes_without_holding_the_poll(
+    tmp_path, monkeypatch
+):
+    key = (str(tmp_path), "lane")
+    expired = time.monotonic() - supervision.COMPLETION_TTL - 1
+    monkeypatch.setitem(supervision._COMPLETIONS, key, (expired, None))
+    release = threading.Event()
+    calls = []
+
+    def slow(root, branch):
+        calls.append(branch)
+        release.wait(10)
+        return ("MERGED", 1.0)
+
+    monkeypatch.setattr(supervision.forge, "branch_completion", slow)
+
+    started = time.monotonic()
+    first = supervision.branch_completion(tmp_path, "lane")
+    second = supervision.branch_completion(tmp_path, "lane")
+    held = time.monotonic() - started
+    release.set()
+    deadline = time.monotonic() + 5
+    while supervision._COMPLETIONS[key][1] is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    assert first is None and second is None
+    assert held < 1
+    assert calls == ["lane"]
+    assert supervision.branch_completion(tmp_path, "lane") == ("MERGED", 1.0)
