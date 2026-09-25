@@ -87,6 +87,8 @@ _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
 _READINGS: dict[str, tuple[float, dict, dict]] = {}
 _COMPLETIONS: dict[tuple[str, str], tuple[float, tuple[str, float] | None]] = {}
+_REFRESHING: set[tuple[str, str]] = set()
+_REFRESHING_LOCK = threading.Lock()
 _POLL_READINGS: contextvars.ContextVar[dict[tuple, object] | None] = (
     contextvars.ContextVar("poll_readings", default=None)
 )
@@ -1691,8 +1693,11 @@ def branch_completion(root: Path, branch: str) -> tuple[str, float] | None:
 
     Each reading is one forge request that may take seconds, and a poll used
     to repeat it for every owning lane on every poll. A reading is reused for
-    `COMPLETION_TTL` seconds per repository and branch, so a merge is
-    noticed at most that much later.
+    `COMPLETION_TTL` seconds per repository and branch. An expired reading
+    is still returned while one background thread per key replaces it, so
+    a poll never waits on the forge for a branch it has read before; a
+    merge is noticed at most one refresh after the reading expires. Only a
+    branch with no reading yet is read in the poll itself.
 
     Args:
         root: Repository that selects the forge project.
@@ -1705,11 +1710,42 @@ def branch_completion(root: Path, branch: str) -> tuple[str, float] | None:
     key = (str(root), branch)
     now = time.monotonic()
     cached = _COMPLETIONS.get(key)
-    if cached and now - cached[0] < COMPLETION_TTL:
-        return cached[1]
-    reading = forge.branch_completion(root, branch)
-    _COMPLETIONS[key] = (now, reading)
-    return reading
+    if cached is None:
+        reading = forge.branch_completion(root, branch)
+        _COMPLETIONS[key] = (now, reading)
+        return reading
+    if now - cached[0] >= COMPLETION_TTL:
+        with _REFRESHING_LOCK:
+            start = key not in _REFRESHING
+            _REFRESHING.add(key)
+        if start:
+            threading.Thread(
+                target=_refresh_completion,
+                args=(root, branch, key),
+                name=f"completion {branch}",
+                daemon=True,
+            ).start()
+    return cached[1]
+
+
+def _refresh_completion(root: Path, branch: str, key: tuple[str, str]) -> None:
+    """Replaces one expired completion reading off the poll thread.
+
+    A failed forge read keeps the expired reading, and the next poll past
+    the TTL tries again.
+
+    Args:
+        root: Repository that selects the forge project.
+        branch: Lane branch whose pull requests are read.
+        key: Cache key for the repository and branch.
+    """
+    try:
+        with contextlib.suppress(Exception):
+            reading = forge.branch_completion(root, branch)
+            _COMPLETIONS[key] = (time.monotonic(), reading)
+    finally:
+        with _REFRESHING_LOCK:
+            _REFRESHING.discard(key)
 
 
 def published_work(directory: Path, name: str) -> dict:
