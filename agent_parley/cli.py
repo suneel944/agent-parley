@@ -74,12 +74,15 @@ if TYPE_CHECKING:
         read_events,
     )
     from agent_parley.copilot import configure_copilot, release_copilot
+    from agent_parley.forge import report_comment
     from agent_parley.issues import attempt as change_attempt
     from agent_parley.issues import (
         change,
         deadline_state,
         describe,
+        exact_claim,
         handoff_fields,
+        held_claim,
         offer_state,
         orphan_age,
         parse_issue,
@@ -160,6 +163,8 @@ MOVED_CALLABLES = {
         "owned_hook",
         "release_copilot",
     ),
+    "forge": ("report_comment",),
+    "issues": ("exact_claim", "held_claim"),
     "merges": (
         "attributed_commits",
         "group_lanes",
@@ -1641,95 +1646,6 @@ def merged_lanes(
         bridge.preview_merge(repo, args.name)
         if preview
         else bridge.merge(repo, args.name)
-    )
-
-
-def held_claim(directory: Path, name: str) -> dict:
-    """Names the claim a lane's integration record belongs to.
-
-    Args:
-        directory: Private state directory for the common repository.
-        name: Participant that owns the lane.
-
-    Returns:
-        The issue and claim identifier the lane currently holds, or empty
-        fields when it holds none. A record with no claim is reported as
-        unknown by history rather than being attached to a guessed one.
-    """
-    owned = sorted(
-        (
-            (number, record)
-            for number, record in snapshot(directory)["issues"].items()
-            if record["owner"] == name
-        ),
-        key=lambda item: int(item[0]),
-    )
-    if not owned:
-        return {"issue": None, "claim_id": None}
-    number, record = owned[0]
-    return {"issue": int(number), "claim_id": record.get("claim_id")}
-
-
-def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
-    """Returns one exact owned claim or refuses an ambiguous selection.
-
-    Args:
-        directory: Private state directory for the common repository.
-        name: Participant that owns the lane.
-        issue: Explicit issue selection, or empty to infer a sole claim.
-
-    Returns:
-        Issue number and claim identifier, or empty fields when no claim is
-        held and none was requested.
-
-    Raises:
-        BridgeError: If the selection is not currently owned or ownership is
-            ambiguous.
-    """
-    owned = {
-        number: record
-        for number, record in snapshot(directory)["issues"].items()
-        if record["owner"] == name
-    }
-    if issue:
-        number = parse_issue(issue)
-        if number not in owned:
-            raise BridgeError(f"Issue #{number} is not owned by {name}.")
-    elif len(owned) > 1:
-        raise BridgeError(
-            f"{name} owns multiple issues; name one with --issue."
-        )
-    elif not owned:
-        return {"issue": None, "claim_id": None}
-    else:
-        number = next(iter(owned))
-    return {"issue": int(number), "claim_id": owned[number].get("claim_id")}
-
-
-def report_comment(summary: str, evidence: str) -> str:
-    """Shapes one lane's ready report for the issue it claims.
-
-    The comment reproduces the lane's own summary and evidence and adds no
-    assessment of its own, so a reader on the forge sees what was reported and
-    what that report is worth. It names neither the participant nor the
-    provider that produced the work: which assistant wrote a change belongs in
-    coordination state, where `top` and `status` read it, and never on the
-    user's forge.
-
-    Args:
-        summary: The lane's account of its result.
-        evidence: The verification evidence the lane recorded.
-
-    Returns:
-        Markdown for the issue comment.
-    """
-    return (
-        "Reported ready for review.\n\n"
-        f"{summary.strip()}\n\n"
-        "Verification recorded by the lane:\n\n"
-        f"{evidence.strip()}\n\n"
-        "A reported state is the participant's own account of its lane. It is "
-        "neither review nor independent verification."
     )
 
 

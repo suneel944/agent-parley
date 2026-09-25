@@ -10,23 +10,25 @@ runs `participant merge`, and never on an agent's behalf.
 | Module | Responsibility |
 | --- | --- |
 | `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
-| `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
+| `cli` | Argument parsing and dispatch, plus the `Bridge` command object: service lifecycle, native launch, retirement, status, reports, pull requests and operator mail |
+| `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
+| `merges` | Merge refusals, preview and the merge itself, plus the readiness, dependency and group ordering that integration follows |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
-| `issues` | Claim and handoff state transitions |
+| `issues` | Claim and handoff state transitions, and resolution of the claim a lane holds |
 | `lanes` | The one authoritative state record of each lane in the store (`starting`, `working`, `idle`, `blocked` with its cause, `stopped`, `dead`, `reclaimed`), its closed transition table, and the event every accepted or refused transition appends; the per-lane files are evidence it reads, never a second answer. Hooks (`checkpoints.record`) and the dialog watcher submit evidence to a per-project spool (`lane-evidence.jsonl`) instead of waiting on the store; each poll applies it in arrival order before its liveness sample, and keeps it for the next poll when the store is busy. A session change is a transition that records both session ids. Each poll also charges the time since the last one to idle lane-minutes and unaccountable claim-minutes by state and cause, which `status` reports. A host restart moves every recorded session's row to `stopped` with the restart named as its evidence, which `rebooted` reads to refuse a resume until a new session clears it. The wake budget (attempts, backlog, next attempt, exhaustion, escalation) lives in the same store, seeded once from a lane's published `-wake.json` on upgrade |
 | `roster` | Providers, credential profiles and project participants |
 | `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
-| `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
+| `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null`, and the ready-report comment posted there |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
-| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
+| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema, and the lane hooks and MCP server merged into and removed from a Copilot profile |
 | `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
 | `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
@@ -112,7 +114,9 @@ to `cli` so argparse produces the parsing, error text and exit status. The
 package binds `cli` itself the same way, so importing the surface does not
 execute it. `cli` binds command modules, selected standard-library modules and
 its legacy direct-name callables through deferred modules, so a command loads
-only the modules it reaches. Plain, unfiltered status skips parser construction,
+only the modules it reaches. Helpers moved out of `cli` keep their `cli` names
+the same way, as deferred callables and, for a moved constant, a module
+attribute hook, so callers and tests that read them from `cli` are unchanged. Plain, unfiltered status skips parser construction,
 reads an existing configuration without taking its creation lock and sends one
 bounded HTTP request on a loopback socket rather than loading the general URL
 opener.
