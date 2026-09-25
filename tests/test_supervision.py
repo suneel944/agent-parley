@@ -391,6 +391,87 @@ def test_permission_prompt_is_never_woken(bridge, paired, monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("label", "dialog"),
+    [
+        ("waiting for approval: Bash", {"name": "tool-permission"}),
+        (
+            "dialog: asks the operator: Which branch?",
+            {"name": "question", "action": "ask", "escalated": True},
+        ),
+        (
+            "dialog: an unrecognized native prompt",
+            {"name": "unknown", "action": "escalate", "escalated": True},
+        ),
+    ],
+)
+@pytest.mark.parametrize("event", ["Stop", "PreToolUse"])
+def test_a_lane_parked_on_an_operator_dialog_is_never_woken(
+    bridge, paired, monkeypatch, label, dialog, event
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": label,
+            "dialog": dialog,
+            "event": event,
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: pytest.fail("woke a dialog")
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, directory, "codex")
+    assert observed["activity"] == supervision.WAITING
+    for _ in range(supervision.WORK_WAKE_ATTEMPTS + 1):
+        supervision.wake(
+            bridge.home, directory, paired, "codex", observed, config
+        )
+    record = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert not record.get("attempts")
+    assert not record.get("escalated_at")
+    with store.connect(bridge.home) as db:
+        assert lanes.read(db, paired["root"], "codex")["state"] == (
+            lanes.BLOCKED
+        )
+
+
+def test_an_unrecorded_lane_parked_on_a_dialog_is_never_woken(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "dialog: asks the operator: Which branch?",
+            "dialog": {"name": "question", "action": "ask"},
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: pytest.fail("woke a dialog")
+    )
+    monkeypatch.setattr(supervision, "condition", lambda *args: None)
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        {"process_alive": True, "age_seconds": 500, "stale": True},
+        {**supervision.DEFAULTS, "inactive_after": 1},
+    )
+
+
 def test_a_wake_without_a_session_process_is_retried_when_it_returns(
     bridge, paired, monkeypatch
 ):

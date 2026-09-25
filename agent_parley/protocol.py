@@ -53,6 +53,7 @@ MIGRATE = "agent-parley up migrates the store in place; no lane is stopped."
 UPGRADE = "A newer agent-parley wrote this store; install that version."
 RELAUNCH = "agent-parley up starts a service on the code in the checkout."
 START = "agent-parley up starts the coordination service these lanes need."
+CLI_MODULE = "agent_parley.cli"
 UNKNOWN = -1
 OK = "ok"
 MISMATCH = "mismatch"
@@ -69,7 +70,7 @@ def cli_command() -> str:
     Returns:
         The shell-quoted interpreter and module, without arguments.
     """
-    return shlex.join([sys.executable, "-m", "agent_parley.cli"])
+    return shlex.join([sys.executable, "-m", CLI_MODULE])
 
 
 def cli_rule() -> str:
