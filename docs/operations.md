@@ -63,6 +63,11 @@ except `--version` exits with status 2 and a line pointing to WSL2, because
 the runtime relies on POSIX file locks, pseudo-terminals and process
 primitives that native Windows does not provide.
 
+Native Windows is not supported. The wheel installs there, but every command
+except `--version` exits with status 2 and a line pointing to WSL2, because
+the runtime relies on POSIX file locks, pseudo-terminals and process
+primitives that native Windows does not provide.
+
 ## Daily use
 
 ```sh
