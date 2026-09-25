@@ -1,0 +1,21 @@
+title: Agent Parley
+description: >-
+  Run Claude Code, Codex, Copilot, Gemini, OpenCode and Amp in parallel, each
+  in its own Git worktree, with shared issue ownership, advisory reservations
+  and explicit handoffs.
+url: https://suneel944.github.io
+baseurl: /agent-parley
+theme: jekyll-theme-primer
+plugins:
+  - jekyll-sitemap
+  - jekyll-seo-tag
+  - jekyll-relative-links
+exclude:
+  - agent_parley
+  - tests
+  - scripts
+  - plugins
+  - uv.lock
+  - Makefile
+  - pyproject.toml
+  - CHANGELOG.md
