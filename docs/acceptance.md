@@ -13,22 +13,57 @@ of the shipped package, and it never answers a lane.
 ## Starting a run
 
 ```sh
-python -m scripts.acceptance run --home ~/.local/state/agent-parley --hours 24
+uv run --locked python -m scripts.acceptance run \
+  --home ~/.local/state/parley-acceptance/home --hours 24
 ```
 
 The command takes the state home the estate runs under, the length of the
 period, the sampling interval (300 seconds), the backlog size (20 tasks)
 and the lanes. Without `--workspace` the run creates its own throwaway
-project under `/tmp/parley-acceptance-<timestamp>`. It refuses a directory
-that already holds a repository, so it can never run on real work.
+project under `~/.local/state/parley-acceptance/run-<timestamp>`. It
+refuses a directory that already holds a repository, so it can never run
+on real work.
 
-The run occupies its terminal for the whole period. Start it detached and
-read its log:
+Nothing the run depends on lives under `/tmp`. A host that restarts
+without shutdown clears `/tmp`, and one did so partway through an earlier
+run, taking the project, its worktrees and every frame with it.
+
+The run drives the checkout it is started from, not an installed release.
+`--cli` defaults to the `agent-parley` entry point beside the interpreter
+running the script, so under `uv run` every command, and the hooks and
+service that command starts, come from this checkout's `.venv`.
+
+Give the run a home and a port of its own. The operator's service already
+holds the default port for the operator's home, and a run that shared that
+home would be served by the installed release and judged on the operator's
+real work. A credential profile is recorded per home, so a lane that names
+one needs it defined in the run's home first:
 
 ```sh
-setsid nohup sh -c 'python -m scripts.acceptance run \
-  --home ~/.local/state/agent-parley --hours 24 --trust' \
-  > /tmp/acceptance.log 2>&1 &
+install -d -m 700 ~/.local/state/parley-acceptance/home
+export AGENT_PARLEY_HOME=~/.local/state/parley-acceptance/home
+export AGENT_PARLEY_PORT=8877
+uv run --locked agent-parley credentials add claude-p2 \
+  --config-home ~/.claude-p2
+```
+
+`rehearse` seeds and registers a project exactly as `run` does, starts the
+service the way a lane's launcher would, writes each lane's launch command
+to `acceptance/plan.json`, takes one frame, and exits non-zero naming each
+reading the service did not answer. It starts no lane and spends no model
+quota, so run it before every period:
+
+```sh
+uv run --locked python -m scripts.acceptance rehearse
+```
+
+The run occupies its terminal for the whole period. Start it detached and
+read its log, which lives beside the run rather than in `/tmp`:
+
+```sh
+setsid nohup uv run --locked python -m scripts.acceptance run \
+  --hours 24 --trust \
+  > ~/.local/state/parley-acceptance/run.log 2>&1 &
 ```
 
 `--trust` is what lets the lanes start at all; it is described under what

@@ -9,7 +9,10 @@ hand.
 
 One command starts it::
 
-    python -m scripts.acceptance run --hours 24
+    uv run --locked python -m scripts.acceptance run --hours 24
+
+``rehearse`` seeds, registers and samples the same estate once without
+starting a lane, so a run can be checked before it spends model quota.
 
 The run writes a frame every interval to ``frames.jsonl`` under its
 workspace, and a Markdown report next to it when the period ends. The
@@ -37,6 +40,7 @@ from pathlib import Path
 
 BACKLOG = 20
 HOURS = 24.0
+ROOT = Path("~/.local/state/parley-acceptance")
 IDENTITY = ("Acceptance run", "acceptance@localhost")
 INTERVAL = 300.0
 SETTLE = 20.0
@@ -356,6 +360,90 @@ def _lane(spec: str) -> tuple[str, str, str]:
     return name, provider, credentials
 
 
+def launcher(cli: str, home: Path, repo: Path, lane: str) -> list[str]:
+    """Spells the command that starts one lane's native client.
+
+    Args:
+        cli: Executable that speaks the coordination CLI.
+        home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
+        lane: Lane specification as ``name:provider[:credentials]``.
+
+    Returns:
+        The argument vector the run hands to the lane's launcher.
+    """
+    name, provider, credentials = _lane(lane)
+    command = [
+        cli,
+        "--home",
+        str(home),
+        "run",
+        name,
+        "--provider",
+        provider,
+        "--repo",
+        str(repo),
+        "--task",
+        TASK,
+    ]
+    if credentials:
+        command.extend(["--credentials", credentials])
+    return command
+
+
+def rehearse(cli: str, home: Path, repo: Path, lanes: list[str]) -> list[str]:
+    """Samples a seeded estate once without starting any lane.
+
+    Args:
+        cli: Executable that speaks the coordination CLI.
+        home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
+        lanes: Lane specifications as ``name:provider[:credentials]``.
+
+    Returns:
+        Each reading the run depends on that could not be taken, empty
+        when the estate answered every one.
+
+    The rehearsal starts the service the way a lane's launcher would, so
+    a service that cannot serve this home is found before the period. It
+    writes each lane's launch command to ``plan.json`` and
+    one frame to ``frames.jsonl``, so the owner can read exactly what the
+    period would start and confirm that the service the run samples is
+    serving this project before any model quota is spent.
+    """
+    directory = repo / "acceptance"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "plan.json").write_text(
+        json.dumps(
+            {_lane(lane)[0]: launcher(cli, home, repo, lane) for lane in lanes},
+            indent=1,
+        )
+        + "\n"
+    )
+    started = _run([cli, "--home", str(home), "up"])
+    faults = (
+        [f"up: {started.stderr.strip() or started.stdout.strip()}"]
+        if started.returncode
+        else []
+    )
+    taken = frame(cli, home, repo, lanes)
+    with (directory / "frames.jsonl").open("a") as output:
+        output.write(json.dumps(taken) + "\n")
+    faults.extend(
+        f"{reading}: {taken[reading]['error']}"
+        for reading in ("issues", "problems", "metrics")
+        if "error" in taken[reading]
+    )
+    faults.extend(
+        f"problems: {row.get('detail', '')} ({row.get('command', '')})"
+        for row in taken["problems"].get("problems") or []
+        if row.get("condition") == "service"
+    )
+    if not taken["status"]:
+        faults.append(f"status: no reading names {repo}")
+    return faults
+
+
 def launch(cli: str, home: Path, repo: Path, lanes: list[str]) -> dict:
     """Starts every lane's native client detached from this process.
 
@@ -380,22 +468,8 @@ def launch(cli: str, home: Path, repo: Path, lanes: list[str]) -> dict:
     logs = repo / "acceptance" / "launch"
     logs.mkdir(parents=True, exist_ok=True)
     for lane in lanes:
-        name, provider, credentials = _lane(lane)
-        command = [
-            cli,
-            "--home",
-            str(home),
-            "run",
-            name,
-            "--provider",
-            provider,
-            "--repo",
-            str(repo),
-            "--task",
-            TASK,
-        ]
-        if credentials:
-            command.extend(["--credentials", credentials])
+        name = _lane(lane)[0]
+        command = launcher(cli, home, repo, lane)
         controller, lane_terminal = pty.openpty()
         fcntl.ioctl(
             lane_terminal,
@@ -887,10 +961,12 @@ def main(argv: list[str] | None = None) -> int:
         Zero when the run passed every condition, one when it did not.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("run", "verdict"))
+    parser.add_argument("command", choices=("run", "verdict", "rehearse"))
     parser.add_argument("--home", default=os.environ.get("AGENT_PARLEY_HOME"))
     parser.add_argument("--workspace", default="")
-    parser.add_argument("--cli", default="agent-parley")
+    parser.add_argument(
+        "--cli", default=str(Path(sys.executable).with_name("agent-parley"))
+    )
     parser.add_argument("--hours", type=float, default=HOURS)
     parser.add_argument("--interval", type=float, default=INTERVAL)
     parser.add_argument("--issues", type=int, default=BACKLOG)
@@ -902,10 +978,19 @@ def main(argv: list[str] | None = None) -> int:
     home = Path(arguments.home).expanduser()
     lanes = arguments.lane or list(LANES)
     repo = Path(
-        arguments.workspace
-        or f"/tmp/parley-acceptance-{time.strftime('%Y%m%d-%H%M%S')}"
+        arguments.workspace or ROOT / f"run-{time.strftime('%Y%m%d-%H%M%S')}"
     ).expanduser()
     frames = repo / "acceptance" / "frames.jsonl"
+    if arguments.command == "rehearse":
+        workspace(repo, arguments.issues)
+        register(arguments.cli, home, repo, lanes)
+        mark(home, repo)
+        faults = rehearse(arguments.cli, home, repo, lanes)
+        sys.stdout.write(
+            "".join(f"{fault}\n" for fault in faults)
+            or f"rehearsed {len(lanes)} lanes in {repo}\n"
+        )
+        return 1 if faults else 0
     if arguments.command == "run":
         workspace(repo, arguments.issues)
         register(arguments.cli, home, repo, lanes)
