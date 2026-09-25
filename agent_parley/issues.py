@@ -167,6 +167,25 @@ def unresolved_completion(record: dict) -> dict:
     }
 
 
+def idle_blocking(record: dict) -> list[str]:
+    """Names the issues that wait on a claim while it makes no progress.
+
+    Args:
+        record: Published ledger record for one issue, or an empty mapping.
+
+    Returns:
+        The waiting issue numbers the supervisor recorded against the current
+        ownership generation, or an empty list once the claim progresses or
+        changes hands.
+    """
+    marker = record.get("idle_blocker") or {}
+    if not record.get("claim_id") or marker.get("claim_id") != record.get(
+        "claim_id"
+    ):
+        return []
+    return list(marker.get("waiting", []))
+
+
 def offer_source(offer: dict | None) -> str:
     """Reports who raised one pending offer.
 
@@ -1422,6 +1441,8 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         and how long ago it was recorded rather than a reading of that owner
         now, the reservations that owner still holds and the command a peer
         takes it with; the issue stays owned until that take is recorded.
+        A claim other issues wait on while it makes no progress gets its own
+        row naming its holder, its idle stretch and the waiting issues.
     """
     lines = []
     for number, record in sorted(
@@ -1510,4 +1531,12 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             if request["reason"]:
                 line += f"\n  {note}: " + json.dumps(request["reason"])
         lines.append(line)
+        if record["owner"] and (blocking := idle_blocking(record)):
+            idle = max(0, int(time.time() - last_progress(record)))
+            lines.append(
+                f"Blocking claim #{number} ({record['owner']}): no progress "
+                f"for {idle}s; "
+                + ", ".join(f"#{other}" for other in blocking)
+                + " waiting on it"
+            )
     return "\n".join(lines) or "No issues claimed."
