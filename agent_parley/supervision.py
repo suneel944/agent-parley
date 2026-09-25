@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TypeGuard, cast
 
@@ -55,6 +56,7 @@ RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 BOOT_RECORD = "boot.json"
 READINGS_PUBLICATION = "git-readings.json"
+GIT_WORKERS = 8
 POLL_RECORD = "supervision-poll.json"
 COMPLETION_TTL = 60.0
 
@@ -769,6 +771,10 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     itself changed, both those committed on its branch and those still
     uncommitted in its worktree.
 
+    The Git calls are read-only and independent per lane, so up to
+    `GIT_WORKERS` of them run at once. One call per lane in turn cost two to
+    three seconds a frame on a 34-lane state root.
+
     The reading is advisory. Nothing rebases, pauses or reverts, and the lane
     decides what a moved base means for its work.
 
@@ -785,32 +791,50 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     head = _read(root, "rev-parse", "HEAD")
     if not head:
         return {}
-    forks = {}
-    for name, participant in manifest["participants"].items():
-        fork = _read(root, "merge-base", head, participant["branch"])
-        if fork and fork != head:
-            forks[name] = fork
-    if not forks:
-        return {}
+    participants = manifest["participants"]
+
+    def fork_point(participant: dict) -> str | None:
+        """Reads where a lane's branch forked from the base head."""
+        return _read(root, "merge-base", head, participant["branch"])
+
+    def lane_paths(name: str) -> set[str]:
+        """Lists the paths a lane changed, committed or not, since forking."""
+        participant = participants[name]
+        mine = set(_changed(root, forks[name], participant["branch"]))
+        mine.update(dirty_paths(participant["lane"]) or [])
+        return mine
+
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        points = pool.map(fork_point, participants.values())
+        forks = {
+            name: fork
+            for name, fork in zip(participants, points, strict=True)
+            if fork and fork != head
+        }
+        if not forks:
+            return {}
+        starts = sorted(set(forks.values()))
+        moved = dict(
+            zip(
+                starts,
+                pool.map(lambda fork: _changed(root, fork, head), starts),
+                strict=True,
+            )
+        )
+        behind = [name for name, fork in forks.items() if moved[fork]]
+        held_paths = dict(
+            zip(behind, pool.map(lane_paths, behind), strict=True)
+        )
     try:
         held = store.active_reservations(home, root)
     except (BridgeError, OSError, sqlite3.Error):
         held = {}
     advances: dict[str, list[str]] = {}
-    moved: dict[str, list[str]] = {}
-    for name, fork in forks.items():
-        participant = manifest["participants"][name]
-        branch = participant["branch"]
-        if fork not in moved:
-            moved[fork] = _changed(root, fork, head)
-        changed = moved[fork]
-        if not changed:
-            continue
-        patterns = held.get(participant["display"], [])
-        mine = set(_changed(root, fork, branch))
-        mine.update(dirty_paths(participant["lane"]) or [])
+    for name in behind:
+        changed = moved[forks[name]]
+        patterns = held.get(participants[name]["display"], [])
         matched = sorted(
-            {path for path in changed if path in mine}
+            {path for path in changed if path in held_paths[name]}
             | store.overlapping_paths(changed, patterns)
         )
         if matched:
@@ -902,7 +926,8 @@ def readings(
     neither a current copy nor a current publication, such as a hook
     deciding in-process while the service is down, takes the readings
     itself and keeps nothing, so only the poll decides how often Git is
-    asked.
+    asked. It reads the operator edits on a second thread while it reads
+    the base advances, since neither waits on the other.
 
     Args:
         home: Private bridge state root.
@@ -916,7 +941,10 @@ def readings(
         return kept[1], kept[2]
     if (published := _published_readings(home, manifest)) is not None:
         return published
-    return operator_edits(home, manifest), base_advances(home, manifest)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        edits = pool.submit(operator_edits, home, manifest)
+        advances = base_advances(home, manifest)
+        return edits.result(), advances
 
 
 def base_advance_marker(paths: list[str]) -> str:

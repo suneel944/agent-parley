@@ -30,6 +30,7 @@ from agent_parley import (
     forge,
     metrics,
     process,
+    records,
     roster,
     store,
 )
@@ -1159,6 +1160,35 @@ def test_token_reading_survives_a_malformed_session_record(
     )
     rows = rows_of(dashboard.collect(bridge.home, False, {}))
     assert rows["claude"]["tokens"] == 100
+
+
+def test_token_reading_parses_only_records_that_carry_usage(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude_transcript(
+        tmp_path / "claude_config_dir",
+        paired["lanes"]["claude"],
+        [
+            json.dumps({"type": "user", "message": {"content": "hi"}}),
+            usage_record("msg_a", 10),
+            json.dumps({"type": "tool_result", "content": "x" * 64}),
+        ],
+    )
+    parsed = []
+    loads = json.loads
+
+    def counting(text, *args, **kwargs):
+        if isinstance(text, bytes):
+            parsed.append(text)
+        return loads(text, *args, **kwargs)
+
+    monkeypatch.setattr("agent_parley.records.json.loads", counting)
+    tokens = records.reported_tokens(
+        bridge.home, paired["participants"]["claude"], {}
+    )
+    assert tokens == 100
+    assert [line for line in parsed if b"tool_result" in line] == []
+    assert [line for line in parsed if b'"user"' in line] == []
 
 
 def test_token_reading_follows_a_relocated_credential_home(
