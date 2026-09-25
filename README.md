@@ -71,15 +71,36 @@ the filters, `problems`, `metrics` and `watch`.
 
 ## Install
 
-Linux, macOS or WSL2 with the repository in the Linux file system, Git, and
-[uv](https://docs.astral.sh/uv/). No clone. The wheel needs no third-party
-runtime packages.
+You need Git and [uv](https://docs.astral.sh/uv/). No clone. The wheel needs
+no third-party runtime packages.
+
+**macOS**
 
 ```sh
+brew install uv
 uv tool install agent-parley
-# to track the default branch instead:
-# uv tool install git+https://github.com/suneel944/agent-parley
 ```
+
+**Linux**
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install agent-parley
+```
+
+**Windows, through WSL2**
+
+Native Windows is not supported; `agent-parley` exits with a pointer to WSL2.
+Run both commands in a WSL2 shell, and clone the repository you coordinate
+into the Linux file system rather than under `/mnt/c`.
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install agent-parley
+```
+
+To track the default branch instead of the latest release, run
+`uv tool install git+https://github.com/suneel944/agent-parley`.
 
 Then add the plugin to whichever CLI you drive. One marketplace serves both.
 
