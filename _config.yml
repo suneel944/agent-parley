@@ -19,3 +19,100 @@ exclude:
   - Makefile
   - pyproject.toml
   - CHANGELOG.md
+  - AGENTS.md
+  - CLAUDE.md
+defaults:
+  - scope:
+      path: README.md
+    values:
+      title: Run coding agents in parallel Git worktrees
+      description: >-
+        Agent Parley runs Claude Code, Codex, Copilot, Gemini, OpenCode and
+        Amp in parallel on one repository, each in its own Git worktree.
+  - scope:
+      path: docs/lanes.md
+    values:
+      title: Running lanes
+      description: >-
+        Start, steer, hold, integrate and review parallel coding agent lanes,
+        each working in its own Git worktree.
+  - scope:
+      path: docs/coordination.md
+    values:
+      title: Coordination
+      description: >-
+        What Agent Parley enforces between parallel coding agents and what it
+        only reports: issue ownership, reservations and handoffs.
+  - scope:
+      path: docs/commands.md
+    values:
+      title: Commands
+      description: >-
+        Reference for the agent-parley command line, grouped as coordination,
+        policy, observability and lifecycle commands.
+  - scope:
+      path: docs/monitoring.md
+    values:
+      title: Monitoring
+      description: >-
+        Read-only views of parallel coding agent lanes: status, top,
+        problems, doctor, metrics and watch.
+  - scope:
+      path: docs/operations.md
+    values:
+      title: Operations
+      description: >-
+        Install, upgrade and operate Agent Parley on Linux and macOS: daily
+        use, providers, accounts, recovery and plugins.
+  - scope:
+      path: docs/providers.md
+    values:
+      title: Providers and accounts
+      description: >-
+        Configure which native coding agent CLI drives each lane and how that
+        CLI reaches a model.
+  - scope:
+      path: docs/architecture.md
+    values:
+      title: Architecture and contracts
+      description: >-
+        How Agent Parley coordinates coding agents on one host:
+        authentication, persistence, concurrency and platform primitives.
+  - scope:
+      path: docs/releases.md
+    values:
+      title: Release operations
+      description: >-
+        How Agent Parley versions are measured, approved, tagged and
+        published.
+  - scope:
+      path: docs/catalog-submission.md
+    values:
+      title: Catalog submission
+      description: >-
+        Plugin directory submission material for the Agent Parley plugin
+        bundle and how to verify each requirement.
+  - scope:
+      path: docs/0.11.0-validation.md
+    values:
+      title: 0.11.0 work-loop validation
+      description: >-
+        Release acceptance protocol for the autonomous work loop, run with
+        native Claude and Codex terminals.
+  - scope:
+      path: docs/windows-port.md
+    values:
+      title: Native Windows port
+      description: >-
+        Evaluation and plan for a native Windows port of Agent Parley.
+  - scope:
+      path: docs/privacy.md
+    values:
+      title: Privacy policy
+      description: >-
+        What Agent Parley stores, where it stores it and what it sends.
+  - scope:
+      path: docs/terms.md
+    values:
+      title: Terms of use
+      description: Terms of use for the Agent Parley command line and plugin.

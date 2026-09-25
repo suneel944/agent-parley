@@ -1422,6 +1422,8 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         and how long ago it was recorded rather than a reading of that owner
         now, the reservations that owner still holds and the command a peer
         takes it with; the issue stays owned until that take is recorded.
+        An owned claim that carries no deadline says so, since such a claim
+        can never become overdue.
     """
     lines = []
     for number, record in sorted(
@@ -1444,6 +1446,9 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             line += (
                 f"; last progress {max(0, int(time.time() - progressed))}s ago"
             )
+        timing = deadline_state(record)
+        if record["owner"] and not timing["deadline"]:
+            line += "; no deadline"
         if orphan := record.get("orphan"):
             line += (
                 f"; marked orphaned {orphan_age(orphan)}s ago, "
@@ -1454,7 +1459,6 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
                 line += "\n  Held reservations: " + ", ".join(keys)
         if taken := record.get("taken"):
             line += f"\n  Taken from {taken['from']}: {taken['reason']}"
-        timing = deadline_state(record)
         if timing["overdue"]:
             line += f"; overdue {timing['overdue_seconds']}s, still owned"
             if step := (record.get("overdue_recovery") or {}).get("step"):
