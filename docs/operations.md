@@ -44,7 +44,9 @@ Linux process driving a Linux install, and the loopback mail server is not
 reachable across the boundary. `doctor` names the kernel release, the WSL
 generation (`1`, `2` or `none`) and whether `pidfd_open` is available, so a
 platform gap is read before a lane starts. CI runs the behaviour suite inside
-WSL on a Windows runner as an advisory job; it never blocks a merge.
+WSL on a Windows runner as an advisory job; it never blocks a merge. A native
+Windows port is evaluated, not planned, in
+[Native Windows port](windows-port.md).
 
 ## Daily use
 
