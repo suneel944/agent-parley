@@ -589,10 +589,15 @@ def stall(
         after: Seconds of silence after which a waiting item reads as a stall.
 
     Returns:
-        Whether the lane is stalled, the oldest waiting item and its age, and
-        the age of the last served call. A lane whose recorded session process
-        is not alive is never reported as stalled: it is stopped, which the
-        session state already says.
+        Whether the lane is stalled, the oldest waiting item and its age,
+        the age of the last served call, and under `silent_seconds` how long
+        the lane has shown no sign of work, measured by `silence` only once
+        an item has waited past the interval. A lane that served a call,
+        published activity, recorded a native event or filed a report inside
+        the interval is not stalled, and the idle age an operator view prints
+        is that silence rather than the waiting item's age. A lane whose
+        recorded session process is not alive is never reported as stalled:
+        it is stopped, which the session state already says.
     """
     from agent_parley import checkpoints
 
@@ -603,6 +608,7 @@ def stall(
         "sender": "",
         "age_seconds": 0,
         "served_age_seconds": None,
+        "silent_seconds": None,
     }
     state = checkpoints.activity(directory, name)
     if not process.alive(state.get("session_pid"), state.get("session_ticks")):
@@ -615,12 +621,59 @@ def stall(
         return idle
     served = report["served_age_seconds"]
     idle.update(report)
-    idle["stalled"] = bool(
-        report["kind"]
-        and report["age_seconds"] >= after
-        and (served is None or served >= after)
-    )
+    if not (report["kind"] and report["age_seconds"] >= after):
+        return idle
+    silent = silence(directory, name, state, served)
+    idle["silent_seconds"] = silent
+    idle["stalled"] = silent is None or silent >= after
     return idle
+
+
+def silence(
+    directory: Path, name: str, state: dict, served: float | None
+) -> int | None:
+    """Measures how long a lane has shown no sign of work by any evidence.
+
+    A served coordination call is only one sign of a working lane. A lane
+    busy with native tool calls publishes activity and appends hook events
+    without calling the service, and a lane that filed a report was working
+    when it did. Measuring silence from served calls alone read a lane with
+    fresh events as idle for as long as its oldest unanswered message had
+    waited, so the newest of every sign is taken instead.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        state: The lane's published activity record.
+        served: Seconds since the lane's last served call, or None.
+
+    Returns:
+        Seconds since the newest served call, published activity update,
+        observed native hook event or filed report, or None when the lane
+        has recorded none of them.
+    """
+    from agent_parley import checkpoints
+
+    moment = time.time()
+    stamps = [
+        float(value)
+        for value in (state.get("updated"), state.get("reported_at"))
+        if isinstance(value, int | float) and not isinstance(value, bool)
+    ]
+    ignored = {reason.value for reason in checkpoints.UNOBSERVED}
+    try:
+        events = checkpoints.read_events(directory, name)
+    except (BridgeError, OSError):
+        events = []
+    stamps.extend(
+        float(entry.get("ts") or 0)
+        for entry in events
+        if entry.get("reason_class") not in ignored
+    )
+    ages = [max(0, int(moment - stamp)) for stamp in stamps if stamp > 0]
+    if served is not None:
+        ages.append(int(served))
+    return min(ages) if ages else None
 
 
 def stall_marker(idle: dict) -> str:
