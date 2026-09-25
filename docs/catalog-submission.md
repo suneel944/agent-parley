@@ -12,18 +12,23 @@ listing went live on 2026-09-14 at
 the submission archive has been attached to the v0.6.0, v0.7.0 and v0.8.0
 releases; each new version still needs a manual portal upload, because neither
 catalog offers a publishing API. The Claude submission was made on 2026-09-14
-and was still awaiting review on 2026-09-17; a code search of
+and was still awaiting review on 2026-09-25; a code search of
 `anthropics/claude-plugins-official` for `agent-parley` returned no match on
 that date.
 
 The developer lists that compare orchestrators are a separate surface from
-both catalogs, and nothing in this repository can file an entry there. The
+both catalogs, and nothing in this repository can file an entry there. On
+2026-09-25 a code search for `agent-parley` returned no match in any of the
+three active lists the project qualifies for:
+`andyrewlee/awesome-agent-orchestrators`, for parallel coding-agent
+coordination; `hesreallyhim/awesome-claude-code`, for the Claude Code plugin;
+and `punkpeye/awesome-mcp-servers`, for the coordination MCP server. The
 README carries a `How it compares` section whose every claim cites the
-competing project's own documentation, which is the text an entry in
-`andyrewlee/awesome-agent-orchestrators` would reuse. Opening that pull
-request against a third-party repository, and completing the PyPI pending
-publisher so the package page carries a verified repository link, are owner
-actions; both are listed again under the owner-only steps below.
+competing project's own documentation, which is the text an entry in any of
+those lists would reuse. Opening those pull requests against third-party
+repositories, and completing the PyPI pending publisher so the package page
+carries a verified repository link, are owner actions; both are listed again
+under the owner-only steps below.
 Nothing in this document submits a listing, and continuous integration builds
 artifacts rather than filling review forms. Restate the two paragraphs above
 whenever the listing state changes; a stale status here is the defect this
@@ -279,9 +284,11 @@ accounts and to a legal identity that an agent does not hold.
   final decision to publish or withdraw the listing all belong to the owner.
 - **The PyPI pending publisher.** Completing it binds the package page to this
   repository and marks ownership as verified. It is account-bound.
-- **The orchestrator list entry.** A pull request to
-  `andyrewlee/awesome-agent-orchestrators` describes this project to a
-  third-party repository under the owner's account. The README comparison
+- **The awesome-list entries.** A pull request to
+  `andyrewlee/awesome-agent-orchestrators`,
+  `hesreallyhim/awesome-claude-code` or `punkpeye/awesome-mcp-servers`
+  describes this project to a third-party repository under the owner's
+  account. The README comparison
   section is the source text; filing it is the owner's statement to make.
 
 Everything a repository can do ahead of those steps is covered by the
