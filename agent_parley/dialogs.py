@@ -151,8 +151,7 @@ DIALOGS: tuple[Dialog, ...] = (
         "usage-limit",
         "provider usage limit",
         re.compile(
-            r"[⎿■]\s*[^⎿■]{0,24}?"
-            r"(?:hit your [\w-]+ limit|usage limit reached"
+            r"[⎿■]\s*(?:you['’]ve hit your [\w-]+ limit\b"
             r"|weekly limit\b.{0,40}\bresets)",
             re.IGNORECASE,
         ),
