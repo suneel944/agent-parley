@@ -82,9 +82,10 @@ lost or whose conditions were changed after the fact.
 
 ## What the run builds
 
-The throwaway project holds `library.py`, an empty test module and one
-task file per backlog issue, each asking for a single arithmetic function
-and a test. The project is registered with its forge set to `null` and its
+The throwaway project holds a pytest configuration and one task file per
+backlog issue, each asking for a single arithmetic function and a test in
+files of their own. No two tasks touch the same file, so lanes never hold
+each other's reservations and every task can end ready. The project is registered with its forge set to `null` and its
 verify command set to `python -m pytest -q`, so lanes claim bare numbers
 and no work reaches any hosting account.
 

@@ -104,8 +104,8 @@ PROJECT_PERMISSIONS = (
 ENDINGS = frozenset({"ready", "blocked", "partial"})
 CONDITION = """# Task {number}
 
-Add a function `{name}` to `library.py` that {behaviour}, and a test for
-it in `tests/test_library.py`.
+Create `{name}.py` with a function `{name}` that {behaviour}, and a test
+for it in `tests/test_{name}.py`. Touch no other file.
 
 The function takes one integer and returns one integer. Keep the module
 importable with no dependencies outside the standard library.
@@ -169,6 +169,10 @@ def workspace(path: Path, issues: int) -> None:
     answer. The rules live in the throwaway repository, so the operator's
     own settings and every other project are untouched.
 
+    Each task writes its own module and test module. A shared file makes
+    the first claimant's reservation block every other lane, and a
+    blocked task never counts as completed.
+
     Args:
         path: Directory the project is created in.
         issues: Number of backlog tasks to write.
@@ -185,9 +189,11 @@ def workspace(path: Path, issues: int) -> None:
         raise SystemExit(f"{path} already holds a repository")
     (path / "tasks").mkdir(parents=True, exist_ok=True)
     (path / "tests").mkdir(exist_ok=True)
-    (path / "library.py").write_text('"""Acceptance run library."""\n')
-    (path / "tests" / "test_library.py").write_text(
-        '"""Tests for the acceptance run library."""\n'
+    (path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\npythonpath = ["."]\ntestpaths = ["tests"]\n'
+    )
+    (path / "tests" / "conftest.py").write_text(
+        '"""Tests for the acceptance run tasks."""\n'
     )
     (path / "README.md").write_text(
         "# Acceptance workspace\n\nA throwaway project for an unattended "
