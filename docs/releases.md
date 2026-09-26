@@ -270,6 +270,21 @@ issues to the next bare-version milestone, and closes the released milestone.
 Historical milestones are left closed. The next milestone is a planning target;
 creating it does not bump package metadata or authorize a release by itself.
 
+## Documentation site
+
+The `Pages` workflow publishes the README and `docs/` to
+<https://suneel944.github.io/agent-parley/> on every push to `main` that
+changes them, and on manual dispatch. It builds the repository root with the
+GitHub Pages Jekyll build. The root `_config.yml` makes the README the index,
+gives each page its title and description, sets the canonical address and
+enables `jekyll-seo-tag` and `jekyll-sitemap`. A new page under `docs/` needs
+its own entry there. The sitemap is served at `/agent-parley/sitemap.xml`.
+
+The repository Pages source is set to GitHub Actions. The owner's remaining
+one-time steps are to verify the site in Google Search Console, submit the
+sitemap there, and set the repository homepage to the site after the first
+deployment succeeds.
+
 ## Retry contract
 
 The GitHub bundle is the canonical artifact set. It contains exactly the wheel,
