@@ -104,8 +104,10 @@ lane that holds the issue, because only that lane can hand it on.
 one table per
 project with a row per participant: `PARTICIPANT`, `PROVIDER`, `ACCOUNT`,
 `SESSION`, `BRANCH` with `!` when the lane left its assigned branch, `OUTCOME`,
-`ISSUES` held with `!` on an issue past its deadline or attempt budget and `+N`
-for offers waiting on that lane, `MAIL` as unread over pending acknowledgement,
+`REVIEW` as the latest verdict a peer recorded on the lane's report, `ISSUES`
+held with `!` on an issue past its deadline or attempt budget, `*` on a claim
+the supervisor marked orphaned and `+N` for offers waiting on that lane, `MAIL`
+as unread over pending acknowledgement,
 `LEASES` held with `!` and the stale count, `REPORTED` as the age of the last
 report, and `TASK`. A mailbox that could not be read prints `?` rather than a
 zero. Column widths follow the widest value and then the terminal, by the rule
@@ -139,7 +141,7 @@ the latest prompt — instead of as a row. Filters combine, and a lane is
 reported only when it satisfies all of them:
 
 ```sh
-agent-parley status --project /path/to/repo
+agent-parley status --repo /path/to/repo
 agent-parley status --provider codex --outcome blocked
 agent-parley status --drifted
 agent-parley status --pending
@@ -600,11 +602,15 @@ agent-parley deadlines show
 agent-parley deadlines set --claim 4h --offer 30m --ack 15m --attempts 3
 ```
 
-**An overdue claim is still owned.** Past its deadline the claim reads `overdue`
-in `status`, `issue list` and `top` — where the issue is marked `#42!` — with the
-seconds it is over. Ownership does not move, nothing is revoked, and only an
-explicit release or an accepted handoff ever transfers an issue. The same is
-true of an exhausted attempt budget.
+**An overdue claim moves only when its holder is silent.** Past its deadline
+the claim reads `overdue` in `status`, `issue list` and `top` — where the issue
+is marked `#42!` — with the seconds it is over. While the holder keeps working,
+ownership does not move. An overdue claim whose holder has run no tool call for
+`inactive_after` takes the recovery path in
+[Availability, reminders and waking](#availability-reminders-and-waking): one
+wake, then an offer to the fittest peer, then release once that offer expires.
+A claim reading `observed_complete` is never moved. An exhausted attempt budget
+records a notice to the holder and moves nothing by itself.
 
 A lane that reports `blocked` on an issue it still holds spends one attempt.
 `status` and `issue list` show attempts against the budget, and exceeding the
@@ -778,10 +784,9 @@ agent-parley mail show 12 --full
 agent-parley report show 3f9a1c2e4b5d6e7f --full
 ```
 
-Over MCP, `read_attachment` takes the reference and an optional character
-`offset` and returns 2,048 characters per page beside the full byte count.
-A reference is an opaque `kind-identifier` token, never a path: it is
-validated by pattern before it reaches the file system and resolved only
+The MCP server lists no attachment tool; `--full` on `mail show` and
+`report show` is the reading path. A reference is an opaque
+`kind-identifier` token, never a path: it is validated by pattern before it reaches the file system and resolved only
 inside the attachment folder. Only the participant that wrote an attachment
 and the participants its record was addressed to can read it; a report's
 attachment is readable by its own lane.
@@ -851,11 +856,12 @@ Keys in the live view:
 | `o` | Narrow to projects, comma separated; empty clears. |
 | `c` | Choose the columns shown; empty shows all. |
 | `a` | Show or hide stopped lanes and projects whose root is gone. |
+| `P` | Show the `problems` rows in place of the table. |
 | `?` | Show the key map and the column legend. |
 | `q` | Leave. The view never writes state. |
 
 The same choices are available on the command line as `--sort COLUMN`,
-`--reverse`, `--project ROOT`, `--participant NAME` and `--columns LIST`,
+`--reverse`, `--repo ROOT`, `--participant NAME` and `--columns LIST`,
 and they apply to `--once` and `--json` as well as to the live view. A sort
 on a counted column orders from the largest value down. Narrowing recounts
 the header, so it never counts a row the table does not show. A project is
@@ -912,9 +918,12 @@ nothing to the target repository, and it grants nothing: it only narrows what
 may be reserved.
 
 `top` and `status` mark a lane `idle` when its recorded session process is
-alive, no coordination call has been served for it within the configured
-interval, and it holds unread mail or an unacknowledged message at least that
-old. The marker names the oldest waiting item and how long it has waited, so a
+alive, it holds unread mail or an unacknowledged message at least as old as the
+configured interval, and it has shown no sign of work inside that interval: no
+served coordination call, published activity update, native hook event or
+filed report. A lane busy with native tool calls is therefore not idle, and the
+idle age printed is that silence rather than the waiting item's age. The marker
+names the oldest waiting item and how long it has waited, so a
 stalled lane reads differently from a busy one instead of looking healthy in
 every column. It is read-only: nothing is revoked, no claim is released, no
 ownership moves and no lane is woken by it. A lane whose session process is not
@@ -1215,10 +1224,10 @@ with each ownership generation and how long it was held. `history participant
 NAME` lists the same for one lane, and `history claim ID` prints the whole chain
 from a claim to the pull request that ended it.
 
-`--kind claim|handoff|report|reservation|message`, `--participant`,
+`--kind claim|handoff|report|approval|reservation|message`, `--participant`,
 `--provider`, `--issue` and `--since` combine on any listing, and `--json`
 prints one document with a `records` array, consistent with the snapshot
-contract below.
+contract below. `--output PATH` writes that document to a file instead.
 
 **A correlation key follows the work.** Every claim carries its own identifier,
 minted again on each claim and each accepted handoff, so releasing and
@@ -1329,7 +1338,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `participants`, `participant`, `history`, `mail_thread`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `approval`, `verify`, `init`, `branch`, `forge`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `resources`, `providers`, `provider`, `credentials` or `credentials_show`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `plan`, `plan_diff`, `approval`, `verify`, `init`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials` or `credentials_show`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -1658,8 +1667,9 @@ native launch configuration and an interactive terminal;
 authentication and permission prompts remain in force. Environment-only vendor
 accounts that cannot be reconstructed safely require manual attention.
 
-Wake attempts are separated by the inactivity interval and capped at three for
-each unchanged backlog. Work dispatches add their offer generation and
+Wake attempts start one inactivity interval apart and the spacing doubles with
+each attempt, up to one hour. Three attempts on an unchanged backlog exhaust
+it; the lane is then asked hourly rather than never. Work dispatches add their offer generation and
 issue-scoped progress digest to that backlog. Delivery without a claim, handoff
 or other recorded issue progress leaves the obligation pending. Exhaustion
 records the offer, issues, attempt count, last result and operator action in the
@@ -2153,6 +2163,11 @@ left the worktree, or the decision itself failed, the prompt goes through and th
 reason reaches the agent as context on it. The same causes still deny a tool
 call.
 
+A hook payload that cannot be decided, one past 1,000,000 characters such as a
+`Write` of a large file or one that is not a JSON hook object, is allowed and
+recorded as `oversize_payload` or `unreadable_payload` in the lane's event log,
+because a denial would refuse the same call on every retry.
+
 A lane whose shell cwd left its worktree is told on its next prompt to run
 `cd LANE` before any tool work, and every tool call from outside is denied with
 that same instruction. The one call it may still make is a shell command whose first
@@ -2500,7 +2515,9 @@ states how many units of work the claim still has left.
 `up` starts the detached service; `down` stops its verified process and retains
 state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in
 `server.log`, with the previous window in `server.log.1`; repeated per-lane
-`undecided` and `unanswered` entries are coalesced to one per minute. Set `AGENT_PARLEY_HOME` or pass `--home` for another private root.
+`undecided`, `unanswered` and `unrecovered` entries are coalesced to one per
+minute, and the next entry carries the count it skipped. Set
+`AGENT_PARLEY_HOME` or pass `--home` for another private root.
 Set `AGENT_PARLEY_PORT` before first initialization to override port 8876.
 
 `server.json` names a service that answered: `up` publishes it only once the

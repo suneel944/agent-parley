@@ -324,6 +324,8 @@ reported.
                     native["permissions"] = {
                         "allow": [protocol.TOOL_PREFIX, protocol.cli_rule()]
                     }
+                if dialogs.auto_mode(data, agent):
+                    native.setdefault("permissions", {})["defaultMode"] = "auto"
                 command = [
                     executable,
                     "--mcp-config",

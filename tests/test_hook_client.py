@@ -907,6 +907,43 @@ def test_the_shell_client_serves_the_decision_the_module_serves(
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_the_shell_client_reads_a_payload_from_a_socket(
+    bridge, repo, paired, service
+):
+    """Node hands a hook a socketpair, where /dev/stdin cannot be opened."""
+    lane = Path(paired["lanes"]["codex"])
+    payload = {**ALLOW, "cwd": str(lane), "session_id": "s1"}
+    client = hook.write_client(str(bridge.home), sys.executable)
+    writer, reader = socket.socketpair()
+    with writer, reader:
+        process = subprocess.Popen(
+            [
+                shutil.which("bash") or "bash",
+                client,
+                "--home",
+                str(bridge.home),
+                "--directory",
+                str(lane.parent),
+                "--participant",
+                "codex",
+            ],
+            stdin=reader,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        writer.sendall(json.dumps(payload).encode())
+        writer.shutdown(socket.SHUT_WR)
+        _, stderr = process.communicate(timeout=30)
+    assert process.returncode == 0, stderr
+    assert "No such device" not in stderr
+    assert not any(
+        entry.get("reason_class") == "unreadable_payload"
+        for entry in events(lane.parent)
+    )
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
 def test_the_shell_client_starts_python_when_the_service_is_down(
     bridge, repo, paired
 ):

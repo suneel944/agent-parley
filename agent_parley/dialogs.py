@@ -77,10 +77,12 @@ REPORT_WIDTH = 100
 OPTION_LABEL = 60
 ESCALATE_AFTER = 30.0
 REPEAT_LIMIT = 2
+SILENT_AFTER = 5.0
 MARKER = "dialog: "
 APPROVAL = "waiting for approval"
 PERMISSION = "tool-permission"
 PRE_APPROVE = "approve_bridge_tools"
+AUTO_MODE = "auto_mode"
 STANDING_REPLY = "answer_questions"
 QUESTION = "question"
 TRUST = "directory-trust"
@@ -600,9 +602,35 @@ def pre_approved(manifest: dict, name: str) -> bool:
         True when the operator recorded the opt-in for this lane, which scopes
         the pre-approval to this bridge's own MCP server and nothing else.
     """
-    project = (manifest.get("supervision") or {}).get(PRE_APPROVE)
+    return _opted_in(manifest, name, PRE_APPROVE)
+
+
+def auto_mode(manifest: dict, name: str) -> bool:
+    """Reports whether a lane starts in the client's auto permission mode.
+
+    An unattended lane that runs a command outside its allow list waits on
+    a native approval prompt nobody answers. The client's auto mode lets its
+    own classifier approve routine commands and still stops a risky one.
+    The client ignores that mode from a project's own settings, so the
+    launch carries it in the session settings instead. Choosing it is the
+    operator's decision, so it is off until a project or one of its lanes
+    records it. A lane entry overrides the project.
+
+    Args:
+        manifest: Project manifest as the roster reports it.
+        name: Participant that owns the lane.
+
+    Returns:
+        True when the operator recorded the opt-in for this lane.
+    """
+    return _opted_in(manifest, name, AUTO_MODE)
+
+
+def _opted_in(manifest: dict, name: str, key: str) -> bool:
+    """Reads one boolean opt-in, a lane entry overriding its project."""
+    project = (manifest.get("supervision") or {}).get(key)
     participant = (manifest.get("participants") or {}).get(name) or {}
-    lane = participant.get(PRE_APPROVE)
+    lane = participant.get(key)
     chosen = lane if isinstance(lane, bool) else project
     return chosen is True
 
@@ -724,6 +752,8 @@ class Watch:
         self._resolved = False
         self._parked = False
         self._answered = False
+        self._answered_at = 0.0
+        self._answered_tail = b""
         self._repeats: dict[str, int] = {}
 
     def _opted_in(self) -> bool:
@@ -752,10 +782,13 @@ class Watch:
         so it is dropped rather than left to scroll out of the tail. The next
         output the client draws releases the published dialog and is judged on
         its own, which makes a dialog drawn again after an answer a new dialog
-        rather than one already handled.
+        rather than one already handled. The screen is kept aside, so an
+        answer the client never reacts to can be judged again.
         """
+        self._answered_tail = self._tail
         self._tail = b""
         self._answered = True
+        self._answered_at = 0.0
 
     def advance(self, output: bytes, now: float, held: bool = False) -> bytes:
         """Observes new terminal output and decides one action.
@@ -763,7 +796,11 @@ class Watch:
         A screen is acted on only once it has stopped changing, so a dialog
         drawn across several reads is answered as one screen rather than half
         of one. Output after an answer, from this watcher or the operator,
-        releases the dialog the answer dismissed before it is read.
+        releases the dialog the answer dismissed before it is read. An
+        answer that draws no output for `SILENT_AFTER` seconds was lost, so
+        the screen it answered is judged again: it is pressed once more
+        within the repeat limit and then escalates, rather than leaving the
+        lane parked on a dialog nobody is told about.
 
         Args:
             output: Bytes just read from the client, empty when the launcher
@@ -779,10 +816,19 @@ class Watch:
         if output:
             if self._answered:
                 self._answered = False
+                self._answered_tail = b""
                 self._signature = ""
                 self._resolved = False
                 self._release()
             self._tail = (self._tail + output)[-SCREEN_BYTES:]
+        elif self._answered and self._answered_tail:
+            if not self._answered_at:
+                self._answered_at = now
+            elif now - self._answered_at >= SILENT_AFTER:
+                self._answered = False
+                self._resolved = False
+                self._tail = self._answered_tail
+                self._answered_tail = b""
         if not self._tail:
             return b""
         screen = flatten(self._tail)

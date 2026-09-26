@@ -24,6 +24,25 @@ MAX_RESERVATION_BYTES = 240
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
 
 
+def delivered(record: dict) -> bool:
+    """Reports whether a claim has no work left for its holder.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        True when the claim's current generation reported ready or was
+        verified complete. It then waits on verification and integration,
+        not on its holder. A ready report from an earlier generation does
+        not count, because the claim it described is gone.
+    """
+    execution = lifecycle.state(record)
+    return execution["state"] in (
+        lifecycle.READY,
+        lifecycle.COMPLETE,
+    ) and execution["claim_id"] == record.get("claim_id")
+
+
 def deadline_state(record: dict, now: float = 0.0) -> dict:
     """Derives the deadline and retry state a claim currently reads as.
 
@@ -52,14 +71,9 @@ def deadline_state(record: dict, now: float = 0.0) -> dict:
     """
     stamp = now or time.time()
     deadline = record.get("deadline")
-    execution = lifecycle.state(record)
-    delivered = execution["state"] in (
-        lifecycle.READY,
-        lifecycle.COMPLETE,
-    ) and execution["claim_id"] == record.get("claim_id")
     over = (
         int(stamp - deadline)
-        if deadline and stamp > deadline and not delivered
+        if deadline and stamp > deadline and not delivered(record)
         else 0
     )
     budget = record.get("budget")

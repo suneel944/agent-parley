@@ -59,11 +59,16 @@ model call, `q` quits.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
 </p>
 
-A lane reads `active` while it is serving coordination calls, `idle` once a
-live lane passes the inactivity threshold, and `stopped` only when its
-recorded session process is gone. A quiet lane is not a lost one. Every frame
-on this page is real command output from a demo project; only the state and
-project paths are shortened.
+A lane reads `active` while its session process is alive and its latest native
+activity is current, `idle` once that activity passes the inactivity
+threshold, and `stopped` only when its recorded session process is gone. A
+quiet lane is not a lost one. Each reading comes from one recorded lane state,
+`starting`, `working`, `idle`, `blocked`, `stopped`, `dead` or `reclaimed`,
+and every wake, orphan, reclaim and park decision reads that same record. The
+view draws live lanes only: a stopped lane that holds nothing, and a project
+whose root is gone, are counted in the header, and `top --all` draws them.
+Every frame on this page is real command output from a demo project; only the
+state and project paths are shortened.
 
 [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md)
 covers the whole view: the columns, the keys,
@@ -168,7 +173,8 @@ lane's mail and sends, acknowledges and marks nothing on its behalf.
 Unread mail never blocks a lane's work: it arrives as context, most relevant
 first. A tool call is refused only when it is unsafe now, such as a write to a
 path a peer reserved. Project news goes to a feed, a broadcast reaches only the
-lanes it concerns, and a newer note on a topic replaces the older one.
+lanes it concerns, and a newer note on a topic replaces the older one. Mail a
+lane sent under a claim stops being owed once that claim closes or moves.
 
 When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
@@ -215,6 +221,19 @@ a ready report, a configured gate that passes, its own assigned branch and no
 peer reservation over the paths it changed, and every such pull request records
 what authorized it. Merging stays an operator step either way.
 
+A lane that crashed, hung or lost its host comes back with one command:
+
+```sh
+agent-parley participant restart claude-2
+```
+
+A restart is refused while the lane's session is alive and current. A session
+still alive but silent past `inactive_after` is ended first. Every claim the
+lane owns is captured into a recovery checkpoint, uncommitted work stays where
+it is, and the new session starts in the same worktree and is told where the
+checkpoint is. After a host restart no lane is resumed on its own: each reads
+`stopped` and restarts the same way.
+
 [Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md)
 covers the rest of the operator surface:
 deferred and bulk steering, pausing, stopping and restarting a lane, the
@@ -223,19 +242,28 @@ and the setup command every new lane runs.
 
 ## What it enforces
 
-- **Ownership changes only through explicit claims and accepted handoffs.** No
-  timeout and no process exit moves an issue, and a recorded dependency informs
-  rather than gates.
+- **Ownership changes through explicit claims, accepted handoffs and one
+  recorded recovery path.** A process exit alone moves no issue, and a
+  recorded dependency informs rather than gates. A lane holds at most
+  `max_claims_per_lane` claims, two by default; a claim, an acceptance or a
+  takeover request past it is refused.
 - **Choosing work is a reading, not a guess.** `agent-parley issue next` ranks
   the unclaimed, unblocked issues a lane could take, with the reason for each
   place, and claims nothing.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
-  updates only when coordination state actually changes.
+  updates only when coordination state actually changes. A prompt you type is
+  never refused: a paused lane, branch drift or a session that left its
+  worktree reaches the agent as context on the prompt, and only a tool call is
+  refused, naming the lane path to return to.
 - **A deadline reports until the holder stops working.** An overdue claim
-  whose holder has run no tool past the inactivity window gets one wake, then
-  an offer to the fittest peer with its recovery checkpoint, then release to
-  the pool. A budget informs; it does not gate.
+  whose holder has run no tool past the inactivity window, or a claim with no
+  progress of its own for `claim_idle_after` while its holder works elsewhere,
+  gets one wake, then an offer to the fittest peer with its recovery
+  checkpoint, then release to the pool. A claim whose pull request already
+  ended is observed complete and never moved: its holder is reminded to send
+  the completion, and `agent-parley issue resolve` ends it with the forge
+  evidence. A budget informs; it does not gate.
 - **Reservations are advisory.** Conflicts name the blocking owner and that
   owner's declared reason; nothing on disk is locked.
 - **Mail stays private; a decision does not.** Only a message a lane marks as a
@@ -264,8 +292,8 @@ flowchart TD
     Repo[Your repository] --> Launcher[Agent Parley launcher]
     Launcher --> Claude[Participant · own worktree]
     Launcher --> Codex[Participant · own worktree]
-    Claude <-->|Ten scoped MCP tools| Server[Local coordination service]
-    Codex <-->|Ten scoped MCP tools| Server
+    Claude <-->|Sixteen scoped MCP tools| Server[Local coordination service]
+    Codex <-->|Sixteen scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]
     Claude --> Claims[Atomic issue claims and handoffs]
     Codex --> Claims
@@ -364,13 +392,19 @@ inbound status queries are off.
 ## What it does not do
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent
-Parley integrates a lane only when you run `participant merge`, and it never
-approves a command. The runtime can wake an idle lane to review pending mail,
-with global and per-lane opt-outs and a bounded number of attempts per backlog.
-Reported `ready` is ready for review, not verified completion. Token usage still
-depends on the native agents: `CONTEXT` reports the bytes coordination itself
-injects and `TOKENS` repeats what a lane's own client counted, and neither is
-billed spend or a claim about a token-saving percentage.
+Parley integrates a lane only when you run `participant merge`, and it approves
+no command on an agent's behalf, with one opt-in exception: with
+`approve_bridge_tools` on, a launched `claude` lane is allowed this bridge's
+own MCP tools and its own coordination CLI, so a resumed lane does not park on
+a prompt nobody is there to answer. With `auto_mode` on, a launched `claude`
+lane starts in the client's own auto permission mode, whose classifier still
+decides each command. The runtime can wake an idle lane to review
+pending mail, with global and per-lane opt-outs and a bounded number of
+attempts per backlog. Reported `ready` is ready for review, not verified
+completion. Token usage still depends on the native agents: `CONTEXT` reports
+the bytes coordination itself injects and `TOKENS` repeats what a lane's own
+client counted, and neither is billed spend or a claim about a token-saving
+percentage.
 
 ## How it compares
 
@@ -415,7 +449,11 @@ remembered.
 ## Contributing
 
 Run `make check` before opening a PR. It checks formatting, lint, typing,
-documentation rules, package builds, and behavior tests.
+documentation rules, package builds, and behavior tests. A minor or major
+release also needs the fault-injection acceptance suite,
+`tests/test_fault_acceptance.py`, to pass on the release commit, and a live
+acceptance record, `docs/acceptance/<version>.json`, with the numbers an
+unattended run measured; a patch release needs neither.
 
 [Contributing](https://github.com/suneel944/agent-parley/blob/main/CONTRIBUTING.md) ·
 [Architecture](https://github.com/suneel944/agent-parley/blob/main/docs/architecture.md) ·

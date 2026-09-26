@@ -4,7 +4,7 @@ Agent Parley is published by Suneel Kaushik S. These terms cover the command
 line tool, the Claude plugin and the Codex plugin, all distributed from
 https://github.com/suneel944/agent-parley.
 
-Last updated 2026-09-10.
+Last updated 2026-09-26.
 
 ## License
 
@@ -26,7 +26,9 @@ You are responsible for the repositories you point the tool at, for the
 agents you launch through it, and for complying with the terms of those
 agents and their providers. Reservations announced by the tool are advisory:
 they inform other participants, and they do not lock files or change
-filesystem permissions. Issue ownership records a claim; it does not grant
+filesystem permissions. A lane's native hook refuses that lane's own write
+into a path a peer reserved; anything outside the lane's agent, you included,
+writes as before. Issue ownership records a claim; it does not grant
 merge or push authority.
 
 ## Support

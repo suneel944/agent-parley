@@ -211,6 +211,31 @@ def environment(home: Path, binaries: Path, base: Path) -> dict[str, str]:
     return values
 
 
+def lower_stall_windows(directory: Path) -> None:
+    """Shortens a project's supervision windows for a screenshot run.
+
+    A lane only reads as idle once its silence passes the project's
+    ``stalled_after`` window, which defaults to ten minutes. A screenshot
+    generator that waited that long to show a genuine idle label would
+    make ``make demo screenshots`` impractical, so this rewrites the
+    project's own manifest, the legitimate place that setting lives,
+    rather than faking the label. ``inactive_after`` is left at its
+    default: it also governs whether a launched session still reads as
+    running, and lowering it would misreport every quiet lane as stopped.
+
+    Args:
+        directory: Private project state directory holding
+            ``project.json``.
+    """
+    path = directory / "project.json"
+    manifest = json.loads(path.read_text())
+    manifest["supervision"] = {
+        **manifest.get("supervision", {}),
+        "stalled_after": 2,
+    }
+    path.write_text(json.dumps(manifest))
+
+
 def terminal() -> tuple[int, int]:
     """Opens a pseudo-terminal sized like the recorded frame.
 
@@ -596,6 +621,143 @@ def record(recorder: Recorder) -> None:
     recorder.hook("ada", "git checkout -b hotfix/refund")
 
 
+def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
+    """Drives the coordination features the static screenshots show.
+
+    Unlike ``record``, this leaves one lane genuinely idle and one branch
+    genuinely drifted, so ``top``, ``status`` and the native hook each
+    capture a real refusal or a real idle label instead of a scripted one.
+
+    ``codex-1`` never receives a synthetic ``SessionStart``. That event
+    always clears a lane's recorded session identity until a later hook is
+    confirmed to descend from the same process; this recorder's hook calls
+    are spawned by the script itself rather than by the launched process, so
+    that confirmation never comes, and the lane would misread as stopped.
+    Leaving the identity ``launch`` already recorded untouched keeps
+    ``codex-1`` genuinely alive, so the idle reading ``status`` later
+    captures for it is real rather than staged.
+
+    Args:
+        recorder: Recorder collecting the frames.
+
+    Returns:
+        Each screenshot's file name mapped to the blocks ``render_static``
+        draws for it, in order.
+    """
+    path = "src/payments/refund.py"
+    root = str(recorder.repository)
+    recorder.run("up")
+    recorder.run("setup", root)
+    recorder.run("forge", "set", "null", "--repo", root)
+    recorder.run("participant", "add", "claude-1", "--provider", "claude")
+    recorder.run("participant", "add", "codex-1", "--provider", "codex")
+    recorder.run("participant", "add", "kimi-1", "--provider", "kimi")
+    recorder.launch("claude-1")
+    recorder.launch("codex-1")
+    recorder.session("claude-1")
+    claude_lane = recorder.lanes["claude-1"]
+    codex_lane = recorder.lanes["codex-1"]
+    lower_stall_windows(claude_lane.parent)
+    recorder.env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:0"
+    recorder.env["ANTHROPIC_AUTH_TOKEN"] = "screenshot-fixture"
+    recorder.launch("kimi-1")
+    recorder.session("kimi-1")
+    dormant_process = recorder.sessions[-1]
+    dormant_process.terminate()
+    dormant_process.wait(timeout=10.0)
+    recorder.run("issue", "claim", "17", cwd=codex_lane)
+    recorder.run("issue", "claim", "42", cwd=claude_lane)
+    recorder.tool(
+        "claude-1",
+        "file_reservation_paths",
+        {"paths": [path], "exclusive": True, "reason": "refund rounding fix"},
+    )
+    reserved = recorder.steps[-1]
+    recorder.tool(
+        "codex-1",
+        "file_reservation_paths",
+        {"paths": [path], "exclusive": True, "reason": "shared helper rename"},
+    )
+    conflicted = recorder.steps[-1]
+    recorder.run("issue", "block", "42", "--on", "17", cwd=claude_lane)
+    recorder.run(
+        "issue",
+        "offer",
+        "42",
+        "--to",
+        "codex-1",
+        "--summary",
+        "Capture path committed; rounding table left to check.",
+        cwd=claude_lane,
+    )
+    recorder.run("issue", "list", cwd=claude_lane)
+    issue_list = recorder.steps[-1]
+    recorder.tool(
+        "claude-1",
+        "send_message",
+        {
+            "to": ["codex-1"],
+            "subject": "Refund path needs a second pass",
+            "body_md": (
+                "Rounding fixed in refund.py; capture path still needs a "
+                "review."
+            ),
+            "idempotency_key": "screenshot-1",
+            "ack_required": True,
+        },
+    )
+    sent = recorder.steps[-1]
+    recorder.tool("codex-1", "fetch_inbox", {"limit": 5})
+    fetched = recorder.steps[-1]
+    git("switch", "-c", "refund-spike", cwd=codex_lane)
+    recorder.hook("codex-1", "cat src/payments/refund.py")
+    drifted = recorder.steps[-1]
+    recorder.hook("claude-1", "git switch -c hotfix")
+    blocked = recorder.steps[-1]
+    time.sleep(3.0)
+    recorder.run("top", "--once")
+    top = recorder.steps[-1]
+    recorder.run("status")
+    status = recorder.steps[-1]
+
+    return {
+        "screenshot-top.svg": [top],
+        "screenshot-status.svg": [status],
+        "screenshot-issues.svg": [issue_list],
+        "screenshot-hooks.svg": [
+            annotate("# a branch switch attempted inside an assigned lane"),
+            annotate(""),
+            blocked,
+            annotate(""),
+            annotate(
+                "# the same lane after any bypass leaves it on another branch"
+            ),
+            annotate(""),
+            drifted,
+        ],
+        "screenshot-coordination.svg": [
+            annotate("# the agent reserves the file it is about to change"),
+            reserved,
+            annotate(""),
+            annotate(
+                "# a second agent asks for the same path and is granted nothing"
+            ),
+            conflicted,
+            annotate(""),
+            annotate(
+                "# messages are addressed by participant name and carry "
+                "an acknowledgement flag"
+            ),
+            sent,
+            annotate(""),
+            annotate(
+                "# inboxes page incrementally and never mark a message read"
+            ),
+            fetched,
+        ],
+    }
+
+
 def rewritten(steps: list[Step], places: dict[str, str]) -> list[Step]:
     """Replaces recording paths with a stable demo shape.
 
@@ -773,13 +935,136 @@ def render(steps: list[Step], destination: Path) -> None:
     destination.write_text("\n".join(parts) + "\n")
 
 
+def annotate(text: str) -> Step:
+    """Builds a narrative line for a static screenshot.
+
+    Args:
+        text: Line drawn without a command header, either a ``#`` comment
+            or a blank spacer between blocks.
+
+    Returns:
+        A step ``render_static`` draws as one body line and no header.
+    """
+    return Step("", "", (text,))
+
+
+def render_static(steps: list[Step], destination: Path, title: str) -> None:
+    """Writes a fixed set of blocks as one unanimated terminal frame.
+
+    Unlike ``render``, every block is visible at once: this is for a
+    screenshot, not a looping recording. A step with an empty prompt, as
+    ``annotate`` builds, is drawn as a narrative line with no header; any
+    other step draws its prompt/command header followed by its output.
+
+    Args:
+        steps: Blocks to draw, in order.
+        destination: File to write.
+        title: Text centered in the terminal's title bar.
+    """
+    widths = [len(title)]
+    for step in steps:
+        if step.prompt:
+            widths.append(len(step.prompt) + 1 + len(step.command))
+        widths.extend(len(row) for row in step.output)
+    columns = min(max(widths), COLUMNS)
+    width = round(columns * CHARACTER + MARGIN * 2)
+    total_lines = sum(
+        (1 if step.prompt else 0) + len(step.output) for step in steps
+    )
+    height = round(HEADER + MARGIN * 2 + LINE * total_lines)
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}" '
+        'font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, '
+        '\'Liberation Mono\', monospace" font-size="13">',
+    ]
+    parts.append(
+        f'<rect width="{width}" height="{height}" rx="10" fill="{BACKGROUND}"/>'
+    )
+    parts.append(f'<rect width="{width}" height="30" rx="10" fill="{BAR}"/>')
+    parts.append(f'<rect y="20" width="{width}" height="10" fill="{BAR}"/>')
+    parts.append(
+        '<circle cx="18" cy="15" r="5.5" fill="#ff5f57"/>'
+        '<circle cx="36" cy="15" r="5.5" fill="#febc2e"/>'
+        '<circle cx="54" cy="15" r="5.5" fill="#28c840"/>'
+    )
+    parts.append(
+        f'<text x="{width / 2}" y="19" text-anchor="middle" fill="{MUTED}" '
+        f'font-size="12">{escape(title[:columns])}</text>'
+    )
+    baseline = HEADER + MARGIN
+    for step in steps:
+        if step.prompt:
+            marker = PROMPT if step.prompt == "$" else TOOL
+            parts.append(
+                f'<text x="{MARGIN}" y="{baseline}" xml:space="preserve">'
+                f'<tspan fill="{marker}">{escape(step.prompt)} </tspan>'
+                f'<tspan fill="{COMMAND}">{escape(step.command)}</tspan>'
+                "</text>"
+            )
+            baseline += LINE
+        for row in step.output:
+            parts.append(
+                f'<text x="{MARGIN}" y="{baseline}" xml:space="preserve" '
+                f'fill="{colour(row)}">{escape(row)}</text>'
+            )
+            baseline += LINE
+    parts.append("</svg>")
+    destination.write_text("\n".join(parts) + "\n")
+
+
+def screenshots(destination: Path) -> int:
+    """Records the static screenshots and writes each asset.
+
+    Args:
+        destination: Directory the screenshot assets are written to.
+
+    Returns:
+        Zero when every screenshot was written.
+    """
+    from agent_parley import server
+
+    titles = {
+        "screenshot-top.svg": "agent-parley top",
+        "screenshot-status.svg": "agent-parley status",
+        "screenshot-issues.svg": "agent-parley issue list",
+        "screenshot-hooks.svg": "native hooks · enforcement and delivery",
+        "screenshot-coordination.svg": f"{len(server.TOOLS)} scoped MCP tools",
+    }
+    with tempfile.TemporaryDirectory(
+        prefix="agent-parley-screenshots-"
+    ) as path:
+        base = Path(path)
+        home, binaries, repository = fixtures(base)
+        recorder = Recorder(home, repository, environment(home, binaries, base))
+        try:
+            blocks = screenshot_scenario(recorder)
+        finally:
+            recorder.close()
+        places = {
+            str(home): DEMO_STATE,
+            str(repository): DEMO_REPOSITORY,
+            str(base): DEMO_HOME,
+            str(Path.home()): DEMO_HOME,
+        }
+        for name, steps in blocks.items():
+            rewrite = rewritten(steps, places)
+            render_static(rewrite, destination / name, titles[name])
+            print(f"wrote {destination / name}")
+    return 0
+
+
 def main() -> int:
     """Records the demo and writes the asset.
+
+    Run with ``--screenshots`` to record the static screenshots instead.
 
     Returns:
         Zero when the recording and the asset were written.
     """
     destination = Path(__file__).resolve().parent.parent / "docs" / "assets"
+    if "--screenshots" in sys.argv[1:]:
+        return screenshots(destination)
     with tempfile.TemporaryDirectory(prefix="agent-parley-demo-") as path:
         base = Path(path)
         home, binaries, repository = fixtures(base)

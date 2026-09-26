@@ -20,10 +20,16 @@ path and the fitness check tell a lane that is thinking from a lane that is no
 longer there. Every state only reports: nothing is revoked, no claim is released
 and no ownership moves.
 
+A session whose process identity cannot be trusted reads `unknown` instead of
+any of the three: it is never inferred dead from its age, and it is left for
+you to inspect.
+
 The send result keeps the older operator wording for the dead case. A message
 addressed to a `stopped` lane is summarised as `queued for NAME (unreachable)`,
 and one addressed to an `idle` lane as `queued for NAME (idle; wake
-requested)`. A presence row written before this release still carries
+requested)`, and one addressed to an `unknown` lane as `queued for NAME
+(process identity unavailable; manual attention required)`. A presence row
+written before this release still carries
 `unreachable` and is read as `stopped`.
 
 `idle` names the oldest waiting item and how long it has waited, so a lane that
@@ -148,14 +154,30 @@ A prompt for any other command escalates as before. A participant entry
 overrides the project entry, so one lane can stay fully interactive.
 
 A lane the supervisor launches or resumes runs in the client's default
-permission mode; no permission mode is passed. A lane you started by hand and
+permission mode unless you record `auto_mode`. A lane you started by hand and
 switched to the client's auto mode does not carry that choice into a
 supervisor-driven resume, so a resumed lane parks on the first shell command
 outside your own allow list and the two rules above. Record that command in
-the client's own permission settings to keep such a lane moving. Codex CLI
+the client's own permission settings to keep such a lane moving, or record
+`"auto_mode": true` for the project under `supervision` or for one lane. With
+it on, a launched `claude` lane's session settings carry
+`permissions.defaultMode` set to `auto`: the client's own classifier approves
+routine commands and still stops a risky one. The client ignores `auto` from a
+project's own `.claude/settings.json`, which is why the launch carries it. The
+default is off, a lane entry overrides the project, a value that is not a
+boolean is refused, and no bypass mode is ever passed. Codex CLI
 0.153.4 has no per-tool approval surface of its own — its approval settings are
 whole-session policies — so its launch is left untouched and its prompts are
 reported for you to answer.
+
+## Tab titles
+
+An attached lane's terminal tab names the lane first, then its state and claim
+progress, such as `[codex] idle with claim #412 - 2/5 done`, so a tab strip of
+lanes reads as a summary without opening any of them. `agent-parley title`
+prints the same line for a native status line and prints nothing outside a
+lane. The supervision key `titles` turns the tab title off; the details are in
+[Operations](operations.md).
 
 ## `status`
 
@@ -183,9 +205,9 @@ agent-parley status --idle            # live lanes past the inactivity threshold
 agent-parley status --outcome blocked --provider codex
 ```
 
-`--drifted` and `--pending` exit non-zero when a lane matches, so a shell gate
-fails on drift without parsing the table. Columns shrink to the terminal, and a
-redirected stream receives every column instead.
+`--drifted`, `--pending` and `--over-budget` exit non-zero when a lane
+matches, so a shell gate fails on drift without parsing the table. Columns
+shrink to the terminal, and a redirected stream receives every column instead.
 
 A pending handoff is reported with the offering lane's head commit, the
 reservations that move with it and the remaining work from its last report, in
@@ -209,7 +231,7 @@ read stays on screen regardless. The header counts what was left out;
 agent-parley top --provider codex
 agent-parley top --provider claude --provider codex
 agent-parley top --sort IDLE --reverse
-agent-parley top --project payments --participant codex
+agent-parley top --repo payments --participant codex
 agent-parley top --columns PARTICIPANT,STATE,ISSUES,IDLE
 agent-parley top --all
 ```
@@ -295,7 +317,13 @@ every condition an operator should act on: a lane stalled or inactive past its
 supervision threshold, a claim past its deadline, a handoff offer with no
 answer, a message awaiting acknowledgement past `--ack-after`, a lane whose
 branch drifted or whose worktree is dirty with no recent activity, a lane over
-its advisory budget, a store schema behind the code, and a service that is down.
+its advisory budget, a lane holding more claims than `max_claims_per_lane`, a
+store schema behind the code, and a service that is down.
+
+A quiet lane counts as inactive only while it owes work: it holds a claim that
+has not reported ready or been verified complete, or it is paused, held by a
+prompt or stopped answering wakes. A lane that delivered everything it holds is
+at rest, and `problems` does not list it.
 
 Retiring a lane supersedes the shares it still owed an acknowledgement, so
 they never bounce. `problems` names that once per retired lane under `shares
@@ -318,7 +346,9 @@ counting operator rows against service rows.
 An empty list exits zero with one line saying so; any row exits 1, so a shell
 or a cron can notice. `--json` prints the same rows, and `P` in `top` shows
 them in place. The view reads the same snapshot `status` prints and moves
-nothing itself.
+nothing itself. The one write beside it is `problems ack MESSAGE_ID`, which
+records your own acknowledgement of a message a lane left unanswered and clears
+that row and nothing else.
 
 ## `doctor`
 
