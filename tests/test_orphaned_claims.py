@@ -631,6 +631,28 @@ def test_unpublished_takeover_fence_does_not_stop_the_old_owner(
     assert refusal["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+def test_a_fenced_session_still_takes_a_prompt_as_context(bridge, repo, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    bridge.issue(peer, "claim", "42", take_orphaned=True)
+    payload = {
+        "session_id": "claude-session",
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": str(lane),
+        "prompt": "carry on",
+    }
+    output = checkpoints.checkpoint(bridge.home, directory, "claude", payload)
+    details = output["hookSpecificOutput"]
+    assert "permissionDecision" not in details
+    assert "cannot resume edits" in details["additionalContext"]
+
+
 def test_explicit_approval_quiesces_session_observation_after_reclaim(
     bridge, repo, paired
 ):

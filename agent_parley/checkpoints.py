@@ -195,6 +195,7 @@ class Reason(StrEnum):
     SUPERSEDED = "superseded"
     OVERSIZE_PAYLOAD = "oversize_payload"
     UNREADABLE_PAYLOAD = "unreadable_payload"
+    OUTSIDE_LANE = "outside_lane"
 
 
 UNOBSERVED = frozenset(
@@ -2027,6 +2028,77 @@ def paused_output(event: str) -> dict | None:
     return None
 
 
+def outside_lane_output(event: str, cwd: Path, lane: Path) -> dict | None:
+    """Builds the native output for an event whose cwd left the lane.
+
+    An agent's shell can drift out of its worktree, for example after a
+    ``cd`` into a settings directory. Refusing every event from there locks
+    the user out of their own session, because a refused prompt never
+    reaches the agent. A prompt or session boundary is therefore answered
+    with context telling the agent where to return, and tool use is denied
+    with the same instruction so no work lands outside the lane.
+
+    Args:
+        event: Native lifecycle event name.
+        cwd: Resolved working directory the event reported.
+        lane: Resolved worktree the agent is assigned.
+
+    Returns:
+        Native hook output steering the agent back to its lane, or None when
+        the event has no channel to carry it.
+    """
+    message = (
+        f"Your shell cwd {cwd} is outside your lane {lane}. "
+        f"Run `cd {lane}` before any tool work."
+    )
+    if event == "PreToolUse":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": message,
+            }
+        }
+    if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": message,
+            }
+        }
+    return None
+
+
+def lane_return(payload: dict, cwd: Path, lane: Path) -> Path | None:
+    """Names the lane directory a command's first step returns the shell to.
+
+    A drifted agent must be able to leave its drift on its own; denying its
+    own ``cd`` back leaves only the user's shell escape. Only the first
+    simple command is considered, and only a bare ``cd`` with one target,
+    so a command that wanders elsewhere first stays refused. The target is
+    resolved against the reported cwd and compared by path ancestry, never
+    by string prefix.
+
+    Args:
+        payload: Native PreToolUse payload.
+        cwd: Resolved working directory the event reported.
+        lane: Resolved worktree the agent is assigned.
+
+    Returns:
+        The resolved directory inside the lane the command changes to, or
+        None when its first step does not return to the lane.
+    """
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return None
+    command = str(tool_input.get("command", tool_input.get("cmd", "")))
+    segments = shell_segments(command)
+    if not segments or len(segments[0]) != 2 or segments[0][0] != "cd":
+        return None
+    target = (cwd / Path(segments[0][1]).expanduser()).resolve()
+    return target if target.is_relative_to(lane) else None
+
+
 def native_process(
     directory: Path, agent: str, hook_pid: object
 ) -> process.ServerProcess | None:
@@ -2189,6 +2261,14 @@ def checkpoint(
     the recorded process is gone and the event is attributed to a live
     native process. Any other such event is recorded by `foreign_session`.
 
+    An event whose cwd lies outside the lane is steered back rather than
+    failed: see `outside_lane_output`. A tool call whose first step is a
+    ``cd`` into the lane is decided as if made from there, so a drifted
+    agent can return without the user's help. A prompt is never refused for
+    any reason: a paused lane, a fenced session, branch drift and a failed
+    decision all reach the agent as context on the prompt, and only tool
+    events keep their refusals.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -2225,8 +2305,20 @@ def checkpoint(
     if participant is None:
         raise BridgeError(f"{agent} is not a participant in this project.")
     lane = Path(participant["lane"]).resolve()
-    if not Path(payload.get("cwd", str(lane))).resolve().is_relative_to(lane):
-        raise BridgeError("Hook cwd does not belong to this agent's worktree.")
+    cwd = Path(payload.get("cwd", str(lane))).resolve()
+    if event == "PreToolUse" and not cwd.is_relative_to(lane):
+        if returned := lane_return(payload, cwd, lane):
+            payload = {**payload, "cwd": str(returned)}
+            cwd = returned
+    if not cwd.is_relative_to(lane):
+        outside = outside_lane_output(event, cwd, lane)
+        if outside is None:
+            raise BridgeError(
+                f"Hook cwd {cwd} does not belong to this agent's worktree; "
+                f"return to {lane}."
+            )
+        record(directory, agent, payload, Reason.OUTSIDE_LANE, outside)
+        return outside
     from agent_parley import recovery
 
     stages.enter("session")
@@ -2257,11 +2349,18 @@ def checkpoint(
                 updated=time.time(), event=event, checkpoint_error=message
             )
             write_json(directory / f"{agent}-activity.json", state)
-        failure_output = (
-            {"hookSpecificOutput": {"permissionDecision": "deny"}}
-            if event in ("PreToolUse", "SessionStart", "UserPromptSubmit")
-            else None
-        )
+        failure_output: dict | None = None
+        if event == "UserPromptSubmit":
+            failure_output = {
+                "hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": message,
+                }
+            }
+        elif event in ("PreToolUse", "SessionStart"):
+            failure_output = {
+                "hookSpecificOutput": {"permissionDecision": "deny"}
+            }
         record(
             directory, agent, payload, Reason.CHECKPOINT_FAILED, failure_output
         )
@@ -2897,14 +2996,6 @@ def serve(
         declared = int(declared)
     except (TypeError, ValueError):
         declared = protocol.UNKNOWN
-    if not protocol.compatible(declared):
-        return {
-            "status": 2,
-            "stdout": "",
-            "stderr": "Agent Parley checkpoint refused: "
-            + protocol.mismatch("lane's configured hook", declared)
-            + "\n",
-        }
     payload = request.get("payload")
     fallback = (
         {"cause": str(request["fallback"]), "recorded": False}
@@ -2912,10 +3003,10 @@ def serve(
         else None
     )
     marked = FALLBACK.set(fallback)
+    adapter: ModuleType | None = None
     try:
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object")
-        adapter: ModuleType | None = None
         if request.get("adapter") == "gemini":
             from agent_parley import gemini as adapter
         elif request.get("adapter") == "copilot":
@@ -2926,6 +3017,13 @@ def serve(
             from agent_parley import amp as adapter
         if adapter is not None:
             payload = adapter.payload(payload)
+        if not protocol.compatible(declared):
+            return failed(
+                payload,
+                protocol.mismatch("lane's configured hook", declared),
+                adapter,
+                "refused",
+            )
         stages = stages or Stages()
         stages.enter("process")
         session_process = native_process(
@@ -2977,7 +3075,7 @@ def serve(
         }
     except OSError as exc:
         if exc.errno not in STORAGE_ERRORS:
-            return failed(payload, exc)
+            return failed(payload, exc, adapter)
         return {
             "status": 0,
             "stdout": "{}\n",
@@ -2985,7 +3083,7 @@ def serve(
             f"call allowed: {exc}\n",
         }
     except (ValueError, KeyError, BridgeError) as exc:
-        return failed(payload, exc)
+        return failed(payload, exc, adapter)
     finally:
         FALLBACK.reset(marked)
         if fallback and not fallback["recorded"] and isinstance(payload, dict):
@@ -3000,19 +3098,47 @@ def serve(
             )
 
 
-def failed(payload: object, exc: Exception) -> dict:
+def failed(
+    payload: object,
+    exc: Exception | str,
+    adapter: ModuleType | None = None,
+    verb: str = "failed",
+) -> dict:
     """Returns the hook contract for a decision that could not be made.
+
+    A prompt is never refused. Refusing it locks the user out of their own
+    session, since the refusal reaches the user and not the agent, so the
+    prompt goes through and carries the failure as context instead.
 
     Args:
         payload: Native hook payload, or whatever arrived in its place.
         exc: Why the decision failed.
+        adapter: Provider adapter whose schema the context is written in,
+            or None for the shared schema.
+        verb: How the decision ended, as the message names it.
 
     Returns:
-        ``status``, ``stdout`` and ``stderr``: an allow for an event that
-        reports after the fact, a denial for one that gates the call.
+        ``status``, ``stdout`` and ``stderr``: context for a prompt, an allow
+        for an event that reports after the fact, a denial for one that
+        gates the call.
     """
-    stderr = f"Agent Parley checkpoint failed: {exc}\n"
-    if isinstance(payload, dict) and payload.get("hook_event_name") in (
+    stderr = f"Agent Parley checkpoint {verb}: {exc}\n"
+    event = payload.get("hook_event_name") if isinstance(payload, dict) else ""
+    if event == "UserPromptSubmit":
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": stderr.strip(),
+            }
+        }
+        if adapter is not None:
+            output = adapter.response(output)
+        return {
+            "status": 0,
+            "stdout": json.dumps(output) + "\n",
+            "stderr": stderr,
+        }
+    if event in (
         "PostToolUse",
         "PermissionRequest",
         "Stop",
@@ -3095,13 +3221,6 @@ def main(fallback: str = "", size: int = 0) -> int:
     )
     parser.add_argument("--protocol", type=int, default=protocol.PROTOCOL)
     args = parser.parse_args()
-    if not protocol.compatible(args.protocol):
-        print(
-            "Agent Parley checkpoint refused: "
-            + protocol.mismatch("lane's configured hook", args.protocol),
-            file=sys.stderr,
-        )
-        return 2
     raw, read = hook.read_input(sys.stdin)
     size = max(size, read)
     try:
