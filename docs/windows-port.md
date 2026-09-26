@@ -1,8 +1,9 @@
 # Native Windows port: evaluation and plan
 
-Status: evaluation only. Nothing here is implemented. The decision to start
-waits on the download measurement in issue #450, whose numbers are not yet
-measured. Tracking issue: #449.
+Status: evaluation only. Nothing here is implemented. The download
+measurement from issue #450 is recorded in
+[Download measurement](#download-measurement); it does not meet the decision
+rule. Tracking issue: #449.
 
 Today the supported Windows path is WSL2 with the repository in the Linux file
 system ([Platforms](operations.md#platforms)). A native port would let a
@@ -147,12 +148,60 @@ Do not start the port now. WSL2 is supported and covers Windows users who can
 keep the repository in the Linux file system. The port is L-sized, and the
 terminal layer carries the most risk; the demand is not measured.
 
-The numbers #450 asks for are not yet measured. pypistats reported 1,656
-downloads from 2026-09-09 to 2026-09-24 with 88% carrying no operating system,
-so neither share can be read from it.
+### Download measurement
 
-Decision rule, applied to the BigQuery result of #450 over at least 30 days
-and at least 500 downloads with a recorded system:
+Measured on 2026-09-26 for issue #450 from the public ClickHouse copy of the
+PyPI download log (`pypi.pypi` on `sql-clickhouse.clickhouse.com`, user
+`demo`, no account needed). It carries the same installer and system fields
+as `bigquery-public-data.pypi.file_downloads`, and covers every download of
+`agent-parley` from 2026-09-09 to 2026-09-25: 5,471 in total.
+
+```sql
+SELECT installer, system, count() AS downloads
+FROM pypi.pypi
+WHERE project = 'agent-parley' AND date >= '2026-09-01'
+GROUP BY installer, system
+ORDER BY downloads DESC
+```
+
+| Installer | System | Downloads | Share |
+| --- | --- | ---: | ---: |
+| (none sent) | (none) | 2,624 | 48.0% |
+| `bandersnatch` | (none) | 1,188 | 21.7% |
+| `Browser` | (none) | 886 | 16.2% |
+| `requests` | (none) | 539 | 9.9% |
+| `Nexus` | (none) | 28 | 0.5% |
+| `pip` | Linux | 122 | 2.2% |
+| `pip` | Darwin | 68 | 1.2% |
+| `uv` | Linux | 11 | 0.2% |
+| `uv` | Darwin | 3 | 0.1% |
+| `uv` | Windows | 2 | <0.1% |
+
+Installer share of the unknown-system downloads: all 5,265 downloads with no
+system came from clients that are not package installers. An empty user
+agent is 49.8% of them, `bandersnatch` mirrors 22.6%, browser file
+downloads 16.8%, scripts using `requests` 10.2% and Nexus proxies 0.5%. No
+`pip` or `uv` download lacks a system, so the 88% pypistats reports as
+unknown is mirror and scraper traffic, not hidden users. The dataset marks no
+download as coming from CI.
+
+Installs with a recorded system: 206. Linux 133 (64.6%), macOS 71 (34.5%),
+native Windows 2 (1.0%).
+
+WSL2 share of Linux downloads: not measurable from this dataset, which keeps
+only the system name. BigQuery's `details.system.release` holds the WSL
+kernel string. The decision does not depend on it yet: the sample is 206
+installs over 17 days, below the 500 downloads and 30 days the rule needs.
+Measure `details.system.release` with the BigQuery query in #450 at the next
+minor release, when the sample meets the rule.
+
+Result against the rule below: native Windows is 1.0% of installs with a
+recorded system, under the 10% trigger, and the sample is too small. Do not
+start the port; keep WSL2 as the Windows path and measure again at the next
+minor release.
+
+Decision rule, applied over at least 30 days and at least 500 downloads with
+a recorded system:
 
 - Start the port if native Windows is at least 10% of downloads with a
   recorded system, or WSL2 is at least 25% of Linux downloads.
