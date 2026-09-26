@@ -4542,6 +4542,35 @@ def _record_refusals(
     )
 
 
+def record_refusal(
+    home: Path, root: str, name: str, holder: str, path: str
+) -> None:
+    """Records a hook refusal of a write into a peer's reservation.
+
+    The lifecycle hook refuses a write that overlaps a peer's exclusive
+    reservation without any reservation call reaching the store, so without
+    this row the holder's status and the problems view never learn that it
+    blocks a lane.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose write was refused.
+        holder: Identity that holds the overlapping reservation.
+        path: Lane-relative path the refused write named.
+
+    Raises:
+        BridgeError: If the refused identity is unregistered.
+        sqlite3.Error: If the store cannot be written.
+    """
+    with connect(home, write=True) as db:
+        _record_refusals(
+            db,
+            _identify(db, root, name),
+            [{"owner": holder, "path": path}],
+        )
+
+
 def _refused_by(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
     """Maps each holding lane to the lanes it refused and still blocks.
 

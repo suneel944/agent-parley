@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, store
+from agent_parley import checkpoints, issues, protocol, store
 from agent_parley.state import write_json
 
 
@@ -162,7 +162,8 @@ def test_an_offer_about_to_expire_denies_a_mutating_call(tmp_path):
     reason, text = checkpoints.hazard(payload, tmp_path, "codex", {}, ledger)
 
     assert reason == checkpoints.Reason.OFFER_EXPIRING
-    assert "issue accept 7 --offer-id o1" in text
+    assert f"{protocol.cli_command()} issue accept 7 --offer-id o1" in text
+    assert f"{protocol.cli_command()} issue decline 7 --offer-id o1" in text
     assert (
         checkpoints.hazard(
             {"tool_name": "Grep", "tool_input": {}},
@@ -173,3 +174,144 @@ def test_an_offer_about_to_expire_denies_a_mutating_call(tmp_path):
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"{protocol.cli_command()} issue accept 7 --offer-id o1",
+        "python3 -m agent_parley.cli issue decline 7 --offer-id o1",
+        f"rtk {protocol.cli_command()} status",
+        "agent-parley issue accept 7 --offer-id o1",
+    ],
+)
+def test_the_protocol_form_cli_is_exempt_like_the_console_script(
+    tmp_path, command
+):
+    ledger = {
+        "issues": {
+            "7": {
+                "offer": {
+                    "id": "o1",
+                    "to": "codex",
+                    "deadline": time.time() + 30,
+                }
+            }
+        }
+    }
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    assert checkpoints.diagnosable(payload)
+    assert checkpoints.hazard(payload, tmp_path, "codex", {}, ledger) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"{protocol.cli_command()} status; rm -rf src",
+        f"{protocol.cli_command()} status > src/parser.py",
+        "python3 -m agent_parley.other status",
+        "node -m agent_parley.cli status",
+    ],
+)
+def test_a_protocol_form_chained_or_redirected_is_not_exempt(command):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    assert not checkpoints.diagnosable(payload)
+
+
+def test_a_hook_reservation_refusal_names_the_holder_in_usage(
+    bridge, paired, lanes
+):
+    reserve(bridge, lanes, "src/parser.py")
+
+    denied = hook(
+        bridge,
+        lanes,
+        "PreToolUse",
+        tool_name="Write",
+        tool_input={
+            "file_path": str(lanes["lane"] / "src" / "parser.py"),
+            "content": "x",
+        },
+    )["hookSpecificOutput"]
+
+    assert denied["permissionDecision"] == "deny"
+    assert store.usage(bridge.home, lanes["root"])["claude"]["refused"] == [
+        "codex"
+    ]
+
+
+def record_only(bridge, lanes, **extra):
+    """Runs one codex PreToolUse decided without the context scans."""
+    return checkpoints.checkpoint(
+        bridge.home,
+        lanes["directory"],
+        "codex",
+        {
+            "hook_event_name": "PreToolUse",
+            "cwd": str(lanes["lane"]),
+            "session_id": "s1",
+            **extra,
+        },
+        record_only=True,
+    )
+
+
+def test_a_record_only_write_on_a_peer_reservation_is_still_denied(
+    bridge, paired, lanes
+):
+    reserve(bridge, lanes, "src/parser.py")
+    target = str(lanes["lane"] / "src" / "parser.py")
+
+    denied = record_only(
+        bridge,
+        lanes,
+        tool_name="Write",
+        tool_input={"file_path": target, "content": "x"},
+    )["hookSpecificOutput"]
+
+    assert denied["permissionDecision"] == "deny"
+    assert "claude" in denied["permissionDecisionReason"]
+    assert store.usage(bridge.home, lanes["root"])["claude"]["refused"] == [
+        "codex"
+    ]
+    summary = checkpoints.event_summary(lanes["directory"], "codex")
+    assert {
+        "reason": "reserved_path",
+        "tool": "Write",
+        "count": 1,
+    } in summary["denied_by"]
+    allowed = record_only(
+        bridge,
+        lanes,
+        tool_name="Read",
+        tool_input={"file_path": target},
+    )
+    assert "permissionDecision" not in allowed.get("hookSpecificOutput", {})
+
+
+def test_a_record_only_call_past_an_expiring_offer_is_still_denied(
+    bridge, paired, lanes
+):
+    ledger = issues.snapshot(lanes["directory"])
+    ledger["issues"]["7"] = {
+        "offer": {"id": "o1", "to": "codex", "deadline": time.time() + 30}
+    }
+    write_json(lanes["directory"] / "issues.json", ledger)
+
+    denied = record_only(
+        bridge, lanes, tool_name="Bash", tool_input={"command": "make"}
+    )["hookSpecificOutput"]
+
+    assert denied["permissionDecision"] == "deny"
+    assert "issue accept 7 --offer-id o1" in denied["permissionDecisionReason"]
+    answered = record_only(
+        bridge,
+        lanes,
+        tool_name="Bash",
+        tool_input={
+            "command": f"{protocol.cli_command()} issue accept 7 --offer-id o1"
+        },
+    )
+    assert "permissionDecision" not in answered.get("hookSpecificOutput", {})
