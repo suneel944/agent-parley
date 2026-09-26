@@ -327,7 +327,10 @@ def test_the_workspace_allows_edits_only_in_its_own_settings(tmp_path):
         (tmp_path / "run" / ".claude" / "settings.json").read_text()
     )
     assert settings == {
-        "permissions": {"allow": list(acceptance.PROJECT_PERMISSIONS)}
+        "permissions": {
+            "defaultMode": "auto",
+            "allow": list(acceptance.PROJECT_PERMISSIONS),
+        }
     }
 
 

@@ -129,9 +129,12 @@ to `codex`, so each lane draws that screen before it reads any prompt.
 The throwaway repository carries a `.claude/settings.json` that allows file
 edits and the test, status, diff, add and commit commands the tasks need.
 Without it every `claude` lane stops at its first `Do you want to
-overwrite` prompt, which is not a coordination dialog. The operator's own
-settings are not touched. Every other permission is left as the operator
-configured it.
+overwrite` prompt, which is not a coordination dialog. The same file
+starts `claude` in its `auto` permission mode: the client's own classifier
+approves routine commands and still stops a risky one. Without it a lane
+that runs any exploratory command outside the list waits on a `Bash
+command` prompt that no operator answers. This is not a bypass mode. The
+operator's own settings are not touched.
 
 The 2026-09-26 run that preceded these answers parked every lane within
 minutes: both `codex` lanes on the hook review, two `claude` lanes on the

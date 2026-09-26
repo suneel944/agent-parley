@@ -167,7 +167,11 @@ def workspace(path: Path, issues: int) -> None:
     Without them each lane stops at the client's first edit prompt, which
     is not a coordination dialog and which no operator is there to
     answer. The rules live in the throwaway repository, so the operator's
-    own settings and every other project are untouched.
+    own settings and every other project are untouched. The same settings
+    start ``claude`` in its auto permission mode, where the client's own
+    classifier approves routine commands and still stops a risky one, so
+    a lane that runs an exploratory command outside the list is not
+    parked on a prompt nobody answers.
 
     Each task writes its own module and test module. A shared file makes
     the first claimant's reservation block every other lane, and a
@@ -201,7 +205,15 @@ def workspace(path: Path, issues: int) -> None:
     )
     (path / ".claude").mkdir(exist_ok=True)
     (path / ".claude" / "settings.json").write_text(
-        json.dumps({"permissions": {"allow": list(PROJECT_PERMISSIONS)}}) + "\n"
+        json.dumps(
+            {
+                "permissions": {
+                    "defaultMode": "auto",
+                    "allow": list(PROJECT_PERMISSIONS),
+                }
+            }
+        )
+        + "\n"
     )
     for number in range(1, issues + 1):
         (path / "tasks" / f"{number}.md").write_text(
