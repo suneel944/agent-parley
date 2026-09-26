@@ -589,10 +589,15 @@ def stall(
         after: Seconds of silence after which a waiting item reads as a stall.
 
     Returns:
-        Whether the lane is stalled, the oldest waiting item and its age, and
-        the age of the last served call. A lane whose recorded session process
-        is not alive is never reported as stalled: it is stopped, which the
-        session state already says.
+        Whether the lane is stalled, the oldest waiting item and its age,
+        the age of the last served call, and under `silent_seconds` how long
+        the lane has shown no sign of work, measured by `silence` only once
+        an item has waited past the interval. A lane that served a call,
+        published activity, recorded a native event or filed a report inside
+        the interval is not stalled, and the idle age an operator view prints
+        is that silence rather than the waiting item's age. A lane whose
+        recorded session process is not alive is never reported as stalled:
+        it is stopped, which the session state already says.
     """
     from agent_parley import checkpoints
 
@@ -603,6 +608,7 @@ def stall(
         "sender": "",
         "age_seconds": 0,
         "served_age_seconds": None,
+        "silent_seconds": None,
     }
     state = checkpoints.activity(directory, name)
     if not process.alive(state.get("session_pid"), state.get("session_ticks")):
@@ -615,12 +621,59 @@ def stall(
         return idle
     served = report["served_age_seconds"]
     idle.update(report)
-    idle["stalled"] = bool(
-        report["kind"]
-        and report["age_seconds"] >= after
-        and (served is None or served >= after)
-    )
+    if not (report["kind"] and report["age_seconds"] >= after):
+        return idle
+    silent = silence(directory, name, state, served)
+    idle["silent_seconds"] = silent
+    idle["stalled"] = silent is None or silent >= after
     return idle
+
+
+def silence(
+    directory: Path, name: str, state: dict, served: float | None
+) -> int | None:
+    """Measures how long a lane has shown no sign of work by any evidence.
+
+    A served coordination call is only one sign of a working lane. A lane
+    busy with native tool calls publishes activity and appends hook events
+    without calling the service, and a lane that filed a report was working
+    when it did. Measuring silence from served calls alone read a lane with
+    fresh events as idle for as long as its oldest unanswered message had
+    waited, so the newest of every sign is taken instead.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        state: The lane's published activity record.
+        served: Seconds since the lane's last served call, or None.
+
+    Returns:
+        Seconds since the newest served call, published activity update,
+        observed native hook event or filed report, or None when the lane
+        has recorded none of them.
+    """
+    from agent_parley import checkpoints
+
+    moment = time.time()
+    stamps = [
+        float(value)
+        for value in (state.get("updated"), state.get("reported_at"))
+        if isinstance(value, int | float) and not isinstance(value, bool)
+    ]
+    ignored = {reason.value for reason in checkpoints.UNOBSERVED}
+    try:
+        events = checkpoints.read_events(directory, name)
+    except (BridgeError, OSError):
+        events = []
+    stamps.extend(
+        float(entry.get("ts") or 0)
+        for entry in events
+        if entry.get("reason_class") not in ignored
+    )
+    ages = [max(0, int(moment - stamp)) for stamp in stamps if stamp > 0]
+    if served is not None:
+        ages.append(int(served))
+    return min(ages) if ages else None
 
 
 def stall_marker(idle: dict) -> str:
@@ -2735,6 +2788,81 @@ def _overdue_summary(number: str, cause: str, checkpoint: dict) -> str:
     )
 
 
+def _idle_blocker(
+    directory: Path, root: str, ledger: dict, number: str, idle: int
+) -> None:
+    """Tells the operator once that other issues wait on an idle claim.
+
+    A lane parked on an issue that waits on another lane's idle claim had no
+    signal of its own, so load moved only when the operator noticed by hand.
+    The claim records which issues wait on it while it has no progress, which
+    is what `status` reports, and the operator is notified once per claim
+    generation. The marker keeps its generation after progress resumes, so a
+    later idle stretch of the same claim notifies nothing further.
+
+    Args:
+        directory: Private project state directory.
+        root: Canonical project key the notification names.
+        ledger: Issue records read at the start of this poll.
+        number: Issue number of the held claim.
+        idle: Seconds the claim has gone without progress, or zero while it
+            is not idle.
+    """
+    record = ledger[number]
+    claim = record.get("claim_id")
+    current = record.get("idle_blocker") or {}
+    waiting = (
+        sorted(
+            (
+                other
+                for other, entry in ledger.items()
+                if number in entry.get("blocked_by", [])
+            ),
+            key=int,
+        )
+        if idle
+        else []
+    )
+    marker = (
+        {"claim_id": claim, "waiting": waiting}
+        if waiting or current.get("claim_id") == claim
+        else {}
+    )
+    if marker == current:
+        return
+    with lock(directory / "issues.lock", timeout=1):
+        state = issues.snapshot(directory)
+        written = state["issues"].get(number)
+        if not written or written.get("claim_id") != claim:
+            return
+        if marker:
+            written["idle_blocker"] = marker
+        else:
+            written.pop("idle_blocker", None)
+        state["revision"] += 1
+        write_json(directory / "issues.json", state)
+    if not waiting or current.get("claim_id") == claim:
+        return
+    try:
+        notify.deliver(
+            directory,
+            str(record.get("owner")),
+            notify.Event.IDLE_BLOCKER,
+            {
+                "repo": root,
+                "issue": number,
+                "claim": claim,
+                "detail": (
+                    f"no progress for {idle}s; "
+                    + ", ".join(f"#{other}" for other in waiting)
+                    + " waiting on it"
+                ),
+            },
+        )
+    except (BridgeError, OSError) as exc:
+        issues.note_supervision_error(directory, f"Notification: {exc}")
+
+
 def _overdue_step(
     directory: Path,
     number: str,
@@ -2866,6 +2994,8 @@ def overdue_claims(
                 config["claim_idle_after"],
                 now,
             )
+        if record.get("claim_id"):
+            _idle_blocker(directory, manifest["root"], ledger, number, idle)
         if (
             holder not in manifest["participants"]
             or not record.get("claim_id")

@@ -35,6 +35,12 @@ def deadline_state(record: dict, now: float = 0.0) -> dict:
     runtime gains no scheduler and a stopped service produces no phantom
     transitions.
 
+    A claim whose current generation reported ready, or was verified
+    complete, has no work left for its holder to do: it waits on
+    verification and integration, which the deadline does not measure, so
+    it never reads overdue. A ready report from an earlier generation does
+    not count, because the claim it described is gone.
+
     Args:
         record: Published ledger record for one issue.
         now: Instant to evaluate against; the current time when zero.
@@ -46,7 +52,16 @@ def deadline_state(record: dict, now: float = 0.0) -> dict:
     """
     stamp = now or time.time()
     deadline = record.get("deadline")
-    over = int(stamp - deadline) if deadline and stamp > deadline else 0
+    execution = lifecycle.state(record)
+    delivered = execution["state"] in (
+        lifecycle.READY,
+        lifecycle.COMPLETE,
+    ) and execution["claim_id"] == record.get("claim_id")
+    over = (
+        int(stamp - deadline)
+        if deadline and stamp > deadline and not delivered
+        else 0
+    )
     budget = record.get("budget")
     attempts = int(record.get("attempts", 0) or 0)
     return {
@@ -165,6 +180,25 @@ def unresolved_completion(record: dict) -> dict:
         "reminders": int(marker.get("reminders", 0) or 0) if standing else 0,
         "observed_at": marker.get("observed_at") if standing else None,
     }
+
+
+def idle_blocking(record: dict) -> list[str]:
+    """Names the issues that wait on a claim while it makes no progress.
+
+    Args:
+        record: Published ledger record for one issue, or an empty mapping.
+
+    Returns:
+        The waiting issue numbers the supervisor recorded against the current
+        ownership generation, or an empty list once the claim progresses or
+        changes hands.
+    """
+    marker = record.get("idle_blocker") or {}
+    if not record.get("claim_id") or marker.get("claim_id") != record.get(
+        "claim_id"
+    ):
+        return []
+    return list(marker.get("waiting", []))
 
 
 def offer_source(offer: dict | None) -> str:
@@ -1009,9 +1043,12 @@ def _change(
             owner and the reason the marker gave.
         takeover: Revalidated owner generation and durable checkpoint for an
             orphan take.
-        cap: Most claims one lane may hold at once. A claim of a new issue
-            and a takeover request past it are refused, naming the claims
-            the lane holds and how long each has gone without progress.
+        cap: Most claims one lane may hold at once. A claim of a new issue,
+            the acceptance of an offer and a takeover request past it are
+            refused, naming the claims the lane holds and how long each has
+            gone without progress. Acceptance moves ownership exactly as a
+            claim does, so an uncapped acceptance let a lane collect claims
+            past the cap one offer at a time.
 
     A transition that ends an ownership generation, by releasing it, by
     handing it to another lane, by taking it from an orphaned owner or by the
@@ -1147,6 +1184,7 @@ def _change(
                         "Only the named recipient can answer this handoff."
                     )
                 if action == "accept":
+                    _within_cap(state["issues"], agent, cap)
                     expected = (
                         within if within is not None else budgets.get("claim")
                     )
@@ -1423,7 +1461,9 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
         now, the reservations that owner still holds and the command a peer
         takes it with; the issue stays owned until that take is recorded.
         An owned claim that carries no deadline says so, since such a claim
-        can never become overdue.
+        can never become overdue. A claim other issues wait on while it makes
+        no progress gets its own row naming its holder, its idle stretch and
+        the waiting issues.
     """
     lines = []
     for number, record in sorted(
@@ -1514,4 +1554,12 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
             if request["reason"]:
                 line += f"\n  {note}: " + json.dumps(request["reason"])
         lines.append(line)
+        if record["owner"] and (blocking := idle_blocking(record)):
+            idle = max(0, int(time.time() - last_progress(record)))
+            lines.append(
+                f"Blocking claim #{number} ({record['owner']}): no progress "
+                f"for {idle}s; "
+                + ", ".join(f"#{other}" for other in blocking)
+                + " waiting on it"
+            )
     return "\n".join(lines) or "No issues claimed."

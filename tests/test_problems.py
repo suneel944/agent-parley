@@ -864,6 +864,12 @@ LANE_CAUSES = [
     },
     {"drift": True, "branch": "elsewhere"},
     {"budget": {"over": True, "marker": "over budget; hours 2h of 1h"}},
+    {
+        "claims": [
+            {"issue": number, "overdue": False, "overdue_seconds": 0}
+            for number in (41, 42, 43)
+        ]
+    },
 ]
 
 OFFERED = {
@@ -912,6 +918,7 @@ def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
         problems.STALLED,
         problems.INACTIVE,
         problems.OVERDUE,
+        problems.OVER_CAP,
         problems.UNRESOLVED,
         problems.OFFER,
         problems.ACK,
@@ -938,6 +945,34 @@ def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
                 named in remedy
                 for named in ("claude", "/lane", "agent-parley", "service")
             ), remedy
+
+
+def test_claims_past_the_cap_are_named_with_their_excess():
+    claims = [
+        {"issue": number, "overdue": False, "overdue_seconds": 0}
+        for number in range(1376, 1388)
+    ]
+    rows = problems._lane_rows(
+        lane_record(claims=claims),
+        {"lane": "/lane", "branch": "work"},
+        "/root",
+        {**supervision.DEFAULTS, "wake": False},
+        600,
+        time.time(),
+    )
+    [row] = [row for row in rows if row["condition"] == problems.OVER_CAP]
+    assert row["count"] == 10
+    assert "holds 12 claims, 10 past max_claims_per_lane 2" in row["detail"]
+    assert row["command"] == "agent-parley issue release 1387 --repo /root"
+    within = problems._lane_rows(
+        lane_record(claims=claims[:2]),
+        {"lane": "/lane", "branch": "work"},
+        "/root",
+        {**supervision.DEFAULTS, "wake": False},
+        600,
+        time.time(),
+    )
+    assert problems.OVER_CAP not in {row["condition"] for row in within}
 
 
 class Screen:

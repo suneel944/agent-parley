@@ -379,7 +379,8 @@ condition, that count, its age and what clears it:
 | `service` | The coordination server is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
 | `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | Whatever the lane's state allows, from the remedy table below. |
 | `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
-| `overdue claim` | One or more held issues are past their recorded deadline. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
+| `overdue claim` | One or more held issues are past their recorded deadline. A claim whose current generation reported ready or was verified complete is never overdue. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
+| `claims over cap` | A lane holds more claims than `max_claims_per_lane`, from a ledger written before every ownership path was capped or a cap lowered after the claims were taken. The count is the excess. | `agent-parley issue release NUMBER` for the highest-numbered claim, named in the row, or an offer to a peer. |
 | `unanswered offer` | One or more handoff offers to the same lane have no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
 | `unresolved completion` | One or more claimed issues read closed on the forge, or merged or closed on the lane branch when the forge cannot say, and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
 | `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
@@ -1391,8 +1392,11 @@ and whose `queued_by` names the lanes that asked. `claims`
 carries one record per issue that lane owns, with its `deadline_at`, `overdue`,
 `overdue_seconds`, `attempts`, `budget` and `budget_exceeded`. `idle` carries
 `stalled`, the waiting item's `kind`, `message_id`, `sender` and `age_seconds`,
-the `served_age_seconds` since the last served call, and the same `marker` the
-table prints. `waiting` carries one record per pending wait, longest first,
+the `served_age_seconds` since the last served call, `silent_seconds` since
+the newest served call, activity update, native hook event or report, and the
+same `marker` the table prints. A lane is stalled only when that silence is
+past the interval, and the idle age the table prints is the silence, never the
+waiting item's age. `waiting` carries one record per pending wait, longest first,
 each with its `kind`, its item and `seconds`. A
 mailbox that cannot be read reports `{"error": "..."}` in `mail` rather than
 failing the document, exactly as the table reports coordination as unavailable.
@@ -1562,9 +1566,9 @@ other work: one notice to the holder and to the lanes whose issues wait on it,
 then an offer to the fittest peer below the claim cap with the recovery
 checkpoint attached, then release once that offer expires. Each step is
 recorded in history and counted in `attempts`. Blocked and ready work is
-waiting rather than idle and is not moved. `issue claim` refuses a lane that
-already holds `max_claims_per_lane` claims and names each held claim with its
-progress age. `issue request N [--summary REASON]` asks the holder to hand the
+waiting rather than idle and is not moved. `issue claim` and `issue accept` refuse a lane
+that already holds `max_claims_per_lane` claims and name each held claim with
+its progress age. `issue request N [--summary REASON]` asks the holder to hand the
 issue to the requesting lane; the holder answers with `issue accept` or
 `issue decline` and the request identifier, and a holder that neither answers
 nor records progress on the claim within `takeover_grace` has the request

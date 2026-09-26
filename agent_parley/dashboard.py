@@ -413,7 +413,7 @@ def _row(
             liveness,
             participant.get("paused", False),
             stalled["stalled"],
-            stalled["age_seconds"],
+            tables.idle_age(stalled),
             (
                 time.time() - float(participant["retired"])
                 if roster.retired(participant)
@@ -423,7 +423,7 @@ def _row(
         "lane_state": condition["state"] if condition else None,
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
-        "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
+        "stall_age": tables.idle_age(stalled) if stalled["stalled"] else 0,
         "operator_edits": edited,
         "operator_edit": supervision.operator_edit_marker(edited),
         "base_advance_paths": advanced,

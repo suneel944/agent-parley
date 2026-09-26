@@ -201,6 +201,24 @@ def test_a_claim_past_the_cap_is_refused_naming_the_held_claims(bridge, paired):
     assert bridge.issue(lane, "claim", "8")["owner"] == "claude"
 
 
+def test_accepting_an_offer_past_the_cap_is_refused(bridge, paired):
+    directory = busy_with_one_idle_claim(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    codex = Path(paired["lanes"]["codex"])
+    bridge.issue(codex, "claim", "9")
+    offered = bridge.issue(
+        codex, "offer", "9", to="claude", summary="take #9 over"
+    )
+    with pytest.raises(BridgeError, match="max_claims_per_lane is 2"):
+        bridge.issue(lane, "accept", "9", offer_id=offered["offer"]["id"])
+    record = issues.snapshot(directory)["issues"]["9"]
+    assert record["owner"] == "codex"
+    assert record["offer"]["to"] == "claude"
+    bridge.issue(lane, "release", "8")
+    moved = bridge.issue(lane, "accept", "9", offer_id=offered["offer"]["id"])
+    assert moved["owner"] == "claude"
+
+
 def test_a_project_may_raise_the_claim_cap(bridge, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])
@@ -212,3 +230,76 @@ def test_a_project_may_raise_the_claim_cap(bridge, paired):
         assert bridge.issue(lane, "claim", number)["owner"] == "claude"
     with pytest.raises(BridgeError, match="max_claims_per_lane is 3"):
         bridge.issue(lane, "claim", "10")
+
+
+def blocking_an_idle_claim(bridge, paired, monkeypatch):
+    """Parks codex's #9 on claude's idle #8 and records every notice sent."""
+    directory = busy_with_one_idle_claim(bridge, paired)
+    codex = Path(paired["lanes"]["codex"])
+    bridge.issue(codex, "claim", "9")
+    bridge.issue(codex, "block", "9", on="8")
+    sent = []
+    monkeypatch.setattr(
+        supervision.notify,
+        "deliver",
+        lambda directory, agent, event, fields: sent.append(
+            (agent, event, dict(fields))
+        ),
+    )
+    return directory, sent
+
+
+def test_a_blocking_idle_claim_notifies_the_operator_once(
+    bridge, paired, monkeypatch
+):
+    directory, sent = blocking_an_idle_claim(bridge, paired, monkeypatch)
+    for _ in range(3):
+        record = step(bridge, directory)["8"]
+    assert record["idle_blocker"]["waiting"] == ["9"]
+    assert len(sent) == 1
+    agent, event, fields = sent[0]
+    assert (agent, event) == ("claude", supervision.notify.Event.IDLE_BLOCKER)
+    assert fields["issue"] == "8"
+    assert fields["claim"] == record["claim_id"]
+    assert fields["detail"].endswith("; #9 waiting on it")
+
+    lifecycle.record_report(
+        directory, "claude", "partial", "", "still going", issue="8"
+    )
+    assert step(bridge, directory)["8"]["idle_blocker"]["waiting"] == []
+    edit(
+        directory,
+        "8",
+        lambda record: record["execution"]["progress"].update(
+            at=time.time() - 2 * IDLE_AFTER
+        ),
+    )
+    assert step(bridge, directory)["8"]["idle_blocker"]["waiting"] == ["9"]
+    assert len(sent) == 1
+
+
+def test_status_shows_a_row_for_a_blocking_claim_without_progress(
+    bridge, paired, monkeypatch, capsys
+):
+    directory, _ = blocking_an_idle_claim(bridge, paired, monkeypatch)
+    bridge.status()
+    assert "Blocking claim" not in capsys.readouterr().out
+
+    step(bridge, directory)
+    bridge.status()
+    rows = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("Blocking claim")
+    ]
+    assert len(rows) == 1
+    assert rows[0].startswith("Blocking claim #8 (claude): no progress for ")
+    assert rows[0].endswith("s; #9 waiting on it")
+    assert int(rows[0].split("for ")[1].split("s;")[0]) >= 2 * IDLE_AFTER
+
+    lifecycle.record_report(
+        directory, "claude", "partial", "", "still going", issue="8"
+    )
+    step(bridge, directory)
+    bridge.status()
+    assert "Blocking claim" not in capsys.readouterr().out
