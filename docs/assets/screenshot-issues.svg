@@ -1,11 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="940" height="150" viewBox="0 0 940 150" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13">
-<rect width="940" height="150" rx="10" fill="#0d1117"/>
-<rect width="940" height="30.0" rx="10" fill="#161b22"/>
-<rect y="20.0" width="940" height="10" fill="#161b22"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1067" height="192" viewBox="0 0 1067 192" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13">
+<rect width="1067" height="192" rx="10" fill="#0d1117"/>
+<rect width="1067" height="30" rx="10" fill="#161b22"/>
+<rect y="20" width="1067" height="10" fill="#161b22"/>
 <circle cx="18" cy="15" r="5.5" fill="#ff5f57"/><circle cx="36" cy="15" r="5.5" fill="#febc2e"/><circle cx="54" cy="15" r="5.5" fill="#28c840"/>
-<text x="470" y="19" text-anchor="middle" fill="#8b949e" font-size="12">agent-parley issue list</text>
-<text x="18.0" y="61.5" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue list</tspan></text>
-<text x="18.0" y="79.5" xml:space="preserve" fill="#c9d1d9">#17: codex (stopped)</text>
-<text x="18.0" y="97.5" xml:space="preserve" fill="#c9d1d9">#42: claude (stopped); waits on #17 (codex); handoff to codex pending 0s; offer 4560c1ded1424c549843694d42e43d39</text>
-<text x="18.0" y="115.5" xml:space="preserve" fill="#8b949e">  Peer-provided summary: "rounding fixed in payments.py; refund path still open"</text>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">agent-parley issue list</text>
+<text x="18.0" y="48.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue list</tspan></text>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#c9d1d9">#17: codex-1 (starting; awaiting native hook; event 18s ago); last progress 1s ago; no deadline</text>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">#42: claude-1 (unknown; no session process recorded; event 10s ago); last progress 1s ago; no deadline; waits on #17 (codex-1); hand</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">off to codex-1 pending 0s; offer 2a74af74ac1c49b8971ccfbf92a8cac2</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  Peer-provided summary: "Capture path committed; rounding table left to check."</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  Commit: 72a9387bbdd88713853d9a07f65c161b2fbc51bb</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">  Reservations: src/payments/refund.py</text>
 </svg>
