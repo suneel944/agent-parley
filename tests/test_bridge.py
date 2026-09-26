@@ -554,20 +554,199 @@ def test_git_timeout_is_recorded_and_obeys_hook_exit_contract(
             "codex",
         ],
     )
-    blocking = event in ("PreToolUse", "SessionStart", "UserPromptSubmit")
+    blocking = event in ("PreToolUse", "SessionStart")
     assert checkpoints.main() == (2 if blocking else 0)
     output = capsys.readouterr()
-    assert output.err == (
+    failure = (
         "Agent Parley checkpoint failed: "
-        "Git branch inspection timed out after 3s.\n"
+        "Git branch inspection timed out after 3s."
     )
-    assert output.out == ("" if blocking else "{}\n")
+    assert output.err == failure + "\n"
+    if event == "UserPromptSubmit":
+        assert json.loads(output.out) == {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": failure,
+            }
+        }
+    else:
+        assert output.out == ("" if blocking else "{}\n")
     state = checkpoints.activity(lane.parent, "codex")
     assert state["event"] == event
     assert "timed out" in state["checkpoint_error"]
     entry = checkpoints.read_events(lane.parent, "codex")[-1]
     assert entry["reason_class"] == "checkpoint_failed"
     assert entry["decision"] == ("deny" if blocking else "allow")
+
+
+@pytest.mark.parametrize(
+    ("event", "key"),
+    [
+        ("UserPromptSubmit", "additionalContext"),
+        ("SessionStart", "additionalContext"),
+        ("PreToolUse", "permissionDecisionReason"),
+    ],
+)
+def test_a_cwd_outside_the_lane_steers_back_without_locking_out(
+    bridge, repo, paired, monkeypatch, capsys, tmp_path, event, key
+):
+    lane = Path(paired["lanes"]["codex"]).resolve()
+    outside = tmp_path.resolve()
+    payload = {"hook_event_name": event, "cwd": str(outside)}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "checkpoint",
+            "--home",
+            str(bridge.home),
+            "--directory",
+            str(lane.parent),
+            "--participant",
+            "codex",
+        ],
+    )
+    assert checkpoints.main() == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    details = json.loads(output.out)["hookSpecificOutput"]
+    assert details["hookEventName"] == event
+    assert str(outside) in details[key]
+    assert f"cd {lane}" in details[key]
+    denied = event == "PreToolUse"
+    assert (details.get("permissionDecision") == "deny") is denied
+    entry = checkpoints.read_events(lane.parent, "codex")[-1]
+    assert entry["reason_class"] == "outside_lane"
+    assert entry["decision"] == ("deny" if denied else "allow")
+
+
+def outside_decision(bridge, lane, cwd, command):
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(cwd),
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    }
+    output = checkpoint(bridge.home, lane.parent, "codex", payload)
+    entry = checkpoints.read_events(lane.parent, "codex")[-1]
+    return output, entry["reason_class"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd {lane}",
+        "cd {lane}/agent_parley && git status",
+        "cd {name}",
+    ],
+)
+def test_a_drifted_agent_may_cd_back_into_its_lane(
+    bridge, repo, paired, command
+):
+    lane = Path(paired["lanes"]["codex"]).resolve()
+    write_json(lane.parent / "codex-identity.json", {"name": "BlueRiver"})
+    text = command.format(lane=lane, name=lane.name)
+    output, reason = outside_decision(bridge, lane, lane.parent, text)
+    assert reason != "outside_lane"
+    assert "outside your lane" not in json.dumps(output)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd {elsewhere} && cd {lane}",
+        "ls && cd {lane}",
+        "cd {lane}/../..",
+        "cd {lane}-other",
+    ],
+)
+def test_a_drifted_agent_is_denied_anything_but_a_return(
+    bridge, repo, paired, tmp_path, command
+):
+    lane = Path(paired["lanes"]["codex"]).resolve()
+    text = command.format(lane=lane, elsewhere=tmp_path)
+    output, reason = outside_decision(bridge, lane, tmp_path, text)
+    assert reason == "outside_lane"
+    details = output["hookSpecificOutput"]
+    assert details["permissionDecision"] == "deny"
+    assert f"`cd {lane}`" in details["permissionDecisionReason"]
+
+
+def prompt_payload(lane):
+    return {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s1",
+        "cwd": str(lane),
+        "prompt": "carry on",
+    }
+
+
+def assert_prompt_context(output, text):
+    details = output["hookSpecificOutput"]
+    assert "permissionDecision" not in details
+    assert "decision" not in output
+    assert text in details["additionalContext"]
+
+
+def test_a_paused_lane_still_takes_a_prompt_as_context(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    bridge.pause(repo, "codex")
+    output = checkpoint(bridge.home, lane.parent, "codex", prompt_payload(lane))
+    assert_prompt_context(output, roster.PAUSED_REASON)
+
+
+def test_a_drifted_branch_still_takes_a_prompt_as_context(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    git(lane, "switch", "-c", "wandered")
+    output = checkpoint(bridge.home, lane.parent, "codex", prompt_payload(lane))
+    assert_prompt_context(output, "git switch")
+    assert checkpoints.read_events(lane.parent, "codex")[-1]["decision"] == (
+        "allow"
+    )
+
+
+@pytest.mark.parametrize(
+    ("adapter", "read"),
+    [
+        (None, lambda out: out["hookSpecificOutput"]["additionalContext"]),
+        ("copilot", lambda out: out["additionalContext"]),
+        ("opencode", lambda out: out["context"]),
+        ("gemini", lambda out: out["hookSpecificOutput"]["additionalContext"]),
+    ],
+)
+@pytest.mark.parametrize(
+    ("change", "text"),
+    [
+        ({"participant": "nobody"}, "not a participant"),
+        ({"protocol": 99}, "speaks protocol 99"),
+    ],
+)
+def test_a_failed_decision_lets_the_prompt_through_as_context(
+    bridge, repo, paired, adapter, read, change, text
+):
+    lane = Path(paired["lanes"]["codex"])
+    payload = prompt_payload(lane)
+    if adapter == "opencode":
+        payload["hook_event_name"] = "chat.message"
+    if adapter == "gemini":
+        payload["hook_event_name"] = "BeforeAgent"
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "payload": payload,
+        **change,
+    }
+    if adapter:
+        request["adapter"] = adapter
+    served = checkpoints.serve(bridge.home, request)
+    assert served["status"] == 0
+    assert text in served["stderr"]
+    assert text in read(json.loads(served["stdout"]))
+    tool = {**request, "payload": {**prompt_payload(lane), "tool_name": "x"}}
+    tool["payload"]["hook_event_name"] = "PreToolUse"
+    tool.pop("adapter", None)
+    assert checkpoints.serve(bridge.home, tool)["status"] == 2
 
 
 def test_native_hook_allows_branch_work_in_separate_worktree(
@@ -937,9 +1116,17 @@ def test_hook_failure_pauses_tools_and_foreign_worktree_is_rejected(
     }
     result = checkpoint(bridge.home, lane.parent, "claude", payload)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    foreign = checkpoint(
+        bridge.home, lane.parent, "claude", {**payload, "cwd": str(repo)}
+    )["hookSpecificOutput"]
+    assert foreign["permissionDecision"] == "deny"
+    assert f"cd {lane.resolve()}" in foreign["permissionDecisionReason"]
     with pytest.raises(BridgeError, match="cwd"):
         checkpoint(
-            bridge.home, lane.parent, "claude", {**payload, "cwd": str(repo)}
+            bridge.home,
+            lane.parent,
+            "claude",
+            {**payload, "hook_event_name": "Stop", "cwd": str(repo)},
         )
     assert (
         checkpoint(

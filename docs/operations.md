@@ -2140,6 +2140,21 @@ and drift detection keep working across the change. A branch name that already
 exists in the repository only moves the ordinal on: nothing is renamed, reused
 or deleted.
 
+### What the lifecycle hooks refuse
+
+The hooks refuse tool use, never a prompt. A refused prompt would reach you, not
+the agent, and lock you out of your own session. So when a lane is paused, its
+session generation was fenced by a takeover, its branch drifted, its shell `cd`
+left the worktree, or the decision itself failed, the prompt goes through and the
+reason reaches the agent as context on it. The same causes still deny a tool
+call.
+
+A lane whose shell cwd left its worktree is told on its next prompt to run
+`cd LANE` before any tool work, and every tool call from outside is denied with
+that same instruction. The one call it may still make is a shell command whose first
+step is a bare `cd` into the lane or a directory inside it, so the agent can
+return without your help; `cd /elsewhere && cd LANE` stays denied.
+
 ### Selecting the forge
 
 Issue titles, assignee mirrors and report comments go to the forge the project
