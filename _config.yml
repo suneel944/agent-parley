@@ -10,6 +10,8 @@ plugins:
   - jekyll-sitemap
   - jekyll-seo-tag
   - jekyll-relative-links
+optional_front_matter:
+  remove_originals: true
 exclude:
   - agent_parley
   - tests
