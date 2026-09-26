@@ -307,7 +307,7 @@ def test_a_lane_on_a_second_account_is_trusted_in_its_own_record(
     assert second[str(repo)]["hasTrustDialogAccepted"] is True
 
 
-def test_only_the_bridge_opt_in_and_hook_review_answer_are_recorded(
+def test_only_the_opt_ins_and_hook_review_answer_are_recorded(
     tmp_path,
 ):
     home, repo = estate(tmp_path)
@@ -316,6 +316,7 @@ def test_only_the_bridge_opt_in_and_hook_review_answer_are_recorded(
     data = json.loads(manifest.read_text())
     assert data["supervision"] == {
         "approve_bridge_tools": True,
+        "auto_mode": True,
         "dialogs": {"hook-review": "Trust all and continue"},
     }
     assert data["root"] == str(repo)
@@ -327,10 +328,7 @@ def test_the_workspace_allows_edits_only_in_its_own_settings(tmp_path):
         (tmp_path / "run" / ".claude" / "settings.json").read_text()
     )
     assert settings == {
-        "permissions": {
-            "defaultMode": "auto",
-            "allow": list(acceptance.PROJECT_PERMISSIONS),
-        }
+        "permissions": {"allow": list(acceptance.PROJECT_PERMISSIONS)}
     }
 
 

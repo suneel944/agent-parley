@@ -299,6 +299,30 @@ def test_a_dialog_split_across_reads_is_still_recognized(tmp_path):
     assert watch.holding is True
 
 
+def test_an_answer_the_client_ignores_is_pressed_again_then_escalates(
+    tmp_path,
+):
+    watch = dialogs.Watch(tmp_path, "lane", {"hook-review": "review hooks"})
+    assert watch.advance(HOOK_REVIEW.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.2) == b"1\r"
+    assert watch.advance(b"", 1.0) == b""
+    assert watch.advance(b"", 1.0 + dialogs.SILENT_AFTER) == b"1\r"
+    assert watch.advance(b"", 7.0) == b""
+    assert watch.advance(b"", 7.0 + dialogs.SILENT_AFTER) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
+    assert state["dialog"]["name"] == "hook-review"
+
+
+def test_an_answer_the_client_draws_after_is_not_pressed_again(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", {"hook-review": "review hooks"})
+    assert watch.advance(HOOK_REVIEW.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.2) == b"1\r"
+    assert watch.advance(WORKING.encode(), 1.0) == b""
+    assert watch.advance(b"", 1.0 + dialogs.SILENT_AFTER * 2) == b""
+    assert watch.holding is False
+
+
 def test_the_answers_an_operator_recorded_are_read_per_lane():
     manifest = {
         "supervision": {"dialogs": {"hook-review": "review hooks"}},
@@ -597,12 +621,35 @@ def test_status_names_the_prompt_and_how_long_it_has_waited(tmp_path):
     assert "; waiting 90s" in line
 
 
+BRIDGE_RULES = [protocol.TOOL_PREFIX, protocol.cli_rule()]
+
+
+@pytest.mark.parametrize("scope", ["project", "lane"])
+def test_a_non_boolean_auto_mode_is_refused(bridge, repo, paired, scope):
+    """Refuses a recorded auto mode that is not a plain choice."""
+    directory = Path(paired["lanes"]["claude"]).parent
+    manifest = json.loads((directory / "project.json").read_text())
+    if scope == "project":
+        manifest["supervision"] = {dialogs.AUTO_MODE: "yes"}
+    else:
+        manifest["participants"]["claude"][dialogs.AUTO_MODE] = "yes"
+    write_json(directory / "project.json", manifest)
+    with pytest.raises(BridgeError, match="auto_mode setting must be"):
+        roster.read(directory)
+
+
 @pytest.mark.parametrize(
     "opt_in,allowed",
     [
         (None, None),
-        (False, None),
-        (True, [protocol.TOOL_PREFIX, protocol.cli_rule()]),
+        ({dialogs.PRE_APPROVE: False}, None),
+        ({dialogs.PRE_APPROVE: True}, {"allow": BRIDGE_RULES}),
+        ({dialogs.AUTO_MODE: False}, None),
+        ({dialogs.AUTO_MODE: True}, {"defaultMode": "auto"}),
+        (
+            {dialogs.PRE_APPROVE: True, dialogs.AUTO_MODE: True},
+            {"allow": BRIDGE_RULES, "defaultMode": "auto"},
+        ),
     ],
 )
 def test_the_launch_approves_this_bridge_and_nothing_else(
@@ -629,7 +676,7 @@ def test_the_launch_approves_this_bridge_and_nothing_else(
     directory = Path(data["participants"]["lane"]["lane"]).parent
     if opt_in is not None:
         manifest = json.loads((directory / "project.json").read_text())
-        manifest["supervision"] = {dialogs.PRE_APPROVE: opt_in}
+        manifest["supervision"] = opt_in
         write_json(directory / "project.json", manifest)
     monkeypatch.setattr(bridge, "up", lambda: None)
 
@@ -644,7 +691,7 @@ def test_the_launch_approves_this_bridge_and_nothing_else(
         assert set(settings) == {"hooks"}
     else:
         assert set(settings) == {"hooks", "permissions"}
-        assert settings["permissions"] == {"allow": allowed}
+        assert settings["permissions"] == allowed
     assert "bypass" not in " ".join(argv).lower()
     assert "--dangerously-skip-permissions" not in argv
 

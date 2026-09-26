@@ -154,11 +154,18 @@ A prompt for any other command escalates as before. A participant entry
 overrides the project entry, so one lane can stay fully interactive.
 
 A lane the supervisor launches or resumes runs in the client's default
-permission mode; no permission mode is passed. A lane you started by hand and
+permission mode unless you record `auto_mode`. A lane you started by hand and
 switched to the client's auto mode does not carry that choice into a
 supervisor-driven resume, so a resumed lane parks on the first shell command
 outside your own allow list and the two rules above. Record that command in
-the client's own permission settings to keep such a lane moving. Codex CLI
+the client's own permission settings to keep such a lane moving, or record
+`"auto_mode": true` for the project under `supervision` or for one lane. With
+it on, a launched `claude` lane's session settings carry
+`permissions.defaultMode` set to `auto`: the client's own classifier approves
+routine commands and still stops a risky one. The client ignores `auto` from a
+project's own `.claude/settings.json`, which is why the launch carries it. The
+default is off, a lane entry overrides the project, a value that is not a
+boolean is refused, and no bypass mode is ever passed. Codex CLI
 0.153.4 has no per-tool approval surface of its own — its approval settings are
 whole-session policies — so its launch is left untouched and its prompts are
 reported for you to answer.

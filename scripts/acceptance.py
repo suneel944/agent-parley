@@ -167,11 +167,7 @@ def workspace(path: Path, issues: int) -> None:
     Without them each lane stops at the client's first edit prompt, which
     is not a coordination dialog and which no operator is there to
     answer. The rules live in the throwaway repository, so the operator's
-    own settings and every other project are untouched. The same settings
-    start ``claude`` in its auto permission mode, where the client's own
-    classifier approves routine commands and still stops a risky one, so
-    a lane that runs an exploratory command outside the list is not
-    parked on a prompt nobody answers.
+    own settings and every other project are untouched.
 
     Each task writes its own module and test module. A shared file makes
     the first claimant's reservation block every other lane, and a
@@ -205,15 +201,7 @@ def workspace(path: Path, issues: int) -> None:
     )
     (path / ".claude").mkdir(exist_ok=True)
     (path / ".claude" / "settings.json").write_text(
-        json.dumps(
-            {
-                "permissions": {
-                    "defaultMode": "auto",
-                    "allow": list(PROJECT_PERMISSIONS),
-                }
-            }
-        )
-        + "\n"
+        json.dumps({"permissions": {"allow": list(PROJECT_PERMISSIONS)}}) + "\n"
     )
     for number in range(1, issues + 1):
         (path / "tasks" / f"{number}.md").write_text(
@@ -295,11 +283,17 @@ def supervise(home: Path, repo: Path) -> None:
     is the choice an operator makes once per lane at a terminal. An
     earlier run that left the screen unanswered parked both ``codex``
     lanes for the whole period.
+
+    ``auto_mode`` starts every ``claude`` lane in the client's auto
+    permission mode. A lane otherwise waits on a native prompt for any
+    command outside its allow list, and the client ignores that mode
+    from the throwaway project's own settings.
     """
     manifest = _directory(home, repo) / "project.json"
     data = _read(manifest)
     supervision = dict(data.get("supervision") or {})
     supervision["approve_bridge_tools"] = True
+    supervision["auto_mode"] = True
     supervision["dialogs"] = {"hook-review": "Trust all and continue"}
     data["supervision"] = supervision
     manifest.write_text(json.dumps(data, indent=1) + "\n")

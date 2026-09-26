@@ -981,6 +981,10 @@ def normalize(manifest: dict) -> dict:
             participant["approve_bridge_tools"] = approval_opt_in(
                 participant["approve_bridge_tools"]
             )
+        if "auto_mode" in participant:
+            participant["auto_mode"] = approval_opt_in(
+                participant["auto_mode"], "auto_mode"
+            )
         if "answer_questions" in participant:
             participant["answer_questions"] = standing_reply(
                 participant["answer_questions"]
@@ -1003,6 +1007,10 @@ def normalize(manifest: dict) -> dict:
     if "approve_bridge_tools" in project:
         project["approve_bridge_tools"] = approval_opt_in(
             project["approve_bridge_tools"]
+        )
+    if "auto_mode" in project:
+        project["auto_mode"] = approval_opt_in(
+            project["auto_mode"], "auto_mode"
         )
     if "answer_questions" in project:
         project["answer_questions"] = standing_reply(
@@ -1058,16 +1066,20 @@ def dialog_answers(value: object) -> dict[str, str]:
     return {name: answer.strip() for name, answer in value.items()}
 
 
-def approval_opt_in(value: object) -> bool:
-    """Validates the native approval pre-approval an operator recorded.
+def approval_opt_in(
+    value: object, setting: str = "approve_bridge_tools"
+) -> bool:
+    """Validates a native permission opt-in an operator recorded.
 
-    The setting decides whether a launch carries approval of this bridge's own
-    MCP server into the client's native permission settings. It grants nothing
-    wider, so it is a plain choice rather than a list of tools, and a value that
-    is not a boolean is refused instead of read as consent.
+    `approve_bridge_tools` decides whether a launch carries approval of this
+    bridge's own MCP server into the client's native permission settings, and
+    `auto_mode` whether it starts the client in its auto permission mode.
+    Each is a plain choice, and a value that is not a boolean is refused
+    instead of read as consent.
 
     Args:
         value: Recorded opt-in for a project or one of its lanes.
+        setting: Manifest key the value was recorded under.
 
     Returns:
         The recorded choice.
@@ -1076,7 +1088,7 @@ def approval_opt_in(value: object) -> bool:
         BridgeError: If the value is not a boolean.
     """
     if type(value) is not bool:
-        raise BridgeError("The approve_bridge_tools setting must be a boolean.")
+        raise BridgeError(f"The {setting} setting must be a boolean.")
     return value
 
 

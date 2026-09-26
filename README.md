@@ -396,7 +396,9 @@ Parley integrates a lane only when you run `participant merge`, and it approves
 no command on an agent's behalf, with one opt-in exception: with
 `approve_bridge_tools` on, a launched `claude` lane is allowed this bridge's
 own MCP tools and its own coordination CLI, so a resumed lane does not park on
-a prompt nobody is there to answer. The runtime can wake an idle lane to review
+a prompt nobody is there to answer. With `auto_mode` on, a launched `claude`
+lane starts in the client's own auto permission mode, whose classifier still
+decides each command. The runtime can wake an idle lane to review
 pending mail, with global and per-lane opt-outs and a bounded number of
 attempts per backlog. Reported `ready` is ready for review, not verified
 completion. Token usage still depends on the native agents: `CONTEXT` reports
