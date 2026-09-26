@@ -65,24 +65,37 @@ LANES = (
 TASK = """You are one lane of an unattended acceptance run. No operator
 is watching, and nobody will answer a question you ask.
 
-Coordinate through your `agent_parley` tools rather than a shell: they
-are the surface this estate gives you, and the shell is not.
+Claim, report and release through the `agent-parley` command in your
+shell; the `agent_parley` tools carry mail and reservations only. The
+tasks are not on any forge, so `next_issues` offers nothing: the task
+files are the backlog.
 
 Work this loop until the backlog is empty:
 
-1. List the issues and pick the lowest numbered task in `tasks/` that no
-   lane owns.
-2. Claim it.
+1. Run `agent-parley issue list` and pick the lowest numbered task in
+   `tasks/` that no lane owns.
+2. Claim it with `agent-parley issue claim <number>`. When the claim is
+   refused, pick the next task.
 3. Read `tasks/<number>.md` in your worktree and make exactly the change
    it asks for, with a test.
-4. Run the project's verify command. When it passes, commit and report
-   the issue ready with a summary of what you changed. When the task
-   cannot be done as written, report it blocked with the reason and
-   release the claim.
+4. Run `python -m pytest -q`. When it passes, commit and run
+   `agent-parley report --issue <number> --state ready --summary "..."
+   --evidence "..."`. When the task cannot be done as written, run
+   `agent-parley report --issue <number> --state blocked --remaining
+   "..."` with the reason, then `agent-parley issue release <number>`.
 5. Take the next task.
 
 Read your mail when the bridge tells you there is mail, and answer a peer
 that asks you something. Never wait for the operator."""
+PROJECT_PERMISSIONS = (
+    "Edit",
+    "Write",
+    "Bash(python -m pytest:*)",
+    "Bash(git add:*)",
+    "Bash(git commit:*)",
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+)
 CONDITION = """# Task {number}
 
 Add a function `{name}` to `library.py` that {behaviour}, and a test for
@@ -143,6 +156,13 @@ def _document(cli: str, home: Path, args: list[str]) -> dict:
 def workspace(path: Path, issues: int) -> None:
     """Creates the throwaway project the estate coordinates over.
 
+    The project carries its own ``claude`` settings allowing file edits
+    and the test, status, diff, add and commit commands every task needs.
+    Without them each lane stops at the client's first edit prompt, which
+    is not a coordination dialog and which no operator is there to
+    answer. The rules live in the throwaway repository, so the operator's
+    own settings and every other project are untouched.
+
     Args:
         path: Directory the project is created in.
         issues: Number of backlog tasks to write.
@@ -166,6 +186,10 @@ def workspace(path: Path, issues: int) -> None:
     (path / "README.md").write_text(
         "# Acceptance workspace\n\nA throwaway project for an unattended "
         "acceptance run.\n"
+    )
+    (path / ".claude").mkdir(exist_ok=True)
+    (path / ".claude" / "settings.json").write_text(
+        json.dumps({"permissions": {"allow": list(PROJECT_PERMISSIONS)}}) + "\n"
     )
     for number in range(1, issues + 1):
         (path / "tasks" / f"{number}.md").write_text(
@@ -230,7 +254,7 @@ def register(cli: str, home: Path, repo: Path, lanes: list[str]) -> None:
 
 
 def supervise(home: Path, repo: Path) -> None:
-    """Records the one opt-in an unattended estate is given.
+    """Records the answers an unattended estate is given in advance.
 
     Args:
         home: Private state directory the estate runs under.
@@ -239,15 +263,20 @@ def supervise(home: Path, repo: Path) -> None:
     A resumed session asks again for permission to use this bridge's own
     MCP tools, and no operator is there to answer. The opt-in scopes a
     native permission rule to this bridge's coordination tools and
-    nothing else: no file tool, no shell, no other server. Every other
-    permission the clients ask for is left exactly as the operator
-    configured it, because what this run measures is a day without an
-    operator, not a day without permissions.
+    nothing else: no file tool, no shell, no other server.
+
+    ``codex`` asks the operator to review new hooks before it reads any
+    prompt, and every lane worktree is new to it. The recorded answer
+    trusts the hooks this bridge wrote into the throwaway project, which
+    is the choice an operator makes once per lane at a terminal. An
+    earlier run that left the screen unanswered parked both ``codex``
+    lanes for the whole period.
     """
     manifest = _directory(home, repo) / "project.json"
     data = _read(manifest)
     supervision = dict(data.get("supervision") or {})
     supervision["approve_bridge_tools"] = True
+    supervision["dialogs"] = {"hook-review": "Trust all and continue"}
     data["supervision"] = supervision
     manifest.write_text(json.dumps(data, indent=1) + "\n")
 

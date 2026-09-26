@@ -298,14 +298,28 @@ def test_a_lane_on_a_second_account_is_trusted_in_its_own_record(
     assert second[str(repo)]["hasTrustDialogAccepted"] is True
 
 
-def test_the_bridge_tool_opt_in_is_the_only_one_recorded(tmp_path):
+def test_only_the_bridge_opt_in_and_hook_review_answer_are_recorded(
+    tmp_path,
+):
     home, repo = estate(tmp_path)
     manifest = home / "projects" / "one" / "project.json"
     acceptance.supervise(home, repo)
     data = json.loads(manifest.read_text())
-    assert data["supervision"] == {"approve_bridge_tools": True}
+    assert data["supervision"] == {
+        "approve_bridge_tools": True,
+        "dialogs": {"hook-review": "Trust all and continue"},
+    }
     assert data["root"] == str(repo)
-    assert "dialogs" not in data.get("supervision", {})
+
+
+def test_the_workspace_allows_edits_only_in_its_own_settings(tmp_path):
+    acceptance.workspace(tmp_path / "run", 2)
+    settings = json.loads(
+        (tmp_path / "run" / ".claude" / "settings.json").read_text()
+    )
+    assert settings == {
+        "permissions": {"allow": list(acceptance.PROJECT_PERMISSIONS)}
+    }
 
 
 def test_the_status_reading_of_another_project_is_ignored(tmp_path):

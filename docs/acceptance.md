@@ -112,15 +112,30 @@ client's terminal never reports end of file.
 
 ## What the estate is given before it is left alone
 
-Two decisions are recorded before the period starts, and they are the only
-two.
+Four decisions are recorded before the period starts, and they are the only
+four. Each is one an operator makes once at a terminal, and each is scoped
+to the throwaway project.
 
 The project manifest is given `supervision.approve_bridge_tools`. A resumed
 session asks again for permission to use this bridge's own MCP tools and no
 operator is there to answer, so the launch adds one native permission rule
-scoped to those coordination tools and nothing else. Every other permission
-the clients ask for is left exactly as the operator configured it, because
-the run measures a day without an operator, not a day without permissions.
+scoped to those coordination tools and the `agent-parley` command.
+
+The manifest also answers `codex`'s `Hooks need review` screen with `Trust
+all and continue` through `supervision.dialogs`. Every lane worktree is new
+to `codex`, so each lane draws that screen before it reads any prompt.
+
+The throwaway repository carries a `.claude/settings.json` that allows file
+edits and the test, status, diff, add and commit commands the tasks need.
+Without it every `claude` lane stops at its first `Do you want to
+overwrite` prompt, which is not a coordination dialog. The operator's own
+settings are not touched. Every other permission is left as the operator
+configured it.
+
+The 2026-09-26 run that preceded these answers parked every lane within
+minutes: both `codex` lanes on the hook review, two `claude` lanes on the
+edit prompt, and the rest after a prompt that told them to avoid the
+command they claim with.
 
 `--trust` records the throwaway project and each lane worktree in the
 native clients' own trust records: `hasTrustDialogAccepted` for `claude` in
@@ -262,10 +277,10 @@ returning a third time after two answers all escalate instead.
 Carrying a permission decision forward across a resume is a separate
 opt-in, `approve_bridge_tools`, recorded the same way and scoped to this
 bridge's own MCP server. Neither setting weakens a native permission
-decision or adds a way around one. The run records that opt-in and no
-dialog answer at all, so a lane that meets one of the three screens still
-holds it, publishes it and escalates it, which is what the period is
-measuring.
+decision or adds a way around one. The run records that opt-in and one
+dialog answer, for `hook-review`, so a lane that meets a tool permission
+or usage-limit screen still holds it, publishes it and escalates it,
+which is what the period is measuring.
 
 ## Reading the evidence
 
