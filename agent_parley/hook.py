@@ -76,7 +76,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-payload="$(</dev/stdin)"
+payload="$(cat)"
 
 decide_in_process() {
   printf '%s' "$payload" | "@PYTHON@" -m agent_parley.hook "${arguments[@]}"
@@ -177,9 +177,14 @@ def write_client(home: str, python: str) -> str:
     was already sent and served, and the fallback then asks a second time for
     a decision the service has already recorded as delivered.
 
-    The payload is read with a ``$(</dev/stdin)`` substitution, which reads
-    the pipe in blocks. ``read -d ''`` reads a pipe one byte per system call
-    and spent about 1.5 seconds of the hook budget on a 2 MB payload. A
+    The payload is read with ``cat``, which reads standard input in blocks.
+    ``read -d ''`` reads a pipe one byte per system call and spent about 1.5
+    seconds of the hook budget on a 2 MB payload. A ``$(</dev/stdin)``
+    substitution also reads in blocks, but it opens ``/dev/stdin`` again,
+    which fails with "No such device or address" when standard input is a
+    socket, and Node gives a hook a socketpair as standard input, so every
+    ``claude`` hook call arrived empty. ``cat`` reads descriptor 0 as it
+    was given, for one short process. A
     payload past `MAX_INPUT_BYTES` goes straight to the in-process path,
     which records it as oversize and allows the call.
 
