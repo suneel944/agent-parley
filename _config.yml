@@ -88,6 +88,13 @@ defaults:
         How Agent Parley versions are measured, approved, tagged and
         published.
   - scope:
+      path: docs/acceptance.md
+    values:
+      title: Unattended acceptance run
+      description: >-
+        How a day of real parallel coding agent lanes is run without an
+        operator and turned into the evidence a minor release needs.
+  - scope:
       path: docs/catalog-submission.md
     values:
       title: Catalog submission

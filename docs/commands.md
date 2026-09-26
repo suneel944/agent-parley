@@ -28,11 +28,11 @@ on standard output and export to a file.
 | `completion SHELL` | Print a `bash`, `zsh` or `fish` completion script generated from the installed command tree. |
 | `status` | Show server health, whether the running service is behind the installed code, and one table per project, each lane's condition read from its authoritative state record; `NAME` reports one lane in full, and `--repo`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since`, `--over-budget` and `--issue` narrow the rows. |
 | `setup PATH` | Register a repository from committed HEAD. |
-| `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`. |
+| `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`, and `--resume` resumes the lane's recorded native session. |
 | `top` | The dashboard of live lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it; `--all` also shows stopped lanes holding nothing and projects whose root is gone, which the header otherwise only counts. |
 | `title` | Print the current lane's name, state and claim progress for a native status line; prints nothing outside a lane. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it. |
-| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--idempotency-key` makes a retry safe. |
+| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--issue` binds the report to one owned issue, `--resume-on N` resumes a blocked report once that issue completes, and `--idempotency-key` makes a retry safe. |
 | `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
 | `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
@@ -43,8 +43,9 @@ on standard output and export to a file.
 | `issue match GOAL` | List the open issues whose recorded title or forge labels share subject words with a stated goal, marking the ones a peer already owns and naming the peer reservations those words run into. It is read only: a match is a reason to read the issue and claim or negotiate for it rather than open a second number for the same work, and no match is a recorded reason to open one. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
 | `issue claim NUMBER --take-orphaned` | Take an issue whose owner reads as orphaned, recording the previous owner and the reason and releasing the reservations that owner held. |
+| `issue request NUMBER` | Ask the holder of an owned issue to hand it to this lane; `--summary` says why. The holder answers with `issue accept` or `issue decline`, and a holder that neither answers nor records progress within the project's `takeover_grace` has the request granted as an offer to this lane. |
 | `issue release NUMBER` | Release ownership without closing the GitHub issue. |
-| `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly; `--when-released N` records it until that issue is released. |
+| `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly; `--remaining ITEM`, repeatable, lists the work still to do, and `--when-released N` records it until that issue is released. |
 | `issue accept NUMBER --offer-id ID` | Accept the current offer addressed to this lane; the offered reservations move with the issue. |
 | `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |
 | `issue cancel NUMBER` | Cancel this lane's pending handoff offer. |
@@ -69,8 +70,8 @@ on standard output and export to a file.
 | `participant pause NAME` | Refuse a lane's calls and tool use; keep its session and claims. |
 | `participant resume NAME` | Let a paused lane act again. |
 | `participant stop NAME` | End a lane's session from the base checkout; keep its claims. |
-| `participant restart NAME` | Start a crashed, wedged or stopped lane again; keep its uncommitted work. |
-| `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. |
+| `participant restart NAME` | Start a crashed, wedged or stopped lane again; keep its uncommitted work. `--task` is the new session's opening instruction. |
+| `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. `--all` integrates every lane reported ready in recorded dependency order and `--group NAME` one group of the applied plan, each stopping at the first refusal or failure. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
 | `participant budget NAME` | Show or set the lane's advisory `--tokens`, `--calls` and `--hours` limits; `0` removes one. Crossing a limit marks the lane and stops nothing. |
 | `... --all --provider N --outcome S --drifted --idle --over-budget` | Select several lanes for one `say`, `issue assign`, `participant stop/pause/resume/pr/merge`; one plan and one confirmation, `--yes` to skip it. |
@@ -101,7 +102,7 @@ on standard output and export to a file.
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `init show` | Show the command every new lane runs before it starts. |
 | `init set COMMAND` | Set that command; an empty string removes it. |
-| `mail show ID` | Print one message this lane received; `--full` adds the whole attachment. |
+| `mail show ID` | Print one message this lane sent or received; `--full` adds the whole attachment. |
 | `mail thread ID` | Read this lane's messages in a thread; `--after-id` pages forward. |
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
 | `mail list` | List this lane's mail newest first, with the same `--limit` as a search and no query to write. |
@@ -118,23 +119,26 @@ on standard output and export to a file.
 | `events export` | Export JSON Lines; filter by `--participant` and `--since`, or write `--output FILE`. |
 | `state export --output PATH` | Write the whole state directory, or one `--project ROOT`, as one tar archive with a hashed manifest and no credentials. |
 | `state show PATH` | List an archive's projects, participants, issue counts and export time without importing it. |
-| `state import PATH` | Restore an archive into an empty state directory; `--merge` adds projects beside existing ones and refuses a collision. |
+| `state import PATH` | Restore an archive into an empty state directory; `--project ROOT` restores one archived project, and `--merge` adds projects beside existing ones and refuses a collision. |
 | `watch NAME` | Follow one lane's coordination events as a stream; `--since` widens the backlog, `--kind` narrows it, `--json` prints JSON Lines. The agent's conversation is never shown. |
 
 ## Machine-readable output
 
-Every read-only command above also accepts `--json` and prints exactly one JSON
+These read-only commands also accept `--json` and print exactly one JSON
 document, so a script, a shell prompt or another agent reads coordination state
-without parsing a table: `status`, `top`, `version`, `issue list`,
-`issue show`, `issue next`, `issue match`, `participant list`, `participant show`,
-`mail thread`,
-`mail search`, `mail list`, `mail pending`, `decision list`, `approval show`,
-`verify show`, `init show`, `branch show`, `forge show`, `state show`,
+without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
+`issue list`, `issue show`, `issue next`, `issue match`, `participant list`,
+`participant show`, `mail show`, `mail thread`, `mail search`, `mail list`,
+`mail pending`, `decision list`, `report show`, `history issue`,
+`history participant`, `history claim`, `plan diff`, `plan show`,
+`approval show`, `verify show`, `init show`, `branch show`, `forge show`,
+`deadlines show`, `budget show`, `resources show`, `state show`,
 `provider list`, `provider show`, `credentials list` and `credentials show`.
 The commands that change something print their outcome the same way with
 `--json`: `up`, `down`, `setup`, `run`, `say`, `decide`, `mail send`,
-`mail cancel`, `approve`, `reject` and `problems ack`. `top --json` prints one
-frame and exits.
+`mail cancel`, `approve`, `reject`, `report review`, `problems ack`,
+`notify test` and `gc`. `top --json` prints one frame and exits;
+`metrics --json` prints the same values as its Prometheus text.
 The document carries the identifiers the table abbreviates — offer, message and
 thread IDs — with every time in RFC 3339, and no credential value. A pending
 handoff carries its structured fields there too: the offering lane's head
@@ -164,7 +168,6 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `read_thread` | Page messages this lane sent or received in one thread. |
 | `search_messages` | Search only messages this lane sent or received. |
 | `search_decisions` | Search decisions any lane recorded for this project, whoever sent or received them; an empty query lists the newest and `since` bounds their age. |
-| `read_attachment` | Page an attachment a message, report or offer named; only its writer and its addressees may read it. |
 | `next_issues` | Rank the unclaimed, unblocked issues this lane could take next, with the reason for each; `limit` bounds the list. It claims nothing, so the chosen issue is still taken by an explicit claim. |
 | `retire` | Retire this lane from the project when it has nothing left to do. Every issue it holds is released back to the pool and every handoff offered to it is declined, so the offering lane owns that work again; each lane that had handed it work is told by mail. Its advisory reservations are released, any key a peer queued for is granted, its worktree is removed when Git reports it clean and kept with its changed paths reported when it is not, and its credential is invalidated last. The lane is then never woken, never relaunched by the service and never named as a peer work could move to. Only the operator returns it to service, with `agent-parley participant add`. |
 | `review_report` | Record this lane's `verdict` of `pass` or `fail` on the peer report named by `report_id`, with the `evidence` it checked. The report's own author is refused. A verdict is that lane's own claim about work it did not do: it is not independent verification, it approves nothing and it gates no integration. |
@@ -204,8 +207,7 @@ handoff summary above 2,048 is neither refused nor truncated: the whole body is
 kept as an attachment under the private state directory and the record carries
 the first bounded slice ending with `[attachment message-12: 20480 bytes]`. The
 peer's checkpoint notice stays within its 1,536-byte budget and ends with that
-reference. Nothing is delivered whole automatically; the reader calls
-`read_attachment` for 2,048 characters at a time, or prints it with
+reference. Nothing is delivered whole automatically; the reader prints it with
 `agent-parley mail show ID --full` and `agent-parley report show ID --full`. One
 attachment is capped at 65,536 bytes, a lane holds at most 1 MiB of them, and an
 attachment is removed when its record is pruned or its offer is declined,

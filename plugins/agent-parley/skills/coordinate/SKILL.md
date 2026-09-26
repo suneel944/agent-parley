@@ -115,7 +115,7 @@ command is already tracked, and tell me if someone is holding it."
   summary it carries `commit` (the lane's head), `reservations` (the advisory
   keys that lane holds), `remaining` (the items given above) and, when the
   diff against the project base fits the 65,536-byte attachment cap, `diff`
-  and `diff_bytes` naming an attachment to read with `read_attachment`. Each
+  and `diff_bytes` naming the attachment that holds the diff. Each
   field is best effort: an unreadable head, an unreachable store or an
   oversized diff records that field empty rather than failing the offer.
   Read them from `agent-parley issue list --json` or `status --json`; do not
@@ -217,9 +217,8 @@ the record keeps the first slice and ends with
 `[attachment message-12: 20480 bytes]`, and the peer's notice ends with that
 reference. Attach when the detail is evidence a peer must inspect, such as a
 test log, a diff or a design note; keep the decision itself in the bounded
-body. A peer sees only the reference and must call `read_attachment` with it,
-one page at a time, or print it with `agent-parley mail show ID --full` or
-`agent-parley report show ID --full`. Only the writer and the addressees can
+body. A peer sees only the reference and prints the whole body with
+`agent-parley mail show ID --full` or `agent-parley report show ID --full`. Only the writer and the addressees can
 read an attachment. One attachment is capped at 65,536 bytes and a lane holds
 at most 1 MiB of them.
 

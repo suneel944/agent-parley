@@ -7,12 +7,18 @@ the repository. [Running lanes](lanes.md) covers the operator side, and
 
 ## Ownership changes only through explicit claims and accepted handoffs
 
-No timeout and no process exit moves an issue. `agent-parley status` reports who
-owns what, which handoff is waiting on an offer ID, and any lane that left its
-assigned branch. An owner can record that one issue waits on another with
-`agent-parley issue block 42 --on 17`; the listing then names who holds the
-blocking issue, and every lane sees the change at its next checkpoint. A
-recorded dependency informs, it does not gate.
+No process exit hands an issue to another lane: a peer gets it only by a claim
+or an accepted offer. The one timed path is the overdue and idle-claim sequence
+below, which offers a claim and then returns it to the pool. `agent-parley
+status` reports who owns what, which handoff is waiting on an offer ID, and any
+lane that left its assigned branch. An owner can record that one issue waits on
+another with `agent-parley issue block 42 --on 17`; the listing then names who
+holds the blocking issue, and every lane sees the change at its next
+checkpoint. A dependency never stops a claim, but it keeps the issue out of the
+unclaimed work lanes are shown, and `report ready` and a verified completion
+refuse while a dependency is incomplete. A block on an unrecorded issue or one
+that would form a cycle is refused, and the supervisor drops an edge once its
+blocker is complete or no longer recorded.
 
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-issues.svg" width="880" alt="agent-parley issue list showing an issue that waits on another, the participant holding it, and a pending handoff with its offer ID">
@@ -61,8 +67,10 @@ those before it answers, so accepting is a decision rather than a guess.
 
 Accepting moves the named reservations to the acceptor with the issue, so the
 paths the work needs do not have to be reserved again and a released offer
-leaves nothing stranded. Mail is not transferred: acknowledgements stay owed by
-the lane that received the message, and each lane still acknowledges its own.
+leaves nothing stranded. Accepting also clears the previous generation's
+`taken` and `orphan` records, so a later claim never restores an old
+checkpoint. Mail is not transferred: acknowledgements stay owed by the lane
+that received the message, and each lane still acknowledges its own.
 
 ```sh
 agent-parley issue offer 42 --to codex --summary "commit, checks, remaining work"
@@ -83,6 +91,15 @@ at all. If a rename removed the assigned branch, the hook names the exact
 repair. Branch drift blocks completion once; a Stop retry can end the session
 while status continues to show the drift.
 
+Pending mail and notices ride on the call as context and never refuse it. Only
+two coordination hazards deny a tool call: a write to a path that overlaps an
+exclusive reservation a peer holds (`reserved_path`, whose text says
+reservations are advisory), and an offer to this lane that expires unanswered
+within 120 seconds (`offer_expiring`, which names the accept and decline
+commands). A call that only reads, and Agent Parley's own commands, are never
+refused for coordination. A Stop is blocked once while an issue or work notice
+is waiting, so the lane reads it before the turn ends.
+
 Enforcement is recorded, not discarded. Every hook decision carries an
 enumerated reason and lands in that participant's event log; every served call
 is recorded inside the transaction that carried its effect. That is why `top`
@@ -97,43 +114,53 @@ that was made before the default existed. Past its deadline a claim reads `overd
 with the seconds over, `top` marks the issue `#42!`, and a lane that reports
 `blocked` on work it still holds spends one attempt of the recorded budget.
 
-An overdue claim whose holder is still working stays owned. An overdue claim
-whose holder is silent, meaning its session process is gone or it has run no
-tool call for the project's inactivity window, gets a terminating transition:
+An overdue claim whose holder is still working on it stays owned. Two cases get
+a terminating transition. The first is an overdue claim whose holder is
+silent, meaning its session process is gone or it has run no tool call for the
+project's inactivity window; a holder parked on a dialog only the operator can
+answer is not silent. The second is any claim with no progress of its own for
+`claim_idle_after` (3600 seconds), even while its holder works elsewhere.
+Progress is a report naming the claim, or any tool call when it is the lane's
+only claim. Both take the same steps:
 
-1. The supervisor wakes the holder once.
-2. If the holder is still silent one window later, the supervisor offers the
-   claim to the fittest running peer, with the claim's recovery checkpoint
-   named in the summary and its commit carried in the offer. With no fit peer
-   it releases the claim instead.
+1. The supervisor wakes the holder once. For an idle claim, the notice also
+   goes to the lanes waiting on the issue.
+2. If nothing changes one window later, the supervisor offers the claim to the
+   fit, running, unpaused peer below `max_claims_per_lane` that holds the
+   fewest claims, with the claim's recovery checkpoint named in the summary
+   and its commit carried in the offer. With no fit peer it releases the claim
+   instead.
 3. If the offer expires or is declined, the supervisor releases the claim to
-   the pool.
+   the pool. An offer with no deadline expires after `stalled_after`.
 
 Each step is recorded in the claim history as `overdue-wake`, `overdue-offer`
 or `overdue-release` and counted in the claim's attempts. A supervisor resume
-that ends without a tool call does not reset the silence, and a holder that
-runs a tool again cancels the sequence.
+that ends without a tool call does not reset the silence. A holder that runs a
+tool again, or progress recorded on an idle claim, cancels the sequence. A
+claim observed complete is never moved; its completion reminder and the
+operator's `issue resolve` end it.
 
 ## A dead lane's claims are offered, never taken away
 
-A lane whose recorded session process is gone and that has been silent past the
-project's stall threshold has its claims marked `orphaned` in `issue list`,
-`status` and `top`, which marks the issue `#42*`. The marker states what was
-observed: an idle lane with a live process is never marked, however long it has
-been quiet. A session that ended cleanly with `SessionEnd` and left no process
-to check counts as gone, so a lane that exited on purpose is marked like one
-that crashed; a lane that never recorded a session is left alone. Every other
-lane receives one notice naming the orphaned issues and the reservations that
-lane still holds.
+A lane whose state record reads `dead` has its claims marked `orphaned` in
+`issue list`, `status` and `top`, which marks the issue `#42*`. A lane is
+`dead` once it has read `stopped` past the project's stall threshold
+(`stalled_after`, 600 seconds). It reads `stopped` when its session process is
+gone, when its session ended cleanly with `SessionEnd`, or after a host
+restart, so a lane that exited on purpose is marked like one that crashed. The
+marker states what was observed: an idle lane with a live process is never
+marked, however long it has been quiet. Every other lane receives one notice
+naming the orphaned issues and the reservations that lane still holds.
 
 Ownership does not move on the marker. A peer takes the work explicitly, and
-the take records the previous owner and the reason, then releases the
-reservations that owner held so the paths read as free.
+the take records the previous owner and the reason, then moves the
+reservations tied to that claim to the new owner. Reservations the old owner
+holds for other claims stay with it.
 
 A marker is withdrawn as soon as the observation behind it stops holding. The
-next poll after the lane's recorded session process answers again removes the
-marker from its claims, keeps those claims with that lane and tells every peer
-that received the notice once that the work is no longer available to take. The
+next poll after the lane's state record reads live again removes the marker
+from its claims, keeps those claims with that lane and tells every peer that
+received the notice once that the work is no longer available to take. The
 readings state when the marker was recorded rather than what is true now, so an
 operator never reads a stored observation as a live one. A marker published by
 an authorized live recovery is not withdrawn this way: it records an approved
@@ -252,6 +279,15 @@ Only a marked message is shared. Ordinary mail keeps the scope it always had,
 and a decision is capped, deduplicated and spilled to an attachment by the same
 rules as any other message.
 
+A lane's send that asks for no acknowledgement and records no decision is routed
+by relevance. A base-advance or merge note goes to the project feed alone, and a
+broadcast reaches only the lanes whose claim, reserved paths or name it
+concerns; every other lane reads it from the feed. A checkpoint delivers an
+acknowledgement request first, then mail naming a path the lane reserved, then
+mail naming the lane. A completed claim retires the mail its generation sent.
+Acknowledgement debt expires: a request past its deadline, or superseded by a
+closed claim or a newer message, no longer counts against the lane.
+
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-coordination.svg" width="880" alt="A granted reservation, a denied one naming the blocking owner, a deduplicated send, and an inbox page">
 </p>
@@ -290,10 +326,22 @@ holding more than one claim. When a lane holds several claims and a peer reads
 one. Every offer is checked first against what the host can read without asking
 a vendor: the session process, the lane's own client records for a recent
 rate-limit or usage-window refusal, the worktree, and the acknowledgements it
-owes. A lane that fails a check is reported `unfit` with the failed check named,
-and no offer names it. `top` shows each lane's `FIT` result and whether an offer
-is pending. Nothing is claimed for anyone: `issue offer` stays the only transfer
-path, and the recipient still accepts or declines.
+owes. Acknowledgement debt is suspended while the lane's state record has held
+a state other than starting or working for `inactive_after`, since such a lane
+is not reading mail. A lane that fails a check is reported `unfit` with the
+failed check named, and no offer names it. `top` shows each lane's `FIT` result
+and whether an offer is pending. `issue claim`, `issue accept` and
+`issue request` refuse a lane that already holds `max_claims_per_lane` claims
+(2 by default). Nothing is claimed for anyone: `issue offer` stays the only
+transfer path, and the recipient still accepts or declines.
+
+A lane that owes a turn is woken by the state its record holds. A starting,
+working or reclaimed lane is never woken, a blocked one is deferred under its
+cause, an idle one is asked for a turn, and a stopped or dead one is resumed on
+its recorded session. Attempts back off from `inactive_after`, doubling up to
+one hour, and stop after three without progress. A retired or paused lane, and
+one stopped by a host restart, is not woken;
+[Operations](operations.md#availability-reminders-and-waking) has the detail.
 
 ## The forge is selectable per project
 

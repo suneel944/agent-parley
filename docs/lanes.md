@@ -94,13 +94,27 @@ refused: every coordination call and every tool use comes back denied naming the
 operator, and `top` shows `paused`. `stop` tells the lane once, then signals the
 recorded session process exactly as a normal exit does, sends `SIGKILL` to one
 that ignores it, and never signals a process whose recorded identity no longer
-matches. `restart` refuses while a current session is alive and ends a wedged
-one first. It keeps uncommitted work in place, captures the lane's claims into
-recovery checkpoints and names them in the opening task. It replays the
-recorded `init` command and launches the same provider and account as before.
-After a host restart the lane reads as stopped and restarts the same way.
+matches. `restart` refuses while a current session is alive, and ends a wedged
+one first: a live process whose evidence is stale past `inactive_after`, such
+as a client left in a native dialog. It refuses a lane that is off its assigned
+branch. Uncommitted work stays in place; when there is any, the lane's claims
+are captured into recovery checkpoints and named in the opening task, which
+`--task` sets. It replays the recorded `init` command and launches the same
+provider and account as before. After a host restart the lane reads as stopped
+and supervision neither wakes nor resumes it, so `restart` is how it comes
+back.
 None of the four releases a claim: ownership still moves only through an
 explicit release or an accepted handoff, and all four land in the event log.
+
+A lane whose work has landed does not need removing by hand. The service sweeps
+merged lanes that hold no work, and the worktrees lanes made, at most every 900
+seconds. `agent-parley gc` reports the same sweep on demand, `gc --apply`
+removes what it may, and `--force` also removes a lane-made worktree holding
+uncommitted or unpushed work after writing a recovery checkpoint of it. The
+conditions are in [Operations](operations.md#reclaiming-landed-lanes). An
+attached `run` titles its terminal tab with the lane name, its state and its
+claim progress, and `agent-parley title` prints the same line for a native
+status line.
 
 ## Integrating one lane
 
