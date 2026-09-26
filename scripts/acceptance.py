@@ -68,7 +68,10 @@ is watching, and nobody will answer a question you ask.
 Claim, report and release through the `agent-parley` command in your
 shell; the `agent_parley` tools carry mail and reservations only. The
 tasks are not on any forge, so `next_issues` offers nothing: the task
-files are the backlog.
+files are the backlog. Below, `agent-parley` stands for the full command
+the bridge gave you. Spell that command out in full, and run one command
+per shell call with no shell variables, so the permission it was granted
+matches.
 
 Work this loop until the backlog is empty:
 
@@ -95,6 +98,8 @@ PROJECT_PERMISSIONS = (
     "Bash(git commit:*)",
     "Bash(git status:*)",
     "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(ls:*)",
 )
 CONDITION = """# Task {number}
 
