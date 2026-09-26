@@ -5449,8 +5449,9 @@ reported.
         Args:
             repo: Repository for listing, or assigned worktree for mutations.
             action: List, claim, release, offer, accept, decline, cancel,
-                block, unblock, or request. A claim and a takeover request
-                are refused past the project's `max_claims_per_lane`.
+                block, unblock, or request. A claim, an acceptance and a
+                takeover request are refused past the project's
+                `max_claims_per_lane`.
             number: Repository issue number for a mutation.
             to: Handoff recipient.
             summary: Handoff context supplied by the owner.
@@ -5554,7 +5555,7 @@ reported.
                     supervision.configuration(self.home, data)[
                         "max_claims_per_lane"
                     ]
-                    if action in ("claim", "request")
+                    if action in ("claim", "request", "accept")
                     else None
                 ),
             )
@@ -7138,6 +7139,7 @@ reported.
                 "sender": stalled["sender"],
                 "age_seconds": stalled["age_seconds"],
                 "served_age_seconds": stalled["served_age_seconds"],
+                "silent_seconds": stalled["silent_seconds"],
                 "marker": supervision.stall_marker(stalled),
             },
             "operator_edits": list(edited),

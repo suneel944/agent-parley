@@ -201,6 +201,24 @@ def test_a_claim_past_the_cap_is_refused_naming_the_held_claims(bridge, paired):
     assert bridge.issue(lane, "claim", "8")["owner"] == "claude"
 
 
+def test_accepting_an_offer_past_the_cap_is_refused(bridge, paired):
+    directory = busy_with_one_idle_claim(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    codex = Path(paired["lanes"]["codex"])
+    bridge.issue(codex, "claim", "9")
+    offered = bridge.issue(
+        codex, "offer", "9", to="claude", summary="take #9 over"
+    )
+    with pytest.raises(BridgeError, match="max_claims_per_lane is 2"):
+        bridge.issue(lane, "accept", "9", offer_id=offered["offer"]["id"])
+    record = issues.snapshot(directory)["issues"]["9"]
+    assert record["owner"] == "codex"
+    assert record["offer"]["to"] == "claude"
+    bridge.issue(lane, "release", "8")
+    moved = bridge.issue(lane, "accept", "9", offer_id=offered["offer"]["id"])
+    assert moved["owner"] == "claude"
+
+
 def test_a_project_may_raise_the_claim_cap(bridge, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])
