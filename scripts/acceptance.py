@@ -171,7 +171,9 @@ def workspace(path: Path, issues: int) -> None:
 
     Each task writes its own module and test module. A shared file makes
     the first claimant's reservation block every other lane, and a
-    blocked task never counts as completed.
+    blocked task never counts as completed. The project ignores the
+    bytecode and cache that a test run leaves behind, so a lane that ran
+    its tests does not read as a dirty worktree needing an operator.
 
     Args:
         path: Directory the project is created in.
@@ -195,6 +197,7 @@ def workspace(path: Path, issues: int) -> None:
     (path / "tests" / "conftest.py").write_text(
         '"""Tests for the acceptance run tasks."""\n'
     )
+    (path / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n")
     (path / "README.md").write_text(
         "# Acceptance workspace\n\nA throwaway project for an unattended "
         "acceptance run.\n"
