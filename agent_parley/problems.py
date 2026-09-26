@@ -35,6 +35,7 @@ SUPERVISING = "supervision failing"
 STALLED = "stalled"
 INACTIVE = "inactive"
 OVERDUE = "overdue claim"
+OVER_CAP = "claims over cap"
 OFFER = "unanswered offer"
 UNRESOLVED = "unresolved completion"
 ACK = "awaiting acknowledgement"
@@ -271,6 +272,46 @@ def _claim_rows(record: dict, name: str, repo: str, root: str) -> list[dict]:
             root,
             BY_OPERATOR,
             len(overdue),
+        )
+    ]
+
+
+def _cap_rows(
+    record: dict, name: str, repo: str, root: str, cap: int
+) -> list[dict]:
+    """Reports a lane holding more claims than the project's claim cap.
+
+    Every path that moves ownership to a lane refuses it past the cap, but a
+    ledger written before a path was capped, or a cap lowered after claims
+    were taken, can still hold more. Nothing moves them automatically, so the
+    excess is named for the operator to release or offer.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+        cap: The project's `max_claims_per_lane`.
+
+    Returns:
+        One row counting the claims past the cap and naming the newest-numbered
+        of them as the one to release, or no row within the cap.
+    """
+    held = [claim["issue"] for claim in record["claims"]]
+    if len(held) <= cap:
+        return []
+    excess = len(held) - cap
+    return [
+        _row(
+            OVER_CAP,
+            f"holds {len(held)} claims, {excess} past max_claims_per_lane "
+            f"{cap}",
+            f"agent-parley issue release {max(held)} {repo}",
+            None,
+            name,
+            root,
+            BY_OPERATOR,
+            excess,
         )
     ]
 
@@ -574,6 +615,9 @@ def _lane_rows(
             )
         )
     rows.extend(_claim_rows(record, name, repo, root))
+    rows.extend(
+        _cap_rows(record, name, repo, root, config["max_claims_per_lane"])
+    )
     rows.extend(
         _retire_rows(record, name, repo, root, config["orphan_retire_after"])
     )
