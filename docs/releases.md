@@ -274,11 +274,11 @@ creating it does not bump package metadata or authorize a release by itself.
 
 The `Pages` workflow publishes the README and `docs/` to
 <https://suneel944.github.io/agent-parley/> on every push to `main` that
-changes them, and on manual dispatch. `scripts/pages_site.py` stages the
-source: the README becomes the index, each page gets a title and a
-description from its first heading and paragraph, and the site configuration
-sets the canonical address and enables `jekyll-seo-tag` and `jekyll-sitemap`.
-The sitemap is served at `/agent-parley/sitemap.xml`.
+changes them, and on manual dispatch. It builds the repository root with the
+GitHub Pages Jekyll build. The root `_config.yml` makes the README the index,
+gives each page its title and description, sets the canonical address and
+enables `jekyll-seo-tag` and `jekyll-sitemap`. A new page under `docs/` needs
+its own entry there. The sitemap is served at `/agent-parley/sitemap.xml`.
 
 The repository Pages source is set to GitHub Actions. The owner's remaining
 one-time steps are to verify the site in Google Search Console, submit the

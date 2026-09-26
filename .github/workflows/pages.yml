@@ -6,7 +6,7 @@ on:
     paths:
       - README.md
       - docs/**
-      - scripts/pages_site.py
+      - _config.yml
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -23,12 +23,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: Stage the README and docs as the site source
-        run: python3 scripts/pages_site.py site
       - uses: actions/jekyll-build-pages@44a6e6beabd48582f863aeeb6cb2151cc1716697
-        with:
-          source: site
-          destination: _site
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
   deploy:
     needs: build
