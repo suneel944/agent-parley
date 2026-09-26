@@ -469,6 +469,7 @@ class StatusMixin(BridgeCore):
                 "sender": stalled["sender"],
                 "age_seconds": stalled["age_seconds"],
                 "served_age_seconds": stalled["served_age_seconds"],
+                "silent_seconds": stalled["silent_seconds"],
                 "marker": supervision.stall_marker(stalled),
             },
             "operator_edits": list(edited),
