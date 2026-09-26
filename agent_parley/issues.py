@@ -1563,3 +1563,65 @@ def describe(state: dict, liveness: dict[str, str] | None = None) -> str:
                 + " waiting on it"
             )
     return "\n".join(lines) or "No issues claimed."
+
+
+def held_claim(directory: Path, name: str) -> dict:
+    """Names the claim a lane's integration record belongs to.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The issue and claim identifier the lane currently holds, or empty
+        fields when it holds none. A record with no claim is reported as
+        unknown by history rather than being attached to a guessed one.
+    """
+    owned = sorted(
+        (
+            (number, record)
+            for number, record in snapshot(directory)["issues"].items()
+            if record["owner"] == name
+        ),
+        key=lambda item: int(item[0]),
+    )
+    if not owned:
+        return {"issue": None, "claim_id": None}
+    number, record = owned[0]
+    return {"issue": int(number), "claim_id": record.get("claim_id")}
+
+
+def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
+    """Returns one exact owned claim or refuses an ambiguous selection.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        issue: Explicit issue selection, or empty to infer a sole claim.
+
+    Returns:
+        Issue number and claim identifier, or empty fields when no claim is
+        held and none was requested.
+
+    Raises:
+        BridgeError: If the selection is not currently owned or ownership is
+            ambiguous.
+    """
+    owned = {
+        number: record
+        for number, record in snapshot(directory)["issues"].items()
+        if record["owner"] == name
+    }
+    if issue:
+        number = parse_issue(issue)
+        if number not in owned:
+            raise BridgeError(f"Issue #{number} is not owned by {name}.")
+    elif len(owned) > 1:
+        raise BridgeError(
+            f"{name} owns multiple issues; name one with --issue."
+        )
+    elif not owned:
+        return {"issue": None, "claim_id": None}
+    else:
+        number = next(iter(owned))
+    return {"issue": int(number), "claim_id": owned[number].get("claim_id")}

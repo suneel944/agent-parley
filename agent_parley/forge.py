@@ -683,3 +683,30 @@ def comment(repo: Path, number: str, body: str) -> bool:
         )
         is not None
     )
+
+
+def report_comment(summary: str, evidence: str) -> str:
+    """Shapes one lane's ready report for the issue it claims.
+
+    The comment reproduces the lane's own summary and evidence and adds no
+    assessment of its own, so a reader on the forge sees what was reported and
+    what that report is worth. It names neither the participant nor the
+    provider that produced the work: which assistant wrote a change belongs in
+    coordination state, where `top` and `status` read it, and never on the
+    user's forge.
+
+    Args:
+        summary: The lane's account of its result.
+        evidence: The verification evidence the lane recorded.
+
+    Returns:
+        Markdown for the issue comment.
+    """
+    return (
+        "Reported ready for review.\n\n"
+        f"{summary.strip()}\n\n"
+        "Verification recorded by the lane:\n\n"
+        f"{evidence.strip()}\n\n"
+        "A reported state is the participant's own account of its lane. It is "
+        "neither review nor independent verification."
+    )
