@@ -287,5 +287,24 @@ Attach the report to the release it validates:
 gh release upload v<version> <workspace>/acceptance/report.md
 ```
 
+A minor or major release also reads the run's numbers from
+`docs/acceptance/X.Y.Z.json`. `record` writes that file from the finished
+verdict, with a link to the uploaded report:
+
+```sh
+uv run --locked python -m scripts.acceptance record \
+  --home <home> --workspace <workspace> --version <version> \
+  --run <report-url>
+```
+
+The record holds the lane count, the issues the lanes claimed, how many of
+those reported ready, the idle lane-minutes the lanes' event logs measure
+over the period, and the claim-minutes nothing accounted for. A claim's
+minute is accounted for when its owner reads as active or the problems
+view names the owner or a service or store fault, the same rule the
+fault-injection suite applies. The release refuses the record unless every
+claim reported ready, so a run with a blocked issue cannot validate a
+release.
+
 Keep the frames with the report when a condition failed. The report says
 which condition failed; only the frames say when it started failing.

@@ -13,6 +13,8 @@ One command starts it::
 
 ``rehearse`` seeds, registers and samples the same estate once without
 starting a lane, so a run can be checked before it spends model quota.
+``record`` turns a finished run's verdict into the live acceptance record
+``docs/acceptance/X.Y.Z.json`` that a minor or major release requires.
 
 The run writes a frame every interval to ``frames.jsonl`` under its
 workspace, and a Markdown report next to it when the period ends. The
@@ -38,9 +40,12 @@ import termios
 import time
 from pathlib import Path
 
+from agent_parley import metrics, problems, supervision
+
 BACKLOG = 20
 HOURS = 24.0
 ROOT = Path("~/.local/state/parley-acceptance")
+RECORDS = Path(__file__).resolve().parents[1] / "docs" / "acceptance"
 IDENTITY = ("Acceptance run", "acceptance@localhost")
 INTERVAL = 300.0
 SETTLE = 20.0
@@ -784,6 +789,103 @@ def _stale_leases(taken: list[dict]) -> list[str]:
     return sorted(found)
 
 
+def measure(
+    home: Path,
+    repo: Path,
+    lanes: list[str],
+    endings: dict,
+    taken: list[dict],
+) -> dict:
+    """Measures the numbers the live acceptance record carries.
+
+    Args:
+        home: Private state directory the estate runs under.
+        repo: Throwaway project the lanes coordinate over.
+        lanes: Lane specifications as ``name:provider[:credentials]``.
+        endings: Each backlog issue's last recorded report.
+        taken: Frames the run recorded.
+
+    Returns:
+        The lane count, the issues any lane claimed, how many of those
+        reported ready, the idle lane-minutes the lanes' event logs measure
+        over the period, and the claim-minutes nothing accounted for.
+
+    A claim's minute is accounted for when its owner reads as active or
+    the problems view names the owner or a service or store fault, which
+    is the rule the fault-injection suite applies. Each frame stands for
+    the time until the next one, so the last frame adds nothing.
+    """
+    claimed = {number for number, ending in endings.items() if ending["state"]}
+    unaccounted = 0.0
+    for index, record in enumerate(taken):
+        gap = (
+            float(taken[index + 1].get("at", 0) or 0)
+            - float(record.get("at", 0) or 0)
+            if index + 1 < len(taken)
+            else 0.0
+        )
+        rows = [
+            row
+            for row in (record.get("problems") or {}).get("problems") or []
+            if row.get("project") == str(repo)
+        ]
+        faulted = any(
+            row.get("condition") in {problems.SERVICE, problems.STORE}
+            for row in rows
+        )
+        named = {row.get("participant") for row in rows}
+        for lane in (record.get("status") or {}).get("participants") or []:
+            claims = [str(claim["issue"]) for claim in lane.get("claims") or []]
+            claimed.update(claims)
+            state = (lane.get("availability") or {}).get("state")
+            if (
+                claims
+                and not faulted
+                and state != supervision.ACTIVE
+                and lane.get("participant") not in named
+            ):
+                unaccounted += gap * len(claims)
+    directory = _directory(home, repo)
+    idle = 0
+    if taken and directory != home:
+        idle = sum(
+            metrics.idle_intervals(
+                directory,
+                _lane(lane)[0],
+                since=float(taken[0].get("at", 0) or 0),
+                now=float(taken[-1].get("at", 0) or 0),
+            )["seconds"]
+            for lane in lanes
+        )
+    return {
+        "lanes": len(lanes),
+        "claims": len(claimed),
+        "claims_completed": sum(
+            1
+            for number in claimed
+            if endings.get(number, {}).get("state") == "ready"
+        ),
+        "idle_lane_minutes": round(idle / 60, 1),
+        "unaccountable_claim_minutes": round(unaccounted / 60, 1),
+    }
+
+
+def acceptance_record(decided: dict, version: str, run: str) -> dict:
+    """Builds the live acceptance record a release reads.
+
+    Args:
+        decided: The verdict a finished run produced.
+        version: Version the run validates.
+        run: Link to the run's published report.
+
+    Returns:
+        The record ``scripts.release_publish`` checks, holding the version,
+        the report link and the measured numbers exactly as the run took
+        them.
+    """
+    return {"version": version, "run": run, **decided["measured"]}
+
+
 def verdict(
     cli: str,
     home: Path,
@@ -888,6 +990,7 @@ def verdict(
         "lanes": counters,
         "endings": endings,
         "frames": len(taken),
+        "measured": measure(home, repo, lanes, endings, taken),
     }
 
 
@@ -961,7 +1064,9 @@ def main(argv: list[str] | None = None) -> int:
         Zero when the run passed every condition, one when it did not.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("run", "verdict", "rehearse"))
+    parser.add_argument(
+        "command", choices=("run", "verdict", "rehearse", "record")
+    )
     parser.add_argument("--home", default=os.environ.get("AGENT_PARLEY_HOME"))
     parser.add_argument("--workspace", default="")
     parser.add_argument(
@@ -972,7 +1077,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--issues", type=int, default=BACKLOG)
     parser.add_argument("--lane", action="append", default=[])
     parser.add_argument("--trust", action="store_true")
+    parser.add_argument("--version", default="")
+    parser.add_argument("--run", default="")
     arguments = parser.parse_args(argv)
+    if arguments.command == "record":
+        if not (arguments.workspace and arguments.version and arguments.run):
+            parser.error("record needs --workspace, --version and --run")
+        decided = _read(
+            Path(arguments.workspace).expanduser()
+            / "acceptance"
+            / "verdict.json"
+        )
+        if "measured" not in decided:
+            parser.error("the workspace holds no finished verdict")
+        path = RECORDS / f"{arguments.version}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                acceptance_record(decided, arguments.version, arguments.run),
+                indent=2,
+            )
+            + "\n"
+        )
+        sys.stdout.write(f"{path}\n")
+        return 0
     if not arguments.home:
         parser.error("--home or AGENT_PARLEY_HOME is required")
     home = Path(arguments.home).expanduser()
