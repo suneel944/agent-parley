@@ -35,6 +35,12 @@ def deadline_state(record: dict, now: float = 0.0) -> dict:
     runtime gains no scheduler and a stopped service produces no phantom
     transitions.
 
+    A claim whose current generation reported ready, or was verified
+    complete, has no work left for its holder to do: it waits on
+    verification and integration, which the deadline does not measure, so
+    it never reads overdue. A ready report from an earlier generation does
+    not count, because the claim it described is gone.
+
     Args:
         record: Published ledger record for one issue.
         now: Instant to evaluate against; the current time when zero.
@@ -46,7 +52,16 @@ def deadline_state(record: dict, now: float = 0.0) -> dict:
     """
     stamp = now or time.time()
     deadline = record.get("deadline")
-    over = int(stamp - deadline) if deadline and stamp > deadline else 0
+    execution = lifecycle.state(record)
+    delivered = execution["state"] in (
+        lifecycle.READY,
+        lifecycle.COMPLETE,
+    ) and execution["claim_id"] == record.get("claim_id")
+    over = (
+        int(stamp - deadline)
+        if deadline and stamp > deadline and not delivered
+        else 0
+    )
     budget = record.get("budget")
     attempts = int(record.get("attempts", 0) or 0)
     return {
@@ -1028,9 +1043,12 @@ def _change(
             owner and the reason the marker gave.
         takeover: Revalidated owner generation and durable checkpoint for an
             orphan take.
-        cap: Most claims one lane may hold at once. A claim of a new issue
-            and a takeover request past it are refused, naming the claims
-            the lane holds and how long each has gone without progress.
+        cap: Most claims one lane may hold at once. A claim of a new issue,
+            the acceptance of an offer and a takeover request past it are
+            refused, naming the claims the lane holds and how long each has
+            gone without progress. Acceptance moves ownership exactly as a
+            claim does, so an uncapped acceptance let a lane collect claims
+            past the cap one offer at a time.
 
     A transition that ends an ownership generation, by releasing it, by
     handing it to another lane, by taking it from an orphaned owner or by the
@@ -1166,6 +1184,7 @@ def _change(
                         "Only the named recipient can answer this handoff."
                     )
                 if action == "accept":
+                    _within_cap(state["issues"], agent, cap)
                     expected = (
                         within if within is not None else budgets.get("claim")
                     )

@@ -12,6 +12,7 @@ from agent_parley import (
     cli,
     dashboard,
     issues,
+    lifecycle,
     roster,
     store,
     supervision,
@@ -179,6 +180,30 @@ def test_an_overdue_claim_is_visible_and_still_owned(bridge, repo, paired):
     }
     assert rows["claude"]["issues"] == "#42!"
     assert rows["claude"]["overdue"] == ["42"]
+
+
+def test_a_claim_reported_ready_is_never_overdue(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "42", within=60)
+    age_claim(directory, "42", 300)
+    lifecycle.record_report(
+        directory, "claude", "ready", "abcdef1", "", issue="42"
+    )
+    record = ledger(directory)["42"]
+    timing = issues.deadline_state(record)
+    assert timing["overdue"] is False
+    assert timing["overdue_seconds"] == 0
+    assert record["owner"] == "claude"
+    rows = {
+        row["participant"]: row
+        for row in dashboard.collect(bridge.home, False, {})["projects"][0][
+            "rows"
+        ]
+    }
+    assert rows["claude"]["issues"] == "#42"
+    record["execution"]["claim_id"] = "an-earlier-generation"
+    assert issues.deadline_state(record)["overdue"] is True
 
 
 def test_a_blocked_report_spends_one_attempt(bridge, repo, paired):
