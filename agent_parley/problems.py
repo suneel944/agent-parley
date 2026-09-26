@@ -499,8 +499,12 @@ def _lane_rows(
         reported with the lanes it refused and how long it has been quiet,
         because the refused lane saw the refusal and nobody else did. A
         second client sending hooks under the lane's identity is named with
-        its process while it lasts, because its events are ignored. A lane
-        that retired reports only the worktree it kept,
+        its process while it lasts, because its events are ignored. A quiet
+        lane is inactive only while it owes work, meaning a claim it has not
+        delivered, or while something recorded keeps it from its next turn.
+        A lane that delivered everything it holds is at rest, and waking it
+        spends a turn on nothing. A lane that retired reports only the
+        worktree it kept,
         because its quiet is the state the operator asked for and every
         other remedy here would wake a lane that has given its work back.
     """
@@ -601,7 +605,14 @@ def _lane_rows(
                 actor,
             )
         )
-    elif quiet and availability["process_alive"]:
+    elif (
+        quiet
+        and availability["process_alive"]
+        and (
+            _blocked(record)
+            or any(not claim.get("delivered") for claim in record["claims"])
+        )
+    ):
         command, actor = _remedy(name, repo, record, waking)
         rows.append(
             _row(

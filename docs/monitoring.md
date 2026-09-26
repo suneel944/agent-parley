@@ -320,6 +320,11 @@ branch drifted or whose worktree is dirty with no recent activity, a lane over
 its advisory budget, a lane holding more claims than `max_claims_per_lane`, a
 store schema behind the code, and a service that is down.
 
+A quiet lane counts as inactive only while it owes work: it holds a claim that
+has not reported ready or been verified complete, or it is paused, held by a
+prompt or stopped answering wakes. A lane that delivered everything it holds is
+at rest, and `problems` does not list it.
+
 Retiring a lane supersedes the shares it still owed an acknowledgement, so
 they never bounce. `problems` names that once per retired lane under `shares
 to a retired lane`, for example `3 shares to codex superseded: codex retired`.

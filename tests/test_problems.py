@@ -250,11 +250,24 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     bridge, repo, paired, served
 ):
     alive(bridge.project(repo)[1], "claude")
+    bridge.issue(paired["lanes"]["claude"], "claim", "42")
     [row] = rows(bridge, problems.INACTIVE)
     assert row["participant"] == "claude"
     assert row["actor"] == problems.BY_SERVICE
     assert row["command"].startswith("the coordination service wakes claude")
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_a_quiet_lane_owing_no_work_is_at_rest(
+    bridge, repo, paired, served, claimed
+):
+    alive(bridge.project(repo)[1], "claude")
+    if claimed:
+        lane = paired["lanes"]["claude"]
+        bridge.issue(lane, "claim", "42")
+        bridge.report(lane, "ready", "Task done.", "", "make check")
+    assert not rows(bridge, problems.INACTIVE)
 
 
 def test_an_idle_lane_holding_a_refused_key_names_the_refused_lane(
@@ -686,6 +699,7 @@ def test_rows_are_ordered_longest_held_first_behind_the_store_and_service(
     alive(directory, "claude")
     alive(directory, "codex", updated=time.time() - 400)
     bridge.issue(paired["lanes"]["claude"], "claim", "42", within=60)
+    bridge.issue(paired["lanes"]["codex"], "claim", "43")
     state = issues.snapshot(directory)
     state["issues"]["42"]["deadline"] = time.time() - 900
     state["revision"] += 1
@@ -712,6 +726,7 @@ def test_the_json_document_carries_every_row(
     bridge, repo, paired, monkeypatch, capsys
 ):
     alive(bridge.project(repo)[1], "claude")
+    bridge.issue(paired["lanes"]["claude"], "claim", "42")
     code, out = run(monkeypatch, capsys, bridge, "--json")
     assert code == 1
     document = json.loads(out)
@@ -740,6 +755,7 @@ def test_every_printed_row_names_the_lane_the_age_and_the_command(
 ):
     unwoken(bridge)
     alive(bridge.project(repo)[1], "claude")
+    bridge.issue(paired["lanes"]["claude"], "claim", "42")
     code, out = run(monkeypatch, capsys, bridge)
     assert code == 1
     [line] = out.splitlines()
@@ -753,6 +769,7 @@ def test_the_report_closes_by_counting_what_the_service_is_handling(
     bridge, repo, paired, served, monkeypatch, capsys
 ):
     alive(bridge.project(repo)[1], "claude")
+    bridge.issue(paired["lanes"]["claude"], "claim", "42")
     code, out = run(monkeypatch, capsys, bridge)
     assert code == 1
     printed = out.splitlines()

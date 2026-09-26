@@ -435,6 +435,7 @@ class StatusMixin(BridgeCore):
             "claims": [
                 {
                     "issue": int(number),
+                    "delivered": issues.delivered(record),
                     **deadline_state(record),
                     "deadline_at": views.timestamp(
                         deadline_state(record)["deadline"]
