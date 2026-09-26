@@ -20,13 +20,22 @@ if command[0] == "issue" and command[1] == "show":
     print(
         json.dumps(
             {{
-                "history": [
-                    {{
-                        "action": "report",
-                        "participant": "claude",
-                        "detail": {{"state": "ready", "summary": "done"}},
-                    }}
-                ]
+                "history": {{
+                    "records": [
+                        {{
+                            "kind": "claim",
+                            "action": "claim",
+                            "participant": "claude",
+                            "detail": "claim #1",
+                        }},
+                        {{
+                            "kind": "report",
+                            "action": "ready",
+                            "participant": "claude",
+                            "detail": "reported ready",
+                        }},
+                    ]
+                }}
             }}
         )
     )

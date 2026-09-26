@@ -101,6 +101,7 @@ PROJECT_PERMISSIONS = (
     "Bash(git log:*)",
     "Bash(ls:*)",
 )
+ENDINGS = frozenset({"ready", "blocked", "partial"})
 CONDITION = """# Task {number}
 
 Add a function `{name}` to `library.py` that {behaviour}, and a test for
@@ -681,22 +682,23 @@ def _reports(cli: str, home: Path, repo: Path, issues: int) -> dict:
 
     Returns:
         Each issue number mapped to the last report recorded on it and
-        the reason that report carried. An issue nobody reported on maps
-        to an empty state, which is what fails the run.
+        the transition the history names for it. A release after a
+        blocked report leaves the report as the ending. An issue nobody
+        reported on maps to an empty state, which is what fails the run.
     """
     endings: dict[str, dict] = {}
     for number in range(1, issues + 1):
         document = _document(
             cli, home, ["issue", "show", str(number), "--repo", str(repo)]
         )
-        history = document.get("history") or []
+        history = document.get("history") or {}
         ending = {"state": "", "reason": "", "owner": ""}
-        for event in history:
+        for event in history.get("records") or []:
             action = str(event.get("action", ""))
-            if action in ("report", "bounce", "release"):
+            if event.get("kind") == "report" and action in ENDINGS:
                 ending = {
-                    "state": str(event.get("detail", {}).get("state", action)),
-                    "reason": str(event.get("detail", {}).get("summary", "")),
+                    "state": action,
+                    "reason": str(event.get("detail", "")),
                     "owner": str(event.get("participant", "")),
                 }
         endings[str(number)] = ending
