@@ -1,6 +1,7 @@
 """Checks that completion reminders follow the current claim, not a branch."""
 
 import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -146,3 +147,163 @@ def test_the_claim_generation_starts_at_the_latest_claim_or_handoff():
         )
         == 9.0
     )
+
+
+def closing(monkeypatch, reading):
+    """Reports one fixed issue reading to the supervisor."""
+    monkeypatch.setattr(
+        supervision.forge, "issue_completion", lambda *args: reading
+    )
+
+
+def closed_by(branch, state="MERGED", at=None):
+    """Builds a closed-issue reading naming its closing pull request."""
+    return {
+        "state": state,
+        "closed_at": time.time() + 1 if at is None else at,
+        "pull_request": 1328,
+        "url": "https://example.invalid/pull/1328",
+        "branch": branch,
+        "commit": "abcdef1234567",
+    }
+
+
+def test_an_issue_closed_from_a_non_lane_branch_is_observed_complete(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by("refactor/1-replay-package"))
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    assert ended["1"]["branch"] == "refactor/1-replay-package"
+    assert ended["1"]["pull_request"] == 1328
+    assert ended["1"]["commit"] == "abcdef1234567"
+    supervision.poll(bridge.home, claimed.parent)
+    assert prompt(claimed)["trigger"] == "pull request ended"
+    assert issues.snapshot(claimed.parent)["issues"]["1"]["owner"] == "claude"
+
+
+def test_an_issue_closed_before_the_claim_is_not_observed_complete(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by("refactor/1", at=time.time() - HOUR))
+    supervision.poll(bridge.home, claimed.parent)
+    assert prompt(claimed) is None
+
+
+def test_a_lane_branch_merge_does_not_mark_an_open_issue(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, "MERGED", time.time() + 1)
+    closing(monkeypatch, {"state": "OPEN"})
+    supervision.poll(bridge.home, claimed.parent)
+    assert prompt(claimed) is None
+
+
+def test_an_unreachable_forge_leaves_the_claim_unchanged(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, None)
+    before = issues.snapshot(claimed.parent)["issues"]["1"]
+    supervision.poll(bridge.home, claimed.parent)
+    assert issues.snapshot(claimed.parent)["issues"]["1"] == before
+
+
+def test_a_peer_lane_that_landed_the_claim_is_named_to_the_owner(
+    bridge, claimed, monkeypatch
+):
+    peer = supervision.roster.read(claimed.parent)["participants"]["codex"]
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by(peer["branch"]))
+    supervision.poll(bridge.home, claimed.parent)
+    assert "codex landed the pull request" in prompt(claimed)["text"]
+
+
+def test_a_per_issue_branch_is_attributed_to_the_lane_that_checked_it_out(
+    bridge, claimed, monkeypatch
+):
+    peer = supervision.roster.read(claimed.parent)["participants"]["codex"]
+    for step in (["-b", "codex/1-fix"], [peer["branch"]]):
+        subprocess.run(
+            ["git", "-C", peer["lane"], "checkout", "-q", *step],
+            check=True,
+        )
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by("codex/1-fix"))
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    assert ended["1"]["landed_by"] == "codex"
+    supervision.poll(bridge.home, claimed.parent)
+    assert "codex landed the pull request" in prompt(claimed)["text"]
+
+
+def test_a_branch_no_lane_checked_out_is_attributed_to_nobody(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, None, 0.0)
+    closing(monkeypatch, closed_by("elsewhere/1"))
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    assert "landed_by" not in ended["1"]
+
+
+def test_the_issue_reading_names_its_closing_pull_request(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    replies = {
+        "issue": {
+            "state": "CLOSED",
+            "closedAt": "2026-09-20T00:00:00Z",
+            "closedByPullRequestsReferences": [{"number": 1328}],
+        },
+        "pr": {
+            "state": "MERGED",
+            "number": 1328,
+            "url": "https://example.invalid/pull/1328",
+            "headRefName": "refactor/1216-replay",
+            "mergeCommit": {"oid": "abcdef1234567"},
+        },
+    }
+    monkeypatch.setattr(
+        forge, "_run", lambda args, timeout: json.dumps(replies[args[1]])
+    )
+    reading = forge.issue_completion(tmp_path, "1216")
+    assert reading == {
+        "state": "MERGED",
+        "closed_at": forge._epoch("2026-09-20T00:00:00Z"),
+        "pull_request": 1328,
+        "url": "https://example.invalid/pull/1328",
+        "branch": "refactor/1216-replay",
+        "commit": "abcdef1234567",
+    }
+    replies["issue"] = {"state": "OPEN"}
+    assert forge.issue_completion(tmp_path, "1216") == {"state": "OPEN"}
+    monkeypatch.setattr(forge, "_run", lambda *args: None)
+    assert forge.issue_completion(tmp_path, "1216") is None
+
+
+def test_a_ready_report_on_an_observed_complete_claim_asks_for_completion(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, "MERGED", time.time() + 1)
+    supervision.poll(bridge.home, claimed.parent)
+    owed = bridge.report(claimed, "ready", "Parser built", "", "make check")
+    assert owed.startswith("Issue #1 is observed complete")
+    assert "`issue resolve 1`" in owed
+
+
+def test_a_ready_report_on_an_open_claim_owes_nothing(
+    bridge, claimed, monkeypatch
+):
+    completion(monkeypatch, "OPEN", time.time() + 1)
+    supervision.poll(bridge.home, claimed.parent)
+    assert bridge.report(claimed, "ready", "Parser built", "", "ok") == ""

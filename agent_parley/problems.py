@@ -19,27 +19,38 @@ files it holds, because retiring the lane would drop its claims to clean one
 directory.
 """
 
+import contextlib
 import datetime
 import json
+import sqlite3
 import time
 from pathlib import Path
 
 from agent_parley import dialogs, issues, roster, store, supervision, tables
+from agent_parley.state import BridgeError
 
 STORE = "store"
 SERVICE = "service"
+SUPERVISING = "supervision failing"
 STALLED = "stalled"
 INACTIVE = "inactive"
 OVERDUE = "overdue claim"
+OVER_CAP = "claims over cap"
 OFFER = "unanswered offer"
 UNRESOLVED = "unresolved completion"
 ACK = "awaiting acknowledgement"
 BOUNCE = "bounced share"
+RETIRED = "shares to a retired lane"
+RETIRED_WINDOW = 86400
 DRIFT = "branch drift"
 DIRTY = "dirty worktree"
 BUDGET = "over budget"
 WAKE = "wake attention"
 APPROVAL = "waiting on approval"
+HELD = "held by a native dialog"
+READY = "ready to retire"
+HOLDING = "holding a refused key"
+FOREIGN = "second session"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -265,6 +276,92 @@ def _claim_rows(record: dict, name: str, repo: str, root: str) -> list[dict]:
     ]
 
 
+def _cap_rows(
+    record: dict, name: str, repo: str, root: str, cap: int
+) -> list[dict]:
+    """Reports a lane holding more claims than the project's claim cap.
+
+    Every path that moves ownership to a lane refuses it past the cap, but a
+    ledger written before a path was capped, or a cap lowered after claims
+    were taken, can still hold more. Nothing moves them automatically, so the
+    excess is named for the operator to release or offer.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+        cap: The project's `max_claims_per_lane`.
+
+    Returns:
+        One row counting the claims past the cap and naming the newest-numbered
+        of them as the one to release, or no row within the cap.
+    """
+    held = [claim["issue"] for claim in record["claims"]]
+    if len(held) <= cap:
+        return []
+    excess = len(held) - cap
+    return [
+        _row(
+            OVER_CAP,
+            f"holds {len(held)} claims, {excess} past max_claims_per_lane "
+            f"{cap}",
+            f"agent-parley issue release {max(held)} {repo}",
+            None,
+            name,
+            root,
+            BY_OPERATOR,
+            excess,
+        )
+    ]
+
+
+def _retire_rows(
+    record: dict, name: str, repo: str, root: str, ceiling: float
+) -> list[dict]:
+    """Reports once that a lane holding only orphaned claims may retire.
+
+    A lane whose session died keeps its claims, and the supervisor marks
+    them orphaned so a peer can take them. A marker that has stood past the
+    ceiling means nobody took them and the lane did not return, so the
+    lane is ready to retire. The row only names the command: the sweep
+    never releases held work on its own.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+        ceiling: Seconds an orphan marker stands before the row appears.
+
+    Returns:
+        One row naming the orphaned claims and the age of the oldest
+        marker, or no row while the lane holds any claim not orphaned or
+        every marker is younger than the ceiling.
+    """
+    claims = record["claims"]
+    if not claims or not all(claim.get("orphaned") for claim in claims):
+        return []
+    oldest = max(
+        int(claim.get("orphan_recorded_seconds") or 0) for claim in claims
+    )
+    if oldest <= ceiling:
+        return []
+    numbers = ", ".join(f"#{claim['issue']}" for claim in claims)
+    return [
+        _row(
+            READY,
+            f"orphaned claims {numbers} stood unclaimed past the ceiling",
+            f"agent-parley participant retire {name} {repo}",
+            oldest,
+            name,
+            root,
+            BY_OPERATOR,
+            len(claims),
+        )
+    ]
+
+
 def _unresolved_rows(
     record: dict, name: str, repo: str, root: str, now: float
 ) -> list[dict]:
@@ -395,10 +492,17 @@ def _lane_rows(
         oldest, so a broadcast costs one row per lane rather than one per
         message it created. A native approval prompt is reported once it has
         stood unanswered past the same bound an unacknowledged message uses,
-        because a prompt the operator is about to answer needs no row. A lane
-        that retired reports only the worktree it kept, because its quiet is
-        the state the operator asked for and every other remedy here would
-        wake a lane that has given its work back.
+        because a prompt the operator is about to answer needs no row. A
+        native dialog the launcher escalated is reported at once by name,
+        with the options it offers, because nothing will answer it but the
+        operator. A quiet lane that refused a peer a key it still holds is
+        reported with the lanes it refused and how long it has been quiet,
+        because the refused lane saw the refusal and nobody else did. A
+        second client sending hooks under the lane's identity is named with
+        its process while it lasts, because its events are ignored. A lane
+        that retired reports only the worktree it kept,
+        because its quiet is the state the operator asked for and every
+        other remedy here would wake a lane that has given its work back.
     """
     name = record["participant"]
     repo = f"--repo {root}"
@@ -452,6 +556,38 @@ def _lane_rows(
                     root,
                 )
             )
+    elif held.get("escalated"):
+        shown = str(held.get("label", "")) or "a native prompt"
+        offered = [str(item) for item in held.get("options") or []]
+        if offered:
+            shown = f"{shown} ({'; '.join(offered)})"
+        at = held.get("at")
+        rows.append(
+            _row(
+                HELD,
+                f"the client is held by {shown}",
+                f"answer the prompt in {name}'s terminal",
+                (
+                    max(0, int(now - float(at)))
+                    if isinstance(at, (int, float))
+                    else None
+                ),
+                name,
+                root,
+            )
+        )
+    if foreign := record.get("foreign_session"):
+        rows.append(
+            _row(
+                FOREIGN,
+                f"session {foreign['session_id'] or 'unnamed'} (pid "
+                f"{foreign['pid']}) sends hooks as this lane and is ignored",
+                f"stop that process, or run it outside {name}'s worktree",
+                foreign.get("age_seconds"),
+                name,
+                root,
+            )
+        )
     if idle["stalled"]:
         command, actor = _remedy(name, repo, record, waking)
         rows.append(
@@ -479,8 +615,29 @@ def _lane_rows(
             )
         )
     rows.extend(_claim_rows(record, name, repo, root))
+    rows.extend(
+        _cap_rows(record, name, repo, root, config["max_claims_per_lane"])
+    )
+    rows.extend(
+        _retire_rows(record, name, repo, root, config["orphan_retire_after"])
+    )
     rows.extend(_unresolved_rows(record, name, repo, root, now))
     rows.extend(_ack_rows(record, name, repo, root, ack_after, waking))
+    refused = (record.get("mail") or {}).get("refused") or []
+    if quiet and refused:
+        command, actor = _remedy(name, repo, record, waking)
+        rows.append(
+            _row(
+                HOLDING,
+                f"idle while holding a key refused to {_listed(refused)}",
+                command,
+                availability["age_seconds"],
+                name,
+                root,
+                actor,
+                len(refused),
+            )
+        )
     if record["drift"]:
         rows.append(
             _row(
@@ -636,6 +793,52 @@ def _bounce_rows(
     return rows
 
 
+def _retired_rows(home: Path, project: dict) -> list[dict]:
+    """Derives one row per retired lane whose shares retirement superseded.
+
+    Retirement supersedes every delivery the lane still owed, so those
+    shares never bounce; this row says once where they went instead of
+    letting them vanish. It is informational: the shares cannot be answered
+    and nothing moves them back. It lasts only while those shares are inside
+    their acknowledgement deadline, the same bound a bounced share has, and a
+    share recorded without a deadline counts for `RETIRED_WINDOW` seconds
+    after retirement, one day, long enough for an operator returning the
+    next session to read it.
+
+    Args:
+        home: Private bridge state root.
+        project: One project's status reading.
+
+    Returns:
+        Zero or more rows, one per retired lane, carrying the share count.
+    """
+    groups: list[dict] = []
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        groups = store.superseded_shares(home, project["root"], RETIRED_WINDOW)
+    rows = []
+    for group in groups:
+        reason = group["reason"]
+        if not reason.endswith(" retired"):
+            continue
+        name = reason.removesuffix(" retired")
+        count = group["count"]
+        noun = "share" if count == 1 else "shares"
+        rows.append(
+            _row(
+                RETIRED,
+                f"{count} {noun} to {name} superseded: {reason}",
+                "nothing to run; the row clears when those shares' "
+                "acknowledgement deadlines pass",
+                group["waiting_seconds"],
+                name,
+                project["root"],
+                BY_OPERATOR,
+                count,
+            )
+        )
+    return rows
+
+
 def derive(
     home: Path, report: dict, ack_after: float = 0.0, now: float = 0.0
 ) -> list[dict]:
@@ -674,6 +877,17 @@ def derive(
     aged: list[dict] = []
     for project in report["projects"]:
         directory, data = manifests[project["root"]]
+        if failing := issues.supervision_error(directory):
+            rows.append(
+                _row(
+                    SUPERVISING,
+                    f"supervision poll failing; last: {failing['detail']}",
+                    "read server.log in the state directory and fix the "
+                    "stage it names; the next clean poll clears this row",
+                    max(int(stamp - failing["since"]), 0),
+                    project=project["root"],
+                )
+            )
         config = supervision.configuration(home, data)
         after = ack_after or config["stalled_after"]
         for record in project["participants"]:
@@ -689,6 +903,7 @@ def derive(
             )
         aged.extend(_offer_rows(project, stamp))
         aged.extend(_bounce_rows(home, directory, data, project, config))
+        aged.extend(_retired_rows(home, project))
     aged.sort(key=lambda row: -(row["seconds"] or 0))
     return rows + aged
 

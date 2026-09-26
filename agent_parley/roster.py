@@ -62,6 +62,7 @@ RESERVED = frozenset(
 LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
 MAX_VERIFY_ARGUMENTS = 64
+MAX_STANDING_REPLY = 500
 MANIFEST_VERSION = 2
 APPROVAL_STEPS = ("merge", "pr")
 PROVIDERS = "providers.json"
@@ -309,8 +310,9 @@ def deadlines(value: dict) -> dict:
 
     A default is inherited by a claim, an offer or an acknowledgement that
     passes no explicit window, so lanes carry a budget without repeating a
-    flag. A deadline never transfers ownership: it only makes an overdue
-    claim, offer or acknowledgement say so.
+    flag. A deadline makes an overdue claim, offer or acknowledgement say
+    so; only the supervisor's overdue transition, which acts when the holder
+    has stopped working, moves an overdue claim.
 
     Args:
         value: Defaults recorded in the project manifest.
@@ -979,6 +981,10 @@ def normalize(manifest: dict) -> dict:
             participant["approve_bridge_tools"] = approval_opt_in(
                 participant["approve_bridge_tools"]
             )
+        if "answer_questions" in participant:
+            participant["answer_questions"] = standing_reply(
+                participant["answer_questions"]
+            )
         if type(participant.get("retired", 0.0)) not in (int, float):
             raise BridgeError(
                 "Participant retirement must be recorded as a time."
@@ -997,6 +1003,10 @@ def normalize(manifest: dict) -> dict:
     if "approve_bridge_tools" in project:
         project["approve_bridge_tools"] = approval_opt_in(
             project["approve_bridge_tools"]
+        )
+    if "answer_questions" in project:
+        project["answer_questions"] = standing_reply(
+            project["answer_questions"]
         )
     return {
         "version": MANIFEST_VERSION,
@@ -1068,6 +1078,36 @@ def approval_opt_in(value: object) -> bool:
     if type(value) is not bool:
         raise BridgeError("The approve_bridge_tools setting must be a boolean.")
     return value
+
+
+def standing_reply(value: object) -> str:
+    """Validates the reply an operator recorded for a lane's questions.
+
+    The reply is typed into the client's question picker as free text, so it
+    is refused when it carries a control character that could submit early,
+    cancel the picker or drive the terminal, and when it is too long to read
+    as one answer.
+
+    Args:
+        value: Recorded reply for a project or one of its lanes.
+
+    Returns:
+        The reply with surrounding whitespace removed.
+
+    Raises:
+        BridgeError: If the value is not bounded printable text.
+    """
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > MAX_STANDING_REPLY
+        or not value.isprintable()
+    ):
+        raise BridgeError(
+            "The answer_questions setting must be one line of printable text "
+            f"of at most {MAX_STANDING_REPLY} characters."
+        )
+    return value.strip()
 
 
 def forge_choice(value: object) -> str | None:

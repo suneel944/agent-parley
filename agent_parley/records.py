@@ -27,6 +27,7 @@ from agent_parley import roster
 from agent_parley.state import BridgeError
 
 MAX_READ = 1 << 20
+USAGE_MARK = b'usage"'
 MAX_META = 1 << 16
 CODEX_DAYS = 2
 CODEX_CANDIDATES = 16
@@ -558,6 +559,10 @@ def _advance(path: Path, fold: Fold, reading: dict) -> dict:
     that grew by more than the budget catches up over later refreshes. A
     replaced or truncated file starts a new reading.
 
+    Every adapter folds only records carrying a usage object, whose key ends
+    in ``USAGE_MARK``, so a line without those bytes is skipped unparsed.
+    Most transcript lines are prompts and tool output with no usage at all.
+
     Args:
         path: Session record file.
         fold: Adapter-specific accumulator for one parsed record.
@@ -589,6 +594,8 @@ def _advance(path: Path, fold: Fold, reading: dict) -> dict:
         return reading
     reading["offset"] += end + 1
     for line in chunk[:end].split(b"\n"):
+        if USAGE_MARK not in line:
+            continue
         try:
             record = json.loads(line)
         except ValueError:

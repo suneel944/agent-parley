@@ -103,6 +103,68 @@ def readme_link_errors(root: Path) -> list[str]:
     return errors
 
 
+def duplicate_paragraph_errors(root: Path) -> list[str]:
+    """Checks tracked Markdown for a prose paragraph repeated verbatim.
+
+    A merge that re-applies the same edit at a different offset can leave a
+    paragraph duplicated without any tool noticing, since neither the diff
+    nor a line-count check sees the repeat. Code fences, table rows, heading
+    lines and short paragraphs are exempt so that legitimate short repeated
+    notes do not trip the check.
+
+    Args:
+        root: Repository root holding README.md and the docs tree.
+
+    Returns:
+        One message per paragraph that recurs within the same file, naming
+        the file, both starting lines and the paragraph's first words.
+    """
+    errors = []
+    paths = [root / "README.md", *sorted((root / "docs").glob("**/*.md"))]
+    for path in paths:
+        if not path.is_file() or path.name == "CHANGELOG.md":
+            continue
+        current: list[str] = []
+        start = 0
+        in_fence = False
+        paragraphs: list[tuple[int, str]] = []
+        for line_number, line in enumerate(path.read_text().splitlines(), 1):
+            if line.strip().startswith("```"):
+                if current:
+                    paragraphs.append((start, " ".join(current)))
+                    current = []
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            if not line.strip():
+                if current:
+                    paragraphs.append((start, " ".join(current)))
+                    current = []
+                continue
+            if not current:
+                start = line_number
+            current.append(line)
+        if current:
+            paragraphs.append((start, " ".join(current)))
+        seen: dict[str, int] = {}
+        for para_start, raw in paragraphs:
+            if raw.lstrip().startswith(("|", "#")):
+                continue
+            normalized = " ".join(raw.split())
+            if len(normalized) < 80:
+                continue
+            if normalized in seen:
+                first_words = " ".join(normalized.split()[:8])
+                errors.append(
+                    f"{path.relative_to(root)}: paragraph repeated at "
+                    f"lines {seen[normalized]}, {para_start}: {first_words!r}"
+                )
+            else:
+                seen[normalized] = para_start
+    return errors
+
+
 def frontmatter(text: str) -> dict[str, str]:
     """Returns the scalar fields of a leading document block.
 
@@ -236,7 +298,11 @@ def main() -> None:
     """Rejects undocumented code, inline comments and runtime dependencies."""
     root = Path(__file__).resolve().parents[1]
     metadata = tomllib.loads((root / "pyproject.toml").read_text())["project"]
-    errors = contribution_errors(root) + readme_link_errors(root)
+    errors = (
+        contribution_errors(root)
+        + readme_link_errors(root)
+        + duplicate_paragraph_errors(root)
+    )
     for message in sys.argv[1:]:
         if has_attribution(Path(message).read_text()):
             errors.append("Commit message contains prohibited attribution.")

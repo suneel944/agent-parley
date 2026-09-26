@@ -15,7 +15,19 @@ MAX_LOG_BYTES = 262144
 MAX_LOG_RECORDS = 2000
 
 
-class LockBusy(BridgeError):
+class Transient(BridgeError):
+    """A refusal caused by a condition the next attempt may not meet.
+
+    A keyed transition records a refusal so a retry is refused identically.
+    That is right when the refusal describes the ledger, such as another
+    owner, and wrong when it describes a moment, such as contention or
+    evidence that changed while it was read: the protocol tells the caller to
+    retry the same message with the same key, and a recorded moment would
+    refuse that retry forever. A refusal of this kind is never recorded.
+    """
+
+
+class LockBusy(Transient):
     """Contention a current holder of the same lock caused.
 
     A caller that cannot distinguish contention from a real operational

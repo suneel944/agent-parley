@@ -10,22 +10,33 @@ runs `participant merge`, and never on an agent's behalf.
 | Module | Responsibility |
 | --- | --- |
 | `entry` | Installed command's startup: answers a bare version flag and hands every other invocation to `cli` unchanged |
-| `cli` | Worktrees, native launch/configuration, status, reports, merge gates, pull requests and operator mail |
+| `cli` | Argument parsing and dispatch, plus the `Bridge` command object that joins the command groups below and keeps lane restore, pause, stop, restart, retirement, reclaim and pull requests |
+| `core` | Base of the `Bridge` command object: the private state root and its configuration, the mail server's start, stop and readiness, the project manifest and the participant lanes it records |
+| `settings` | The per-project settings commands: verification and initialization commands, approval policy, branch naming, issue tracker, declared resources and lane budgets |
+| `integration` | The merge, preview and ordered integration commands, and the operator's approve and reject decisions that gate them |
+| `claims` | The issue commands: claims, handoffs, recovery, assignment, resolution, the next-issue ranking and the recorded work plan |
+| `mail` | Operator mail: steering a lane, acknowledgements, the mailbox, and recorded decisions |
+| `reports` | Ready reports, their review, the event export, the state archive and ownership history |
+| `status` | The `status`, `problems` and `doctor` readings, lane liveness and the per-lane status rows |
+| `launch` | Native launch of a lane: registration, the coordination protocol, the lane hooks and the supervised native client |
+| `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
+| `merges` | Merge refusals, preview and the merge itself, plus the readiness, dependency and group ordering that integration follows |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `process` | Per-platform process identity, session liveness and shutdown |
-| `issues` | Claim and handoff state transitions |
+| `issues` | Claim and handoff state transitions, and resolution of the claim a lane holds |
+| `lanes` | The one authoritative state record of each lane in the store (`starting`, `working`, `idle`, `blocked` with its cause, `stopped`, `dead`, `reclaimed`), its closed transition table, and the event every accepted or refused transition appends; the per-lane files are evidence it reads, never a second answer. Hooks (`checkpoints.record`) and the dialog watcher submit evidence to a per-project spool (`lane-evidence.jsonl`) instead of waiting on the store; each poll applies it in arrival order before its liveness sample, and keeps it for the next poll when the store is busy. A session change is a transition that records both session ids. Each poll also charges the time since the last one to idle lane-minutes and unaccountable claim-minutes by state and cause, which `status` reports. A host restart moves every recorded session's row to `stopped` with the restart named as its evidence, which `rebooted` reads to refuse a resume until a new session clears it. The wake budget (attempts, backlog, next attempt, exhaustion, escalation) lives in the same store, seeded once from a lane's published `-wake.json` on upgrade |
 | `roster` | Providers, credential profiles and project participants |
 | `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
-| `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null` |
+| `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null`, and the ready-report comment posted there |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
-| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema |
+| `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema, and the lane hooks and MCP server merged into and removed from a Copilot profile |
 | `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
 | `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
@@ -111,7 +122,13 @@ to `cli` so argparse produces the parsing, error text and exit status. The
 package binds `cli` itself the same way, so importing the surface does not
 execute it. `cli` binds command modules, selected standard-library modules and
 its legacy direct-name callables through deferred modules, so a command loads
-only the modules it reaches. Plain, unfiltered status skips parser construction,
+only the modules it reaches. Helpers moved out of `cli` keep their `cli` names
+the same way, as deferred callables and, for a moved constant, a module
+attribute hook, so callers and tests that read them from `cli` are unchanged.
+The `Bridge` command groups are base classes in their own modules. Their
+methods import the module-level names they use from `cli` when they run, so a
+name `cli` binds lazily, or a test replaces there, is the one they read, and no
+group module imports `cli` while `cli` is still loading. Plain, unfiltered status skips parser construction,
 reads an existing configuration without taking its creation lock and sends one
 bounded HTTP request on a loopback socket rather than loading the general URL
 opener.
@@ -161,6 +178,28 @@ the threads that are still live rather than every message it ever received. The
 wake backlog is a bounded digest of the newest message per live thread, capped
 at `WAKE_DIGEST_THREADS`, because the checkpoint context a woken turn receives
 is itself bounded by `MAX_CONTEXT_BYTES` and previews at most three messages.
+
+Pending coordination is context, never a refusal. A checkpoint hands unread
+mail, owed acknowledgements and project news to the turn as additional context
+and lets the tool call run; `Stop` blocks only for an issue or work notice. A
+tool call is denied only when it is unsafe now: a write to a path a peer holds
+under an exclusive reservation, or any non-read-only call while an offer to
+this lane expires within `OFFER_REPLY_SECONDS`. The denial names the path and
+holder, or the exact accept and decline commands. Read-only and diagnostic
+tools are never refused. Mail a checkpoint previewed is marked read.
+
+A message carries a `topic`, `direct` unless the sender names one. A newer
+message from the same sender on the same topic supersedes the recipient's
+unread copy of the older one. The `base` topic, which a subject such as
+`Merged #12` or `main is at abc123` selects, is project news: it goes to a
+feed each lane reads once at session start and in its advance notice, and to
+no mailbox. A broadcast, a send to every other live lane with at least
+`BROADCAST_MIN` recipients, reaches only the lanes it concerns: an
+acknowledgement request, a mention of the lane, or a reservation or claimed
+work the text touches. The rest are reported as `withheld` and read it in the
+feed. A send to a chosen subset is delivered to everyone it names. The preview
+digest orders mail by that relevance and states how many unread and
+superseded messages it left out.
 
 The supervising operator writes from the command line only. `agent-parley say`
 resolves the project and the addressed participant, then takes the ordinary
@@ -260,22 +299,44 @@ a dispatch generation, issue-scoped progress digest, bounded attempt count and
 last result. An unchanged actionable offer joins the wake backlog even after a
 checkpoint injected it. The launcher reads the revalidated wake selection from
 private state after admitting the wake, so generated work context does not
-cross the wake socket. The attempt bound measures lane silence rather than
-elapsed wakes: each attempt records the lane's own activity marker, built from
-its tool and turn-end hook events and the last message it sent, which together
-cover the reports, commits and mail a working lane produces. Three attempts
-across which that marker never changes produce a durable escalation in the same
-publication and in `top`; any recorded lane activity resets the series and
-clears the escalation, and changed issue state starts a new bounded attempt
-series. A spent attempt is re-decided on every poll rather than being final:
-durable capacity, the published screen state and the recorded session process
-are read again, and a cause still in force parks the lane with that cause and
-the time its next attempt is due without spending one, so nothing is consumed
-while nothing could answer. A cleared cause makes the next attempt due one
-doubling inactivity window after the last, or at the provider reset the
-capacity observation named, whichever is later. `status` prints that next time,
-and prints the exhausted budget with its last cause only for a lane that spent
-every attempt. An offer is advisory: it never writes the ledger,
+cross the wake socket. The attempt bound measures lane progress rather than
+elapsed wakes: each attempt records the lane's own progress marker, built from
+its HEAD movements, the state of the claims it owns and its latest reservation.
+Hook events and turn ends do not count, because a woken lane that reads its
+prompt and stops records both without doing anything. Three attempts across
+which that marker never changes produce one durable escalation in the same
+publication and in `top`; waking then backs off by doubling to an hourly
+ceiling instead of repeating every window or stopping. Any progress resets the
+series and clears the escalation, and changed issue state starts a new bounded
+attempt series. A spent attempt is re-decided on every poll rather than being
+final: durable capacity, the published screen state and the recorded session
+process are read again, and a cause still in force parks the lane with that
+cause and the time its next attempt is due without spending one, so nothing is
+consumed while nothing could answer. A screen-state label blocks only while
+the presence reading is current; a label older than the inactivity window was
+left by a dropped hook and no longer blocks, except an approval prompt, which
+records no hook until answered. An exhaustion that named no reset is probed on
+the same doubling backoff, and an accepted probe or a later tool hook clears
+it. A cleared cause makes the next attempt due one doubling inactivity window
+after the last, or at the provider reset the capacity observation named,
+whichever is later. `status` prints that next time, and prints the exhausted
+budget with its last cause and the backoff for a lane that spent every
+attempt. Each poll stage runs isolated: a failing stage is recorded in
+`supervision-error.json` and `server.log`, reported by `status` and `problems`,
+and the remaining stages still run; a clean poll clears the record. Every
+exception is caught, each lane's wake is its own stage, and the record names
+the stage, the lane and the line that raised; the supervision thread itself
+catches every exception a poll raises, so one malformed record can no longer
+end supervision for the service. The poll's presence write waits the store's
+busy timeout like every other writer. Each poll writes
+`supervision-poll.json` with the wall time of each stage, and `status` prints
+its age, its wall time, its slowest stage and the age of the last clean poll.
+Each lane's fitness and idle readings are taken once per poll and shared by
+every lane's backlog, so a poll's Git and capacity readings grow with the lane
+count, not its square. A branch's pull-request completion is read from the
+forge at most once a minute per branch, so a merge is noticed up to a minute
+later. An offer is
+advisory: it never writes the ledger,
 and `issue offer` remains the only transfer path. Supervision reads project
 manifests to resolve lane state; this is the explicit bridge from served
 project identity to private launcher state. Its best-effort forge reads run
@@ -323,15 +384,27 @@ candidate snapshot. An empty snapshot clears stale candidates. Recovery reads
 the persisted issue candidate and revalidates its owner and evidence identity
 before acting.
 
-The same poll marks the claims of a lane whose session process is gone and that
-has been silent past the stall threshold, writing an orphan marker on each of
+Every decision of the poll after its liveness sample reads the lane's condition
+from its state record: wake, parking, orphan marking, reclaim, work fitness and
+share targets. The activity file, the wake copy and `participant_presence` are
+evidence the poll applies to that record or copies published from it, never a
+decision input. A lane with no state record yet falls back to its presence
+reading, so it is still woken and still orphaned. `settle_reboot` detects a
+changed host boot identifier before the sample and moves every lane whose
+recorded session that boot ended into `stopped`, naming the restart as its
+evidence; `lanes.rebooted` reads that evidence to keep a wake from resuming
+the dead session, and the next session the lane records clears it.
+
+The same poll marks the claims of a lane whose state is `dead`: a session
+process gone, or a clean `SessionEnd` with no process left to check, past the
+stall threshold. It writes an orphan marker on each of
 its ledger records and sending every other lane one notice that names those
 issues and the reservations the dead lane still holds. The marker is an
 observation: the issue keeps its owner and the reservations keep their holder
 until a peer records `issue claim --take-orphaned`, which writes a `take`
 transition naming the previous owner and the reason and then releases that
 owner's advisory reservations through `store.py`. The same poll withdraws a
-marker whose owner's recorded session process is alive again, under the same
+marker whose owner's lane state is live again, under the same
 `issues.lock` and with one notice to the peers that received the orphan notice,
 so a stored observation never contradicts what takeover reads. A marker
 carrying an operator authorization and a checkpoint describes an approved
@@ -347,7 +420,10 @@ transitions, never from branch or pull request inference, and no read-only path
 delivers. There is no scheduler process and no additional thread.
 
 `terminal.py` owns a native pseudo-terminal and a private control socket under
-the existing session lock. Because it owns that stream, it is also the only
+the existing session lock. It reaps the client itself, ends the session on
+`SIGTERM` or `SIGHUP` through its normal cleanup, bounds a detached launcher's
+output log, and rewrites the titles the client sets into a lane-first tab title
+read from the activity record and the issue ledger. Because it owns that stream, it is also the only
 place that can see a dialog the client draws on its own screen, so it passes
 every chunk it forwards to `dialogs.py`. That module recognizes the screens
 recorded from live clients, records an exhausted provider capacity with the
@@ -362,9 +438,12 @@ client runs its `PermissionRequest` hook while it waits; that branch publishes
 the same `dialog` record, naming the tool and the instant the wait began, so
 status, the fit checks, wake admission and `problems.py` read one surface for
 both observations. `dialogs.py` also owns the operator opt-in the launch reads
-before it carries approval of this bridge's own MCP server into a client's
-native permission settings, which is off by default and scoped to that one
-server. `gemini.py`, `copilot.py`, `opencode.py` and
+before it carries approval of this bridge's own MCP server and its own CLI
+command into a client's native permission settings, which is off by default
+and scoped to that server and the one interpreter and module
+`protocol.cli_command` spells for the prompt, the rule and the watcher alike.
+With the opt-in on, the watcher answers a shell prompt for that command and
+nothing else. `gemini.py`, `copilot.py`, `opencode.py` and
 `amp.py` translate the additional native hook contracts. `evidence.py` collects retained claim-window measurements and writes
 review artifacts beside the lane. The CLI orchestrates these modules and runs
 configured verification before publishing a PR; native authentication stays in
@@ -505,7 +584,10 @@ the thread reads the same mailbox `checkpoints.mailbox` reads, composes the
 same bounded notice the checkpoint composes, publishes it to a lane-private
 file under the state root that the coordination prompt tells the lane to read
 each turn, and records the delivery through `checkpoints.record` so a polled
-lane's delivered context is counted where every other lane's is. A read that
+lane's delivered context is counted where every other lane's is. The feed,
+owed-acknowledgement and relevance-ordered mail digest come from the same
+`checkpoints` builders, and the mail it previews is marked read as a hook
+delivery marks it. A read that
 fails is retried on the next interval rather than raised, because losing
 delivery must never end a native session, and delivery decides nothing: a
 missing guard still refuses the launch.
@@ -655,12 +737,14 @@ from the live ones and names the age of the oldest, and both surfaces report
 that age in seconds past the deadline.
 
 An expired lease is renewed by its holder or reclaimed from it. A holder that
-is still coordinating renews its own expired leases at its next checkpoint,
+is still working renews its own expired leases at its next `PreToolUse`,
 restoring the window that holder declared, so live work never loses a key it
-is using. A lease correlated with a claim that holder no longer holds is
-released at that checkpoint instead, and the holder is told which keys it lost.
-A lease whose holder was last observed without a live session process, or that
-has been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
+is using. A session start, a prompt, a turn end or a supervisor resume proves
+no work and renews nothing. A lease correlated with a claim that holder no
+longer holds is released at that checkpoint instead, and the holder is told
+which keys it lost. A lease whose holder was last observed without a live
+session process, or idle past the project's inactive threshold, or that has
+been expired longer than the `RESERVATION_GRACE` window of 1800 seconds,
 is released by the next reservation call or supervision poll: the oldest queued
 request for each key is granted, the lane that took it is told who lost it, and
 the former holder is told what was released and why. The grace sits above the
@@ -715,7 +799,11 @@ version carrying the file's digest and the identity that applied it, bounded to
 the twenty most recent versions in `plan.json` beside the issue ledger. A plan
 is refused before any edge is written when it names a malformed issue, exceeds a
 bound, or describes a cycle, so an operator never has to unpick a half-applied
-order by hand. Applying adds edges and never removes one, so an edge recorded
+order by hand. The cycle check reads the recorded edges too, so plans applied
+in turn cannot close a cycle together, and an edge to a complete issue is
+skipped. Each supervisor poll drops an edge whose blocker is complete or no
+longer recorded, because completion reconciles dependents only once, at the
+instant it is recorded. Applying adds edges and never removes one, so an edge recorded
 after the apply is reported as entered by hand and a narrowed plan shows its
 dropped edges as unlisted until `issue unblock` removes them. Groups are advice
 a later offer or integration path may read; this layer only records them.
@@ -742,8 +830,13 @@ key is recorded afterwards. That ordering costs a repeated evaluation when a
 process dies between the two, and never a replayed effect. A recorded refusal
 is replayed as the same refusal: authorization granted after the first call
 never reaches a retry carrying the refused key, so a replay cannot widen
-authority. Transitions that were already idempotent, such as reclaiming an
-issue this lane owns, stay correct without a key.
+authority. Only refusals that describe the ledger are recorded this way. An
+issue transition refused by a transient condition, lock contention or
+recovery evidence that changed while it was read, raises `state.Transient`
+and records nothing, so a retry with the same key is evaluated again rather
+than refused until the key ages out. Transitions that were already
+idempotent, such as reclaiming an issue this lane owns, stay correct without
+a key.
 
 Issue mutations use a repository-scoped lock and atomic JSON replacement. Only
 the owner can offer work; only the named recipient can accept the current offer
@@ -896,10 +989,31 @@ that sends no such `Accept` header is answered with the original JSON reply.
 
 A refused connection, a timeout, a refused credential, any other reply the
 client cannot use, or a reply it cannot frame falls back to `checkpoints.main`
-in the hook process, which records the cause as a `service_fallback` event
-before deciding; `python -m agent_parley.checkpoints` remains a valid hook
-command. A status the shell client already read travels into that fallback, so
-one refusal is never posted to the service twice.
+in the hook process, which records the cause in a `fallback` field of the
+event's own record, so an outage never counts an event twice;
+`python -m agent_parley.checkpoints` remains a valid hook command. A decision
+that fails and writes no record gets one `service_fallback` record instead. A
+status the shell client already read travels into that fallback, so one
+refusal is never posted to the service twice.
+
+A state write that fails because storage is full, over quota, read-only or
+failing allows the call and names the failure on stderr, because a denial
+would also refuse the `rm` or `du` that frees the space. Other decision
+failures keep their denial for gating events. A write killed between its
+temporary file and the rename leaves a `tmp*` file in the project state
+directory; the service removes those older than a minute when it starts.
+
+The launcher takes the lane's checkpoint lock for its activity write, as every
+hook decision does, so a slow `SessionEnd` finishing after a relaunch cannot
+restore the old session or drop the launcher's process identity.
+
+A native payload over 1,000,000 characters, as a `Write` of a large file
+carries in both `PreToolUse` and `PostToolUse`, is never posted: the clients
+read it in blocks, keep its head, and the in-process path records one
+`oversize_payload` event naming the event and the full size, then allows the
+call with exit status 0. A payload that is not a JSON hook object is recorded
+as `unreadable_payload` and allowed the same way. Neither can be decided, and
+denying one would refuse the same call on every retry.
 
 Status 202 is the exception, and it is not an outage. It means the service is
 still running a decision for this lane and abandoned only the reply. Such a
@@ -907,22 +1021,64 @@ decision keeps the lane's checkpoint lock and still writes the lane's activity
 file and event record, so deciding the same event again in the hook process
 would contend with it and could deny a native call over coordination work
 already in progress. The client therefore injects no context and exits
-successfully, and the service counts the decisions a lane abandoned at that
-deadline and starts no further decision for it while it holds one. A lane's
-first minutes are where that bound earns its place: the first checkpoint,
-roster, mail and recovery scans all run inside one hook budget, and without it
-each following event started a decision that queued behind the slow one and
-expired in its turn. Decisions merely in flight are not counted, so parallel
-native calls in a healthy lane keep their context injection. Contention on
+successfully. The service counts the decisions a lane abandoned at that
+deadline, keyed by project and lane name because one service serves every
+project and lane names repeat across them. While a lane holds one, its later
+events are decided record-only: the activity label, event record, session
+process identity and recovery checkpoint are written, and the mail and
+context scans are skipped. No event is discarded, so a `PostToolUse` or `Stop`
+that arrives behind a slow decision still closes the tool call or the turn.
+Decisions merely in flight are not counted, so parallel native calls in a
+healthy lane keep their context injection.
+
+The recovery checkpoint of a `SessionStart`, `PostToolUse`, `Stop` or
+`SessionEnd` is not part of the decision. The service answers the hook first
+and then queues the capture on one thread per lane, which works the lane's
+requests in arrival order under the lane's checkpoint lock. A decision
+abandoned at its deadline queues its capture when it finishes. The in-process
+fallback writes its reply, then captures before it exits.
+
+The context scans (issue ledger, work offer, operator edits, base advances and
+budget standing) run before the checkpoint lock is taken, so the lock guards
+only the lane's record and mail cursor. Operator edits and base advances are
+Git readings the supervision poll takes once per project per interval and
+keeps for twice that interval. It also publishes the reading as
+`git-readings.json` in the project state directory with the same expiry. The
+hook path, `status` and `top` read that copy and ask Git only when no current
+reading exists, as in the in-process fallback. Measured on 12 lanes, the
+median hook fell from 22.7 to 4.4 ms and the median time the lock is held from
+19.6 to 0.9 ms. On 15 lanes over 20,000 files with an advanced base, the
+status reading fell from 0.35 to 0.007 s. An event that finds a newer event already applied
+still writes its record and delivers its context, but leaves the newer
+activity label in place.
+
+An abandoned decision records what it observed, with the activity label the
+event itself implies, but never marks the coordination it prepared as
+delivered. The mail cursor, the issue revision, the work offer, the roster and
+notice fields, and the `working` label a blocked `Stop` carries are written
+only after the reply carrying them was written to the client: the service
+records them before closing the connection, waiting at most
+`server.DELIVERY_SECONDS` for the lane's checkpoint lock, and the in-process
+path records them after flushing its output. A reply the client never received
+therefore leaves the same mail and offer for the lane's next event, and a
+delivery for a session that has since restarted is discarded. Contention on
 a lane's own checkpoint lock is likewise never an enforcement result: the loser
 of the bounded wait records a `lock_contended` event and degrades to no
-injection. The bounded worst case is one connection attempt, one service
+injection. An event that ends or pauses a turn (`Stop`, `SessionEnd`,
+`PermissionRequest`, `Notification`) is the only record that the lane went
+idle or stopped on a prompt, so the service waits up to 30 seconds for the lock
+on it. The service answers the client at its own deadline either way, and the
+abandoned decision finishes on its thread. When the lock comes free after a
+newer event already wrote the lane's state, the late event records
+`superseded` and changes nothing. Delivery polling reads the mailbox, issue
+snapshot and work offer before taking the lock, so it holds the lock only for
+its own writes. The bounded worst case is one connection attempt, one service
 deadline and one lock wait, which is 2.75 seconds against the 3-second hook
 timeout the launcher registers.
 
 Every decision is timed by the step it is walking: the roster read, the stale
-session check, the Git branch guard, the wait for the lane's checkpoint lock,
-the activity read, the mailbox read, the coordination scans, the recovery
+session check, the Git branch guard, the coordination scans, the wait for the
+lane's checkpoint lock, the activity read, the mailbox read, the recovery
 capture and the record it writes. A decision slower than half the service
 deadline is logged as `decided` with those durations, and an abandoned one is
 logged as `expired` with the step it was holding when the deadline passed, so
@@ -930,7 +1086,14 @@ the slow step at a launch is named rather than inferred. A hook process is
 killed by its client at the hook timeout and its shell client stops reading at
 its own, so a reply written after either deadline meets a socket nobody holds;
 that is the client's contract working and is recorded as a single `unanswered`
-entry rather than a traceback for every event.
+entry rather than a traceback for every event. Repeated `undecided` and
+`unanswered` entries for one lane are coalesced to one per minute. The count is
+never dropped when a burst stops: the lane's next entry carries it, any other
+lane's entry first writes every count whose minute has passed, and the service
+writes the rest as it stops. The service log is bounded like
+every line log here; the lines a rotation drops move to `server.log.1`, and
+every entry and rotation is taken under one lock so no line is lost to a
+rewrite.
 
 Hook decisions use local state without model calls. They reject
 branch-changing commands in assigned lanes, detect branch drift after any bypass,

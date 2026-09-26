@@ -27,9 +27,11 @@ from typing import NamedTuple
 from agent_parley.state import BridgeError
 
 STOP_TIMEOUT = 10
+KILL_TIMEOUT = 5
 POLL_INTERVAL = 0.05
 PS_TIMEOUT = 5
 ANCESTRY_LIMIT = 8
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 
 PsReader = Callable[[str, int], str]
 
@@ -176,16 +178,34 @@ def libc_pidfd(name: str, *arguments: int | None) -> int:
     return result
 
 
+def linux_signal(fd: int, number: int) -> None:
+    """Signals the process a pidfd pins.
+
+    Args:
+        fd: Pidfd of the recorded process.
+        number: Signal to deliver.
+    """
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(fd, number)
+    else:
+        libc_pidfd("pidfd_send_signal", fd, number, None, 0)
+
+
 def linux_terminate(pid: int, ticks: str) -> None:
     """Pins the process with pidfd before signaling and waiting for exit.
 
+    A process that ignores `SIGTERM`, such as a client wedged in a native
+    dialog or left behind by a system hang, is sent `SIGKILL` once the
+    shutdown timeout passes, through the same pinned descriptor, so the
+    escalation can never reach a recycled process ID.
+
     Args:
-        pid: Process ID recorded for the server.
+        pid: Process ID recorded for the process.
         ticks: Creation ticks recorded beside that process ID.
 
     Raises:
         BridgeError: If the creation ticks changed or the process did
-            not exit within the shutdown timeout.
+            not exit even after `SIGKILL`.
     """
     try:
         fd = (
@@ -198,12 +218,13 @@ def linux_terminate(pid: int, ticks: str) -> None:
     try:
         if linux_start_ticks(pid) != ticks:
             raise BridgeError("Server PID changed; refusing to signal it.")
-        if hasattr(signal, "pidfd_send_signal"):
-            signal.pidfd_send_signal(fd, signal.SIGTERM)
-        else:
-            libc_pidfd("pidfd_send_signal", fd, signal.SIGTERM, None, 0)
+        linux_signal(fd, signal.SIGTERM)
         if not select.select([fd], [], [], STOP_TIMEOUT)[0]:
-            raise BridgeError("Server did not stop within 10s.")
+            linux_signal(fd, signal.SIGKILL)
+            if not select.select([fd], [], [], KILL_TIMEOUT)[0]:
+                raise BridgeError(
+                    f"Process {pid} did not exit after SIGTERM and SIGKILL."
+                )
         try:
             os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
@@ -342,38 +363,43 @@ def darwin_terminate(reader: PsReader, pid: int, ticks: str) -> None:
     only the recorded process is ever signaled and narrows the remaining
     window to the kernel's own scheduling gap. Each poll reaps the
     process first, because a child that has exited but not been reaped
-    still answers an existence check.
+    still answers an existence check. A process still running once the
+    shutdown timeout passes is sent `SIGKILL` after the same creation-time
+    check.
 
     Args:
         reader: Reads one ``ps`` field for a process ID.
-        pid: Process ID recorded for the server.
+        pid: Process ID recorded for the process.
         ticks: Creation time recorded beside that process ID.
 
     Raises:
         BridgeError: If the creation time changed, the process belongs
-            to another user, or it did not exit within the shutdown
-            timeout.
+            to another user, or it did not exit even after `SIGKILL`.
     """
-    try:
-        if darwin_start_ticks(reader, pid) != ticks:
-            raise BridgeError("Server PID changed; refusing to signal it.")
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except PermissionError as error:
-        raise BridgeError(
-            "Server process belongs to another user; not signaling it."
-        ) from error
-    deadline = time.monotonic() + STOP_TIMEOUT
-    while time.monotonic() < deadline:
+    for number, timeout in (
+        (signal.SIGTERM, STOP_TIMEOUT),
+        (signal.SIGKILL, KILL_TIMEOUT),
+    ):
         try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
-        if not darwin_running(pid):
+            if darwin_start_ticks(reader, pid) != ticks:
+                raise BridgeError("Server PID changed; refusing to signal it.")
+            os.kill(pid, number)
+        except ProcessLookupError:
             return
-        time.sleep(POLL_INTERVAL)
-    raise BridgeError("Server did not stop within 10s.")
+        except PermissionError as error:
+            raise BridgeError(
+                "Server process belongs to another user; not signaling it."
+            ) from error
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            if not darwin_running(pid):
+                return
+            time.sleep(POLL_INTERVAL)
+    raise BridgeError(f"Process {pid} did not exit after SIGTERM and SIGKILL.")
 
 
 class Platform(NamedTuple):
@@ -393,6 +419,8 @@ class Platform(NamedTuple):
             a given private state directory.
         terminate: Verifies identity, signals the process, and waits for
             it to exit.
+        boot_id: Names the current boot of the host, so a process record
+            written before a restart is known to be from an earlier boot.
     """
 
     start_ticks: Callable[[int], str]
@@ -401,6 +429,32 @@ class Platform(NamedTuple):
     running: Callable[[int], bool]
     matches_command: Callable[[int, Path], bool]
     terminate: Callable[[int, str], None]
+    boot_id: Callable[[], str]
+
+
+def linux_boot_id() -> str:
+    """Reads the identifier the Linux kernel draws afresh at every boot.
+
+    Returns:
+        The boot identifier.
+    """
+    return BOOT_ID.read_text().strip()
+
+
+def darwin_boot_id() -> str:
+    """Reads the instant the macOS kernel records for the current boot.
+
+    Returns:
+        The boot time exactly as `sysctl` prints it, which changes only
+        when the host starts again.
+    """
+    return subprocess.run(
+        ["sysctl", "-n", "kern.boottime"],
+        capture_output=True,
+        text=True,
+        timeout=PS_TIMEOUT,
+        check=True,
+    ).stdout.strip()
 
 
 def linux_platform() -> Platform:
@@ -416,6 +470,7 @@ def linux_platform() -> Platform:
         running=linux_running,
         matches_command=linux_matches_command,
         terminate=linux_terminate,
+        boot_id=linux_boot_id,
     )
 
 
@@ -436,6 +491,7 @@ def darwin_platform(reader: PsReader = read_ps_field) -> Platform:
         running=darwin_running,
         matches_command=functools.partial(darwin_matches_command, reader),
         terminate=functools.partial(darwin_terminate, reader),
+        boot_id=darwin_boot_id,
     )
 
 
@@ -563,6 +619,20 @@ def check_repository_host(repo: Path, release: str | None = None) -> None:
         return
     if repo.resolve().is_relative_to("/mnt"):
         raise BridgeError(MOUNTED_DRIVE)
+
+
+def boot_id() -> str:
+    """Names the current boot of the host.
+
+    Returns:
+        A value that changes whenever the host starts again, or empty text
+        when the platform cannot report one, in which case no restart can
+        be told from an ordinary quiet lane.
+    """
+    try:
+        return PLATFORM.boot_id()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def start_ticks(pid: int) -> str:

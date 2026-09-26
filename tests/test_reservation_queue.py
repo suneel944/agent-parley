@@ -84,12 +84,12 @@ def held(bridge, holder):
         )
 
 
-def hook(bridge, paired, name):
+def hook(bridge, paired, name, event="PreToolUse"):
     """Runs one lifecycle checkpoint for a lane and reports its output."""
     directory = Path(paired["lanes"][name]).parent
     write_json(directory / f"{name}-identity.json", {"name": name})
     payload = {
-        "hook_event_name": "PreToolUse",
+        "hook_event_name": event,
         "session_id": "test",
         "cwd": paired["lanes"][name],
         "tool_name": "Bash",
@@ -350,6 +350,40 @@ def test_a_live_holder_renews_its_expired_lease_at_the_next_checkpoint(
         "claude": ["src/engine.py"]
     }
     assert inbox(bridge, peer) == []
+
+
+@pytest.mark.parametrize("event", ["SessionStart", "Stop", "UserPromptSubmit"])
+def test_an_event_that_proves_no_work_leaves_an_expired_lease_expired(
+    bridge, repo, paired, event
+):
+    holder = actor(bridge, paired["root"], "claude")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=3600)
+    expire(bridge, holder, 60)
+    hook(bridge, paired, "claude", event)
+    assert held(bridge, holder) == {"leases": 1, "expired": 1}
+
+
+def test_a_queued_request_is_granted_when_the_holder_goes_idle(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=3600)
+    request(bridge, peer, "src/engine.py")
+    expire(bridge, holder, 60)
+    assert store.reclaim_expired(bridge.home, paired["root"]) == []
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "INSERT INTO participant_presence(agent_id,state,process_alive,"
+            "observed_ts,last_active) VALUES (?,'idle',1,?,?)",
+            (holder["id"], time.time(), time.time() - 3600),
+        )
+    reclaimed = store.reclaim_expired(bridge.home, paired["root"])
+    assert [entry["agent"] for entry in reclaimed] == ["claude"]
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "codex": ["src/engine.py"]
+    }
+    assert "codex took it from the queue" in inbox(bridge, holder)[0]["body_md"]
 
 
 def test_a_checkpoint_releases_a_lease_whose_claim_is_closed(

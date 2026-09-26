@@ -1,6 +1,9 @@
 """Observes lane availability and reminds holders about waiting peers."""
 
+import collections
 import contextlib
+import contextvars
+import copy
 import hashlib
 import json
 import sqlite3
@@ -8,14 +11,21 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypeGuard, cast
 
 from agent_parley import (
+    dialogs,
     forge,
     issues,
+    lanes,
     lifecycle,
     notify,
     process,
+    reclaim,
     records,
     roster,
     store,
@@ -29,15 +39,27 @@ DEFAULTS = {
     "stalled_after": 600,
     "start_deadline": 30,
     "completion_reminders": 3,
+    "orphan_retire_after": 3600,
+    "claim_idle_after": 3600,
+    "takeover_grace": 300,
+    "max_claims_per_lane": 2,
     "prompts": True,
     "wake": True,
     "reclaim": True,
+    "titles": True,
 }
 
 MAX_COMPLETION_REMINDERS = 100
+MAX_CLAIMS_PER_LANE = 100
 ENDED = "pull request ended"
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
+ROOT_PUBLICATION = "root-missing.json"
+BOOT_RECORD = "boot.json"
+READINGS_PUBLICATION = "git-readings.json"
+GIT_WORKERS = 8
+POLL_RECORD = "supervision-poll.json"
+COMPLETION_TTL = 60.0
 
 ACTIVE = "active"
 IDLE = "idle"
@@ -48,8 +70,8 @@ WORK_WAKE_ATTEMPTS = 3
 WAKE_DIGEST_THREADS = 8
 UNKNOWN = "unknown"
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
-WORK_EVENTS = frozenset({"PreToolUse", "PostToolUse", "Stop"})
-WAKE_READY = frozenset({IDLE, STOPPED})
+WAKE_BACKOFF_CEILING = 3600.0
+TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 WAKE_ATTENTION = "manual attention required"
 WORKING = "working"
 WAITING = "waiting"
@@ -64,6 +86,13 @@ AVAILABILITY = {
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
 _LAUNCHERS_LOCK = threading.Lock()
+_READINGS: dict[str, tuple[float, dict, dict]] = {}
+_COMPLETIONS: dict[tuple[str, str], tuple[float, tuple[str, float] | None]] = {}
+_REFRESHING: set[tuple[str, str]] = set()
+_REFRESHING_LOCK = threading.Lock()
+_POLL_READINGS: contextvars.ContextVar[dict[tuple, object] | None] = (
+    contextvars.ContextVar("poll_readings", default=None)
+)
 
 
 def track_launcher(child: subprocess.Popen[bytes]) -> None:
@@ -103,12 +132,21 @@ def settings(value: dict) -> dict:
         "inactive_after",
         "stalled_after",
         "start_deadline",
+        "orphan_retire_after",
+        "claim_idle_after",
+        "takeover_grace",
     ):
         if (
             type(result[field]) not in (int, float)
             or not 1 <= result[field] <= 86400
         ):
             raise BridgeError(f"{field} must be between 1 and 86400 seconds.")
+    cap = result["max_claims_per_lane"]
+    if type(cap) is not int or not 1 <= cap <= MAX_CLAIMS_PER_LANE:
+        raise BridgeError(
+            "max_claims_per_lane must be between 1 and "
+            f"{MAX_CLAIMS_PER_LANE} claims."
+        )
     reminders_before = result["completion_reminders"]
     if (
         type(reminders_before) is not int
@@ -118,7 +156,7 @@ def settings(value: dict) -> dict:
             "completion_reminders must be between 1 and "
             f"{MAX_COMPLETION_REMINDERS} reminders."
         )
-    for field in ("prompts", "wake", "reclaim"):
+    for field in ("prompts", "wake", "reclaim", "titles"):
         if type(result[field]) is not bool:
             raise BridgeError(f"{field} must be a boolean.")
     return result
@@ -147,10 +185,19 @@ def lane_state(
     no longer evidence of anything current, and past the inactive threshold
     any record reads as stale with its age rather than as the present.
 
+    A lane `dialogs.parked` on an approval prompt or a watcher-held dialog,
+    including the `asks the operator` questions, is waiting however old the
+    label is and whatever tool call it interrupted: such a screen records no
+    hook until somebody answers it, so neither its age nor the open call
+    says the lane could take a turn.
+
     A living session process is never described as stopped. A record that
     names a finished session while its process still answers means the client
     is up and waiting for whoever owns its terminal, which is a prompt to
-    answer rather than a session to resume.
+    answer rather than a session to resume. A session recorded before the
+    host last restarted is dead whatever its process ID now names, because
+    a boot starts every process afresh and a low process ID with matching
+    start ticks is ordinary after one.
 
     Args:
         published: Activity record published for the lane, or an empty
@@ -173,6 +220,8 @@ def lane_state(
         type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
     )
     alive = process.alive(pid, ticks) if identified else None
+    if identified and rebooted(published):
+        alive = False
     recorded = published.get("updated")
     age = None if recorded is None else max(0.0, moment - recorded)
     activity = str(published.get("activity", ""))
@@ -196,19 +245,108 @@ def lane_state(
         if alive is False or activity == "stopped" or not published:
             return reading(STOPPED, "stopped")
         return reading(UNKNOWN, "unknown; no session process recorded")
+    if dialogs.parked(published):
+        return reading(WAITING, activity)
     if in_flight:
         return reading(WORKING, "working; tool call in flight")
     if not activity:
         return reading(WORKING, "running; checkpoints unavailable (relaunch)")
     if stale:
         return reading(IDLE, f"stale; last {activity}")
-    if activity == "waiting for approval":
-        return reading(WAITING, activity)
     if activity == "stopped":
         return reading(WAITING, "session ended; client process alive")
     if activity == "idle":
         return reading(IDLE, activity)
     return reading(WORKING, activity)
+
+
+def rebooted(published: dict) -> bool:
+    """Reports whether a lane's recorded session predates a host restart.
+
+    The mark names the exact session record it was written against, so the
+    next session a launch records clears it without anyone removing it.
+
+    Args:
+        published: Activity record published for the lane.
+
+    Returns:
+        Whether the record still names the session a restart ended.
+    """
+    marker = published.get("rebooted")
+    return (
+        isinstance(marker, dict)
+        and marker.get("session_pid") == published.get("session_pid")
+        and marker.get("session_ticks") == published.get("session_ticks")
+    )
+
+
+def settle_reboot(home: Path, directory: Path, manifest: dict) -> list[str]:
+    """Marks every recorded session stopped once the host has restarted.
+
+    A restart ends every process without a shutdown, so the recorded session
+    of each lane is dead even when its process ID now names something else.
+    Each such lane's state record moves to `stopped` with the restart as its
+    evidence, which `lanes.rebooted` reads and `wake` refuses to resume, and
+    the lane is published as stopped and marked with the session the
+    restart ended. That mark makes presence read the process as gone, so the
+    lane's expired leases are released and its claims move through the
+    orphan path, and the refused resume keeps fresh activity from resetting
+    the silence those paths measure. An operator restart records a new
+    session, which moves the record out of `stopped` and clears the mark.
+
+    The record is written before the mark, and the boot identifier only
+    after every lane was marked, so a lane whose checkpoint lock or store
+    was busy is marked on the next poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+
+    Returns:
+        Participants whose recorded session was marked stopped.
+    """
+    from agent_parley import checkpoints
+
+    current = process.boot_id()
+    if not current:
+        return []
+    record = directory / BOOT_RECORD
+    try:
+        previous = str(json.loads(record.read_text()).get("boot_id") or "")
+    except (OSError, ValueError, AttributeError):
+        previous = ""
+    if previous == current:
+        return []
+    marked = []
+    if previous:
+        for name in manifest["participants"]:
+            with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+                state = checkpoints.activity(directory, name)
+                if state.get("session_pid") is None or rebooted(state):
+                    continue
+                with store.connect(home, write=True) as db:
+                    lanes.transition(
+                        db,
+                        manifest["root"],
+                        name,
+                        lanes.STOPPED,
+                        evidence=(
+                            f"{lanes.REBOOTED}: boot {previous} ended session "
+                            f"{state.get('session_pid')}"
+                        ),
+                    )
+                state["activity"] = STOPPED
+                state["rebooted"] = {
+                    "boot_id": previous,
+                    "at": time.time(),
+                    "session_pid": state.get("session_pid"),
+                    "session_ticks": state.get("session_ticks"),
+                }
+                write_json(directory / f"{name}-activity.json", state)
+                marked.append(name)
+    write_json(record, {"boot_id": current, "recorded": time.time()})
+    return marked
 
 
 def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
@@ -249,7 +387,9 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         `None` rather than an age measured from the Unix epoch, and reads as
         `ACTIVE` while its process is alive, because a lane that has never
         checked in has not been quiet for any span a threshold can be
-        compared against.
+        compared against. `ended` is true when the last recorded event is
+        a clean `SessionEnd` that left no session process to check, which
+        is a known stop rather than an unknown process.
     """
     path = directory / f"{name}-activity.json"
     value = json.loads(path.read_text()) if path.exists() else {}
@@ -263,6 +403,80 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "activity": derived["state"],
         "evidence": derived["evidence"],
         "stale": derived["stale"],
+        "ended": value.get("event") == "SessionEnd"
+        and derived["process_alive"] is None,
+    }
+
+
+def recorded_presence(record: dict | None, observed: dict) -> dict:
+    """Reads the presence a supervision decision acts on from the lane state.
+
+    The activity file a presence reading is derived from is evidence, and
+    `settle_lanes` has already applied it to the lane's record. Every
+    decision reads the lane's condition from that record, so the liveness,
+    availability and activity it acts on are replaced here by the record's,
+    and a label the record has not accepted cannot change a decision. The
+    timing and evidence text of the reading are kept for wording and for
+    spacing wakes. An idle or blocked lane whose evidence has gone stale
+    is published `idle`, so the lease sweep releases its expired leases
+    rather than holding them for the whole grace: a lane parked on a
+    prompt that long is not working under them.
+
+    Args:
+        record: The lane's state record, or None when it has none.
+        observed: This poll's presence reading of the lane.
+
+    Returns:
+        The reading with `process_alive`, `state` and `activity` taken from
+        the record and the record itself under `record`. A lane with no
+        record yet keeps the reading as it was, so the safety net that wakes
+        and orphans a lane still covers one whose record the store has not
+        seeded, for example because the store could not be written.
+    """
+    if record is None:
+        return {**observed, "record": None}
+    state = record["state"]
+    if state in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
+        alive, availability, activity = False, STOPPED, STOPPED
+    elif state == lanes.BLOCKED:
+        availability = IDLE if observed.get("stale") else ACTIVE
+        alive, activity = True, WAITING
+    elif state == lanes.IDLE:
+        availability = IDLE if observed.get("stale") else ACTIVE
+        alive, activity = True, IDLE
+    else:
+        alive, availability, activity = True, ACTIVE, WORKING
+    return {
+        **observed,
+        "state": availability,
+        "process_alive": alive,
+        "activity": activity,
+        "record": record,
+    }
+
+
+def recorded_observations(
+    home: Path, manifest: dict, observations: dict[str, dict]
+) -> dict[str, dict]:
+    """Reads the presence of every lane from its state record.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        observations: This poll's presence reading per participant.
+
+    Returns:
+        The `recorded_presence` of every participant. A store that cannot be
+        read yields no record for any lane, so every lane is decided on its
+        presence reading this poll.
+    """
+    records: dict[str, dict] = {}
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        with store.connect(home) as db:
+            records = lanes.read_all(db, manifest["root"])
+    return {
+        name: recorded_presence(records.get(name), observations.get(name, {}))
+        for name in manifest["participants"]
     }
 
 
@@ -275,6 +489,9 @@ def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
     label and the observation are written. The recorded launch time, the live
     session field and the resumable session are left exactly as the launcher
     and any earlier session left them, and no native process is signalled.
+    The same observation is queued as lane evidence, `blocked` on a dialog,
+    because the lane state is what wake and work decisions read, and the
+    next native hook the client reports moves the lane out of it.
 
     Args:
         directory: Private project state directory.
@@ -307,7 +524,15 @@ def _mark_unstarted(directory: Path, name: str, deadline: float) -> bool:
             "waited": int(time.time() - float(started)),
         }
         write_json(path, state)
-        return True
+    lanes.submit(
+        directory,
+        name,
+        "launch",
+        lanes.BLOCKED,
+        cause=lanes.DIALOG,
+        evidence=f"it never started within {int(deadline)}s of its launch",
+    )
+    return True
 
 
 def launches(directory: Path, manifest: dict, config: dict) -> list[str]:
@@ -364,10 +589,15 @@ def stall(
         after: Seconds of silence after which a waiting item reads as a stall.
 
     Returns:
-        Whether the lane is stalled, the oldest waiting item and its age, and
-        the age of the last served call. A lane whose recorded session process
-        is not alive is never reported as stalled: it is stopped, which the
-        session state already says.
+        Whether the lane is stalled, the oldest waiting item and its age,
+        the age of the last served call, and under `silent_seconds` how long
+        the lane has shown no sign of work, measured by `silence` only once
+        an item has waited past the interval. A lane that served a call,
+        published activity, recorded a native event or filed a report inside
+        the interval is not stalled, and the idle age an operator view prints
+        is that silence rather than the waiting item's age. A lane whose
+        recorded session process is not alive is never reported as stalled:
+        it is stopped, which the session state already says.
     """
     from agent_parley import checkpoints
 
@@ -378,6 +608,7 @@ def stall(
         "sender": "",
         "age_seconds": 0,
         "served_age_seconds": None,
+        "silent_seconds": None,
     }
     state = checkpoints.activity(directory, name)
     if not process.alive(state.get("session_pid"), state.get("session_ticks")):
@@ -390,12 +621,59 @@ def stall(
         return idle
     served = report["served_age_seconds"]
     idle.update(report)
-    idle["stalled"] = bool(
-        report["kind"]
-        and report["age_seconds"] >= after
-        and (served is None or served >= after)
-    )
+    if not (report["kind"] and report["age_seconds"] >= after):
+        return idle
+    silent = silence(directory, name, state, served)
+    idle["silent_seconds"] = silent
+    idle["stalled"] = silent is None or silent >= after
     return idle
+
+
+def silence(
+    directory: Path, name: str, state: dict, served: float | None
+) -> int | None:
+    """Measures how long a lane has shown no sign of work by any evidence.
+
+    A served coordination call is only one sign of a working lane. A lane
+    busy with native tool calls publishes activity and appends hook events
+    without calling the service, and a lane that filed a report was working
+    when it did. Measuring silence from served calls alone read a lane with
+    fresh events as idle for as long as its oldest unanswered message had
+    waited, so the newest of every sign is taken instead.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        state: The lane's published activity record.
+        served: Seconds since the lane's last served call, or None.
+
+    Returns:
+        Seconds since the newest served call, published activity update,
+        observed native hook event or filed report, or None when the lane
+        has recorded none of them.
+    """
+    from agent_parley import checkpoints
+
+    moment = time.time()
+    stamps = [
+        float(value)
+        for value in (state.get("updated"), state.get("reported_at"))
+        if isinstance(value, int | float) and not isinstance(value, bool)
+    ]
+    ignored = {reason.value for reason in checkpoints.UNOBSERVED}
+    try:
+        events = checkpoints.read_events(directory, name)
+    except (BridgeError, OSError):
+        events = []
+    stamps.extend(
+        float(entry.get("ts") or 0)
+        for entry in events
+        if entry.get("reason_class") not in ignored
+    )
+    ages = [max(0, int(moment - stamp)) for stamp in stamps if stamp > 0]
+    if served is not None:
+        ages.append(int(served))
+    return min(ages) if ages else None
 
 
 def stall_marker(idle: dict) -> str:
@@ -482,9 +760,11 @@ def _changed(root: str, start: str, end: str) -> list[str]:
 
     Returns:
         The changed paths, empty when nothing differs and when Git could not
-        answer.
+        answer. A rename is listed under both its old and its new path:
+        rename detection costs half a second on a large diff, and a held
+        path that the other side moved away is changed all the same.
     """
-    listing = _read(root, "diff", "--name-only", start, end)
+    listing = _read(root, "diff", "--no-renames", "--name-only", start, end)
     return [path for path in (listing or "").splitlines() if path]
 
 
@@ -519,14 +799,7 @@ def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
     collisions: dict[str, list[str]] = {}
     for name, participant in manifest["participants"].items():
         patterns = held.get(participant["display"], [])
-        matched = sorted(
-            {
-                path
-                for path in dirty
-                for pattern in patterns
-                if store.overlapping(path, pattern)
-            }
-        )
+        matched = sorted(store.overlapping_paths(dirty, patterns))
         if matched:
             collisions[name] = matched
     return collisions
@@ -560,6 +833,10 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     itself changed, both those committed on its branch and those still
     uncommitted in its worktree.
 
+    The Git calls are read-only and independent per lane, so up to
+    `GIT_WORKERS` of them run at once. One call per lane in turn cost two to
+    three seconds a frame on a 34-lane state root.
+
     The reading is advisory. Nothing rebases, pauses or reverts, and the lane
     decides what a moved base means for its work.
 
@@ -576,38 +853,160 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
     head = _read(root, "rev-parse", "HEAD")
     if not head:
         return {}
-    forks = {}
-    for name, participant in manifest["participants"].items():
-        fork = _read(root, "merge-base", head, participant["branch"])
-        if fork and fork != head:
-            forks[name] = fork
-    if not forks:
-        return {}
+    participants = manifest["participants"]
+
+    def fork_point(participant: dict) -> str | None:
+        """Reads where a lane's branch forked from the base head."""
+        return _read(root, "merge-base", head, participant["branch"])
+
+    def lane_paths(name: str) -> set[str]:
+        """Lists the paths a lane changed, committed or not, since forking."""
+        participant = participants[name]
+        mine = set(_changed(root, forks[name], participant["branch"]))
+        mine.update(dirty_paths(participant["lane"]) or [])
+        return mine
+
+    with ThreadPoolExecutor(max_workers=GIT_WORKERS) as pool:
+        points = pool.map(fork_point, participants.values())
+        forks = {
+            name: fork
+            for name, fork in zip(participants, points, strict=True)
+            if fork and fork != head
+        }
+        if not forks:
+            return {}
+        starts = sorted(set(forks.values()))
+        moved = dict(
+            zip(
+                starts,
+                pool.map(lambda fork: _changed(root, fork, head), starts),
+                strict=True,
+            )
+        )
+        behind = [name for name, fork in forks.items() if moved[fork]]
+        held_paths = dict(
+            zip(behind, pool.map(lane_paths, behind), strict=True)
+        )
     try:
         held = store.active_reservations(home, root)
     except (BridgeError, OSError, sqlite3.Error):
         held = {}
     advances: dict[str, list[str]] = {}
-    for name, fork in forks.items():
-        participant = manifest["participants"][name]
-        branch = participant["branch"]
-        changed = _changed(root, fork, head)
-        if not changed:
-            continue
-        patterns = held.get(participant["display"], [])
-        mine = set(_changed(root, fork, branch))
-        mine.update(dirty_paths(participant["lane"]) or [])
+    for name in behind:
+        changed = moved[forks[name]]
+        patterns = held.get(participants[name]["display"], [])
         matched = sorted(
-            {
-                path
-                for path in changed
-                if path in mine
-                or any(store.overlapping(path, pattern) for pattern in patterns)
-            }
+            {path for path in changed if path in held_paths[name]}
+            | store.overlapping_paths(changed, patterns)
         )
         if matched:
             advances[name] = matched
     return advances
+
+
+def refresh_readings(
+    home: Path, manifest: dict, lifetime: float
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Takes the project's Git readings and keeps them for the hook path.
+
+    The supervision poll calls this once per project per interval. Every
+    hook of every lane used to run `operator_edits` and `base_advances`
+    itself, one Git status and one merge-base per participant each time,
+    which is the scan that held decisions past their deadline under load.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+        lifetime: Seconds the reading stays current for `readings`.
+
+    Returns:
+        The operator edits and the base advances, keyed by participant.
+    """
+    edits = operator_edits(home, manifest)
+    advances = base_advances(home, manifest)
+    _READINGS[manifest["root"]] = (
+        time.monotonic() + lifetime,
+        edits,
+        advances,
+    )
+    if directory := roster.locate(home, manifest["root"]):
+        with contextlib.suppress(OSError):
+            write_json(
+                directory / READINGS_PUBLICATION,
+                {
+                    "expires": time.time() + lifetime,
+                    "edits": edits,
+                    "advances": advances,
+                },
+            )
+    return edits, advances
+
+
+def _published_readings(
+    home: Path, manifest: dict
+) -> tuple[dict[str, list[str]], dict[str, list[str]]] | None:
+    """Reads the Git readings the last supervision poll published.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout.
+
+    Returns:
+        The operator edits and the base advances, or None when no current,
+        well-formed publication exists.
+    """
+    directory = roster.locate(home, manifest["root"])
+    if directory is None:
+        return None
+    try:
+        published = json.loads((directory / READINGS_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(published, dict):
+        return None
+    expires = published.get("expires")
+    edits = published.get("edits")
+    advances = published.get("advances")
+    if (
+        not isinstance(expires, (int, float))
+        or time.time() >= expires
+        or not isinstance(edits, dict)
+        or not isinstance(advances, dict)
+    ):
+        return None
+    return edits, advances
+
+
+def readings(
+    home: Path, manifest: dict
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """Returns the project's Git readings, from the poll's copy if current.
+
+    The poll also publishes its reading in the project state directory, so
+    a separate process such as `agent-parley status` reuses it instead of
+    asking Git for a status and a merge-base per lane again. A process with
+    neither a current copy nor a current publication, such as a hook
+    deciding in-process while the service is down, takes the readings
+    itself and keeps nothing, so only the poll decides how often Git is
+    asked. It reads the operator edits on a second thread while it reads
+    the base advances, since neither waits on the other.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest naming the base checkout and the roster.
+
+    Returns:
+        The operator edits and the base advances, keyed by participant.
+    """
+    kept = _READINGS.get(manifest["root"])
+    if kept is not None and time.monotonic() < kept[0]:
+        return kept[1], kept[2]
+    if (published := _published_readings(home, manifest)) is not None:
+        return published
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        edits = pool.submit(operator_edits, home, manifest)
+        advances = base_advances(home, manifest)
+        return edits.result(), advances
 
 
 def base_advance_marker(paths: list[str]) -> str:
@@ -645,41 +1044,32 @@ UNKNOWN_FIT: dict = {
 }
 
 
-def _session_check(directory: Path, name: str) -> tuple[bool | None, str]:
-    """Reads whether the lane's recorded session process is running.
+def _session_check(home: Path, root: str, name: str) -> tuple[bool | None, str]:
+    """Reads from the lane state whether the lane could take a turn.
 
     Args:
-        directory: Private project state directory.
+        home: Private bridge state root.
+        root: Canonical project key.
         name: Participant that owns the lane.
 
     Returns:
-        The check result and, when it failed, why. A lane that published no
-        activity yet reports None, which is no opinion rather than a refusal.
-        A launch that passed its start deadline without a native hook fails
-        here, which is what keeps it out of offers and out of share targets.
-        A lane whose launcher published a native dialog fails the check as
-        well: its client is alive and reading nothing but a keypress. A lane
-        waiting on a native approval names the tool the prompt asked about.
+        The check result and, when it failed, why. A lane with no state
+        record yet reports None, which is no opinion rather than a refusal.
+        A stopped, dead or reclaimed lane fails, and so does a blocked one,
+        named with its cause and the evidence that set it: a launch that
+        passed its start deadline without a native hook, a native dialog or
+        approval its client is held by, or a session that ended while its
+        client still runs. That is what keeps such a lane out of offers and
+        out of share targets.
     """
-    from agent_parley import checkpoints, dialogs
-
-    state = checkpoints.activity(directory, name)
-    if not state:
+    record = condition(home, root, name)
+    if record is None:
         return None, ""
-    if state.get("activity") == NOT_STARTED:
-        waited = (state.get("not_started") or {}).get("deadline", 0)
-        return False, f"it never started within {int(waited)}s of its launch"
-    if not process.alive(state.get("session_pid"), state.get("session_ticks")):
+    if record["state"] in (lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED):
         return False, "its session process is not running"
-    if state.get("activity") == "stopped":
-        return False, "its session ended"
-    if str(state.get("activity", "")).startswith(dialogs.APPROVAL):
-        tool = str((state.get("dialog") or {}).get("tool", ""))
-        named = f" of {tool}" if tool else ""
-        return False, f"it is waiting for a native approval{named}"
-    if isinstance(state.get("dialog"), dict):
-        label = str(state["dialog"].get("label", "a native dialog"))
-        return False, f"its client is held by {label}"
+    if record["state"] == lanes.BLOCKED:
+        seen = f": {record['evidence']}" if record["evidence"] else ""
+        return False, f"it is blocked ({record['cause']}){seen}"
     return True, ""
 
 
@@ -697,6 +1087,12 @@ def published_capacity(directory: Path, name: str) -> dict:
 def record_capacity(directory: Path, name: str, observation: dict) -> dict:
     """Persists a newer validated capacity or bounded-probe outcome.
 
+    An observation that names no session, such as the one the native dialog
+    watcher makes from the lane's screen, is attributed to the session the
+    lane's own activity record names. Every consumer of the record then reads
+    the same session identity, so a recovery candidate derived from it can be
+    fenced to that session rather than refused as unverifiable.
+
     Args:
         directory: Private project state directory.
         name: Participant whose provider produced the observation.
@@ -711,6 +1107,15 @@ def record_capacity(directory: Path, name: str, observation: dict) -> dict:
         BridgeError: If the observation does not carry a usable state, time,
             source and evidence identity.
     """
+    if not observation.get("session_id"):
+        from agent_parley import checkpoints
+
+        observation = {
+            **observation,
+            "session_id": str(
+                checkpoints.activity(directory, name).get("session_id") or ""
+            ),
+        }
     state = observation.get("state")
     observed_at = observation.get("observed_at")
     if (
@@ -775,6 +1180,21 @@ def _observe_capacity(
         observation["progress"] = current.get("progress")
     if observation is not None and _native_recovery(current, observation):
         current = record_capacity(directory, name, observation)
+    if current["state"] == "exhausted" and not _instant(
+        current.get("reset_at")
+    ):
+        from agent_parley import checkpoints
+
+        activity = checkpoints.activity(directory, name)
+        updated = activity.get("updated")
+        if (
+            activity.get("event") in TOOL_EVENTS
+            and _instant(updated)
+            and float(updated) > float(current["observed_at"])
+        ):
+            current = _clear_exhaustion(
+                directory, name, current, "native-hook", float(updated)
+            )
     reset_at = current.get("reset_at")
     if (
         current["state"] == "exhausted"
@@ -795,6 +1215,68 @@ def _observe_capacity(
             },
         )
     return current
+
+
+def _clear_exhaustion(
+    directory: Path, name: str, current: dict, source: str, at: float
+) -> dict:
+    """Records that a lane exhausted with no named reset is working again.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose capacity was exhausted.
+        current: Durable exhausted observation being cleared.
+        source: Evidence that cleared it, a native hook or an accepted wake.
+        at: Unix time of that evidence.
+
+    Returns:
+        The durable observation after the clear.
+    """
+    return record_capacity(
+        directory,
+        name,
+        {
+            **current,
+            "state": "available",
+            "observed_at": max(at, float(current["observed_at"])),
+            "reset_at": None,
+            "source": source,
+            "observation_id": f"{source}:{current['observation_id']}",
+            "probes": 0,
+            "probed_at": None,
+        },
+    )
+
+
+def probe_exhaustion(directory: Path, name: str, result: str) -> None:
+    """Records the outcome of a wake made while exhaustion named no reset.
+
+    An accepted wake is the evidence the usage-limit dialog is gone, so it
+    clears the exhaustion. Any other outcome counts one probe, which doubles
+    the wait before the next one.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose lane was woken.
+        result: Launcher result of the wake.
+    """
+    current = published_capacity(directory, name)
+    if current["state"] != "exhausted" or _instant(current.get("reset_at")):
+        return
+    if result == "accepted":
+        _clear_exhaustion(
+            directory, name, current, "wake-accepted", time.time()
+        )
+        return
+    record_capacity(
+        directory,
+        name,
+        {
+            **current,
+            "probes": int(current.get("probes") or 0) + 1,
+            "probed_at": time.time(),
+        },
+    )
 
 
 def _account_members(home: Path, manifest: dict, name: str) -> list[str]:
@@ -902,15 +1384,31 @@ def _worktree_check(participant: dict) -> tuple[bool | None, str]:
 
 
 def _mail_check(
-    home: Path, manifest: dict, name: str, after: float
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float,
 ) -> tuple[bool | None, str]:
-    """Reads whether the lane owes an old acknowledgement.
+    """Reads whether the lane owes a live, old acknowledgement.
+
+    Acknowledgement debt expires: a request past its recorded deadline or
+    superseded by a closed claim or a newer message no longer counts, and a
+    lane whose state record has held a state other than starting or working
+    for ``inactive_after``, or entered it on stale evidence, has its debt
+    suspended, since the lane is not reading mail at all. The lane's state
+    record decides this, never its activity file; a lane with no record yet
+    keeps its debt.
 
     Args:
         home: Private bridge state root.
+        directory: Private project state directory.
         manifest: Project manifest holding this participant.
         name: Participant that owns the lane.
         after: Seconds after which an unanswered acknowledgement counts.
+        inactive_after: Seconds a lane's recorded quiet state must be held
+            before it reads as stale.
 
     Returns:
         The check result and, when it failed, the age of the oldest item. An
@@ -918,6 +1416,16 @@ def _mail_check(
     """
     from agent_parley import checkpoints
 
+    record = condition(home, manifest["root"], name)
+    if (
+        record is not None
+        and record["state"] not in (lanes.STARTING, lanes.WORKING)
+        and (
+            time.time() - float(record["since"]) >= inactive_after
+            or "stale" in str(record["evidence"])
+        )
+    ):
+        return True, ""
     try:
         mail = checkpoints.mailbox(
             home, manifest["root"], manifest["participants"][name]["display"]
@@ -925,7 +1433,11 @@ def _mail_check(
     except (BridgeError, OSError, sqlite3.Error):
         return None, ""
     oldest = max(
-        (int(item["age_seconds"]) for item in mail["outstanding_ack"]),
+        (
+            int(item["age_seconds"])
+            for item in mail["outstanding_ack"]
+            if not item.get("overdue_seconds")
+        ),
         default=0,
     )
     if oldest >= after:
@@ -934,13 +1446,18 @@ def _mail_check(
 
 
 def fit(
-    home: Path, directory: Path, manifest: dict, name: str, after: float
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float = DEFAULTS["inactive_after"],
 ) -> dict:
     """Reports whether a lane could take more work right now.
 
     Offering work to a lane that cannot take it stalls twice, so every offer
-    is checked first against what the runtime can read locally: the recorded
-    session process, the lane's own client records, its worktree, and the
+    is checked first against what the runtime can read locally: the lane's
+    state record, its provider capacity, its worktree, and the
     acknowledgements it owes. Each check defaults to no opinion, and only a
     check that actually failed makes a lane unfit.
 
@@ -953,18 +1470,52 @@ def fit(
         manifest: Project manifest holding this participant.
         name: Participant whose lane is being considered.
         after: Seconds after which an unanswered item blocks an offer.
+        inactive_after: Age past which the lane's activity reads as stale,
+            which suspends its acknowledgement debt.
 
     Returns:
         Whether the lane is fit, each check's result, the names of the failed
         checks and one line naming the first failure.
     """
+    return _once_per_poll(
+        ("fit", str(directory), name, after, inactive_after),
+        lambda: _fit_reading(
+            home, directory, manifest, name, after, inactive_after
+        ),
+    )
+
+
+def _fit_reading(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    after: float,
+    inactive_after: float,
+) -> dict:
+    """Takes the readings behind `fit` for one lane.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Project manifest holding this participant.
+        name: Participant whose lane is being considered.
+        after: Seconds after which an unanswered item blocks an offer.
+        inactive_after: Age past which the lane's activity reads as stale,
+            which suspends its acknowledgement debt.
+
+    Returns:
+        The fitness record `fit` reports.
+    """
     participant = manifest["participants"][name]
     observed_capacity = capacity(home, directory, manifest, name)
     results = {
-        "session": _session_check(directory, name),
+        "session": _session_check(home, manifest["root"], name),
         "capacity": _capacity_check(observed_capacity),
         "worktree": _worktree_check(participant),
-        "mail": _mail_check(home, manifest, name, after),
+        "mail": _mail_check(
+            home, directory, manifest, name, after, inactive_after
+        ),
     }
     failed = [check for check in FIT_CHECKS if results[check][0] is False]
     return {
@@ -989,6 +1540,12 @@ def stranded_claims(
     nor establish that a live owner stopped editing. Recovery must record its
     own transition and fence the prior claim generation before any transfer.
 
+    An exhausted observation that names no session, because the lane had
+    published none when its client reported the limit, yields no candidate:
+    recovery fences a transfer to the owner's session, so a candidate without
+    one could never be acted on, and it must not stop the snapshot of every
+    other lane's candidates from being recorded.
+
     Args:
         manifest: Project manifest holding every participant.
         ledger: Current issue ledger.
@@ -996,7 +1553,10 @@ def stranded_claims(
 
     Returns:
         One candidate per unfinished owned issue. A candidate with no eligible
-        peers remains in the result as a durable wait obligation.
+        peers remains in the result as a durable wait obligation. An
+        exhaustion that names no source, session or observation is left out:
+        recovery could never verify it, and publishing it would reject the
+        whole snapshot and stop the poll for every lane of the project.
     """
     owned = issues.holders(ledger)
     eligible = [
@@ -1007,7 +1567,10 @@ def stranded_claims(
     candidates = []
     for owner, numbers in sorted(owned.items()):
         observed = results.get(owner, {}).get("capacity", UNKNOWN_CAPACITY)
-        if observed.get("state") != "exhausted":
+        if observed.get("state") != "exhausted" or not all(
+            observed.get(key)
+            for key in ("source", "session_id", "observation_id")
+        ):
             continue
         peers = [name for name in eligible if name != owner]
         reset_at = observed.get("reset_at")
@@ -1124,16 +1687,125 @@ def idle_seconds(directory: Path, name: str) -> int:
     """
     from agent_parley import metrics
 
-    return next(
-        (
-            int(interval["seconds"])
-            for interval in reversed(
-                metrics.idle_intervals(directory, name)["intervals"]
-            )
-            if interval.get("open")
+    return _once_per_poll(
+        ("idle", str(directory), name),
+        lambda: next(
+            (
+                int(interval["seconds"])
+                for interval in reversed(
+                    metrics.idle_intervals(directory, name)["intervals"]
+                )
+                if interval.get("open")
+            ),
+            0,
         ),
-        0,
     )
+
+
+@contextlib.contextmanager
+def poll_readings() -> Iterator[None]:
+    """Shares each lane's fitness and idle readings across one poll.
+
+    Every lane's work backlog used to read fitness and idle time again for
+    every peer, so one poll took a number of `git status` calls, capacity
+    readings and event-log scans that grew with the square of the lane
+    count. Inside this scope each reading is taken once per lane and reused
+    until the scope ends or `forget_poll_readings` drops it.
+
+    Yields:
+        None; the readings are kept for the calling thread only.
+    """
+    token = _POLL_READINGS.set({})
+    try:
+        yield
+    finally:
+        _POLL_READINGS.reset(token)
+
+
+def forget_poll_readings() -> None:
+    """Drops the readings shared so far, after a step that changes them."""
+    readings = _POLL_READINGS.get()
+    if readings is not None:
+        readings.clear()
+
+
+def _once_per_poll[T](key: tuple, measure: Callable[[], T]) -> T:
+    """Returns one reading, taken once per poll when a poll scope is open.
+
+    Args:
+        key: Reading kind and the lane it belongs to.
+        measure: Takes the reading when this poll has not yet.
+
+    Returns:
+        A private copy of the reading, so no caller can alter what the next
+        caller in the same poll sees.
+    """
+    readings = _POLL_READINGS.get()
+    if readings is None:
+        return measure()
+    if key not in readings:
+        readings[key] = measure()
+    return cast(T, copy.deepcopy(readings[key]))
+
+
+def branch_completion(root: Path, branch: str) -> tuple[str, float] | None:
+    """Reads how a lane branch's newest pull request ended, briefly cached.
+
+    Each reading is one forge request that may take seconds, and a poll used
+    to repeat it for every owning lane on every poll. A reading is reused for
+    `COMPLETION_TTL` seconds per repository and branch. An expired reading
+    is still returned while one background thread per key replaces it, so
+    a poll never waits on the forge for a branch it has read before; a
+    merge is noticed at most one refresh after the reading expires. Only a
+    branch with no reading yet is read in the poll itself.
+
+    Args:
+        root: Repository that selects the forge project.
+        branch: Lane branch whose pull requests are read.
+
+    Returns:
+        The newest pull request's state and creation time, or None, as
+        `forge.branch_completion` reports them.
+    """
+    key = (str(root), branch)
+    now = time.monotonic()
+    cached = _COMPLETIONS.get(key)
+    if cached is None:
+        reading = forge.branch_completion(root, branch)
+        _COMPLETIONS[key] = (now, reading)
+        return reading
+    if now - cached[0] >= COMPLETION_TTL:
+        with _REFRESHING_LOCK:
+            start = key not in _REFRESHING
+            _REFRESHING.add(key)
+        if start:
+            threading.Thread(
+                target=_refresh_completion,
+                args=(root, branch, key),
+                name=f"completion {branch}",
+                daemon=True,
+            ).start()
+    return cached[1]
+
+
+def _refresh_completion(root: Path, branch: str, key: tuple[str, str]) -> None:
+    """Replaces one expired completion reading off the poll thread.
+
+    A failed forge read keeps the expired reading, and the next poll past
+    the TTL tries again.
+
+    Args:
+        root: Repository that selects the forge project.
+        branch: Lane branch whose pull requests are read.
+        key: Cache key for the repository and branch.
+    """
+    try:
+        with contextlib.suppress(Exception):
+            reading = forge.branch_completion(root, branch)
+            _COMPLETIONS[key] = (time.monotonic(), reading)
+    finally:
+        with _REFRESHING_LOCK:
+            _REFRESHING.discard(key)
 
 
 def published_work(directory: Path, name: str) -> dict:
@@ -1321,7 +1993,7 @@ def share_recipients(
             directory,
             manifest,
             name,
-            presence(directory, name, config["inactive_after"]),
+            recorded_presence(condition(home, manifest["root"], name), {}),
             ledger,
         )
     ]
@@ -1482,8 +2154,10 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         for name, participant in manifest["participants"].items()
         if not roster.retired(participant)
     ]
+    idle = config["inactive_after"]
     results = {
-        name: fit(home, directory, manifest, name, after) for name in serving
+        name: fit(home, directory, manifest, name, after, idle)
+        for name in serving
     }
     record_stranded_claims(
         directory, stranded_claims(manifest, ledger, results)
@@ -1503,8 +2177,9 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 )
         owned = issues.holders(ledger)
         available = lifecycle.actionable(ledger)
+        forget_poll_readings()
         results = {
-            name: fit(home, directory, manifest, name, after)
+            name: fit(home, directory, manifest, name, after, idle)
             for name in serving
         }
         record_stranded_claims(
@@ -1627,13 +2302,28 @@ def configuration(home: Path, manifest: dict) -> dict:
     return config
 
 
-def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
+def reminders(
+    directory: Path,
+    manifest: dict,
+    closed: set[str],
+    landed: dict[str, str] | None = None,
+) -> None:
     """Records idempotent reminders without releasing or transferring claims.
+
+    A `pull request ended` reminder asks the lane that holds the claim to
+    report it. Once that lane no longer owns the issue, whether it released,
+    handed off, was reclaimed or was resolved, the reminder asks for nothing
+    it can still do, so it is stamped answered and leaves the lane's wake
+    backlog, delivery and listing.
 
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
-        closed: Issues whose lane pull request is observed merged or closed.
+        closed: Issues observed closed, or whose pull request is observed
+            merged or closed, inside the current ownership generation.
+        landed: Another lane that landed the closing pull request, per issue
+            number, named in the reminder so the owner and the operator
+            reading it learn a peer finished the claim.
     """
     after_message_id = 0
     home = directory.parent.parent
@@ -1646,6 +2336,14 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
         ledger = issues.snapshot(directory)
         changed = False
         for number, record in ledger["issues"].items():
+            prompt = record.get("handoff_prompt") or {}
+            if (
+                prompt.get("trigger") == ENDED
+                and not prompt.get("responded_at")
+                and record.get("owner") != prompt.get("holder")
+            ):
+                prompt["responded_at"] = time.time()
+                changed = True
             waiting = sorted(
                 {
                     other["owner"]
@@ -1685,6 +2383,12 @@ def reminders(directory: Path, manifest: dict, closed: set[str]) -> None:
                     "with the "
                     "commit, verification and remaining work. Ownership "
                     "does not move until an explicit handoff."
+                    + (
+                        f" {(landed or {})[number]} landed the pull request "
+                        "that closed it."
+                        if (landed or {}).get(number)
+                        else ""
+                    )
                 ),
             }
             changed = True
@@ -1703,14 +2407,51 @@ def unresolved_reason(holder: str, reminders: int, observed: dict) -> str:
     )
 
 
+def observed_complete(record: dict) -> bool:
+    """Reports whether the current claim on an issue was observed finished.
+
+    The forge closing the issue, or the pull request that closes it ending,
+    inside the current ownership generation writes an `ENDED` completion
+    reminder to the holder and, once it goes unanswered, an unresolved
+    completion. Either says the work is done, so the claim is no longer
+    work a peer could take over.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        Whether the current generation carries an unresolved completion or
+        an `ENDED` reminder addressed to its owner.
+    """
+    if issues.unresolved_completion(record)["unresolved"]:
+        return True
+    prompt = record.get("handoff_prompt") or {}
+    return (
+        prompt.get("trigger") == ENDED
+        and bool(record.get("owner"))
+        and prompt.get("holder") == record.get("owner")
+        and float(prompt.get("created", 0) or 0) >= claimed_since(record)
+    )
+
+
 def completion_escalations(
-    directory: Path, manifest: dict, observed: dict, threshold: int
+    directory: Path,
+    manifest: dict,
+    observed: dict,
+    threshold: int,
+    window: float,
 ) -> None:
     """Escalates to the operator when a holder ignores completion reminders.
 
     Repeating a reminder at a lane that has stopped answering changes nothing,
-    so the supervisor counts the reminders it re-observes unanswered and, past
-    the project's threshold, records that the completion is unresolved. The
+    so the supervisor counts the reminders it left unanswered and, past the
+    project's threshold, records that the completion is unresolved. A
+    reminder is written once per identifier, then stays in the holder's wake
+    backlog, and a silent lane is asked for a turn at most once per inactive
+    window. The count is therefore the windows elapsed since the reminder
+    was first written, counting the first, and never the polls that
+    re-observed it: a poll every few seconds would otherwise escalate a
+    reminder the lane has had one chance to answer. The
     marker is an observation the operator acts on. Nothing moves here: the
     issue keeps its owner, its offer and its reservations, no peer gains any
     power over another lane's claim, and only an explicit operator resolution
@@ -1726,6 +2467,8 @@ def completion_escalations(
             inside the current ownership generation, carrying the branch, the
             pull request state and the instant it was observed.
         threshold: Unanswered reminders this project escalates after.
+        window: Seconds of silence after which a lane is asked again, the
+            span one unanswered reminder is counted over.
     """
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
@@ -1747,9 +2490,11 @@ def completion_escalations(
             seen = observed.get(number) or {}
             if current or not seen:
                 continue
-            counted = int(prompt.get("reminders", 0) or 0) + 1
-            prompt["reminders"] = counted
-            changed = True
+            elapsed = max(0.0, time.time() - float(prompt.get("created", 0)))
+            counted = 1 + int(elapsed // window)
+            if prompt.get("reminders") != counted:
+                prompt["reminders"] = counted
+                changed = True
             if counted < threshold:
                 continue
             record["unresolved_completion"] = {
@@ -1815,9 +2560,10 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
                 "waiting": waiting,
                 "created": time.time(),
                 "text": (
-                    f"Issue #{number} {cause}. {holder} still owns it: a "
-                    "deadline reports, it never transfers. Ask for a handoff "
-                    "or release it explicitly."
+                    f"Issue #{number} {cause}. {holder} still owns it while "
+                    "it works. Hand it off or release it explicitly; a holder "
+                    "that stays silent is woken, then offered away, then "
+                    "released by the supervisor."
                 ),
             }
             changed = True
@@ -1826,16 +2572,559 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
             write_json(directory / "issues.json", ledger)
 
 
-def dialog_waiting(directory: Path, name: str) -> bool:
+def deadline_defaults(directory: Path, manifest: dict) -> None:
+    """Gives every claim that has no deadline the project's claim default.
+
+    A claim made before the project recorded defaults, or through a path that
+    did not read them, carried no deadline and could never become overdue, so
+    no overdue transition could ever reach it. The default is measured from
+    the start of the current ownership generation, as it would have been had
+    it applied at claim time. A project with no claim default changes nothing.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    window = (manifest.get("deadlines") or {}).get("claim")
+    if not window:
+        return
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        changed = False
+        for record in ledger["issues"].values():
+            if not record.get("owner") or record.get("deadline"):
+                continue
+            start = claimed_since(record) or time.time()
+            record["deadline"] = start + float(window)
+            changed = True
+        if changed:
+            ledger["revision"] += 1
+            write_json(directory / "issues.json", ledger)
+
+
+def tool_silence(directory: Path, name: str) -> float | None:
+    """Measures how long a lane has gone without running a tool.
+
+    A session that starts, reads its context and ends without a tool call
+    did no work, yet it records native events that reset the ordinary
+    activity age. Only a tool call counts here, so a resume that ends
+    without work never extends a holder's apparent activity. A
+    `PreToolUse` counts while its session is still open, since a long tool
+    call is work in progress. One followed by `SessionEnd` before any
+    `PostToolUse` never completed, so a supervisor resume that starts a
+    tool and ends does not reset the silence clock.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose hook events are read.
+
+    Returns:
+        Seconds since the lane's latest counted tool event, or None when no
+        such event is retained or the event log cannot be read.
+    """
+    from agent_parley import checkpoints
+
+    try:
+        events = checkpoints.read_events(directory, name)
+    except (BridgeError, OSError, ValueError):
+        return None
+    latest = 0.0
+    pending = 0.0
+    for entry in events:
+        kind = entry.get("event")
+        stamp = float(entry.get("ts", 0) or 0)
+        if kind == "PostToolUse":
+            latest = max(latest, stamp)
+            pending = 0.0
+        elif kind == "PreToolUse":
+            pending = max(pending, stamp)
+        elif kind == "SessionEnd":
+            pending = 0.0
+    counted = max(latest, pending)
+    if not counted:
+        return None
+    return max(0.0, time.time() - counted)
+
+
+def holder_silent(
+    directory: Path, name: str, observed: dict, window: float
+) -> bool:
+    """Reports whether a claim holder has stopped doing work.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant holding the claim.
+        observed: Presence reading for that participant.
+        window: Seconds without a tool call that count as silence.
+
+    Returns:
+        Whether the holder's session process is gone, or its latest tool call
+        is older than the window. A holder with no retained tool call falls
+        back to whether its presence evidence is stale. A live holder parked
+        on a screen only the operator can answer (`dialogs.parked`) is not
+        silent: its quiet is the operator's to end, not the holder's.
+    """
+    if observed.get("process_alive") is False:
+        return True
+    path = directory / f"{name}-activity.json"
+    with contextlib.suppress(OSError, ValueError):
+        if dialogs.parked(json.loads(path.read_text())):
+            return False
+    silence = tool_silence(directory, name)
+    if silence is None:
+        return bool(observed.get("stale"))
+    return silence >= window
+
+
+def idle_claim(
+    directory: Path, record: dict, sole: bool, window: float, now: float
+) -> int:
+    """Measures how long one held claim has gone without progress of its own.
+
+    Lane liveness says nothing about which claim a lane works, so one busy
+    subagent kept every claim of its lane looking alive while all but one sat
+    untouched. A claim is measured by its own progress instead: its
+    generation start and the reports that name it. A lane that holds only
+    this claim is working on it whenever it runs a tool, so its tool calls
+    count too. Work that is blocked on a recorded condition or awaits
+    integration is waiting rather than idle, and an orphaned claim is the
+    orphan path's to move.
+
+    Args:
+        directory: Private project state directory.
+        record: Published ledger record of a held claim.
+        sole: Whether the holder holds no other claim.
+        window: Seconds without progress that make a claim idle.
+        now: Unix time the claim is measured at.
+
+    Returns:
+        Seconds the claim has gone without progress once that reaches the
+        window, else zero.
+    """
+    if record.get("orphan") or lifecycle.state(record)["state"] not in (
+        lifecycle.RUNNING,
+        lifecycle.RECOVERY,
+    ):
+        return 0
+    latest = issues.last_progress(record)
+    if (
+        sole
+        and (silence := tool_silence(directory, record["owner"])) is not None
+    ):
+        latest = max(latest, now - silence)
+    idle = int(now - latest)
+    return idle if latest and idle >= window else 0
+
+
+def _overdue_peer(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    config: dict,
+    observations: dict[str, dict],
+    holder: str,
+) -> str | None:
+    """Chooses the peer an overdue claim is offered to.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant.
+        holder: Participant holding the overdue claim.
+
+    Returns:
+        The fit, running peer below the project's claim cap that owns the
+        fewest claims, ties broken by name, or None when no peer qualifies.
+    """
+    ledger = issues.snapshot(directory)["issues"].values()
+    candidates = []
+    for name, participant in manifest["participants"].items():
+        observed = observations.get(name) or {}
+        if (
+            name == holder
+            or roster.retired(participant)
+            or participant.get("paused", False)
+            or observed.get("process_alive") is False
+        ):
+            continue
+        if not fit(
+            home,
+            directory,
+            manifest,
+            name,
+            config["stalled_after"],
+            config["inactive_after"],
+        )["fit"]:
+            continue
+        owned = sum(1 for record in ledger if record.get("owner") == name)
+        if owned >= config["max_claims_per_lane"]:
+            continue
+        candidates.append((owned, name))
+    return min(candidates)[1] if candidates else None
+
+
+def _overdue_summary(number: str, cause: str, checkpoint: dict) -> str:
+    """Words the handoff summary of a supervisor offer for a stuck claim.
+
+    Args:
+        number: Issue number being offered.
+        cause: Clause stating why the claim is moving.
+        checkpoint: Recovery checkpoint captured for the claim, or empty.
+
+    Returns:
+        One paragraph naming the cause and the checkpoint to resume from.
+    """
+    text = f"Supervisor offer: issue #{number} {cause}."
+    if not checkpoint:
+        return f"{text} No recovery checkpoint could be captured."
+    artifact = checkpoint.get("artifact") or {}
+    return (
+        f"{text} Recovery checkpoint {checkpoint['id']} holds its work at "
+        f"{checkpoint.get('worktree_commit', '')} on branch "
+        f"{checkpoint.get('branch') or '(detached)'}; bundle "
+        f"{artifact.get('reference', '')}."
+    )
+
+
+def _idle_blocker(
+    directory: Path, root: str, ledger: dict, number: str, idle: int
+) -> None:
+    """Tells the operator once that other issues wait on an idle claim.
+
+    A lane parked on an issue that waits on another lane's idle claim had no
+    signal of its own, so load moved only when the operator noticed by hand.
+    The claim records which issues wait on it while it has no progress, which
+    is what `status` reports, and the operator is notified once per claim
+    generation. The marker keeps its generation after progress resumes, so a
+    later idle stretch of the same claim notifies nothing further.
+
+    Args:
+        directory: Private project state directory.
+        root: Canonical project key the notification names.
+        ledger: Issue records read at the start of this poll.
+        number: Issue number of the held claim.
+        idle: Seconds the claim has gone without progress, or zero while it
+            is not idle.
+    """
+    record = ledger[number]
+    claim = record.get("claim_id")
+    current = record.get("idle_blocker") or {}
+    waiting = (
+        sorted(
+            (
+                other
+                for other, entry in ledger.items()
+                if number in entry.get("blocked_by", [])
+            ),
+            key=int,
+        )
+        if idle
+        else []
+    )
+    marker = (
+        {"claim_id": claim, "waiting": waiting}
+        if waiting or current.get("claim_id") == claim
+        else {}
+    )
+    if marker == current:
+        return
+    with lock(directory / "issues.lock", timeout=1):
+        state = issues.snapshot(directory)
+        written = state["issues"].get(number)
+        if not written or written.get("claim_id") != claim:
+            return
+        if marker:
+            written["idle_blocker"] = marker
+        else:
+            written.pop("idle_blocker", None)
+        state["revision"] += 1
+        write_json(directory / "issues.json", state)
+    if not waiting or current.get("claim_id") == claim:
+        return
+    try:
+        notify.deliver(
+            directory,
+            str(record.get("owner")),
+            notify.Event.IDLE_BLOCKER,
+            {
+                "repo": root,
+                "issue": number,
+                "claim": claim,
+                "detail": (
+                    f"no progress for {idle}s; "
+                    + ", ".join(f"#{other}" for other in waiting)
+                    + " waiting on it"
+                ),
+            },
+        )
+    except (BridgeError, OSError) as exc:
+        issues.note_supervision_error(directory, f"Notification: {exc}")
+
+
+def _overdue_step(
+    directory: Path,
+    number: str,
+    identifier: str,
+    step: str | None,
+    notice: str = "",
+) -> None:
+    """Records one overdue-claim step in the claim history and its attempts.
+
+    Args:
+        directory: Private project state directory.
+        number: Issue number the step applies to.
+        identifier: Claim generation the step belongs to.
+        step: Step taken, or None to clear the recorded recovery.
+        notice: Text told once to the holder and to the lanes whose issues
+            wait on this one, or empty to tell nothing beyond the step. A
+            cleared recovery also drops the notice it wrote.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        record = ledger["issues"].get(number)
+        if not record:
+            return
+        if step is None:
+            written = (record.get("deadline_notice") or {}).get("id", "")
+            dropped = written == f"idle:{identifier}" and bool(
+                record.pop("deadline_notice")
+            )
+            if not record.pop("overdue_recovery", None) and not dropped:
+                return
+        else:
+            now = time.time()
+            if notice:
+                record["deadline_notice"] = {
+                    "id": f"idle:{identifier}",
+                    "holder": record.get("owner"),
+                    "waiting": sorted(
+                        {
+                            other["owner"]
+                            for other in ledger["issues"].values()
+                            if number in other.get("blocked_by", [])
+                            and other.get("owner")
+                        }
+                    ),
+                    "created": now,
+                    "text": notice,
+                }
+            record["overdue_recovery"] = {
+                "id": identifier,
+                "step": step,
+                "at": now,
+            }
+            record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+            record.setdefault("history", []).append(
+                {
+                    "action": f"overdue-{step}",
+                    "actor": "supervisor",
+                    "at": now,
+                    "owner": record.get("owner"),
+                    "offer": record.get("offer"),
+                    "claim_id": record.get("claim_id"),
+                }
+            )
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+
+
+def overdue_claims(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    config: dict,
+    observations: dict[str, dict],
+) -> None:
+    """Moves a claim that is overdue while its holder does no work.
+
+    A deadline used to report and never transfer, and the report was injected
+    into the holder's own next hook. A holder that stopped working runs no
+    hook, so the report was never read and the claim sat overdue for days
+    while fresh lanes found nothing to take. A claim that is past its deadline
+    while its holder is silent now gets a terminating transition: one wake,
+    then an offer to the fittest peer with the claim's recovery checkpoint
+    attached, then release to the pool once that offer expires. Each step is
+    recorded in the claim history and counted in its attempts.
+
+    Silence is measured from tool calls, so a supervisor resume that ends
+    without work does not reset it. A holder that runs a tool again, or a
+    claim that is no longer overdue, drops the recorded recovery, and the
+    next breach starts over from the wake. A claim `observed_complete` is
+    never moved: its work is finished, and the completion reminder and the
+    operator's resolution are what end it.
+
+    A live holder does not protect a claim it does not work on. A claim with
+    no progress of its own for `claim_idle_after` takes the same transition
+    while its holder stays busy elsewhere, and its wake step tells the holder
+    and the lanes waiting on the issue why. Progress recorded on the claim
+    drops the recovery as a tool call does for a silent holder.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant for this poll.
+    """
+    from agent_parley import recovery
+
+    window = config["inactive_after"]
+    now = time.time()
+    ledger = issues.snapshot(directory)["issues"]
+    held = collections.Counter(
+        record.get("owner") for record in ledger.values()
+    )
+    for number, record in ledger.items():
+        holder = record.get("owner")
+        current = record.get("overdue_recovery") or {}
+        identifier = f"{number}:{record.get('claim_id')}"
+        timing = issues.deadline_state(record, now)
+        idle = 0
+        if (
+            holder in manifest["participants"]
+            and record.get("claim_id")
+            and (current.get("id") == identifier or not record.get("offer"))
+        ):
+            idle = idle_claim(
+                directory,
+                record,
+                held[holder] == 1,
+                config["claim_idle_after"],
+                now,
+            )
+        if record.get("claim_id"):
+            _idle_blocker(directory, manifest["root"], ledger, number, idle)
+        if (
+            holder not in manifest["participants"]
+            or not record.get("claim_id")
+            or observed_complete(record)
+            or not (
+                (
+                    timing["overdue"]
+                    and holder_silent(
+                        directory,
+                        holder,
+                        observations.get(holder) or {},
+                        window,
+                    )
+                )
+                or idle
+            )
+        ):
+            if current:
+                _overdue_step(directory, number, identifier, None)
+            continue
+        cause = (
+            f"is overdue by {timing['overdue_seconds']}s and {holder} stayed "
+            "silent after a wake"
+            if timing["overdue"] and not idle
+            else f"has recorded no progress for {idle}s while {holder} holds it"
+        )
+        elapsed = now - float(current.get("at", 0) or 0)
+        if current.get("id") != identifier:
+            _overdue_step(
+                directory,
+                number,
+                identifier,
+                "wake",
+                (
+                    f"Issue #{number} {cause}. Record progress with "
+                    f"agent-parley report partial --issue {number}, or offer "
+                    "or release it; otherwise the supervisor offers it to an "
+                    "idle peer, then releases it."
+                )
+                if idle
+                else "",
+            )
+        elif current.get("step") == "wake" and elapsed >= window:
+            peer = _overdue_peer(
+                home, directory, manifest, config, observations, holder
+            )
+            if peer is None:
+                _overdue_step(directory, number, identifier, "release")
+                issues.change(
+                    directory,
+                    holder,
+                    "release",
+                    number,
+                    participants=set(manifest["participants"]),
+                )
+                continue
+            checkpoint: dict = {}
+            with contextlib.suppress(BridgeError, OSError, ValueError):
+                checkpoint = next(
+                    (
+                        item
+                        for item in recovery.capture(
+                            directory, manifest, holder
+                        )
+                        if item.get("claim_id") == record.get("claim_id")
+                    ),
+                    {},
+                )
+            if record.get("offer"):
+                issues.change(
+                    directory,
+                    holder,
+                    "cancel",
+                    number,
+                    participants=set(manifest["participants"]),
+                )
+            issues.change(
+                directory,
+                holder,
+                "offer",
+                number,
+                participants=set(manifest["participants"]),
+                to=peer,
+                summary=_overdue_summary(number, cause, checkpoint),
+                carried={
+                    "commit": checkpoint.get("worktree_commit", ""),
+                    "remaining": checkpoint.get("remaining", []),
+                },
+                defaults=manifest.get("deadlines") or {},
+            )
+            _overdue_step(directory, number, identifier, "offer")
+        elif current.get("step") == "offer":
+            offer = record.get("offer") or {}
+            expired = (
+                issues.offer_state(offer, now)["overdue"]
+                if offer.get("deadline")
+                else elapsed >= config["stalled_after"]
+            )
+            if offer and not expired:
+                continue
+            _overdue_step(directory, number, identifier, "release")
+            if offer:
+                issues.change(
+                    directory,
+                    holder,
+                    "cancel",
+                    number,
+                    participants=set(manifest["participants"]),
+                )
+            issues.change(
+                directory,
+                holder,
+                "release",
+                number,
+                participants=set(manifest["participants"]),
+            )
+
+
+def dialog_waiting(home: Path, root: str, name: str) -> bool:
     """Reports whether the lane's own state reads as a dialog on its screen.
 
     The lane's last wake outcome is the only local reading that distinguishes
     a session waiting for the operator from one working, so it is the
-    predicate every caller uses. A screen watcher that records a dialog
-    through the same lane state is read here without further change.
+    predicate every caller uses. It is read from the wake fields of the
+    lane's state.
 
     Args:
-        directory: Private project state directory.
+        home: Private bridge state root.
+        root: Canonical project key.
         name: Participant that owns the lane.
 
     Returns:
@@ -1843,14 +3132,12 @@ def dialog_waiting(directory: Path, name: str) -> bool:
         no recorded wake outcome reads as not waiting, because an absent
         record is no evidence of a dialog.
     """
-    try:
-        wake = json.loads((directory / f"{name}-wake.json").read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(wake, dict) and wake.get("result") in DIALOG_WAKES
+    return wake_record(home, root, name).get("result") in DIALOG_WAKES
 
 
-def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
+def unacknowledged_reason(
+    home: Path, directory: Path, root: str, name: str, observed: dict
+) -> str:
     """States in one clause why a lane did not acknowledge in time.
 
     Only what the runtime can read locally is reported: the recorded session
@@ -1859,7 +3146,9 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     itself, so a lane that reads as available is reported as exactly that.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
+        root: Canonical project key.
         name: Participant that owes the acknowledgement.
         observed: That lane's presence reading.
 
@@ -1868,7 +3157,7 @@ def unacknowledged_reason(directory: Path, name: str, observed: dict) -> str:
     """
     if observed.get("state") == STOPPED:
         return "has no running session"
-    if dialog_waiting(directory, name):
+    if dialog_waiting(home, root, name):
         return "has a native dialog waiting for the operator"
     state = published_capacity(directory, name)["state"]
     if state == "exhausted":
@@ -1915,7 +3204,13 @@ def acknowledgement_deadlines(
             for display in breach["recipients"]:
                 observed = observations.get(named.get(display, display))
                 reason = (
-                    unacknowledged_reason(directory, named[display], observed)
+                    unacknowledged_reason(
+                        home,
+                        directory,
+                        manifest["root"],
+                        named[display],
+                        observed,
+                    )
                     if observed
                     else "is not a participant in this project"
                 )
@@ -1974,7 +3269,7 @@ def share_blocker(
     """
     if observed.get("state") == STOPPED:
         return "has no live session process"
-    if dialog_waiting(directory, name):
+    if dialog_waiting(home, manifest["root"], name):
         return "has a native dialog waiting for the operator"
     if capacity(home, directory, manifest, name)["state"] == "exhausted":
         return "has exhausted its provider capacity"
@@ -2122,12 +3417,10 @@ def share_bounces(
             )
 
 
-def orphan_reason(name: str, observed: dict) -> str:
+def orphan_reason(name: str, record: dict) -> str:
     """States why a lane's claims read as orphaned, in one clause."""
-    return (
-        f"{name} has no running session process and has been silent for "
-        f"{int(observed['age_seconds'] or 0)}s"
-    )
+    seen = f": {record['evidence']}" if record.get("evidence") else ""
+    return f"{name} is dead and has no running session process{seen}"
 
 
 def orphan_marker(numbers: list[str], keys: list[str]) -> str:
@@ -2145,6 +3438,9 @@ def orphan_marker(numbers: list[str], keys: list[str]) -> str:
 def _dead(observed: dict, after: float) -> bool:
     """Reports whether a lane is gone rather than merely quiet.
 
+    Only a lane with no state record yet is judged this way; a recorded
+    lane is dead when its record says so.
+
     Args:
         observed: Presence reading for the lane.
         after: Seconds of silence the project counts as a stall.
@@ -2153,10 +3449,14 @@ def _dead(observed: dict, after: float) -> bool:
         Whether the recorded session process is gone and the lane has been
         silent for longer than that threshold. A live lane is never dead
         however long it has been idle, and a lane that recorded no activity
-        at all has no age to measure, so it is left alone.
+        at all has no age to measure, so it is left alone. A lane whose last
+        event was a clean `SessionEnd` has no process left to check, and
+        that recorded end counts as a known stop; a lane that never recorded
+        one keeps an unknown process out of this reading.
     """
+    stopped = observed["process_alive"] is False or bool(observed.get("ended"))
     return (
-        observed["process_alive"] is False
+        stopped
         and observed["age_seconds"] is not None
         and observed["age_seconds"] >= after
     )
@@ -2197,11 +3497,18 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
 
     Nothing moves here. The issue keeps its owner, the reservations keep their
     holder, and only an explicit ``issue claim --take-orphaned`` by a peer
-    transfers either. A lane that is merely idle is never marked.
+    transfers either. A recorded lane is marked only when its state record
+    is `dead`, so a lane that is idle or stopped for less than the stall
+    threshold is never marked, whatever its activity file says. A lane with
+    no record yet, which the poll could not seed because its process
+    identity is unknown, falls back to `_dead` on its presence reading, so
+    the safety net never waits on a record. The marker is keyed by the time
+    the lane entered `dead`, so a lane that dies again is announced again.
 
     A marker is an observation, not a verdict, so it is withdrawn as soon as
-    the observation stops holding: a lane whose recorded session process is
-    running again loses the marker on its claims and keeps those claims. The
+    the observation stops holding: a lane whose state is live again, or an
+    unrecorded lane whose session process runs, loses the marker on its
+    claims and keeps those claims. The
     alternative left the ledger reporting a claim as orphaned while takeover
     read the owner as live and refused, so the remedy the marker printed could
     never succeed. A marker published by authorized live recovery survives,
@@ -2214,19 +3521,39 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         config: Resolved supervision settings.
     """
     after = config["stalled_after"]
-    observations = {
-        name: presence(directory, name, config["inactive_after"])
+    records = {
+        name: condition(home, manifest["root"], name)
         for name in manifest["participants"]
     }
-    dead = {
-        name: observed
-        for name, observed in observations.items()
-        if _dead(observed, after)
+    unrecorded = {
+        name: presence(directory, name, config["inactive_after"])
+        for name, record in records.items()
+        if record is None
     }
+    dead = {
+        name: record
+        for name, record in records.items()
+        if record is not None and record["state"] == lanes.DEAD
+    }
+    dead.update(
+        {
+            name: {
+                "evidence": f"silent for {int(observed['age_seconds'])}s",
+                "since": observed["last_active"] or 0,
+            }
+            for name, observed in unrecorded.items()
+            if _dead(observed, after)
+        }
+    )
     returned = [
         name
-        for name, observed in observations.items()
-        if name not in dead and observed["process_alive"] is True
+        for name, record in records.items()
+        if name not in dead
+        and (
+            unrecorded[name]["process_alive"] is True
+            if record is None
+            else record["state"] in lanes.LIVE
+        )
     ]
     if not dead and not returned:
         return
@@ -2250,13 +3577,13 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     with lock(directory / "issues.lock", timeout=1):
         ledger = issues.snapshot(directory)
         changed = False
-        for name, observed in dead.items():
+        for name, lane in dead.items():
             if name not in recoverable:
                 continue
             keys = reservations.get(
                 manifest["participants"][name]["display"], []
             )
-            reason = orphan_reason(name, observed)
+            reason = orphan_reason(name, lane)
             marked = []
             fresh = False
             for number, record in ledger["issues"].items():
@@ -2268,7 +3595,7 @@ def orphans(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                     continue
                 identifier = (
                     f"{name}:{record.get('claim_id') or number}:"
-                    f"{int(observed['last_active'] or 0)}"
+                    f"{int(lane['since'])}"
                 )
                 marked.append(number)
                 if record.get("orphan", {}).get("id") == identifier:
@@ -2384,30 +3711,152 @@ def _announce_return(
             )
 
 
-def claimed_since(record: dict) -> float:
-    """Reports when the current ownership generation of an issue began.
+claimed_since = issues.claimed_since
 
-    A lane branch is reused across claims, so a pull request that ended before
-    the current claim started describes earlier work and must not report that
-    claim as finished. The generation starts at the most recent claim or
-    accepted handoff; a record whose history no longer names one is treated as
-    having always been owned, which preserves the previous observation. A take
-    of an orphaned claim starts a generation like any other claim.
+
+ISSUE_READING_SECONDS = 300.0
+_issue_readings: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+def _issue_reading(root: Path, number: str) -> dict | None:
+    """Reads one issue's forge completion, reusing a recent reading.
+
+    The supervisor polls every few seconds and a forge round trip costs about
+    a second, so one reading per issue is reused for
+    `ISSUE_READING_SECONDS`. A failed reading is never kept, so a forge that
+    comes back is read again on the next poll.
+    """
+    key = (str(root), number)
+    kept = _issue_readings.get(key)
+    if kept and time.time() - kept[0] < ISSUE_READING_SECONDS:
+        return kept[1]
+    reading = forge.issue_completion(root, number)
+    if reading is None:
+        _issue_readings.pop(key, None)
+    else:
+        _issue_readings[key] = (time.time(), reading)
+    return reading
+
+
+def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
+    """Observes which claimed issues ended inside their ownership generation.
+
+    Completion is read per issue: the forge's issue state and the pull
+    request it links as closing the issue decide it, whichever branch that
+    pull request came from. Lanes that open one pull request per issue never
+    merge their lane branch, and a lane branch merge says nothing about which
+    claim it closed. Only when the forge cannot say anything about an issue
+    does the lane branch's newest pull request speak for it.
 
     Args:
-        record: Published ledger record for one issue.
+        manifest: Current participant manifest.
+        ledger: Published issue ledger.
 
     Returns:
-        Unix time the current ownership generation began, or zero.
+        One observation per ended issue number: the branch the work landed
+        from, the pull request state, the instant it was observed and, when
+        the forge named one, the closing pull request's number, URL and merge
+        commit. `landed_by` names another lane whose lane branch carried the
+        closing pull request, or whose worktree alone checked out the
+        per-issue branch it came from.
     """
-    return max(
-        (
-            float(entry.get("at", 0) or 0)
-            for entry in record.get("history", [])
-            if entry.get("action") in {"claim", "accept", "take"}
-        ),
-        default=0.0,
-    )
+    root = Path(manifest["root"])
+    lanes = {
+        participant["branch"]: name
+        for name, participant in manifest["participants"].items()
+    }
+    ended: dict[str, dict] = {}
+    for name, participant in manifest["participants"].items():
+        branch: tuple[str, float] | None = None
+        branch_read = False
+        for number, record in ledger["issues"].items():
+            if record.get("owner") != name:
+                continue
+            since = claimed_since(record)
+            reading = _issue_reading(root, number)
+            if reading is None:
+                if not branch_read:
+                    branch = branch_completion(root, participant["branch"])
+                    branch_read = True
+                if (
+                    branch is None
+                    or branch[0] not in {"MERGED", "CLOSED"}
+                    or branch[1] < since
+                ):
+                    continue
+                ended[number] = {
+                    "branch": participant["branch"],
+                    "state": branch[0],
+                    "observed_at": time.time(),
+                }
+                continue
+            if reading["state"] not in {"MERGED", "CLOSED"}:
+                continue
+            if reading["closed_at"] < since:
+                continue
+            seen = {
+                "branch": reading["branch"] or f"issue #{number}",
+                "state": reading["state"],
+                "observed_at": time.time(),
+                "pull_request": reading["pull_request"],
+                "url": reading["url"],
+                "commit": reading["commit"],
+            }
+            landed = lanes.get(reading["branch"])
+            if not landed and reading["branch"]:
+                landed = branch_lane(manifest, reading["branch"])
+            if landed and landed != name:
+                seen["landed_by"] = landed
+            ended[number] = seen
+    return ended
+
+
+def branch_lane(manifest: dict, branch: str) -> str:
+    """Names the one lane whose worktree checked out a per-issue branch.
+
+    Every lane shares one repository and pushes as the same forge account,
+    so neither the branch ref nor the pull request author says which lane
+    made a branch. Each worktree keeps its own HEAD reflog, though, and a
+    checkout records the branch it moved to. A branch exactly one lane's
+    reflog moved to is that lane's; a branch no lane or several lanes moved
+    to is attributed to nobody.
+
+    Args:
+        manifest: Current participant manifest.
+        branch: Head branch of the closing pull request.
+
+    Returns:
+        The participant name, or an empty string when the branch cannot be
+        attributed to exactly one lane.
+    """
+    moved = f" to {branch}"
+    owners = []
+    for name, participant in manifest["participants"].items():
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(participant["lane"]),
+                    "reflog",
+                    "show",
+                    "--format=%gs",
+                    "HEAD",
+                    "--",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and any(
+            line.startswith("checkout: moving from ") and line.endswith(moved)
+            for line in result.stdout.splitlines()
+        ):
+            owners.append(name)
+    return owners[0] if len(owners) == 1 else ""
 
 
 def reported_since(directory: Path, name: str, since: float) -> bool:
@@ -2553,7 +4002,14 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     it never runs on the ordinary thirty second cadence. Its outcome is
     published whether it succeeded, refused or failed, which both bounds the
     next attempt and gives the operator the account of what was removed and
-    what was kept.
+    what was kept. The worktrees lanes made for themselves are swept in the
+    same pass and published beside the lanes, without their sizes, because
+    measuring them walks every file they hold. The state directory's total
+    size and the count of worktrees still left for a reclaim are measured
+    here once, so `status` reports both without walking the disk itself.
+    Every lane the sweep removed requests the `reclaimed` transition of its
+    state; the transition table refuses it, and records the refusal, for a
+    lane whose state is not `stopped` or `dead`.
 
     Args:
         home: Private bridge state root.
@@ -2566,16 +4022,158 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     if not reclaim_due(directory, now, RECLAIM_INTERVAL):
         return
     rows: list[dict] = []
+    made: list[dict] = []
+    bridge = cli.Bridge(home)
     try:
-        rows = cli.Bridge(home).reclaim(Path(manifest["root"]), apply=True)
+        rows = bridge.reclaim(Path(manifest["root"]), apply=True)
+        made = bridge.reclaim_worktrees(Path(manifest["root"]), apply=True)
     except BridgeError:
-        rows = []
+        pass
     finally:
+        left = [row for row in made if not row.get("removed")]
         with contextlib.suppress(OSError):
             write_json(
                 directory / RECLAIM_PUBLICATION,
-                {"swept": now, "lanes": rows},
+                {
+                    "swept": now,
+                    "lanes": rows,
+                    "worktrees": made,
+                    "state_bytes": reclaim.size(directory),
+                    "reclaimable": sum(row["reclaim"] for row in left),
+                    "forceable": sum(reclaim.forceable(row) for row in left),
+                },
             )
+    removed = [row["participant"] for row in rows if row.get("removed")]
+    if removed:
+        with store.connect(home, write=True) as db:
+            for name in removed:
+                lanes.transition(
+                    db,
+                    manifest["root"],
+                    name,
+                    lanes.RECLAIMED,
+                    evidence="reclaim removed the lane after its work landed",
+                )
+
+
+def reclaim_summary(directory: Path) -> dict:
+    """Reads what the last sweep measured for one project.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        The state directory's size in bytes, the worktrees a reclaim would
+        remove and the further ones only a forced reclaim would, and when
+        they were measured; every value is None before the first sweep.
+    """
+    try:
+        published = json.loads((directory / RECLAIM_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        published = {}
+    if not isinstance(published, dict):
+        published = {}
+    return {
+        key: published.get(key)
+        for key in ("state_bytes", "reclaimable", "forceable", "swept")
+    }
+
+
+def root_retired(directory: Path) -> bool:
+    """Reports whether the supervisor retired a project whose root is gone.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        True once `missing_root` published the project's retirement.
+    """
+    try:
+        published = json.loads((directory / ROOT_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(published, dict) and bool(published.get("retired"))
+
+
+def missing_root(
+    home: Path, directory: Path, manifest: dict, config: dict
+) -> None:
+    """Retires a project whose root checkout has been gone an interval.
+
+    A root removed under a live project, such as a temporary directory a
+    reboot wiped, leaves every lane reported as an unavailable worktree and
+    every status poll walking it. The first poll that finds the root gone
+    only records when; a root still gone one supervision interval later is
+    a root that is not coming back. Each lane that has not retired is then
+    captured into a recovery checkpoint where Git can still read it,
+    retired through `retirement.withdraw`, which releases its claims and
+    declines offers made to it, and its credential is invalidated. The
+    publication names, per lane, the claims released and the checkpoint
+    each one left, fresh or from an earlier capture, so whoever takes the
+    issue next can restore the work. It names the state directory for the
+    operator to remove;
+    nothing here deletes it. A root that reappears clears the record on the
+    next poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+    """
+    from agent_parley import recovery, retirement
+
+    path = directory / ROOT_PUBLICATION
+    now = time.time()
+    try:
+        recorded = json.loads(path.read_text())
+    except (OSError, ValueError):
+        recorded = {}
+    since = recorded.get("since") if isinstance(recorded, dict) else None
+    if not isinstance(since, int | float) or isinstance(since, bool):
+        write_json(
+            path,
+            {"since": now, "retired": None, "state_directory": str(directory)},
+        )
+        return
+    if recorded.get("retired") or now - since < config["interval"]:
+        return
+    lanes = []
+    for name, participant in manifest["participants"].items():
+        if roster.retired(participant):
+            continue
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            recovery.capture(directory, manifest, name)
+        checkpoints = {}
+        for number, record in issues.snapshot(directory)["issues"].items():
+            if record.get("owner") != name or not record.get("claim_id"):
+                continue
+            with contextlib.suppress(BridgeError):
+                checkpoints[number] = recovery.checkpoint(
+                    directory, number, str(record["claim_id"])
+                )["id"]
+        try:
+            report = retirement.withdraw(directory, name)
+        except BridgeError:
+            continue
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.revoke(home, manifest["root"], participant["display"])
+        lanes.append(
+            {
+                "participant": name,
+                "released": report["released"],
+                "checkpoints": checkpoints,
+            }
+        )
+    write_json(
+        path,
+        {
+            "since": since,
+            "retired": now,
+            "state_directory": str(directory),
+            "lanes": lanes,
+        },
+    )
 
 
 def poll(home: Path, directory: Path) -> None:
@@ -2585,6 +4183,9 @@ def poll(home: Path, directory: Path) -> None:
     so a message whose time or condition has just arrived is part of the
     backlog this same poll may wake the lane for.
 
+    A host restart since the previous poll is settled before anything else,
+    so no part of this poll reads a session the restart ended as alive.
+
     Launches are judged against their start deadline first, so a lane whose
     client never reported a native hook is published as not started before this
     same poll reads presence, publishes fitness and considers a wake.
@@ -2593,15 +4194,198 @@ def poll(home: Path, directory: Path) -> None:
     the sweep decides on this poll's observation of each holder rather than
     the previous one. A store that is busy or unreadable reclaims nothing
     this round rather than failing the poll.
+
+    The presence reading is evidence only. It is applied to the lane state
+    records first, and every later stage, the published presence row the
+    lease sweep reads included, is given the reading `recorded_presence`
+    derives from those records instead.
+
+    A project whose root checkout no longer exists is handed to
+    `missing_root` and polled no further, because every other step reads
+    Git or wakes a lane that has no repository left to work in.
+
+    Every stage after the manifest is read runs isolated from the others. One
+    stage that raises used to skip every later one, so a single malformed
+    record stopped the wake loop and lane reclaim for the whole project while
+    the service still reported healthy. A failing stage is now recorded, the
+    rest of the poll still runs, and the failures are published beside the
+    issue ledger where status and problems report them; a poll in which every
+    stage succeeded clears that record. A stage catches every exception, and
+    its record names the stage, the lane a wake belongs to and the line that
+    raised, so one lane's failure never starves the lanes after it.
+
+    Each poll records when it finished, how long it took and when the last
+    clean poll finished, which status reports as the supervisor's liveness.
+    The record also holds the wall seconds of each stage, so a slow poll
+    names the stage that made it slow.
+
+    Fitness and idle readings are taken once per lane per poll and shared by
+    every lane's backlog, so the poll's cost grows with the lane count rather
+    than with its square.
     """
+    with poll_readings():
+        _poll(home, directory)
+
+
+def _poll(home: Path, directory: Path) -> None:
+    """Runs one poll inside a shared reading scope, as `poll` describes."""
     manifest = roster.read(directory)
     config = configuration(home, manifest)
-    launches(directory, manifest, config)
+    if not Path(manifest["root"]).exists():
+        missing_root(home, directory, manifest, config)
+        return
+    (directory / ROOT_PUBLICATION).unlink(missing_ok=True)
+    failures: list[str] = []
+    stages: dict[str, float] = {}
+    started = time.time()
+
+    def stage(label: str, call: Callable[..., object], *args: object) -> None:
+        """Runs one poll stage, recording rather than raising its failure."""
+        begun = time.time()
+        try:
+            call(*args)
+        except Exception as exc:
+            failures.append(failure(label, exc))
+        stages[label] = round(time.time() - begun, 3)
+
+    stage("reboot", settle_reboot, home, directory, manifest)
+    stage("launches", launches, directory, manifest, config)
+    stage("readings", refresh_readings, home, manifest, 2 * config["interval"])
+    stage("lane evidence", settle_evidence, home, directory, manifest)
     observations = {
         name: presence(directory, name, config["inactive_after"])
         for name in manifest["participants"]
     }
-    with store.connect(home, write=True, timeout=0) as db:
+    stage("lane states", settle_lanes, home, manifest, config, observations)
+    stage("lane accounting", account_lanes, home, directory, manifest)
+    observations = recorded_observations(home, manifest, observations)
+    stage("presence", _publish_presence, home, manifest, observations)
+    with contextlib.suppress(BridgeError, sqlite3.Error):
+        store.reclaim_expired(home, manifest["root"])
+    stage("deliveries", deliveries, home, directory, manifest)
+    stage("dependencies", lifecycle.settle_dependencies, directory)
+    if config["prompts"]:
+        stage(
+            "completions",
+            _remind,
+            home,
+            directory,
+            manifest,
+            config,
+            observations,
+            stage,
+        )
+        stage("work", work, home, directory, manifest, config)
+        stage(
+            "overdue claims",
+            overdue_claims,
+            home,
+            directory,
+            manifest,
+            config,
+            observations,
+        )
+        stage(
+            "takeover requests",
+            issues.grant_requests,
+            directory,
+            config["takeover_grace"],
+            manifest.get("deadlines") or {},
+        )
+    if config["wake"]:
+        for name, participant in manifest["participants"].items():
+            if participant.get("wake", True):
+                stage(
+                    f"wake {name}",
+                    wake,
+                    home,
+                    directory,
+                    manifest,
+                    name,
+                    observations[name],
+                    config,
+                )
+    if config["reclaim"]:
+        stage("reclaim lanes", reclaim_lanes, home, directory, manifest)
+    if failures:
+        issues.note_supervision_error(directory, "; ".join(failures))
+    else:
+        with contextlib.suppress(OSError):
+            (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
+    finished = time.time()
+    with contextlib.suppress(OSError):
+        write_json(
+            directory / POLL_RECORD,
+            {
+                "at": finished,
+                "seconds": round(finished - started, 3),
+                "failed": len(failures),
+                "clean_at": (
+                    finished
+                    if not failures
+                    else last_poll(directory).get("clean_at")
+                ),
+                "stages": stages,
+            },
+        )
+
+
+def failure(label: str, exc: BaseException) -> str:
+    """Describes a failed poll step with the line that raised it.
+
+    Args:
+        label: Poll stage, naming the lane when the step belongs to one.
+        exc: Exception the step raised.
+
+    Returns:
+        The stage, the exception type and text, and the innermost frame that
+        raised it, so a recorded failure can be traced without the log.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = (
+        f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}"
+        if frames
+        else ""
+    )
+    return f"{label}: {type(exc).__name__}: {exc}{where}"
+
+
+def last_poll(directory: Path) -> dict:
+    """Reads when supervision last finished a poll of one project.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        The finish time, the wall seconds it took, how many steps failed and
+        when the last poll with no failed step finished, or an empty mapping
+        when no poll has been recorded or the record is unreadable.
+    """
+    try:
+        value = json.loads((directory / POLL_RECORD).read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _publish_presence(
+    home: Path, manifest: dict, observations: dict[str, dict]
+) -> None:
+    """Publishes every lane's presence as its state record reads it.
+
+    The row is a copy published from the lane state, so the lease sweep
+    and the send warnings that read it agree with every other decision.
+
+    The write waits `store.BUSY_TIMEOUT` like every other writer. It used to
+    give up at once, so under steady hook traffic the presence reading was
+    skipped on the polls that needed it most.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        observations: `recorded_presence` per participant.
+    """
+    with store.connect(home, write=True) as db:
         for name, participant in manifest["participants"].items():
             observed = observations[name]
             db.execute(
@@ -2620,62 +4404,230 @@ def poll(home: Path, directory: Path) -> None:
                     participant["display"],
                 ),
             )
-    with contextlib.suppress(BridgeError, sqlite3.Error):
-        store.reclaim_expired(home, manifest["root"])
-    deliveries(home, directory, manifest)
-    if config["prompts"]:
-        closed: set[str] = set()
-        ended: dict[str, dict] = {}
-        ledger = issues.snapshot(directory)
-        for name, participant in manifest["participants"].items():
-            claimed = {
-                number: claimed_since(record)
-                for number, record in ledger["issues"].items()
-                if record.get("owner") == name
-            }
-            if not claimed:
-                continue
-            completion = forge.branch_completion(
-                Path(manifest["root"]), participant["branch"]
+
+
+def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
+    """Applies the lane evidence hooks and screen watchers queued.
+
+    The queue is discarded only after the transaction that applied it
+    commits. A store that is busy raises out of this stage, so the queue is
+    kept and applied, still in order, at the next poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    items = lanes.pending(directory)
+    if not items:
+        return
+    with store.connect(home, write=True) as db:
+        lanes.apply(db, manifest["root"], items)
+    lanes.settled(directory)
+
+
+def settle_lanes(
+    home: Path, manifest: dict, config: dict, observations: dict[str, dict]
+) -> None:
+    """Records this poll's liveness sample of every lane in its state.
+
+    Every later decision of the poll reads the lane's condition from the
+    state record rather than from the presence reading, so the sample is
+    applied first and a stopped lane ages into `dead` here, after the
+    project's stall threshold, and nowhere else. The poll takes the reading
+    only after `settle_evidence` has applied the queued hook evidence, so a
+    reading of the activity file older than a hook it already applied can
+    never override that hook.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: Presence reading per participant.
+    """
+    with store.connect(home, write=True) as db:
+        for name in manifest["participants"]:
+            lanes.sample(
+                db,
+                manifest["root"],
+                name,
+                observations[name],
+                dead_after=config["stalled_after"],
             )
-            if completion is None or completion[0] not in {"MERGED", "CLOSED"}:
-                continue
-            for number, since in claimed.items():
-                if completion[1] < since:
-                    continue
-                closed.add(number)
-                ended[number] = {
-                    "branch": participant["branch"],
-                    "state": completion[0],
-                    "observed_at": time.time(),
-                }
-        reminders(directory, manifest, closed)
-        deadline_notices(directory, manifest)
-        acknowledgement_deadlines(home, directory, manifest, observations)
-        share_bounces(home, directory, manifest, observations)
-        orphans(home, directory, manifest, config)
-        with contextlib.suppress(OSError):
-            (directory / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
-        observe_responses(home, directory, manifest)
-        completion_escalations(
-            directory,
-            manifest,
-            ended,
-            int(
-                config.get(
-                    "completion_reminders", DEFAULTS["completion_reminders"]
-                )
-            ),
-        )
-        work(home, directory, manifest, config)
-    if config["wake"]:
-        for name, participant in manifest["participants"].items():
-            if participant.get("wake", True):
-                wake(
-                    home, directory, manifest, name, observations[name], config
-                )
-    if config["reclaim"]:
-        reclaim_lanes(home, directory, manifest)
+
+
+def account_lanes(home: Path, directory: Path, manifest: dict) -> None:
+    """Charges this poll's span to every lane's idle and claim totals.
+
+    Work exists for a lane when it owns an open claim or the ledger holds
+    an unclaimed, unblocked issue any lane could take.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    ledger = issues.snapshot(directory)
+    owned = issues.holders(ledger)
+    claimable = bool(issues.unclaimed(ledger))
+    with store.connect(home, write=True) as db:
+        for name in manifest["participants"]:
+            lanes.account(
+                db,
+                manifest["root"],
+                name,
+                lanes.read(db, manifest["root"], name),
+                has_work=claimable or bool(owned.get(name)),
+                owns=bool(owned.get(name)),
+            )
+
+
+def wake_record(
+    home: Path, root: str, name: str, directory: Path | None = None
+) -> dict:
+    """Reads the wake fields of one lane's state for a wake decision.
+
+    Before the store held these fields they lived only in the lane's
+    `-wake.json`. A lane whose store has no wake row yet but still has that
+    file is seeded from it once, so an upgrade keeps the attempts spent,
+    the exhaustion and the escalation already recorded instead of spending
+    the whole budget and escalating a second time.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        directory: Private project state directory holding the published
+            `-wake.json` to seed from, or None to read the store alone.
+
+    Returns:
+        The fields `lanes.read_wake` returns, or an empty mapping when none
+        was recorded or the store cannot be read.
+    """
+    with contextlib.suppress(
+        BridgeError, OSError, sqlite3.Error, TypeError, ValueError
+    ):
+        with store.connect(home) as db:
+            record = lanes.read_wake(db, root, name)
+        if record or directory is None:
+            return record
+        published = json.loads((directory / f"{name}-wake.json").read_text())
+        if not isinstance(published, dict) or not published:
+            return record
+        with store.connect(home, write=True) as db:
+            if not lanes.read_wake(db, root, name):
+                lanes.write_wake(db, root, name, published)
+            return lanes.read_wake(db, root, name)
+    return {}
+
+
+def store_wake(
+    home: Path, directory: Path, root: str, name: str, record: dict
+) -> None:
+    """Writes the wake fields of one lane's state and publishes a copy.
+
+    The store holds the fields every wake decision reads. The lane's
+    `-wake.json` is rewritten from the same record only as a published copy
+    for an operator reading the state directory; nothing decides from it.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        record: Wake fields to store.
+    """
+    with store.connect(home, write=True) as db:
+        lanes.write_wake(db, root, name, record)
+    write_json(directory / f"{name}-wake.json", record)
+
+
+def condition(home: Path, root: str, name: str) -> dict | None:
+    """Reads one lane's state record for a supervision decision.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lane's record, or None when it has none or the store cannot be
+        read, in which case the decision keeps its own reading.
+    """
+    with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+        with store.connect(home) as db:
+            return lanes.read(db, root, name)
+    return None
+
+
+def _remind(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    config: dict,
+    observations: dict[str, dict],
+    stage: Callable[..., None],
+) -> None:
+    """Runs the reminder and escalation stages of one poll, each isolated.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+        observations: This poll's presence reading per participant.
+        stage: Runner that records a raising stage instead of propagating it.
+
+    Completion reads the forge and each lane's reflog, so it runs as its own
+    stage. A reading that raises is recorded and leaves no claim observed
+    ended for this poll, so reminders and every later stage still run.
+    """
+    ended: dict[str, dict] = {}
+    stage(
+        "completion",
+        lambda: ended.update(
+            completed_claims(manifest, issues.snapshot(directory))
+        ),
+    )
+    closed = set(ended)
+    stage(
+        "reminders",
+        reminders,
+        directory,
+        manifest,
+        closed,
+        {
+            number: seen["landed_by"]
+            for number, seen in ended.items()
+            if seen.get("landed_by")
+        },
+    )
+    stage("deadline defaults", deadline_defaults, directory, manifest)
+    stage("deadline notices", deadline_notices, directory, manifest)
+    stage(
+        "acknowledgements",
+        acknowledgement_deadlines,
+        home,
+        directory,
+        manifest,
+        observations,
+    )
+    stage(
+        "share bounces", share_bounces, home, directory, manifest, observations
+    )
+    stage("orphans", orphans, home, directory, manifest, config)
+    stage("responses", observe_responses, home, directory, manifest)
+    stage(
+        "completion escalations",
+        completion_escalations,
+        directory,
+        manifest,
+        ended,
+        int(
+            config.get("completion_reminders", DEFAULTS["completion_reminders"])
+        ),
+        float(config["inactive_after"]),
+    )
 
 
 def observe_responses(home: Path, directory: Path, manifest: dict) -> None:
@@ -2752,7 +4704,14 @@ def _work_backlog(
     ledger = issues.snapshot(directory)
     owned = issues.holders(ledger)
     results = {
-        peer: fit(home, directory, manifest, peer, config["stalled_after"])
+        peer: fit(
+            home,
+            directory,
+            manifest,
+            peer,
+            config["stalled_after"],
+            config["inactive_after"],
+        )
         for peer in manifest["participants"]
     }
     stretches = {
@@ -2791,27 +4750,22 @@ def _work_backlog(
 def _lane_activity(
     home: Path, directory: Path, manifest: dict, name: str
 ) -> dict:
-    """Marks what the lane itself did, for comparison across wake attempts.
+    """Marks the progress the lane made, for comparison across wake attempts.
 
-    A lane can work for far longer than one wake window without changing the
-    state of the issue it was offered, so an offer's progress digest cannot
-    separate a busy lane from a silent one. Every signal read here is work the
-    lane performed: the newest tool or turn-end event it recorded, and the last
-    message it sent. A report, a commit on the claim branch and a message are
-    all tool calls, so the event log already carries them; the store reading is
-    kept beside it because a lane whose hooks are not installed still leaves
-    the messages it sent. Nothing here starts a process: the wake path must not
-    make a lane's own activity depend on a Git call that can time out.
+    Progress is a change in the work, never a hook event. Every wake turn a
+    lane answers ends in a `Stop`, so counting hook events reset the attempt
+    count on every wake and a lane holding a claim while waiting on CI was
+    woken every window forever with its escalation unreachable. A wake turn
+    that only reads and stops is therefore an attempt, and only these count
+    as progress: a commit or other move of the lane's `HEAD`, a lifecycle
+    transition, report or ownership change on an issue the lane holds, and a
+    file reservation it took.
 
-    Only `WORK_EVENTS` count. Session starts, prompt submissions, permission
-    requests, wake records and notification failures are produced by the
-    runtime, by a resumed launcher or by the very dialog an operator is being
-    told about, so counting them would make a stuck lane look busy and an
-    escalation unreachable.
-
+    Nothing here starts a process: the `HEAD` reading is the size of its
+    reflog, so the wake path never depends on a Git call that can time out.
     Each reading is best effort and contributes nothing when it cannot be
-    taken. An event log held by maintenance and a store that cannot be opened
-    must neither fail the wake nor invent activity the lane did not produce.
+    taken, so a store that cannot be opened neither fails the wake nor
+    invents progress the lane did not make.
 
     Args:
         home: Private bridge state root.
@@ -2820,37 +4774,42 @@ def _lane_activity(
         name: Participant that owns the lane.
 
     Returns:
-        Comparable activity marker for the lane, whose values change only when
-        the lane acts.
+        Comparable progress marker for the lane, whose values change only
+        when the lane moves its work.
     """
     from agent_parley import checkpoints
 
     participant = manifest.get("participants", {}).get(name) or {}
-    marker: dict = {"events": 0.0, "message": 0}
-    entries: list[dict] = []
-    with contextlib.suppress(BridgeError, OSError):
-        entries = checkpoints.read_events(directory, name)
-    marker["events"] = max(
-        (
-            float(entry["ts"])
-            for entry in entries
-            if str(entry.get("event", "")) in WORK_EVENTS
-            and type(entry.get("ts")) in (int, float)
-        ),
-        default=0.0,
-    )
+    marker: dict = {"head": 0, "claims": "", "reservation": 0}
+    if lane := participant.get("lane"):
+        marker["head"] = checkpoints.head_moves(Path(lane))
+    with contextlib.suppress(BridgeError, OSError, ValueError):
+        ledger = issues.snapshot(directory)
+        held = [
+            [
+                number,
+                record.get("claim_id"),
+                record.get("execution"),
+                len(record.get("history") or []),
+            ]
+            for number, record in sorted(ledger["issues"].items())
+            if record.get("owner") == name
+        ]
+        marker["claims"] = hashlib.sha256(
+            json.dumps(held, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
     display = participant.get("display", "")
     if display:
         with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
             with store.connect(home) as db:
                 row = db.execute(
-                    "SELECT MAX(m.id) AS sent FROM messages m "
-                    "JOIN agents a ON a.id=m.sender_id "
+                    "SELECT MAX(r.id) AS taken FROM file_reservations r "
+                    "JOIN agents a ON a.id=r.agent_id "
                     "JOIN projects p ON p.id=a.project_id "
                     "WHERE p.human_key=? AND a.name=?",
                     (manifest.get("root", ""), display),
                 ).fetchone()
-            marker["message"] = int((row["sent"] if row else 0) or 0)
+            marker["reservation"] = int((row["taken"] if row else 0) or 0)
     return marker
 
 
@@ -2967,6 +4926,8 @@ def _wake_due(
     The delay doubles with each attempt already spent, so a lane that answered
     nothing is asked again less often instead of being asked on every poll, and
     a cause that names its own clearing time postpones the attempt until then.
+    The delay stops doubling at `WAKE_BACKOFF_CEILING`, so a lane past its
+    budget is asked hourly rather than never.
 
     Args:
         at: Time of the last recorded attempt.
@@ -2977,12 +4938,45 @@ def _wake_due(
     Returns:
         Unix time from which the next attempt may be made.
     """
-    delay = window * 2 ** max(attempts - 1, 0)
+    delay = min(window * 2 ** max(attempts - 1, 0), WAKE_BACKOFF_CEILING)
     return max(at + delay, ready_at)
 
 
+def _instant(value: object) -> TypeGuard[float]:
+    """Reports whether a recorded value is a Unix time rather than absent."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def exhaustion_probe_due(observation: dict, window: float) -> float:
+    """Times the next probe of an exhaustion that named no reset.
+
+    A provider usage limit lasts hours, not days, but a client that shows the
+    limit without a reset time gives nothing a wake could wait for, and a
+    lane parked on that dialog produces no hook event that could clear it.
+    Such an exhaustion is probed instead: first one inactivity window after
+    it was observed, then after twice the window, doubling to one hour and
+    hourly after that, each probe measured from the last one.
+
+    Args:
+        observation: Durable exhausted capacity observation with no reset.
+        window: Inactivity window the probes are spaced by.
+
+    Returns:
+        Unix time from which the next probe wake may be made.
+    """
+    probes = int(observation.get("probes") or 0)
+    last = observation.get("probed_at")
+    if not _instant(last):
+        last = observation.get("observed_at") or 0.0
+    return float(last) + min(window * 2**probes, WAKE_BACKOFF_CEILING)
+
+
 def _wake_block(
-    directory: Path, name: str, state: dict, observed: dict, record: dict
+    directory: Path,
+    name: str,
+    observed: dict,
+    record: dict,
+    window: float,
 ) -> tuple[str, float]:
     """Names what stops a wake attempt now and when it could clear.
 
@@ -2990,27 +4984,28 @@ def _wake_block(
     only on a lane that could answer it. Capacity is read from the durable
     observation, never from elapsed time, and blocks only while the provider
     named a reset still ahead, because the attempt after that reset is itself
-    the evidence that the lane is back. A lane whose screen state is not idle
-    or stopped while its recorded process runs is working or parked on a native
-    dialog it owns, and the dialog watcher publishes into the same activity
-    state, so answering the dialog clears this cause with no change here. A
-    lane with no running process and no session to resume is blocked only once
+    the evidence that the lane is back. An exhaustion that named no reset is
+    given one by `exhaustion_probe_due`, so a lane parked on a usage-limit
+    dialog is probed on a bounded backoff instead of never.
+
+    Every other cause is read from the lane state record, never from the
+    activity file. A lane recorded `blocked` is deferred under its named
+    cause: a native dialog, an approval prompt, an exhausted capacity, or a
+    launch that never reported a native hook within its start deadline. The
+    evidence that answers it, a hook or the dialog watcher seeing the dialog
+    close, moves the record and clears the cause here with no change of its
+    own, and a wake never types into a dialog. The launcher still refuses a
+    lane that is genuinely busy, and a busy refusal spends no budget. A lane
+    recorded stopped or dead with no session to resume is blocked only once
     its first attempt has already recorded that, so the refusal is reported
     before the cause starts sparing the budget.
-
-    A launch marked not started is blocked before any of that. It has no session
-    to resume and no client that could read an injected prompt, so it is a lane
-    with no session however alive its launcher still is, and nothing a wake can
-    do reaches the dialog that is holding it. The operator answering that dialog
-    produces a native hook event, which republishes the activity and clears the
-    cause here with no change of its own.
 
     Args:
         directory: Private project state directory.
         name: Participant that owns the lane.
-        state: The lane's published activity state.
-        observed: The lane's presence reading.
+        observed: The lane's `recorded_presence`.
         record: The lane's last durable wake record.
+        window: Inactivity window the attempts are spaced by.
 
     Returns:
         The blocking cause, empty when an attempt can be made, and the earliest
@@ -3019,45 +5014,61 @@ def _wake_block(
     observation = published_capacity(directory, name)
     allowed, reason = _capacity_check(observation)
     reset_at = observation.get("reset_at")
+    if observation["state"] == "exhausted" and not _instant(reset_at):
+        reset_at = exhaustion_probe_due(observation, window)
+        reason += f"; next try at {int(reset_at)}"
     if (
         allowed is False
-        and isinstance(reset_at, (int, float))
-        and not isinstance(reset_at, bool)
+        and _instant(reset_at)
         and float(reset_at) > time.time()
     ):
         return reason, float(reset_at)
-    activity = str(state.get("activity", "")) or UNKNOWN
-    if activity == NOT_STARTED:
-        waited = (state.get("not_started") or {}).get("deadline", 0)
-        return f"it never started within {int(waited)}s of its launch", 0.0
-    if activity not in WAKE_READY and observed["process_alive"]:
-        return f"its screen state is {activity}", 0.0
+    lane = observed.get("record") or {}
+    if lane.get("state") == lanes.BLOCKED:
+        return f"blocked: {lane['cause']}", 0.0
     if (
         observed["process_alive"] is False
-        and not state.get("session_id")
+        and not lane.get("session")
         and str(record.get("result", "")) == WAKE_ATTENTION
     ):
         return "its session process is not running", 0.0
     return "", 0.0
 
 
-def _park_wake(path: Path, record: dict, cause: str, due: float | None) -> None:
-    """Publishes the blocking cause and next attempt time on a wake record.
+def _park_wake(
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    record: dict,
+    cause: str,
+    due: float | None,
+) -> None:
+    """Records the blocking cause and next attempt time in the wake fields.
 
     Args:
-        path: The lane's durable wake record.
-        record: That record as read.
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+        record: The lane's wake fields as read.
         cause: Why no attempt was made, empty when only spacing applies.
         due: Unix time of the next attempt, None once the budget is spent.
     """
     if record.get("blocked") == cause and record.get("next_at") == due:
         return
     record.update(blocked=cause, next_at=due)
-    write_json(path, record)
+    store_wake(home, directory, root, name, record)
 
 
 def _defer_wake(
-    directory: Path, name: str, cause: str, ready_at: float, window: float
+    home: Path,
+    directory: Path,
+    root: str,
+    name: str,
+    cause: str,
+    ready_at: float,
+    window: float,
 ) -> None:
     """Keeps a blocked lane's next attempt visible without spending one.
 
@@ -3066,26 +5077,23 @@ def _defer_wake(
     being observed.
 
     Args:
+        home: Private bridge state root.
         directory: Private project state directory.
+        root: Canonical project key.
         name: Participant that owns the lane.
         cause: Why no attempt was made.
         ready_at: Earliest time the cause can clear, 0 when unknown.
         window: Inactivity window the attempts are spaced by.
     """
-    path = directory / f"{name}-wake.json"
-    if not path.exists():
-        return
     with lock(directory / f"{name}-wake.lock"):
-        record: dict = {}
-        with contextlib.suppress(OSError, ValueError):
-            record = json.loads(path.read_text())
-        if not isinstance(record, dict) or not record.get("result"):
-            return
-        if record.get("exhausted_at"):
-            _park_wake(path, record, cause, None)
+        record = wake_record(home, root, name, directory)
+        if not record.get("result"):
             return
         _park_wake(
-            path,
+            home,
+            directory,
+            root,
+            name,
             record,
             cause,
             _wake_due(
@@ -3151,30 +5159,47 @@ def wake(
     rather than extending the old one. A request the launcher refuses with a
     `busy` reason is spaced like any other but does not count against the
     bound, because the lane never received a turn to decline; it is asked
-    again once it is idle. A non-idle activity label blocks a wake only while
-    its recorded process remains alive. A session with no trustworthy process
-    identity records a manual-attention refusal and is never presumed dead.
+    again once it is idle.
 
-    The attempt bound counts silence, not elapsed wakes. A lane accepts an
-    offer and then works for as long as the work takes, which can span several
-    wake windows without moving the offer's progress digest, so the digest is
-    no longer what the bound is judged on. Each attempt records the lane's own
-    activity marker, and an attempt that finds the marker changed resets the
-    count to zero and clears any escalation on the offer, whether or not this
-    pass goes on to ask for a turn. Only a lane that recorded nothing across
-    the whole bound is escalated, because only then is there something an
-    operator has to do.
+    The lane's condition is read from its state record alone. The activity
+    file and the presence reading passed in are evidence the poll already
+    applied to that record; only the reading's age still spaces a wake of a
+    live lane. A lane recorded starting, working or reclaimed is never
+    woken, a blocked one is deferred under its cause, an idle one is asked
+    for a turn, and a stopped or dead one is resumed when its record names a
+    session. A lane with no record yet is decided on the state its presence
+    reading and activity label would record, through `lanes.from_liveness`,
+    and resumed on the session its activity file names. A lane
+    `dialogs.parked` on an approval prompt or a watcher-held dialog is
+    recorded blocked under that dialog's cause and deferred, never woken,
+    and an idle one is still asked for a turn, so a store
+    that has not seeded the record never silences a wake. A reading that
+    would record nothing leaves the presence reading as it is.
+
+    The attempt bound counts wakes without progress. Each attempt records the
+    lane's progress marker from `_lane_activity`: its `HEAD` moves, the state
+    of the claims it holds and the reservations it took. An attempt that finds
+    the marker changed resets the count to zero and clears any escalation on
+    the offer, whether or not this pass goes on to ask for a turn. A wake
+    turn that only reads and stops leaves the marker as it was, so it is an
+    attempt, and a lane that made no progress across the whole bound is
+    escalated once, because only then is there something an operator has to
+    do. A lane that is working is never woken, because a wake needs the lane
+    quiet past the inactivity window.
 
     A spent attempt is not the end of the series. Every poll re-decides the
-    lane against what it can read locally: durable provider capacity, the
-    published screen state and the recorded session process. A cause that is
+    lane against what it can read locally: durable provider capacity and the
+    lane state record. A cause that is
     still in force parks the lane with that cause and the time its next attempt
     is due, and spends nothing, so the budget is not consumed while nothing
     could have answered. When the cause clears, the next attempt is due one
     doubling window after the last one, or at the provider reset the capacity
-    observation named, whichever is later. Only a lane that has actually spent
-    its whole budget is recorded as exhausted, and it keeps the last cause and
-    result for the operator instead of a next time it will never have.
+    observation named, whichever is later. A lane that has actually spent its
+    whole budget is recorded as exhausted and escalated once, and waking then
+    backs off rather than stopping: the doubling continues to one hour and
+    stays hourly, so a lane is never parked forever and never re-prompted
+    every window either. An exhausted lane's claims are also eligible for the
+    overdue-claim transition in `overdue_claims`.
 
     A durable retryable capacity observation is itself a backlog reason, so a
     lane whose client stopped on a transient provider error resumes on this
@@ -3191,6 +5216,9 @@ def wake(
 
     A lane that retired is never woken and never resumed. It asked to stop,
     released what it held, and only an operator re-admitting it brings it back.
+    A lane whose record `settle_reboot` stopped on a host restart is not
+    woken or resumed either, because the resume would reset the silence its
+    claims and leases are judged on; `participant restart` brings it back.
     """
     participant = manifest["participants"][name]
     if (
@@ -3200,18 +5228,46 @@ def wake(
         or roster.retired(participant)
     ):
         return
-    path = directory / f"{name}-activity.json"
-    state = json.loads(path.read_text()) if path.exists() else {}
-    wake_path = directory / f"{name}-wake.json"
+    root = manifest["root"]
     window = config["inactive_after"]
-    parked: dict = {}
-    with contextlib.suppress(OSError, ValueError):
-        if wake_path.exists():
-            published = json.loads(wake_path.read_text())
-            parked = published if isinstance(published, dict) else {}
-    blocked, ready_at = _wake_block(directory, name, state, observed, parked)
+    parked = wake_record(home, root, name, directory)
+    recorded = condition(home, root, name)
+    if lanes.rebooted(recorded):
+        return
+    stopped = False
+    if recorded is None:
+        path = directory / f"{name}-activity.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if rebooted(state):
+            return
+        label = str(state.get("activity", ""))
+        session = str(state.get("session_id") or "")
+        stopped = label == lanes.STOPPED
+        seen = lanes.from_liveness(
+            None, {**observed, "activity": label, "evidence": label}
+        )
+        if observed.get("process_alive") and dialogs.parked(state):
+            cause = (
+                lanes.APPROVAL
+                if label.startswith(dialogs.APPROVAL)
+                else dialogs.lane_cause(state.get("dialog") or {})
+            )
+            seen = lanes.BLOCKED, cause
+        if seen is not None:
+            recorded = {
+                "state": seen[0],
+                "cause": seen[1],
+                "evidence": label,
+                "session": session,
+            }
+    else:
+        session = recorded["session"]
+    if not lanes.wakes(recorded):
+        return
+    observed = recorded_presence(recorded, observed)
+    blocked, ready_at = _wake_block(directory, name, observed, parked, window)
     if blocked:
-        _defer_wake(directory, name, blocked, ready_at, window)
+        _defer_wake(home, directory, root, name, blocked, ready_at, window)
         return
     if observed["process_alive"] and (
         observed["age_seconds"] is None
@@ -3250,6 +5306,13 @@ def wake(
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
     )
+    backlog.extend(
+        f"overdue:{recovery['id']}"
+        for record in ledger
+        if record.get("owner") == name
+        and (recovery := record.get("overdue_recovery") or {}).get("step")
+        == "wake"
+    )
     capacity = published_capacity(directory, name)
     if capacity["state"] == "retryable":
         backlog.append(f"capacity:{capacity['observation_id']}")
@@ -3269,7 +5332,7 @@ def wake(
             work_offer = None
         if not backlog:
             return
-        record = json.loads(wake_path.read_text()) if wake_path.exists() else {}
+        record = wake_record(home, root, name)
         same_backlog = record.get("backlog") == backlog
         marker = _lane_activity(home, directory, manifest, name)
         worked = bool(record.get("activity")) and record["activity"] != marker
@@ -3293,17 +5356,18 @@ def wake(
             record.pop("escalated_at", None)
             record.pop("exhausted_at", None)
             record.update(attempts=0, activity=marker, blocked="", next_at=None)
-            write_json(wake_path, record)
-        if attempts >= WORK_WAKE_ATTEMPTS:
+            store_wake(home, directory, root, name, record)
+        spent_before = attempts >= WORK_WAKE_ATTEMPTS
+        if spent_before:
             if not record.get("exhausted_at"):
-                record.update(exhausted_at=time.time(), next_at=None)
-                write_json(wake_path, record)
+                record.update(exhausted_at=time.time())
+                store_wake(home, directory, root, name, record)
             if work_offer and dispatch.get("state") != "escalated":
                 result = _work_escalation(
                     work_offer, attempts, str(record.get("result", ""))
                 )
                 record.update(result=result, escalated_at=time.time())
-                write_json(wake_path, record)
+                store_wake(home, directory, root, name, record)
                 _write_work_dispatch(
                     directory,
                     name,
@@ -3312,11 +5376,10 @@ def wake(
                     result,
                     "escalated",
                 )
-            return
         due = _wake_due(float(throttle_at), int(attempts), ready_at, window)
         if time.time() < due:
             if record.get("result"):
-                _park_wake(wake_path, record, "", due)
+                _park_wake(home, directory, root, name, record, "", due)
             return
         result = WAKE_ATTENTION
         selected = _select_work_prompt(home, directory, name, work_offer)
@@ -3324,10 +5387,7 @@ def wake(
             result = "busy:stale"
         elif observed["process_alive"]:
             result = terminal.request(directory, name)
-        elif (
-            observed["process_alive"] is False
-            or state.get("activity") == "stopped"
-        ) and state.get("session_id"):
+        elif (observed["process_alive"] is False or stopped) and session:
             entry = roster.provider(home, participant["provider"])
             if entry["adapter"] in roster.ADAPTERS and not entry.get(
                 "require_env"
@@ -3359,11 +5419,15 @@ def wake(
                         )
                     track_launcher(child)
                     result = f"resume requested (launcher {child.pid})"
+        probe_exhaustion(directory, name, result)
         counted = attempts + (not result.startswith("busy"))
         now = time.time()
         spent = counted >= WORK_WAKE_ATTEMPTS
-        write_json(
-            wake_path,
+        store_wake(
+            home,
+            directory,
+            root,
+            name,
             {
                 "at": now,
                 "backlog": backlog,
@@ -3372,13 +5436,16 @@ def wake(
                 "result": result,
                 "activity": marker,
                 "blocked": "",
-                "next_at": (
-                    None if spent else _wake_due(now, counted, 0.0, window)
+                "next_at": _wake_due(now, counted, 0.0, window),
+                "exhausted_at": (
+                    (record.get("exhausted_at") or now) if spent else None
                 ),
-                "exhausted_at": now if spent else None,
+                "escalated_at": (
+                    record.get("escalated_at") if spent_before else None
+                ),
             },
         )
-        if work_offer:
+        if work_offer and not spent_before:
             _write_work_dispatch(
                 directory,
                 name,
@@ -3408,7 +5475,19 @@ def run(home: Path, stopped: threading.Event) -> None:
 
     Per-project failures are isolated from coordination calls. Observations
     become visibly stale if polling fails; they never grant ownership.
+
+    A failure is never silent. A poll that raised, and every stage a poll
+    isolated, is written to the service log and to the project's supervision
+    error record, which status and problems report, so a supervisor that
+    fails on every tick is distinguishable from a healthy one.
+
+    Every exception a poll raises is caught, not only the expected kinds.
+    This thread is started once and serves every project, so an unexpected
+    `KeyError` from one malformed record used to end supervision for the
+    whole service with no trace until it was restarted.
     """
+    from agent_parley import server
+
     deadlines: dict[Path, float] = {}
     while not stopped.is_set():
         for path in (home / "projects").glob("*/project.json"):
@@ -3417,12 +5496,21 @@ def run(home: Path, stopped: threading.Event) -> None:
             if time.monotonic() < deadlines.get(path, 0):
                 continue
             interval = DEFAULTS["interval"]
-            with contextlib.suppress(
-                OSError, ValueError, BridgeError, sqlite3.Error
-            ):
+            try:
                 manifest = roster.read(path.parent)
                 interval = configuration(home, manifest)["interval"]
                 poll(home, path.parent)
+            except Exception as exc:
+                issues.note_supervision_error(path.parent, failure("poll", exc))
+            if error := issues.supervision_error(path.parent):
+                server.log(
+                    home,
+                    "supervision",
+                    f"{path.parent.name}: {error['detail']}",
+                )
             deadlines[path] = time.monotonic() + interval
-        reap_launchers()
+        try:
+            reap_launchers()
+        except Exception as exc:
+            server.log(home, "supervision", failure("reap launchers", exc))
         stopped.wait(1)

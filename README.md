@@ -71,15 +71,36 @@ the filters, `problems`, `metrics` and `watch`.
 
 ## Install
 
-Linux, macOS or WSL2 with the repository in the Linux file system, Git, and
-[uv](https://docs.astral.sh/uv/). No clone. The wheel needs no third-party
-runtime packages.
+You need Git and [uv](https://docs.astral.sh/uv/). No clone. The wheel needs
+no third-party runtime packages.
+
+**macOS**
 
 ```sh
+brew install uv
 uv tool install agent-parley
-# to track the default branch instead:
-# uv tool install git+https://github.com/suneel944/agent-parley
 ```
+
+**Linux**
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install agent-parley
+```
+
+**Windows, through WSL2**
+
+Native Windows is not supported; `agent-parley` exits with a pointer to WSL2.
+Run both commands in a WSL2 shell, and clone the repository you coordinate
+into the Linux file system rather than under `/mnt/c`.
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv tool install agent-parley
+```
+
+To track the default branch instead of the latest release, run
+`uv tool install git+https://github.com/suneel944/agent-parley`.
 
 Then add the plugin to whichever CLI you drive. One marketplace serves both.
 
@@ -121,7 +142,10 @@ That is the whole setup. The first run registers the repository, creates that
 participant's worktree and branch, starts the coordination service, and hands
 you the native CLI. Prompt it exactly as you always do. A new name creates its
 own lane, so a second account of the same provider, or another provider, is one
-more terminal.
+more terminal. Each tab's title names its lane, its state and its claim
+progress, such as `[codex] idle with claim #412 - 2/5 done`, so the tab strip
+tells the lanes apart; the supervision key `titles` turns this off.
+`agent-parley title` prints the same line for a Claude Code status line.
 
 Then watch the work, and steer a lane without taking over its terminal:
 
@@ -141,6 +165,11 @@ query. Every one of them accepts `--json`. The mail readers take `--as NAME`,
 so the message `problems` cites opens from the main checkout: it reads that
 lane's mail and sends, acknowledges and marks nothing on its behalf.
 
+Unread mail never blocks a lane's work: it arrives as context, most relevant
+first. A tool call is refused only when it is unsafe now, such as a write to a
+path a peer reserved. Project news goes to a feed, a broadcast reaches only the
+lanes it concerns, and a newer note on a topic replaces the older one.
+
 When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
 
@@ -157,13 +186,27 @@ demand:
 ```sh
 agent-parley gc           # what would be reclaimed, and what is kept and why
 agent-parley gc --apply   # reclaim the lanes whose work has landed
+agent-parley gc --apply --force  # also dirty lane-made worktrees, checkpointed
 ```
+
+`agent-parley reclaim` is the same command, and `--dry-run` spells out the
+default report.
 
 A lane is reclaimed only when it is idle, holds no claim, has nothing
 uncommitted, carries no commit the base checkout or its own upstream lacks,
 and the forge shows its pull request merged or its branch already gone. Every
 other lane is kept and reported with the condition that held it, including a
 pull request that was closed without merging.
+
+The same sweep retires a lane that stopped, never moved its branch, holds no
+claim, lease or offer and stayed untouched past `inactive_after`. It also
+removes clean worktrees a lane made for itself, wherever they are, once their
+head is on the base, their lane retired, or they went untouched past
+`inactive_after` with every commit on their upstream. A worktree no lane made
+is never touched. Uncommitted files and unpushed commits are only reported,
+with the worktree's size, unless `--force` removes them after writing a
+recovery checkpoint. `status` shows each project's state directory size and
+how many worktrees a reclaim would remove.
 
 A repository can also authorize the second of those for the lane itself, with
 `pull_request.self_service` in its private project settings. It is off by
@@ -189,8 +232,10 @@ and the setup command every new lane runs.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
   updates only when coordination state actually changes.
-- **A deadline reports; it never transfers.** A budget informs; it does not
-  gate. Both mark the lane and stop nothing.
+- **A deadline reports until the holder stops working.** An overdue claim
+  whose holder has run no tool past the inactivity window gets one wake, then
+  an offer to the fittest peer with its recovery checkpoint, then release to
+  the pool. A budget informs; it does not gate.
 - **Reservations are advisory.** Conflicts name the blocking owner and that
   owner's declared reason; nothing on disk is locked.
 - **Mail stays private; a decision does not.** Only a message a lane marks as a

@@ -30,6 +30,7 @@ from agent_parley import (
     forge,
     metrics,
     process,
+    records,
     roster,
     store,
 )
@@ -228,7 +229,11 @@ def test_a_failed_start_publishes_no_server_record(bridge, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", start)
     with pytest.raises(BridgeError, match="failed to start"):
         bridge.up()
-    assert not (bridge.home / "server.json").exists()
+    recorded = json.loads((bridge.home / "server.json").read_text())
+    assert recorded["state"] == "failed"
+    assert recorded["failures"] == 1
+    assert "pid" not in recorded
+    assert "port" not in recorded
 
 
 def test_stale_pid_record_cannot_stop_an_unrelated_process(bridge):
@@ -549,20 +554,199 @@ def test_git_timeout_is_recorded_and_obeys_hook_exit_contract(
             "codex",
         ],
     )
-    blocking = event in ("PreToolUse", "SessionStart", "UserPromptSubmit")
+    blocking = event in ("PreToolUse", "SessionStart")
     assert checkpoints.main() == (2 if blocking else 0)
     output = capsys.readouterr()
-    assert output.err == (
+    failure = (
         "Agent Parley checkpoint failed: "
-        "Git branch inspection timed out after 3s.\n"
+        "Git branch inspection timed out after 3s."
     )
-    assert output.out == ("" if blocking else "{}\n")
+    assert output.err == failure + "\n"
+    if event == "UserPromptSubmit":
+        assert json.loads(output.out) == {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "additionalContext": failure,
+            }
+        }
+    else:
+        assert output.out == ("" if blocking else "{}\n")
     state = checkpoints.activity(lane.parent, "codex")
     assert state["event"] == event
     assert "timed out" in state["checkpoint_error"]
     entry = checkpoints.read_events(lane.parent, "codex")[-1]
     assert entry["reason_class"] == "checkpoint_failed"
     assert entry["decision"] == ("deny" if blocking else "allow")
+
+
+@pytest.mark.parametrize(
+    ("event", "key"),
+    [
+        ("UserPromptSubmit", "additionalContext"),
+        ("SessionStart", "additionalContext"),
+        ("PreToolUse", "permissionDecisionReason"),
+    ],
+)
+def test_a_cwd_outside_the_lane_steers_back_without_locking_out(
+    bridge, repo, paired, monkeypatch, capsys, tmp_path, event, key
+):
+    lane = Path(paired["lanes"]["codex"]).resolve()
+    outside = tmp_path.resolve()
+    payload = {"hook_event_name": event, "cwd": str(outside)}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "checkpoint",
+            "--home",
+            str(bridge.home),
+            "--directory",
+            str(lane.parent),
+            "--participant",
+            "codex",
+        ],
+    )
+    assert checkpoints.main() == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    details = json.loads(output.out)["hookSpecificOutput"]
+    assert details["hookEventName"] == event
+    assert str(outside) in details[key]
+    assert f"cd {lane}" in details[key]
+    denied = event == "PreToolUse"
+    assert (details.get("permissionDecision") == "deny") is denied
+    entry = checkpoints.read_events(lane.parent, "codex")[-1]
+    assert entry["reason_class"] == "outside_lane"
+    assert entry["decision"] == ("deny" if denied else "allow")
+
+
+def outside_decision(bridge, lane, cwd, command):
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(cwd),
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    }
+    output = checkpoint(bridge.home, lane.parent, "codex", payload)
+    entry = checkpoints.read_events(lane.parent, "codex")[-1]
+    return output, entry["reason_class"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd {lane}",
+        "cd {lane}/agent_parley && git status",
+        "cd {name}",
+    ],
+)
+def test_a_drifted_agent_may_cd_back_into_its_lane(
+    bridge, repo, paired, command
+):
+    lane = Path(paired["lanes"]["codex"]).resolve()
+    write_json(lane.parent / "codex-identity.json", {"name": "BlueRiver"})
+    text = command.format(lane=lane, name=lane.name)
+    output, reason = outside_decision(bridge, lane, lane.parent, text)
+    assert reason != "outside_lane"
+    assert "outside your lane" not in json.dumps(output)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd {elsewhere} && cd {lane}",
+        "ls && cd {lane}",
+        "cd {lane}/../..",
+        "cd {lane}-other",
+    ],
+)
+def test_a_drifted_agent_is_denied_anything_but_a_return(
+    bridge, repo, paired, tmp_path, command
+):
+    lane = Path(paired["lanes"]["codex"]).resolve()
+    text = command.format(lane=lane, elsewhere=tmp_path)
+    output, reason = outside_decision(bridge, lane, tmp_path, text)
+    assert reason == "outside_lane"
+    details = output["hookSpecificOutput"]
+    assert details["permissionDecision"] == "deny"
+    assert f"`cd {lane}`" in details["permissionDecisionReason"]
+
+
+def prompt_payload(lane):
+    return {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s1",
+        "cwd": str(lane),
+        "prompt": "carry on",
+    }
+
+
+def assert_prompt_context(output, text):
+    details = output["hookSpecificOutput"]
+    assert "permissionDecision" not in details
+    assert "decision" not in output
+    assert text in details["additionalContext"]
+
+
+def test_a_paused_lane_still_takes_a_prompt_as_context(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    bridge.pause(repo, "codex")
+    output = checkpoint(bridge.home, lane.parent, "codex", prompt_payload(lane))
+    assert_prompt_context(output, roster.PAUSED_REASON)
+
+
+def test_a_drifted_branch_still_takes_a_prompt_as_context(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    git(lane, "switch", "-c", "wandered")
+    output = checkpoint(bridge.home, lane.parent, "codex", prompt_payload(lane))
+    assert_prompt_context(output, "git switch")
+    assert checkpoints.read_events(lane.parent, "codex")[-1]["decision"] == (
+        "allow"
+    )
+
+
+@pytest.mark.parametrize(
+    ("adapter", "read"),
+    [
+        (None, lambda out: out["hookSpecificOutput"]["additionalContext"]),
+        ("copilot", lambda out: out["additionalContext"]),
+        ("opencode", lambda out: out["context"]),
+        ("gemini", lambda out: out["hookSpecificOutput"]["additionalContext"]),
+    ],
+)
+@pytest.mark.parametrize(
+    ("change", "text"),
+    [
+        ({"participant": "nobody"}, "not a participant"),
+        ({"protocol": 99}, "speaks protocol 99"),
+    ],
+)
+def test_a_failed_decision_lets_the_prompt_through_as_context(
+    bridge, repo, paired, adapter, read, change, text
+):
+    lane = Path(paired["lanes"]["codex"])
+    payload = prompt_payload(lane)
+    if adapter == "opencode":
+        payload["hook_event_name"] = "chat.message"
+    if adapter == "gemini":
+        payload["hook_event_name"] = "BeforeAgent"
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "payload": payload,
+        **change,
+    }
+    if adapter:
+        request["adapter"] = adapter
+    served = checkpoints.serve(bridge.home, request)
+    assert served["status"] == 0
+    assert text in served["stderr"]
+    assert text in read(json.loads(served["stdout"]))
+    tool = {**request, "payload": {**prompt_payload(lane), "tool_name": "x"}}
+    tool["payload"]["hook_event_name"] = "PreToolUse"
+    tool.pop("adapter", None)
+    assert checkpoints.serve(bridge.home, tool)["status"] == 2
 
 
 def test_native_hook_allows_branch_work_in_separate_worktree(
@@ -768,7 +952,7 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(
                 )
                 assert result.returncode == 0, result.stderr
                 delivered = json.loads(result.stdout)["hookSpecificOutput"]
-                assert delivered["permissionDecision"] == "deny"
+                assert "permissionDecision" not in delivered
                 assert "session_id" in delivered["additionalContext"]
                 assert (
                     checkpoint(bridge.home, directory, "codex", payload) == {}
@@ -834,11 +1018,8 @@ def test_mcp_two_clients_conflict_handoff_auth_and_restart(
                     "session_id": "claude-test",
                     "cwd": data["lanes"]["claude"],
                 }
-                assert (
-                    checkpoint(bridge.home, directory, "claude", stop)[
-                        "decision"
-                    ]
-                    == "block"
+                assert "decision" not in checkpoint(
+                    bridge.home, directory, "claude", stop
                 )
                 assert (
                     checkpoint(
@@ -935,9 +1116,17 @@ def test_hook_failure_pauses_tools_and_foreign_worktree_is_rejected(
     }
     result = checkpoint(bridge.home, lane.parent, "claude", payload)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    foreign = checkpoint(
+        bridge.home, lane.parent, "claude", {**payload, "cwd": str(repo)}
+    )["hookSpecificOutput"]
+    assert foreign["permissionDecision"] == "deny"
+    assert f"cd {lane.resolve()}" in foreign["permissionDecisionReason"]
     with pytest.raises(BridgeError, match="cwd"):
         checkpoint(
-            bridge.home, lane.parent, "claude", {**payload, "cwd": str(repo)}
+            bridge.home,
+            lane.parent,
+            "claude",
+            {**payload, "hook_event_name": "Stop", "cwd": str(repo)},
         )
     assert (
         checkpoint(
@@ -1115,11 +1304,11 @@ def test_top_reports_tokens_each_native_client_recorded(
         for line in lines
     )
     assert (
-        next(line for line in lines if line.startswith("claude ")).split()[-2]
+        next(line for line in lines if line.startswith("claude ")).split()[-3]
         == "150"
     )
     assert (
-        next(line for line in lines if line.startswith("codex ")).split()[-2]
+        next(line for line in lines if line.startswith("codex ")).split()[-3]
         == "2.5k"
     )
     assert "not billed spend" in output
@@ -1139,7 +1328,7 @@ def test_top_leaves_tokens_blank_without_readable_session_records(
         for line in lines
     )
     row = next(line for line in lines if line.startswith("claude "))
-    assert row.split()[-2:] == ["0", "0s+"]
+    assert row.split()[-3:] == ["0", "0s+", "-"]
 
 
 def test_token_reading_survives_a_malformed_session_record(
@@ -1158,6 +1347,35 @@ def test_token_reading_survives_a_malformed_session_record(
     )
     rows = rows_of(dashboard.collect(bridge.home, False, {}))
     assert rows["claude"]["tokens"] == 100
+
+
+def test_token_reading_parses_only_records_that_carry_usage(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude_transcript(
+        tmp_path / "claude_config_dir",
+        paired["lanes"]["claude"],
+        [
+            json.dumps({"type": "user", "message": {"content": "hi"}}),
+            usage_record("msg_a", 10),
+            json.dumps({"type": "tool_result", "content": "x" * 64}),
+        ],
+    )
+    parsed = []
+    loads = json.loads
+
+    def counting(text, *args, **kwargs):
+        if isinstance(text, bytes):
+            parsed.append(text)
+        return loads(text, *args, **kwargs)
+
+    monkeypatch.setattr("agent_parley.records.json.loads", counting)
+    tokens = records.reported_tokens(
+        bridge.home, paired["participants"]["claude"], {}
+    )
+    assert tokens == 100
+    assert [line for line in parsed if b"tool_result" in line] == []
+    assert [line for line in parsed if b'"user"' in line] == []
 
 
 def test_token_reading_follows_a_relocated_credential_home(
@@ -1263,6 +1481,9 @@ def test_checkpoint_records_every_decision_in_a_rotating_event_log(
     summary = event_summary(directory, "claude")
     assert summary["events"] == 2
     assert summary["denials"] == 1
+    assert summary["denied_by"] == [
+        {"reason": "branch_drift", "tool": "", "count": 1}
+    ]
     assert summary["injected_bytes"] == 12
     assert summary["last_ts"] == 2.0
     assert summary["last_reason"] == "coordination_pending"
@@ -1383,6 +1604,11 @@ def test_issue_crash_releases_operation_lock_but_preserves_owner(
     assert bridge.issue(codex, "claim", "432")["owner"] == "codex"
 
 
+def listed(state: dict) -> str:
+    """Renders the issue listing without its clock-dependent progress ages."""
+    return re.sub(r"; last progress \d+s ago", "", describe(state))
+
+
 def test_issue_dependencies_are_owner_only_and_survive_a_release(
     bridge, repo, paired
 ):
@@ -1402,6 +1628,9 @@ def test_issue_dependencies_are_owner_only_and_survive_a_release(
     revision = bridge.issue(repo, "list")["revision"]
     assert bridge.issue(claude, "block", "432", on="77")["blocked_by"] == ["77"]
     assert bridge.issue(repo, "list")["revision"] == revision
+    for extra in [*range(100, 99 + MAX_BLOCKERS), 999]:
+        bridge.issue(codex, "claim", str(extra))
+        bridge.issue(codex, "release", str(extra))
     for extra in range(100, 99 + MAX_BLOCKERS):
         bridge.issue(claude, "block", "432", on=str(extra))
     with pytest.raises(BridgeError, match="drop one with issue unblock"):
@@ -1411,7 +1640,7 @@ def test_issue_dependencies_are_owner_only_and_survive_a_release(
         "77",
         *(str(extra) for extra in range(100, 99 + MAX_BLOCKERS)),
     ]
-    assert "#432: claude; waits on #77 (codex)" in describe(
+    assert "#432: claude; no deadline; waits on #77 (codex)" in listed(
         bridge.issue(repo, "list")
     )
     with pytest.raises(BridgeError, match="does not wait on #555"):
@@ -1514,6 +1743,13 @@ def test_forge_mirrors_use_the_operator_account_and_absorb_refusal(
     assert forge.assign(repo, "42") is False
 
 
+def recorded(bridge, repo, number):
+    """Records one issue in the ledger through a plan, claiming nothing."""
+    path = repo.parent / f"record-{number}.toml"
+    path.write_text(f'[dependencies]\n"{int(number) + 1}" = ["{number}"]\n')
+    bridge.work_plan(repo, "apply", path)
+
+
 def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
     bridge, repo, paired, monkeypatch
 ):
@@ -1530,6 +1766,7 @@ def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
         "agent_parley.cli.forge.unassign",
         lambda directory, number: mirrored.append(("unassign", number)),
     )
+    recorded(bridge, repo, "77")
     bridge.issue(claude, "claim", "#432")
     bridge.issue(claude, "block", "432", on="77")
     bridge.issue(claude, "release", "432")
@@ -1614,8 +1851,8 @@ def test_issue_claim_records_and_renders_the_forge_title(
         "Title for issue 432"
     )
     assert (
-        describe(bridge.issue(repo, "list"))
-        == "#432: claude — Title for issue 432"
+        listed(bridge.issue(repo, "list"))
+        == "#432: claude — Title for issue 432; no deadline"
     )
 
 
@@ -1631,8 +1868,8 @@ def test_issue_claim_survives_an_unavailable_forge(
         "agent_parley.cli.forge.issue_title", lambda directory, number: ""
     )
     assert "title" not in bridge.issue(claude, "claim", "433")
-    assert describe(bridge.issue(repo, "list")) == (
-        "#432: claude\n#433: claude"
+    assert listed(bridge.issue(repo, "list")) == (
+        "#432: claude; no deadline\n#433: claude; no deadline"
     )
 
 
@@ -1646,6 +1883,7 @@ def test_recorded_issue_title_survives_later_transitions(
         "agent_parley.cli.forge.issue_title",
         lambda directory, number: "Resolved from the forge",
     )
+    recorded(bridge, repo, "77")
     bridge.issue(claude, "claim", "432")
     blocked = bridge.issue(claude, "block", "432", on="77")
     assert blocked["title"] == "Resolved from the forge"
@@ -1655,8 +1893,9 @@ def test_recorded_issue_title_survives_later_transitions(
     )
     reclaimed = bridge.issue(codex, "claim", "432")
     assert reclaimed["title"] == "Resolved from the forge"
-    assert "#432: codex — Resolved from the forge; waits on #77" in describe(
-        bridge.issue(repo, "list")
+    assert (
+        "#432: codex — Resolved from the forge; no deadline; waits on #77"
+        in listed(bridge.issue(repo, "list"))
     )
 
 
@@ -1688,7 +1927,7 @@ def test_issue_notifications_are_once_per_change_without_empty_reminders(
     notice = checkpoint(bridge.home, directory, "codex", payload)[
         "hookSpecificOutput"
     ]
-    assert notice["permissionDecision"] == "deny"
+    assert "permissionDecision" not in notice
     assert "handoff to codex" in notice["additionalContext"]
     assert checkpoint(bridge.home, directory, "codex", payload) == {}
     reminder = checkpoint(
@@ -1701,12 +1940,11 @@ def test_issue_notifications_are_once_per_change_without_empty_reminders(
     bridge.issue(claude, "cancel", "432")
     stop = {**payload, "hook_event_name": "Stop", "stop_hook_active": True}
     assert checkpoint(bridge.home, directory, "codex", stop) == {}
-    assert (
-        checkpoint(bridge.home, directory, "codex", payload)[
-            "hookSpecificOutput"
-        ]["permissionDecision"]
-        == "deny"
-    )
+    cancelled = checkpoint(bridge.home, directory, "codex", payload)[
+        "hookSpecificOutput"
+    ]
+    assert "permissionDecision" not in cancelled
+    assert cancelled["additionalContext"]
 
 
 def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):

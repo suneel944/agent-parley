@@ -294,7 +294,10 @@ def diff(directory: Path, path: Path) -> dict:
 def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
     """Records a plan's dependencies and the version that recorded them.
 
-    Applying authorizes every issue the plan names and adds edges. It never
+    Applying authorizes every issue the plan names and adds edges. An edge to
+    an issue already complete is skipped, because nothing would ever clear
+    it, and an edge that closes a cycle with the edges already recorded,
+    from this plan or any other, refuses the whole apply. It never
     removes one, claims an issue or assigns a lane, so an operator who narrows
     a plan drops the edge with `issue unblock` and sees it as unlisted until
     then. Blockers gain queued records so dispatch can finish them before
@@ -309,8 +312,8 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
         The recorded version and the edges this apply added.
 
     Raises:
-        BridgeError: If the plan file is unusable or the ledger cannot be
-            locked.
+        BridgeError: If the plan file is unusable, an edge would close a
+            dependency cycle, or the ledger cannot be locked.
     """
     document = read(path)
     with lock(directory / "issues.lock", timeout=1):
@@ -347,9 +350,20 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
             record = state["issues"][issue]
             waiting = record.get("blocked_by", [])
             for blocker in blockers:
-                if blocker not in waiting:
-                    waiting.append(blocker)
-                    added.append((issue, blocker))
+                recorded_blocker = state["issues"][blocker]
+                if blocker in waiting or (
+                    lifecycle.state(recorded_blocker)["state"]
+                    == lifecycle.COMPLETE
+                ):
+                    continue
+                if lifecycle.reaches(state["issues"], blocker, issue):
+                    raise BridgeError(
+                        f"Issue #{issue} waiting on #{blocker} would form a "
+                        "dependency cycle with the recorded ledger."
+                    )
+                waiting.append(blocker)
+                record["blocked_by"] = waiting
+                added.append((issue, blocker))
             if len(waiting) > MAX_BLOCKERS:
                 raise BridgeError(
                     f"Issue #{issue} would wait on more than {MAX_BLOCKERS} "

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import (
+    checkpoints,
     cli,
     completion,
     dashboard,
@@ -67,10 +68,14 @@ def unwoken(bridge):
     write_json(bridge.home / "supervision.json", {"wake": False})
 
 
-def refuse(directory, name, result, attempts=0):
-    """Records one wake refusal for a lane."""
-    write_json(
-        directory / f"{name}-wake.json",
+def refuse(bridge, directory, name, result, attempts=0):
+    """Records one wake refusal in a lane's state."""
+    root = json.loads((directory / "project.json").read_text())["root"]
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        root,
+        name,
         {
             "at": time.time(),
             "attempts": attempts,
@@ -170,6 +175,32 @@ def test_a_stalled_lane_the_service_still_wakes_is_reported_as_its_work(
     assert not rows(bridge, problems.INACTIVE)
 
 
+def test_a_second_session_in_a_lane_is_named_while_it_runs(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+    foreign = {
+        "session_id": "s2",
+        "pid": child.pid,
+        "ticks": start_ticks(child.pid),
+        "seen": time.time() - 30,
+    }
+    try:
+        alive(directory, "claude", session_id="s1", foreign_session=foreign)
+        [row] = rows(bridge, problems.FOREIGN)
+        assert row["participant"] == "claude"
+        assert f"session s2 (pid {child.pid})" in row["detail"]
+        assert row["seconds"] >= 30
+    finally:
+        child.stdin.close()
+        child.wait()
+    assert not rows(bridge, problems.FOREIGN)
+
+
 def test_a_stalled_lane_the_service_cannot_wake_names_the_say(
     bridge, repo, paired, served
 ):
@@ -190,7 +221,7 @@ def test_a_lane_the_service_has_woken_reports_the_attempts_it_made(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    refuse(directory, "claude", "busy:turn", attempts=2)
+    refuse(bridge, directory, "claude", "busy:turn", attempts=2)
     deliver(bridge, repo, paired, aged=1800)
     [row] = rows(bridge, problems.STALLED)
     assert row["actor"] == problems.BY_SERVICE
@@ -224,6 +255,120 @@ def test_a_live_lane_past_the_inactive_threshold_is_a_row(
     assert row["actor"] == problems.BY_SERVICE
     assert row["command"].startswith("the coordination service wakes claude")
     assert [r["participant"] for r in rows(bridge)] == ["claude"]
+
+
+def test_an_idle_lane_holding_a_refused_key_names_the_refused_lane(
+    bridge, repo, paired, served
+):
+    alive(bridge.project(repo)[1], "claude")
+    store.initialize(bridge.home)
+    lanes = {
+        name: store.authenticate(
+            bridge.home,
+            store.register(bridge.home, paired["root"], name)[
+                "registration_token"
+            ],
+        )
+        for name in ("claude", "codex")
+    }
+    store.call(
+        bridge.home,
+        lanes["claude"],
+        "file_reservation_paths",
+        {"paths": ["shared.txt"]},
+    )
+    refused = store.call(
+        bridge.home,
+        lanes["codex"],
+        "file_reservation_paths",
+        {"paths": ["shared.txt"]},
+    )
+    assert refused["conflicts"]
+    [record] = [
+        lane
+        for project in bridge.status_snapshot()["projects"]
+        for lane in project["participants"]
+        if lane["participant"] == "claude"
+    ]
+    assert record["mail"]["refused"] == ["codex"]
+    [row] = rows(bridge, problems.HOLDING)
+    assert row["participant"] == "claude"
+    assert "codex" in row["detail"]
+    assert row["seconds"] is not None
+    store.call(bridge.home, lanes["claude"], "release_file_reservations", {})
+    assert not rows(bridge, problems.HOLDING)
+
+
+def test_a_hook_refusal_on_a_held_key_names_the_refused_lane(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    store.initialize(bridge.home)
+    holder = store.authenticate(
+        bridge.home,
+        store.register(bridge.home, paired["root"], "claude")[
+            "registration_token"
+        ],
+    )
+    store.register(bridge.home, paired["root"], "codex")
+    store.call(
+        bridge.home,
+        holder,
+        "file_reservation_paths",
+        {"paths": ["shared.txt"], "exclusive": True},
+    )
+    lane = Path(paired["lanes"]["codex"])
+    write_json(directory / "codex-identity.json", {"name": "codex"})
+    denied = checkpoints.checkpoint(
+        bridge.home,
+        directory,
+        "codex",
+        {
+            "hook_event_name": "PreToolUse",
+            "cwd": str(lane),
+            "session_id": "s1",
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(lane / "shared.txt")},
+        },
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    [record] = [
+        lane
+        for project in bridge.status_snapshot()["projects"]
+        for lane in project["participants"]
+        if lane["participant"] == "claude"
+    ]
+    assert record["mail"]["refused"] == ["codex"]
+    [row] = rows(bridge, problems.HOLDING)
+    assert row["participant"] == "claude"
+    assert "codex" in row["detail"]
+
+
+def test_an_escalated_native_dialog_is_a_row_naming_it(
+    bridge, repo, paired, served
+):
+    alive(
+        bridge.project(repo)[1],
+        "claude",
+        activity="dialog: native directory trust prompt",
+        dialog={
+            "name": "directory-trust",
+            "label": "native directory trust prompt",
+            "action": "answer",
+            "escalated": True,
+            "options": ["1. Yes, continue", "2. No, quit"],
+            "at": time.time() - 40,
+        },
+    )
+    [row] = rows(bridge, problems.HELD)
+    assert row["participant"] == "claude"
+    assert row["detail"] == (
+        "the client is held by native directory trust prompt "
+        "(1. Yes, continue; 2. No, quit)"
+    )
+    assert row["command"] == "answer the prompt in claude's terminal"
+    assert row["seconds"] >= 40
 
 
 def test_a_paused_lane_is_resumed_rather_than_spoken_to(
@@ -267,7 +412,7 @@ def test_a_wake_refusal_names_its_reason_and_an_actor_who_can_clear_it(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    refuse(directory, "claude", result)
+    refuse(bridge, directory, "claude", result)
     [record] = [
         row
         for row in bridge.status_snapshot()["projects"][0]["participants"]
@@ -285,7 +430,7 @@ def test_a_lane_that_cannot_read_mail_is_never_offered_say(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude")
-    refuse(directory, "claude", problems.DIALOG)
+    refuse(bridge, directory, "claude", problems.DIALOG)
     deliver(bridge, repo, paired, ack=True, aged=1800)
     found = rows(bridge, ack_after=600)
     assert found
@@ -300,7 +445,7 @@ def test_a_live_working_lane_is_never_told_to_stop_its_session(
 ):
     directory = bridge.project(repo)[1]
     alive(directory, "claude", updated=time.time())
-    refuse(directory, "claude", problems.RETRY)
+    refuse(bridge, directory, "claude", problems.RETRY)
     [row] = rows(bridge, problems.WAKE)
     assert row["actor"] == problems.BY_SERVICE
     assert row["command"] == (
@@ -719,6 +864,12 @@ LANE_CAUSES = [
     },
     {"drift": True, "branch": "elsewhere"},
     {"budget": {"over": True, "marker": "over budget; hours 2h of 1h"}},
+    {
+        "claims": [
+            {"issue": number, "overdue": False, "overdue_seconds": 0}
+            for number in (41, 42, 43)
+        ]
+    },
 ]
 
 OFFERED = {
@@ -767,6 +918,7 @@ def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
         problems.STALLED,
         problems.INACTIVE,
         problems.OVERDUE,
+        problems.OVER_CAP,
         problems.UNRESOLVED,
         problems.OFFER,
         problems.ACK,
@@ -793,6 +945,34 @@ def test_every_remedy_the_view_emits_names_a_command_the_cli_declares(
                 named in remedy
                 for named in ("claude", "/lane", "agent-parley", "service")
             ), remedy
+
+
+def test_claims_past_the_cap_are_named_with_their_excess():
+    claims = [
+        {"issue": number, "overdue": False, "overdue_seconds": 0}
+        for number in range(1376, 1388)
+    ]
+    rows = problems._lane_rows(
+        lane_record(claims=claims),
+        {"lane": "/lane", "branch": "work"},
+        "/root",
+        {**supervision.DEFAULTS, "wake": False},
+        600,
+        time.time(),
+    )
+    [row] = [row for row in rows if row["condition"] == problems.OVER_CAP]
+    assert row["count"] == 10
+    assert "holds 12 claims, 10 past max_claims_per_lane 2" in row["detail"]
+    assert row["command"] == "agent-parley issue release 1387 --repo /root"
+    within = problems._lane_rows(
+        lane_record(claims=claims[:2]),
+        {"lane": "/lane", "branch": "work"},
+        "/root",
+        {**supervision.DEFAULTS, "wake": False},
+        600,
+        time.time(),
+    )
+    assert problems.OVER_CAP not in {row["condition"] for row in within}
 
 
 class Screen:

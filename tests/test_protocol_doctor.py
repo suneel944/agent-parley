@@ -1,5 +1,6 @@
 """Checks the protocol contract, its refusals, and the doctor report."""
 
+import io
 import json
 import re
 import subprocess
@@ -114,6 +115,7 @@ def test_a_hook_speaking_another_protocol_is_refused(
     bridge, repo, paired, monkeypatch, capsys
 ):
     directory = bridge.project(repo)[1]
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     monkeypatch.setattr(
         sys,
         "argv",

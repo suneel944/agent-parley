@@ -1,6 +1,7 @@
 """Checks the hook client against the service and its in-process fallback."""
 
 import asyncio
+import errno
 import json
 import os
 import re
@@ -21,6 +22,8 @@ from agent_parley import (
     hook,
     process,
     protocol,
+    recovery,
+    roster,
     server,
     store,
 )
@@ -42,6 +45,11 @@ SLEEPER = "import time; time.sleep(120)"
 def events(directory, agent="codex"):
     path = directory / f"{agent}-events.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def fell_back(entry):
+    """Reports whether one record was decided after a service failure."""
+    return "fallback" in entry or entry["reason_class"] == "service_fallback"
 
 
 @pytest.fixture(autouse=True)
@@ -124,13 +132,10 @@ def test_a_served_decision_equals_the_in_process_decision(
         local.stdout,
         local.stderr,
     )
-    assert not any(
-        entry["reason_class"] == "service_fallback"
-        for entry in events(lane.parent)
-    )
+    assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
-def test_a_served_decision_carries_context_and_blocks_completion(
+def test_a_served_decision_carries_context_and_lets_mail_wait_past_stop(
     bridge, repo, paired, service
 ):
     lane = Path(paired["lanes"]["codex"])
@@ -163,10 +168,12 @@ def test_a_served_decision_carries_context_and_blocks_completion(
         },
     )
     stopped = run_hook(bridge, lane.parent, {**STOP, **cwd})
-    assert json.loads(stopped.stdout)["decision"] == "block"
+    assert "decision" not in json.loads(stopped.stdout or "{}")
     recorded = events(lane.parent)
-    assert recorded[-1]["decision"] == "block"
-    assert recorded[-1]["reason_class"] == "coordination_pending"
+    assert recorded[-1]["decision"] != "block"
+    assert (
+        checkpoints.mailbox(bridge.home, paired["root"], "codex")["unread"] == 1
+    )
 
 
 def test_a_served_hook_records_its_foreground_native_process(
@@ -357,9 +364,9 @@ def test_a_down_service_falls_back_in_process(bridge, repo, paired):
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "ConnectionRefusedError" in recorded[0]["cause"]
-    assert recorded[-1]["decision"] == "deny"
+    assert len(recorded) == 1
+    assert "ConnectionRefusedError" in recorded[0]["fallback"]
+    assert recorded[0]["decision"] == "deny"
 
 
 def test_a_reply_without_a_status_line_falls_back_in_process(
@@ -387,14 +394,13 @@ def test_a_reply_without_a_status_line_falls_back_in_process(
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "ValueError: reply has no status line" in recorded[0]["cause"]
+    assert "reply has no status line" in recorded[0]["fallback"]
 
 
 def test_a_failure_inside_the_served_decision_answers_500(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None):
+    def broken(home, request, stages=None, *args, **kwargs):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -405,8 +411,7 @@ def test_a_failure_inside_the_served_decision_answers_500(
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 500" in recorded[0]["cause"]
+    assert "service answered 500" in recorded[0]["fallback"]
     logged = capsys.readouterr().out
     entry = next(line for line in logged.splitlines() if " failed " in line)
     assert STAMP.match(entry)
@@ -433,8 +438,7 @@ def test_a_stale_service_answers_the_hook_with_a_fallback_status(
     decision = json.loads(served.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 503" in recorded[0]["cause"]
+    assert "service answered 503" in recorded[0]["fallback"]
     logged = capsys.readouterr()
     assert "Traceback" not in logged.out + logged.err
     assert logged.out.count(server.DRIFTED) == 1
@@ -634,9 +638,9 @@ def test_a_wrong_credential_is_refused_and_falls_back(
     assert served.returncode == 0
     assert "Participants" in json.dumps(json.loads(served.stdout))
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 401" in recorded[0]["cause"]
-    assert recorded[-1]["reason_class"] == "coordination_pending"
+    assert len(recorded) == 1
+    assert "service answered 401" in recorded[0]["fallback"]
+    assert recorded[0]["reason_class"] == "coordination_pending"
 
 
 def test_a_credential_for_another_lane_is_refused(
@@ -737,10 +741,10 @@ def test_a_stalled_decision_is_held_and_frees_its_slot(
     release = threading.Event()
     finished = threading.Event()
 
-    def stalling(home, request, stages=None):
+    def stalling(home, request, stages=None, *args, **kwargs):
         release.wait(20)
         try:
-            return deciding(home, request, stages)
+            return deciding(home, request, stages, *args, **kwargs)
         finally:
             finished.set()
 
@@ -899,10 +903,7 @@ def test_the_shell_client_serves_the_decision_the_module_serves(
         served.stdout,
         served.stderr,
     ), shell_diagnosis(bridge, lane.parent, {**payload, **cwd})
-    assert not any(
-        entry["reason_class"] == "service_fallback"
-        for entry in events(lane.parent)
-    )
+    assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
@@ -915,14 +916,14 @@ def test_the_shell_client_starts_python_when_the_service_is_down(
     assert shell.returncode == 0, shell.stderr
     decision = json.loads(shell.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
-    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    assert "fallback" in events(lane.parent)[0]
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
 def test_the_shell_client_starts_python_when_the_service_fails(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def broken(home, request, stages=None):
+    def broken(home, request, stages=None, *args, **kwargs):
         raise ImportError("cannot import name 'budgets'")
 
     monkeypatch.setattr(server.checkpoints, "serve", broken)
@@ -933,8 +934,7 @@ def test_the_shell_client_starts_python_when_the_service_fails(
     decision = json.loads(shell.stdout)["hookSpecificOutput"]
     assert decision["permissionDecision"] == "deny"
     recorded = events(lane.parent)
-    assert recorded[0]["reason_class"] == "service_fallback"
-    assert "service answered 500" in recorded[0]["cause"]
+    assert "service answered 500" in recorded[0]["fallback"]
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
@@ -949,14 +949,14 @@ def test_the_shell_client_falls_back_on_a_forged_credential(
     shell = run_shell(bridge, lane.parent, {**ALLOW, **cwd})
     assert shell.returncode == 0, shell.stderr
     assert "Participants" in json.dumps(json.loads(shell.stdout))
-    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    assert "fallback" in events(lane.parent)[0]
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
 def test_the_shell_client_forwards_both_served_streams_and_the_status(
     bridge, repo, paired, service, monkeypatch
 ):
-    def loud(home, request, stages=None):
+    def loud(home, request, stages=None, *args, **kwargs):
         return {"stdout": '{"ok": true}\n', "stderr": "warned\n", "status": 2}
 
     monkeypatch.setattr(server.checkpoints, "serve", loud)
@@ -1042,7 +1042,7 @@ def test_an_outage_brings_the_service_back_on_the_next_hook(
         bridge, lane.parent, {**ALLOW, "cwd": str(lane), "session_id": "s1"}
     )
     assert decided.returncode == 0, decided.stderr
-    assert events(lane.parent)[0]["reason_class"] == "service_fallback"
+    assert "fallback" in events(lane.parent)[0]
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline and bridge.server_process() is None:
         time.sleep(0.2)
@@ -1075,6 +1075,59 @@ def test_no_relaunch_is_asked_for_without_a_recorded_service(
     hook.relaunch(str(bridge.home))
     assert asked == []
     assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
+
+
+def test_a_start_that_times_out_is_retried_after_the_backoff(
+    bridge, monkeypatch
+):
+    monkeypatch.setattr(cli, "START_SECONDS", 0.3)
+    monkeypatch.setattr(type(bridge), "ready", lambda self: False)
+    with pytest.raises(cli.BridgeError, match="failed to start"):
+        bridge.up()
+    record = json.loads((bridge.home / "server.json").read_text())
+    assert record["state"] == "failed"
+    assert record["failures"] == 1
+    assert bridge.server_process() is None
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    past = time.time() - hook.RELAUNCH_INTERVAL - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 2
+
+
+def test_a_repeated_failure_backs_off_further(bridge, monkeypatch):
+    write_json(
+        bridge.home / "server.json",
+        {"state": "failed", "failed_at": time.time(), "failures": 3},
+    )
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    past = time.time() - hook.RELAUNCH_INTERVAL * 2 - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
+    past = time.time() - hook.RELAUNCH_INTERVAL * 4 - 1
+    os.utime(stamp, (past, past))
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 2
+
+
+def test_a_stamp_dated_in_the_future_does_not_hold_relaunch(
+    bridge, monkeypatch
+):
+    gone(bridge)
+    stamp = bridge.home / hook.RELAUNCH_STAMP
+    stamp.touch()
+    future = time.time() + 3600
+    os.utime(stamp, (future, future))
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    assert len(asked) == 1
 
 
 def held_lock(path, release):
@@ -1127,15 +1180,72 @@ def test_a_held_checkpoint_lock_defers_rather_than_denying(
     ]
 
 
+def stopped_under_a_held_lock(bridge, lane, meanwhile):
+    """Sends Stop while the checkpoint lock is held for 1.5 seconds."""
+    prompted = run_hook(
+        bridge, lane.parent, {**PROMPT, "cwd": str(lane), "session_id": "s1"}
+    )
+    assert prompted.returncode == 0, prompted.stderr
+    release = threading.Event()
+    keeper = held_lock(lane.parent / "codex-checkpoint.lock", release)
+
+    def later():
+        time.sleep(0.5)
+        meanwhile()
+        time.sleep(1.0)
+        release.set()
+
+    threading.Thread(target=later, daemon=True).start()
+    try:
+        stopped = run_hook(
+            bridge,
+            lane.parent,
+            {**STOP, "cwd": str(lane), "session_id": "s1"},
+        )
+    finally:
+        release.set()
+        keeper.join(timeout=10)
+    assert stopped.returncode == 0, stopped.stderr
+    settled(lane.parent, 2)
+    return events(lane.parent)[-1]["reason_class"]
+
+
+def test_a_served_stop_outlasts_a_held_checkpoint_lock(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    reason = stopped_under_a_held_lock(bridge, lane, lambda: None)
+    state = json.loads((lane.parent / "codex-activity.json").read_text())
+    assert reason != "lock_contended"
+    assert state["activity"] == "idle"
+
+
+def test_a_served_stop_yields_to_a_newer_event(bridge, repo, paired, service):
+    lane = Path(paired["lanes"]["codex"])
+    path = lane.parent / "codex-activity.json"
+
+    def newer():
+        state = json.loads(path.read_text())
+        state["updated"] = time.time()
+        state["activity"] = "working"
+        write_json(path, state)
+
+    reason = stopped_under_a_held_lock(bridge, lane, newer)
+    assert reason == "superseded"
+    assert json.loads(path.read_text())["activity"] == "working"
+
+
 def stalling(monkeypatch, seconds):
     """Delays every served decision past the service's own deadline."""
     served = server.checkpoints.serve
     asked = []
 
-    def slow(home, request, stages=None):
-        asked.append(request)
+    def slow(
+        home, request, stages=None, settle=0.0, record_only=False, **kwargs
+    ):
+        asked.append(record_only)
         time.sleep(seconds)
-        return served(home, request, stages)
+        return served(home, request, stages, settle, record_only, **kwargs)
 
     monkeypatch.setattr(server.checkpoints, "serve", slow)
     return asked
@@ -1157,6 +1267,64 @@ def test_a_decision_past_its_deadline_is_never_decided_again(
     assert len(events(lane.parent)) == 1
 
 
+def test_an_abandoned_stop_leaves_its_coordination_undelivered(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "claude-identity.json").read_text())
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Unseen change",
+            "body_md": "Read this.",
+            "idempotency_key": "unseen",
+        },
+    )
+    write_json(
+        lane.parent / "codex-work.json",
+        {"offer": {"id": "offer-1", "text": "Take issue #9 next."}},
+    )
+    deciding = checkpoints.serve
+    stalling(monkeypatch, server.DECISION_SECONDS + 0.5)
+    stop = {**STOP, "cwd": str(lane), "session_id": "s1"}
+    abandoned = run_hook(bridge, lane.parent, stop)
+    assert abandoned.returncode == 0, abandoned.stderr
+    assert json.loads(abandoned.stdout) == {}
+    settled(lane.parent, 1)
+    state = checkpoints.activity(lane.parent, "codex")
+    assert state["activity"] == "idle"
+    assert state.get("cursor", 0) == 0
+    assert "work_offer" not in state
+    monkeypatch.setattr(server.checkpoints, "serve", deciding)
+    served = run_hook(bridge, lane.parent, stop)
+    reason = json.loads(served.stdout)["reason"]
+    assert "Unseen change" in reason
+    assert "Take issue #9 next." in reason
+    state = checkpoints.activity(lane.parent, "codex")
+    assert state["cursor"] > 0
+    assert state["work_offer"] == "offer-1"
+    assert state["activity"] == "working"
+
+
+def test_a_delivery_for_an_ended_session_is_discarded(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    write_json(
+        lane.parent / "codex-activity.json",
+        {"session_id": "s2", "cursor": 0, "updated": 2.0},
+    )
+    pending = {
+        "markers": {"cursor": 7, "activity": "working"},
+        "session_id": "s1",
+        "updated": 1.0,
+    }
+    assert not checkpoints.deliver(lane.parent, "codex", pending)
+    assert checkpoints.activity(lane.parent, "codex")["cursor"] == 0
+
+
 def hook_body(lane, payload=ALLOW):
     """Builds the hook request body the service accepts for a lane."""
     return json.dumps(
@@ -1168,7 +1336,7 @@ def hook_body(lane, payload=ALLOW):
     ).encode()
 
 
-def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
+def test_a_lane_only_records_events_while_one_is_abandoned(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
     deciding = checkpoints.serve
@@ -1184,12 +1352,14 @@ def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
     ]
     assert [status for status, _ in answers] == [hook.DECIDING] * len(answers)
     assert json.loads(answers[-1][1])["detail"] == server.UNDECIDED
-    assert len(asked) == server.UNDECIDED_LIMIT
+    limit = server.UNDECIDED_LIMIT
+    assert asked == [False] * limit + [True] * (len(answers) - limit)
     entries = capsys.readouterr().out.splitlines()
-    assert sum(" expired " in line for line in entries) == 1
     held = [line for line in entries if "already has" in line]
-    assert len(held) == len(answers) - 1
-    assert "answered without starting another" in held[0]
+    assert len(held) == 1
+    root = roster.read(lane.parent)["root"]
+    assert f"codex of {root} already has" in held[0]
+    assert "recorded without building context" in held[0]
     assert token not in held[0]
     monkeypatch.setattr(server.checkpoints, "serve", deciding)
     deadline = time.monotonic() + 30
@@ -1200,12 +1370,106 @@ def test_a_lane_stops_starting_decisions_while_one_is_abandoned(
     assert answered == 200
 
 
+def test_turn_ending_events_are_recorded_past_an_abandoned_decision(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    identity = json.loads((directory / "codex-identity.json").read_text())
+    token = identity["registration_token"]
+    port = bridge.config["port"]
+    scanning = checkpoints.scan
+    release = threading.Event()
+
+    def stuck(*args):
+        release.wait(20)
+        return scanning(*args)
+
+    monkeypatch.setattr(checkpoints, "scan", stuck)
+    command = {"tool_name": "Bash", "tool_input": {"command": "pytest -q"}}
+    testing = {"hook_event_name": "PreToolUse", **command}
+    finished = {"hook_event_name": "PostToolUse", **command}
+    try:
+        assert hook.request(port, token, hook_body(lane, testing))[0] == (
+            hook.DECIDING
+        )
+        assert hook.request(port, token, hook_body(lane, finished))[0] == 200
+        assert checkpoints.activity(directory, "codex")["activity"] == (
+            "working"
+        )
+        assert hook.request(port, token, hook_body(lane, STOP))[0] == 200
+        assert checkpoints.activity(directory, "codex")["activity"] == "idle"
+    finally:
+        release.set()
+    settled(directory, 3)
+    assert [entry["event"] for entry in events(directory)] == [
+        "PostToolUse",
+        "Stop",
+        "PreToolUse",
+    ]
+    state = checkpoints.activity(directory, "codex")
+    assert state["activity"] == "idle"
+    assert state["event"] == "Stop"
+
+
+def test_an_abandoned_decision_holds_only_its_own_project(
+    bridge, repo, paired, service, monkeypatch, tmp_path
+):
+    second = tmp_path / "second"
+    second.mkdir()
+    cli.git(second, "init")
+    (second / "shared.txt").write_text("original\n")
+    cli.git(second, "add", "shared.txt")
+    cli.git(
+        second,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Second fixture",
+    )
+    other = bridge.add_participant(second, "codex", "codex")
+    asyncio.run(bridge.identity("codex", other))
+    first = Path(paired["lanes"]["codex"])
+    elsewhere = Path(other["lanes"]["codex"])
+    served = checkpoints.serve
+    asked = []
+    release = threading.Event()
+
+    def selective(
+        home, request, stages=None, settle=0.0, record_only=False, **kwargs
+    ):
+        asked.append((request["directory"], record_only))
+        if request["directory"] == str(first.parent):
+            release.wait(20)
+        return served(home, request, stages, settle, record_only, **kwargs)
+
+    monkeypatch.setattr(server.checkpoints, "serve", selective)
+    port = bridge.config["port"]
+    tokens = [
+        json.loads((lane.parent / "codex-identity.json").read_text())[
+            "registration_token"
+        ]
+        for lane in (first, elsewhere)
+    ]
+    try:
+        held = hook.request(port, tokens[0], hook_body(first))[0]
+        status, _ = hook.request(port, tokens[1], hook_body(elsewhere))
+    finally:
+        release.set()
+    assert held == hook.DECIDING
+    assert status == 200
+    assert asked[-1] == (str(elsewhere.parent), False)
+
+
 def test_an_expired_decision_names_the_step_that_held_it(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
     release = threading.Event()
 
-    def holding(home, request, stages=None):
+    def holding(home, request, stages=None, *args, **kwargs):
         stages.enter("mail")
         release.wait(20)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1234,7 +1498,7 @@ def test_an_expired_decision_names_the_step_that_held_it(
 def test_a_slow_served_decision_is_logged_with_its_duration(
     bridge, repo, paired, service, monkeypatch, capsys
 ):
-    def unhurried(home, request, stages=None):
+    def unhurried(home, request, stages=None, *args, **kwargs):
         stages.enter("scan")
         time.sleep(0.2)
         return {"status": 0, "stdout": "{}\n", "stderr": ""}
@@ -1276,10 +1540,10 @@ def test_a_served_decision_times_every_step_it_walked(bridge, repo, paired):
         "roster",
         "session",
         "guard",
+        "scan",
         "lock",
         "state",
         "mail",
-        "scan",
     ]
     assert all(seconds >= 0 for _, seconds in stages.spent)
     assert re.search(r"^start \d+\.\d{3}s ", stages.report())
@@ -1323,10 +1587,7 @@ def test_the_shell_client_leaves_a_running_decision_alone(
     assert json.loads(shell.stdout) == {}
     settled(lane.parent, 1)
     assert len(asked) == 1
-    assert not any(
-        entry["reason_class"] == "service_fallback"
-        for entry in events(lane.parent)
-    )
+    assert not any(fell_back(entry) for entry in events(lane.parent))
 
 
 def test_the_hook_budget_covers_the_worst_bounded_path():
@@ -1336,3 +1597,350 @@ def test_the_hook_budget_covers_the_worst_bounded_path():
         + checkpoints.LOCK_SECONDS
         <= checkpoints.HOOK_TIMEOUT
     )
+    assert (
+        server.DECISION_SECONDS + server.DELIVERY_SECONDS < hook.REPLY_TIMEOUT
+    )
+
+
+def written(lane, size, event="PreToolUse"):
+    """Builds a native Write event whose content is the given size."""
+    content = "x" * size
+    payload = {
+        "hook_event_name": event,
+        "session_id": "s1",
+        "cwd": str(lane),
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(lane / "big.json"), "content": content},
+    }
+    if event == "PostToolUse":
+        payload["tool_response"] = {"content": content}
+    return payload
+
+
+@pytest.mark.parametrize("client", ["python", "shell"])
+def test_an_oversize_payload_is_allowed_and_recorded(
+    bridge, repo, paired, service, client
+):
+    if client == "shell" and not shutil.which("bash"):
+        pytest.skip("requires bash")
+    lane = Path(paired["lanes"]["codex"])
+    payload = written(lane, 2_000_000)
+    runner = run_shell if client == "shell" else run_hook
+    answered = runner(bridge, lane.parent, payload)
+    assert answered.returncode == 0, answered.stderr
+    assert json.loads(answered.stdout) == {}
+    entry = events(lane.parent)[-1]
+    assert entry["reason_class"] == "oversize_payload"
+    assert entry["event"] == "PreToolUse"
+    assert entry["decision"] == "allow"
+    assert (
+        f"PreToolUse payload of {len(json.dumps(payload))}" in (entry["cause"])
+    )
+
+
+def test_a_post_tool_use_carrying_a_large_write_exits_zero(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    answered = run_hook(
+        bridge, lane.parent, written(lane, 600_000, "PostToolUse")
+    )
+    assert answered.returncode == 0, answered.stderr
+    assert events(lane.parent)[-1]["event"] == "PostToolUse"
+
+
+def test_an_unparsable_payload_is_allowed_in_process(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    answered = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "agent_parley.checkpoints",
+            "--home",
+            str(bridge.home),
+            "--directory",
+            str(lane.parent),
+            "--participant",
+            "codex",
+        ],
+        input='{"hook_event_name": "PreToolUse", "tool_input": ',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env=importable(),
+    )
+    assert answered.returncode == 0, answered.stderr
+    entry = events(lane.parent)[-1]
+    assert entry["reason_class"] == "unreadable_payload"
+    assert entry["event"] == "PreToolUse"
+
+
+def served_in_process(lane, payload, fallback=""):
+    """Decides one event for the codex lane the way the hook fallback does."""
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "payload": {**payload, "cwd": str(lane), "session_id": "s1"},
+    }
+    if fallback:
+        request["fallback"] = fallback
+    return request
+
+
+def test_a_fallback_stop_is_recorded_once(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    served = checkpoints.serve(
+        bridge.home, served_in_process(lane, STOP, "ConnectionRefusedError")
+    )
+    assert served["status"] == 0
+    recorded = events(lane.parent)
+    assert [entry["event"] for entry in recorded] == ["Stop"]
+    assert recorded[0]["reason_class"] != "service_fallback"
+    assert recorded[0]["fallback"] == "ConnectionRefusedError"
+
+
+def test_a_full_disk_allows_the_call_and_reports_it(
+    bridge, repo, paired, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(checkpoints, "write_json", full)
+    served = checkpoints.serve(bridge.home, served_in_process(lane, ALLOW))
+    assert served["status"] == 0
+    assert served["stdout"] == "{}\n"
+    assert "No space left on device" in served["stderr"]
+    assert "call allowed" in served["stderr"]
+
+
+def test_a_service_start_sweeps_only_old_temporary_state_files(tmp_path):
+    project = tmp_path / "projects" / "one"
+    project.mkdir(parents=True)
+    old = project / "tmpabc123"
+    fresh = project / "tmpdef456"
+    kept = project / "codex-activity.json"
+    for path in (old, fresh, kept):
+        path.write_text("{}")
+    stale = time.time() - server.TEMPORARY_SECONDS - 5
+    os.utime(old, (stale, stale))
+    os.utime(kept, (stale, stale))
+    assert server.sweep(tmp_path) == 1
+    assert not old.exists()
+    assert fresh.exists()
+    assert kept.exists()
+
+
+def test_the_hook_reply_excludes_the_recovery_capture(
+    bridge, repo, paired, service, monkeypatch
+):
+    lane = Path(paired["lanes"]["codex"])
+    bridge.issue(lane, "claim", "42")
+    release = threading.Event()
+    captured = threading.Event()
+    original = recovery.capture
+
+    def slow(*args, **kwargs):
+        release.wait(20)
+        saved = original(*args, **kwargs)
+        captured.set()
+        return saved
+
+    monkeypatch.setattr(recovery, "capture", slow)
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Read",
+        "cwd": str(lane),
+        "session_id": "s1",
+    }
+    served = run_hook(bridge, lane.parent, payload)
+
+    assert served.returncode == 0, served.stderr
+    assert not captured.is_set()
+    assert not any(fell_back(entry) for entry in events(lane.parent))
+    release.set()
+    assert captured.wait(20)
+    deadline = time.monotonic() + 10
+    state = checkpoints.activity(lane.parent, "codex")
+    while not state.get("recovery_checkpoints"):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+        state = checkpoints.activity(lane.parent, "codex")
+    assert len(state["recovery_checkpoints"]) == 1
+
+
+def held_process():
+    """Starts a child that runs until its input closes."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+    return child, process.ServerProcess(
+        child.pid, process.start_ticks(child.pid)
+    )
+
+
+def release(child):
+    """Ends a child started by held_process and reaps it."""
+    child.stdin.close()
+    child.wait()
+
+
+def test_a_new_session_after_its_process_exited_is_adopted(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    child, ended = held_process()
+    release(child)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": ended.pid,
+            "session_ticks": ended.ticks,
+            "activity": "idle",
+            "cursor": 7,
+            "updated": time.time() - 60,
+        },
+    )
+    native = process.ServerProcess(
+        os.getpid(), process.start_ticks(os.getpid())
+    )
+
+    checkpoints.checkpoint(
+        bridge.home,
+        directory,
+        "codex",
+        {**ALLOW, "session_id": "s2", "cwd": str(lane)},
+        native,
+        record_only=True,
+    )
+
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_id"] == "s2"
+    assert state["session_pid"] == native.pid
+    assert state["activity"] == "working"
+    assert state["cursor"] == 0
+    assert events(directory)[-1]["reason_class"] == "observed"
+
+
+def test_a_concurrent_foreign_session_is_named_and_never_relabels(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    recorded = {
+        "session_id": "s1",
+        "session_pid": own.pid,
+        "session_ticks": own.ticks,
+        "activity": "idle",
+        "updated": time.time() - 60,
+    }
+    write_json(directory / "codex-activity.json", recorded)
+    child, foreign = held_process()
+    try:
+        for _ in range(2):
+            assert (
+                checkpoints.checkpoint(
+                    bridge.home,
+                    directory,
+                    "codex",
+                    {**ALLOW, "session_id": "s2", "cwd": str(lane)},
+                    foreign,
+                )
+                == {}
+            )
+        state = json.loads((directory / "codex-activity.json").read_text())
+        assert {key: state[key] for key in recorded} == recorded
+        assert state["foreign_session"]["session_id"] == "s2"
+        assert state["foreign_session"]["pid"] == child.pid
+        dropped = events(directory)[-2:]
+        assert [entry["reason_class"] for entry in dropped] == [
+            "session_mismatch"
+        ] * 2
+        assert dropped[-1]["session_id"] == "s2"
+        assert dropped[-1]["recorded_session_id"] == "s1"
+        assert dropped[-1]["pid"] == child.pid
+        reading = checkpoints.foreign_reading(state)
+        assert reading["pid"] == child.pid
+        [record] = [
+            entry
+            for entry in bridge.status_snapshot()["projects"][0]["participants"]
+            if entry["participant"] == "codex"
+        ]
+        assert record["foreign_session"]["session_id"] == "s2"
+    finally:
+        release(child)
+    assert checkpoints.foreign_reading(state) == {}
+
+
+def test_a_new_session_in_the_recorded_process_is_adopted(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": own.pid,
+            "session_ticks": own.ticks,
+            "activity": "idle",
+            "cursor": 7,
+            "updated": time.time() - 60,
+        },
+    )
+
+    checkpoints.checkpoint(
+        bridge.home,
+        directory,
+        "codex",
+        {**ALLOW, "session_id": "s2", "cwd": str(lane)},
+        own,
+    )
+
+    state = json.loads((directory / "codex-activity.json").read_text())
+    assert state["session_id"] == "s2"
+    assert "foreign_session" not in state
+    assert all(
+        entry["reason_class"] != "session_mismatch"
+        for entry in events(directory)
+    )
+
+
+def test_a_foreign_process_editing_as_the_lane_is_denied(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": own.pid,
+            "session_ticks": own.ticks,
+            "activity": "idle",
+            "updated": time.time() - 60,
+        },
+    )
+    edit = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(lane / "notes.txt")},
+        "session_id": "s2",
+        "cwd": str(lane),
+    }
+    child, foreign = held_process()
+    try:
+        output = checkpoints.checkpoint(
+            bridge.home, directory, "codex", edit, foreign
+        )
+    finally:
+        release(child)
+    decision = output["hookSpecificOutput"]
+    assert decision["permissionDecision"] == "deny"
+    assert "session s1" in decision["permissionDecisionReason"]
+    assert "session s2" in decision["permissionDecisionReason"]
+    assert events(directory)[-1]["reason_class"] == "session_mismatch"

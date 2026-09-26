@@ -86,16 +86,19 @@ Steer a lane's life without typing into its terminal either:
 agent-parley participant pause claude-2     # refuse its calls, keep its work
 agent-parley participant resume claude-2    # let it act again
 agent-parley participant stop claude-2      # end its session cleanly
-agent-parley participant restart claude-2   # start it again from clean state
+agent-parley participant restart claude-2   # start it again in its worktree
 ```
 
 A paused lane keeps its session, its claims and its reservations. Only acting is
 refused: every coordination call and every tool use comes back denied naming the
 operator, and `top` shows `paused`. `stop` tells the lane once, then signals the
-recorded session process exactly as a normal exit does, and it never signals a
-process whose recorded identity no longer matches. `restart` refuses while a
-session is alive, refuses a dirty worktree naming the paths, replays the
+recorded session process exactly as a normal exit does, sends `SIGKILL` to one
+that ignores it, and never signals a process whose recorded identity no longer
+matches. `restart` refuses while a current session is alive and ends a wedged
+one first. It keeps uncommitted work in place, captures the lane's claims into
+recovery checkpoints and names them in the opening task. It replays the
 recorded `init` command and launches the same provider and account as before.
+After a host restart the lane reads as stopped and restarts the same way.
 None of the four releases a claim: ownership still moves only through an
 explicit release or an accepted handoff, and all four land in the event log.
 

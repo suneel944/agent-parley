@@ -21,7 +21,18 @@ answered.
 The patterns are recorded from `claude` CLI 2.1.270 and Codex CLI 0.153.4.
 Matching runs on a flattened screen with escape sequences removed and
 whitespace collapsed, because both clients redraw and rewrap the same dialog
-continuously and neither emits line breaks between redraws.
+continuously and neither emits line breaks between redraws. Only the bottom
+of that screen is read as a dialog, and a dialog that offers a choice must
+draw its option list and selection footer there, so output a lane printed
+that merely quotes a dialog's words is never taken for one.
+
+A dialog is released as soon as it is answered, by this watcher or by the
+operator typing at an attached terminal: the screen read before the answer is
+dropped, and the client's next output is judged on its own.
+
+A question the lane asks its operator through the client's question picker is
+published with the question and the options it offers. It is answered only by
+the standing reply an operator recorded for the lane, typed as free text.
 
 Publication reuses the lane surfaces a reader already has: the activity file
 carries the dialog under `dialog` and names it in `activity`, provider capacity
@@ -51,10 +62,14 @@ import zoneinfo
 from pathlib import Path
 from typing import NamedTuple
 
-from agent_parley import protocol
+from agent_parley import lanes, protocol
 from agent_parley.state import BridgeError, lock, write_json
 
 SCREEN_BYTES = 8192
+REGION_CHARS = 1200
+FOOTER_CHARS = 120
+PROMPT_CHARS = 300
+QUESTION_CHARS = 120
 SIGNATURE_CHARS = 200
 REPORT_CHARS = 1200
 REPORT_LINES = 4
@@ -66,8 +81,17 @@ MARKER = "dialog: "
 APPROVAL = "waiting for approval"
 PERMISSION = "tool-permission"
 PRE_APPROVE = "approve_bridge_tools"
+STANDING_REPLY = "answer_questions"
+QUESTION = "question"
+TRUST = "directory-trust"
 EXHAUSTED = "exhausted"
 ANSWER = "answer"
+ASK = "ask"
+FREE_TEXT = "type something"
+SHELL_TITLE = "Bash command"
+BRIDGE_ANSWER = "Yes"
+SHELL_OPERATORS = re.compile(r"[;&|<>$`\\]")
+BOX = re.compile(r"[─-╿]")
 
 ESCAPES = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
@@ -77,7 +101,12 @@ ESCAPES = re.compile(
 )
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 OPTION = re.compile(r"(?:›|❯|>)?\s*(\d)\.\s+")
-LABEL_END = re.compile(r"·|Esc to |Press enter|esc to ")
+LABEL_END = re.compile(r"·|Esc to |Press enter|esc to |Enter to ")
+FOOTER = re.compile(
+    r"esc to (?:cancel|go back|exit)|press enter|enter to (?:select|confirm)",
+    re.IGNORECASE,
+)
+QUESTION_LINE = re.compile(r"([^?!›❯☐☒✔]{3,}\?)")
 PROMPT_SHAPE = re.compile(
     r"do you want to|\(y/n\)|press enter to confirm|esc to cancel"
     r"|\d\.\s+yes\b",
@@ -102,14 +131,19 @@ class Dialog(NamedTuple):
     Attributes:
         name: Stable identifier an operator names to configure an answer.
         label: Short description shown on the lane's status line.
-        pattern: Recognizer applied to the flattened screen.
-        action: Either an exhausted provider capacity or an offered answer.
+        pattern: Recognizer applied to the screen's dialog region.
+        action: An exhausted provider capacity, an offered answer, or a
+            question the operator is asked.
+        framed: Whether the screen must also draw an option list and a
+            selection footer after the recognized text. Only the usage-limit
+            notice is drawn without one.
     """
 
     name: str
     label: str
     pattern: re.Pattern[str]
     action: str
+    framed: bool = True
 
 
 DIALOGS: tuple[Dialog, ...] = (
@@ -117,16 +151,38 @@ DIALOGS: tuple[Dialog, ...] = (
         "usage-limit",
         "provider usage limit",
         re.compile(
-            r"hit your [\w-]+ limit|usage limit reached|"
-            r"weekly limit\b.{0,40}\bresets",
+            r"[⎿■]\s*(?:you['’]ve hit your [\w-]+ limit\b"
+            r"|weekly limit\b.{0,40}\bresets)",
             re.IGNORECASE,
         ),
         EXHAUSTED,
+        framed=False,
+    ),
+    Dialog(
+        QUESTION,
+        "a question for the operator",
+        re.compile(
+            r"\d\.\s+type something\.?\s+\d\.\s+chat about this\b"
+            r".{0,40}?enter to select\b.{0,20}?to navigate",
+            re.IGNORECASE,
+        ),
+        ASK,
     ),
     Dialog(
         "hook-review",
         "native hook trust review",
         re.compile(r"hooks need review", re.IGNORECASE),
+        ANSWER,
+    ),
+    Dialog(
+        TRUST,
+        "native directory trust prompt",
+        re.compile(
+            r"\btrust\b[^?]{0,60}\b(?:directory|folder|workspace)\b[^?]{0,40}\?"
+            r"|\bproject you created or one you trust\b"
+            r"|\bi trust this (?:folder|directory)\b",
+            re.IGNORECASE,
+        ),
         ANSWER,
     ),
     Dialog(
@@ -137,8 +193,21 @@ DIALOGS: tuple[Dialog, ...] = (
     ),
 )
 
-NAMES = frozenset(item.name for item in DIALOGS)
+NAMES = frozenset(item.name for item in DIALOGS if item.action == ANSWER)
 BY_NAME = {item.name: item for item in DIALOGS}
+
+
+class Frame(NamedTuple):
+    """The recognized dialog and the part of the screen that draws it.
+
+    Attributes:
+        dialog: Policy entry the screen matched.
+        text: Screen text from the dialog's first recognized line to the end
+            of the screen, which is where its options and footer are read.
+    """
+
+    dialog: Dialog
+    text: str
 
 
 def flatten(data: bytes) -> str:
@@ -157,6 +226,82 @@ def flatten(data: bytes) -> str:
     return " ".join(CONTROL.sub(" ", text).split())
 
 
+def _picker_start(region: str, end: int) -> int:
+    """Finds where a question picker's question begins before its options.
+
+    Args:
+        region: Dialog region of the screen.
+        end: Offset of the picker's own footer options.
+
+    Returns:
+        Offset of the question line drawn above the first option, or of the
+        first option when no question line precedes it.
+    """
+    firsts = [
+        mark.start()
+        for mark in OPTION.finditer(region, 0, end)
+        if mark.group(1) == "1"
+    ]
+    first = firsts[-1] if firsts else end
+    floor = max(0, first - 2 * QUESTION_CHARS)
+    lines = list(QUESTION_LINE.finditer(region, floor, first))
+    return lines[-1].start() if lines else first
+
+
+def lane_cause(record: dict) -> str:
+    """Names the blocked cause a published dialog record gives its lane.
+
+    Args:
+        record: Dialog record as `Watch` publishes it.
+
+    Returns:
+        `capacity` for a usage limit, `approval` for a tool permission,
+        `prompt` for a question or an unrecognized prompt, and `dialog` for
+        any other recorded dialog.
+    """
+    if record.get("action") == EXHAUSTED:
+        return lanes.CAPACITY
+    if record.get("name") == PERMISSION:
+        return lanes.APPROVAL
+    if record.get("action") == ASK or record.get("name") == "unknown":
+        return lanes.PROMPT
+    return lanes.DIALOG
+
+
+def locate(screen: str) -> Frame | None:
+    """Finds the recorded dialog the bottom of a flattened screen draws.
+
+    The flattened tail holds scrollback as well as the dialog: model output,
+    diffs and file contents a lane printed. A dialog is therefore recognized
+    only in the last `REGION_CHARS` of the screen, and a dialog that offers a
+    choice must also draw at least two numbered options after its recognized
+    text and a selection footer at the very end of the screen. A usage-limit
+    notice draws no options, so it must carry the client's own notice marker
+    instead, which quoted text in a code block or a log does not.
+
+    Args:
+        screen: Flattened screen text.
+
+    Returns:
+        The first policy entry drawn in the dialog region, with the text that
+        draws it, or None.
+    """
+    region = screen[-REGION_CHARS:]
+    for dialog in DIALOGS:
+        found = dialog.pattern.search(region)
+        if found is None:
+            continue
+        if not dialog.framed:
+            return Frame(dialog, region[found.start() :])
+        start = found.start()
+        if dialog.name == QUESTION:
+            start = _picker_start(region, start)
+        text = region[start:]
+        if len(options(text)) >= 2 and FOOTER.search(text[-FOOTER_CHARS:]):
+            return Frame(dialog, text)
+    return None
+
+
 def match(screen: str) -> Dialog | None:
     """Returns the recorded dialog a flattened screen shows.
 
@@ -164,22 +309,45 @@ def match(screen: str) -> Dialog | None:
         screen: Flattened screen text.
 
     Returns:
-        The first policy entry whose recognizer matches, or None.
+        The policy entry drawn in the screen's dialog region, or None.
     """
-    return next((item for item in DIALOGS if item.pattern.search(screen)), None)
+    found = locate(screen)
+    return found.dialog if found else None
 
 
 def prompted(screen: str) -> bool:
     """Reports whether a flattened screen holds an answer-shaped prompt.
 
+    Only the bottom of the screen is read, because a client draws a waiting
+    prompt last and the same words further up are output it printed.
+
     Args:
         screen: Flattened screen text.
 
     Returns:
-        True when the screen carries a marker a client only draws while it is
-        waiting for a keypress.
+        True when the end of the screen carries a marker a client only draws
+        while it is waiting for a keypress.
     """
-    return bool(PROMPT_SHAPE.search(screen))
+    return bool(PROMPT_SHAPE.search(screen[-PROMPT_CHARS:]))
+
+
+def question(text: str) -> str:
+    """Reads the question a question picker asks.
+
+    Args:
+        text: Screen text drawing the picker, from its question line on.
+
+    Returns:
+        The last question sentence drawn above the first option, bounded to
+        `QUESTION_CHARS`, or empty text when the picker drew none.
+    """
+    first = OPTION.search(text)
+    head = text[: first.start() if first else len(text)]
+    lines = QUESTION_LINE.findall(head)
+    if not lines:
+        return ""
+    line = lines[-1].rsplit(". ", 1)[-1].strip()
+    return line[-QUESTION_CHARS:].strip()
 
 
 def options(screen: str) -> dict[str, str]:
@@ -369,6 +537,30 @@ def requested(tool: str, previous: object, now: float) -> dict:
     }
 
 
+def parked(state: dict) -> bool:
+    """Reports whether a lane is held on a screen only the operator answers.
+
+    A tool approval prompt is labelled `APPROVAL` by the native hook, and a
+    dialog the watcher could not answer is labelled with `MARKER`, which
+    also carries the `asks the operator` questions. A usage-limit dialog is
+    published the same way but is provider capacity, not a question, so it
+    is left to the capacity paths.
+
+    Args:
+        state: Lane activity record.
+
+    Returns:
+        True when the lane's label is an approval prompt or a watcher-held
+        dialog other than an exhausted capacity.
+    """
+    activity = str(state.get("activity", ""))
+    if activity.startswith(APPROVAL):
+        return True
+    record = state.get("dialog")
+    action = record.get("action") if isinstance(record, dict) else None
+    return activity.startswith(MARKER) and action != EXHAUSTED
+
+
 def waited(state: dict, now: float) -> int | None:
     """Measures how long a recorded approval prompt has stood unanswered.
 
@@ -415,6 +607,78 @@ def pre_approved(manifest: dict, name: str) -> bool:
     return chosen is True
 
 
+def bridge_shell(screen: str, text: str) -> bool:
+    """Reports whether a shell permission prompt asks for this bridge's CLI.
+
+    The protocol prompt orders every lane to run `protocol.cli_command`
+    through its shell tool, so a lane launched before the operator's opt-in
+    parks on the first such command. Only a prompt titled as a shell command
+    whose command begins with that exact interpreter and module, and whose
+    remainder carries no shell operator that could chain a second command,
+    qualifies. Any other screen escalates as before.
+
+    Args:
+        screen: Flattened screen text.
+        text: Part of the screen that draws the prompt's question and options.
+
+    Returns:
+        True when the prompt asks to run this bridge's CLI and nothing else.
+    """
+    region = screen[-REGION_CHARS:]
+    head = region[: max(0, len(region) - len(text))]
+    title = head.rfind(SHELL_TITLE)
+    if title < 0:
+        return False
+    shown = " ".join(BOX.sub(" ", head[title + len(SHELL_TITLE) :]).split())
+    command = protocol.cli_command() + " "
+    if not shown.startswith(command):
+        return False
+    return SHELL_OPERATORS.search(shown[len(command) :]) is None
+
+
+def standing_reply(manifest: dict, name: str) -> str:
+    """Reads the reply an operator recorded for a lane's own questions.
+
+    A lane can ask its operator a design question through the client's
+    question picker, and an unattended lane would otherwise hold that picker
+    until someone opens its terminal. The reply is text the operator wrote
+    once for every question, so it is off until a project or one of its lanes
+    records it, and a lane entry overrides the project.
+
+    Args:
+        manifest: Project manifest as the roster reports it.
+        name: Participant that owns the lane.
+
+    Returns:
+        The recorded reply, or empty text when every question escalates.
+    """
+    project = (manifest.get("supervision") or {}).get(STANDING_REPLY)
+    participant = (manifest.get("participants") or {}).get(name) or {}
+    lane = participant.get(STANDING_REPLY)
+    chosen = lane if isinstance(lane, str) else project
+    return chosen.strip() if isinstance(chosen, str) else ""
+
+
+def typed(text: str, reply: str) -> bytes:
+    """Returns the keystrokes that answer a question picker in free text.
+
+    Args:
+        text: Screen text drawing the picker.
+        reply: Standing reply the operator recorded.
+
+    Returns:
+        The digit of the picker's free-text option, the reply and a carriage
+        return, or empty bytes when the picker offers no free-text option or
+        the reply is empty.
+    """
+    if not reply:
+        return b""
+    for number, label in options(text).items():
+        if _comparable(label).startswith(FREE_TEXT):
+            return f"{number}{reply}\r".encode()
+    return b""
+
+
 class Watch:
     """Watches one launcher's terminal and publishes the dialog it holds.
 
@@ -429,6 +693,8 @@ class Watch:
         answers: dict[str, str] | None = None,
         *,
         deadline: float = ESCALATE_AFTER,
+        reply: str = "",
+        bridge: bool | None = None,
     ) -> None:
         """Prepares a watcher for one lane's pseudo-terminal.
 
@@ -438,29 +704,66 @@ class Watch:
             answers: Dialog name to configured option text.
             deadline: Seconds an unrecognized prompt may hold an unchanged
                 screen before it escalates.
+            reply: Standing reply typed into a question picker, empty when
+                every question escalates.
+            bridge: Whether the operator opted this lane into approving this
+                bridge's own tools, which lets a shell prompt for its CLI be
+                answered as the launch's permission rule would allow it. None
+                reads the opt-in from the manifest when such a prompt is
+                drawn, so a lane launched before the opt-in is unparked too.
         """
         self._directory = directory
         self._name = name
         self._answers = dict(answers or {})
         self._deadline = deadline
+        self._reply = reply
+        self._bridge = bridge
         self._tail = b""
         self._signature = ""
         self._since = 0.0
         self._resolved = False
         self._parked = False
+        self._answered = False
         self._repeats: dict[str, int] = {}
+
+    def _opted_in(self) -> bool:
+        """Reads whether this lane's operator allows this bridge's own tools.
+
+        A manifest that cannot be read counts as no opt-in, so the prompt
+        escalates rather than being answered by guess.
+        """
+        if self._bridge is not None:
+            return self._bridge
+        from agent_parley import roster
+
+        with contextlib.suppress(BridgeError, OSError, ValueError, KeyError):
+            return pre_approved(roster.read(self._directory), self._name)
+        return False
 
     @property
     def holding(self) -> bool:
         """Reports whether a dialog is published as holding the screen."""
         return self._parked
 
+    def answered(self) -> None:
+        """Records that the dialog on screen was just answered.
+
+        The screen already read is the dialog as it stood before the answer,
+        so it is dropped rather than left to scroll out of the tail. The next
+        output the client draws releases the published dialog and is judged on
+        its own, which makes a dialog drawn again after an answer a new dialog
+        rather than one already handled.
+        """
+        self._tail = b""
+        self._answered = True
+
     def advance(self, output: bytes, now: float, held: bool = False) -> bytes:
         """Observes new terminal output and decides one action.
 
         A screen is acted on only once it has stopped changing, so a dialog
         drawn across several reads is answered as one screen rather than half
-        of one.
+        of one. Output after an answer, from this watcher or the operator,
+        releases the dialog the answer dismissed before it is read.
 
         Args:
             output: Bytes just read from the client, empty when the launcher
@@ -474,12 +777,17 @@ class Watch:
             to a recognized dialog and nothing else.
         """
         if output:
+            if self._answered:
+                self._answered = False
+                self._signature = ""
+                self._resolved = False
+                self._release()
             self._tail = (self._tail + output)[-SCREEN_BYTES:]
         if not self._tail:
             return b""
         screen = flatten(self._tail)
-        dialog = match(screen)
-        signature = self._describe(screen, dialog)
+        found = locate(screen)
+        signature = self._describe(screen, found)
         if signature != self._signature:
             self._signature = signature
             self._since = now
@@ -487,44 +795,95 @@ class Watch:
             if not signature:
                 self._release()
             return b""
-        if not signature or self._resolved:
+        if not signature:
+            self._release()
             return b""
-        return self._act(screen, dialog, now, held)
+        if self._resolved and not self._approvable(screen, found):
+            return b""
+        return self._act(screen, found, now, held)
 
-    def _describe(self, screen: str, dialog: Dialog | None) -> str:
+    def _approvable(self, screen: str, found: Frame | None) -> bool:
+        """Reports whether an escalated prompt became answerable in place.
+
+        A lane parked on a shell prompt for this bridge's CLI stays parked
+        until someone answers it, so the operator's later opt-in is read again
+        while that one prompt holds the screen. Any other escalated screen is
+        left as it was published.
+        """
+        return (
+            self._parked
+            and found is not None
+            and found.dialog.name == PERMISSION
+            and not self._answers.get(PERMISSION)
+            and bridge_shell(screen, found.text)
+            and self._opted_in()
+        )
+
+    def _describe(self, screen: str, found: Frame | None) -> str:
         """Names the screen so a redraw of it compares equal to itself."""
-        if dialog is not None:
-            return "\x00".join((dialog.name, *options(screen).values()))
+        if found is not None:
+            return "\x00".join(
+                (found.dialog.name, *options(found.text).values())
+            )
         if prompted(screen):
             return "prompt\x00" + screen[-SIGNATURE_CHARS:]
         return ""
 
     def _act(
-        self, screen: str, dialog: Dialog | None, now: float, held: bool
+        self, screen: str, found: Frame | None, now: float, held: bool
     ) -> bytes:
         """Applies the policy for a screen that has stopped changing."""
-        if dialog is None:
+        if found is None:
             if now - self._since < self._deadline:
                 return b""
             self._escalate(None, "an unrecognized native prompt", screen)
             return b""
+        dialog = found.dialog
         if dialog.action == EXHAUSTED:
-            self._exhaust(dialog, screen)
+            self._exhaust(dialog, found.text)
             return b""
-        answer = self._answers.get(dialog.name, "")
-        pressed = keys(screen, answer) if answer else b""
+        detail: dict = {}
+        label = dialog.label
+        if dialog.action == ASK:
+            asked = question(found.text)
+            label = f"asks the operator: {asked or 'an unnamed question'}"
+            answer = self._reply
+            pressed = typed(found.text, answer)
+            detail = {
+                "question": asked,
+                "options": [
+                    f"{number}. {text}"
+                    for number, text in options(found.text).items()
+                ],
+            }
+        else:
+            answer = self._answers.get(dialog.name, "")
+            if (
+                not answer
+                and dialog.name == PERMISSION
+                and bridge_shell(screen, found.text)
+                and self._opted_in()
+            ):
+                answer = BRIDGE_ANSWER
+            pressed = keys(found.text, answer) if answer else b""
         repeats = self._repeats.get(self._signature, 0)
         if not pressed or repeats >= REPEAT_LIMIT:
-            self._escalate(dialog, dialog.label, screen)
+            self._escalate(dialog, label, found.text, detail)
             return b""
         if held:
             return b""
         self._repeats = {self._signature: repeats + 1}
         self._publish(
             dialog,
-            screen,
-            {"answer": answer, "keys": pressed.decode().strip()},
+            found.text,
+            {
+                **detail,
+                "label": label,
+                "answer": answer,
+                "keys": pressed.decode().strip(),
+            },
         )
+        self.answered()
         return pressed
 
     def _exhaust(self, dialog: Dialog, screen: str) -> None:
@@ -532,13 +891,20 @@ class Watch:
 
         The capacity is recorded before the dialog is published, so a reader
         that sees the lane parked on a usage limit also sees the exhaustion
-        that parked it rather than a lane with no capacity record.
+        that parked it rather than a lane with no capacity record. The
+        observation names the session the lane last published, because a
+        stranded-claim candidate without one is evidence recovery refuses,
+        and supervision rejected every such candidate before it could offer
+        the claim to a peer.
         """
         observed = time.time()
         reset = reset_at(screen, observed)
-        from agent_parley import supervision
+        from agent_parley import checkpoints, supervision
 
         with contextlib.suppress(BridgeError, OSError, ValueError):
+            session = checkpoints.activity(self._directory, self._name).get(
+                "session_id"
+            )
             supervision.record_capacity(
                 self._directory,
                 self._name,
@@ -547,16 +913,34 @@ class Watch:
                     "observed_at": observed,
                     "reset_at": reset,
                     "source": "native-dialog",
+                    "session_id": str(session or ""),
                     "observation_id": self._evidence(dialog.name, reset),
                 },
             )
-        self._publish(dialog, screen, {"reset_at": reset})
-        self._notify(dialog.label, screen)
+        if self._publish(dialog, screen, {"reset_at": reset}):
+            self._notify(dialog.label, " ".join(report(screen)))
 
-    def _escalate(self, dialog: Dialog | None, label: str, screen: str) -> None:
-        """Parks the lane on a screen no configured answer covers."""
-        self._publish(dialog, screen, {"label": label, "escalated": True})
-        self._notify(label, screen)
+    def _escalate(
+        self,
+        dialog: Dialog | None,
+        label: str,
+        screen: str,
+        detail: dict | None = None,
+    ) -> None:
+        """Parks the lane on a screen no configured answer covers.
+
+        A question carries its own text and option lines into the record and
+        the notice, so the operator can answer from the notice alone.
+        """
+        extra = dict(detail or {})
+        if not self._publish(
+            dialog, screen, {**extra, "label": label, "escalated": True}
+        ):
+            return
+        shown = " ".join(report(screen))
+        if extra.get("options"):
+            shown = " | ".join((label, *extra["options"]))
+        self._notify(label, shown)
 
     def _evidence(self, name: str, reset: float | None) -> str:
         """Identifies one screen situation for a durable observation."""
@@ -567,11 +951,16 @@ class Watch:
 
     def _publish(
         self, dialog: Dialog | None, screen: str, detail: dict
-    ) -> None:
+    ) -> bool:
         """Records the dialog on the lane's own activity state.
 
         The last observed native checkpoint is left untouched: a dialog is
-        evidence that the lane stopped, never fresh activity.
+        evidence that the lane stopped, never fresh activity. A record that
+        cannot take the lane's checkpoint lock is not marked handled, so the
+        next pass publishes it again rather than dropping it.
+
+        Returns:
+            Whether the record was written.
         """
         from agent_parley import checkpoints
 
@@ -601,12 +990,26 @@ class Watch:
                 write_json(path, state)
             self._parked = True
             self._resolved = True
+            lanes.submit(
+                self._directory,
+                self._name,
+                "dialog",
+                lanes.BLOCKED,
+                cause=lane_cause(record),
+                evidence=label,
+            )
+            return True
+        return False
 
     def _release(self) -> None:
-        """Clears a published dialog once the screen no longer shows one."""
+        """Clears a published dialog once the screen no longer shows one.
+
+        A release that cannot take the lane's checkpoint lock leaves the
+        dialog recorded as held, so the next pass retries it rather than the
+        lane reading as parked after its dialog is gone.
+        """
         if not self._parked:
             return
-        self._parked = False
         from agent_parley import checkpoints
 
         path = self._directory / f"{self._name}-activity.json"
@@ -615,18 +1018,25 @@ class Watch:
                 self._directory / f"{self._name}-checkpoint.lock", timeout=1
             ):
                 state = checkpoints.activity(self._directory, self._name)
-                if not state:
-                    return
-                if str(state.get("activity", "")).startswith(MARKER):
-                    state["activity"] = (
-                        str((state.get("dialog") or {}).get("previous", ""))
-                        or "idle"
-                    )
-                state.pop("dialog", None)
-                write_json(path, state)
+                if state:
+                    if str(state.get("activity", "")).startswith(MARKER):
+                        state["activity"] = (
+                            str((state.get("dialog") or {}).get("previous", ""))
+                            or "idle"
+                        )
+                    state.pop("dialog", None)
+                    write_json(path, state)
+            self._parked = False
+            lanes.submit(
+                self._directory,
+                self._name,
+                "dialog",
+                lanes.WORKING,
+                evidence="dialog released",
+            )
 
-    def _notify(self, label: str, screen: str) -> None:
-        """Sends the operator one message carrying the screen text."""
+    def _notify(self, label: str, detail: str) -> None:
+        """Sends the operator one message carrying what the screen shows."""
         from agent_parley import notify
 
         with contextlib.suppress(BridgeError, OSError, ValueError):
@@ -634,7 +1044,7 @@ class Watch:
                 self._directory,
                 self._name,
                 notify.Event.NATIVE_DIALOG,
-                {"dialog": label, "detail": " ".join(report(screen))},
+                {"dialog": label, "detail": detail},
             )
 
 
@@ -653,6 +1063,9 @@ def watcher(directory: Path, name: str) -> Watch:
     from agent_parley import roster
 
     answers: dict[str, str] = {}
+    reply = ""
     with contextlib.suppress(BridgeError, OSError, ValueError, KeyError):
-        answers = configured(roster.read(directory), name)
-    return Watch(directory, name, answers, deadline=ESCALATE_AFTER)
+        manifest = roster.read(directory)
+        answers = configured(manifest, name)
+        reply = standing_reply(manifest, name)
+    return Watch(directory, name, answers, deadline=ESCALATE_AFTER, reply=reply)

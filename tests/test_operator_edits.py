@@ -1,5 +1,6 @@
 """Checks the advisory notice for an operator edit on a reserved path."""
 
+import itertools
 import json
 import subprocess
 import sys
@@ -153,3 +154,93 @@ def test_a_git_failure_reports_nothing_without_raising(
     assert supervision.operator_edits(bridge.home, paired) == {}
     view = dashboard.collect(bridge.home, False, {})
     assert view["projects"][0]["rows"][0]["operator_edits"] == []
+
+
+def test_the_hook_reads_the_poll_reading_instead_of_asking_git(
+    bridge, repo, paired, monkeypatch
+):
+    reserve(bridge, paired["root"], "claude", "shared.txt")
+    (repo / "shared.txt").write_text("operator change\n")
+    directory = Path(paired["lanes"]["claude"]).parent
+    write_json(directory / "claude-identity.json", {"name": "claude"})
+    kept = supervision.refresh_readings(bridge.home, paired, 60)
+    assert kept[0] == {"claude": ["shared.txt"]}
+
+    def asked(*args, **kwargs):
+        raise AssertionError("the hook path asked Git")
+
+    monkeypatch.setattr(supervision, "operator_edits", asked)
+    monkeypatch.setattr(supervision, "base_advances", asked)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "test",
+        "cwd": paired["lanes"]["claude"],
+        "tool_name": "Bash",
+    }
+    first = checkpoints.checkpoint(bridge.home, directory, "claude", payload)
+    context = first["hookSpecificOutput"]["additionalContext"]
+    assert "Operator edit on a path you reserved: shared.txt" in context
+
+
+def test_status_reads_the_published_poll_reading_instead_of_asking_git(
+    bridge, repo, paired, monkeypatch
+):
+    reserve(bridge, paired["root"], "claude", "shared.txt")
+    (repo / "shared.txt").write_text("operator change\n")
+    supervision.refresh_readings(bridge.home, paired, 60)
+    supervision._READINGS.clear()
+
+    def asked(*args, **kwargs):
+        raise AssertionError("status asked Git for a poll reading")
+
+    monkeypatch.setattr(supervision, "operator_edits", asked)
+    monkeypatch.setattr(supervision, "base_advances", asked)
+    lanes = {
+        lane["participant"]: lane
+        for lane in bridge.status_snapshot()["projects"][0]["participants"]
+    }
+    assert lanes["claude"]["operator_edits"] == ["shared.txt"]
+    view = dashboard.collect(bridge.home, False, {})
+    rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
+    assert rows["claude"]["operator_edits"] == ["shared.txt"]
+
+
+def test_an_expired_publication_is_read_from_git_again(bridge, repo, paired):
+    reserve(bridge, paired["root"], "claude", "shared.txt")
+    supervision.refresh_readings(bridge.home, paired, -1)
+    supervision._READINGS.clear()
+    (repo / "shared.txt").write_text("operator change\n")
+
+    assert supervision.readings(bridge.home, paired)[0] == {
+        "claude": ["shared.txt"]
+    }
+
+
+def test_the_batch_matcher_agrees_with_the_pairwise_rule():
+    keys = [
+        "a",
+        "a/",
+        "a/b",
+        "a/b/",
+        "a/b/c.py",
+        "a/*",
+        "a/b/*.py",
+        "*.py",
+        "ab",
+        "ab/c",
+        "x:y",
+        "x:y/z",
+        "[ab]/c",
+        "?",
+        "c/d/e",
+    ]
+    for size in (1, 2):
+        for patterns in itertools.combinations(keys, size):
+            expected = {
+                path
+                for path in keys
+                for pattern in patterns
+                if store.overlapping(path, pattern)
+            }
+            assert store.overlapping_paths(keys, list(patterns)) == expected
+    assert store.overlapping_paths(keys, []) == set()

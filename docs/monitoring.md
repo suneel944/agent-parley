@@ -29,6 +29,19 @@ requested)`. A presence row written before this release still carries
 `idle` names the oldest waiting item and how long it has waited, so a lane that
 is quiet with an empty inbox reads differently from one sitting on unread mail.
 
+## A second session in a lane
+
+A hook event from a session other than the lane's recorded one is recorded as
+`session_mismatch` with the arriving `session_id`, the lane's
+`recorded_session_id` and the arriving native `pid`, and it changes nothing.
+When the recorded session's process has exited and the event comes from a live
+native process, the new session is adopted as if it had sent `SessionStart`, so
+a lane whose start event was lost follows its real session again. Any other
+second session, such as a headless `claude -p` started inside the worktree, is
+named in the lane's `status` detail and as a `second session` row in
+`problems` while its process runs, or for ten minutes when its process cannot
+be told apart from the lane's.
+
 ## A lane held by a native dialog
 
 A native client sometimes stops on a screen of its own: a usage limit, a tool
@@ -40,11 +53,36 @@ a `dialog` entry with the last screen lines, a wake addressed to the lane is
 refused with `manual attention required`, and you get one notification with the
 screen text. A recognized usage limit also records the provider capacity as
 exhausted with the reset instant the screen names, so the lane is parked with
-that reason and restored when the reset passes. No lane on a dialog is ever
+that reason and restored when the reset passes. A screen that names no reset
+is probed on a doubling backoff capped at one hour; an accepted probe or a
+later tool call clears the exhaustion. No lane on a dialog is ever
 reported as `working` or `starting`.
 
-Three dialogs are recognized, recorded from `claude` CLI 2.1.270 and Codex CLI
-0.153.4: `usage-limit`, `hook-review` and `tool-permission`. Answering one is
+Five dialogs are recognized, recorded from `claude` CLI 2.1.270 and Codex CLI
+0.153.4: `usage-limit`, `question`, `hook-review`, `directory-trust` and
+`tool-permission`. Only the bottom of the screen, where a client draws its
+dialog, is read. A framed dialog counts only while it shows at least two
+numbered options and its own footer (`Esc to cancel`, `Enter to select` and
+similar), and a usage limit counts only on the client's own notice line. Text
+that merely quotes a dialog, in scrollback or in the agent's output, never
+parks the lane. Once a dialog is answered, by the launcher or by a key you type
+in the lane's terminal, the next screen output releases the lane.
+
+`directory-trust` is the screen that asks whether you trust the folder. Codex
+records that trust for the repository root, so trusting a lane's worktree also
+covers the shared project. `question` is the client asking you a question
+through its own picker. The notification and the `dialog` entry name the
+question and every option it offers, and `status` lists the lane as held by
+that dialog. To let a lane answer questions without you, set a standing reply;
+it is typed into the picker's free-text option:
+
+```json
+{"participants": {"claude": {"answer_questions": "Use your best judgement."}}}
+```
+
+The reply is one line of printable text of at most 500 characters, set per
+participant or under `supervision` for the whole project. Answering any other
+dialog is
 your decision, so nothing is answered until you say which option to press. Name
 the option's own text, not its position, because the clients reorder options
 between versions:
@@ -60,8 +98,8 @@ between versions:
 
 A participant entry overrides the project entry for that dialog name. An
 unanswered dialog, a dialog whose configured option the screen does not offer,
-an answer the screen survives twice, and any prompt that is not one of the three
-and holds the screen for 30 seconds are all escalated to you instead. The
+an answer the screen survives twice, and any prompt that is not a recognized
+dialog and holds the screen for 30 seconds are all escalated to you instead. The
 keystrokes sent are the ones you would press on an option the client itself
 offered; no permission check is skipped and no bypass flag exists.
 
@@ -95,10 +133,26 @@ server there, and only when you record the opt-in:
 ```
 
 The default is off and changes nothing about the client's configuration. With it
-on, the launch adds one native permission rule, `mcp__agent_parley`, which allows
-this bridge's own coordination tools and nothing else: no file tool, no shell, no
-other MCP server, no bypass flag and no weakened decision. A participant entry
-overrides the project entry, so one lane can stay fully interactive. Codex CLI
+on, the launch adds two native permission rules: `mcp__agent_parley`, which
+allows this bridge's own coordination tools, and
+`Bash(<interpreter> -m agent_parley.cli *)`, which allows the exact interpreter
+and module the protocol prompt orders every lane to run for `issue claim`,
+`issue list`, `report` and the other CLI commands. Both are spelled from the
+same string the prompt prints, so they cannot drift apart. Nothing else is
+allowed: no file tool, no other shell command, no other MCP server, no bypass
+flag and no weakened decision. A lane launched before you recorded the opt-in
+still draws the shell prompt for that command; its watcher reads the opt-in
+again while the prompt holds the screen and answers `Yes` when the prompt's
+command begins with that interpreter and module and chains no second command.
+A prompt for any other command escalates as before. A participant entry
+overrides the project entry, so one lane can stay fully interactive.
+
+A lane the supervisor launches or resumes runs in the client's default
+permission mode; no permission mode is passed. A lane you started by hand and
+switched to the client's auto mode does not carry that choice into a
+supervisor-driven resume, so a resumed lane parks on the first shell command
+outside your own allow list and the two rules above. Record that command in
+the client's own permission settings to keep such a lane moving. Codex CLI
 0.153.4 has no per-tool approval surface of its own — its approval settings are
 whole-session policies — so its launch is left untouched and its prompts are
 reported for you to answer.
@@ -139,7 +193,17 @@ the table and in `status --json`.
 
 ## `top`
 
-`top` is the live view: every lane at once, refreshed in place, `q` quits.
+`top` is the live view: every live lane at once, refreshed in place, `q`
+quits. Like a task manager, it lists what is live: a lane out of a live state
+(retired, or its state record `stopped`, `dead` or `reclaimed`; no record
+yet falls back to a stopped session cell) is left out once it owns no
+issue, holds no offer, holds or waits on no lease, has no unread or
+unacknowledged mail and has no ready report awaiting approval. A project
+whose root no longer exists, such as a run under `/tmp` after a reboot, is
+left out the same way; a lane whose mailbox or lease store could not be
+read stays on screen regardless. The header counts what was left out;
+`--all` on the command line, or `a` in the live view, shows it again, and
+`--json` always reports every lane.
 
 ```sh
 agent-parley top --provider codex
@@ -147,6 +211,7 @@ agent-parley top --provider claude --provider codex
 agent-parley top --sort IDLE --reverse
 agent-parley top --project payments --participant codex
 agent-parley top --columns PARTICIPANT,STATE,ISSUES,IDLE
+agent-parley top --all
 ```
 
 With a dozen lanes open the whole table is rarely what you want. `--provider`
@@ -172,9 +237,15 @@ The same choices are reachable from the live view with single keys:
 | `f` | Narrow to participants, comma separated; empty clears. |
 | `o` | Narrow to projects, comma separated; empty clears. |
 | `c` | Choose the columns shown; empty shows all. |
+| `a` | Show or hide stopped lanes and projects whose root is gone. |
 | `P` | Show the `problems` rows in place until any key returns. |
 | `?` | Show the key map and the column legend. |
 | `q` | Leave. The view never writes state. |
+
+The header also carries how long the frame took to read. Git reads dominate
+a frame, so the live view reads each lane's branch and each project's
+operator edits and base advances at most once every five seconds; the rest
+of the frame is read on every redraw, keeping a normal frame under a second.
 
 A lane that drifted from its branch, holds a stale lease, had a call rejected,
 owns an overdue issue or lost its session process is drawn in colour where the
@@ -200,6 +271,23 @@ a `ready` report before integration. Every figure comes from records the runtime
 already keeps, so it reports observed coordination inactivity and never claims
 to know what the native client was doing inside a turn.
 
+`status` also prints two accountability numbers per project, measured from
+each lane's state record by every supervision poll:
+
+```text
+Lanes: idle 35.0 min/lane-hour (top: claude blocked: capacity, 4 min); unaccountable claims 3.5 min (top: claude blocked: capacity, 4 min)
+```
+
+Idle lane-minutes per lane-hour count the time a lane spent `idle`,
+`blocked`, `stopped` or `dead` while it owned a claim or the ledger held an
+unclaimed, unblocked issue. Unaccountable claim-minutes count the time a lane
+owned a claim while it was not `working`. Each names its largest cause. The
+totals run from the first poll that saw the lane; a gap of more than five
+minutes between polls, a stopped service, is charged to nothing. `status
+--json` carries both per lane and per project under `accounting`, and each
+time a lane's total crosses a whole minute an `accounting` event is added to
+its lane history.
+
 ## `problems`
 
 One screen says what needs you now. `agent-parley problems` lists, oldest first,
@@ -208,6 +296,13 @@ supervision threshold, a claim past its deadline, a handoff offer with no
 answer, a message awaiting acknowledgement past `--ack-after`, a lane whose
 branch drifted or whose worktree is dirty with no recent activity, a lane over
 its advisory budget, a store schema behind the code, and a service that is down.
+
+Retiring a lane supersedes the shares it still owed an acknowledgement, so
+they never bounce. `problems` names that once per retired lane under `shares
+to a retired lane`, for example `3 shares to codex superseded: codex retired`.
+The row is informational and offers nothing to run; it clears when those
+shares' acknowledgement deadlines pass, or a day after retirement for a share
+sent without a deadline.
 
 Each lane contributes one row per cause, not one row per item: a lane sitting
 on twenty unacknowledged messages is a single row carrying that count and the

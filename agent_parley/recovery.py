@@ -12,8 +12,9 @@ import time
 from pathlib import Path
 
 from agent_parley import process
-from agent_parley.state import BridgeError, lock, write_json
+from agent_parley.state import BridgeError, Transient, lock, write_json
 
+CAPTURE_INTERVAL = 30
 GIT_SECONDS = 30
 MAX_STEP_BYTES = 400
 RECOVERY_FOLDER = "recovery"
@@ -152,6 +153,57 @@ def _content_trees(lane: Path) -> tuple[str, str]:
     return index_tree, worktree_tree
 
 
+def _fingerprint(lane: Path) -> str:
+    """Digests what a capture would record, without writing any object.
+
+    The head commit, the status of every changed or untracked path, and each
+    such path's size and modification time change whenever the index or
+    worktree content does: staging moves a status column, and a file edited
+    again while it stays modified keeps its status line but not its size and
+    modification time, which is why both are read. The status is read
+    without optional locks so the reading itself never rewrites the index.
+    Reading all of this costs one `git status` instead of writing trees and
+    bundles for the whole worktree.
+
+    Args:
+        lane: Assigned worktree being captured.
+
+    Returns:
+        A SHA-256 hex digest of the reading.
+
+    Raises:
+        BridgeError: If Git cannot read the lane.
+    """
+    digest = hashlib.sha256()
+    digest.update(
+        _git(lane, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD")
+    )
+    status = _git(
+        lane,
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    digest.update(status)
+    paths = []
+    skip = False
+    for entry in status.split(b"\0"):
+        if skip or len(entry) < 4:
+            skip = False
+            continue
+        paths.append(lane / os.fsdecode(entry[3:]))
+        skip = entry[:1] in (b"R", b"C")
+    for path in paths:
+        try:
+            observed = path.lstat()
+            digest.update(f"{observed.st_size}:{observed.st_mtime_ns}".encode())
+        except OSError:
+            digest.update(b"absent")
+    return digest.hexdigest()
+
+
 def _tree(lane: Path, revision: str) -> str:
     """Returns the tree object for one verified revision."""
     return _text(lane, "rev-parse", f"{revision}^{{tree}}")
@@ -200,10 +252,22 @@ def _refuse_untracked_collisions(
 
 
 def _require_dead(activity: dict, issue: str, owner: str) -> None:
-    """Requires one recorded process generation to be known and stopped."""
+    """Requires one recorded process generation to be known and stopped.
+
+    A session that recorded a clean `SessionEnd` and left no process to
+    check is a known stop, so it satisfies this requirement without a
+    process identity.
+    """
     session_id = activity.get("session_id")
     pid = activity.get("session_pid")
     ticks = activity.get("session_ticks")
+    if (
+        isinstance(session_id, str)
+        and session_id
+        and activity.get("event") == "SessionEnd"
+        and pid is None
+    ):
+        return
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -216,7 +280,7 @@ def _require_dead(activity: dict, issue: str, owner: str) -> None:
             "confirm that generation before takeover."
         )
     if process.alive(pid, ticks):
-        raise BridgeError(
+        raise Transient(
             f"Issue #{issue} owner {owner} has a live session; stop and "
             "confirm that generation before takeover."
         )
@@ -293,6 +357,12 @@ def capture(
     target repository keeps both commits reachable across Git maintenance.
     Source index and worktree content remain unchanged.
 
+    A tree unchanged since the last checkpoint reuses that checkpoint. A
+    capture driven by a native event also reuses a checkpoint taken less than
+    `CAPTURE_INTERVAL` seconds ago even when the tree changed, so a burst of
+    tool calls bundles each lane at most once per interval. A capture with no
+    event, such as a handoff or an overdue offer, always reflects the tree.
+
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
@@ -320,6 +390,38 @@ def capture(
     if not owned:
         return []
     folder = _folder(directory)
+    fingerprint = _fingerprint(lane)
+    step, gate = _step(payload or {})
+    unchanged = []
+    for number, record in owned:
+        identifier = _identifier(number, str(record["claim_id"]))
+        try:
+            previous = json.loads((folder / f"{identifier}.json").read_text())
+        except (OSError, ValueError):
+            break
+        recent = (
+            payload is not None
+            and time.time() - float(previous.get("captured_at") or 0)
+            < CAPTURE_INTERVAL
+        )
+        changed = previous.get("fingerprint") != fingerprint and not recent
+        if changed or not (folder / f"{identifier}.bundle").exists():
+            break
+        unchanged.append((record, previous))
+    if len(unchanged) == len(owned):
+        for record, previous in unchanged:
+            handoff = record.get("handoff") or {}
+            offer = record.get("offer") or {}
+            previous["remaining"] = list(
+                handoff.get("remaining") or offer.get("remaining") or []
+            )
+            previous["blockers"] = list(record.get("blocked_by") or [])
+            if payload is not None:
+                previous["last_verified_step"] = step
+            if gate:
+                previous["gate"] = gate
+            write_json(folder / f"{previous['id']}.json", previous)
+        return [previous for _, previous in unchanged]
     descriptor, index_name = tempfile.mkstemp(dir=folder)
     os.close(descriptor)
     temporary_index = Path(index_name)
@@ -330,7 +432,6 @@ def capture(
         temporary_index.unlink(missing_ok=True)
     head = _text(lane, "rev-parse", "HEAD")
     branch = _text(lane, "branch", "--show-current")
-    step, gate = _step(payload or {})
     published = []
     for number, record in owned:
         claim_id = str(record["claim_id"])
@@ -357,6 +458,7 @@ def capture(
             "head": head,
             "index_commit": index_commit,
             "worktree_commit": worktree_commit,
+            "fingerprint": fingerprint,
             "captured_at": time.time(),
             "last_verified_step": (
                 step
@@ -382,6 +484,65 @@ def capture(
         write_json(record_path, checkpoint)
         published.append(checkpoint)
     return published
+
+
+def preserve(directory: Path, worktree: Path) -> dict:
+    """Captures one worktree's whole content before it is force-removed.
+
+    The same index and worktree commits a claim checkpoint takes are built
+    for a worktree no claim owns, and published as a private bundle beside
+    the claim checkpoints, so uncommitted files and unpushed commits both
+    survive the removal.
+
+    Args:
+        directory: Private project state directory.
+        worktree: Worktree about to be removed.
+
+    Returns:
+        The checkpoint record, naming its bundle and the commits that
+        restore the worktree.
+
+    Raises:
+        BridgeError: If Git could not capture the worktree.
+    """
+    folder = _folder(directory)
+    descriptor, index_name = tempfile.mkstemp(dir=folder)
+    os.close(descriptor)
+    temporary_index = Path(index_name)
+    temporary_index.unlink()
+    try:
+        index_commit, worktree_commit = _snapshot_commits(
+            worktree, temporary_index
+        )
+    finally:
+        temporary_index.unlink(missing_ok=True)
+    identifier = (
+        "worktree-"
+        + hashlib.sha256(
+            f"{worktree.resolve()}\0{worktree_commit}".encode()
+        ).hexdigest()[:24]
+    )
+    bundle = folder / f"{identifier}.bundle"
+    size, digest = _publish_bundle(
+        worktree, bundle, identifier, worktree_commit
+    )
+    record = {
+        "id": identifier,
+        "source_worktree": str(worktree.resolve()),
+        "branch": _text(worktree, "branch", "--show-current"),
+        "head": _text(worktree, "rev-parse", "HEAD"),
+        "index_commit": index_commit,
+        "worktree_commit": worktree_commit,
+        "captured_at": time.time(),
+        "artifact": {
+            "kind": "git-bundle",
+            "reference": bundle.name,
+            "bytes": size,
+            "sha256": digest,
+        },
+    }
+    write_json(folder / f"{identifier}.json", record)
+    return record
 
 
 def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
@@ -687,7 +848,7 @@ def commit_takeover(
         or evidence.get("claim_id") != record.get("claim_id")
         or evidence.get("orphan_id") != orphan.get("id")
     ):
-        raise BridgeError(f"Issue #{issue} recovery evidence is invalid.")
+        raise Transient(f"Issue #{issue} recovery evidence is invalid.")
     activity_path = directory / f"{owner}-activity.json"
     with lock(directory / f"{owner}-checkpoint.lock", timeout=1):
         try:
@@ -1106,8 +1267,40 @@ def preflight(directory: Path, lane: Path, saved: dict) -> None:
     )
 
 
+def current_take(record: dict) -> dict:
+    """Returns the take that minted the record's current ownership generation.
+
+    A take is acted on only by the generation it created. A record whose
+    ownership moved on since, by an accepted handoff or a later claim, may
+    still carry an older take, and restoring that checkpoint would lay a dead
+    owner's patches over work handed on since. The take transition's history
+    entry names the generation it minted, so the check also holds for ledgers
+    written before ownership changes cleared the field.
+
+    Args:
+        record: Persisted issue record.
+
+    Returns:
+        The recorded take, or an empty mapping when none belongs to the
+        current generation.
+    """
+    taken = record.get("taken") or {}
+    takes = [
+        entry
+        for entry in record.get("history", [])
+        if entry.get("action") == "take"
+    ]
+    if not taken or not takes:
+        return {}
+    if takes[-1].get("claim_id") != record.get("claim_id"):
+        return {}
+    return taken
+
+
 def restore(directory: Path, lane: Path, record: dict) -> dict:
     """Restores one taken checkpoint into a clean recipient worktree.
+
+    A take that belongs to an earlier ownership generation restores nothing.
 
     Args:
         directory: Private project state directory.
@@ -1121,8 +1314,7 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
         BridgeError: If the artifact is invalid or destination has work that
             could be overwritten.
     """
-    taken = record.get("taken") or {}
-    saved = taken.get("checkpoint") or {}
+    saved = current_take(record).get("checkpoint") or {}
     if not saved:
         return record
     recipient = str(record.get("owner") or "")
