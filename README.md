@@ -195,7 +195,7 @@ agent-parley gc --apply   # reclaim the lanes whose work has landed
 agent-parley gc --apply --force  # also dirty lane-made worktrees, checkpointed
 ```
 
-`agent-parley reclaim` is the same command, and `--dry-run` spells out the
+`agent-parley reclaim` is a compatibility alias of `gc`, and `--dry-run` spells out the
 default report.
 
 A lane is reclaimed only when it is idle, holds no claim, has nothing

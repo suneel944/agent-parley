@@ -13,7 +13,12 @@ whole table, so a pipe or a file keeps every column.
 
 from __future__ import annotations
 
+import unicodedata
+
 GAP = "  "
+ZERO_WIDTH = "".join(
+    map(chr, (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, *range(0xFE00, 0xFE10)))
+)
 MINIMUM_TASK = 12
 STATUS_COLUMNS = (
     "PARTICIPANT",
@@ -52,20 +57,69 @@ def size(count: int) -> str:
     return f"{count / 1024 / 1024:.1f}MB"
 
 
+def _char_columns(char: str) -> int:
+    """Counts the terminal columns one code point occupies.
+
+    East Asian Wide and Fullwidth characters take two columns. Combining
+    marks, zero-width spaces and joiners, and variation selectors take none.
+    Every other character, including East Asian Ambiguous ones such as the
+    ellipsis, takes one, which matches a terminal in a non-CJK locale.
+    """
+    if char in ZERO_WIDTH or unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def measure(value: str) -> int:
+    """Measures text in terminal display columns rather than code points.
+
+    Each code point is counted on its own, so an emoji joined by zero-width
+    joiners into one glyph, such as a family sequence, counts the width of
+    every emoji it joins. A terminal that draws the sequence as one glyph
+    shows it narrower than measured, so a cell may carry spare padding but
+    never overruns its column budget.
+
+    Args:
+        value: Text as it will be printed.
+
+    Returns:
+        The number of terminal columns the text occupies.
+    """
+    return sum(_char_columns(char) for char in value)
+
+
 def fit(value: str, width: int) -> str:
     """Pads a cell, marking any value the column could not show in full.
 
+    Width is counted in terminal display columns, as `measure` defines them,
+    so wide characters and combining marks line up with the columns around
+    them.
+
     Args:
         value: Cell text.
-        width: Column width.
+        width: Column width in terminal display columns.
 
     Returns:
         Text padded to the column width, ending in an ellipsis when clipped,
-        so a truncated branch or issue list never reads as complete.
+        so a truncated branch or issue list never reads as complete. A
+        clipped cell keeps whole characters with their combining marks and,
+        when a wide character would cross the budget, pads with a space
+        instead of splitting it.
     """
-    if len(value) > width:
-        return value[: width - 1] + "…"
-    return value.ljust(width)
+    used = measure(value)
+    if used <= width:
+        return value + " " * (width - used)
+    budget = width - 1
+    kept: list[str] = []
+    used = 0
+    for char in value:
+        cost = _char_columns(char)
+        if used + cost > budget:
+            break
+        kept.append(char)
+        used += cost
+    text = "".join(kept).rstrip(ZERO_WIDTH)
+    return text + "…" + " " * (budget - used)
 
 
 def session(
@@ -121,11 +175,11 @@ def idle_age(stalled: dict) -> float:
 
 
 def widths(columns: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[int]:
-    """Measures each column against its heading and its widest value."""
+    """Measures each column's display width against its heading and values."""
     return [
-        max(len(name), *(len(row[index]) for row in rows), 1)
+        max(measure(name), *(measure(row[index]) for row in rows), 1)
         if rows
-        else len(name)
+        else measure(name)
         for index, name in enumerate(columns)
     ]
 

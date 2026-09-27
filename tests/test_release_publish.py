@@ -1275,6 +1275,39 @@ def test_an_incomplete_live_record_is_named(tmp_path, changes, named):
     assert named in errors[0]
 
 
+@pytest.mark.parametrize("name", release.ACCEPTANCE_MEASURES)
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_a_non_finite_measurement_is_named(tmp_path, name, value):
+    path = live_record(tmp_path, "0.13.0")
+    record = json.loads(path.read_text())
+    record[name] = 0
+    path.write_text(
+        json.dumps(record).replace(f'"{name}": 0', f'"{name}": {value}')
+    )
+    error = release.acceptance_record_error(tmp_path, "0.13.0")
+    assert error.endswith(f"lacks measured {name}")
+
+
+@pytest.mark.parametrize("name", release.ACCEPTANCE_COUNTS)
+@pytest.mark.parametrize("value", [6.5, 6.0, True])
+def test_a_fractional_or_boolean_count_is_named(tmp_path, name, value):
+    live_record(tmp_path, "0.13.0", **{name: value})
+    error = release.acceptance_record_error(tmp_path, "0.13.0")
+    assert error.endswith(f"lacks measured {name}")
+
+
+def test_a_finite_record_with_large_counts_is_accepted(tmp_path):
+    live_record(
+        tmp_path,
+        "0.13.0",
+        lanes=10**400,
+        claims=10**400,
+        claims_completed=10**400,
+        unaccountable_claim_minutes=0.25,
+    )
+    assert release.acceptance_record_error(tmp_path, "0.13.0") == ""
+
+
 def test_the_evidence_phase_refuses_a_minor_release_by_name(
     counted_repo, local
 ):

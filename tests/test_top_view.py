@@ -170,6 +170,46 @@ def test_a_column_is_as_wide_as_its_widest_value_in_the_frame():
     assert "…" in tables.fit("release/candidate-77", 18)
 
 
+@pytest.mark.parametrize(
+    ("value", "width", "expected"),
+    [
+        ("branch", 8, "branch  "),
+        ("branch/long", 6, "branc…"),
+        ("界界", 4, "界界"),
+        ("界界", 6, "界界  "),
+        ("界界界", 5, "界界…"),
+        ("界界界", 4, "界… "),
+        ("e" + chr(0x301) + "a", 3, "e" + chr(0x301) + "a "),
+        ("e" + chr(0x301) + "ab", 2, "e" + chr(0x301) + "…"),
+        ("👍", 3, "👍 "),
+        ("👍👍", 3, "👍…"),
+    ],
+)
+def test_a_cell_is_measured_padded_and_clipped_in_display_columns(
+    value, width, expected
+):
+    assert tables.fit(value, width) == expected
+    assert tables.measure(tables.fit(value, width)) == width
+
+
+def test_a_joined_emoji_never_overruns_its_column():
+    family = chr(0x200D).join(("\U0001f468", "\U0001f469", "\U0001f467"))
+    assert tables.measure(family) == 6
+    clipped = tables.fit(family, 4)
+    assert clipped == "\U0001f468… "
+    assert tables.measure(clipped) == 4
+
+
+def test_a_status_table_with_wide_text_stays_inside_its_width():
+    row = ("界面", "codex", "-", "live", "機能/分岐") + ("-",) * 6
+    rows = [(*row, "タスク" * 10)]
+    *table, hidden = tables.status_table(rows, 60)
+    assert hidden.startswith("Hidden columns:")
+    assert all(tables.measure(line) <= 60 for line in table)
+    assert tables.measure(table[1]) == 60
+    assert tables.widths(("A",), [("界界",)]) == [4]
+
+
 def test_a_narrow_terminal_drops_columns_instead_of_clipping_every_cell():
     view = snapshot(("/repo", lanes(3)))
     lines = dashboard.render(view, 60)

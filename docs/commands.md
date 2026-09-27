@@ -7,6 +7,14 @@ repository commands accept `--repo PATH` unless noted below. Issue mutations,
 reports and lane mail resolve identity from the current lane. `say` and
 `issue assign` act as `operator` from any checkout of the repository.
 
+Each operation has one canonical spelling, used throughout the docs, skills
+and generated remedies: `say` sends an operator message and `gc` reclaims
+landed lanes. `mail send` and `reclaim` remain compatibility aliases with the
+same arguments and behavior. Similar names that do different things stay
+separate: `decide` records a decision while `decision` reads them back, and
+`status` prints one table, `top` draws the live dashboard and `watch` follows
+one lane's event stream.
+
 `--repo` is the repository selector everywhere, `status` and `top` included.
 Both still accept `--project` for one release; it is undocumented in their
 help and will be removed.
@@ -57,7 +65,7 @@ on standard output and export to a file.
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
-| `gc`, `reclaim` | Report the lanes and lane-made worktrees a reclaim would remove and keep, with each worktree's size; `--dry-run` is that default, `--apply` removes them, and `--apply --force` also removes lane-made worktrees kept for uncommitted changes, unpushed commits or a recent change after writing a recovery checkpoint of each; a lane's own worktree is never forced. |
+| `gc` (alias `reclaim`) | Report the lanes and lane-made worktrees a reclaim would remove and keep, with each worktree's size; `--dry-run` is that default, `--apply` removes them, and `--apply --force` also removes lane-made worktrees kept for uncommitted changes, unpushed commits or a recent change after writing a recovery checkpoint of each; a lane's own worktree is never forced. |
 | `notify test` | Send one test message on each configured transport. |
 | `doctor` | Report launcher, plugin, store and running-service versions and their fit; non-zero exit on a mismatch. |
 | `problems` | List every lane, claim and store condition that needs attention, oldest first, one row per lane per cause with its count and the remedy the lane's state allows; rows the supervision service is handling say so, `--ack-after` sets the acknowledgement age, `--json` prints it for scripts, exit 1 when any row exists. |
@@ -108,7 +116,7 @@ on standard output and export to a file.
 | `mail search QUERY` | Search this lane's mail with an optional `--limit`. |
 | `mail list` | List this lane's mail newest first, with the same `--limit` as a search and no query to write. |
 | `mail ... --as NAME` | Read `mail show`, `mail thread`, `mail search` and `mail list` for one lane from the main checkout, so an operator opens a message `problems` cites without changing directory. It reads only: nothing is sent, acknowledged or marked read for that lane. |
-| `mail send NAME TEXT` | The same command as `say`, under `mail` with the other mail verbs; every `say` flag applies. |
+| `mail send NAME TEXT` | Compatibility alias of `say`, the canonical spelling, kept under `mail` with the other mail verbs; every `say` flag applies. |
 | `decide TEXT` | Record one decision every registered lane can read; `--subject` names it and `--key` deduplicates it. |
 | `decision list [QUERY]` | List or search the decisions recorded for this project; `--since` bounds their age and `--limit` the page. |
 | `mail pending` | List operator messages and offers recorded but not delivered. |
@@ -148,6 +156,14 @@ Field names are documented in
 [Operations](operations.md#machine-readable-output) and carry the same stability
 promise as the flags. `events export` and `watch --json` stay JSON Lines,
 because each is a stream rather than a snapshot.
+
+Without `--json`, `decision list` prints one row per decision — its ID, time,
+sender and subject — with a one-line body preview, and `provider show` and
+`credentials show` print one labeled field per line, identity first. An empty
+log or an empty field is stated in words. On a terminal narrower than a line,
+the line is clipped with `…` and a closing hint names `--json` for the full
+values; a pipe or a file receives every value in full. Credential values stay
+redacted in both modes.
 
 ## MCP tools
 

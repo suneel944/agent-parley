@@ -776,7 +776,8 @@ def _widths(
             index,
             name,
             max(
-                [minimum, len(name)] + [len(_cells(row)[index]) for row in rows]
+                [minimum, len(name)]
+                + [tables.measure(_cells(row)[index]) for row in rows]
             ),
         )
         for index, (name, minimum) in enumerate(COLUMNS)

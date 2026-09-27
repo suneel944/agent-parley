@@ -3,6 +3,7 @@
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -38,6 +39,7 @@ ACCEPTANCE_MEASURES = (
     "idle_lane_minutes",
     "unaccountable_claim_minutes",
 )
+ACCEPTANCE_COUNTS = ("lanes", "claims", "claims_completed")
 RELEASE_KINDS = ("major", "minor", "patch")
 MEASURED = "measured"
 RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?(!?):")
@@ -521,6 +523,11 @@ def run_acceptance_suite(root: Path) -> str:
 def acceptance_record_error(root: Path, version: str) -> str:
     """Validates the live acceptance record a minor or major release needs.
 
+    Every measurement must be a finite, non-negative number, and lane and
+    claim counts must be integers. JSON decoding admits NaN, infinity and
+    overflowed literals, so those are named as invalid rather than letting
+    comparisons against them pass the record.
+
     Args:
         root: Checkout holding the acceptance records.
         version: Version the release would publish.
@@ -545,8 +552,10 @@ def acceptance_record_error(root: Path, version: str) -> str:
     missing = [
         name
         for name in ACCEPTANCE_MEASURES
-        if not isinstance(record.get(name), (int, float))
-        or isinstance(record.get(name), bool)
+        if isinstance(record.get(name), bool)
+        or not isinstance(record.get(name), (int, float))
+        or (name in ACCEPTANCE_COUNTS and isinstance(record[name], float))
+        or (isinstance(record[name], float) and not math.isfinite(record[name]))
         or record[name] < 0
     ]
     if missing:
