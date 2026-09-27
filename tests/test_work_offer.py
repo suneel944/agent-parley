@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from agent_parley import (
     dashboard,
     issues,
+    lanes,
     records,
     roster,
     store,
@@ -69,21 +71,38 @@ def turn_ended(directory, name, ago):
     )
 
 
-def tool_used(directory, name):
-    """Appends one tool-use event of the kind a working lane records."""
-    with (directory / f"{name}-events.jsonl").open("a") as stream:
-        stream.write(
-            json.dumps({"ts": time.time(), "event": "PostToolUse"}) + "\n"
-        )
+def committed(lane):
+    """Records one commit in a lane, the progress a working lane makes."""
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(lane),
+            "-c",
+            "user.name=Lane",
+            "-c",
+            "user.email=lane@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "progress",
+        ],
+        check=True,
+    )
 
 
-def unthrottle(directory, name):
+def rewake(home, directory, name, **changes):
+    """Rewrites a lane's recorded wake fields in the lane state."""
+    root = json.loads((directory / "project.json").read_text())["root"]
+    record = supervision.wake_record(home, root, name)
+    supervision.store_wake(home, directory, root, name, {**record, **changes})
+
+
+def unthrottle(home, directory, name):
     """Ages the wake spacing so the next attempt is admitted immediately."""
-    path = directory / f"{name}-wake.json"
-    if path.exists():
-        record = json.loads(path.read_text())
-        record["at"] = 0
-        write_json(path, record)
+    root = json.loads((directory / "project.json").read_text())["root"]
+    if supervision.wake_record(home, root, name):
+        rewake(home, directory, name, at=0)
     published = supervision.published_work(directory, name)
     if published.get("dispatch"):
         published["dispatch"]["updated_at"] = 0
@@ -394,7 +413,18 @@ def test_a_qualified_weekly_limit_is_exhausted(bridge, repo, paired):
 
 def test_a_named_reset_holds_the_lane_until_it_passes(bridge, repo, paired):
     directory = Path(paired["lanes"]["claude"]).parent
-    refused(paired, "claude", 30, SESSION_LIMIT)
+    ahead = datetime.datetime.now(ZoneInfo("Asia/Dubai")) + (
+        datetime.timedelta(hours=1)
+    )
+    hour = ahead.hour % 12 or 12
+    meridiem = "am" if ahead.hour < 12 else "pm"
+    refused(
+        paired,
+        "claude",
+        30,
+        f"You've hit your session limit · resets {hour}:{ahead.minute:02d}"
+        f"{meridiem} (Asia/Dubai) (error type rate_limit, HTTP 429)",
+    )
     observed = supervision.capacity(bridge.home, directory, paired, "claude")
     assert observed["state"] == "exhausted"
     assert observed["reset_at"] > observed["observed_at"]
@@ -449,14 +479,20 @@ def test_a_transient_block_resumes_on_the_wake_backoff(
         "request",
         lambda path, name: requested.append(name) or "accepted",
     )
+    observed = supervision.presence(
+        directory, "claude", config["inactive_after"]
+    )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.sample(
+            db,
+            paired["root"],
+            "claude",
+            observed,
+            dead_after=config["stalled_after"],
+        )
 
     supervision.wake(
-        bridge.home,
-        directory,
-        manifest,
-        "claude",
-        supervision.presence(directory, "claude", config["inactive_after"]),
-        config,
+        bridge.home, directory, manifest, "claude", observed, config
     )
 
     blocked = supervision.published_capacity(directory, "claude")
@@ -912,9 +948,11 @@ def test_a_split_names_no_recipient_parked_on_a_dialog(
     bridge, repo, paired, monkeypatch
 ):
     _, _, directory = holding_a_backlog(bridge, paired, monkeypatch, 129)
-    write_json(
-        directory / "codex-wake.json",
-        {"result": sorted(supervision.DIALOG_WAKES)[0]},
+    rewake(
+        bridge.home,
+        directory,
+        "codex",
+        result=sorted(supervision.DIALOG_WAKES)[0],
     )
 
     supervision.poll(bridge.home, directory)
@@ -1144,10 +1182,7 @@ def test_delivery_without_work_progress_retries_then_escalates(
         directory, "claude", config["inactive_after"]
     )
     for _ in range(3):
-        wake_path = directory / "claude-wake.json"
-        wake = json.loads(wake_path.read_text())
-        wake["at"] = 0
-        write_json(wake_path, wake)
+        rewake(bridge.home, directory, "claude", at=0)
         published = supervision.published_work(directory, "claude")
         published["dispatch"]["updated_at"] = 0
         write_json(directory / "claude-work.json", published)
@@ -1160,7 +1195,7 @@ def test_delivery_without_work_progress_retries_then_escalates(
             config,
         )
 
-    assert requested == ["claude", "claude", "claude"]
+    assert requested == ["claude"] * 4
     published = supervision.published_work(directory, "claude")
     dispatch = published["dispatch"]
     assert dispatch["state"] == "escalated"
@@ -1200,8 +1235,8 @@ def test_a_lane_working_between_wakes_is_never_escalated(
         directory, "claude", config["inactive_after"]
     )
     for _ in range(5):
-        tool_used(directory, "claude")
-        unthrottle(directory, "claude")
+        committed(lane)
+        unthrottle(bridge.home, directory, "claude")
         supervision.wake(
             bridge.home, directory, manifest, "claude", observed, config
         )
@@ -1230,7 +1265,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
         directory, "claude", config["inactive_after"]
     )
     for _ in range(4):
-        unthrottle(directory, "claude")
+        unthrottle(bridge.home, directory, "claude")
         supervision.wake(
             bridge.home, directory, manifest, "claude", observed, config
         )
@@ -1239,15 +1274,15 @@ def test_an_escalation_holds_until_the_lane_records_activity(
     dispatch = supervision.published_work(directory, "claude")["dispatch"]
     assert dispatch["state"] == "escalated"
 
-    unthrottle(directory, "claude")
+    unthrottle(bridge.home, directory, "claude")
     supervision.wake(
         bridge.home, directory, manifest, "claude", observed, config
     )
     held = json.loads(wake_path.read_text())
     assert held["escalated_at"] == escalated["escalated_at"]
 
-    tool_used(directory, "claude")
-    unthrottle(directory, "claude")
+    committed(lane)
+    unthrottle(bridge.home, directory, "claude")
     supervision.wake(
         bridge.home, directory, manifest, "claude", observed, config
     )
@@ -1256,7 +1291,7 @@ def test_an_escalation_holds_until_the_lane_records_activity(
     assert cleared["state"] == "awaiting_progress"
     assert cleared["attempts"] == 1
     record = json.loads(wake_path.read_text())
-    assert "escalated_at" not in record
+    assert record.get("escalated_at") is None
     assert record["attempts"] == 1
 
 
@@ -1484,3 +1519,228 @@ def test_top_reports_the_fit_result_and_a_pending_offer(bridge, repo, paired):
     reported = views.frame(view)["projects"][0]["participants"]
     assert reported[0]["fit"] is True
     assert reported[0]["work_offer"] == "pull"
+
+
+def test_a_poll_reads_each_lane_once_however_many_lanes(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(peer, "claim", "2")
+    bridge.issue(peer, "claim", "3")
+    manifest = json.loads((directory / "project.json").read_text())
+    template = manifest["participants"]["claude"]
+    for index in range(18):
+        name = f"lane{index:02d}"
+        manifest["participants"][name] = {**template, "display": name}
+    write_json(directory / "project.json", manifest)
+    for name in manifest["participants"]:
+        if name != "codex":
+            alive(directory, name, updated=time.time() - 500)
+    counts = {"worktree": 0, "forge": 0}
+    measured = supervision._worktree_check
+
+    def worktree(participant):
+        counts["worktree"] += 1
+        return measured(participant)
+
+    def completion(*args):
+        counts["forge"] += 1
+
+    monkeypatch.setattr(supervision, "_worktree_check", worktree)
+    monkeypatch.setattr(supervision.forge, "branch_completion", completion)
+    monkeypatch.setattr(terminal, "request", lambda path, name: "accepted")
+
+    supervision.poll(bridge.home, directory)
+    first = dict(counts)
+    supervision.poll(bridge.home, directory)
+
+    assert len(manifest["participants"]) == 20
+    assert first == {"worktree": 20, "forge": 1}
+    assert counts == {"worktree": 40, "forge": 1}
+    stages = supervision.last_poll(directory)["stages"]
+    assert {"work", "completions", "wake claude"} <= set(stages)
+
+
+def test_an_expired_completion_refreshes_without_holding_the_poll(
+    tmp_path, monkeypatch
+):
+    key = (str(tmp_path), "lane")
+    expired = time.monotonic() - supervision.COMPLETION_TTL - 1
+    monkeypatch.setitem(supervision._COMPLETIONS, key, (expired, None))
+    release = threading.Event()
+    calls = []
+
+    def slow(root, branch):
+        calls.append(branch)
+        release.wait(10)
+        return ("MERGED", 1.0)
+
+    monkeypatch.setattr(supervision.forge, "branch_completion", slow)
+
+    started = time.monotonic()
+    first = supervision.branch_completion(tmp_path, "lane")
+    second = supervision.branch_completion(tmp_path, "lane")
+    held = time.monotonic() - started
+    release.set()
+    deadline = time.monotonic() + 5
+    while supervision._COMPLETIONS[key][1] is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    assert first is None and second is None
+    assert held < 1
+    assert calls == ["lane"]
+    assert supervision.branch_completion(tmp_path, "lane") == ("MERGED", 1.0)
+
+
+def held(state, **extra):
+    """Builds one ledger record claude holds in its current generation."""
+    return {
+        "owner": "claude",
+        "claim_id": "c",
+        "blocked_by": [],
+        **extra,
+        "execution": {"authorized": True, "state": state, "claim_id": "c"},
+    }
+
+
+def waiting_offer(ledger, leads):
+    """Derives claude's offer from a ledger and the leads read for it."""
+    return supervision._work_offer(
+        "claude",
+        {"claude": {"fit": True, "checks": {}}},
+        {"claude": 0},
+        issues.holders(ledger),
+        [],
+        ledger,
+        600,
+        [],
+        leads,
+    )
+
+
+NO_LEADS = {"mail": [], "next": "", "stalled": None}
+WAITING = {
+    "issues": {
+        "2": held("ready"),
+        "3": held("running", blocked_by=["9"]),
+        "9": {"owner": None, "execution": {"state": "queued"}},
+    }
+}
+
+
+def test_a_lane_whose_claims_all_wait_is_told_what_each_waits_on():
+    offer = waiting_offer(WAITING, NO_LEADS)
+    assert offer["kind"] == "continue"
+    assert offer["issues"] == ["2", "3"]
+    assert "#2 (ready, waits on CI and review" in offer["text"]
+    assert "#3 (waits on dependency #9)" in offer["text"]
+    assert "(resume)" not in offer["text"]
+
+
+def test_a_lane_with_nothing_left_is_told_to_retire():
+    ledger = {
+        "issues": {
+            "3": held("running", blocked_by=["9"]),
+            "9": {"owner": None, "execution": {"state": "queued"}},
+        }
+    }
+    text = waiting_offer(ledger, NO_LEADS)["text"]
+    assert "Nothing else needs this lane" in text
+    assert "retire MCP tool" in text
+
+
+def test_a_lane_holding_ready_work_is_not_told_to_retire():
+    text = waiting_offer(WAITING, NO_LEADS)["text"]
+    assert "Nothing else needs this lane" in text
+    assert "retire MCP tool" not in text
+    assert "retire would be refused" in text
+
+
+def test_a_waiting_lane_answers_peer_mail_before_new_work():
+    leads = {
+        "mail": ["#12 from codex"],
+        "next": "7",
+        "stalled": {"issue": "4", "owner": "codex"},
+    }
+    text = waiting_offer(WAITING, leads)["text"]
+    mail = text.index("#12 from codex")
+    claim = text.index("agent-parley issue claim 7")
+    request = text.index("agent-parley issue request 4")
+    assert mail < claim < request
+    assert "retire" not in text
+
+
+def test_a_waiting_lane_is_pointed_at_the_top_next_candidate():
+    text = waiting_offer(WAITING, {**NO_LEADS, "next": "7"})["text"]
+    assert "claim #7, the top agent-parley issue next candidate" in text
+    assert "retire" not in text
+
+
+def test_a_waiting_lane_is_pointed_at_a_stalled_peer_claim():
+    stalled = {"issue": "4", "owner": "codex"}
+    text = waiting_offer(WAITING, {**NO_LEADS, "stalled": stalled})["text"]
+    assert "ask for #4, held by codex" in text
+    assert "agent-parley issue request 4" in text
+
+
+def test_a_resumable_claim_still_names_the_claims_that_wait():
+    ledger = {"issues": {"2": held("ready"), "5": held("running")}}
+    text = waiting_offer(ledger, None)["text"]
+    assert text.startswith("Continue authorized work")
+    assert "#5 (resume)" in text
+    assert "Waiting, no need to re-check: #2 (ready" in text
+
+
+def test_idle_leads_read_mail_the_next_issue_and_a_stalled_peer(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    actors = {
+        name: store.authenticate(
+            bridge.home,
+            store.register(bridge.home, paired["root"], name)[
+                "registration_token"
+            ],
+        )
+        for name in ("claude", "codex")
+    }
+    message = store.call(
+        bridge.home,
+        actors["codex"],
+        "send_message",
+        {
+            "to": ["claude"],
+            "subject": "Question",
+            "body_md": "Which branch holds the fix?",
+            "idempotency_key": "ask",
+            "ack_required": True,
+        },
+    )
+    directory = Path(paired["lanes"]["claude"]).parent
+    manifest = roster.read(directory)
+    ledger = {
+        "issues": {
+            "2": held("ready"),
+            "3": {**held("running"), "owner": "codex"},
+            "7": {"owner": None, "execution": {"authorized": True}},
+        }
+    }
+    leads = supervision._idle_leads(
+        bridge.home, directory, manifest, "claude", ledger, 0
+    )
+    assert leads == {
+        "mail": [f"#{message['id']} from codex"],
+        "next": "7",
+        "stalled": {"issue": "3", "owner": "codex"},
+    }
+    ledger["issues"]["5"] = held("running")
+    assert (
+        supervision._idle_leads(
+            bridge.home, directory, manifest, "claude", ledger, 0
+        )
+        is None
+    )

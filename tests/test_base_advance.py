@@ -104,6 +104,19 @@ def test_a_base_commit_on_a_reserved_path_marks_the_lane_and_notifies(
     assert hook(bridge, paired, "claude") == {}
 
 
+def test_every_lane_behind_the_base_is_read_with_its_own_paths(
+    bridge, repo, paired
+):
+    reserve(bridge, paired["root"], "claude", "first.txt")
+    reserve(bridge, paired["root"], "codex", "second.txt")
+    commit(repo, "first.txt", "one\n")
+    commit(repo, "second.txt", "two\n")
+    assert supervision.base_advances(bridge.home, paired) == {
+        "claude": ["first.txt"],
+        "codex": ["second.txt"],
+    }
+
+
 def test_a_base_advance_over_no_held_path_is_silent(bridge, repo, paired):
     reserve(bridge, paired["root"], "claude", "shared.txt")
     store.register(bridge.home, paired["root"], "codex")

@@ -198,6 +198,7 @@ def test_issue_show_reports_owner_blockers_and_history(
     bridge, repo, paired, monkeypatch, capsys
 ):
     lane = paired["lanes"]["claude"]
+    bridge.issue(paired["lanes"]["codex"], "claim", "7")
     bridge.issue(lane, "claim", "42")
     bridge.issue(lane, "block", "42", on="7")
     document = envelope(
@@ -753,3 +754,9 @@ def test_mail_cancel_reports_the_outcome_as_json(
         "mail_cancel",
     )
     assert document["cancelled"] is True
+
+
+@pytest.mark.parametrize("text", ["nan", "inf", "-inf", "infm", "nanh"])
+def test_duration_refuses_a_non_finite_window(text):
+    with pytest.raises(ValueError, match="is not a window"):
+        cli.duration(text)

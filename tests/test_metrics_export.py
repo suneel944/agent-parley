@@ -82,7 +82,7 @@ def test_a_label_value_escapes_quotes_backslashes_and_newlines():
     view = snapshot({"participant": "claude", "provider_name": "x"}, root)
     text = views.exposition(view)
     assert 'project="a\\\\b\\"c\\nd"' in text
-    assert len(text.splitlines()) == len(views.LANE_METRICS) * 2 + (
+    assert len(text.splitlines()) == (len(views.LANE_METRICS) + 1) * 2 + (
         len(views.PROJECT_METRICS) * 3
     )
 

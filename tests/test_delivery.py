@@ -11,25 +11,82 @@ from pathlib import Path
 import pytest
 
 from agent_parley import checkpoints, delivery, roster, store
+from agent_parley.state import lock, write_json
 
 SUBJECT = "Interface change"
 
 
-def send(bridge, data, recipient, key="delivery-1"):
+def send(bridge, data, recipient, key="delivery-1", subject=SUBJECT, **extra):
     """Sends one message from the first lane to the named participant."""
     token = asyncio.run(bridge.identity("claude", data))["registration_token"]
     sender = store.authenticate(bridge.home, token)
-    store.call(
+    return store.call(
         bridge.home,
         sender,
         "send_message",
         {
             "to": [data["participants"][recipient]["display"]],
-            "subject": SUBJECT,
+            "subject": subject,
             "body_md": "Response now includes session_id.",
             "idempotency_key": key,
+            **extra,
         },
     )
+
+
+def unread(bridge, data):
+    """Counts the helper lane's unread mail as its checkpoint would."""
+    directory = Path(data["lanes"]["helper"]).parent
+    name = roster.read(directory)["participants"]["helper"]["display"]
+    return checkpoints.mailbox(bridge.home, data["root"], name)["unread"]
+
+
+def test_polled_mail_carries_the_digest_header_and_is_marked_read(
+    bridge, polled
+):
+    directory = Path(polled["lanes"]["helper"]).parent
+    assert unread(bridge, polled) == 1
+
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+
+    text = delivery.mail_file(directory, "helper").read_text()
+    assert "Mail: 1 of 1 unread, most relevant first; 0 superseded." in text
+    assert unread(bridge, polled) == 0
+
+
+def test_polled_delivery_orders_mail_by_relevance(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    send(bridge, polled, "helper", "ask", "Review needed", ack_required=True)
+
+    delivery.deliver(bridge.home, directory, "helper")
+
+    text = delivery.mail_file(directory, "helper").read_text()
+    assert text.index("Review needed") < text.index(SUBJECT)
+
+
+def test_polled_delivery_shows_the_project_feed_once(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    delivery.deliver(bridge.home, directory, "helper")
+    send(bridge, polled, "helper", "merge", "Merged #12 into main")
+
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    text = delivery.mail_file(directory, "helper").read_text()
+    assert "Project feed, newest first: " in text
+    assert "Merged #12 into main" in text
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
+
+
+def test_polled_delivery_names_owed_acknowledgements_once(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    asked = send(bridge, polled, "helper", "ask", "Sign off", ack_required=True)
+    delivery.deliver(bridge.home, directory, "helper")
+    send(bridge, polled, "helper", "later", "Status")
+
+    delivery.deliver(bridge.home, directory, "helper")
+
+    text = delivery.mail_file(directory, "helper").read_text()
+    assert f"Acknowledgements owed: message {asked['id']} from" in text
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
 
 
 @pytest.fixture
@@ -75,6 +132,40 @@ def test_a_delivery_is_recorded_like_a_served_checkpoint(bridge, polled):
     assert state["injected_bytes"] == size
     assert delivery.deliver(bridge.home, directory, "helper") == 0
     assert checkpoints.event_summary(directory, "helper")["events"] == 1
+
+
+def test_the_mailbox_is_read_outside_the_checkpoint_lock(
+    bridge, polled, monkeypatch
+):
+    directory = Path(polled["lanes"]["helper"]).parent
+    mailbox = checkpoints.mailbox
+
+    def unlocked(*args):
+        with lock(directory / "helper-checkpoint.lock", timeout=0.1):
+            return mailbox(*args)
+
+    monkeypatch.setattr(checkpoints, "mailbox", unlocked)
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+
+
+def test_a_delivery_composed_from_a_moved_state_is_dropped(
+    bridge, polled, monkeypatch
+):
+    directory = Path(polled["lanes"]["helper"]).parent
+    path = directory / "helper-activity.json"
+    mailbox = checkpoints.mailbox
+
+    def moved(*args):
+        read = mailbox(*args)
+        write_json(
+            path, {**checkpoints.activity(directory, "helper"), "cursor": 99}
+        )
+        return read
+
+    monkeypatch.setattr(checkpoints, "mailbox", moved)
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
+    assert checkpoints.activity(directory, "helper")["cursor"] == 99
+    assert not delivery.mail_file(directory, "helper").exists()
 
 
 def test_a_second_message_is_delivered_after_the_first(bridge, polled):

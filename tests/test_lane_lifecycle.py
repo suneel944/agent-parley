@@ -13,7 +13,15 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from agent_parley import checkpoints, cli, dashboard, process, roster, store
+from agent_parley import (
+    checkpoints,
+    cli,
+    dashboard,
+    process,
+    roster,
+    store,
+    supervision,
+)
 from agent_parley.state import BridgeError, write_json
 
 SLEEPER = "import time; time.sleep(120)"
@@ -193,18 +201,145 @@ def test_restart_refuses_while_a_session_is_alive(bridge, repo, paired):
         bridge.restart(repo, "claude")
 
 
-def test_restart_refuses_a_dirty_worktree_and_names_the_paths(
-    bridge, repo, paired
+def capture_launch(bridge, monkeypatch):
+    """Records restart launches instead of starting a native client."""
+    captured: list = []
+    monkeypatch.setattr(
+        bridge,
+        "launch",
+        lambda *args, **kwargs: captured.append(args) or 0,
+    )
+    return captured
+
+
+def test_restart_after_a_crash_keeps_dirty_work_and_names_its_checkpoint(
+    bridge, repo, paired, monkeypatch
 ):
     lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
     (lane / "scratch.txt").write_text("unsaved work\n")
-    with pytest.raises(BridgeError) as refusal:
-        bridge.restart(repo, "claude")
-    message = str(refusal.value)
-    assert "uncommitted changes" in message
-    assert "scratch.txt" in message
-    assert "resets, cleans or stashes" in message
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(10)
+    write_json(
+        directory / "claude-activity.json",
+        {
+            "activity": "working",
+            "session_pid": child.pid,
+            "session_ticks": "1",
+        },
+    )
+    captured = capture_launch(bridge, monkeypatch)
+    assert bridge.restart(repo, "claude", "Continue") == 0
+    opening = captured[0][2]
+    assert opening.startswith("Continue")
+    assert "left in place, not reset" in opening
+    assert "#7 " in opening
+    assert str(directory / "recovery") in opening
     assert (lane / "scratch.txt").read_text() == "unsaved work\n"
+    assert cli.snapshot(directory)["issues"]["7"]["owner"] == "claude"
+
+
+def test_restart_ends_a_wedged_session_before_launching(
+    bridge, repo, paired, monkeypatch
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    child = subprocess.Popen([sys.executable, "-c", SLEEPER])
+    try:
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "waiting for approval",
+                "updated": 1.0,
+                "session_pid": child.pid,
+                "session_ticks": process.start_ticks(child.pid),
+            },
+        )
+        captured = capture_launch(bridge, monkeypatch)
+        assert bridge.restart(repo, "claude") == 0
+        assert child.wait(10) is not None
+        assert captured[0][0] == "claude"
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(10)
+
+
+def test_stop_kills_a_session_that_ignores_sigterm(
+    bridge, repo, paired, monkeypatch
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    monkeypatch.setattr(process, "STOP_TIMEOUT", 1)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); time.sleep(120)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "working",
+                "session_pid": child.pid,
+                "session_ticks": process.start_ticks(child.pid),
+            },
+        )
+        assert "ended from the base checkout" in bridge.stop(repo, "claude")
+        assert child.wait(10) is not None
+        state = json.loads((directory / "claude-activity.json").read_text())
+        assert "session_pid" not in state
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(10)
+        child.stdout.close()
+
+
+def test_a_reboot_marks_the_lane_stopped_orphaned_and_restartable(
+    bridge, repo, paired, monkeypatch
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    manifest = roster.read(directory)
+    bridge.issue(lane, "claim", "7")
+    write_json(
+        directory / "claude-activity.json",
+        {
+            "activity": "working",
+            "updated": 1.0,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    write_json(directory / supervision.BOOT_RECORD, {"boot_id": "old"})
+    monkeypatch.setattr(process, "boot_id", lambda: "new")
+    home = bridge.home
+    assert supervision.settle_reboot(home, directory, manifest) == ["claude"]
+    assert supervision.settle_reboot(home, directory, manifest) == []
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert state["activity"] == "stopped"
+    assert supervision.rebooted(state)
+    observed = supervision.presence(directory, "claude")
+    assert observed["process_alive"] is False
+    config = supervision.configuration(home, manifest)
+    readings = {
+        name: supervision.presence(directory, name)
+        for name in manifest["participants"]
+    }
+    supervision.settle_lanes(home, manifest, config, readings)
+    supervision.orphans(home, directory, manifest, config)
+    assert cli.snapshot(directory)["issues"]["7"].get("orphan")
+    assert "no verified running session" in bridge.stop(repo, "claude")
+    captured = capture_launch(bridge, monkeypatch)
+    assert bridge.restart(repo, "claude") == 0
+    assert captured[0][0] == "claude"
 
 
 def test_restart_replays_initialization_and_launches_the_same_provider(

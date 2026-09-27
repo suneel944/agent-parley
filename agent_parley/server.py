@@ -40,8 +40,13 @@ LOG_NAME = "server.log"
 WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
 SLOW_DECISION = DECISION_SECONDS / 2
+DELIVERY_SECONDS = 0.25
+TEMPORARY_SECONDS = 60.0
 UNDECIDED_LIMIT = 1
 REFUSAL_SECONDS = 5.0
+REPEAT_SECONDS = 60.0
+ROTATED_NAME = "server.log.1"
+_LOGGING = threading.Lock()
 GONE = (BrokenPipeError, ConnectionResetError)
 UNDECIDED = (
     "A decision for this lane is still running; this event was answered "
@@ -68,7 +73,12 @@ def log(home: Path, event: str, detail: str = "") -> None:
 
     The log is bounded by the rotation every line log here shares, so a
     long-lived service on a shared machine does not grow the file without
-    end. A log that cannot be written or bounded never fails a request.
+    end. The lines a rotation drops are appended to `ROTATED_NAME`, itself
+    bounded the same way, so the window before the current one survives.
+    The rotation rewrites the log in place, so every entry and every
+    rotation is taken under one lock: an entry printed between the
+    rotation's read and its truncate would otherwise be lost. A log that
+    cannot be written or bounded never fails a request.
 
     Args:
         home: Private bridge state root holding the service log.
@@ -76,11 +86,46 @@ def log(home: Path, event: str, detail: str = "") -> None:
         detail: Remainder of the entry, already free of credentials.
     """
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    try:
-        print(f"{stamp} {event} {detail}".rstrip(), flush=True)
-    except OSError:
-        return
-    trim_log(home / LOG_NAME)
+    with _LOGGING:
+        try:
+            print(f"{stamp} {event} {detail}".rstrip(), flush=True)
+        except OSError:
+            return
+        dropped = trim_log(home / LOG_NAME)
+        if not dropped:
+            return
+        rotated = home / ROTATED_NAME
+        try:
+            with rotated.open("a", encoding="utf-8") as stream:
+                stream.write("\n".join(dropped) + "\n")
+        except OSError:
+            return
+        trim_log(rotated)
+
+
+def sweep(home: Path) -> int:
+    """Removes temporary files that interrupted state writes left behind.
+
+    Every state write goes through a ``tmp*`` file in the target's
+    directory and renames it into place, so a writer killed between the
+    two leaves that file for good. Only files older than
+    `TEMPORARY_SECONDS` are removed, because a hook deciding in process
+    while the service starts may be writing one right now.
+
+    Args:
+        home: Private bridge state root holding the project directories.
+
+    Returns:
+        Number of temporary files removed.
+    """
+    cutoff = time.time() - TEMPORARY_SECONDS
+    removed = 0
+    for path in (home / "projects").glob("*/tmp*"):
+        with contextlib.suppress(OSError):
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+    return removed
 
 
 def _tool(
@@ -132,6 +177,7 @@ TOOLS = [
                 **INTEGER,
                 "description": "Message answered; joins its thread.",
             },
+            "topic": TEXT,
             "ack_required": FLAG,
             "ack_within": {
                 "type": "number",
@@ -369,7 +415,12 @@ class Server(ThreadingHTTPServer):
         self.reading = threading.Lock()
         self.stopping = threading.Event()
         self.counting = threading.Lock()
-        self.deciding: dict[str, int] = {}
+        self.deciding: dict[tuple[str, str], int] = {}
+        self.recovering: dict[tuple[str, str], list[dict]] = {}
+        self.repeats: dict[
+            tuple[str, tuple[str, str]], tuple[float, int, str]
+        ] = {}
+        self.serving = threading.local()
         self.refusals = 0
         self.reported: float | None = None
         super().__init__(("127.0.0.1", config["port"]), Handler)
@@ -528,6 +579,131 @@ class Server(ThreadingHTTPServer):
             f"{WORKERS} worker slots busy",
         )
 
+    def recover(self, lane: tuple[str, str], owed: dict) -> None:
+        """Queues a recovery checkpoint to run after its hook was answered.
+
+        One thread per lane works its queue in arrival order, so the lane's
+        checkpoints stay ordered and a burst of events never starts more
+        than one Git capture for the same worktree at once. Every request is
+        kept, because a later one may carry no gate evidence and would lose
+        the passing command an earlier one recorded.
+
+        Args:
+            lane: Project key and participant name the request is for.
+            owed: The ``recovery`` request `checkpoints.serve` returned.
+        """
+        with self.counting:
+            queued = self.recovering.get(lane)
+            if queued is not None:
+                queued.append(owed)
+                return
+            self.recovering[lane] = []
+        threading.Thread(
+            target=self._recovering, args=(lane, owed), daemon=True
+        ).start()
+
+    def _recovering(self, lane: tuple[str, str], owed: dict) -> None:
+        """Runs one lane's queued recovery checkpoints until none are left.
+
+        Args:
+            lane: Project key and participant name the queue belongs to.
+            owed: First request to run.
+        """
+        while True:
+            try:
+                checkpoints.recover(
+                    Path(owed["directory"]),
+                    owed["participant"],
+                    owed["payload"],
+                    checkpoints.SETTLE_SECONDS,
+                )
+            except Exception as exc:
+                self.coalesce(
+                    "unrecovered",
+                    lane,
+                    f"{lane[1]} recovery checkpoint not written; the next "
+                    f"event captures again: {type(exc).__name__}",
+                )
+            with self.counting:
+                queued = self.recovering.get(lane) or []
+                if not queued:
+                    self.recovering.pop(lane, None)
+                    return
+                owed = queued.pop(0)
+
+    def coalesce(self, event: str, lane: tuple[str, str], detail: str) -> None:
+        """Records a per-lane repeat at most once per `REPEAT_SECONDS`.
+
+        One stuck lane answered every event with the same `undecided` or
+        `unanswered` line, and those lines filled the log's bound within
+        minutes, so the log kept under an hour when it was needed most. The
+        first entry of a window is written; later ones for the same event
+        and lane are counted. The count is never lost when a burst stops:
+        the next entry for the same lane carries it, any other lane's entry
+        first writes every count whose window has closed, and
+        `flush_repeats` writes the rest at shutdown.
+
+        Args:
+            event: Single word naming what happened.
+            lane: Project key and participant name the entry is about.
+            detail: Remainder of the entry, already free of credentials.
+        """
+        key = (event, lane)
+        with self.counting:
+            now = time.monotonic()
+            entries = self._pending(now, key)
+            opened, skipped, _ = self.repeats.get(key, (None, 0, ""))
+            if opened is not None and now - opened < REPEAT_SECONDS:
+                self.repeats[key] = (opened, skipped + 1, detail)
+            else:
+                self.repeats[key] = (now, 0, detail)
+                if skipped:
+                    detail += f"; {skipped} more since the previous entry"
+                entries.append((event, detail))
+        for written, text in entries:
+            log(self.home, written, text)
+
+    def flush_repeats(self) -> None:
+        """Writes every repeat count still held, as the service stops."""
+        with self.counting:
+            entries = self._pending(None, None)
+        for event, text in entries:
+            log(self.home, event, text)
+
+    def _pending(
+        self,
+        now: float | None,
+        keep: tuple[str, tuple[str, str]] | None,
+    ) -> list[tuple[str, str]]:
+        """Removes closed repeat windows and returns their unwritten counts.
+
+        Callers hold `counting`. A window closes when `REPEAT_SECONDS` have
+        passed since it opened, or always when `now` is None. The window
+        named by `keep` stays, because its own next entry carries the count.
+
+        Args:
+            now: Monotonic time to judge windows by, or None for all.
+            keep: Event and lane whose window the caller handles itself.
+
+        Returns:
+            Event and detail pairs, one per closed window with a count.
+        """
+        entries = []
+        for key, (opened, skipped, detail) in list(self.repeats.items()):
+            if key == keep:
+                continue
+            if now is not None and now - opened < REPEAT_SECONDS:
+                continue
+            del self.repeats[key]
+            if skipped:
+                entries.append(
+                    (
+                        key[0],
+                        f"{detail}; {skipped} more since the previous entry",
+                    )
+                )
+        return entries
+
     def handle_error(
         self,
         request: socket.socket | tuple[bytes, socket.socket],
@@ -548,10 +724,13 @@ class Server(ThreadingHTTPServer):
             client_address: Loopback peer, which identifies nothing here.
         """
         if isinstance(sys.exception(), GONE):
-            log(
-                self.home,
+            lane = getattr(self.serving, "lane", ("", ""))
+            named = f"{lane[1]} of {lane[0]} " if lane[1] else ""
+            self.coalesce(
                 "unanswered",
-                "hook client stopped reading before the reply was written",
+                lane,
+                f"hook client {named}stopped reading before the reply was "
+                "written",
             )
             return
         log(self.home, "failed", "request handling\n" + traceback.format_exc())
@@ -755,6 +934,11 @@ class Handler(BaseHTTPRequestHandler):
         parsing a connection that closed without a status line, as it did
         when a reinstall removed modules from under a running service.
 
+        A recovery checkpoint the decision owes is queued with
+        `Server.recover` only after the reply was written, so the commit and
+        bundle it takes never count against the client's read timeout. A
+        decision abandoned at its deadline queues its own when it finishes.
+
         Args:
             actor: Registered identity the bearer credential resolved to.
         """
@@ -788,15 +972,52 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._reply(403)
             return
-        served = self._decide(request, actor["name"])
+        lane = (str(actor["project"]), str(actor["name"]))
+        self.server.serving.lane = lane
+        served = self._decide(request, lane)
         if served is None:
             return
-        if self.headers.get("Accept") == hook.RAW_REPLY:
-            self._raw_hook(served)
-            return
-        self._reply(200, served)
+        delivery = served.pop("delivery", None)
+        owed = served.pop("recovery", None)
+        try:
+            if self.headers.get("Accept") == hook.RAW_REPLY:
+                self._raw_hook(served)
+            else:
+                self._reply(200, served)
+            if delivery:
+                self._delivered(path, request["participant"], delivery)
+        finally:
+            if owed:
+                self.server.recover(lane, owed)
 
-    def _decide(self, request: dict, participant: str) -> dict | None:
+    def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
+        """Marks a written reply's coordination as delivered to the lane.
+
+        The whole reply is written before this runs, and the connection
+        closes after it, so the client reads its end of stream only once the
+        lane's state says what it was given, as the in-process path does.
+        The wait for the lane's checkpoint lock is `DELIVERY_SECONDS`, which
+        keeps the close inside the client's read timeout. A reply the
+        client stopped reading raised before this point, and a decision the
+        client was answered `hook.DECIDING` for never reaches it, so both
+        leave their coordination to the lane's next event.
+
+        Args:
+            directory: Common project state directory of the lane.
+            agent: Participant the decision was made for.
+            delivery: Delivery markers the decision prepared.
+        """
+        try:
+            checkpoints.deliver(directory, agent, delivery, DELIVERY_SECONDS)
+        except (OSError, ValueError, BridgeError) as exc:
+            log(
+                self.server.home,
+                "undelivered",
+                f"{self.path} {agent} delivery not recorded; the next event "
+                f"repeats it: {type(exc).__name__}",
+            )
+
+    def _decide(self, request: dict, lane: tuple[str, str]) -> dict | None:
         """Produces one hook decision under a deadline of its own.
 
         The client stops reading after `hook.REPLY_TIMEOUT`, so a decision
@@ -808,23 +1029,28 @@ class Handler(BaseHTTPRequestHandler):
         An abandoned decision is not finished work. It keeps running on its
         own thread, and it still holds the lane's checkpoint lock, still
         writes the lane's activity file, and still appends the lane's event
-        record when it completes. Answering the client as though the service
-        were unavailable used to make it ask again, which started a second
+        record when it completes. It never marks the coordination it
+        prepared as delivered: that happens only after a reply carrying it
+        was written, so the lane's next event injects it again. Answering
+        the client as though the service were unavailable used to make it
+        ask again, which started a second
         decision for the same event, and the two then contended for that
         lock until one of them lost and denied a native call. Expiry is
         therefore answered with `hook.DECIDING`, which tells the client the
         decision is held here: it emits no context and exits successfully
         rather than repeating the event.
 
-        Only the decisions a lane abandoned are counted, and a lane that
-        already holds `UNDECIDED_LIMIT` of them is answered without starting
-        another. A lane's first minutes are where this matters: its
-        checkpoint, roster and mail scans all run for the first time inside
-        one hook budget, and without the bound every following event started
-        a decision that queued behind the slow one and expired in its turn.
-        Concurrent decisions that are merely in flight are not counted, so
-        parallel native calls in a healthy lane keep their context
-        injection.
+        Only the decisions a lane abandoned are counted, keyed by the lane's
+        project and name because one service serves every project and lane
+        names repeat across them. A lane that already holds `UNDECIDED_LIMIT`
+        of them has its next events decided with `record_only`: the activity
+        label, event record, session process identity and recovery
+        checkpoint are written, and the mail and context scans are skipped.
+        Refusing those events outright used to drop the `PostToolUse` and
+        `Stop` that end a turn for as long as the slow decision ran, which
+        left the lane labelled as working and parked it for good. Concurrent
+        decisions that are merely in flight are not counted, so parallel
+        native calls in a healthy lane keep their context injection.
 
         Every decision is timed. One past `SLOW_DECISION` is logged with the
         step that spent the time, and an abandoned one names the step it was
@@ -833,12 +1059,12 @@ class Handler(BaseHTTPRequestHandler):
 
         Args:
             request: Hook request the credential was accepted for.
-            participant: Registered identity the credential resolved to.
+            lane: Project key and participant name the credential resolved
+                to.
 
         Returns:
             The decision, or None once the client has been answered because
-            the decision failed, was already abandoned, or ran past its
-            deadline.
+            the decision failed or ran past its deadline.
         """
         outcome: dict = {}
         stages = checkpoints.Stages()
@@ -847,32 +1073,42 @@ class Handler(BaseHTTPRequestHandler):
             """Records the decision or the failure that ended it."""
             try:
                 outcome["served"] = checkpoints.serve(
-                    self.server.home, request, stages
+                    self.server.home,
+                    request,
+                    stages,
+                    checkpoints.SETTLE_SECONDS,
+                    record_only,
+                    deferred=True,
                 )
             except Exception:
                 outcome["failed"] = traceback.format_exc()
             finally:
                 with self.server.counting:
-                    if outcome.pop("abandoned", False):
-                        held = self.server.deciding.get(participant, 1)
+                    abandoned = outcome.pop("abandoned", False)
+                    if abandoned:
+                        held = self.server.deciding.get(lane, 1)
                         if held > 1:
-                            self.server.deciding[participant] = held - 1
+                            self.server.deciding[lane] = held - 1
                         else:
-                            self.server.deciding.pop(participant, None)
+                            self.server.deciding.pop(lane, None)
                     outcome["finished"] = True
+                late = outcome.get("served")
+                if abandoned and isinstance(late, dict):
+                    if owed := late.pop("recovery", None):
+                        self.server.recover(lane, owed)
 
+        project, participant = lane
         with self.server.counting:
-            undecided = self.server.deciding.get(participant, 0)
-        if undecided >= UNDECIDED_LIMIT:
-            log(
-                self.server.home,
+            undecided = self.server.deciding.get(lane, 0)
+        record_only = undecided >= UNDECIDED_LIMIT
+        if record_only:
+            self.server.coalesce(
                 "undecided",
-                f"{self.path} {participant} already has {undecided} "
-                "decision(s) past their deadline; answered without "
-                "starting another",
+                lane,
+                f"{self.path} {participant} of {project} already has "
+                f"{undecided} decision(s) past their deadline; recorded "
+                "without building context",
             )
-            self._reply(hook.DECIDING, {"detail": UNDECIDED})
-            return None
         worker = threading.Thread(target=decide, daemon=True)
         started = time.monotonic()
         worker.start()
@@ -898,11 +1134,16 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(500)
             return None
         with self.server.counting:
-            if not outcome.get("finished"):
+            finished = bool(outcome.get("finished"))
+            if not finished:
                 outcome["abandoned"] = True
-                self.server.deciding[participant] = (
-                    self.server.deciding.get(participant, 0) + 1
+                self.server.deciding[lane] = (
+                    self.server.deciding.get(lane, 0) + 1
                 )
+        late = outcome.get("served")
+        if finished and isinstance(late, dict):
+            if owed := late.pop("recovery", None):
+                self.server.recover(lane, owed)
         log(
             self.server.home,
             "expired",
@@ -1077,6 +1318,10 @@ def main() -> None:
     that finds its published record dead, and every native call until then
     pays an in-process decision, so the interval that bounds the detection
     also bounds the leaving.
+
+    Wake sockets left behind by launchers that did not exit cleanly are
+    removed at start, so each start begins with only the sockets a live
+    launcher still listens on.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, required=True)
@@ -1084,7 +1329,11 @@ def main() -> None:
     os.umask(0o077)
     config = json.loads((args.home / "config.json").read_text())
     store.initialize(args.home)
-    from agent_parley import inbound, supervision
+    if removed := sweep(args.home):
+        log(args.home, "swept", f"{removed} temporary state files")
+    from agent_parley import inbound, supervision, terminal
+
+    terminal.sweep_sockets(args.home)
 
     stopped = threading.Event()
     workers = [
@@ -1097,6 +1346,7 @@ def main() -> None:
         with Server(args.home, config) as server:
             stop_on_signal(args.home, server)
             server.serve_forever(poll_interval=0.2)
+            server.flush_repeats()
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()

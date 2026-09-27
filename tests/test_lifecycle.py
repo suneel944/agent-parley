@@ -371,6 +371,41 @@ def test_premerge_gate_that_moves_base_head_cannot_integrate(
     assert execution["state"] == lifecycle.READY
 
 
+def test_merge_gate_leaves_the_setup_lock_to_other_operations(
+    bridge,
+    repo,
+    paired,
+    monkeypatch,
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda *args: None
+    )
+    monkeypatch.setattr("agent_parley.cli.forge.assign", lambda *args: True)
+    identify(repo)
+    bridge.issue(lane, "claim", "58")
+    commit(lane, "gated.txt")
+    bridge.report(lane, "ready", "Ready", "", "tests passed")
+    bridge.verification(repo, "true")
+    original = cli.verify_base
+    seen = []
+
+    def gate(*args, **kwargs):
+        with cli.lock(directory / "setup.lock"):
+            seen.append("setup")
+        with pytest.raises(BridgeError, match="Another merge"):
+            bridge.merge(repo, "claude")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("agent_parley.cli.verify_base", gate)
+
+    bridge.merge(repo, "codex")
+
+    assert seen == ["setup", "setup"]
+    assert (repo / "gated.txt").exists()
+
+
 def test_keyed_report_retry_repairs_interrupted_lifecycle_transition(
     bridge,
     paired,
@@ -479,3 +514,90 @@ def test_unknown_resume_issue_adds_no_authority_or_blocked_activity(
         not activity.exists()
         or json.loads(activity.read_text()).get("outcome") != "blocked"
     )
+
+
+def planned(directory: Path, text: str) -> None:
+    """Applies one plan file written into the state directory."""
+    path = directory / "work.toml"
+    path.write_text(text)
+    plan.apply(directory, path)
+
+
+def rewrite(directory: Path, change) -> None:
+    """Edits the issue ledger in place, bypassing every transition."""
+    path = directory / "issues.json"
+    ledger = json.loads(path.read_text())
+    change(ledger["issues"])
+    path.write_text(json.dumps(ledger))
+
+
+def completed(records: dict, number: str) -> None:
+    """Marks one ledger record complete without reconciling dependents."""
+    records[number].setdefault("execution", {})["state"] = lifecycle.COMPLETE
+
+
+def block(directory: Path, number: str, blocker: str) -> dict:
+    """Records one dependency edge as the codex lane."""
+    return issues.change(
+        directory,
+        "codex",
+        "block",
+        number,
+        participants={"codex", "claude"},
+        on=blocker,
+    )
+
+
+def test_blocking_on_unrecorded_or_complete_work_adds_no_edge(tmp_path):
+    planned(tmp_path, "[dependencies]\n42 = [17]\n")
+    claim(tmp_path, "50")
+    with pytest.raises(BridgeError, match="not in the issue ledger"):
+        block(tmp_path, "50", "99")
+    rewrite(tmp_path, lambda records: completed(records, "17"))
+
+    assert block(tmp_path, "50", "17").get("blocked_by", []) == []
+    waiting = issues.snapshot(tmp_path)["issues"]["50"]
+    assert waiting.get("blocked_by", []) == []
+
+
+def test_a_block_that_closes_a_cycle_is_refused(tmp_path):
+    planned(tmp_path, "[dependencies]\n42 = [17]\n43 = [42]\n")
+    claim(tmp_path, "17")
+
+    with pytest.raises(BridgeError, match="dependency cycle"):
+        block(tmp_path, "17", "43")
+    waiting = issues.snapshot(tmp_path)["issues"]["17"]
+    assert waiting.get("blocked_by", []) == []
+
+
+def test_the_supervisor_drops_edges_no_completion_will_clear(tmp_path):
+    planned(tmp_path, "[dependencies]\n42 = [17]\n43 = [99]\n")
+
+    def stale(records: dict) -> None:
+        """Completes #17 unreconciled and forgets #99 entirely."""
+        completed(records, "17")
+        del records["99"]
+
+    rewrite(tmp_path, stale)
+
+    assert lifecycle.settle_dependencies(tmp_path) == [
+        ("42", "17"),
+        ("43", "99"),
+    ]
+    ledger = issues.snapshot(tmp_path)["issues"]
+    assert ledger["42"]["blocked_by"] == []
+    assert ledger["43"]["blocked_by"] == []
+    assert lifecycle.settle_dependencies(tmp_path) == []
+
+
+def test_the_operator_unblocks_an_unowned_issue_from_the_base_checkout(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    lane = Path(paired["lanes"]["codex"])
+    planned(directory, "[dependencies]\n42 = [17]\n")
+
+    with pytest.raises(BridgeError, match="has no owner"):
+        bridge.issue(lane, "unblock", "42", on="17")
+    bridge.issue(repo, "unblock", "42", on="17")
+    assert issues.snapshot(directory)["issues"]["42"]["blocked_by"] == []

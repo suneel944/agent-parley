@@ -13,6 +13,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,15 @@ CHANGELOG_SECTIONS = (
     ("feat", "Features"),
     ("fix", "Bug fixes"),
     ("perf", "Performance"),
+)
+ACCEPTANCE_SUITE = "tests/test_fault_acceptance.py"
+ACCEPTANCE_RECORDS = "docs/acceptance"
+ACCEPTANCE_MEASURES = (
+    "lanes",
+    "claims",
+    "claims_completed",
+    "idle_lane_minutes",
+    "unaccountable_claim_minutes",
 )
 RELEASE_KINDS = ("major", "minor", "patch")
 MEASURED = "measured"
@@ -480,6 +490,114 @@ def release_history_errors(root: Path) -> list[str]:
     return errors
 
 
+def run_acceptance_suite(root: Path) -> str:
+    """Runs the fault-injection acceptance suite on the checked-out commit.
+
+    Args:
+        root: Checkout holding the release source and its test suite.
+
+    Returns:
+        An empty string when every scenario passed, otherwise the reason the
+        suite did not pass, taken from the last line pytest printed.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", ACCEPTANCE_SUITE],
+            cwd=root,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if result.returncode == 0:
+        return ""
+    lines = result.stdout.strip().splitlines()
+    return lines[-1] if lines else f"pytest exited {result.returncode}"
+
+
+def acceptance_record_error(root: Path, version: str) -> str:
+    """Validates the live acceptance record a minor or major release needs.
+
+    Args:
+        root: Checkout holding the acceptance records.
+        version: Version the release would publish.
+
+    Returns:
+        An empty string for a valid record, otherwise what is missing or
+        wrong in it.
+    """
+    path = f"{ACCEPTANCE_RECORDS}/{version}.json"
+    try:
+        record = json.loads((root / path).read_text())
+    except FileNotFoundError:
+        return f"no live acceptance record {path}"
+    except (OSError, ValueError) as exc:
+        return f"live acceptance record {path} is unreadable: {exc}"
+    if not isinstance(record, dict):
+        return f"live acceptance record {path} is not an object"
+    if record.get("version") != version:
+        return f"live acceptance record {path} names another version"
+    if not str(record.get("run", "")).strip():
+        return f"live acceptance record {path} names no run"
+    missing = [
+        name
+        for name in ACCEPTANCE_MEASURES
+        if not isinstance(record.get(name), (int, float))
+        or isinstance(record.get(name), bool)
+        or record[name] < 0
+    ]
+    if missing:
+        return f"live acceptance record {path} lacks measured " + ", ".join(
+            missing
+        )
+    if record["claims"] <= 0 or record["claims_completed"] != record["claims"]:
+        return (
+            f"live acceptance record {path} completed "
+            f"{record['claims_completed']} of {record['claims']} claims"
+        )
+    return ""
+
+
+def acceptance_errors(
+    root: Path,
+    approved: str,
+    version: str,
+    suite: Callable[[Path], str] | None = None,
+) -> list[str]:
+    """Names the acceptance evidence a minor or major release still lacks.
+
+    A patch release needs none: it repairs a published version rather than
+    claiming new behaviour. A minor or major release claims new unattended
+    behaviour, so it needs both the fault-injection suite passing on the
+    release commit and a live acceptance record for the version with the
+    numbers that run measured.
+
+    Args:
+        root: Checkout of the release commit.
+        approved: Approved release version the release advances from.
+        version: Version the release would publish.
+        suite: Runs the acceptance suite and returns why it did not pass;
+            `run_acceptance_suite` when None.
+
+    Returns:
+        One line per missing piece of evidence; empty when none is missing.
+    """
+    if approved.split(".")[:2] == version.split(".")[:2]:
+        return []
+    errors = []
+    if failure := (suite or run_acceptance_suite)(root):
+        errors.append(
+            f"fault-injection acceptance suite {ACCEPTANCE_SUITE} did not "
+            f"pass on the release commit: {failure}"
+        )
+    if failure := acceptance_record_error(root, version):
+        errors.append(failure)
+    return errors
+
+
 def changelog_entry(
     root: Path, baseline: str, approved: str, version: str
 ) -> str:
@@ -897,6 +1015,17 @@ def main() -> None:
             print(f"{measured}; no package changes since the approved release.")
         else:
             print(f"{measured}; proposing {version}.")
+        return
+    if phase == "evidence":
+        version = os.environ["RELEASE_VERSION"]
+        approved = json.loads((root / MANIFEST_PATH).read_text())["."]
+        errors = acceptance_errors(root, approved, version)
+        if errors:
+            raise ValueError(
+                f"Release {version} refused; missing acceptance evidence:\n"
+                + "\n".join(f"- {error}" for error in errors)
+            )
+        print(f"Acceptance evidence for {version} is complete.")
         return
     if phase == "bump":
         version = os.environ["RELEASE_VERSION"]

@@ -114,6 +114,8 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
+DENIAL_CAUSES = "agent_parley_lane_hook_denials_by_cause_total"
+
 PROJECT_METRICS: tuple[tuple[str, str, str, str], ...] = (
     (
         "agent_parley_project_participants",
@@ -606,6 +608,7 @@ def _row(row: dict) -> dict:
         "injected_bytes": row["injected_bytes"],
         "hook_events": row["hook_events"],
         "denials": row["denials"],
+        "denied_by": [dict(item) for item in row.get("denied_by") or []],
         "calls": row["calls"],
         "errors": row["errors"],
         "tokens": row["tokens"],
@@ -704,7 +707,8 @@ def families(view: dict) -> list[dict]:
     """Reports the exported counters and gauges of one live snapshot.
 
     Every lane series is labelled by project, participant and provider, and
-    every project series by project alone. A field that states nothing could
+    every project series by project alone. Denials are also counted by the
+    reason class and the tool that drew them. A field that states nothing could
     be read, such as tokens on an unreadable session record, contributes no
     sample rather than a zero, so a reader never mistakes an unread value for
     a measured one.
@@ -738,6 +742,28 @@ def families(view: dict) -> list[dict]:
         reported.append(
             {"name": name, "type": kind, "help": text, "samples": samples}
         )
+    reported.append(
+        {
+            "name": DENIAL_CAUSES,
+            "type": "counter",
+            "help": "Hook denials in the reported window by reason and tool.",
+            "samples": [
+                {
+                    "labels": {
+                        "project": project["root"],
+                        "participant": row["participant"],
+                        "provider": row["provider_name"],
+                        "reason": item["reason"],
+                        "tool": item["tool"],
+                    },
+                    "value": item["count"],
+                }
+                for project in view["projects"]
+                for row in project["rows"]
+                for item in row.get("denied_by") or []
+            ],
+        }
+    )
     for name, kind, key, text in PROJECT_METRICS:
         reported.append(
             {

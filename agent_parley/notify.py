@@ -43,6 +43,7 @@ class Event(StrEnum):
     HOOK_REFUSAL = "hook_refusal"
     INBOUND_LOCKED = "inbound_locked"
     NATIVE_DIALOG = "native_dialog"
+    IDLE_BLOCKER = "idle_blocker"
 
 
 TITLES: dict[str, str] = {
@@ -53,6 +54,7 @@ TITLES: dict[str, str] = {
     Event.HOOK_REFUSAL: "A hook refused a lane action",
     Event.INBOUND_LOCKED: "Inbound status queries are locked",
     Event.NATIVE_DIALOG: "A lane is held by a native dialog",
+    Event.IDLE_BLOCKER: "Other issues wait on an idle claim",
 }
 
 KEY_FIELDS: dict[str, tuple[str, ...]] = {
@@ -63,6 +65,7 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
     Event.HOOK_REFUSAL: ("session", "reason"),
     Event.INBOUND_LOCKED: ("detail",),
     Event.NATIVE_DIALOG: ("dialog", "detail"),
+    Event.IDLE_BLOCKER: ("issue", "claim"),
 }
 
 REFUSALS = frozenset({"branch_drift", "branch_switch"})

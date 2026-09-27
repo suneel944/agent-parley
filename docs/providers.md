@@ -167,8 +167,10 @@ agent-parley participant retire claude-2
 agent-parley run claude-2 --provider claude --credentials account-2
 ```
 
-`retire` refuses while a session is running and refuses a lane with uncommitted
-changes, so commit or preserve the work first; it never discards work. Commits
+`retire` refuses while a session is running, refuses a lane with uncommitted
+changes, and refuses a lane still holding work it reported ready until that
+work is merged or offered on, so commit or preserve the work first; it never
+discards work. Commits
 the lane made are kept on its branch, and it says so. Messages are preserved.
 The replacement lane is a fresh worktree on the next free lane branch, so it
 does not continue the retired branch: merge that branch, or branch from it with

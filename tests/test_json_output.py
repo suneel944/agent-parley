@@ -133,6 +133,7 @@ def test_issue_list_reports_offers_with_their_identifiers(
     bridge, repo, paired, monkeypatch, capsys
 ):
     lane = paired["lanes"]["claude"]
+    bridge.issue(paired["lanes"]["codex"], "claim", "9")
     bridge.issue(lane, "claim", "7")
     bridge.issue(lane, "block", "7", on="9")
     record = bridge.issue(

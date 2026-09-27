@@ -62,6 +62,7 @@ RESERVED = frozenset(
 LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
 MAX_VERIFY_ARGUMENTS = 64
+MAX_STANDING_REPLY = 500
 MANIFEST_VERSION = 2
 APPROVAL_STEPS = ("merge", "pr")
 PROVIDERS = "providers.json"
@@ -309,8 +310,9 @@ def deadlines(value: dict) -> dict:
 
     A default is inherited by a claim, an offer or an acknowledgement that
     passes no explicit window, so lanes carry a budget without repeating a
-    flag. A deadline never transfers ownership: it only makes an overdue
-    claim, offer or acknowledgement say so.
+    flag. A deadline makes an overdue claim, offer or acknowledgement say
+    so; only the supervisor's overdue transition, which acts when the holder
+    has stopped working, moves an overdue claim.
 
     Args:
         value: Defaults recorded in the project manifest.
@@ -979,6 +981,14 @@ def normalize(manifest: dict) -> dict:
             participant["approve_bridge_tools"] = approval_opt_in(
                 participant["approve_bridge_tools"]
             )
+        if "auto_mode" in participant:
+            participant["auto_mode"] = approval_opt_in(
+                participant["auto_mode"], "auto_mode"
+            )
+        if "answer_questions" in participant:
+            participant["answer_questions"] = standing_reply(
+                participant["answer_questions"]
+            )
         if type(participant.get("retired", 0.0)) not in (int, float):
             raise BridgeError(
                 "Participant retirement must be recorded as a time."
@@ -997,6 +1007,14 @@ def normalize(manifest: dict) -> dict:
     if "approve_bridge_tools" in project:
         project["approve_bridge_tools"] = approval_opt_in(
             project["approve_bridge_tools"]
+        )
+    if "auto_mode" in project:
+        project["auto_mode"] = approval_opt_in(
+            project["auto_mode"], "auto_mode"
+        )
+    if "answer_questions" in project:
+        project["answer_questions"] = standing_reply(
+            project["answer_questions"]
         )
     return {
         "version": MANIFEST_VERSION,
@@ -1048,16 +1066,20 @@ def dialog_answers(value: object) -> dict[str, str]:
     return {name: answer.strip() for name, answer in value.items()}
 
 
-def approval_opt_in(value: object) -> bool:
-    """Validates the native approval pre-approval an operator recorded.
+def approval_opt_in(
+    value: object, setting: str = "approve_bridge_tools"
+) -> bool:
+    """Validates a native permission opt-in an operator recorded.
 
-    The setting decides whether a launch carries approval of this bridge's own
-    MCP server into the client's native permission settings. It grants nothing
-    wider, so it is a plain choice rather than a list of tools, and a value that
-    is not a boolean is refused instead of read as consent.
+    `approve_bridge_tools` decides whether a launch carries approval of this
+    bridge's own MCP server into the client's native permission settings, and
+    `auto_mode` whether it starts the client in its auto permission mode.
+    Each is a plain choice, and a value that is not a boolean is refused
+    instead of read as consent.
 
     Args:
         value: Recorded opt-in for a project or one of its lanes.
+        setting: Manifest key the value was recorded under.
 
     Returns:
         The recorded choice.
@@ -1066,8 +1088,38 @@ def approval_opt_in(value: object) -> bool:
         BridgeError: If the value is not a boolean.
     """
     if type(value) is not bool:
-        raise BridgeError("The approve_bridge_tools setting must be a boolean.")
+        raise BridgeError(f"The {setting} setting must be a boolean.")
     return value
+
+
+def standing_reply(value: object) -> str:
+    """Validates the reply an operator recorded for a lane's questions.
+
+    The reply is typed into the client's question picker as free text, so it
+    is refused when it carries a control character that could submit early,
+    cancel the picker or drive the terminal, and when it is too long to read
+    as one answer.
+
+    Args:
+        value: Recorded reply for a project or one of its lanes.
+
+    Returns:
+        The reply with surrounding whitespace removed.
+
+    Raises:
+        BridgeError: If the value is not bounded printable text.
+    """
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > MAX_STANDING_REPLY
+        or not value.isprintable()
+    ):
+        raise BridgeError(
+            "The answer_questions setting must be one line of printable text "
+            f"of at most {MAX_STANDING_REPLY} characters."
+        )
+    return value.strip()
 
 
 def forge_choice(value: object) -> str | None:
@@ -1217,6 +1269,28 @@ def resolve(manifest: dict, lane: Path) -> str:
     raise BridgeError(
         "Run this from an assigned agent worktree, not the main checkout."
     )
+
+
+def caller_lane(manifest: dict) -> str | None:
+    """Returns the participant whose worktree holds the working directory.
+
+    Operator-only commands call this rather than trusting ``--repo``: a lane
+    can name the base checkout as ``--repo`` while it runs inside its own
+    worktree, and only the process working directory shows where the command
+    actually runs.
+
+    Args:
+        manifest: Manifest using the participant roster layout.
+
+    Returns:
+        The owning participant name, or None outside every lane.
+    """
+    here = Path.cwd().resolve()
+    for name, participant in manifest["participants"].items():
+        lane = Path(participant["lane"]).resolve()
+        if here == lane or lane in here.parents:
+            return name
+    return None
 
 
 def describe(manifest: dict) -> str:

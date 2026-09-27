@@ -28,10 +28,16 @@ One more identity crosses the same boundaries: the name this bridge's MCP server
 carries in the client configuration a launch writes, in the native permission
 rules that name its tools, and in the tool names a hook reports. `SERVER` and
 `TOOL_PREFIX` hold that name so no surface matches a second spelling of it.
+The command a lane is told to run for this bridge's CLI crosses the same way:
+into the protocol prompt, into the native shell permission rule a launch
+writes, and into the watcher that recognizes a prompt for it. `cli_command`
+spells it once for all three.
 """
 
 import json
 import os
+import shlex
+import sys
 from pathlib import Path
 
 from agent_parley import __version__
@@ -43,15 +49,38 @@ HEADER = "Agent-Parley-Protocol"
 PROTOCOL = 1
 SUPPORTED = (1,)
 UPDATE = "agent-parley setup PATH reinstalls the plugin for this repository."
-MIGRATE = "agent-parley down, then agent-parley up, migrates the store."
+MIGRATE = "agent-parley up migrates the store in place; no lane is stopped."
 UPGRADE = "A newer agent-parley wrote this store; install that version."
 RELAUNCH = "agent-parley up starts a service on the code in the checkout."
 START = "agent-parley up starts the coordination service these lanes need."
+CLI_MODULE = "agent_parley.cli"
 UNKNOWN = -1
 OK = "ok"
 MISMATCH = "mismatch"
 STALE = "stale"
 STOPPED = "not running"
+
+
+def cli_command() -> str:
+    """Spells the command a lane runs to reach this bridge's own CLI.
+
+    The interpreter is the one running this code, so a lane never resolves a
+    different installed version from its login shell.
+
+    Returns:
+        The shell-quoted interpreter and module, without arguments.
+    """
+    return shlex.join([sys.executable, "-m", CLI_MODULE])
+
+
+def cli_rule() -> str:
+    """Returns the native shell permission rule for this bridge's CLI.
+
+    Returns:
+        A `Bash` rule that allows `cli_command` with any arguments and no
+        other command, spelled from the same string the prompt prints.
+    """
+    return f"Bash({cli_command()} *)"
 
 
 def manifests(root: Path) -> dict[str, Path]:

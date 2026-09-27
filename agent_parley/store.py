@@ -2,13 +2,16 @@
 
 import contextlib
 import fnmatch
+import functools
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from agent_parley import (
     attachments,
@@ -23,7 +26,7 @@ from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
 
 DATABASE = "bridge.sqlite3"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 SCHEMA_ABSENT = "absent"
 SCHEMA_BEHIND = "needs migration"
 SCHEMA_CURRENT = "ok"
@@ -35,6 +38,7 @@ MAX_RESULT_BYTES = 8192
 MAX_RECIPIENTS = 16
 MAX_ROSTER = 32
 MAX_EVENT_ROWS = 2000
+REFUSAL_SECONDS = 86400.0
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
@@ -44,6 +48,25 @@ MAX_QUEUED_REQUESTS = 32
 MAX_NOTICE_CHARACTERS = 1000
 DEFAULT_ACK_SECONDS = 240
 RESERVATION_GRACE = 1800
+BASE_TOPIC = "base"
+DIRECT_TOPIC = "direct"
+MAX_TOPIC = 80
+MIN_STEM = 3
+BROADCAST_MIN = 3
+MARK_READ_TIMEOUT = 0.5
+BASE_NOTE = re.compile(
+    r"^\W*(?:main|master|trunk|base|integration\S*|origin/\S+)\s+"
+    r"(?:is|now|at|moved|advanced)\b|\bmerged\b",
+    re.IGNORECASE,
+)
+CLAIM_SUPERSESSION = (
+    "UPDATE message_recipients SET superseded_ts=CURRENT_TIMESTAMP,"
+    "superseded_reason=? WHERE superseded_ts IS NULL AND message_id IN ("
+    "SELECT m.id FROM messages m JOIN projects p ON p.id=m.project_id "
+    "WHERE p.human_key=? AND m.claim_id=?) AND (read_ts IS NULL OR "
+    "(ack_ts IS NULL AND EXISTS (SELECT 1 FROM messages m WHERE "
+    "m.id=message_recipients.message_id AND m.ack_required=1)))"
+)
 SCHEDULE_FIELDS = (
     "id",
     "kind",
@@ -113,6 +136,7 @@ CREATE TABLE IF NOT EXISTS messages (
  subject TEXT NOT NULL, body_md TEXT NOT NULL, ack_required INTEGER DEFAULT 0,
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
  ack_deadline_ts TEXT, claim_id TEXT, decision INTEGER NOT NULL DEFAULT 0,
+ topic TEXT NOT NULL DEFAULT '', feed INTEGER NOT NULL DEFAULT 0,
  UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
@@ -141,6 +165,11 @@ CREATE TABLE IF NOT EXISTS reservation_requests (
  granted_ts TEXT, cancelled_ts TEXT, claim_id TEXT);
 CREATE INDEX IF NOT EXISTS queued ON reservation_requests(project_id,id)
  WHERE granted_ts IS NULL AND cancelled_ts IS NULL;
+CREATE TABLE IF NOT EXISTS reservation_refusals (
+ project_id INTEGER NOT NULL REFERENCES projects(id),
+ agent_id INTEGER NOT NULL REFERENCES agents(id), holder TEXT NOT NULL,
+ path_pattern TEXT NOT NULL, refused_ts REAL NOT NULL,
+ PRIMARY KEY(project_id,agent_id,holder,path_pattern));
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), tool TEXT NOT NULL,
@@ -168,7 +197,7 @@ CREATE TABLE IF NOT EXISTS scheduled_deliveries (
  ack_within REAL, not_before REAL, condition TEXT NOT NULL DEFAULT '',
  unless_reported INTEGER NOT NULL DEFAULT 0, every_seconds REAL,
  repeats_left INTEGER NOT NULL DEFAULT 1, created_ts REAL NOT NULL,
- delivered_ts REAL, cancelled_ts REAL);
+ delivered_ts REAL, cancelled_ts REAL, cancelled_reason TEXT);
 CREATE INDEX IF NOT EXISTS undelivered ON scheduled_deliveries(project_id)
  WHERE delivered_ts IS NULL AND cancelled_ts IS NULL;
 """
@@ -184,6 +213,22 @@ CREATE TRIGGER IF NOT EXISTS message_unindexed AFTER DELETE ON messages BEGIN
  VALUES ('delete',old.id,old.subject,old.body_md);
 END;
 """
+
+
+class Transaction(sqlite3.Connection):
+    """A store connection that undoes its side files when it rolls back.
+
+    SQLite reuses the identifier of a rolled-back row in a table without
+    ``AUTOINCREMENT``, so a file written beside such a row would outlive the
+    rollback under an identifier the next record takes. A writer that creates
+    one registers its removal in ``undo``, and ``connect`` runs every removal
+    when the transaction rolls back.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Opens the connection with nothing to undo yet."""
+        super().__init__(*args, **kwargs)
+        self.undo: list[Callable[[], None]] = []
 
 
 @contextlib.contextmanager
@@ -207,8 +252,13 @@ def connect(
     accumulated sleep budget, which can overrun wall time on macOS. A writer
     holds its reservation before yielding, so its statements do not need a
     second busy wait.
+
+    A transaction that rolls back also runs every removal registered in its
+    ``undo`` list, so no file written for it outlives it.
     """
-    db = sqlite3.connect(home / DATABASE, timeout=0 if write else timeout)
+    db = sqlite3.connect(
+        home / DATABASE, timeout=0 if write else timeout, factory=Transaction
+    )
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     try:
@@ -230,6 +280,9 @@ def connect(
         db.commit()
     except BaseException:
         db.rollback()
+        for undo in db.undo:
+            with contextlib.suppress(OSError):
+                undo()
         raise
     finally:
         db.close()
@@ -295,6 +348,22 @@ def initialize(home: Path) -> None:
     and its receipts, and mail delivered before the upgrade reads as live
     until the claim it was sent under closes, so no backlog is retired by
     being upgraded.
+
+    Upgrading a store written before topics and the project feed gives every
+    stored message an empty topic and keeps it out of the feed, so routing
+    and supersession apply only to mail sent after the upgrade.
+
+    A store already stamped with this build's schema still has every column
+    this build owns verified and added where it is missing. The stamp says
+    which upgrade ran, not that its columns are all present, and a store
+    missing one under a current stamp would otherwise fail every read that
+    names it while every restart took the same early return. Each column
+    step reads the table first, so a complete store changes nothing.
+
+    Every step a store past the lease rebuild takes is additive, so a service
+    still running an older build keeps serving from the migrated store, and a
+    newer build can migrate it in place without stopping the lanes that are
+    working.
     """
     with lock(home / "store.lock"):
         path = home / DATABASE
@@ -312,18 +381,18 @@ def initialize(home: Path) -> None:
             db.executescript(SCHEMA)
             with db:
                 db.execute("BEGIN IMMEDIATE")
-                if version == SCHEMA_VERSION:
-                    _add_message_search(db)
-                    return
                 _add_ack_deadline(db)
                 _add_decision_flag(db)
-                if version == 1:
-                    _add_reservation_created(db)
+                _add_reservation_created(db)
                 _rebuild_reservations(db)
                 _add_claim_correlation(db)
                 _add_reservation_ttl(db)
                 _add_supersession(db)
+                _add_topic(db)
                 _add_message_search(db)
+                _add_schedule_cancellation(db)
+                if version == SCHEMA_VERSION:
+                    return
                 legacy = home / "mail.sqlite3"
                 if version == 0 and legacy.exists():
                     _import_legacy(db, legacy)
@@ -381,11 +450,19 @@ def _add_claim_correlation(db: sqlite3.Connection) -> None:
     It runs after the reservation table has been rebuilt into its current
     shape, because that rebuild copies a fixed column list and would otherwise
     drop a column added before it.
+
+    The partial index on a message's claim lets closing or moving a claim
+    find the mail that claim sent without scanning every delivery while it
+    holds the write lock. Mail sent under no claim stays out of it.
     """
     for table in ("messages", "file_reservations"):
         columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
         if "claim_id" not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN claim_id TEXT")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS claims ON messages(project_id,claim_id) "
+        "WHERE claim_id IS NOT NULL"
+    )
 
 
 def _add_reservation_ttl(db: sqlite3.Connection) -> None:
@@ -436,6 +513,49 @@ def _add_supersession(db: sqlite3.Connection) -> None:
             db.execute(
                 f"ALTER TABLE message_recipients ADD COLUMN {column} TEXT"
             )
+
+
+def _add_topic(db: sqlite3.Connection) -> None:
+    """Adds the message topic and the project feed marker to an older store.
+
+    Both columns are additive with empty defaults, so a message stored before
+    the upgrade carries no topic, supersedes nothing, stays in the mailboxes
+    it was delivered to and never appears in the project feed.
+
+    Args:
+        db: Open upgrade transaction owned by the caller.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+    if "topic" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN topic TEXT NOT NULL DEFAULT ''"
+        )
+    if "feed" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN feed INTEGER NOT NULL DEFAULT 0"
+        )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS feed ON messages(project_id,id) "
+        "WHERE feed=1"
+    )
+
+
+def _add_schedule_cancellation(db: sqlite3.Connection) -> None:
+    """Adds the reason a scheduled item was cancelled to an older store.
+
+    The column is additive and nullable, so an item cancelled before the
+    upgrade keeps its cancellation time and simply records no reason.
+
+    Args:
+        db: Open upgrade transaction owned by the caller.
+    """
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(scheduled_deliveries)")
+    }
+    if "cancelled_reason" not in columns:
+        db.execute(
+            "ALTER TABLE scheduled_deliveries ADD COLUMN cancelled_reason TEXT"
+        )
 
 
 def _add_reservation_created(db: sqlite3.Connection) -> None:
@@ -706,6 +826,19 @@ def _number(value: object, name: str, low: int, high: int) -> int:
     return value
 
 
+def _whole(value: object, name: str, low: int, high: int) -> int:
+    """Validates integer bounds, taking a whole-number float as its integer.
+
+    A duration parsed from the command line, or read back from a ``REAL``
+    column, is a float even when it names whole seconds. A finite float with
+    no fraction is taken as that integer; a fractional or non-finite float,
+    a boolean or anything else out of bounds is refused.
+    """
+    if type(value) is float and value.is_integer():
+        value = int(value)
+    return _number(value, name, low, high)
+
+
 def _flag(value: object, name: str) -> bool:
     """Rejects truthy strings and numeric substitutes for booleans."""
     if type(value) is not bool:
@@ -757,6 +890,261 @@ def _answered_thread(db: sqlite3.Connection, actor: dict, value: object) -> str:
     return row[0]
 
 
+def ack_seconds(manifest: dict | None) -> float:
+    """Reads the acknowledgement deadline one project records.
+
+    Args:
+        manifest: Project manifest, or None when none was read.
+
+    Returns:
+        The project's recorded ``ack`` deadline in seconds, or
+        ``DEFAULT_ACK_SECONDS`` when it records none.
+    """
+    recorded = ((manifest or {}).get("deadlines") or {}).get("ack")
+    return float(DEFAULT_ACK_SECONDS if recorded is None else recorded)
+
+
+def message_topic(subject: str, explicit: str = "") -> str:
+    """Names the topic a message supersedes earlier mail under.
+
+    A sender may name a topic. Without one, a subject announcing where a base
+    branch now points or that work merged is a base note, whose newest copy
+    is the only one worth reading; any other subject has no topic and so
+    replaces nothing.
+
+    Args:
+        subject: Message subject.
+        explicit: Topic the sender named, or an empty string.
+
+    Returns:
+        The topic, ``BASE_TOPIC`` for a base note, or an empty string.
+    """
+    if explicit:
+        return explicit
+    return BASE_TOPIC if BASE_NOTE.search(subject) else ""
+
+
+def mentions(text: str, name: str) -> bool:
+    """Reports whether text names a lane as a word of its own.
+
+    Args:
+        text: Subject and body of a message.
+        name: Registered identity of a lane.
+
+    Returns:
+        Whether the name appears with no word character or hyphen on either
+        side, so ``claude`` is not found inside ``claude-2``.
+    """
+    return bool(re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text, re.I))
+
+
+def reservation_stem(pattern: str) -> str:
+    """Returns the literal part of a reservation key a message could quote.
+
+    Args:
+        pattern: Reservation key, a path, a glob or a named resource.
+
+    Returns:
+        The key up to its first glob character without a trailing slash, or
+        an empty string when that part is too short to identify anything.
+    """
+    stem = re.split(r"[*?\[]", pattern, maxsplit=1)[0].rstrip("/")
+    return stem if len(stem) >= MIN_STEM else ""
+
+
+def lane_work(directory: Path | None) -> dict[str, list[str]]:
+    """Maps each registered identity to the issue numbers its lane owns.
+
+    Args:
+        directory: Project state directory, or None when none is known.
+
+    Returns:
+        Registered identity to owned issue numbers. An unreadable manifest or
+        ledger yields an empty mapping, so routing falls back to mentions and
+        reserved paths alone.
+    """
+    if directory is None:
+        return {}
+    try:
+        manifest = roster.read(directory)
+        owned = issues.holders(issues.snapshot(directory))
+    except (BridgeError, OSError, ValueError, KeyError):
+        return {}
+    return {
+        participant["display"]: owned.get(name, [])
+        for name, participant in manifest["participants"].items()
+    }
+
+
+def _concerned(
+    db: sqlite3.Connection,
+    recipient: int,
+    name: str,
+    text: str,
+    claim: str,
+    owned: list[str],
+) -> bool:
+    """Reports whether one message concerns one of the lanes it addressed.
+
+    A message concerns a lane that it names, whose reserved paths it quotes,
+    whose owned issue it cites by number, or whose reservations were taken
+    under the claim the message was sent from.
+
+    Args:
+        db: Open transaction owned by the caller.
+        recipient: Store identifier of the addressed lane.
+        name: Registered identity of the addressed lane.
+        text: Subject and body of the message.
+        claim: Claim the sender held, or an empty string.
+        owned: Issue numbers the addressed lane owns.
+
+    Returns:
+        Whether the message should reach this lane's mailbox.
+    """
+    if mentions(text, name):
+        return True
+    if any(re.search(rf"#{re.escape(number)}\b", text) for number in owned):
+        return True
+    for row in db.execute(
+        "SELECT path_pattern,claim_id FROM file_reservations "
+        "WHERE agent_id=? AND released_ts IS NULL",
+        (recipient,),
+    ):
+        if claim and row["claim_id"] == claim:
+            return True
+        stem = reservation_stem(row["path_pattern"])
+        if stem and stem in text:
+            return True
+    return False
+
+
+def _routed(
+    db: sqlite3.Connection,
+    actor: dict,
+    addressed: dict[int, str],
+    text: str,
+    topic: str,
+    claim: str,
+    directory: Path | None,
+) -> set[int]:
+    """Chooses which addressed lanes a status message reaches.
+
+    A base note goes to the project feed and no mailbox. A broadcast, a note
+    addressed to every other lane that can receive mail and to at least
+    ``BROADCAST_MIN`` of them, reaches only the lanes it concerns, and the
+    feed carries it for everybody else. A note to a chosen subset of lanes
+    is an explicit address and reaches every lane it names.
+
+    Args:
+        db: Open transaction owned by the caller.
+        actor: Authenticated sender.
+        addressed: Store identifier to registered identity of each recipient
+            the sender named.
+        text: Subject and body of the message.
+        topic: Topic the message carries.
+        claim: Claim the sender held, or an empty string.
+        directory: Project state directory, or None when none is known.
+
+    Returns:
+        Store identifiers of the lanes whose mailboxes receive the message.
+    """
+    if topic == BASE_TOPIC:
+        return set()
+    peers = {
+        row[0]
+        for row in db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND id<>? "
+            "AND token_digest IS NOT NULL",
+            (actor["project_id"], actor["id"]),
+        )
+    }
+    if len(addressed) < BROADCAST_MIN or not peers <= set(addressed):
+        return set(addressed)
+    owned = lane_work(directory)
+    return {
+        recipient
+        for recipient, name in addressed.items()
+        if _concerned(db, recipient, name, text, claim, owned.get(name, []))
+    }
+
+
+def mark_read(home: Path, root: str, name: str, ids: list[int]) -> int:
+    """Records that a checkpoint delivered messages into a lane's context.
+
+    Only the reading time still unset is stamped, and an acknowledgement is
+    never recorded on the lane's behalf, so a message that asks for one is
+    still owed. A store that cannot be written leaves the mail unread, which
+    only means it is offered again.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity the mail was delivered to.
+        ids: Messages the delivered context carried.
+
+    Returns:
+        The number of deliveries newly marked read.
+    """
+    if not ids or not (home / DATABASE).exists():
+        return 0
+    marks = ",".join("?" * len(ids))
+    try:
+        with connect(home, write=True, timeout=MARK_READ_TIMEOUT) as db:
+            cursor = db.execute(
+                "UPDATE message_recipients SET read_ts=CURRENT_TIMESTAMP "
+                f"WHERE read_ts IS NULL AND message_id IN ({marks}) "
+                "AND agent_id=(SELECT a.id FROM agents a JOIN projects p "
+                "ON p.id=a.project_id WHERE p.human_key=? AND a.name=?)",
+                (*ids, root, name),
+            )
+            return cursor.rowcount
+    except (sqlite3.Error, OSError):
+        return 0
+
+
+def feed(home: Path, root: str, after: int = 0, limit: int = 3) -> dict:
+    """Reads the newest live project feed entries after a cursor.
+
+    An entry is live while no newer entry from the same sender carries the
+    same non-empty topic; a replaced entry is only counted.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        after: Last feed entry this reader already saw.
+        limit: Most entries to return.
+
+    Returns:
+        ``items`` newest first, each with its identifier, sender, topic,
+        subject and creation time, and ``superseded``, the number of entries
+        after the cursor that a newer one replaced.
+    """
+    if not (home / DATABASE).exists():
+        return {"items": [], "superseded": 0}
+    replaced = (
+        "EXISTS (SELECT 1 FROM messages n WHERE n.project_id=m.project_id "
+        "AND n.feed=1 AND n.sender_id=m.sender_id AND n.topic=m.topic "
+        "AND m.topic<>'' AND n.id>m.id)"
+    )
+    with connect(home) as db:
+        rows = db.execute(
+            "SELECT m.id,a.name AS sender,m.topic,substr(m.subject,1,80) "
+            "AS subject,m.created_ts FROM messages m "
+            "JOIN agents a ON a.id=m.sender_id "
+            "JOIN projects p ON p.id=m.project_id WHERE p.human_key=? "
+            f"AND m.feed=1 AND m.id>? AND NOT {replaced} "
+            "ORDER BY m.id DESC LIMIT ?",
+            (root, after, limit),
+        ).fetchall()
+        superseded = db.execute(
+            "SELECT count(*) FROM messages m JOIN projects p "
+            "ON p.id=m.project_id WHERE p.human_key=? AND m.feed=1 "
+            f"AND m.id>? AND {replaced}",
+            (root, after),
+        ).fetchone()[0]
+    return {"items": [dict(row) for row in rows], "superseded": superseded}
+
+
 def _ack_window(directory: Path | None) -> float:
     """Resolves the deadline an acknowledgement request carries by default.
 
@@ -776,9 +1164,7 @@ def _ack_window(directory: Path | None) -> float:
     """
     if directory is not None:
         with contextlib.suppress(BridgeError, OSError, ValueError):
-            recorded = roster.read(directory)["deadlines"].get("ack")
-            if recorded is not None:
-                return float(recorded)
+            return ack_seconds(roster.read(directory))
     return float(DEFAULT_ACK_SECONDS)
 
 
@@ -788,8 +1174,16 @@ def _send(
     args: dict,
     claim: str = "",
     directory: Path | None = None,
+    route: bool = False,
 ) -> dict:
     """Atomically delivers an idempotent message to authorized recipients.
+
+    A lane send (``route``) that neither requires acknowledgement nor
+    records a decision is routed by relevance: a base-advance or merge note
+    goes to the project feed alone, and a broadcast to every other lane
+    reaches only those whose claim, reserved paths or name it concerns. The
+    rest read it from the feed. A send with a topic supersedes the same
+    sender's older unread message on that topic for each recipient.
 
     A send naming ``reply_to`` joins the thread of the message it answers. A
     send naming neither ``reply_to`` nor ``thread_id`` opens its own thread,
@@ -823,7 +1217,7 @@ def _send(
     decision = _flag(args.get("decision", False), "decision")
     within = args.get("ack_within")
     if within is not None:
-        within = _number(within, "ack_within", 1, 86400 * 30)
+        within = _whole(within, "ack_within", 1, 86400 * 30)
     if ack and within is None:
         within = _ack_window(directory)
     if "reply_to" in args:
@@ -831,6 +1225,9 @@ def _send(
             raise BridgeError("Answer with reply_to or thread_id, not both.")
         thread = _answered_thread(db, actor, args["reply_to"])
     thread = thread or _opened_thread(actor, key)
+    topic = message_topic(
+        subject, _text(args.get("topic", ""), "topic", MAX_TOPIC, empty=True)
+    )
     recipients = args.get("to", [] if decision else None)
     lowest = 0 if decision else 1
     if (
@@ -842,6 +1239,7 @@ def _send(
             "participants."
         )
     ids = []
+    addressed: dict[int, str] = {}
     for recipient in recipients:
         name = _text(recipient, "recipient", 80)
         row = db.execute(
@@ -856,6 +1254,7 @@ def _send(
                 "operator or retired participant has no active credential."
             )
         ids.append(row[0])
+        addressed[row[0]] = name
     existing = db.execute(
         "SELECT * FROM messages WHERE sender_id=? AND dedup_key=?",
         (actor["id"], key),
@@ -879,17 +1278,27 @@ def _send(
             existing["thread_id"],
             existing["ack_required"],
             bool(existing["decision"]),
-        ) != (subject, stored, thread, ack, decision) or previous != set(ids):
+        ) != (subject, stored, thread, ack, decision) or (
+            not previous <= set(ids)
+            if existing["feed"]
+            else previous != set(ids)
+        ):
             raise BridgeError("Idempotency key already names another message.")
         return {
             "id": existing["id"],
             "thread_id": existing["thread_id"],
             "duplicate": True,
         }
+    delivered = set(ids)
+    if route and not ack and not decision:
+        delivered = _routed(
+            db, actor, addressed, f"{subject}\n{body}", topic, claim, directory
+        )
+    fed = route and delivered != set(ids)
     cursor = db.execute(
         "INSERT INTO messages(project_id,sender_id,subject,body_md,"
-        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id,decision) "
-        "VALUES (?,?,?,?,?,?,?,datetime('now',?),?,?)",
+        "thread_id,ack_required,dedup_key,ack_deadline_ts,claim_id,decision,"
+        "topic,feed) VALUES (?,?,?,?,?,?,?,datetime('now',?),?,?,?,?)",
         (
             actor["project_id"],
             actor["id"],
@@ -901,17 +1310,53 @@ def _send(
             None if within is None else f"+{int(within)} seconds",
             claim or None,
             decision,
+            topic,
+            fed,
         ),
     )
     message_id = cursor.lastrowid
     db.executemany(
         "INSERT INTO message_recipients(message_id,agent_id) VALUES (?,?)",
-        [(message_id, recipient) for recipient in set(ids)],
+        [(message_id, recipient) for recipient in delivered],
     )
-    result = {"id": message_id, "thread_id": thread}
+    if topic and delivered:
+        db.execute(
+            "UPDATE message_recipients SET superseded_ts=CURRENT_TIMESTAMP,"
+            "superseded_reason=? WHERE superseded_ts IS NULL AND agent_id IN "
+            "(SELECT agent_id FROM message_recipients WHERE message_id=?) "
+            "AND message_id IN (SELECT id FROM messages WHERE sender_id=? "
+            "AND topic=? AND id<?) AND (read_ts IS NULL OR (ack_ts IS NULL "
+            "AND EXISTS (SELECT 1 FROM messages m WHERE "
+            "m.id=message_recipients.message_id AND m.ack_required=1)))",
+            (
+                f"superseded by message {message_id}",
+                message_id,
+                actor["id"],
+                topic,
+                message_id,
+            ),
+        )
+    result: dict = {"id": message_id, "thread_id": thread}
+    if topic:
+        result["topic"] = topic
+    if fed:
+        result["feed"] = True
+        result["withheld"] = sorted(
+            name
+            for recipient, name in addressed.items()
+            if recipient not in delivered
+        )
     if decision:
         result["decision"] = True
     if oversized and directory is not None:
+        if isinstance(db, Transaction):
+            db.undo.append(
+                functools.partial(
+                    attachments.remove,
+                    directory,
+                    attachments.reference("message", message_id),
+                )
+            )
         stored, ref = attachments.spill(
             directory,
             "message",
@@ -1308,7 +1753,9 @@ def overlapping(pattern: str, other: str) -> bool:
     directory, or when both are globs, which the matcher cannot compare and
     so treats as a collision. A plain path checked against a pattern uses the
     same rule, so a dirty file in a checkout is matched exactly the way a
-    competing reservation would be.
+    competing reservation would be. A key without glob characters is only
+    ever the text being matched, never a compiled pattern, which gives the
+    same answer without one regular expression per dirty path.
 
     Args:
         pattern: Reservation key or repository-relative path.
@@ -1319,16 +1766,76 @@ def overlapping(pattern: str, other: str) -> bool:
     """
     if named_resource(pattern) or named_resource(other):
         return pattern == other
-    both_globs = any(c in pattern for c in "*?[") and any(
-        c in other for c in "*?["
-    )
+    pattern_glob = any(c in pattern for c in "*?[")
+    other_glob = any(c in other for c in "*?[")
     return (
-        both_globs
-        or fnmatch.fnmatchcase(pattern, other)
-        or fnmatch.fnmatchcase(other, pattern)
+        (pattern_glob and other_glob)
+        or pattern == other
+        or (other_glob and fnmatch.fnmatchcase(pattern, other))
+        or (pattern_glob and fnmatch.fnmatchcase(other, pattern))
         or pattern.startswith(other.rstrip("/") + "/")
         or other.startswith(pattern.rstrip("/") + "/")
     )
+
+
+def overlapping_paths(paths: list[str], patterns: list[str]) -> set[str]:
+    """Names the paths that overlap any pattern, as ``overlapping`` judges.
+
+    A dirty checkout can list tens of thousands of paths, and one call per
+    path and pattern pair costs a second on every reading. A plain pattern
+    is answered instead with one set lookup for itself, one for each
+    directory above it, and one prefix scan for the paths under it. A glob
+    pattern is compiled once and matched against every plain path, and
+    collides with every globbed path. A named resource overlaps only its own
+    spelling, so either side being one is answered by a set lookup; only a
+    globbed path checked against a plain pattern uses the pairwise rule.
+
+    Args:
+        paths: Reservation keys or repository-relative paths.
+        patterns: Reservation keys each path is compared against.
+
+    Returns:
+        Every path that ``overlapping(path, pattern)`` reports for some
+        pattern.
+    """
+    if not patterns:
+        return set()
+    globbed = [
+        path for path in paths if "*" in path or "?" in path or "[" in path
+    ]
+    trimmed: dict[str, list[str]] = {}
+    for path in paths:
+        trimmed.setdefault(path.rstrip("/"), []).append(path)
+    exact = set(paths)
+    shaped = [path for path in globbed if not named_resource(path)]
+    skipped = set(globbed)
+    plain = [
+        path
+        for path in paths
+        if path not in skipped and not named_resource(path)
+    ]
+    found: set[str] = set()
+    for pattern in patterns:
+        if pattern in exact:
+            found.add(pattern)
+        if named_resource(pattern):
+            continue
+        for index, character in enumerate(pattern):
+            if character == "/":
+                found.update(trimmed.get(pattern[:index], ()))
+        prefix = pattern.rstrip("/") + "/"
+        if any(c in pattern for c in "*?["):
+            matches = re.compile(fnmatch.translate(pattern)).match
+            found.update(shaped)
+            found.update(
+                path
+                for path in plain
+                if matches(path) or path.startswith(prefix)
+            )
+            continue
+        found.update(path for path in paths if path.startswith(prefix))
+        found.update(path for path in globbed if overlapping(path, pattern))
+    return found
 
 
 def _keys(
@@ -1422,29 +1929,34 @@ def _expired_leases(
     """Names the leases of one project that no longer describe live work.
 
     A lease is reclaimable once its declared deadline has passed and either
-    the last observation of its holder found no live session process, or it
-    has been past that deadline longer than ``RESERVATION_GRACE``. The grace
-    is longer than the runtime's whole wake budget, so a holder that can be
-    woken is woken, and renews the lease from its next checkpoint, before any
-    peer takes the key. A holder never observed at all is not assumed dead:
-    only the grace reclaims its lease.
+    the last observation of its holder found no live session process, found
+    the holder idle past the project's inactive threshold, or it has been
+    past that deadline longer than ``RESERVATION_GRACE``. A lane idle that
+    long is not working under the lease, and only a tool call renews one, so
+    a lane parked on a dialog or resumed without working loses the key to
+    the queue rather than holding it for the whole grace. The grace covers
+    a holder observed as active, which is woken and renews the lease from
+    its next tool call before any peer takes the key. A holder never
+    observed at all is not assumed dead: only the grace reclaims its lease.
 
     Args:
         db: Open transaction owned by the caller.
         project_id: Registered project whose leases are read.
 
     Returns:
-        One row per reclaimable lease, with its holder, its key and how long
-        it has been past its deadline, in holder and key order.
+        One row per reclaimable lease, with its holder, whether that holder
+        still holds a credential to be told, its key and how long it has
+        been past its deadline, in holder and key order.
     """
     return db.execute(
         "SELECT f.id,f.agent_id,f.path_pattern,a.name,"
+        "a.token_digest IS NOT NULL AS addressable,"
         "max(0,unixepoch('now')-unixepoch(f.expires_ts)) AS stale_seconds "
         "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
         "LEFT JOIN participant_presence s ON s.agent_id=f.agent_id "
         "WHERE f.project_id=? AND f.released_ts IS NULL "
         "AND f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP "
-        "AND (s.process_alive=0 "
+        "AND (s.process_alive=0 OR s.state='idle' "
         "OR unixepoch('now')-unixepoch(f.expires_ts)>=?) "
         "ORDER BY a.name,f.path_pattern",
         (project_id, RESERVATION_GRACE),
@@ -1459,14 +1971,18 @@ def _reclaim(db: sqlite3.Connection, project_id: int) -> list[dict]:
     Reservations stay advisory throughout: this changes who is told that a
     key is free, not what the file system allows.
 
+    A retired holder keeps its leases but no credential, so it cannot be
+    sent mail. Its leases are still released and handed on; only the notice
+    is skipped, because nobody is left to read it.
+
     Args:
         db: Open write transaction owned by the caller.
         project_id: Registered project whose leases are swept.
 
     Returns:
         One entry per holder whose leases were reclaimed, naming that holder,
-        the released keys, the notice it was sent and the lanes that took the
-        keys from its queue.
+        the released keys, the notice it was sent, or ``None`` when it could
+        not be told, and the lanes that took the keys from its queue.
     """
     holders: dict[str, list[sqlite3.Row]] = {}
     for row in _expired_leases(db, project_id):
@@ -1485,27 +2001,29 @@ def _reclaim(db: sqlite3.Connection, project_id: int) -> list[dict]:
             "name": name,
         }
         granted = _grant_queued(db, holder, keys, reclaimed=True)
-        subject, body = _reclaim_notice(
-            keys, max(lease["stale_seconds"] for lease in leases), granted
-        )
-        message = _send(
-            db,
-            _operator(db, project_id),
-            {
-                "to": [name],
-                "subject": subject,
-                "body_md": body,
-                "idempotency_key": (
-                    f"reservation-reclaimed-"
-                    f"{max(lease['id'] for lease in leases)}"
-                ),
-            },
-        )
+        message_id = None
+        if leases[0]["addressable"]:
+            subject, body = _reclaim_notice(
+                keys, max(lease["stale_seconds"] for lease in leases), granted
+            )
+            message_id = _send(
+                db,
+                _operator(db, project_id),
+                {
+                    "to": [name],
+                    "subject": subject,
+                    "body_md": body,
+                    "idempotency_key": (
+                        f"reservation-reclaimed-"
+                        f"{max(lease['id'] for lease in leases)}"
+                    ),
+                },
+            )["id"]
         reclaimed.append(
             {
                 "agent": name,
                 "paths": keys,
-                "message_id": message["id"],
+                "message_id": message_id,
                 "granted": granted,
             }
         )
@@ -2275,6 +2793,69 @@ def remedy(state: str) -> str:
     return ""
 
 
+def _layout(home: Path) -> int:
+    """Reads the counter SQLite advances on every change to the store layout.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        The store's schema cookie, or -1 when it cannot be read.
+    """
+    try:
+        with contextlib.closing(sqlite3.connect(home / DATABASE)) as db:
+            return int(db.execute("PRAGMA schema_version").fetchone()[0])
+    except sqlite3.Error:
+        return -1
+
+
+def reconcile(home: Path, cause: str = "") -> str:
+    """Migrates a store this build has outgrown and describes the skew.
+
+    A package upgrade reaches every hook on the machine before the service
+    restarts, so the first read that names a new column used to fail with a
+    raw SQLite message and every lane was refused until an operator stopped
+    all of them. The migration is additive and serialized by the store lock,
+    so the build that found the skew performs it in place and the lanes keep
+    working. A store stamped current that is still missing a column, as the
+    failed read names it, is repaired the same way.
+
+    Args:
+        home: Private bridge state root.
+        cause: Text of the failure that exposed the store, when one did.
+
+    Returns:
+        One sentence naming the schema the store carries, the schema this
+        build needs and what was done or what closes the gap, or an empty
+        string when the store matches this build and needed no repair.
+    """
+    schema = schema_version(home)
+    state = schema_state(schema)
+    needed = f"this build needs schema {SCHEMA_VERSION}"
+    missing = state == SCHEMA_CURRENT and "no such column" in cause
+    if state == SCHEMA_BEHIND or missing:
+        before = _layout(home)
+        try:
+            initialize(home)
+        except (BridgeError, OSError, sqlite3.Error) as exc:
+            if missing:
+                return ""
+            return (
+                f"Store schema {schema} is behind; {needed}, and migrating "
+                f"it in place failed: {exc}. {protocol.MIGRATE}"
+            )
+        if missing and _layout(home) == before:
+            return ""
+        found = "lacked a column" if missing else "was behind"
+        return (
+            f"Store schema {schema} {found}; {needed}. It was migrated in "
+            "place without stopping any lane; retry the call."
+        )
+    if state == SCHEMA_UNSUPPORTED:
+        return f"Store schema {schema} is newer; {needed}. {protocol.UPGRADE}"
+    return ""
+
+
 def refused(home: Path, actor: dict, tool: str) -> None:
     """Records a call refused at the transport boundary.
 
@@ -2412,6 +2993,8 @@ def _dispatch(
         result = _serve(
             db, actor, tool, args, declared, claim, commits, directory
         )
+        if tool in RESERVING and result.get("conflicts"):
+            _record_refusals(db, actor, result["conflicts"])
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -2542,6 +3125,11 @@ def _retire(home: Path, actor: dict, started: float) -> dict:
     that had handed it work where that work went, and invalidates the
     credential the call itself authenticated with.
 
+    Each retirement keys its notices afresh. A re-admitted lane keeps its
+    identity, so a key derived from the peer alone would name the notice of
+    an earlier retirement and refuse or swallow this one after its work had
+    already been released.
+
     Args:
         home: Private bridge state root.
         actor: Authenticated project and lane.
@@ -2578,6 +3166,7 @@ def _retire(home: Path, actor: dict, started: float) -> dict:
         for sender, numbers in report.pop("senders", {}).items()
         if sender in participants
     }
+    retiring = secrets.token_hex(8)
     with connect(home, write=True) as db:
         leases = _release(db, actor)
         notices = []
@@ -2590,7 +3179,10 @@ def _retire(home: Path, actor: dict, started: float) -> dict:
                     "to": [sender],
                     "subject": subject,
                     "body_md": body,
-                    "idempotency_key": f"retired-{sender}"[:80],
+                    "idempotency_key": "retired-"
+                    + retiring
+                    + "-"
+                    + hashlib.sha256(sender.encode()).hexdigest()[:32],
                 },
             )
             notices.append(
@@ -2735,13 +3327,40 @@ def supersede_claim(home: Path, root: str, claim: str, reason: str) -> int:
         return 0
     with connect(home, write=True) as db:
         cursor = db.execute(
+            CLAIM_SUPERSESSION, (reason[:MAX_SUPERSEDE_REASON], root, claim)
+        )
+        return cursor.rowcount
+
+
+def supersede_recipient(home: Path, root: str, name: str, reason: str) -> int:
+    """Retires the outstanding deliveries addressed to a lane that left.
+
+    A retired lane will read nothing and acknowledge nothing, so each of its
+    deliveries still unread, or still owing an acknowledgement, is marked
+    superseded with the reason. Only that lane's own receipt is marked: a
+    peer the same message was also addressed to keeps its delivery exactly
+    as it was, and nothing is read, acknowledged or deleted.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity of the lane that left.
+        reason: Why the deliveries stopped being actionable.
+
+    Returns:
+        The number of deliveries marked superseded by this call.
+    """
+    if not (home / DATABASE).exists():
+        return 0
+    with connect(home, write=True) as db:
+        cursor = db.execute(
             "UPDATE message_recipients SET superseded_ts=CURRENT_TIMESTAMP,"
-            "superseded_reason=? WHERE superseded_ts IS NULL AND EXISTS ("
-            "SELECT 1 FROM messages m JOIN projects p ON p.id=m.project_id "
-            "WHERE m.id=message_recipients.message_id AND p.human_key=? "
-            "AND m.claim_id=? AND (message_recipients.read_ts IS NULL OR "
-            "(m.ack_required=1 AND message_recipients.ack_ts IS NULL)))",
-            (reason[:MAX_SUPERSEDE_REASON], root, claim),
+            "superseded_reason=? WHERE superseded_ts IS NULL AND agent_id IN ("
+            "SELECT a.id FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE p.human_key=? AND a.name=?) AND (read_ts IS NULL OR ("
+            "ack_ts IS NULL AND EXISTS (SELECT 1 FROM messages m WHERE "
+            "m.id=message_recipients.message_id AND m.ack_required=1)))",
+            (reason[:MAX_SUPERSEDE_REASON], root, name),
         )
         return cursor.rowcount
 
@@ -2929,7 +3548,7 @@ def _effect(
         BridgeError: If the tool is unknown or its preconditions fail.
     """
     if tool == "send_message":
-        return _send(db, actor, args, claim, directory)
+        return _send(db, actor, args, claim, directory, route=True)
     if tool == "review_report":
         if directory is None:
             raise BridgeError(NO_PROJECT)
@@ -3352,7 +3971,7 @@ def _unanswered(home: Path, root: str, deadline: str) -> list[dict]:
             "JOIN agents s ON s.id=m.sender_id "
             "JOIN projects p ON p.id=m.project_id "
             "WHERE p.human_key=? AND m.ack_required=1 AND r.ack_ts IS NULL "
-            f"AND {deadline} ORDER BY m.id,a.name",
+            f"AND r.superseded_ts IS NULL AND {deadline} ORDER BY m.id,a.name",
             (root,),
         ).fetchall()
     breaches: dict[int, dict] = {}
@@ -3411,6 +4030,51 @@ def pending_acknowledgements(home: Path, root: str) -> list[dict]:
         root,
         "(m.ack_deadline_ts IS NULL OR m.ack_deadline_ts>datetime('now'))",
     )
+
+
+def superseded_shares(home: Path, root: str, window: int) -> list[dict]:
+    """Groups the superseded acknowledgement requests by the recorded reason.
+
+    Only requests still unanswered and still inside their deadline count,
+    so a group ends when the requests behind it would have stopped being
+    answerable anyway. A request recorded without a deadline counts for
+    ``window`` seconds after it was superseded instead.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        window: Seconds a superseded request without a deadline counts.
+
+    Returns:
+        One entry per supersession reason naming the reason, how many
+        deliveries it covers and how long the oldest request has waited,
+        oldest reason first. A project with no store yet has nothing to
+        report.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home) as db:
+        rows = db.execute(
+            "SELECT r.superseded_reason AS reason,COUNT(*) AS count,"
+            "CAST(MAX(julianday('now')-julianday(m.created_ts))*86400 "
+            "AS INTEGER) AS waiting FROM messages m "
+            "JOIN message_recipients r ON r.message_id=m.id "
+            "JOIN projects p ON p.id=m.project_id "
+            "WHERE p.human_key=? AND m.ack_required=1 AND r.ack_ts IS NULL "
+            "AND r.superseded_ts IS NOT NULL AND ("
+            "m.ack_deadline_ts>datetime('now') OR (m.ack_deadline_ts IS NULL "
+            "AND r.superseded_ts>datetime('now',?))) "
+            "GROUP BY r.superseded_reason ORDER BY waiting DESC",
+            (root, f"-{int(window)} seconds"),
+        ).fetchall()
+    return [
+        {
+            "reason": row["reason"] or "",
+            "count": row["count"],
+            "waiting_seconds": max(0, int(row["waiting"] or 0)),
+        }
+        for row in rows
+    ]
 
 
 def retire_acknowledgement(home: Path, root: str, identifier: int) -> bool:
@@ -3609,6 +4273,9 @@ def schedule(home: Path, root: str, item: dict) -> dict:
     recipient = str(item.get("recipient", ""))
     body = str(item.get("body_md", ""))
     repeats = int(item.get("repeats_left", 1))
+    within = item.get("ack_within")
+    if within is not None:
+        within = _whole(within, "ack_within", 1, 86400 * 30)
     if kind not in ("message", "offer"):
         raise BridgeError("A scheduled item is a message or an offer.")
     if not recipient:
@@ -3638,7 +4305,7 @@ def schedule(home: Path, root: str, item: dict) -> dict:
                 str(item.get("issue", "")),
                 str(item.get("dedup_key", "")),
                 int(bool(item.get("ack_required"))),
-                item.get("ack_within"),
+                within,
                 item.get("not_before"),
                 str(item.get("condition", "")),
                 int(bool(item.get("unless_reported"))),
@@ -3753,6 +4420,11 @@ def deliver_schedule(home: Path, root: str, identifier: int, name: str) -> dict:
     a bounded repeat commit together in one write transaction, so an
     interrupted poll either delivers the occurrence once or leaves it waiting.
 
+    A send the store refuses, such as one to a retired lane that holds no
+    credential or one whose key already names a different message, would be
+    refused the same way on every later poll. The item is cancelled instead,
+    with the refusal recorded as its reason, rather than retried forever.
+
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
@@ -3760,12 +4432,13 @@ def deliver_schedule(home: Path, root: str, identifier: int, name: str) -> dict:
         name: Registered identity of the addressed participant.
 
     Returns:
-        Whether the item was delivered and the message identifier it produced.
+        Whether the item was delivered and the message identifier it produced,
+        with the recorded reason under ``cancelled`` when the send was refused.
         A participant that has not registered with the store yet leaves the
         item waiting rather than losing it.
 
     Raises:
-        BridgeError: If the project is not registered or the send is invalid.
+        BridgeError: If the project is not registered.
     """
     if not (home / DATABASE).exists():
         raise BridgeError(NO_PROJECT)
@@ -3793,18 +4466,35 @@ def deliver_schedule(home: Path, root: str, identifier: int, name: str) -> dict:
         key = row["dedup_key"]
         if row["sequence"]:
             key = f"{key}-{row['sequence']}"
-        sent = _send(
-            db,
-            dict(actor),
-            {
-                "to": [name],
-                "subject": row["subject"],
-                "body_md": row["body_md"],
-                "idempotency_key": key,
-                "ack_required": bool(row["ack_required"]),
-                "ack_within": row["ack_within"],
-            },
-        )
+        db.execute("SAVEPOINT delivery")
+        try:
+            sent = _send(
+                db,
+                dict(actor),
+                {
+                    "to": [name],
+                    "subject": row["subject"],
+                    "body_md": row["body_md"],
+                    "idempotency_key": key,
+                    "ack_required": bool(row["ack_required"]),
+                    "ack_within": row["ack_within"],
+                },
+            )
+        except BridgeError as exc:
+            db.execute("ROLLBACK TO delivery")
+            db.execute("RELEASE delivery")
+            db.execute(
+                "UPDATE scheduled_deliveries SET cancelled_ts=?,"
+                "cancelled_reason=? WHERE id=?",
+                (time.time(), str(exc)[:MAX_SUPERSEDE_REASON], identifier),
+            )
+            return {
+                "id": identifier,
+                "delivered": False,
+                "message_id": None,
+                "cancelled": str(exc),
+            }
+        db.execute("RELEASE delivery")
         _advance_schedule(db, row, time.time())
         return {
             "id": identifier,
@@ -3933,6 +4623,115 @@ def _waiting_on(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
     return waiting
 
 
+def _record_refusals(
+    db: sqlite3.Connection, actor: dict, conflicts: list[dict]
+) -> None:
+    """Records which holder refused this lane which key.
+
+    A refused lane that did not queue leaves nothing behind in the queue, so
+    an idle holder blocking it was visible only to the lane that asked. One
+    row per refused lane, holder and key is kept at its latest refusal, and
+    rows older than `REFUSAL_SECONDS` are retired on every write.
+
+    Args:
+        db: Open transaction that also carries the refused call.
+        actor: Authenticated project and the lane that was refused.
+        conflicts: Conflicts the refused batch reported.
+    """
+    now = time.time()
+    db.executemany(
+        "INSERT INTO reservation_refusals(project_id,agent_id,holder,"
+        "path_pattern,refused_ts) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(project_id,agent_id,holder,path_pattern) "
+        "DO UPDATE SET refused_ts=excluded.refused_ts",
+        [
+            (
+                actor["project_id"],
+                actor["id"],
+                conflict["owner"],
+                conflict["path"],
+                now,
+            )
+            for conflict in conflicts
+        ],
+    )
+    db.execute(
+        "DELETE FROM reservation_refusals WHERE project_id=? AND refused_ts<?",
+        (actor["project_id"], now - REFUSAL_SECONDS),
+    )
+
+
+def record_refusal(
+    home: Path, root: str, name: str, holder: str, path: str
+) -> None:
+    """Records a hook refusal of a write into a peer's reservation.
+
+    The lifecycle hook refuses a write that overlaps a peer's exclusive
+    reservation without any reservation call reaching the store, so without
+    this row the holder's status and the problems view never learn that it
+    blocks a lane.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose write was refused.
+        holder: Identity that holds the overlapping reservation.
+        path: Lane-relative path the refused write named.
+
+    Raises:
+        BridgeError: If the refused identity is unregistered.
+        sqlite3.Error: If the store cannot be written.
+    """
+    with connect(home, write=True) as db:
+        _record_refusals(
+            db,
+            _identify(db, root, name),
+            [{"owner": holder, "path": path}],
+        )
+
+
+def _refused_by(db: sqlite3.Connection, root: str) -> dict[str, list[str]]:
+    """Maps each holding lane to the lanes it refused and still blocks.
+
+    A refusal is reported under its holder only while that holder keeps a
+    live lease overlapping the refused key, so a holder that released,
+    expired into reclamation or was reclaimed drops out without a separate
+    cleanup.
+
+    Args:
+        db: Open read transaction to answer from.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        Mapping of holding identity to the sorted identities it refused.
+    """
+    refusals = db.execute(
+        "SELECT r.holder AS holder,r.path_pattern AS pattern,"
+        "a.name AS name FROM reservation_refusals r "
+        "JOIN agents a ON a.id=r.agent_id "
+        "JOIN projects p ON p.id=r.project_id WHERE p.human_key=?",
+        (root,),
+    ).fetchall()
+    if not refusals:
+        return {}
+    leases = db.execute(
+        "SELECT a.name AS name,f.path_pattern AS pattern "
+        "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
+        "JOIN projects p ON p.id=f.project_id WHERE p.human_key=? "
+        "AND f.released_ts IS NULL",
+        (root,),
+    ).fetchall()
+    refused: dict[str, set[str]] = {}
+    for refusal in refusals:
+        if any(
+            lease["name"] == refusal["holder"]
+            and overlapping(refusal["pattern"], lease["pattern"])
+            for lease in leases
+        ):
+            refused.setdefault(refusal["holder"], set()).add(refusal["name"])
+    return {holder: sorted(names) for holder, names in refused.items()}
+
+
 def usage(
     home: Path, root: str, *, db: sqlite3.Connection | None = None
 ) -> dict[str, dict]:
@@ -3948,7 +4747,8 @@ def usage(
         returned bytes, held leases, how many of those leases are past a
         declared time to live, the age of its oldest held lease, how long
         the oldest expired one has been expired, and the queued reservation
-        requests waiting on the keys it holds with the lanes that asked. An
+        requests waiting on the keys it holds with the lanes that asked,
+        and the lanes it refused a key it still holds as ``refused``. An
         expired lease is counted apart from the live ones and keeps blocking
         until it is renewed, released or reclaimed; a queued request holds
         nothing of its own. Counts cover retained events only; older events
@@ -3975,11 +4775,14 @@ def usage(
                 "stale_lease_age": 0,
                 "queued": 0,
                 "queued_by": [],
+                "refused": [],
             }
         for holder, waiting in _waiting_on(db, root).items():
             report.setdefault(holder, {}).update(
                 queued=len(waiting), queued_by=sorted(set(waiting))
             )
+        for holder, refused in _refused_by(db, root).items():
+            report.setdefault(holder, {}).update(refused=refused)
         for row in db.execute(
             "SELECT a.name AS name,count(*) AS leases,"
             "coalesce(sum(f.expires_ts IS NOT NULL "

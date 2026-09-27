@@ -58,6 +58,7 @@ def test_every_claim_generation_carries_its_own_identifier(
 
 def test_history_of_an_issue_lists_its_transitions(bridge, repo, paired):
     claude = paired["lanes"]["claude"]
+    bridge.issue(paired["lanes"]["codex"], "claim", "17")
     bridge.issue(claude, "claim", "42")
     bridge.issue(claude, "block", "42", on="17")
     bridge.issue(claude, "release", "42")

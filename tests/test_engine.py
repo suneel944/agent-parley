@@ -185,10 +185,12 @@ def test_ownership_listing_reports_liveness_and_keeps_the_owner():
         "revision": 1,
         "issues": {"7": {"owner": "claude-1", "offer": None, "history": []}},
     }
-    assert describe(state) == "#7: claude-1"
-    assert describe(state, {"codex-1": "working"}) == "#7: claude-1"
+    assert describe(state) == "#7: claude-1; no deadline"
+    assert (
+        describe(state, {"codex-1": "working"}) == "#7: claude-1; no deadline"
+    )
     assert describe(state, {"claude-1": "stopped; event 900s ago"}) == (
-        "#7: claude-1 (stopped; event 900s ago)"
+        "#7: claude-1 (stopped; event 900s ago); no deadline"
     )
 
 
@@ -206,7 +208,8 @@ def test_ownership_listing_names_the_holder_of_each_blocking_issue():
         },
     }
     assert describe(state) == (
-        "#4: codex-1\n#7: claude-1; waits on #4 (codex-1), #9 (unclaimed)"
+        "#4: codex-1; no deadline\n"
+        "#7: claude-1; no deadline; waits on #4 (codex-1), #9 (unclaimed)"
     )
 
 

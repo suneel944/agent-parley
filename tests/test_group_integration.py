@@ -1,10 +1,12 @@
 """Checks ordered integration of ready lanes and of one plan group."""
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from agent_parley import plan
+from agent_parley import cli, plan
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
@@ -82,7 +84,10 @@ def test_ready_lanes_integrate_in_dependency_order(bridge, repo, waiting):
 
 
 def test_a_dependency_cycle_is_refused_and_named(bridge, repo, waiting):
-    bridge.issue(Path(waiting["lanes"]["claude"]), "block", "42", on="43")
+    path = bridge.project(repo)[1] / "issues.json"
+    ledger = json.loads(path.read_text())
+    ledger["issues"]["42"]["blocked_by"] = ["43"]
+    path.write_text(json.dumps(ledger))
 
     with pytest.raises(BridgeError, match="form a cycle") as refusal:
         bridge.integrate(repo)
@@ -129,6 +134,35 @@ def test_a_group_integrates_its_members_in_dependency_order(
     assert "Integrated 2 of 2 lanes: claude, codex." in report
     assert (repo / "first.txt").exists()
     assert (repo / "second.txt").exists()
+
+
+def test_a_group_merge_refuses_a_lane_selector(
+    bridge, repo, waiting, monkeypatch, capsys
+):
+    bridge.work_plan(repo, "apply", written(repo.parent))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "participant",
+            "merge",
+            "--repo",
+            str(repo),
+            "--group",
+            "rewrite",
+            "--provider",
+            "claude",
+            "--yes",
+        ],
+    )
+
+    assert cli.main() == 1
+    assert "takes no lane selector" in capsys.readouterr().err
+    assert not (repo / "first.txt").exists()
+    assert not (repo / "second.txt").exists()
 
 
 def test_a_group_preview_merges_nothing(bridge, repo, waiting):

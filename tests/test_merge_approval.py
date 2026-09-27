@@ -80,6 +80,34 @@ def test_a_lane_cannot_record_the_approval_of_its_own_work(
         bridge.merge(repo, "codex")
 
 
+def test_a_lane_naming_the_base_checkout_cannot_approve_itself(
+    bridge, repo, paired, awaiting, monkeypatch
+):
+    nested = awaiting["lane"] / "nested"
+    nested.mkdir()
+    monkeypatch.chdir(nested)
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.approve(repo, "codex")
+    with pytest.raises(BridgeError, match="approve codex"):
+        bridge.merge(repo, "codex")
+
+
+def test_a_lane_naming_the_base_checkout_cannot_approve_recovery(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.chdir(paired["lanes"]["codex"])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.authorize_recovery(repo, "42", "usage limit")
+
+
+def test_a_lane_naming_the_base_checkout_cannot_unblock_as_operator(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.chdir(paired["lanes"]["codex"])
+    with pytest.raises(BridgeError, match="assigned agent worktree"):
+        bridge.issue(repo, "unblock", "42", on="17")
+
+
 def test_an_approval_of_another_lane_or_branch_merges_nothing(
     bridge, repo, paired, awaiting
 ):

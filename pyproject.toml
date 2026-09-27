@@ -41,6 +41,9 @@ dependencies = []
 agent-parley = "agent_parley.entry:main"
 
 [project.urls]
+Homepage = "https://suneel944.github.io/agent-parley/"
+Documentation = "https://github.com/suneel944/agent-parley/tree/main/docs"
+Changelog = "https://github.com/suneel944/agent-parley/blob/main/CHANGELOG.md"
 Repository = "https://github.com/suneel944/agent-parley"
 Issues = "https://github.com/suneel944/agent-parley/issues"
 

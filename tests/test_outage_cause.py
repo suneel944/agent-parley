@@ -179,15 +179,77 @@ def test_an_edit_chained_onto_a_bridge_command_is_still_denied(
     assert details(output)["permissionDecision"] == "deny"
 
 
-def test_a_store_behind_the_code_prescribes_its_migration(
+def recipient_columns(home):
+    with store.connect(home) as db:
+        return {
+            row[1]
+            for row in db.execute("PRAGMA table_info(message_recipients)")
+        }
+
+
+def unmigrated(home, version):
+    store.initialize(home)
+    with store.connect(home, write=True) as db:
+        db.execute("ALTER TABLE message_recipients DROP COLUMN superseded_ts")
+        db.execute(f"PRAGMA user_version={version}")
+
+
+def test_a_store_behind_the_code_is_migrated_in_place(
     bridge, repo, paired, monkeypatch
 ):
-    with store.connect(bridge.home, write=True) as db:
-        db.execute(f"PRAGMA user_version={store.SCHEMA_VERSION - 1}")
+    behind = store.SCHEMA_VERSION - 1
+    unmigrated(bridge.home, behind)
     output, _ = during_outage(
         bridge, paired, monkeypatch, {"tool_name": "Edit"}
     )
-    assert protocol.MIGRATE in details(output)["permissionDecisionReason"]
+    reason = details(output)["permissionDecisionReason"]
+    assert f"Store schema {behind} was behind" in reason
+    assert f"needs schema {store.SCHEMA_VERSION}" in reason
+    assert "retry the call" in reason
+    assert store.schema_version(bridge.home) == store.SCHEMA_VERSION
+    assert "superseded_ts" in recipient_columns(bridge.home)
+
+
+def test_a_failed_in_place_migration_names_both_schemas_and_the_repair(
+    bridge, repo, paired, monkeypatch
+):
+    behind = store.SCHEMA_VERSION - 1
+    unmigrated(bridge.home, behind)
+
+    def locked(home):
+        raise store.BridgeError("store.lock is held")
+
+    monkeypatch.setattr(store, "initialize", locked)
+    output, _ = during_outage(
+        bridge, paired, monkeypatch, {"tool_name": "Edit"}
+    )
+    reason = details(output)["permissionDecisionReason"]
+    assert f"Store schema {behind} is behind" in reason
+    assert "store.lock is held" in reason
+    assert protocol.MIGRATE in reason
+
+
+def test_a_current_store_missing_a_column_is_repaired(bridge):
+    unmigrated(bridge.home, store.SCHEMA_VERSION)
+    note = store.reconcile(bridge.home, "no such column: r.superseded_ts")
+    assert "lacked a column" in note
+    assert "superseded_ts" in recipient_columns(bridge.home)
+
+
+def test_up_migrates_the_store_under_a_running_service(bridge, monkeypatch):
+    unmigrated(bridge.home, store.SCHEMA_VERSION - 1)
+    monkeypatch.setattr(type(bridge), "server_process", lambda self: True)
+    monkeypatch.setattr(type(bridge), "ready", lambda self: True)
+    bridge.up()
+    monkeypatch.undo()
+    assert store.schema_version(bridge.home) == store.SCHEMA_VERSION
+    assert "superseded_ts" in recipient_columns(bridge.home)
+
+
+def test_initialize_restores_a_column_a_current_stamp_lacks(bridge):
+    unmigrated(bridge.home, store.SCHEMA_VERSION)
+    store.initialize(bridge.home)
+    assert "superseded_ts" in recipient_columns(bridge.home)
 
 
 def test_an_ordinary_outage_prescribes_the_status_check(

@@ -106,6 +106,20 @@ def session(
     return liveness
 
 
+def idle_age(stalled: dict) -> float:
+    """Reads the idle age a stalled lane's session cell reports.
+
+    Args:
+        stalled: Stall report from `supervision.stall`.
+
+    Returns:
+        Seconds the lane has shown no sign of work, or the waiting item's age
+        when the lane has recorded no evidence of work at all.
+    """
+    silent = stalled.get("silent_seconds")
+    return stalled["age_seconds"] if silent is None else silent
+
+
 def widths(columns: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[int]:
     """Measures each column against its heading and its widest value."""
     return [
@@ -210,7 +224,7 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
             record["session"],
             record["paused"],
             record["idle"]["stalled"],
-            record["idle"]["age_seconds"],
+            idle_age(record["idle"]),
             record.get("retired_age_seconds"),
         ),
         record["branch"] + ("!" if record["drift"] else ""),

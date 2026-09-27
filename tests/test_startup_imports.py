@@ -137,6 +137,48 @@ def test_the_version_path_reads_only_the_recorded_marker():
     assert json.loads(probe.stdout) == []
 
 
+WINDOWS_PROBE = """
+import json
+import sys
+import types
+
+for name in ("fcntl", "pty", "termios", "tty"):
+    sys.modules[name] = None
+sys.platform = "win32"
+
+from agent_parley import entry
+
+sys.argv = ["agent-parley", "status"]
+status = entry.main()
+json.dump(
+    [
+        status,
+        sorted(
+            name
+            for name in {deferred!r}
+            if type(sys.modules.get(name)) is types.ModuleType
+        ),
+    ],
+    sys.stdout,
+)
+"""
+
+
+def test_native_windows_is_refused_with_a_wsl_pointer_before_the_surface():
+    probe = subprocess.run(
+        [sys.executable, "-c", WINDOWS_PROBE.format(deferred=SURFACE_ONLY)],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert json.loads(probe.stdout) == [2, []]
+    assert "native Windows is not supported" in probe.stderr
+    assert "WSL2" in probe.stderr
+    assert "operations.md#platforms" in probe.stderr
+    assert "Traceback" not in probe.stderr
+
+
 def test_running_the_cli_module_does_not_trigger_a_runpy_warning():
     environment = {**os.environ, "PYTHONWARNINGS": "error"}
     result = subprocess.run(

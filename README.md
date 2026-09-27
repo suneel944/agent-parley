@@ -15,7 +15,7 @@
   <a href="https://github.com/suneel944/agent-parley/releases"><img src="https://img.shields.io/github/v/release/suneel944/agent-parley?style=flat&color=blue" alt="Release"></a>
   <a href="#install"><img src="https://img.shields.io/badge/runtime_dependencies-0-brightgreen?style=flat" alt="Zero runtime dependencies"></a>
   <a href="#install"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=flat" alt="Python 3.12+"></a>
-  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/providers.md"><img src="https://img.shields.io/badge/native_CLIs-claude_%2B_codex-orange?style=flat" alt="claude and codex"></a>
+  <a href="https://github.com/suneel944/agent-parley/blob/main/docs/providers.md"><img src="https://img.shields.io/badge/native_CLIs-6-orange?style=flat" alt="six native CLIs"></a>
   <a href="https://github.com/suneel944/agent-parley/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat" alt="MIT license"></a>
 </p>
 
@@ -59,11 +59,16 @@ model call, `q` quits.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-top.svg" width="900" alt="agent-parley top showing three lanes with issues, mail, leases, denials and served calls">
 </p>
 
-A lane reads `active` while it is serving coordination calls, `idle` once a
-live lane passes the inactivity threshold, and `stopped` only when its
-recorded session process is gone. A quiet lane is not a lost one. Every frame
-on this page is real command output from a demo project; only the state and
-project paths are shortened.
+A lane reads `active` while its session process is alive and its latest native
+activity is current, `idle` once that activity passes the inactivity
+threshold, and `stopped` only when its recorded session process is gone. A
+quiet lane is not a lost one. Each reading comes from one recorded lane state,
+`starting`, `working`, `idle`, `blocked`, `stopped`, `dead` or `reclaimed`,
+and every wake, orphan, reclaim and park decision reads that same record. The
+view draws live lanes only: a stopped lane that holds nothing, and a project
+whose root is gone, are counted in the header, and `top --all` draws them.
+Every frame on this page is real command output from a demo project; only the
+state and project paths are shortened.
 
 [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md)
 covers the whole view: the columns, the keys,
@@ -142,7 +147,10 @@ That is the whole setup. The first run registers the repository, creates that
 participant's worktree and branch, starts the coordination service, and hands
 you the native CLI. Prompt it exactly as you always do. A new name creates its
 own lane, so a second account of the same provider, or another provider, is one
-more terminal.
+more terminal. Each tab's title names its lane, its state and its claim
+progress, such as `[codex] idle with claim #412 - 2/5 done`, so the tab strip
+tells the lanes apart; the supervision key `titles` turns this off.
+`agent-parley title` prints the same line for a Claude Code status line.
 
 Then watch the work, and steer a lane without taking over its terminal:
 
@@ -162,6 +170,12 @@ query. Every one of them accepts `--json`. The mail readers take `--as NAME`,
 so the message `problems` cites opens from the main checkout: it reads that
 lane's mail and sends, acknowledges and marks nothing on its behalf.
 
+Unread mail never blocks a lane's work: it arrives as context, most relevant
+first. A tool call is refused only when it is unsafe now, such as a write to a
+path a peer reserved. Project news goes to a feed, a broadcast reaches only the
+lanes it concerns, and a newer note on a topic replaces the older one. Mail a
+lane sent under a claim stops being owed once that claim closes or moves.
+
 When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
 
@@ -178,7 +192,11 @@ demand:
 ```sh
 agent-parley gc           # what would be reclaimed, and what is kept and why
 agent-parley gc --apply   # reclaim the lanes whose work has landed
+agent-parley gc --apply --force  # also dirty lane-made worktrees, checkpointed
 ```
+
+`agent-parley reclaim` is the same command, and `--dry-run` spells out the
+default report.
 
 A lane is reclaimed only when it is idle, holds no claim, has nothing
 uncommitted, carries no commit the base checkout or its own upstream lacks,
@@ -186,12 +204,35 @@ and the forge shows its pull request merged or its branch already gone. Every
 other lane is kept and reported with the condition that held it, including a
 pull request that was closed without merging.
 
+The same sweep retires a lane that stopped, never moved its branch, holds no
+claim, lease or offer and stayed untouched past `inactive_after`. It also
+removes clean worktrees a lane made for itself, wherever they are, once their
+head is on the base, their lane retired, or they went untouched past
+`inactive_after` with every commit on their upstream. A worktree no lane made
+is never touched. Uncommitted files and unpushed commits are only reported,
+with the worktree's size, unless `--force` removes them after writing a
+recovery checkpoint. `status` shows each project's state directory size and
+how many worktrees a reclaim would remove.
+
 A repository can also authorize the second of those for the lane itself, with
 `pull_request.self_service` in its private project settings. It is off by
 default; with it on, a lane opens the pull request for its own work only after
 a ready report, a configured gate that passes, its own assigned branch and no
 peer reservation over the paths it changed, and every such pull request records
 what authorized it. Merging stays an operator step either way.
+
+A lane that crashed, hung or lost its host comes back with one command:
+
+```sh
+agent-parley participant restart claude-2
+```
+
+A restart is refused while the lane's session is alive and current. A session
+still alive but silent past `inactive_after` is ended first. Every claim the
+lane owns is captured into a recovery checkpoint, uncommitted work stays where
+it is, and the new session starts in the same worktree and is told where the
+checkpoint is. After a host restart no lane is resumed on its own: each reads
+`stopped` and restarts the same way.
 
 [Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md)
 covers the rest of the operator surface:
@@ -201,17 +242,28 @@ and the setup command every new lane runs.
 
 ## What it enforces
 
-- **Ownership changes only through explicit claims and accepted handoffs.** No
-  timeout and no process exit moves an issue, and a recorded dependency informs
-  rather than gates.
+- **Ownership changes through explicit claims, accepted handoffs and one
+  recorded recovery path.** A process exit alone moves no issue, and a
+  recorded dependency informs rather than gates. A lane holds at most
+  `max_claims_per_lane` claims, two by default; a claim, an acceptance or a
+  takeover request past it is refused.
 - **Choosing work is a reading, not a guess.** `agent-parley issue next` ranks
   the unclaimed, unblocked issues a lane could take, with the reason for each
   place, and claims nothing.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
-  updates only when coordination state actually changes.
-- **A deadline reports; it never transfers.** A budget informs; it does not
-  gate. Both mark the lane and stop nothing.
+  updates only when coordination state actually changes. A prompt you type is
+  never refused: a paused lane, branch drift or a session that left its
+  worktree reaches the agent as context on the prompt, and only a tool call is
+  refused, naming the lane path to return to.
+- **A deadline reports until the holder stops working.** An overdue claim
+  whose holder has run no tool past the inactivity window, or a claim with no
+  progress of its own for `claim_idle_after` while its holder works elsewhere,
+  gets one wake, then an offer to the fittest peer with its recovery
+  checkpoint, then release to the pool. A claim whose pull request already
+  ended is observed complete and never moved: its holder is reminded to send
+  the completion, and `agent-parley issue resolve` ends it with the forge
+  evidence. A budget informs; it does not gate.
 - **Reservations are advisory.** Conflicts name the blocking owner and that
   owner's declared reason; nothing on disk is locked.
 - **Mail stays private; a decision does not.** Only a message a lane marks as a
@@ -240,8 +292,8 @@ flowchart TD
     Repo[Your repository] --> Launcher[Agent Parley launcher]
     Launcher --> Claude[Participant · own worktree]
     Launcher --> Codex[Participant · own worktree]
-    Claude <-->|Ten scoped MCP tools| Server[Local coordination service]
-    Codex <-->|Ten scoped MCP tools| Server
+    Claude <-->|Sixteen scoped MCP tools| Server[Local coordination service]
+    Codex <-->|Sixteen scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]
     Claude --> Claims[Atomic issue claims and handoffs]
     Codex --> Claims
@@ -340,13 +392,19 @@ inbound status queries are off.
 ## What it does not do
 
 Worktrees and reservations are coordination boundaries, not OS sandboxes. Agent
-Parley integrates a lane only when you run `participant merge`, and it never
-approves a command. The runtime can wake an idle lane to review pending mail,
-with global and per-lane opt-outs and a bounded number of attempts per backlog.
-Reported `ready` is ready for review, not verified completion. Token usage still
-depends on the native agents: `CONTEXT` reports the bytes coordination itself
-injects and `TOKENS` repeats what a lane's own client counted, and neither is
-billed spend or a claim about a token-saving percentage.
+Parley integrates a lane only when you run `participant merge`, and it approves
+no command on an agent's behalf, with one opt-in exception: with
+`approve_bridge_tools` on, a launched `claude` lane is allowed this bridge's
+own MCP tools and its own coordination CLI, so a resumed lane does not park on
+a prompt nobody is there to answer. With `auto_mode` on, a launched `claude`
+lane starts in the client's own auto permission mode, whose classifier still
+decides each command. The runtime can wake an idle lane to review
+pending mail, with global and per-lane opt-outs and a bounded number of
+attempts per backlog. Reported `ready` is ready for review, not verified
+completion. Token usage still depends on the native agents: `CONTEXT` reports
+the bytes coordination itself injects and `TOKENS` repeats what a lane's own
+client counted, and neither is billed spend or a claim about a token-saving
+percentage.
 
 ## How it compares
 
@@ -358,7 +416,7 @@ taken from the project's own documentation, linked so you can check it.
 | --- | --- | --- |
 | [Claude Squad](https://github.com/smtg-ai/claude-squad) | A terminal manager for background sessions, each in its own worktree, over Claude Code, Codex, Aider and Amp. Isolation is the conflict answer: separate workspaces, "so no conflicts". | The same isolation, plus state the worktrees share: an atomic issue claim, an advisory reservation that names the blocking owner and reason, and a handoff that only moves ownership when a peer accepts it. |
 | [Crystal](https://github.com/stravu/crystal) | Parallel Claude Code and Codex sessions with diffs and test output in one window. The repository now points to its successor, Nimbalyst, and its README describes editor streaming and worktree isolation. | A record rather than a view: who holds which issue, which paths are reserved, what evidence a lane attached to a `ready` report, and whether a peer reviewed that report. |
-| [Conductor](https://conductor.build) | A polished macOS app for running Claude Code in parallel worktrees. Closed source, macOS only. | A standard-library service with no runtime dependencies that runs wherever Python 3.12 does, drives Claude, Codex, Gemini, Amp, OpenCode and Copilot through their own CLIs, and keeps its coordination state outside your repository. |
+| [Conductor](https://conductor.build) | A polished macOS app for running Claude Code in parallel worktrees. Closed source, macOS only. | A standard-library service with no runtime dependencies that runs on Linux, macOS and WSL2, drives Claude, Codex, Gemini, Amp, OpenCode and Copilot through their own CLIs, and keeps its coordination state outside your repository. |
 | [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) | A task board in front of coding agents. Its vendor announced a shutdown in April 2026 and the project continues community-maintained and fully local. | Coordination in the agents' own path rather than a board in front of it: native hooks refuse a branch switch inside an assigned lane and catch drift after a bypass, which no board can see. |
 
 Two things none of them document, and the reasons they matter here:
@@ -391,7 +449,11 @@ remembered.
 ## Contributing
 
 Run `make check` before opening a PR. It checks formatting, lint, typing,
-documentation rules, package builds, and behavior tests.
+documentation rules, package builds, and behavior tests. A minor or major
+release also needs the fault-injection acceptance suite,
+`tests/test_fault_acceptance.py`, to pass on the release commit, and a live
+acceptance record, `docs/acceptance/<version>.json`, with the numbers an
+unattended run measured; a patch release needs neither.
 
 [Contributing](https://github.com/suneel944/agent-parley/blob/main/CONTRIBUTING.md) ·
 [Architecture](https://github.com/suneel944/agent-parley/blob/main/docs/architecture.md) ·

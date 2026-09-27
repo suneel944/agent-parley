@@ -1204,3 +1204,119 @@ def test_bump_refuses_a_marker_it_cannot_raise(versioned_repo):
     (versioned_repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
     with pytest.raises(ValueError, match="no project version"):
         release.bump(versioned_repo, TAG, VERSION, "0.2.0")
+
+
+def live_record(root, released, **changes):
+    """Writes a live acceptance record with every measured number."""
+    record = {
+        "version": released,
+        "run": "https://github.com/suneel944/agent-parley/issues/366",
+        "lanes": 4,
+        "claims": 6,
+        "claims_completed": 6,
+        "idle_lane_minutes": 12.5,
+        "unaccountable_claim_minutes": 0,
+        **changes,
+    }
+    path = root / release.ACCEPTANCE_RECORDS / f"{released}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record))
+    return path
+
+
+def test_a_patch_release_needs_no_acceptance_evidence(tmp_path):
+    def never(root):
+        pytest.fail("A patch release must not run the acceptance suite")
+
+    assert release.acceptance_errors(tmp_path, "0.12.0", "0.12.1", never) == []
+
+
+@pytest.mark.parametrize("version", ["0.13.0", "1.0.0"])
+def test_a_minor_or_major_release_without_evidence_names_both(
+    tmp_path, version
+):
+    errors = release.acceptance_errors(
+        tmp_path, "0.12.0", version, lambda root: "1 failed, 5 passed"
+    )
+    assert len(errors) == 2
+    assert release.ACCEPTANCE_SUITE in errors[0]
+    assert "1 failed, 5 passed" in errors[0]
+    assert (
+        f"no live acceptance record docs/acceptance/{version}.json"
+        in (errors[1])
+    )
+
+
+def test_a_passing_suite_and_a_live_record_admit_a_minor_release(tmp_path):
+    live_record(tmp_path, "0.13.0")
+    assert (
+        release.acceptance_errors(tmp_path, "0.12.0", "0.13.0", lambda r: "")
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "named"),
+    [
+        ({"version": "0.12.0"}, "names another version"),
+        ({"run": ""}, "names no run"),
+        ({"idle_lane_minutes": None}, "lacks measured idle_lane_minutes"),
+        ({"unaccountable_claim_minutes": True}, "unaccountable_claim_minutes"),
+        ({"claims_completed": 5}, "completed 5 of 6 claims"),
+        ({"claims": 0, "claims_completed": 0}, "completed 0 of 0 claims"),
+    ],
+)
+def test_an_incomplete_live_record_is_named(tmp_path, changes, named):
+    live_record(tmp_path, "0.13.0", **changes)
+    errors = release.acceptance_errors(
+        tmp_path, "0.12.0", "0.13.0", lambda r: ""
+    )
+    assert len(errors) == 1
+    assert named in errors[0]
+
+
+def test_the_evidence_phase_refuses_a_minor_release_by_name(
+    counted_repo, local
+):
+    local.chdir(counted_repo)
+    local.setenv("RELEASE_VERSION", "0.2.0")
+    local.setattr(sys, "argv", ["release_publish", "evidence"])
+    local.setattr(release, "run_acceptance_suite", lambda root: "")
+    with pytest.raises(ValueError) as refused:
+        release.main()
+    message = str(refused.value)
+    assert "Release 0.2.0 refused; missing acceptance evidence" in message
+    assert "no live acceptance record docs/acceptance/0.2.0.json" in message
+    live_record(counted_repo, "0.2.0")
+    release.main()
+
+
+def test_the_acceptance_suite_passes_on_this_commit():
+    root = Path(__file__).resolve().parents[1]
+    assert release.run_acceptance_suite(root) == ""
+
+
+def test_the_version_workflow_gates_the_release_on_evidence():
+    root = Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load(
+        (root / ".github/workflows/release-version.yml").read_text()
+    )
+    steps = workflow["jobs"]["version"]["steps"]
+    names = [step.get("name", step.get("uses", "")) for step in steps]
+    gate = names.index(
+        "Require acceptance evidence for a minor or major release"
+    )
+    assert gate < names.index(
+        "Raise every version marker and record the changelog"
+    )
+    assert gate < next(
+        index for index, name in enumerate(names) if "github-app-token" in name
+    )
+    step = steps[gate]
+    assert step["run"] == (
+        "uv run --locked python -m scripts.release_publish evidence"
+    )
+    assert step["env"]["RELEASE_VERSION"] == (
+        "${{ steps.candidate.outputs.version }}"
+    )
+    assert (root / release.ACCEPTANCE_SUITE).exists()

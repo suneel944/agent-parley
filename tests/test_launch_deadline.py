@@ -120,6 +120,7 @@ def test_a_hook_event_after_the_deadline_clears_the_not_started_mark(
     state = published(directory, "claude")
     assert state["activity"] == "idle"
     assert "not_started" not in state
+    supervision.poll(bridge.home, directory)
     result = supervision.fit(
         bridge.home,
         directory,
@@ -164,8 +165,11 @@ def test_a_wake_spends_no_attempt_on_a_lane_that_never_started(
     )
     config = {**supervision.DEFAULTS, "inactive_after": 1}
     path = directory / "codex-wake.json"
-    write_json(
-        path,
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        paired["root"],
+        "codex",
         {
             "at": 0,
             "backlog": ["1"],
@@ -174,6 +178,7 @@ def test_a_wake_spends_no_attempt_on_a_lane_that_never_started(
         },
     )
     supervision.launches(directory, paired, config)
+    supervision.settle_evidence(bridge.home, directory, paired)
     observed = supervision.presence(directory, "codex", 1)
 
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
@@ -181,7 +186,9 @@ def test_a_wake_spends_no_attempt_on_a_lane_that_never_started(
     parked = json.loads(path.read_text())
     assert not calls
     assert parked["attempts"] == 1
-    assert parked["blocked"] == "it never started within 30s of its launch"
+    assert parked["blocked"] == "blocked: dialog"
+    record = supervision.condition(bridge.home, paired["root"], "codex")
+    assert "never started within 30s" in record["evidence"]
 
 
 def test_the_start_deadline_is_configurable_and_bounded(bridge, paired):
