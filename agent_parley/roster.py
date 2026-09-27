@@ -63,6 +63,9 @@ LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
 MAX_VERIFY_ARGUMENTS = 64
 MAX_STANDING_REPLY = 500
+MAX_UNATTENDED_ISSUES = 100
+TARGET_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+ISSUE_NUMBER = re.compile(r"[1-9][0-9]{0,9}")
 MANIFEST_VERSION = 2
 APPROVAL_STEPS = ("merge", "pr")
 PROVIDERS = "providers.json"
@@ -1031,6 +1034,7 @@ def normalize(manifest: dict) -> dict:
         "forge": forge_choice(manifest.get("forge")),
         "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
+        "integration": manifest.get("integration", {}),
         "supervision": project,
         "participants": participants,
     }
@@ -1212,6 +1216,74 @@ def pull_request_policy(value: dict) -> dict:
     if not isinstance(template, str) or len(template.encode()) > 20000:
         raise BridgeError("body_template must contain at most 20000 bytes.")
     return dict(value)
+
+
+def integration_policy(value: object) -> dict:
+    """Validates the project's unattended integration policy.
+
+    The manifest carries the value verbatim, so a hand-edited mistake never
+    stops the commands that do not depend on it. Every reader of the policy
+    calls this function instead, and an invalid value refuses unattended
+    integration explicitly rather than reading as an authorization.
+
+    The only setting is ``unattended``: the ``target`` branch the base
+    checkout must have checked out, and the bounded list of ``issues`` whose
+    ready work may be integrated there without an operator at the keyboard.
+    An empty mapping is the shipped default and authorizes nothing.
+
+    Args:
+        value: The ``integration`` object from the private project manifest.
+
+    Returns:
+        ``{}`` when no policy is recorded, otherwise the validated policy
+        with issue numbers as decimal strings in ascending order.
+
+    Raises:
+        BridgeError: If a setting is unknown, missing or has an invalid value.
+    """
+    invalid = "Invalid integration policy in project manifest: "
+    if not isinstance(value, dict) or set(value) - {"unattended"}:
+        raise BridgeError(invalid + "only `unattended` may be set.")
+    if "unattended" not in value:
+        return {}
+    unattended = value["unattended"]
+    if not isinstance(unattended, dict) or set(unattended) != {
+        "target",
+        "issues",
+    }:
+        raise BridgeError(
+            invalid + "`unattended` must name exactly `target` and `issues`."
+        )
+    target = unattended["target"]
+    if (
+        not isinstance(target, str)
+        or not TARGET_BRANCH.fullmatch(target)
+        or ".." in target
+        or "//" in target
+        or target.endswith(("/", ".", ".lock"))
+    ):
+        raise BridgeError(invalid + "`target` must be one Git branch name.")
+    numbers = unattended["issues"]
+    if (
+        not isinstance(numbers, list)
+        or not 0 < len(numbers) <= MAX_UNATTENDED_ISSUES
+        or any(
+            not isinstance(number, str) or not ISSUE_NUMBER.fullmatch(number)
+            for number in numbers
+        )
+        or len(set(numbers)) != len(numbers)
+    ):
+        raise BridgeError(
+            invalid
+            + "`issues` must list between 1 and "
+            + f"{MAX_UNATTENDED_ISSUES} distinct issue numbers."
+        )
+    return {
+        "unattended": {
+            "target": target,
+            "issues": sorted(numbers, key=int),
+        }
+    }
 
 
 def expand(manifest: dict) -> dict:

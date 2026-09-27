@@ -295,12 +295,33 @@ closed claim or a newer message, no longer counts against the lane.
 ## The work order is a file you can review
 
 Write the issues, the dependencies between them and the groups that may run in
-parallel as TOML, then `agent-parley plan apply work-order.toml`. Applying
+parallel as TOML, then run `agent-parley plan apply work-order.toml` from the
+project base checkout; a lane cannot apply a plan. Applying
 records the same advisory dependencies `issue block` records and nothing else —
 no claim, no assignment, no gate. `plan diff` previews the edges first,
 `plan show` prints the plan as a tree with each issue's current owner, and every
 apply is versioned by the file's digest, so an edge added by hand afterwards is
 reported as exactly that.
+
+A lane that discovers a missing prerequisite or an obsolete edge files a
+revision from its worktree: `agent-parley plan propose --base N --add 43:42
+--reason TEXT --evidence TEXT`, with `N` read from `plan proposals`. It applies
+unattended only inside the envelope the plan's `[revisions]` table declares:
+
+```toml
+[revisions]
+scope = ["17", "42", "43", "44"]
+max_changes = 2
+max_revisions = 5
+```
+
+Anything outside it, including a prerequisite no plan has authorized yet or an
+edge on another lane's claim, waits for `agent-parley plan approve ID` or
+`plan reject ID --reason TEXT` and changes nothing meanwhile. A revision only
+moves edges; it never claims, completes or verifies work, and an edge revised
+back and forth is escalated to the operator rather than flipped again.
+`agent-parley problems` shows each escalated proposal with the approve and
+reject commands that settle it, and one row for the proposals still pending.
 
 ## A peer can record a verdict, and it is still a claim
 

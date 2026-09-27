@@ -185,6 +185,7 @@ class ReportsMixin(BridgeCore):
                 "state": outcome,
                 "issue": claim["issue"],
                 "claim_id": claim["claim_id"],
+                "commit": commit,
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,

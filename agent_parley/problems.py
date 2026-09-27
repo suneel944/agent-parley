@@ -30,6 +30,7 @@ from agent_parley import (
     dialogs,
     issues,
     merges,
+    plan,
     recovery,
     roster,
     store,
@@ -47,6 +48,7 @@ OVERDUE = "overdue claim"
 OVER_CAP = "claims over cap"
 OFFER = "unanswered offer"
 UNRESOLVED = "unresolved completion"
+DIVERGING = "not converging"
 ACK = "awaiting acknowledgement"
 BOUNCE = "bounced share"
 RETIRED = "shares to a retired lane"
@@ -63,6 +65,8 @@ FOREIGN = "second session"
 REFUSED = "recovery refused"
 INTEGRATION = "integration unverified"
 ROOT = "root missing"
+ESCALATED = "escalated plan revision"
+PROPOSED = "plan revisions pending"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -441,6 +445,43 @@ def _unresolved_rows(
     ]
 
 
+def _diverging_rows(
+    record: dict, name: str, repo: str, root: str
+) -> list[dict]:
+    """Reports each claim whose convergence account escalated.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+
+    Returns:
+        One row per claim whose repeated verified failures outlasted the
+        request to change approach. The holder keeps the claim; any handoff
+        or reassignment is the operator's or the holder's explicit act.
+    """
+    rows = []
+    for claim in record["claims"]:
+        shown = claim.get("convergence") or {}
+        if shown.get("stage") != "escalated":
+            continue
+        rows.append(
+            _row(
+                DIVERGING,
+                f"issue #{claim['issue']}: {shown['failures']} failing "
+                f"verification results, signature {shown['signature']} "
+                f"x{shown['repeats']}, no verified improvement for "
+                f"{shown['since_milestone_seconds']}s",
+                f"agent-parley issue show {claim['issue']} {repo}",
+                int(shown["since_milestone_seconds"]),
+                name,
+                root,
+            )
+        )
+    return rows
+
+
 def _ack_rows(
     record: dict,
     name: str,
@@ -665,6 +706,7 @@ def _lane_rows(
         _retire_rows(record, name, repo, root, config["orphan_retire_after"])
     )
     rows.extend(_unresolved_rows(record, name, repo, root, now))
+    rows.extend(_diverging_rows(record, name, repo, root))
     rows.extend(_ack_rows(record, name, repo, root, ack_after, waking))
     refused = (record.get("mail") or {}).get("refused") or []
     if quiet and refused:
@@ -1014,6 +1056,60 @@ def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
     ]
 
 
+def _plan_rows(directory: Path, root: str, now: float) -> list[dict]:
+    """Reports the plan revisions that wait on the operator.
+
+    A lane's revision that repeats a contradiction is escalated rather than
+    applied, and one outside the envelope is kept pending; neither changes
+    the ledger, so nothing else would bring it to the operator. Each
+    escalated proposal is its own row on the proposing lane, carrying the
+    commands that settle it, and the pending proposals share one row that
+    names the listing. Both are bounded by the proposals the plan retains.
+
+    Args:
+        directory: Private project state directory.
+        root: Canonical project key.
+        now: Unix time the proposal ages are measured against.
+
+    Returns:
+        One row per escalated proposal and at most one for the pending ones.
+    """
+    try:
+        filed = plan.recorded(directory).get("proposals", {})
+    except (OSError, ValueError):
+        return []
+    retained = list(filed.values())[-plan.MAX_PROPOSALS :]
+    where = f"--repo {root}"
+    rows = [
+        _row(
+            ESCALATED,
+            f"plan proposal {item['id']} is escalated: "
+            + "; ".join(item.get("held", [])),
+            f"agent-parley plan approve {item['id']} {where} or "
+            f"agent-parley plan reject {item['id']} --reason TEXT {where}",
+            _age(item.get("at"), now),
+            str(item.get("by") or ""),
+            root,
+        )
+        for item in retained
+        if item.get("status") == plan.ESCALATED
+    ]
+    pending = [item for item in retained if item.get("status") == plan.PENDING]
+    if pending:
+        rows.append(
+            _row(
+                PROPOSED,
+                f"{len(pending)} plan proposals outside the revision "
+                "envelope await the operator",
+                f"agent-parley plan proposals {where}",
+                max(_age(item.get("at"), now) for item in pending),
+                project=root,
+                count=len(pending),
+            )
+        )
+    return rows
+
+
 def derive(
     home: Path, report: dict, ack_after: float = 0.0, now: float = 0.0
 ) -> list[dict]:
@@ -1082,6 +1178,7 @@ def derive(
         aged.extend(_refused_rows(directory, project["root"], stamp))
         aged.extend(_integration_rows(directory, project["root"], stamp))
         aged.extend(_root_rows(directory, project["root"], stamp))
+        aged.extend(_plan_rows(directory, project["root"], stamp))
     aged.sort(key=lambda row: -(row["seconds"] or 0))
     return rows + aged
 

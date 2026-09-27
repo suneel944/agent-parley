@@ -2,8 +2,9 @@
 
 Agent Parley runs on one Linux or macOS host under one OS user. It coordinates participating
 agents; it does not execute model requests, enforce filesystem permissions or
-replace native approvals. It integrates a lane's branch only when an operator
-runs `participant merge`, and never on an agent's behalf.
+replace native approvals. It integrates a lane's branch when an operator runs
+`participant merge`, or through `unattended run` for issues the operator
+listed in an explicit project policy, and never on an agent's own authority.
 
 ## Responsibilities
 
@@ -14,6 +15,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `core` | Base of the `Bridge` command object: the private state root and its configuration, the mail server's start, stop and readiness, the project manifest and the participant lanes it records |
 | `settings` | The per-project settings commands: verification and initialization commands, approval policy, branch naming, issue tracker, declared resources and lane budgets |
 | `integration` | The merge, preview and ordered integration commands, and the operator's approve and reject decisions that gate them |
+| `unattended` | The operator-recorded unattended integration policy, its eligibility checks, and the durable decision and refusal records of each attempt |
 | `claims` | The issue commands: claims, handoffs, recovery, assignment, resolution, the next-issue ranking and the recorded work plan |
 | `mail` | Operator mail: steering a lane, acknowledgements, the mailbox, and recorded decisions |
 | `reports` | Ready reports, their review, the event export, the state archive and ownership history |
@@ -33,6 +35,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `recovery` | Capture and restore of an abandoned claim's work as recovery checkpoints, operator-authorized takeover, and the persisted capacity recovery candidates |
 | `lanes` | The one authoritative state record of each lane in the store (`starting`, `working`, `idle`, `blocked` with its cause, `stopped`, `dead`, `reclaimed`), its closed transition table, and the event every accepted or refused transition appends; the per-lane files are evidence it reads, never a second answer. Hooks (`checkpoints.record`) and the dialog watcher submit evidence to a per-project spool (`lane-evidence.jsonl`) instead of waiting on the store; each poll applies it in arrival order before its liveness sample, and keeps it for the next poll when the store is busy. A session change is a transition that records both session ids. Each poll also charges the time since the last one to idle lane-minutes and unaccountable claim-minutes by state and cause, which `status` reports. A host restart moves every recorded session's row to `stopped` with the restart named as its evidence, which `rebooted` reads to refuse a resume until a new session clears it. The wake budget (attempts, backlog, next attempt, exhaustion, escalation) lives in the same store, seeded once from a lane's published `-wake.json` on upgrade |
 | `supervision` | The service's periodic poll: presence sampling, handoff reminders, bounded wakes and their backoff, capacity and work fitness, orphan marking, expired-lease reclaim, recorded operator deliveries, the reclaim sweep and a project whose root checkout is gone |
+| `convergence` | Issue-level convergence accounting per claim generation, kept apart from wake and liveness accounting: verification outcomes and hashed failure signatures from report logs, the last verified milestone, and the bounded change-approach and operator-escalation responses the poll sends |
 | `roster` | Providers, credential profiles and project participants |
 | `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `reclaim` | The assessment of which lane worktrees and branches, and which worktrees lanes made themselves, a project may remove, each with the one condition that decided it, and Git's refusing removal of the lane-made worktrees |
@@ -59,7 +62,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn |
-| `plan` | Versioned work-order plans read from TOML and recorded as dependencies |
+| `plan` | Versioned work-order plans read from TOML and recorded as dependencies, and the proposals that revise their edges within the operator's envelope |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
 | `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
@@ -805,6 +808,64 @@ changed. The conditions travel with the evidence record and the integration
 record, so a self-opened pull request states what authorized it. `participant
 merge` takes no such policy and stays an operator command.
 
+Unattended integration is a separate, opt-in authorization. The manifest key
+`integration.unattended` names a `target` branch and a bounded list of
+`issues` (at most 100), and `agent-parley unattended set` is the only command
+that writes it. That command replaces the whole policy and removes it when
+given no issues. It and `unattended run` refuse lane shells: a process inside
+an assigned worktree, or one whose environment holds a lane's
+`AGENT_PARLEY_TOKEN`, even after it changes directory to the base checkout.
+Like `approve`, this is a command-line boundary, not an operating-system one;
+where a lane must be unable to act as the operator, run lanes under a separate
+OS account from the operator. No served coordination tool reads or writes the
+policy, so a lane cannot grant itself the authority or widen its scope through
+coordination. A manifest without the
+key, which is every existing project, keeps integration operator-only. The
+manifest carries the value verbatim and every reader validates it strictly: an
+unknown key, a missing field, a malformed branch or issue number, or a
+repeated issue refuses unattended integration and is never read as consent,
+while the rest of the project keeps working.
+
+`agent-parley unattended run NAME` is the entry point. It runs from the base
+checkout only, holds the project merge lock for the whole attempt, so a second
+attempt or an operator merge is refused as busy, and evaluates eligibility
+under that lock immediately before merging: the lane's claimed issue is listed,
+its claim generation is the ledger's current one, it is reported ready at a
+source commit the lane still sits on, the base checkout has the target branch
+checked out, every dependency is verified complete, a verification command is
+configured, and no peer's advisory reservation covers a path the work changed.
+An eligible lane is then merged by the same step `participant merge` uses, so
+the session lock, any required operator approval, the pre- and post-merge
+gates and the source-commit binding all still apply; the policy never merges
+on easier terms. Completion, and with it dependent reconciliation, is recorded
+by that step only after the verified integration.
+
+Every attempt appends a decision record of kind `unattended` to the lane's
+report log with bounded evidence: the policy, issue, claim generation, source
+commit, target branch and commit, verification command, changed path count,
+integrated commit, outcome and a reason capped at 2000 characters. A refusal
+names the unmet condition and the command that resolves it, and nothing is
+merged. A merge or gate failure after eligibility leaves the merge step's
+durable integration recovery record, which moves the claim to repair, and
+`unattended.failed` records the decision as `failed` beside it. While the base
+carries an unverified integration that still holds, every attempt is refused:
+unattended integration never repairs, and repair stays with the owning lane or
+the operator. Each attempt reads its inputs afresh, so a new
+commit, a moved target or a new claim generation is judged on its own. The
+merge step is bound to the evaluated claim generation and source commit: it
+rereads the claim under the session lock and merges nothing if either changed
+or the claim is gone. An input that cannot be read, such as a missing ledger
+entry or a failed git query, is recorded as a refusal, never skipped. A replay
+counts as already integrated only when an earlier `integrated` record matches
+the same issue, claim generation and source commit exactly and the ledger
+records that generation complete; any other attempt, including one after the
+policy is removed, is evaluated and refused on its own terms. Integration stays
+local and makes no forge calls: forge checks and reviews are enforced when the
+operator pushes the target branch, not at the local merge, and every decision
+records `forge: "deferred to push"` in its evidence to say so. Native
+authentication likewise applies unchanged at push. Automatic dispatch from the
+supervision service is intentionally not wired.
+
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
 reservations continue to resolve.
@@ -913,6 +974,62 @@ instant it is recorded. Applying adds edges and never removes one, so an edge re
 after the apply is reported as entered by hand and a narrowed plan shows its
 dropped edges as unlisted until `issue unblock` removes them. Groups are advice
 a later offer or integration path may read; this layer only records them.
+
+Changing a plan's edges after it is applied is a separate revision operation,
+because deleting an edge is its own authority and consistency decision and
+reapplying a narrower file never removes one. A proposal names the plan version
+it was written against (the `revision` counter in `plan.json`, raised by every
+apply and every accepted revision), the edges to add or remove, a reason of up
+to 2000 characters and at most five evidence items of 500 characters. Its
+identifier is the digest of the base version, the proposer and the changes, so
+a repeated proposal returns the recorded one. A proposal against any other
+version is refused as stale, and every open proposal is recorded as stale the
+moment an apply or an accepted revision moves the plan past its base, so a
+proposal that can no longer apply never holds one of the places for proposals
+awaiting the operator; it must be proposed again. An apply holds the plan lock
+across its ledger write, taken before the ledger lock as a revision takes them,
+so no proposal can name a version the ledger has already moved past.
+
+The optional `[revisions]` table of the plan file is the operator's envelope:
+because it bounds what lanes may revise alone, only the operator applies a plan
+file, from the project base checkout outside every lane; any checkout may show
+or compare one.
+`scope` lists the issues whose edges lanes may revise unattended, `max_changes`
+bounds the edges one automatic revision changes (default 1, at most 10) and
+`max_revisions` bounds the automatic revisions under one applied plan (default
+1, at most 100). A plan without the table has no envelope. A lane's proposal is
+applied at once only when both ends of every edge are in scope, every issue an
+added edge names is already authorized, no waiting issue is held by another
+lane, no removed edge waits on work reported ready but not yet verified, and
+both limits hold. Anything else is kept as `pending` with every reason and the
+`plan approve ID` command; it writes nothing to the ledger, so unrelated work
+stays eligible. The operator's own proposal and an operator approval apply
+directly and authorize the prerequisite an added edge names, which is the only
+way a new prerequisite becomes claimable through a revision; a removed edge
+authorizes nothing.
+
+Every application validates the whole resulting graph, recorded edges
+included, and refuses a removed edge that is not recorded, an added edge that
+already is or waits on complete work, a waiting list past ten issues, and any
+cycle. The ledger is written once, under its lock, together with the
+proposal's identifier, and the plan history then records a new version
+attributed to the proposer with the edges it added and removed; a proposal
+whose ledger write landed before a restart is recorded as accepted on replay
+or approval rather than applied twice, even when another revision was accepted
+in between. An approval that finds the ledger lock busy leaves the proposal
+open for a retry instead of rejecting it. A revision changes only `blocked_by`: it never
+claims, releases, completes or verifies work and never changes an owner or a
+claim generation. Each accepted revision counts against the edges it touched;
+a lane's proposal touching an edge already revised twice under the current plan
+version is `escalated` to the operator instead of applied, at most twenty
+proposals may await the operator, and `problems` lists each escalated proposal
+as its own row with the `plan approve ID` and `plan reject ID` commands plus
+one row counting the pending ones that names `plan proposals`. The fifty most
+recent proposals are retained with their proposer, evidence, decision and
+note. Applying a plan file
+starts a new plan version and resets the automatic count and the contradiction
+record. Existing `plan.json` files need no migration: the proposal table and
+counters are added the first time they are used.
 
 A writing call can commit and still fail to answer, so the caller retries what
 already happened. An idempotency key makes the two calls one. The first call

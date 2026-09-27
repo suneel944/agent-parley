@@ -312,6 +312,8 @@ class IntegrationMixin(MailMixin):
         data: dict,
         name: str,
         renew: bool = False,
+        *,
+        expected: tuple[str, str] | None = None,
     ) -> str:
         """Runs the gate and merges one lane while its session is excluded.
 
@@ -332,13 +334,17 @@ class IntegrationMixin(MailMixin):
             data: Project manifest holding the roster and the gate command.
             name: Participant whose bridge branch is merged.
             renew: Whether the operator grants a fresh set of attempts.
+            expected: Claim generation and ready source commit an earlier
+                authorization was bound to, rechecked under the session
+                lock; None when the caller bound none.
 
         Returns:
             An account of what was merged.
 
         Raises:
             BridgeError: If the project requires an operator approval the
-                lane's current ready report does not have, if the gate fails,
+                lane's current ready report does not have, if the claim or
+                source commit differs from ``expected``, if the gate fails,
                 if the base carries an unverified integration this attempt may
                 not continue, or if the merge cannot complete unattended.
         """
@@ -381,6 +387,14 @@ class IntegrationMixin(MailMixin):
                     )
                 source_commit = (
                     execution.get("source_commit") or execution["commit"]
+                )
+            if expected is not None and (
+                claim["claim_id"],
+                source_commit,
+            ) != tuple(expected):
+                raise BridgeError(
+                    f"{name}'s claim or ready commit changed after the "
+                    "integration was authorized; nothing was merged."
                 )
             if data["verify"] and held is None:
                 base_commit = git(root, "rev-parse", "HEAD")

@@ -46,7 +46,7 @@ on standard output and export to a file.
 | `say NAME TEXT` | Send as `operator`; `--ack` requests acknowledgement and `--key` controls deduplication. |
 | `say NAME TEXT --after 30m` | Record the message for later; `--at 18:00`, `--when-released N` and `--unless-reported` set the trigger, and `--every 1h --until 18:00` records a bounded repeat. |
 | `issue list` | Show claims, dependencies and handoff offers; each offer carries the offering lane's head commit, the reservations that move with it and its remaining work. |
-| `issue show NUMBER` | Show one issue: its owner, deadline, attempts, blockers, pending offer, the reservations its owner holds and its recorded history. |
+| `issue show NUMBER` | Show one issue: its owner, deadline, attempts, blockers, pending offer, the reservations its owner holds, its convergence account for the current claim and its recorded history. |
 | `issue next` | Rank the unclaimed, unblocked issues this lane could take next, each with the reason for its place: the plan group already under way, the issues it unblocks, the peer reservations and forecast collisions its likely paths run into, and the provider it declares. It claims nothing; `--limit` bounds the list. |
 | `issue match GOAL` | List the open issues whose recorded title or forge labels share subject words with a stated goal, marking the ones a peer already owns and naming the peer reservations those words run into. It is read only: a match is a reason to read the issue and claim or negotiate for it rather than open a second number for the same work, and no match is a recorded reason to open one. |
 | `issue claim NUMBER` | Claim an available issue from this lane. |
@@ -63,8 +63,11 @@ on standard output and export to a file.
 | `issue resolve NUMBER` | End a claim whose holder never filed the completion its pull request already landed, as `operator` and never as the lane. The forge is read at that moment: the issue must have closed inside the current claim, with its closing pull request recorded whichever branch it came from, or, when the forge cannot say, the lane branch pull request must have been opened inside it, and the supervisor must already have escalated the claim as an unresolved completion, so an answering holder is never resolved out from under it. `--reason` is kept beside the recorded evidence, and `--release` returns the work to the queue instead, which a pull request closed without merging requires. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
-| `plan apply PATH` | Record a TOML work order as advisory dependencies; `plan diff PATH` previews it. |
+| `plan apply PATH` | Record a TOML work order as advisory dependencies, from the project base checkout only; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
+| `plan propose --base N --add I:B --remove I:B --reason TEXT` | File a revision of the applied plan's edges against plan version `N`: `--add` records a discovered prerequisite, `--remove` drops an obsolete edge, each repeatable, with up to five `--evidence TEXT`. A lane's revision applies at once only inside the plan's `[revisions]` envelope; otherwise it is kept, changing nothing, with the `plan approve` command that applies it. |
+| `plan proposals` | Print the current plan version, the envelope, the automatic revisions used and every retained proposal with its status. |
+| `plan approve ID` | As `operator`, validate the whole resulting graph and apply one open revision, authorizing any prerequisite it adds; a revision whose base version is no longer current is recorded as stale. `plan reject ID --reason TEXT` refuses it. |
 | `gc` (alias `reclaim`) | Report the lanes and lane-made worktrees a reclaim would remove and keep, with each worktree's size; `--dry-run` is that default, `--apply` removes them, and `--apply --force` also removes lane-made worktrees kept for uncommitted changes, unpushed commits or a recent change after writing a recovery checkpoint of each; a lane's own worktree is never forced. |
 | `notify test` | Send one test message on each configured transport. |
 | `doctor` | Report launcher, plugin, store and running-service versions and their fit; non-zero exit on a mismatch. |
@@ -109,6 +112,9 @@ on standard output and export to a file.
 | `budget set` | Set `--tokens`, `--calls` and `--hours` project defaults; a budget informs and does not gate. |
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
+| `unattended show` | Show the unattended integration policy, or that integration is operator-only. |
+| `unattended set ISSUE ... --target BRANCH` | Authorize unattended integration of those issues into `BRANCH`; no issues removes the policy. Base checkout only. |
+| `unattended run NAME` | Integrate one eligible lane under the policy on `participant merge` terms, recording the decision or the refusal. Base checkout only. |
 | `init show` | Show the command every new lane runs before it starts. |
 | `init set COMMAND` | Set that command; an empty string removes it. |
 | `mail show ID` | Print one message this lane sent or received; `--full` adds the whole attachment. |
@@ -140,12 +146,14 @@ without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 `participant show`, `mail show`, `mail thread`, `mail search`, `mail list`,
 `mail pending`, `decision list`, `report show`, `history issue`,
 `history participant`, `history claim`, `plan diff`, `plan show`,
+`plan proposals`,
 `approval show`, `verify show`, `init show`, `branch show`, `forge show`,
 `deadlines show`, `budget show`, `resources show`, `state show`,
 `provider list`, `provider show`, `credentials list` and `credentials show`.
 The commands that change something print their outcome the same way with
 `--json`: `up`, `down`, `setup`, `run`, `say`, `decide`, `mail send`,
 `mail cancel`, `approve`, `reject`, `report review`, `problems ack`,
+`plan propose`, `plan approve`, `plan reject`,
 `notify test` and `gc`. `top --json` prints one frame and exits;
 `metrics --json` prints the same values as its Prometheus text.
 The document carries the identifiers the table abbreviates — offer, message and

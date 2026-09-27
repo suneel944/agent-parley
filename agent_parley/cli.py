@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         budgets,
         checkpoints,
         completion,
+        convergence,
         evidence,
         forge,
         history,
@@ -131,6 +132,7 @@ DEFERRED_MODULES = (
     "budgets",
     "checkpoints",
     "completion",
+    "convergence",
     "copilot",
     "delivery",
     "dialogs",
@@ -2932,6 +2934,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         (
             "approval",
             "verify",
+            "unattended",
             "init",
             "branch",
             "forge",
@@ -3348,6 +3351,8 @@ def issue_lines(reading: dict) -> str:
         "Reservations held: "
         + (", ".join(reading["reservations"]) or "none recorded")
     )
+    if reading.get("convergence"):
+        lines.append(convergence.describe(reading["convergence"]))
     reported = reading["history"]
     lines.append(history.describe(reported["records"], reported["holdings"]))
     return "\n".join(lines)
@@ -4170,6 +4175,35 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             )
         if action != "apply":
             command.add_argument("--json", action="store_true", help=JSON_HELP)
+    revising = {
+        "propose": "File a revision that adds or removes plan edges.",
+        "approve": "Approve and apply one open revision as operator.",
+        "reject": "Reject one open revision as operator.",
+        "proposals": "List the plan version, envelope and revisions.",
+    }
+    for action, summary in revising.items():
+        command = steps.add_parser(action, help=summary)
+        command.add_argument("--repo", type=Path, default=Path.cwd())
+        command.add_argument("--json", action="store_true", help=JSON_HELP)
+        if action in ("approve", "reject"):
+            command.add_argument("proposal_id")
+            command.add_argument("--reason", default="")
+        elif action == "propose":
+            command.add_argument(
+                "--base",
+                type=int,
+                required=True,
+                help="Plan version read from `plan proposals`.",
+            )
+            for edge in ("add", "remove"):
+                command.add_argument(
+                    f"--{edge}",
+                    action="append",
+                    default=[],
+                    metavar="ISSUE:BLOCKER",
+                )
+            command.add_argument("--reason", required=True)
+            command.add_argument("--evidence", action="append", default=[])
     mail = commands.add_parser(
         "mail",
         help=(
@@ -4446,6 +4480,33 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     setting.add_argument("--repo", type=Path, default=Path.cwd())
+    standing = commands.add_parser(
+        "unattended",
+        help="Show, set or run the project's unattended integration policy.",
+    )
+    standings = standing.add_subparsers(dest="action", required=True)
+    standing_show = standings.add_parser("show")
+    standing_show.add_argument("--repo", type=Path, default=Path.cwd())
+    standing_set = standings.add_parser("set")
+    standing_set.add_argument(
+        "issues",
+        nargs="*",
+        metavar="ISSUE",
+        help=(
+            "Issues whose ready work may be integrated without an operator; "
+            "pass none to remove the policy and stay operator-only."
+        ),
+    )
+    standing_set.add_argument(
+        "--target",
+        help="Branch the base checkout must have checked out.",
+    )
+    standing_set.add_argument("--repo", type=Path, default=Path.cwd())
+    standing_run = standings.add_parser("run")
+    standing_run.add_argument(
+        "name", help="Participant whose ready work is integrated."
+    )
+    standing_run.add_argument("--repo", type=Path, default=Path.cwd())
     preparation = commands.add_parser(
         "init",
         help="Show or set the command every new lane runs before it starts.",
@@ -5014,12 +5075,15 @@ def main() -> int:
             print(
                 views.render(
                     "issue",
-                    views.issue_detail(
-                        detail["ledger"],
-                        int(detail["issue"]),
-                        detail["reservations"],
-                        detail["history"],
-                    ),
+                    {
+                        **views.issue_detail(
+                            detail["ledger"],
+                            int(detail["issue"]),
+                            detail["reservations"],
+                            detail["history"],
+                        ),
+                        "convergence": detail["convergence"],
+                    },
                 )
                 if args.json
                 else issue_lines(detail)
@@ -5145,6 +5209,34 @@ def main() -> int:
                 else notification_report(probed)
             )
             return 0 if all(item["ok"] for item in probed["results"]) else 1
+        elif args.command == "plan" and args.action in (
+            "propose",
+            "approve",
+            "reject",
+            "proposals",
+        ):
+            revised = bridge.plan_revision(
+                args.repo.resolve(),
+                args.action,
+                getattr(args, "proposal_id", ""),
+                base=getattr(args, "base", 0),
+                add=getattr(args, "add", None),
+                remove=getattr(args, "remove", None),
+                reason=getattr(args, "reason", ""),
+                evidence=getattr(args, "evidence", None),
+            )
+            listing = args.action == "proposals"
+            print(
+                views.render(
+                    "plan_proposals" if listing else "plan_revision", revised
+                )
+                if args.json
+                else plan.render_revisions(revised)
+                if listing
+                else plan.render_proposal(revised)
+            )
+            if args.action == "approve" and revised["status"] != "accepted":
+                return 1
         elif args.command == "plan":
             applied = bridge.work_plan(
                 args.repo.resolve(), args.action, getattr(args, "path", None)
@@ -5437,6 +5529,20 @@ def main() -> int:
                         args.steps if args.action == "set" else None,
                     )
                 )
+        elif args.command == "unattended":
+            from agent_parley import unattended
+
+            repository = args.repo.resolve()
+            if args.action == "set":
+                print(
+                    unattended.configure(
+                        bridge, repository, args.target, args.issues
+                    )
+                )
+            elif args.action == "run":
+                print(unattended.integrate(bridge, repository, args.name))
+            else:
+                print(unattended.describe(bridge, repository))
         elif args.command in ("verify", "init"):
             repository = args.repo.resolve()
             if getattr(args, "json", False):

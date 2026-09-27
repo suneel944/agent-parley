@@ -1130,3 +1130,49 @@ def test_top_shows_the_problem_rows_in_place_on_p(monkeypatch, tmp_path):
     assert overlay[0] == "agent-parley problems"
     assert listed[0] in overlay
     assert any("P" in key for key, _ in dashboard.KEYS)
+
+
+def test_plan_revisions_waiting_on_the_operator_are_rows(
+    bridge, repo, paired, served
+):
+    path = repo.parent / "plan.toml"
+    path.write_text(
+        '[dependencies]\n"42" = ["17"]\n"43" = ["17"]\n"44" = ["42"]\n\n'
+        '[revisions]\nscope = ["17", "42", "43", "44", "60"]\n'
+        "max_changes = 2\nmax_revisions = 5\n"
+    )
+    bridge.work_plan(repo, "apply", path)
+    lane = paired["lanes"]["claude"]
+    assert not rows(bridge, problems.ESCALATED)
+    assert not rows(bridge, problems.PROPOSED)
+    base = bridge.plan_revision(repo, "proposals")["revision"]
+    for offset, change in enumerate(
+        ({"add": ["43:42"]}, {"remove": ["43:42"]}, {"add": ["43:42"]})
+    ):
+        looped = bridge.plan_revision(
+            lane, "propose", base=base + offset, reason="loop", **change
+        )
+    assert looped["status"] == "escalated"
+    waiting = bridge.plan_revision(
+        lane, "propose", base=base + 2, add=["42:60"], reason="new"
+    )
+    assert waiting["status"] == "pending"
+    root = paired["root"]
+    [escalated] = rows(bridge, problems.ESCALATED)
+    assert escalated["participant"] == "claude"
+    assert escalated["project"] == root
+    assert escalated["detail"] == (
+        f"plan proposal {looped['id']} is escalated: #43 waits on #42 "
+        "was already revised 2 times under this plan version"
+    )
+    assert escalated["command"] == (
+        f"agent-parley plan approve {looped['id']} --repo {root} or "
+        f"agent-parley plan reject {looped['id']} --reason TEXT --repo {root}"
+    )
+    [pending] = rows(bridge, problems.PROPOSED)
+    assert pending["count"] == 1
+    assert pending["command"] == f"agent-parley plan proposals --repo {root}"
+    bridge.plan_revision(repo, "reject", waiting["id"], reason="not needed")
+    bridge.plan_revision(repo, "approve", looped["id"])
+    assert not rows(bridge, problems.ESCALATED)
+    assert not rows(bridge, problems.PROPOSED)

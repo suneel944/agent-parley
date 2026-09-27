@@ -159,6 +159,8 @@ def _report_records(directory: Path, manifest: dict) -> list[dict]:
                 detail = f"reported {record.get('state', '')}"
             elif kind == "approval":
                 detail = _decided(record)
+            elif kind == "unattended":
+                detail = f"unattended integration {record.get('outcome', '')}"
             records.append(
                 {
                     "kind": "approval" if kind == "approval" else "report",

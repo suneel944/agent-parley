@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TypeGuard, cast
 
 from agent_parley import (
+    convergence,
     dialogs,
     forge,
     issues,
@@ -43,6 +44,8 @@ DEFAULTS = {
     "claim_idle_after": 3600,
     "takeover_grace": 300,
     "max_claims_per_lane": 2,
+    "convergence_repeats": 3,
+    "convergence_after": 14400,
     "prompts": True,
     "wake": True,
     "reclaim": True,
@@ -51,6 +54,7 @@ DEFAULTS = {
 
 MAX_COMPLETION_REMINDERS = 100
 MAX_CLAIMS_PER_LANE = 100
+MAX_CONVERGENCE_REPEATS = 100
 ENDED = issues.ENDED
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
@@ -137,6 +141,7 @@ def settings(value: dict) -> dict:
         "orphan_retire_after",
         "claim_idle_after",
         "takeover_grace",
+        "convergence_after",
     ):
         if (
             type(result[field]) not in (int, float)
@@ -148,6 +153,12 @@ def settings(value: dict) -> dict:
         raise BridgeError(
             "max_claims_per_lane must be between 1 and "
             f"{MAX_CLAIMS_PER_LANE} claims."
+        )
+    repeats = result["convergence_repeats"]
+    if type(repeats) is not int or not 1 <= repeats <= MAX_CONVERGENCE_REPEATS:
+        raise BridgeError(
+            "convergence_repeats must be between 1 and "
+            f"{MAX_CONVERGENCE_REPEATS} failures."
         )
     reminders_before = result["completion_reminders"]
     if (
@@ -4725,6 +4736,14 @@ def _poll(home: Path, directory: Path) -> None:
             config["takeover_grace"],
             manifest.get("deadlines") or {},
         )
+    stage(
+        "convergence",
+        convergence.supervise,
+        home,
+        directory,
+        manifest,
+        config,
+    )
     if config["wake"]:
         for name, participant in manifest["participants"].items():
             if participant.get("wake", True):

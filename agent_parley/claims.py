@@ -806,11 +806,14 @@ class ClaimsMixin(ReportsMixin):
         Returns:
             The project root, the issue number, the published ledger and the
             issue's record in it, the reservation keys its owner holds, and
-            the history reading for the same issue.
+            the history reading for the same issue, and the convergence
+            account of an owned issue's current claim generation, or None
+            for an unowned issue.
 
         Raises:
             BridgeError: If the number is unusable or the project has none.
         """
+        from agent_parley import convergence
         from agent_parley.cli import parse_issue, roster, snapshot, store
 
         root, directory = self.project(repo, create=False)
@@ -833,6 +836,11 @@ class ClaimsMixin(ReportsMixin):
             "owner": owner,
             "reservations": held.get(identity, []),
             "history": self.history(repo, "issue", identifier),
+            "convergence": (
+                convergence.reading(directory, identifier, record["claim_id"])
+                if owner and record.get("claim_id")
+                else None
+            ),
         }
 
     def work_plan(
@@ -842,10 +850,14 @@ class ClaimsMixin(ReportsMixin):
 
         A plan records advisory dependencies and nothing else. Applying one
         claims no issue, assigns no lane and gates no transition, so a plan
-        that turns out to be wrong never blocks anybody.
+        that turns out to be wrong never blocks anybody. Only the operator
+        applies, from the project base checkout outside every lane, because
+        the plan's `[revisions]` table bounds what lanes may revise alone;
+        any checkout may show or compare.
 
         Args:
-            repo: Any checkout of the target repository.
+            repo: Any checkout of the target repository; the base checkout
+                for apply.
             action: Apply, diff, or show.
             path: Plan file for apply and diff.
 
@@ -854,16 +866,99 @@ class ClaimsMixin(ReportsMixin):
             applied plan beside current ownership for show.
 
         Raises:
-            BridgeError: If the plan file is unusable or the ledger cannot be
-                locked.
+            BridgeError: If a lane rather than the operator applies, the plan
+                file is unusable, or the ledger cannot be locked.
         """
-        from agent_parley.cli import plan, reported_ready
+        from agent_parley.cli import git, plan, reported_ready, roster
 
         _, directory = self.project(repo)
         if action == "show":
             return plan.describe(directory, reported_ready(directory))
         if path is None:
             raise BridgeError("Name the plan file to apply or compare.")
-        if action == "apply":
-            return plan.apply(directory, path)
-        return plan.diff(directory, path)
+        if action != "apply":
+            return plan.diff(directory, path)
+        if (directory / "project.json").exists():
+            data = roster.read(directory)
+            checkout = Path(git(repo, "rev-parse", "--show-toplevel"))
+            if checkout.resolve() != Path(data["root"]).resolve() or (
+                roster.caller_lane(data)
+            ):
+                raise BridgeError(
+                    "Only the operator applies a plan, from the project base "
+                    "checkout, because a plan sets the revision envelope "
+                    "lanes are held to."
+                )
+        return plan.apply(directory, path)
+
+    def plan_revision(
+        self,
+        repo: Path,
+        action: str,
+        identity: str = "",
+        *,
+        base: int = 0,
+        add: list[str] | None = None,
+        remove: list[str] | None = None,
+        reason: str = "",
+        evidence: list[str] | None = None,
+    ) -> dict:
+        """Proposes, decides or lists revisions of the applied plan's edges.
+
+        A proposal run from an assigned worktree is that lane's; one run from
+        the project base checkout, outside every lane, is the operator's.
+        A lane running inside its own worktree cannot name a peer's worktree
+        as `--repo`, so it never proposes under the peer's name. Only the
+        operator approves or rejects, so a lane can never widen the
+        authority its own proposal needs.
+
+        Args:
+            repo: Assigned worktree, or the base checkout for the operator.
+            action: Propose, approve, reject, or proposals.
+            identity: Proposal identifier for approve and reject.
+            base: Plan version a proposal was written against.
+            add: `ISSUE:BLOCKER` edges a proposal records.
+            remove: `ISSUE:BLOCKER` edges a proposal drops.
+            reason: Proposal rationale, or the operator's decision note.
+            evidence: Bounded observations supporting a proposal.
+
+        Returns:
+            The proposal record, or the listing for proposals.
+
+        Raises:
+            BridgeError: If the caller lacks the authority the action needs
+                or the plan layer refuses the proposal.
+        """
+        from agent_parley.cli import git, plan, roster
+
+        _, directory = self.project(repo)
+        if action == "proposals":
+            return plan.revisions(directory)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        operator = lane == Path(data["root"]).resolve() and not (
+            roster.caller_lane(data)
+        )
+        if action == "propose":
+            by = roster.OPERATOR if operator else roster.resolve(data, lane)
+            caller = roster.caller_lane(data)
+            if not operator and caller not in (None, by):
+                raise BridgeError(
+                    f"{caller} cannot propose from {by}'s worktree; run the "
+                    "proposal from your own worktree."
+                )
+            return plan.propose(
+                directory,
+                by,
+                base,
+                add or [],
+                remove or [],
+                reason,
+                evidence or [],
+            )
+        if not operator:
+            raise BridgeError(
+                "Only the operator approves or rejects a plan revision, from "
+                "the project base checkout."
+            )
+        return plan.decide(directory, identity, action == "approve", reason)

@@ -541,6 +541,7 @@ class StatusMixin(BridgeCore):
             activity,
             budgets,
             checkpoints,
+            convergence,
             deadline_state,
             handoff_fields,
             issues,
@@ -564,6 +565,7 @@ class StatusMixin(BridgeCore):
             else self._project_context(directory, data)
         )
         ledger = frame["ledger"]
+        accounts = convergence.read(directory)
         configuration = frame["configuration"]
         participant = data["participants"][agent]
         name = participant["display"]
@@ -680,6 +682,9 @@ class StatusMixin(BridgeCore):
                         (record.get("orphan") or {}).get("reservations", [])
                     ),
                     **issues.unresolved_completion(record),
+                    "convergence": convergence.current(
+                        accounts, number, record.get("claim_id")
+                    ),
                 }
                 for number, record in sorted(
                     ledger["issues"].items(), key=lambda i: int(i[0])
