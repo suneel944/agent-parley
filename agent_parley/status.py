@@ -22,6 +22,202 @@ if TYPE_CHECKING:
 
     from agent_parley.cli import Selection
 
+DORMANT_SECONDS = 86400.0
+ENDED_STATES = ("stopped", "dead", "reclaimed")
+ATTENTION_LINES = 8
+FORGE_ISSUES = "forge-issues.json"
+FORGE_TTL = 300.0
+FORGE_RETRY = 60.0
+FORGE_TIMEOUT = 5
+FORGE_LIMIT = 1000
+
+
+def reading(
+    issues: dict | None, limit: int, age: float, fresh: bool, reason: str
+) -> dict:
+    """Shapes one answer of `StatusMixin.forge_issues`.
+
+    Args:
+        issues: Issue number to its title, or None when never read.
+        limit: Most issues the reading asked the forge for.
+        age: Seconds since the reading was taken.
+        fresh: Whether the reading is within `FORGE_TTL`.
+        reason: Why the reading is not fresh, empty when it is.
+
+    Returns:
+        The issues, whether they are every open issue, their whole-second
+        age or None when never read, freshness and the reason.
+    """
+    return {
+        "issues": issues,
+        "complete": issues is not None and len(issues) < limit,
+        "age_seconds": int(age) if issues is not None else None,
+        "fresh": fresh,
+        "reason": reason,
+    }
+
+
+def forge_note(known: dict) -> str:
+    """States in one line why the forge's issue state is not current.
+
+    Args:
+        known: Answer of `StatusMixin.forge_issues`.
+
+    Returns:
+        Empty for a fresh, complete reading. Otherwise the line naming a
+        stale reading's age, an unavailable one's cause, or a list too long
+        to read whole, and whether closed issues are hidden.
+    """
+    from agent_parley.tables import age
+
+    if known["issues"] is None:
+        return (
+            f"Forge: open issues unavailable ({known['reason']}); claims on "
+            "closed issues are not hidden"
+        )
+    if not known["complete"]:
+        return (
+            f"Forge: over {FORGE_LIMIT} open issues; claims on closed issues "
+            "are not hidden"
+        )
+    if not known["fresh"]:
+        return (
+            f"Forge: open issues as read {age(known['age_seconds'])} ago; "
+            f"refresh failed ({known['reason']})"
+        )
+    return ""
+
+
+def lane_state(record: dict) -> str:
+    """Names the state one lane is in for the compact status view.
+
+    Args:
+        record: One lane record from the status reading.
+
+    Returns:
+        ``retired`` or ``paused`` when the operator set either, else the
+        lane's recorded state, such as ``working`` or ``stopped``, else the
+        availability supervision observed for a lane with no record yet.
+    """
+    if record.get("retired_at"):
+        return "retired"
+    if record.get("paused"):
+        return "paused"
+    if condition := record.get("condition"):
+        return str(condition["state"])
+    return str(record["availability"]["state"])
+
+
+def stopped_seconds(record: dict) -> float | None:
+    """Reports how long a lane has been stopped, or None while it is not.
+
+    Args:
+        record: One lane record from the status reading.
+
+    Returns:
+        Seconds since a retired, stopped, dead or reclaimed lane entered that
+        state, or since a lane without a live process was last active. None
+        for a live lane or one with no recorded activity.
+    """
+    if record.get("retired_age_seconds") is not None:
+        return float(record["retired_age_seconds"])
+    condition = record.get("condition")
+    if condition:
+        if condition["state"] in ENDED_STATES:
+            return float(condition["seconds"])
+        return None
+    availability = record["availability"]
+    if availability["process_alive"] or availability["age_seconds"] is None:
+        return None
+    return float(availability["age_seconds"])
+
+
+def dormant(root: str, participants: list[dict]) -> bool:
+    """Reports whether a project is gone or every lane stopped long ago.
+
+    Args:
+        root: Recorded repository root.
+        participants: Every lane record of the project.
+
+    Returns:
+        True when the root is no longer a directory, or when the project has
+        lanes and each has been stopped for at least `DORMANT_SECONDS`.
+    """
+    if not Path(root).is_dir():
+        return True
+    spans = [stopped_seconds(record) for record in participants]
+    return bool(spans) and all(
+        span is not None and span >= DORMANT_SECONDS for span in spans
+    )
+
+
+def pull_request(readings: list[dict], issue: str, branch: str) -> dict | None:
+    """Finds the cached open pull request that carries one claim.
+
+    Args:
+        readings: Open pull requests supervision last cached for the project.
+        issue: Claimed issue number.
+        branch: Branch assigned to the lane that owns the claim.
+
+    Returns:
+        The number, URL, check verdict and merge state of the newest pull
+        request that names the issue as one it closes, else of the one whose
+        head is the lane's branch, or None when the cache holds neither.
+    """
+    ordered = sorted(
+        readings, key=lambda item: int(item.get("number") or 0), reverse=True
+    )
+    found = next(
+        (item for item in ordered if issue in (item.get("issues") or [])),
+        None,
+    ) or next(
+        (item for item in ordered if branch and item.get("branch") == branch),
+        None,
+    )
+    if found is None:
+        return None
+    return {
+        "number": int(found.get("number") or 0),
+        "url": str(found.get("url") or ""),
+        "checks": str(found.get("checks") or ""),
+        "mergeable": str(found.get("mergeable") or ""),
+    }
+
+
+def attention(claim: dict, owner: str) -> list[str]:
+    """States what an open claim needs and the command that resolves it.
+
+    Args:
+        claim: One open claim from a lane record of the status snapshot.
+        owner: Participant holding the claim.
+
+    Returns:
+        One line for a claim whose owner the supervisor marked orphaned and
+        one for a claim past its deadline, each naming the single command
+        that resolves it; nothing for a claim that needs no action.
+    """
+    from agent_parley.tables import age
+
+    number = claim["issue"]
+    lines = []
+    if claim.get("orphaned"):
+        lines.append(
+            f"#{number} orphaned from {owner} "
+            f"({claim.get('orphan_reason') or 'no reason'}); a peer lane runs "
+            f"agent-parley issue claim {number} --take-orphaned"
+        )
+    if claim.get("overdue"):
+        lines.append(
+            f"#{number} overdue {age(claim['overdue_seconds'])} with {owner}; "
+            f"agent-parley issue assign {number} LANE --reason TEXT"
+        )
+    return lines
+
+
+def since(instant: float) -> int | None:
+    """Reports whole seconds since a Unix time, or None when it is unset."""
+    return max(int(time.time() - instant), 0) if instant else None
+
 
 class StatusMixin(BridgeCore):
     """Health check, problem list and per-lane status reporting."""
@@ -258,13 +454,21 @@ class StatusMixin(BridgeCore):
             db: Open read transaction to answer store questions from.
 
         Returns:
-            The shared readings, the transaction they came from, and any store
-            failure that must still be reported against each lane's mail.
+            The shared readings, the open pull requests supervision last
+            cached, the transaction they came from, and any store failure
+            that must still be reported against each lane's mail.
         """
         import sqlite3
 
-        from agent_parley.cli import snapshot, store, supervision
+        from agent_parley.cli import json, snapshot, store, supervision
 
+        try:
+            cached = json.loads(
+                (directory / supervision.PULL_REQUEST_RECORD).read_text()
+            )
+        except (OSError, ValueError):
+            cached = {}
+        pulls = cached.get("pull_requests") if isinstance(cached, dict) else {}
         try:
             usage = store.usage(self.home, data["root"], db=db)
         except sqlite3.Error:
@@ -281,6 +485,13 @@ class StatusMixin(BridgeCore):
             "usage": usage,
             "schedules": schedules,
             "schedules_error": failure,
+            "pull_requests": [
+                reading
+                for reading in (
+                    pulls.values() if isinstance(pulls, dict) else []
+                )
+                if isinstance(reading, dict)
+            ],
             "db": db,
         }
 
@@ -319,6 +530,10 @@ class StatusMixin(BridgeCore):
             from that record alone, through `supervision.recorded_presence`,
             so the activity file cannot report a condition the record does
             not hold; only a lane with no record yet is read from the file.
+            `current_task` is the lane's own last report or registered task,
+            never the operator's last prompt, and each claim carries its
+            recorded title, whether it ended on the forge, the seconds since
+            it last progressed and its cached pull request.
         """
         import sqlite3
 
@@ -435,6 +650,14 @@ class StatusMixin(BridgeCore):
             "claims": [
                 {
                     "issue": int(number),
+                    "title": record.get("title") or "",
+                    "ended": issues.ended(record),
+                    "last_event_seconds": since(issues.last_progress(record)),
+                    "pull_request": pull_request(
+                        frame.get("pull_requests") or [],
+                        number,
+                        participant["branch"],
+                    ),
                     "delivered": issues.delivered(record),
                     **deadline_state(record),
                     "deadline_at": views.timestamp(
@@ -493,7 +716,11 @@ class StatusMixin(BridgeCore):
             ),
             "wake": None,
             "mail": None,
+            "current_task": str(
+                state.get("summary") or state.get("task") or ""
+            )[:240],
         }
+        record["lane_state"] = lane_state(record)
         if wake:
             next_at = wake.get("next_at")
             record["wake"] = {
@@ -521,6 +748,12 @@ class StatusMixin(BridgeCore):
         except (sqlite3.Error, BridgeError, OSError) as exc:
             record["mail"] = {"error": str(exc)}
             return record
+        record["current_task"] = str(
+            state.get("summary")
+            or mail["reported_task"]
+            or state.get("task")
+            or ""
+        )[:240]
         record["mail"] = {
             "pending_operator_items": scheduled,
             "unread": mail["unread"],
@@ -574,7 +807,8 @@ class StatusMixin(BridgeCore):
             per registered project holding its issue ledger and its lanes. A
             service that reports itself stale is not ready, and the state
             names why. A project the supervisor retired because its root is
-            gone is left out.
+            gone is left out; one whose root is missing or whose lanes all
+            stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
         from agent_parley.cli import (
             inbound_status,
@@ -603,9 +837,23 @@ class StatusMixin(BridgeCore):
             edits, advances = supervision.readings(self.home, data)
             with self._project_reading() as db:
                 context = self._project_context(path.parent, data, db)
+                participants = [
+                    self._lane_status(
+                        path.parent,
+                        data,
+                        agent,
+                        edits.get(agent, []),
+                        advances.get(agent, []),
+                        context=context,
+                    )
+                    for agent in sorted(data["participants"])
+                ]
                 projects.append(
                     {
                         "root": data["root"],
+                        "directory": str(path.parent),
+                        "root_missing": not Path(data["root"]).is_dir(),
+                        "dormant": dormant(data["root"], participants),
                         "reclaim": supervision.reclaim_summary(path.parent),
                         "accounting": self._project_accounting(
                             db, data["root"]
@@ -616,17 +864,7 @@ class StatusMixin(BridgeCore):
                             context["ledger"],
                             reported_ready(path.parent),
                         ),
-                        "participants": [
-                            self._lane_status(
-                                path.parent,
-                                data,
-                                agent,
-                                edits.get(agent, []),
-                                advances.get(agent, []),
-                                context=context,
-                            )
-                            for agent in sorted(data["participants"])
-                        ],
+                        "participants": participants,
                         "supervision_error": issues.supervision_error(
                             path.parent
                         ),
@@ -639,6 +877,261 @@ class StatusMixin(BridgeCore):
             "inbound": inbound_status(),
             "projects": projects,
         }
+
+    def _health(self, report: dict) -> None:
+        """Prints the server, code, store, inbound and state directory lines.
+
+        Args:
+            report: Reading produced by `status_snapshot`.
+        """
+        from agent_parley.cli import protocol, store
+
+        ready = "ready" if report["server"]["ready"] else "not ready"
+        print(f"Server: {ready}")
+        if report["server"].get("state") == protocol.STALE:
+            print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
+        schema = store.schema_state(store.schema_version(self.home))
+        if repair := store.remedy(schema):
+            print(f"Store: {schema}; {repair}")
+        if refusal := (report.get("inbound") or {}).get("fault"):
+            print(f"Inbound: {refusal}")
+        print(f"State: {report['state_directory']}")
+
+    def project_at(self, path: Path) -> str:
+        """Names the registered project a directory belongs to.
+
+        The directory matches a project when it sits inside the project's
+        root or inside one of its lane worktrees. Only recorded paths are
+        compared, so the answer never runs git.
+
+        Args:
+            path: Directory to place, usually the working directory.
+
+        Returns:
+            The recorded root of the first matching project, or an empty
+            string when the directory belongs to none.
+        """
+        from agent_parley.cli import json, roster
+
+        here = path.resolve()
+        for manifest in sorted((self.home / "projects").glob("*/project.json")):
+            data = roster.normalize(json.loads(manifest.read_text()))
+            places = [
+                data["root"],
+                *(item["lane"] for item in data["participants"].values()),
+            ]
+            if any(
+                here.is_relative_to(Path(place).resolve())
+                for place in places
+                if place
+            ):
+                return data["root"]
+        return ""
+
+    def board(
+        self,
+        selection: Selection | None = None,
+        width: int | None = None,
+        *,
+        every_claim: bool = False,
+        every_project: bool = False,
+    ) -> int:
+        """Prints who is working on which open issue, and whether it moves.
+
+        Each project prints one table of open work, one line per lane naming
+        its state, its live claims and the task its own last report or
+        registration names, and a short list of orphaned or overdue claims
+        with the command that resolves each. Claims whose work already ended
+        on the forge are summarized on one line unless `every_claim` asks
+        for their rows. Dormant projects are left out unless `every_project`
+        asks for them, or the selection names that project.
+
+        Args:
+            selection: Filters the operator asked for; its project filter
+                scopes the view to one project.
+            width: Columns the tables may use, or None for whole lines.
+            every_claim: Also list claims whose work ended on the forge.
+            every_project: Also list dormant projects, after the others.
+
+        Returns:
+            The number of lanes reported.
+        """
+        from agent_parley.cli import Selection, narrow, reported_lanes
+
+        selection = selection or Selection()
+        reading = self.status_snapshot()
+        report = narrow(reading, selection)
+        self._health(report)
+        shown = sorted(
+            (
+                project
+                for project in report["projects"]
+                if every_project or selection.project or not project["dormant"]
+            ),
+            key=lambda project: project["dormant"],
+        )
+        for project in shown:
+            self._board_project(project, width, every_claim)
+        if selection.project and (
+            others := len(reading["projects"]) - len(report["projects"])
+        ):
+            print(
+                f"\n{others} other project(s) not shown; --all-projects "
+                "lists them."
+            )
+        if hidden := len(report["projects"]) - len(shown):
+            print(
+                f"\n{hidden} dormant project(s) hidden, root missing or every "
+                "lane stopped over 24h; --all-projects lists them last."
+            )
+        return reported_lanes({"projects": shown})
+
+    def forge_issues(self, directory: Path, root: str) -> dict:
+        """Reads the forge's open issues through a short-lived cache.
+
+        The open-work view hides claims on closed issues and shows titles,
+        and only the forge knows either. One bounded `forge` call reads every
+        open issue and is kept in `FORGE_ISSUES` for `FORGE_TTL` seconds. A
+        failed call is retried no sooner than `FORGE_RETRY` seconds later, so
+        a forge that is down costs one timeout per retry window rather than
+        one per reading, and the last good cache answers meanwhile.
+
+        Args:
+            directory: Private state directory of the project.
+            root: Recorded repository root that selects the forge project.
+
+        Returns:
+            ``issues`` as issue number to its title, or None when no reading
+            was ever cached; ``complete`` when that reading held every open
+            issue; ``age_seconds`` of the reading; ``fresh`` when it is
+            within `FORGE_TTL`; and ``reason`` naming why it is not.
+        """
+        from agent_parley.cli import forge, json
+        from agent_parley.state import write_json
+
+        path = directory / FORGE_ISSUES
+        try:
+            cached = json.loads(path.read_text())
+        except (OSError, ValueError):
+            cached = {}
+        if not isinstance(cached, dict):
+            cached = {}
+        now = time.time()
+        stored = cached.get("issues")
+        issues = stored if isinstance(stored, dict) else None
+        read_at = float(cached.get("read_at") or 0)
+        limit = int(cached.get("limit") or FORGE_LIMIT)
+        reason = "forge unreachable"
+        if issues is not None and now - read_at < FORGE_TTL:
+            return reading(issues, limit, now - read_at, True, "")
+        try:
+            manifest = json.loads((directory / "project.json").read_text())
+        except (OSError, ValueError):
+            manifest = {}
+        if forge.select(Path(root), manifest) != "github":
+            return reading(issues, limit, now - read_at, False, "no GitHub")
+        if now - float(cached.get("failed_at") or 0) >= FORGE_RETRY:
+            catalog = forge.open_issue_catalog(
+                Path(root), FORGE_LIMIT, FORGE_TIMEOUT
+            )
+            if catalog is not None:
+                issues = {
+                    number: {"title": str(item.get("title") or "")}
+                    for number, item in catalog.items()
+                }
+                with contextlib.suppress(OSError):
+                    write_json(
+                        path,
+                        {
+                            "read_at": now,
+                            "limit": FORGE_LIMIT,
+                            "issues": issues,
+                        },
+                    )
+                return reading(issues, FORGE_LIMIT, 0.0, True, "")
+            with contextlib.suppress(OSError):
+                write_json(path, {**cached, "failed_at": now})
+        return reading(issues, limit, now - read_at, False, reason)
+
+    def _board_project(
+        self, project: dict, width: int | None, every_claim: bool
+    ) -> None:
+        """Prints one project's open work, lanes and claims needing action.
+
+        Args:
+            project: One project record from the status reading.
+            width: Columns the tables may use, or None for whole lines.
+            every_claim: Also list claims whose work ended on the forge.
+        """
+        from agent_parley.cli import supervision_failure, tables
+
+        dormancy = " (dormant)" if project["dormant"] else ""
+        print(f"\nProject: {project['root']}{dormancy}")
+        if failing := project.get("supervision_error"):
+            print(supervision_failure(failing))
+        known = self.forge_issues(Path(project["directory"]), project["root"])
+        if note := forge_note(known):
+            print(note)
+        opened = known["issues"] if known["complete"] else None
+        work: list[tuple[int, tuple[str, ...]]] = []
+        lanes: list[tuple[str, ...]] = []
+        notes: list[str] = []
+        ended: list[int] = []
+        for record in project["participants"]:
+            owner = record["participant"]
+            live = 0
+            for claim in record["claims"]:
+                entry = (opened or {}).get(str(claim["issue"])) or {}
+                closed = claim["ended"] or (
+                    opened is not None and str(claim["issue"]) not in opened
+                )
+                if closed:
+                    ended.append(claim["issue"])
+                else:
+                    live += 1
+                    notes.extend(attention(claim, owner))
+                if every_claim or not closed:
+                    shown = {
+                        **claim,
+                        "ended": closed,
+                        "title": claim["title"] or entry.get("title", ""),
+                    }
+                    work.append(
+                        (
+                            claim["issue"],
+                            tables.work_row(shown, owner, record["lane_state"]),
+                        )
+                    )
+            lanes.append(
+                (
+                    owner,
+                    record["lane_state"],
+                    str(live),
+                    record.get("current_task") or "-",
+                )
+            )
+        rows = [row for _, row in sorted(work, key=lambda item: item[0])]
+        for text in tables.work_table(rows, width) or ["No open claims."]:
+            print(text)
+        for text in tables.lane_table(lanes, width):
+            print(text)
+        if ended:
+            listed = " ".join(f"#{number}" for number in sorted(ended)[:10])
+            more = f" and {len(ended) - 10} more" if len(ended) > 10 else ""
+            hidden = "" if every_claim else " hidden, --all lists them;"
+            print(
+                f"Closed or ended on the forge, still owned: {listed}{more};"
+                f"{hidden} end each with agent-parley issue resolve N"
+            )
+        if notes:
+            print("Needs action:")
+            for text in notes[:ATTENTION_LINES]:
+                print(f"  {text}")
+            if len(notes) > ATTENTION_LINES:
+                print(
+                    f"  and {len(notes) - ATTENTION_LINES} more; "
+                    "agent-parley status LANE shows each"
+                )
 
     def status(
         self, selection: Selection | None = None, width: int | None = None
@@ -666,12 +1159,10 @@ class StatusMixin(BridgeCore):
             lanes,
             narrow,
             pending_offers,
-            protocol,
             reclaim,
             reported_lanes,
             roster,
             snapshot,
-            store,
             supervision_failure,
             supervision_liveness,
             tables,
@@ -680,16 +1171,7 @@ class StatusMixin(BridgeCore):
         selection = selection or Selection()
         report = narrow(self.status_snapshot(), selection)
         kept = {project["root"]: project for project in report["projects"]}
-        ready = "ready" if report["server"]["ready"] else "not ready"
-        print(f"Server: {ready}")
-        if report["server"].get("state") == protocol.STALE:
-            print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
-        schema = store.schema_state(store.schema_version(self.home))
-        if repair := store.remedy(schema):
-            print(f"Store: {schema}; {repair}")
-        if refusal := (report.get("inbound") or {}).get("fault"):
-            print(f"Inbound: {refusal}")
-        print(f"State: {report['state_directory']}")
+        self._health(report)
         matched = reported_lanes(report)
         if selection.filtered() and not matched:
             print(f"No participant matches {selection.describe()}.")

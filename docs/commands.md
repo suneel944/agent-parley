@@ -80,7 +80,7 @@ on standard output and export to a file.
 | `participant resume NAME` | Let a paused lane act again. |
 | `participant stop NAME` | End a lane's session from the base checkout; keep its claims. |
 | `participant restart NAME` | Start a crashed, wedged or stopped lane again; keep its uncommitted work. `--task` is the new session's opening instruction. |
-| `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. `--all` integrates every lane reported ready in recorded dependency order and `--group NAME` one group of the applied plan, each stopping at the first refusal or failure. |
+| `participant merge NAME` | Run the configured gate and merge; `--preview` only inspects. `--all` integrates every lane reported ready in recorded dependency order and `--group NAME` one group of the applied plan, each stopping at the first refusal or failure. A failed or interrupted integration is recorded and holds further merges until the lane holding its issue retries it; `--renew-recovery` grants a recorded integration three more attempts, and `participant merge --verify-recovery` (no lane name, base checkout only) runs the recorded gate on the base as it stands and clears the record only if it passes and leaves the tree clean. |
 | `participant pr NAME` | Push the lane branch and open or locate its pull request. |
 | `participant budget NAME` | Show or set the lane's advisory `--tokens`, `--calls` and `--hours` limits; `0` removes one. Crossing a limit marks the lane and stops nothing. |
 | `... --all --provider N --outcome S --drifted --idle --over-budget` | Select several lanes for one `say`, `issue assign`, `participant stop/pause/resume/pr/merge`; one plan and one confirmation, `--yes` to skip it. |
@@ -155,7 +155,10 @@ commit, the reservations that move on acceptance, and the remaining work.
 Field names are documented in
 [Operations](operations.md#machine-readable-output) and carry the same stability
 promise as the flags. `events export` and `watch --json` stay JSON Lines,
-because each is a stream rather than a snapshot.
+because each is a stream rather than a snapshot. A runtime failure under
+`--json` adds a one-line `error` document on standard output and still exits
+1; an argument the parser rejects exits 2 with usage on standard error. See
+[Operations](operations.md#machine-readable-output) for the error contract.
 
 Without `--json`, `decision list` prints one row per decision — its ID, time,
 sender and subject — with a one-line body preview, and `provider show` and

@@ -22,6 +22,7 @@ MAX_REMAINING_BYTES = 200
 MAX_RESERVATIONS = 32
 MAX_RESERVATION_BYTES = 240
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
+ENDED = "pull request ended"
 
 
 def delivered(record: dict) -> bool:
@@ -168,6 +169,33 @@ def released(record: dict) -> bool:
     if history and history[-1].get("action") in ("release", "resolve"):
         return True
     return lifecycle.state(record)["state"] == lifecycle.COMPLETE
+
+
+def ended(record: dict) -> bool:
+    """Reports whether a claim's work already ended on the forge.
+
+    The reading uses only what supervision cached in the ledger, so a status
+    reading never waits on the forge. An issue reads as ended when its
+    execution is verified complete, when its unresolved completion is
+    escalated, or when supervision observed its issue or pull request end
+    inside the current owner's generation and that owner has not answered.
+
+    Args:
+        record: Published ledger record for one issue, or an empty mapping.
+
+    Returns:
+        Whether the claim describes finished rather than open work.
+    """
+    prompt = record.get("handoff_prompt") or {}
+    return bool(
+        lifecycle.state(record)["state"] == lifecycle.COMPLETE
+        or unresolved_completion(record)["unresolved"]
+        or (
+            prompt.get("trigger") == ENDED
+            and prompt.get("holder") == record.get("owner")
+            and not prompt.get("responded_at")
+        )
+    )
 
 
 def unresolved_completion(record: dict) -> dict:

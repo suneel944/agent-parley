@@ -100,7 +100,36 @@ lane that holds the issue, because only that lane can hand it on.
 
 ### Reading status
 
-`status` prints the server line, the code line, the state directory, and then
+`status` answers who is working on which open issue and whether it moves. Run
+inside a project checkout or one of its lane worktrees, it reports that project
+only and says how many others it left out; `--all-projects` reports every
+project. Outside any project it reports every project except dormant ones: a
+project whose root is gone, or whose lanes have all been stopped for over 24
+hours, is hidden behind one line and listed last under `--all-projects`.
+
+Each project prints one table of open work, `ISSUE`, `TITLE` (clipped to 40
+characters), `OWNER`, `STATE` of the owning lane, `LAST EVENT` as the age of the
+claim's last progress, and `PR` as the cached open pull request with its check
+verdict and any conflict. Then one line per lane: `LANE`, `STATE`, `CLAIMS` as
+its live claims, and `TASK` from the lane's own last report or registered task,
+never the operator's last prompt. A claim whose issue is no longer open on the
+forge, or whose pull request ended, while still owned is left out of the table
+and named on one line with `agent-parley issue resolve N`; `--all` lists those
+rows too.
+
+Titles and open state come from one bounded read of the project's open GitHub
+issues, the same list `issue list` reads, with a 5-second timeout. The reading
+is cached as `forge-issues.json` in the project's state directory for 300
+seconds, so repeated `status` calls reuse it. When the read fails, `status`
+answers from the last cached reading, prints one `Forge:` line with its age,
+and waits 60 seconds before trying again. With no reading at all, or no GitHub
+forge, the `Forge:` line says so and claims on closed issues are not hidden.
+Last, `Needs action:` lists each orphaned or overdue claim with the
+command that resolves it, `agent-parley issue claim N --take-orphaned` run from
+a peer lane or `agent-parley issue assign N LANE --reason TEXT`.
+
+`status --table`, a participant name, or any lane filter prints the full lane
+table instead: the server line, the code line, the state directory, and then
 one table per
 project with a row per participant: `PARTICIPANT`, `PROVIDER`, `ACCOUNT`,
 `SESSION`, `BRANCH` with `!` when the lane left its assigned branch, `OUTCOME`,
@@ -506,6 +535,34 @@ With a verification command recorded, it runs before each merge as usual and
 again after it, so a set whose halves pass alone but fail together is caught
 before you move on. A failure after a merge stops the run and leaves that merge
 commit present and visibly unverified.
+
+### Recovering an unverified integration
+
+```sh
+agent-parley problems                                   # the one escalation
+agent-parley participant merge claude-2                 # retry and verify
+agent-parley participant merge claude-2 --renew-recovery # after exhaustion
+agent-parley participant merge --verify-recovery        # no repairing lane
+```
+
+A conflict, a failed post-merge gate, or a crash before the gate answered is
+recorded durably as `conflict`, `gate failed` or `interrupted`, bound to the
+claim, the pre-merge base, the resulting commit and the gate command. Until it
+clears, no other lane is integrated and the issue is never recorded complete,
+so its dependents stay held. The issue moves to `recovery` and its holder is
+mailed the failure; whoever holds the issue through the usual claim and
+handoff rules repairs it, commits and reports ready again. `participant merge`
+on that lane then merges the repair and runs the gate on the exact commit the
+base holds, including a fix you committed on the base yourself or a conflict
+you finished with `git merge --continue`. Three attempts are allowed; after
+that `problems` shows one `integration unverified` row naming
+`--renew-recovery`, which grants three more from the base checkout. When no
+lane can repair it, because the issue is unheld or complete or the lane
+retired, fix or reset the base yourself and run `participant merge
+--verify-recovery` from the base checkout: it runs the recorded gate on the
+base as it stands and clears the record only if the gate passes and the tree
+stays clean. Nothing is reset or reverted for you. See the architecture contract for the record's
+fields, its migration and its evidence limits.
 
 `plan show` and `status` mark a group whose every member is reported ready, and
 the `top` header counts those groups, so an integrable set is visible before
@@ -1353,12 +1410,33 @@ commands are unchanged, and a refusal still goes to standard error with a
 non-zero exit status, so a script tells a refusal from a document by the exit
 status alone.
 
+With `--json`, a runtime failure also prints one error document on standard
+output, on a single line, and exits 1 as it does without `--json`:
+
+```json
+{"schema": "agent-parley/read/v1", "kind": "error", "generated_at": "2026-09-27T10:00:00Z", "error": {"type": "bridge", "message": "No participant named nobody"}}
+```
+
+`type` is `bridge` for a coordination refusal, `os` for a file or network
+failure, `value` for an invalid value and `timeout` for an external command
+that ran out of time. `message` is the same text the `agent-parley:` line
+prints on standard error, which still appears; no traceback is printed. The
+document goes to standard output so `agent-parley ... --json | jq` reads a
+failure the same way it reads a result. A command that already wrote part of
+its output before failing is not rolled back: the error document follows on
+its own line, so a script checks the exit status first and reads the last
+line on failure. `watch --json` and `events export` end the same way, and the
+single-line document keeps their JSON Lines stream valid. Without `--json`
+nothing changes. An invalid flag or argument is rejected by the argument
+parser before any command runs: it prints usage on standard error, nothing on
+standard output, and exits 2, with or without `--json`.
+
 Every document carries the same envelope:
 
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `plan`, `plan_diff`, `approval`, `verify`, `init`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials` or `credentials_show`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `plan`, `plan_diff`, `approval`, `verify`, `init`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show` or `error`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -1630,7 +1708,10 @@ launch can take longer than the default.
 Releasing a claim with waiting peers creates a visible handoff reminder.
 The service also checks each claimed issue on the forge and reminds the holder
 when the issue closed inside the current claim, recording the pull request that
-closed it, its head branch and merge commit, whichever branch it came from. A
+closed it, its head branch and merge commit, whichever branch it came from.
+GitHub links a closing pull request only when it targets the default branch;
+for an issue closed by hand after a merge into another base, the issue timeline
+supplies the merged pull request whose body closes the issue by keyword. A
 closing pull request from another lane's branch is named in the reminder, and
 so is one from a per-issue branch that exactly one other lane's worktree
 checked out. Every lane pushes as the same forge account, so the pull request

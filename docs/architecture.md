@@ -23,7 +23,7 @@ runs `participant merge`, and never on an agent's behalf.
 | `terminal` | The launcher-owned native pseudo-terminal, its private wake control socket, removal of wake sockets no launcher listens on, and the lane-first tab title |
 | `dialogs` | Recognition of the native dialogs held on that terminal, the answer the operator configured, capacity records and escalation, and the opt-in that carries approval of this bridge's own tools |
 | `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
-| `merges` | Merge refusals, preview and the merge itself, plus the readiness, dependency and group ordering that integration follows |
+| `merges` | Merge refusals, preview and the merge itself, plus the readiness, dependency and group ordering that integration follows, and the durable record of an integration the base has not verified |
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `attachments` | Oversized coordination payloads spilled to bounded files under project state, and their paged reads |
@@ -698,8 +698,77 @@ refuses the merge, reporting the exit status and the last twenty lines of the
 command's combined output; a command that cannot run is a refusal, not a skip.
 No flag bypasses the gate, and removing it is an explicit `verify set ''`.
 The gate reports the base checkout as it stands before the merge, which is not
-a claim about the merged result, so combined post-merge verification remains a
-separate reviewed action.
+a claim about the merged result, so the same command runs again on the merge
+commit before any claim is recorded complete.
+
+An integration therefore changes the base before its post-merge gate has
+spoken. That span is recorded durably in `integration.json` in the project's
+private state directory: written before the merge starts and removed only when
+the exact resulting commit passes the gate. The record is bound to the lane,
+the issue and claim generation it carried, the reported source commit, the
+pre-merge base, the resulting commit and the gate command, and it keeps the
+last 400 characters of the failure. It names one of three kinds: `conflict`,
+a merge stopped before any commit with the conflict left in the working tree;
+`gate failed`, a merge commit that failed the gate or whose gate changed
+repository content; and `interrupted`, a merge commit whose gate result is
+unknown because the command crashed, timed out or the base moved while it ran.
+A crash leaves the record exactly as written, so a restart reads it back.
+
+While the record stands, no other lane is integrated: `participant merge`, the
+bulk runs' preflight and `--preview` all name it. The issue stays out of
+`complete`, so every issue waiting on it stays held. A conflict whose merge was
+aborted, leaving the base at the recorded pre-merge commit, holds nothing
+further, because that base is the one verified before the attempt.
+
+Repair follows ownership, never the lane that happened to merge. A conflict or
+failed gate moves the issue to the `recovery` state with the failure as its
+blocker and mails the holder, so the ordinary claim, handoff and approved
+recovery rules decide who repairs it and nothing is taken from a live owner.
+Only the lane that holds the recorded issue now, or for an integration that
+carried no issue the lane that merged it, may retry it with
+`participant merge NAME`; a released issue must be claimed first. A retry
+skips the pre-merge gate, whose failure the record already names, merges the
+holder's current ready commit if the base lacks it, and runs the gate on the
+exact commit the base then holds, so a repair committed in the lane, a fix
+committed on the base, and a conflict resolved with `git merge --continue` are
+all verified the same way. Approval policy applies to a retry unchanged.
+
+Retries are bounded at three attempts per record. Each attempt carries its
+number, an observation from an earlier attempt never overwrites a later one,
+recording the same observation twice changes nothing, and only the attempt
+still recorded, at the commit it recorded, can clear the record, so a stale
+pass never clears a newer failure. Exhaustion refuses further retries without
+running the gate and leaves one `integration unverified` row in `problems`
+naming `participant merge NAME --renew-recovery`, which grants three more
+attempts and is accepted only from the base checkout. Nothing is ever reset,
+reverted, cleaned or stashed; undoing an integration stays the operator's own
+Git action.
+
+When no lane may repair a record, because its issue is unheld or already
+complete, its lane retired, or its attempts are used, the one operator path is
+`participant merge --verify-recovery`, accepted only from the base checkout.
+It merges nothing. It refuses while the base holds a merge in progress or
+uncommitted changes, runs the recorded gate command on the base's current
+HEAD, and removes the record only if the gate passes, HEAD stays put and the
+tree stays clean; otherwise the record stands. An operator who fixed or reset
+the base by hand releases the hold this way, and a `gate failed` or
+`interrupted` record, which never clears on its own, clears the same way. The
+issue ledger is left unchanged. Every remedy for an unowned or exhausted
+record names this command. A merge that stopped with `MERGE_HEAD` but no
+unmerged paths, such as one killed by its timeout, is recorded as
+`interrupted`, not `conflict`; a merge that timed out before changing the base
+withdraws its attempt and restores the record it replaced. Moving the claim
+into `recovery` is best effort: if the issue ledger is busy the record still
+stands, the failure is still reported, and the claim stays `ready`.
+
+The record is a new file, so no store migration applies: a state directory
+from an earlier release has none and reads as carrying no unverified
+integration, and an earlier release ignores the file. A record that cannot be
+read holds integration until it is inspected. Evidence limits: the record
+keeps the failure text, not the gate's output, which goes to the terminal that
+ran the merge; containment is Git ancestry, so a revert committed on the base
+is not detected; and an integration interrupted inside `git merge` itself is
+recorded as `interrupted` with no result, which the next retry settles.
 
 `participant pr` pushes one lane's branch to `origin` and opens a pull request
 carrying that lane's recorded report. It is the only command that writes to the

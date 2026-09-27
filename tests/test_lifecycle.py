@@ -327,7 +327,8 @@ def test_passing_gate_that_changes_repository_cannot_complete(
         bridge.merge(repo, "codex")
 
     execution = issues.snapshot(directory)["issues"]["52"]["execution"]
-    assert execution["state"] == lifecycle.READY
+    assert execution["state"] == lifecycle.RECOVERY
+    assert execution["next_action"] == "repair integration"
     assert dirty in git(repo, "status", "--porcelain")
 
 

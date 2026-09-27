@@ -35,6 +35,10 @@ STATUS_COLUMNS = (
     "TASK",
 )
 STATUS_DROP = (2, 10, 9, 1, 8, 6, 3, 5, 4, 7)
+WORK_COLUMNS = ("ISSUE", "TITLE", "OWNER", "STATE", "LAST EVENT", "PR")
+WORK_DROP = (4, 5, 1)
+TITLE_WIDTH = 40
+LANE_COLUMNS = ("LANE", "STATE", "CLAIMS", "TASK")
 
 
 def age(seconds: float) -> str:
@@ -336,3 +340,101 @@ def status_table(
     if omitted:
         lines.append("Hidden columns: " + ", ".join(omitted))
     return lines
+
+
+def pull_cell(claim: dict) -> str:
+    """Names the pull request state one claim carries.
+
+    Args:
+        claim: One claim from a lane record of the status snapshot.
+
+    Returns:
+        ``ended`` with any observed branch state for a claim whose work ended
+        on the forge, the cached open pull request's number, check verdict
+        and any conflict, or ``-`` when none is cached.
+    """
+    if claim.get("ended"):
+        state = str(claim.get("branch_state") or "").lower()
+        return f"ended, {state}" if state else "ended"
+    pull = claim.get("pull_request")
+    if not pull:
+        return "-"
+    cell = f"#{pull['number']} CI {pull['checks'] or 'unknown'}"
+    if pull.get("mergeable") == "CONFLICTING":
+        cell += ", conflicting"
+    return cell
+
+
+def work_row(claim: dict, owner: str, state: str) -> tuple[str, ...]:
+    """Builds one open-work row from a claim and the lane holding it.
+
+    Args:
+        claim: One claim from a lane record of the status snapshot.
+        owner: Participant holding the claim.
+        state: State of the lane holding the claim.
+
+    Returns:
+        One cell per column of `WORK_COLUMNS`, the title clipped to
+        `TITLE_WIDTH` with an ellipsis.
+    """
+    title = str(claim.get("title") or "-")
+    seconds = claim.get("last_event_seconds")
+    return (
+        f"#{claim['issue']}",
+        fit(title, TITLE_WIDTH).rstrip(),
+        owner,
+        state,
+        age(seconds) if seconds is not None else "-",
+        pull_cell(claim),
+    )
+
+
+def work_table(rows: list[tuple[str, ...]], width: int | None) -> list[str]:
+    """Lays out the open-work rows of one project.
+
+    Args:
+        rows: Rows built by `work_row`, in the order they are reported.
+        width: Available terminal columns, or None for the whole table.
+
+    Returns:
+        The heading, one line per row, and a line naming any column the width
+        could not hold.
+    """
+    if not rows:
+        return []
+    selected, omitted = layout(
+        tuple(zip(WORK_COLUMNS, widths(WORK_COLUMNS, rows), strict=True)),
+        width,
+        WORK_DROP,
+    )
+    lines = [heading(selected)]
+    lines.extend(line(values, selected) for values in rows)
+    if omitted:
+        lines.append("Hidden columns: " + ", ".join(omitted))
+    return lines
+
+
+def lane_table(rows: list[tuple[str, ...]], width: int | None) -> list[str]:
+    """Lays out one line per lane: name, state, live claims and current task.
+
+    Args:
+        rows: One row per lane, one cell per column of `LANE_COLUMNS`.
+        width: Available terminal columns, or None for whole lines.
+
+    Returns:
+        The heading and one line per lane, each clipped to the width with an
+        ellipsis, so the task text is what a narrow terminal loses.
+    """
+    if not rows:
+        return []
+    measured = widths(LANE_COLUMNS, rows)
+    lines = [
+        GAP.join(
+            fit(value, cell)
+            for value, cell in zip(values, measured, strict=True)
+        ).rstrip()
+        for values in (LANE_COLUMNS, *rows)
+    ]
+    if width is None:
+        return lines
+    return [fit(text, width).rstrip() for text in lines]

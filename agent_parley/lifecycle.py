@@ -441,7 +441,7 @@ def complete(
                 "completion."
             )
         execution = state(record)
-        if execution["state"] != READY:
+        if execution["state"] not in (READY, RECOVERY):
             raise BridgeError(
                 f"Issue #{issue} is {execution['state']}, not ready for "
                 "verification."
@@ -509,6 +509,55 @@ def complete(
         directory, claim_id, f"issue #{issue} completed"
     )
     return record
+
+
+def integration_failed(
+    directory: Path, issue: str, claim_id: str, reason: str, result: str
+) -> bool:
+    """Returns integrated work to its owner as repair work.
+
+    The claim stays with its current owner and generation: repair is that
+    owner's work, and moving it is left to the ordinary claim, handoff and
+    recovery rules, so it is never taken from a live lane here. The issue
+    moves to the recovery state, which its owner resumes and which is never
+    complete, so everything waiting on it stays held. Only the generation
+    the integration named is changed, and recording the same failure again
+    changes nothing.
+
+    Args:
+        directory: Private project state directory.
+        issue: Issue number whose integration failed.
+        claim_id: Ownership generation the integration carried.
+        reason: Bounded account of the failure.
+        result: Base commit left unverified, or empty for a conflict.
+
+    Returns:
+        Whether the ledger changed.
+
+    Raises:
+        BridgeError: If the ledger cannot be locked.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = _snapshot(directory)
+        record = ledger["issues"].get(issue)
+        if not record or record.get("claim_id") != claim_id:
+            return False
+        execution = state(record)
+        blocker = {"reason": reason, "commit": result}
+        if execution["state"] not in (READY, RECOVERY) or (
+            execution["state"] == RECOVERY and execution["blocker"] == blocker
+        ):
+            return False
+        execution.update(
+            state=RECOVERY,
+            next_action="repair integration",
+            updated_at=time.time(),
+            blocker=blocker,
+        )
+        record["execution"] = execution
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+    return True
 
 
 def settle_dependencies(directory: Path) -> list[tuple[str, str]]:

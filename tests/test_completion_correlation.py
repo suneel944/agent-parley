@@ -291,6 +291,65 @@ def test_the_issue_reading_names_its_closing_pull_request(
     assert forge.issue_completion(tmp_path, "1216") is None
 
 
+def test_a_hand_closed_issue_finds_its_pull_request_on_the_timeline(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+
+    def reference(number, body, merged="2026-09-19T00:00:00Z", home=None):
+        return {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": number,
+                    "body": body,
+                    "pull_request": {"merged_at": merged},
+                    "repository": {"full_name": home or "owner/name"},
+                }
+            },
+        }
+
+    replies = {
+        "issue": {
+            "state": "CLOSED",
+            "closedAt": "2026-09-20T00:00:00Z",
+            "closedByPullRequestsReferences": [],
+        },
+        "api": [
+            {"event": "labeled"},
+            reference(1330, "Refs #1216"),
+            reference(1331, "Closes #1216", merged=None),
+            reference(1332, "Closes #1216", merged="2026-09-21T00:00:00Z"),
+            reference(1333, "Closes #1216", home="other/name"),
+            reference(1334, "Closes #12160"),
+            reference(1328, "Body.\n\nCloses #1216"),
+        ],
+        "pr": {
+            "state": "MERGED",
+            "number": 1328,
+            "url": "https://example.invalid/pull/1328",
+            "headRefName": "fix/1216-replay",
+            "mergeCommit": {"oid": "abcdef1234567"},
+        },
+    }
+    viewed = []
+
+    def run(args, timeout):
+        if args[1] == "pr":
+            viewed.append(args[3])
+        return json.dumps(replies[args[1]])
+
+    monkeypatch.setattr(forge, "_run", run)
+    reading = forge.issue_completion(tmp_path, "1216")
+    assert viewed == ["1328"]
+    assert reading["state"] == "MERGED"
+    assert reading["commit"] == "abcdef1234567"
+    replies["api"] = [reference(1330, "Refs #1216")]
+    reading = forge.issue_completion(tmp_path, "1216")
+    assert reading["state"] == "CLOSED"
+    assert reading["pull_request"] == 0
+
+
 def test_a_ready_report_on_an_observed_complete_claim_asks_for_completion(
     bridge, claimed, monkeypatch
 ):

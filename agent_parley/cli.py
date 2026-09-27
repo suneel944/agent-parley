@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from agent_parley import gemini as gemini
     from agent_parley import lanes as lanes
     from agent_parley import lifecycle as lifecycle
+    from agent_parley import merges as merges
     from agent_parley import opencode as opencode
     from agent_parley import retries as retries
     from agent_parley import tables as tables
@@ -1753,6 +1754,28 @@ def merged_lanes(
         or args.idle
         or getattr(args, "over_budget", False)
     )
+    if getattr(args, "verify_recovery", False):
+        if (
+            preview
+            or args.name
+            or selected(args)
+            or args.group
+            or getattr(args, "renew_recovery", False)
+        ):
+            raise BridgeError(
+                "`participant merge --verify-recovery` verifies the base "
+                "checkout as it stands and names no lane; drop the lane name, "
+                "--preview, --renew-recovery, --all, --group and the "
+                "selectors."
+            )
+        return bridge.verify_recovery(repo)
+    renew = getattr(args, "renew_recovery", False)
+    if renew and (preview or not args.name or selected(args) or args.group):
+        raise BridgeError(
+            "`participant merge --renew-recovery` retries one named lane's "
+            "recorded integration; drop --preview, --all, --group and the "
+            "selectors."
+        )
     if selected(args) or args.group:
         if args.name:
             raise BridgeError(
@@ -1801,7 +1824,7 @@ def merged_lanes(
     return (
         bridge.preview_merge(repo, args.name)
         if preview
-        else bridge.merge(repo, args.name)
+        else bridge.merge(repo, args.name, renew=renew)
     )
 
 
@@ -3392,6 +3415,27 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     health.add_argument("--json", action="store_true", help=JSON_HELP)
     add_status_filters(health)
+    health.add_argument(
+        "--all",
+        action="store_true",
+        help="Also list claims whose issue or pull request ended on the forge.",
+    )
+    health.add_argument(
+        "--all-projects",
+        action="store_true",
+        help=(
+            "Report every project, not only the one the working directory "
+            "belongs to, with dormant projects listed last."
+        ),
+    )
+    health.add_argument(
+        "--table",
+        action="store_true",
+        help=(
+            "Print the full per-lane table instead of the open-work view. "
+            "Any lane filter or a named participant prints it too."
+        ),
+    )
     commands.add_parser(
         "title",
         help=(
@@ -4279,6 +4323,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         command.add_argument("--repo", type=Path, default=Path.cwd())
         if action == "merge":
             command.add_argument("--preview", action="store_true")
+            command.add_argument(
+                "--renew-recovery",
+                action="store_true",
+                help=(
+                    "Grant the named lane's recorded unverified integration "
+                    "a fresh set of attempts, then retry it. Accepted only "
+                    "from the base checkout."
+                ),
+            )
+            command.add_argument(
+                "--verify-recovery",
+                action="store_true",
+                help=(
+                    "Run the recorded gate on the base checkout as it stands "
+                    "and clear the unverified-integration record only if it "
+                    "passes and leaves the tree clean. Merges nothing; "
+                    "accepted only from the base checkout."
+                ),
+            )
             scope = command.add_mutually_exclusive_group()
             scope.add_argument(
                 "--all",
@@ -4627,12 +4690,19 @@ def root_parser(
 
 
 def _plain_status() -> int:
-    """Runs the unfiltered status command without building its parser."""
+    """Runs the bare status command without building its parser.
+
+    The reading is the open-work view scoped to the project the working
+    directory belongs to, or every live project outside any project.
+    """
     home = Path(
         os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
     )
     try:
-        Bridge(home).status(Selection(), terminal_width())
+        bridge = Bridge(home)
+        bridge.board(
+            Selection(project=bridge.project_at(Path.cwd())), terminal_width()
+        )
     except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(f"agent-parley: {exc}", file=sys.stderr)
         return 1
@@ -5494,7 +5564,23 @@ def main() -> int:
                 print(views.render("status", narrowed))
                 matched = reported_lanes(narrowed)
             else:
-                matched = bridge.status(selection, terminal_width())
+                every_project = getattr(args, "all_projects", False)
+                if not selection.project and not every_project:
+                    selection = selection._replace(
+                        project=bridge.project_at(Path.cwd())
+                    )
+                if (
+                    getattr(args, "table", False)
+                    or selection._replace(project="").filtered()
+                ):
+                    matched = bridge.status(selection, terminal_width())
+                else:
+                    matched = bridge.board(
+                        selection,
+                        terminal_width(),
+                        every_claim=getattr(args, "all", False),
+                        every_project=every_project,
+                    )
             if matched and (
                 selection.drifted or selection.pending or selection.over_budget
             ):
@@ -5507,7 +5593,37 @@ def main() -> int:
         subprocess.TimeoutExpired,
     ) as exc:
         print(f"agent-parley: {exc}", file=sys.stderr)
+        if getattr(args, "json", False):
+            print(_error_document(exc))
         return 1
+
+
+def _error_document(exc: Exception) -> str:
+    """Frames one runtime failure as a single-line JSON error document.
+
+    The document carries the shared snapshot envelope with ``kind`` set to
+    ``error``, a stable ``type`` for the exception class and the same
+    ``message`` the human line prints. It fits on one line so it stays a
+    separate record after any partial output a command already wrote.
+
+    Args:
+        exc: Failure the command handler caught.
+
+    Returns:
+        The error document as compact JSON text, without a trailing newline.
+    """
+    if isinstance(exc, BridgeError):
+        kind = "bridge"
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        kind = "timeout"
+    elif isinstance(exc, OSError):
+        kind = "os"
+    else:
+        kind = "value"
+    return json.dumps(
+        views.document("error", {"error": {"type": kind, "message": str(exc)}}),
+        ensure_ascii=False,
+    )
 
 
 if __name__ == "__main__":

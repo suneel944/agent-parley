@@ -181,8 +181,17 @@ lane. The supervision key `titles` turns the tab title off; the details are in
 
 ## `status`
 
-`status` prints the server line, the code line, the state directory and then one
-table per project, a row per participant: ownership, activity and outcomes.
+`status` prints the server line, the code line, the state directory and then,
+per project, the open work: each live claim's issue, title, owner, lane state,
+last event and pull request, then one line per lane with its state, live claim
+count and current task. Inside a project checkout it reports that project only;
+`--all-projects` adds the rest, dormant ones last, and `--all` adds claims whose
+issue is closed or whose pull request ended. Titles and open state come from a
+bounded read of the forge's open issues, cached for 300 seconds in the project
+state directory; a failed read falls back to that cache with one `Forge:` line.
+`--json` stays the complete reading of every
+project. `status --table` prints one table per project, a row per participant:
+ownership, activity and outcomes.
 
 <p align="center">
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">

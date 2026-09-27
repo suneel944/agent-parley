@@ -155,7 +155,7 @@ tells the lanes apart; the supervision key `titles` turns this off.
 Then watch the work, and steer a lane without taking over its terminal:
 
 ```sh
-agent-parley status   # one table per project: ownership, activity, outcomes
+agent-parley status   # this project's open work: issue, owner, state, PR
 agent-parley top      # every lane live, including what enforcement denied
 agent-parley problems # only what needs you now, oldest first
 agent-parley say claude-2 "Rebase onto main before you open the pull request."

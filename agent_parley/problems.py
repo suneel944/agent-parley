@@ -29,6 +29,7 @@ from pathlib import Path
 from agent_parley import (
     dialogs,
     issues,
+    merges,
     recovery,
     roster,
     store,
@@ -60,6 +61,7 @@ READY = "ready to retire"
 HOLDING = "holding a refused key"
 FOREIGN = "second session"
 REFUSED = "recovery refused"
+INTEGRATION = "integration unverified"
 ROOT = "root missing"
 
 BY_OPERATOR = "operator"
@@ -920,6 +922,54 @@ def _refused_rows(directory: Path, root: str, now: float) -> list[dict]:
     return rows
 
 
+def _integration_rows(directory: Path, root: str, now: float) -> list[dict]:
+    """Reports the integration the project's base has not verified.
+
+    The record is one per project, so this is the single escalation an
+    unverified base raises, on the lane that may repair it and with the
+    command that moves it on. A conflict whose merge was aborted leaves the
+    base as verified before the attempt, so it raises no row here; its claim
+    carries the repair state instead.
+
+    Args:
+        directory: Private project state directory.
+        root: Canonical project key, which is the base checkout's path.
+        now: Unix time the record's age is measured against.
+
+    Returns:
+        One row while the base carries an unverified integration, or none.
+    """
+    try:
+        held = merges.integration_record(directory)
+    except BridgeError as unreadable:
+        return [
+            _row(
+                INTEGRATION,
+                str(unreadable),
+                "inspect the record the detail names",
+                project=root,
+            )
+        ]
+    if held is None:
+        return []
+    with contextlib.suppress(BridgeError, OSError):
+        if not merges.integration_holds(Path(root), held):
+            return []
+    owner = merges.integration_owner(directory, held)
+    result = held["result"][:12] or "an unfinished merge"
+    return [
+        _row(
+            INTEGRATION,
+            f"{held['kind']} at {result}, attempt {held['attempt']} of "
+            f"{held['limit']}: {held['detail'] or 'no gate result recorded'}",
+            merges.integration_remedy(Path(root), held, owner),
+            _age(held.get("recorded_at"), now),
+            owner or str(held["lane"]),
+            root,
+        )
+    ]
+
+
 def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
     """Reports a project whose root checkout is gone, naming the lanes kept.
 
@@ -1030,6 +1080,7 @@ def derive(
         aged.extend(_bounce_rows(home, directory, data, project, config))
         aged.extend(_retired_rows(home, project))
         aged.extend(_refused_rows(directory, project["root"], stamp))
+        aged.extend(_integration_rows(directory, project["root"], stamp))
         aged.extend(_root_rows(directory, project["root"], stamp))
     aged.sort(key=lambda row: -(row["seconds"] or 0))
     return rows + aged
