@@ -190,15 +190,140 @@ def test_proposals_left_behind_never_hold_open_places(
 def test_concurrent_proposals_on_one_version_apply_once(bridge, repo, paired):
     base = applied(bridge, repo)
     first = proposed(bridge, paired["lanes"]["claude"], base, add=["42:60"])
-    second = proposed(bridge, paired["lanes"]["codex"], base, add=["43:60"])
+    second = proposed(bridge, paired["lanes"]["codex"], base, add=["42:61"])
     assert bridge.plan_revision(repo, "approve", first["id"])["status"] == (
         "accepted"
     )
     with pytest.raises(BridgeError, match="already stale"):
         bridge.plan_revision(repo, "approve", second["id"])
-    assert ledger(bridge, repo)["43"]["blocked_by"] == ["17"]
+    assert ledger(bridge, repo)["42"]["blocked_by"] == ["17", "60"]
     with pytest.raises(BridgeError, match="plan is at version 2"):
         proposed(bridge, paired["lanes"]["codex"], base, add=["43:42"])
+
+
+def test_an_unrelated_acceptance_carries_open_proposals_forward(
+    bridge, repo, paired
+):
+    base = applied(bridge, repo)
+    held = proposed(bridge, paired["lanes"]["codex"], base, add=["42:60"])
+    overlapping = proposed(
+        bridge, paired["lanes"]["codex"], base, add=["43:61"]
+    )
+    accepted = proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    assert accepted["status"] == "accepted"
+    listing = {
+        item["id"]: item
+        for item in bridge.plan_revision(repo, "proposals")["proposals"]
+    }
+    assert listing[held["id"]]["status"] == "pending"
+    assert listing[held["id"]]["base"] == base + 1
+    assert "carried forward" in listing[held["id"]]["note"]
+    assert listing[overlapping["id"]]["status"] == "stale"
+    approved = bridge.plan_revision(repo, "approve", held["id"])
+    assert approved["status"] == "accepted"
+    assert ledger(bridge, repo)["42"]["blocked_by"] == ["17", "60"]
+
+
+def test_a_crash_after_the_ledger_write_is_finished_by_any_command(
+    bridge, repo, paired, monkeypatch
+):
+    base = applied(bridge, repo)
+    finish = plan._accept
+
+    def crash(*_args):
+        raise RuntimeError("killed between the two writes")
+
+    monkeypatch.setattr(plan, "_accept", crash)
+    with pytest.raises(RuntimeError):
+        proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    monkeypatch.setattr(plan, "_accept", finish)
+    assert ledger(bridge, repo)["43"]["blocked_by"] == ["17", "42"]
+    with pytest.raises(BridgeError, match="No revision proposal"):
+        bridge.plan_revision(repo, "reject", "0000000000000000")
+    listing = bridge.plan_revision(repo, "proposals")
+    assert listing["revision"] == base + 1
+    [record] = listing["proposals"]
+    assert record["status"] == "accepted"
+    assert "applying" not in record
+
+
+def test_an_apply_finishes_a_crashed_proposal_before_staling(
+    bridge, repo, paired, monkeypatch
+):
+    base = applied(bridge, repo)
+    finish = plan._accept
+
+    def crash(*_args):
+        raise RuntimeError("killed between the two writes")
+
+    monkeypatch.setattr(plan, "_accept", crash)
+    with pytest.raises(RuntimeError):
+        proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    monkeypatch.setattr(plan, "_accept", finish)
+    fresh = applied(bridge, repo)
+    assert fresh == base + 2
+    with pytest.raises(BridgeError, match="No revision proposal"):
+        bridge.plan_revision(repo, "reject", "0000000000000000")
+    listing = bridge.plan_revision(repo, "proposals")
+    assert listing["revision"] == fresh
+    assert listing["automatic"] == 0
+    [record] = listing["proposals"]
+    assert record["status"] == "accepted"
+    assert "applying" not in record
+    assert ledger(bridge, repo)["43"]["blocked_by"] == ["17", "42"]
+
+
+def test_a_crashed_approval_keeps_its_note_or_stays_open(
+    bridge, repo, paired, monkeypatch
+):
+    base = applied(bridge, repo)
+    record = proposed(bridge, paired["lanes"]["claude"], base, add=["42:60"])
+    assert record["status"] == "pending"
+
+    def crash(*_args):
+        raise RuntimeError("killed")
+
+    finish = plan._accept
+    monkeypatch.setattr(plan, "_settle", crash)
+    with pytest.raises(RuntimeError):
+        bridge.plan_revision(repo, "approve", record["id"], reason="ok")
+    monkeypatch.undo()
+    listing = bridge.plan_revision(repo, "proposals")
+    [still] = listing["proposals"]
+    assert still["status"] == "pending"
+    assert "60" not in ledger(bridge, repo)
+    monkeypatch.setattr(plan, "_accept", crash)
+    with pytest.raises(RuntimeError):
+        bridge.plan_revision(repo, "approve", record["id"], reason="ok")
+    monkeypatch.setattr(plan, "_accept", finish)
+    with pytest.raises(BridgeError, match="No revision proposal"):
+        bridge.plan_revision(repo, "reject", "0000000000000000")
+    [done] = bridge.plan_revision(repo, "proposals")["proposals"]
+    assert done["status"] == "accepted"
+    assert done["note"] == "ok"
+    assert "applying" not in done
+    assert ledger(bridge, repo)["42"]["blocked_by"] == ["17", "60"]
+
+
+def test_a_crash_before_the_ledger_write_withdraws_the_proposal(
+    bridge, repo, paired, monkeypatch
+):
+    base = applied(bridge, repo)
+
+    def crash(*_args):
+        raise RuntimeError("killed before the ledger write")
+
+    monkeypatch.setattr(plan, "_settle", crash)
+    with pytest.raises(RuntimeError):
+        proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    monkeypatch.undo()
+    with pytest.raises(BridgeError, match="No revision proposal"):
+        bridge.plan_revision(repo, "reject", "0000000000000000")
+    listing = bridge.plan_revision(repo, "proposals")
+    assert listing["proposals"] == []
+    assert listing["revision"] == base
+    record = proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    assert record["status"] == "accepted"
 
 
 def test_a_cycle_anywhere_in_the_result_is_refused(bridge, repo, paired):

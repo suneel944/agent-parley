@@ -405,6 +405,9 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
         lock(directory / "plan.lock", timeout=1),
         lock(directory / "issues.lock", timeout=1),
     ):
+        history = recorded(directory)
+        if _recover(directory, history):
+            write_json(directory / PLAN, history)
         state = snapshot(directory)
         added = []
         approved = set(document["dependencies"])
@@ -458,7 +461,6 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
             "envelope": document["envelope"],
             "added": sorted(added),
         }
-        history = recorded(directory)
         history["versions"] = [*history["versions"], version][-MAX_VERSIONS:]
         history["revision"] += 1
         history.update(automatic=0, flips={})
@@ -831,7 +833,7 @@ def _accept(history: dict, proposal: dict, operator: bool) -> None:
         decided_at=now,
         version=history["revision"],
     )
-    _expire(history)
+    _expire(history, proposal)
 
 
 def _retain(history: dict) -> None:
@@ -844,29 +846,88 @@ def _retain(history: dict) -> None:
         del proposals[key]
 
 
-def _expire(history: dict) -> None:
-    """Marks every open proposal written against an older version stale.
+def _expire(history: dict, accepted: dict | None = None) -> None:
+    """Settles open proposals written against an older plan version.
 
-    Approval refuses such a proposal anyway, so leaving it open would only
-    hold one of the `MAX_PENDING` places and keep it in the problems view
-    until the operator decided something that can no longer apply.
+    Approval refuses a proposal whose base is not the current version, so
+    one left on an older base would only hold a `MAX_PENDING` place. After
+    a whole plan is applied every such proposal is marked stale. After one
+    proposal is accepted, only open proposals that change the waits of an
+    issue it changed are marked stale; the others are carried to the new
+    version with a note, because approval validates the whole resulting
+    graph again and an unrelated acceptance cannot invalidate them.
+
+    Args:
+        history: Recorded plan versions, updated in place.
+        accepted: The proposal just accepted, or None after a plan apply.
     """
     now = time.time()
+    touched = (
+        None
+        if accepted is None
+        else {change["issue"] for change in accepted["changes"]}
+    )
     for item in history.get("proposals", {}).values():
-        if item["status"] in OPEN and item["base"] != history["revision"]:
+        if item["status"] not in OPEN or item["base"] == history["revision"]:
+            continue
+        moved = (
+            f"the plan moved from version {item['base']} to "
+            f"{history['revision']}"
+        )
+        if touched is None or touched & {
+            change["issue"] for change in item["changes"]
+        }:
             item.update(
                 status=STALE,
                 decided_at=now,
-                note=(
-                    f"the plan moved from version {item['base']} to "
-                    f"{history['revision']}; propose again against it"
-                ),
+                note=f"{moved}; propose again against it",
+            )
+        else:
+            item.update(
+                base=history["revision"],
+                note=f"{moved} by an unrelated revision; carried forward",
             )
 
 
 def _landed(directory: Path, identity: str) -> bool:
     """Reports whether the ledger already holds one proposal's changes."""
     return identity in snapshot(directory).get("plan_revisions", [])
+
+
+def _recover(directory: Path, history: dict) -> bool:
+    """Finishes or withdraws settlements a crash interrupted.
+
+    `propose` and `decide` mark a proposal `applying` in the plan history
+    before they write the ledger, so a crash between the two writes never
+    leaves ledger edges without a proposal record. A mark found later means
+    the process stopped in that window. When the ledger holds the proposal
+    it is accepted now, with the operator's decision note the mark kept.
+    Otherwise nothing landed: a new proposal is withdrawn for its lane to
+    file again, and a decided one stays open. `apply` recovers first too,
+    so a new plan version never stales a proposal the ledger already holds.
+
+    Args:
+        directory: Private state directory for the common repository.
+        history: Recorded plan versions, updated in place. The caller holds
+            the plan lock.
+
+    Returns:
+        Whether anything changed, so the caller writes the history.
+    """
+    proposals = history.get("proposals", {})
+    changed = False
+    for identity, item in list(proposals.items()):
+        mark = item.pop("applying", None)
+        if mark is None:
+            continue
+        changed = True
+        if _landed(directory, identity):
+            _accept(history, item, mark["operator"])
+            if "note" in mark:
+                item["note"] = mark["note"]
+        elif mark["new"]:
+            del proposals[identity]
+    return changed
 
 
 def propose(
@@ -920,6 +981,8 @@ def propose(
     with lock(directory / "plan.lock", timeout=1):
         history = recorded(directory)
         proposals = history.setdefault("proposals", {})
+        if _recover(directory, history):
+            write_json(directory / PLAN, history)
         if identity in proposals:
             return {**proposals[identity], "replayed": True}
         if identity in history.get("accepted", []):
@@ -955,15 +1018,27 @@ def propose(
         if landed:
             _accept(history, proposal, by == roster.OPERATOR)
         else:
-            _settle(directory, history, proposal, by == roster.OPERATOR)
-        if proposal["status"] in OPEN and (
-            sum(item["status"] in OPEN for item in proposals.values())
-            >= MAX_PENDING
-        ):
-            raise BridgeError(
-                f"{MAX_PENDING} revision proposals already await the "
-                "operator; nothing was recorded."
-            )
+            waiting = sum(item["status"] in OPEN for item in proposals.values())
+            proposal["applying"] = {
+                "operator": by == roster.OPERATOR,
+                "new": True,
+            }
+            proposals[identity] = proposal
+            write_json(directory / PLAN, history)
+            try:
+                _settle(directory, history, proposal, by == roster.OPERATOR)
+            except BridgeError:
+                del proposals[identity]
+                write_json(directory / PLAN, history)
+                raise
+            del proposal["applying"]
+            if proposal["status"] in OPEN and waiting >= MAX_PENDING:
+                del proposals[identity]
+                write_json(directory / PLAN, history)
+                raise BridgeError(
+                    f"{MAX_PENDING} revision proposals already await the "
+                    "operator; nothing was recorded."
+                )
         proposals[identity] = proposal
         _retain(history)
         write_json(directory / PLAN, history)
@@ -1002,6 +1077,8 @@ def decide(directory: Path, identity: str, approve: bool, note: str) -> dict:
     wanted = ACCEPTED if approve else REJECTED
     with lock(directory / "plan.lock", timeout=1):
         history = recorded(directory)
+        if _recover(directory, history):
+            write_json(directory / PLAN, history)
         proposal = history.get("proposals", {}).get(identity)
         if proposal is None:
             raise BridgeError(
@@ -1035,13 +1112,22 @@ def decide(directory: Path, identity: str, approve: bool, note: str) -> dict:
                 ),
             )
         else:
+            proposal["applying"] = {
+                "operator": True,
+                "new": False,
+                "note": note,
+            }
+            write_json(directory / PLAN, history)
             try:
                 _settle(directory, history, proposal, True)
                 proposal["note"] = note
             except Transient:
+                del proposal["applying"]
+                write_json(directory / PLAN, history)
                 raise
             except BridgeError as exc:
                 proposal.update(settled, status=REJECTED, note=str(exc))
+            proposal.pop("applying", None)
         write_json(directory / PLAN, history)
     return {**proposal, "replayed": False}
 
