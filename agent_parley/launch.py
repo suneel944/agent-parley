@@ -312,8 +312,13 @@ reported.
             )
         import asyncio
 
+        from agent_parley.merges import launch_busy
+
         lane = Path(participant["lane"])
-        with lock(lane.parent / f"{agent}.session.lock"):
+        with lock(
+            lane.parent / f"{agent}.session.lock",
+            launch_busy(lane.parent, agent),
+        ):
             self.up()
             identity = asyncio.run(self.identity(agent, data))
             prompt = self.protocol(agent, data)

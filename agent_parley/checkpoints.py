@@ -172,6 +172,7 @@ class Reason(StrEnum):
     SESSION_MISMATCH = "session_mismatch"
     BRANCH_OK = "branch_ok"
     BRANCH_RESTORE = "branch_restore"
+    BRANCH_REBASE = "branch_rebase"
     BRANCH_DRIFT = "branch_drift"
     BRANCH_SWITCH = "branch_switch"
     OBSERVED = "observed"
@@ -1596,6 +1597,34 @@ def _git_directory(lane: Path) -> Path | None:
     return directory if directory.is_absolute() else lane / directory
 
 
+def rebasing_branch(lane: Path) -> str:
+    """Names the branch an in-progress rebase will end on, if any.
+
+    Git detaches ``HEAD`` while a rebase runs and records the branch it
+    started from in ``rebase-merge/head-name`` or ``rebase-apply/head-name``
+    of the checkout's administrative directory. Both ``--continue`` and
+    ``--abort`` return to that branch.
+
+    Args:
+        lane: Assigned bridge worktree.
+
+    Returns:
+        The rebased branch name, or an empty string when no rebase of a
+        local branch is in progress or its metadata is unreadable.
+    """
+    directory = _git_directory(lane)
+    if directory is None:
+        return ""
+    for state in ("rebase-merge", "rebase-apply"):
+        try:
+            head = (directory / state / "head-name").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        if head.startswith("refs/heads/"):
+            return head.removeprefix("refs/heads/")
+    return ""
+
+
 def head_moves(lane: Path) -> int:
     """Measures how often a lane's ``HEAD`` has moved, without running Git.
 
@@ -1834,6 +1863,29 @@ def branch_guard(
         exact repair command remains available after drift.
     """
     actual = current_branch(lane)
+    if actual == "<detached HEAD>" and rebasing_branch(lane) == expected:
+        message = (
+            f"Agent Parley lane is rebasing {expected!r}. Finish with "
+            "`git rebase --continue` or undo with `git rebase --abort` "
+            "before ending the turn."
+        )
+        if event == "PreToolUse":
+            return None, Reason.BRANCH_REBASE
+        if event == "Stop":
+            if payload.get("stop_hook_active"):
+                return {}, Reason.BRANCH_REBASE
+            return {
+                "decision": "block",
+                "reason": message,
+            }, Reason.BRANCH_REBASE
+        if event != "SessionEnd":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": event,
+                    "additionalContext": message,
+                }
+            }, Reason.BRANCH_REBASE
+        return {}, Reason.BRANCH_REBASE
     if actual != expected:
         missing = not branch_exists(lane, expected)
         rename_from = actual if missing and actual != "<detached HEAD>" else ""

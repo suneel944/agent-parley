@@ -2487,7 +2487,17 @@ agent-parley participant retire claude-1
 
 A lane that ends a session on the wrong branch, or on a detached HEAD, blocks
 only its own participant; every other lane still launches. `status` prints the
-actual branch whenever it differs from the assigned one.
+actual branch whenever it differs from the assigned one. A rebase of the lane's
+own branch is not drift: Git detaches HEAD while it runs, but both
+`git rebase --continue` and `git rebase --abort` end on the assigned branch, so
+the lane keeps its tools and is only asked to finish or abort before ending
+the turn.
+
+When `run` finds the lane's session lock held by a live launcher, it names the
+launcher and client processes, when the session started and its last activity,
+and prints `agent-parley participant stop <lane>`. That session may have been
+resumed by the service with no terminal attached, so retrying cannot succeed
+until it ends.
 
 `participant restore` returns one lane to its bridge branch. It refuses while
 that participant has a running session, refuses on an uncommitted change, and
