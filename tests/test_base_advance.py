@@ -81,7 +81,7 @@ def test_a_base_commit_on_a_reserved_path_marks_the_lane_and_notifies(
     marker = rows["claude"]["base_advance"]
     assert marker.startswith("base advanced over held path shared.txt")
     assert "nothing was rebased" in marker
-    assert any(line == f"    {marker}" for line in dashboard.render(view))
+    assert f"! claude  {marker}" in dashboard.render(view)
     bridge.status(cli.Selection(participant="claude"))
     assert marker in capsys.readouterr().out
     bridge.status(cli.Selection(participant="codex"))
@@ -102,6 +102,19 @@ def test_a_base_commit_on_a_reserved_path_marks_the_lane_and_notifies(
     context = again["hookSpecificOutput"]["additionalContext"]
     assert "notes.md, shared.txt" in context
     assert hook(bridge, paired, "claude") == {}
+
+
+def test_every_lane_behind_the_base_is_read_with_its_own_paths(
+    bridge, repo, paired
+):
+    reserve(bridge, paired["root"], "claude", "first.txt")
+    reserve(bridge, paired["root"], "codex", "second.txt")
+    commit(repo, "first.txt", "one\n")
+    commit(repo, "second.txt", "two\n")
+    assert supervision.base_advances(bridge.home, paired) == {
+        "claude": ["first.txt"],
+        "codex": ["second.txt"],
+    }
 
 
 def test_a_base_advance_over_no_held_path_is_silent(bridge, repo, paired):

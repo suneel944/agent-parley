@@ -2,6 +2,7 @@
 
 import contextlib
 import curses
+import functools
 import shutil
 import sqlite3
 import sys
@@ -13,6 +14,7 @@ from typing import Any
 from agent_parley import (
     approvals,
     budgets,
+    lanes,
     metrics,
     plan,
     process,
@@ -30,6 +32,7 @@ from agent_parley.checkpoints import (
     lane_branch,
     mailbox,
     participant_liveness,
+    read_events,
 )
 from agent_parley.issues import deadline_state, snapshot
 from agent_parley.state import BridgeError
@@ -51,8 +54,24 @@ COLUMNS = (
     ("CALLS", 9),
     ("TOKENS", 9),
     ("IDLE", 8),
+    ("UNUSED", 7),
     ("FIT", 8),
+    ("TASK", 4),
 )
+DEFAULT_COLUMNS = (
+    "PARTICIPANT",
+    "STATE",
+    "BRANCH",
+    "ISSUES",
+    "MAIL",
+    "LEASES",
+    "DENIALS",
+    "TOKENS",
+    "IDLE",
+    "TASK",
+)
+FLEX = ("STATE", "TASK")
+ONCE_HINT = "Live view: top without --once; ? explains each column."
 DROP_ORDER = (
     "PROVIDER",
     "EVENT",
@@ -60,6 +79,8 @@ DROP_ORDER = (
     "CONTEXT",
     "CALLS",
     "TOKENS",
+    "UNUSED",
+    "TASK",
     "LEASES",
     "FIT",
     "IDLE",
@@ -82,7 +103,11 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "CALLS": lambda row: -row["calls"],
     "TOKENS": lambda row: -(row["tokens"] or 0),
     "IDLE": lambda row: -row["idle_seconds"],
+    "UNUSED": lambda row: (
+        -(row.get("accounting") or {}).get("idle_per_lane_hour", -1.0)
+    ),
     "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
+    "TASK": lambda row: row["prompt"],
 }
 KEYS = (
     ("j, down", "select the next lane, paging when it is past the fold"),
@@ -92,27 +117,35 @@ KEYS = (
     ("r", "reverse the order"),
     ("f", "narrow to participants, comma separated; empty clears"),
     ("o", "narrow to projects, comma separated; empty clears"),
-    ("c", "show these columns, comma separated; empty shows all"),
+    ("c", "show these columns; empty is the default set, all is every one"),
+    ("a", "show or hide stopped lanes and projects whose root is gone"),
     ("P", "every lane, claim and store problem, oldest first, in place"),
     ("?", "this key map and the column legend"),
     ("q", "leave; this view never writes state"),
 )
 LEGEND = (
-    "A lane marked idle is alive, has served no coordination call within "
-    "the configured interval, and holds unread or unacknowledged mail at "
-    "least that old; the line under it names the oldest waiting item. The "
-    "marker only reports: nothing is revoked and no ownership moves.",
+    "Each lane is one row. A lane that needs you also gets one line in the "
+    "notes under the table, marked with !, so the table stays one row per "
+    "lane and a monochrome pipe reads the same as colour.",
+    "STATE idle means the lane is alive, has served no coordination call "
+    "within the configured interval, and holds mail at least that old; its "
+    "note names the oldest waiting item. Nothing is revoked and no ownership "
+    "moves.",
     "An issue marked ! is past its recorded deadline or its attempt "
-    "budget. It is still owned: a deadline reports, and only an explicit "
-    "release or an accepted handoff moves ownership.",
+    "budget. It stays owned while its holder works; a holder that has run "
+    "no tool past the inactivity window is woken, then the issue is offered "
+    "to a peer, then released.",
     "An issue marked * is held by a lane whose session process is gone and "
-    "which has been silent past the stall threshold; the line under it "
-    "names those claims and the reservations that lane still holds. It is "
-    "still owned until a peer runs issue claim --take-orphaned.",
-    "A lane with a token, call or hour budget carries a line showing the "
-    "share consumed; over budget marks a crossed limit with !. The budget "
-    "informs and does not gate: nothing is stopped or refused, and a token "
+    "which has been silent past the stall threshold; its note names those "
+    "claims and the reservations that lane still holds. It is still owned "
+    "until a peer runs issue claim --take-orphaned.",
+    "A lane over a token, call or hour budget gets a note naming the "
+    "crossed limit. The lane budget informs and does not gate, and a token "
     "budget counts what the client recorded, not spend.",
+    "TASK is the lane's last prompt or recorded task, clipped to the "
+    "terminal; enter shows it whole. The default columns leave out "
+    "PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and FIT; c or "
+    "--columns all shows them.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, +queued requests waiting on those "
     "keys, with the age of the oldest; DENIALS "
@@ -124,14 +157,17 @@ LEGEND = (
     "turn ends, with + when the window reaches past what retention kept. "
     "IDLE says how long a lane went without coordination activity; it "
     "does not claim to know what the native client was doing inside a "
-    "turn. A branch marked ! left "
+    "turn. UNUSED is the lane state accounting: idle lane-minutes per "
+    "observed lane-hour, then unaccountable claim-minutes, blank before "
+    "the first poll accounts the lane. A branch marked ! left "
     "its assigned bridge branch. A lease past a declared time to live is "
     "counted apart from the live ones and still held: it keeps blocking "
     "until its holder renews it at a checkpoint or releases it, and the "
     "runtime reclaims it for the first queued lane once no live session is "
     "observed for that holder or the expiry grace has run out.",
     "FIT is the last capacity check the runtime read for that lane, with "
-    "+ when an advisory work offer is waiting for it; the line under an "
+    "+ and the offer's kind, such as fit+split or fit+pull, when an "
+    "advisory work offer is waiting for it; the note for an "
     "unfit lane names the check that failed, and no offer names that "
     "lane. A blank cell means nothing was published for it yet. An offer "
     "claims nothing and transfers nothing.",
@@ -146,10 +182,8 @@ LEGEND = (
     "size is never counted here, only the reference that named it.",
     "A row carrying drift, a stale lease, a rejected call, an overdue or "
     "orphaned issue or a stopped session is drawn in colour where the "
-    "terminal "
-    "offers it and in bold where it does not. Every one of those also "
-    "carries its own ! or word in the table, so a monochrome pipe reads "
-    "exactly the same.",
+    "terminal offers it and in bold where it does not. Every one of those "
+    "also carries its own ! or word in the table.",
 )
 
 
@@ -181,6 +215,21 @@ def _tokens(count: int | None) -> str:
     return f"{count / 1000000:.1f}M"
 
 
+def _unused(report: dict | None) -> str:
+    """Formats a lane's accounting as idle per lane-hour and claim minutes.
+
+    Args:
+        report: The lane's `lanes.summary`, or None before any accounting.
+
+    Returns:
+        Idle lane-minutes per lane-hour and unaccountable claim-minutes
+        separated by a slash, or `-` when the lane was never accounted.
+    """
+    if report is None:
+        return "-"
+    return f"{report['idle_per_lane_hour']}/{report['unaccountable_minutes']}"
+
+
 def _fitness(row: dict) -> str:
     """Formats a lane's fit result and whether a work offer is pending.
 
@@ -188,12 +237,37 @@ def _fitness(row: dict) -> str:
         row: Assembled participant row.
 
     Returns:
-        The fit result, marked when an advisory work offer is waiting for the
-        lane. An empty cell states that nothing was published for this lane
-        rather than that it is unfit.
+        The fit result, followed by ``+`` and the offer's kind when an
+        advisory work offer is waiting for the lane. An empty cell states
+        that nothing was published for this lane rather than that it is
+        unfit.
     """
     value = "" if row["fit"] is None else "fit" if row["fit"] else "unfit"
-    return value + ("+" if row["work_offer"] else "")
+    if not row["work_offer"]:
+        return value
+    return f"{value}+{row.get('offer_kind', '')}"
+
+
+def _cached(cache: dict, key: object, read: Callable[[], Any]) -> Any:
+    """Runs a Git reading at most once per branch refresh interval.
+
+    Args:
+        cache: Caller-owned mapping of key to its last reading.
+        key: What the reading is about, such as a lane or a project root.
+        read: Produces a fresh reading.
+
+    Returns:
+        The last reading when it is younger than ``BRANCH_TTL``, otherwise a
+        fresh one. Git subprocesses dominate a frame, so a live view pays for
+        them on this interval instead of on every redraw.
+    """
+    now = time.monotonic()
+    cached = cache.get(key)
+    if cached and now - cached[0] < BRANCH_TTL:
+        return cached[1]
+    value = read()
+    cache[key] = (now, value)
+    return value
 
 
 def _branch(lane: Path, cache: dict) -> str:
@@ -206,14 +280,41 @@ def _branch(lane: Path, cache: dict) -> str:
     Returns:
         The lane's branch name or an unavailable marker.
     """
-    key = str(lane)
-    now = time.monotonic()
-    cached = cache.get(key)
-    if cached and now - cached[0] < BRANCH_TTL:
-        return str(cached[1])
-    value = lane_branch(lane)
-    cache[key] = (now, value)
-    return value
+    return str(_cached(cache, str(lane), lambda: lane_branch(lane)))
+
+
+def dormant(row: dict) -> bool:
+    """Reports whether a lane is stopped and holds nothing to act on.
+
+    Args:
+        row: Participant row produced by ``collect``.
+
+    Returns:
+        True when the lane is retired or out of a live state and it owns no
+        issue, holds no offer, holds or waits on no lease, has no unread or
+        unacknowledged mail, and no ready report awaits the operator. A lane
+        with a state record is live while that record is in `lanes.LIVE`; a
+        lane without one falls back to its session cell reading stopped. A
+        mailbox or lease store that could not be read is not dormant, so a
+        failed reading stays on screen.
+    """
+    recorded = row.get("lane_state")
+    ended = (
+        recorded not in lanes.LIVE
+        if recorded
+        else str(row["state"]).startswith("stopped")
+    )
+    return (
+        (str(row["state"]).startswith("retired") or ended)
+        and not row["owned"]
+        and not row["offers"]
+        and not row["awaiting_approval"]
+        and row.get("usage_read", True)
+        and not row["leases"]
+        and not row["queued"]
+        and row["unread"] == 0
+        and row["pending_ack"] == 0
+    )
 
 
 def _awaiting_approval(directory: Path, data: dict, agent: str) -> bool:
@@ -262,7 +363,11 @@ def _row(
     """
     participant = data["participants"][agent]
     state = activity(directory, agent)
-    events = event_summary(directory, agent, context["since"])
+    try:
+        entries = read_events(directory, agent, context["since"])
+    except BridgeError:
+        entries = None
+    events = event_summary(directory, agent, context["since"], entries)
     stats = context["usage"].get(participant["display"], {})
     issues = context["issues"]["issues"]
     owned = sorted(
@@ -299,11 +404,18 @@ def _row(
     except (BridgeError, OSError, sqlite3.Error):
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
-    liveness = participant_liveness(directory, agent, context["inactive_after"])
+    condition = context.get("conditions", {}).get(agent)
+    liveness = (
+        lanes.describe(condition)
+        if condition
+        else participant_liveness(directory, agent, context["inactive_after"])
+    )
     stalled = supervision.stall(
         home, directory, data, agent, context["stalled_after"]
     )
-    idle = metrics.idle_intervals(directory, agent, context["since"])
+    idle = metrics.idle_intervals(
+        directory, agent, context["since"], entries=entries
+    )
     published = supervision.published_work(directory, agent)
     edited = context["operator_edits"].get(agent, [])
     advanced = context["base_advances"].get(agent, [])
@@ -326,16 +438,17 @@ def _row(
             liveness,
             participant.get("paused", False),
             stalled["stalled"],
-            stalled["age_seconds"],
+            tables.idle_age(stalled),
             (
                 time.time() - float(participant["retired"])
                 if roster.retired(participant)
                 else None
             ),
         ),
+        "lane_state": condition["state"] if condition else None,
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
-        "stall_age": stalled["age_seconds"] if stalled["stalled"] else 0,
+        "stall_age": tables.idle_age(stalled) if stalled["stalled"] else 0,
         "operator_edits": edited,
         "operator_edit": supervision.operator_edit_marker(edited),
         "base_advance_paths": advanced,
@@ -367,6 +480,7 @@ def _row(
         "unread": mail.get("unread", "?"),
         "superseded": mail.get("superseded", "?"),
         "pending_ack": mail.get("pending_ack", "?"),
+        "usage_read": context.get("usage_read", True),
         "leases": stats.get("leases", 0),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
@@ -376,6 +490,7 @@ def _row(
         "injected_bytes": events["injected_bytes"],
         "hook_events": events["events"],
         "denials": events["denials"],
+        "denied_by": events.get("denied_by", []),
         "calls": stats.get("calls", 0),
         "errors": stats.get("errors", 0),
         "tokens": records.reported_tokens(
@@ -383,6 +498,11 @@ def _row(
         ),
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
+        "accounting": (
+            lanes.summary(context["accounts"][agent])
+            if agent in context["accounts"]
+            else None
+        ),
         "budget": budget,
         "over_budget": budget["over"],
         "budget_marker": budgets.marker(budget),
@@ -465,7 +585,9 @@ def collect(
     Args:
         home: Private bridge state root.
         running: Whether the recorded coordination server process is alive.
-        branches: Caller-owned branch cache, refreshed on its own interval.
+        branches: Caller-owned cache of Git readings, each lane branch and
+            each project's operator edits and base advances, refreshed on
+            its own interval. A project whose root is gone is not read.
         providers: Provider names to report; every provider when empty. A
             project keeps its heading once it holds a selected participant, so
             an operator can tell an emptied selection from an empty project.
@@ -480,10 +602,13 @@ def collect(
             repository whose base checkout is always dirty.
 
     Returns:
-        Server health, per-project participant rows, the plan groups whose
-        every member is reported ready, and totals over the reported rows, so
-        a header never counts a participant the table does not show.
+        Server health, per-project participant rows with whether the
+        project's root still exists, the plan groups whose every member is
+        reported ready, totals over the reported rows, so a header never
+        counts a participant the table does not show, and how many seconds
+        the reading took.
     """
+    started = time.monotonic()
     since = time.time() - window if window else 0.0
     cache = {} if readings is None else readings
     projects = []
@@ -492,23 +617,44 @@ def collect(
             data = roster.read(path.parent)
         except (BridgeError, OSError, ValueError):
             continue
+        if supervision.root_retired(path.parent):
+            continue
         try:
             usage = store.usage(home, data["root"])
+            usage_read = True
         except sqlite3.Error:
             usage = {}
+            usage_read = False
         supervised = supervision.configuration(home, data)
+        present = Path(data["root"]).is_dir()
+        edits, advances = (
+            _cached(
+                branches,
+                ("readings", data["root"]),
+                functools.partial(supervision.readings, home, data),
+            )
+            if present
+            else ({}, {})
+        )
+        try:
+            with store.connect(home) as db:
+                accounts = lanes.read_accounts(db, data["root"])
+                conditions = lanes.read_all(db, data["root"])
+        except (BridgeError, OSError, sqlite3.Error):
+            accounts, conditions = {}, {}
         context = {
+            "accounts": accounts,
+            "conditions": conditions,
             "usage": usage,
+            "usage_read": usage_read,
             "issues": snapshot(path.parent),
             "branches": branches,
             "records": cache,
             "since": since,
             "stalled_after": supervised["stalled_after"],
             "inactive_after": supervised["inactive_after"],
-            "operator_edits": (
-                supervision.operator_edits(home, data) if operator_edits else {}
-            ),
-            "base_advances": supervision.base_advances(home, data),
+            "operator_edits": edits if operator_edits else {},
+            "base_advances": advances,
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -519,6 +665,7 @@ def collect(
         projects.append(
             {
                 "root": data["root"],
+                "present": present,
                 "rows": rows,
                 "ready_groups": plan.ready_groups(
                     plan.groups(path.parent),
@@ -534,6 +681,7 @@ def collect(
         "totals": _totals(projects),
         "providers": list(providers),
         "window": window,
+        "read_seconds": time.monotonic() - started,
     }
 
 
@@ -581,7 +729,7 @@ def _cells(row: dict) -> tuple[str, ...]:
     return (
         row["participant"],
         row["provider"],
-        row["state"],
+        state_cell(row),
         row["event_age"],
         row["branch"] + ("!" if row["drift"] else ""),
         row["review"] or "-",
@@ -596,8 +744,76 @@ def _cells(row: dict) -> tuple[str, ...]:
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         _tokens(row["tokens"]),
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
+        _unused(row.get("accounting")),
         _fitness(row),
+        row["prompt"] or "-",
     )
+
+
+def state_cell(row: dict) -> str:
+    """Names a lane's state in one short cell, the way top names a process.
+
+    Args:
+        row: Participant row produced by ``collect``.
+
+    Returns:
+        The session cell, cut to ``idle 3m`` or ``paused`` when it leads
+        with one of those and the lane is still live. A live reading after
+        a pause or an idle age is one that state already outranks, and
+        ``detail`` keeps the whole cell. A stopped session or one whose
+        hooks cannot be read is kept, as in ``paused; stopped``, because
+        it changes what the operator should do. Any other cell, such as
+        ``running; no hooks``, is one state and is kept whole.
+    """
+    state = str(row["state"])
+    head, _, tail = state.partition("; ")
+    live = not tail.startswith("stopped") and not any(
+        blind in tail for blind in ("no hooks", "checkpoints unavailable")
+    )
+    short = head == "paused" or head.startswith("idle ")
+    return head if short and live else state
+
+
+def notes(row: dict) -> list[str]:
+    """Collects the warnings a lane carries, one line each.
+
+    Args:
+        row: Participant row produced by ``collect``.
+
+    Returns:
+        The branch drift, rejected call, stall, operator edit, base
+        advance, orphan, budget, fitness, work offer, failed review and
+        escalated dispatch markers the lane holds, in that order. The note
+        row already names the lane, so a fitness reason drops its own copy
+        of the name. Drift, rejected calls, offers and failed reviews are
+        noted because their columns can be dropped or left out of the
+        default set, so monochrome output still says why a row is
+        emphasised and what waits on the operator. A ``continue`` offer
+        only restates work the lane already holds, so it gets no note. The
+        last prompt is left to the TASK column, so a note is always
+        something to act on.
+    """
+    found = [
+        f"on branch {row['branch']}, not its assigned branch"
+        if row["drift"]
+        else "",
+        f"{row['errors']} rejected calls" if row["errors"] else "",
+        row["stall"],
+        row["operator_edit"],
+        row.get("base_advance", ""),
+        row.get("orphan", ""),
+        row.get("budget_marker", ""),
+        str(row["unfit"] or "").replace(f"): {row['participant']} ", "): ", 1),
+        " ".join(("work offered", row.get("offer_kind", ""))).strip()
+        if row["work_offer"] and row.get("offer_kind") != "continue"
+        else "",
+        f"review failed by {row.get('reviewer') or 'a peer'}"
+        if row.get("review") == "fail"
+        else "",
+    ]
+    if row["work_dispatch"].get("state") == "escalated":
+        found.append(row["work_dispatch"]["last_result"])
+    return [str(note) for note in found if note]
 
 
 def alert(row: dict) -> bool:
@@ -636,36 +852,49 @@ def _widths(
     Args:
         view: Snapshot produced by ``collect``.
         width: Available terminal columns, or None for unbounded output.
-        chosen: Column names the operator asked for; all when empty.
+        chosen: Column names the operator asked for; ``DEFAULT_COLUMNS``
+            when empty, and every column when it names ``ALL``.
 
     Returns:
         The columns to print as index, name and width, and the names that
         were dropped. Each width is the widest value in this frame, never
-        below the column's declared minimum. When the set still exceeds
-        the terminal, columns are dropped in ``DROP_ORDER`` rather than
-        every cell being clipped; if the columns that order never drops
-        still do not fit, they share the width that is left.
+        below the column's declared minimum. STATE and then TASK, like the
+        COMMAND column of top, start at their minimum and take whatever
+        width the others leave, so one long cell is clipped with a marker
+        rather than pushing other columns out. When the set still
+        exceeds the terminal, columns are dropped in ``DROP_ORDER`` rather
+        than every cell being clipped; if the columns that order never
+        drops still do not fit, they share the width that is left.
     """
     rows = [row for project in view["projects"] for row in project["rows"]]
-    measured = [
-        (
-            index,
-            name,
-            max(
-                [minimum, len(name)] + [len(_cells(row)[index]) for row in rows]
-            ),
-        )
+    wanted = (
+        {name for name, _ in COLUMNS}
+        if "ALL" in chosen
+        else set(chosen or DEFAULT_COLUMNS)
+    )
+    known = [
+        (index, name, minimum)
         for index, (name, minimum) in enumerate(COLUMNS)
-        if not chosen or name in chosen
+        if name in wanted
+    ] or [
+        (index, name, minimum)
+        for index, (name, minimum) in enumerate(COLUMNS)
+        if name in DEFAULT_COLUMNS
     ]
-    if not measured:
-        measured = [
-            (index, name, max(minimum, len(name)))
-            for index, (name, minimum) in enumerate(COLUMNS)
-        ]
+    full = {
+        name: max(
+            [minimum, len(name)]
+            + [tables.measure(_cells(row)[index]) for row in rows]
+        )
+        for index, name, minimum in known
+    }
     omitted: list[str] = []
     if width is None:
-        return measured, omitted
+        return [(index, name, full[name]) for index, name, _ in known], omitted
+    measured = [
+        (index, name, max(minimum, len(name)) if name in FLEX else full[name])
+        for index, name, minimum in known
+    ]
     for name in DROP_ORDER:
         if _span(measured) <= width or len(measured) == 1:
             break
@@ -676,7 +905,14 @@ def _widths(
     if _span(measured) > width:
         share = max(1, (width - 2 * (len(measured) - 1)) // len(measured))
         measured = [(index, name, share) for index, name, _ in measured]
-    return measured, omitted
+        return measured, omitted
+    spare = width - _span(measured)
+    grown = []
+    for index, name, size in measured:
+        extra = min(full[name] - size, spare) if name in FLEX else 0
+        spare -= extra
+        grown.append((index, name, size + extra))
+    return grown, omitted
 
 
 def select(
@@ -685,6 +921,7 @@ def select(
     reverse: bool = False,
     projects: tuple[str, ...] = (),
     participants: tuple[str, ...] = (),
+    live: bool = False,
 ) -> dict:
     """Orders and narrows a snapshot without reading any state again.
 
@@ -698,11 +935,15 @@ def select(
             root also matches on its trailing path segments, so a directory
             name selects it without its whole path.
         participants: Participant names to report; every one when empty.
+        live: Whether to leave out the projects whose root is gone and the
+            lanes ``dormant`` reports, the way a task manager lists only
+            what is running. Every row is kept when False.
 
     Returns:
         A snapshot holding the selected rows, totals recounted over them,
-        and the selection itself, so a header never counts a row the table
-        does not show.
+        the selection itself, and how many lanes and projects the live
+        selection left out, so a header never counts a row the table does
+        not show and never hides one without saying so.
 
     Raises:
         BridgeError: If the sort column is not a reported column.
@@ -714,6 +955,7 @@ def select(
         )
     key = SORT_KEYS.get(sort.upper())
     selected = []
+    hidden = {"lanes": 0, "projects": 0}
     for project in view["projects"]:
         root = str(project["root"])
         if projects and not any(
@@ -726,6 +968,16 @@ def select(
             for row in project["rows"]
             if not participants or row["participant"] in participants
         ]
+        if live and not project.get("present", True):
+            hidden["projects"] += 1
+            hidden["lanes"] += len(rows)
+            continue
+        if live:
+            kept = [row for row in rows if not dormant(row)]
+            hidden["lanes"] += len(rows) - len(kept)
+            if rows and not kept:
+                continue
+            rows = kept
         if key is not None:
             rows = sorted(rows, key=key)
         if reverse:
@@ -740,7 +992,9 @@ def select(
             "reverse": reverse,
             "projects": list(projects),
             "participants": list(participants),
+            "live": live,
         },
+        "hidden": hidden,
     }
 
 
@@ -780,9 +1034,9 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
         columns: Negotiated columns as index, name and width.
 
     Returns:
-        Blocks in reported order, each naming the project it belongs to,
-        so paging can never split a lane from its stall marker or its last
-        prompt.
+        Blocks in reported order, each naming the project it belongs to and
+        holding one table line plus the lane's notes, which ``layout``
+        prints under the table rather than inside it.
     """
     empty = (
         "  no participants for the selection"
@@ -796,34 +1050,28 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
     for project in view["projects"]:
         if not project["rows"]:
             blocks.append(
-                {"root": project["root"], "lines": [empty], "row": None}
+                {
+                    "root": project["root"],
+                    "lines": [empty],
+                    "row": None,
+                    "notes": [],
+                }
             )
         for row in project["rows"]:
             cells = _cells(row)
-            lines = [
-                tables.GAP.join(
-                    tables.fit(cells[index], size) for index, _, size in columns
-                ).rstrip()
-            ]
-            if row["stall"]:
-                lines.append(f"    {row['stall']}")
-            if row["operator_edit"]:
-                lines.append(f"    {row['operator_edit']}")
-            if row.get("base_advance"):
-                lines.append(f"    {row['base_advance']}")
-            if row.get("orphan"):
-                lines.append(f"    {row['orphan']}")
-            if row.get("budget_marker"):
-                lines.append(f"    {row['budget_marker']}")
-            if row["unfit"]:
-                lines.append(f"    {row['unfit']}")
-            if row["work_offer"]:
-                lines.append(f"    {row['offer_kind']} offer pending")
-            if row["work_dispatch"].get("state") == "escalated":
-                lines.append(f"    {row['work_dispatch']['last_result']}")
-            if row["prompt"]:
-                lines.append(f"    last: {row['prompt']}")
-            blocks.append({"root": project["root"], "lines": lines, "row": row})
+            line = tables.GAP.join(
+                tables.fit(cells[index], size) for index, _, size in columns
+            ).rstrip()
+            blocks.append(
+                {
+                    "root": project["root"],
+                    "lines": [line],
+                    "row": row,
+                    "notes": [
+                        f"! {row['participant']}  {note}" for note in notes(row)
+                    ],
+                }
+            )
     return blocks
 
 
@@ -873,6 +1121,115 @@ def _page(
     }
 
 
+def _summary(view: dict, rate: str) -> list[str]:
+    """Builds the three summary lines above the table, as top does.
+
+    Args:
+        view: Snapshot produced by ``collect``, optionally narrowed.
+        rate: Denied share of the retained hook events, already formatted.
+
+    Returns:
+        A line naming the server, the time and the reading's cost; a line
+        counting lanes by state and the issues they hold; and a line of
+        mail, lease and enforcement totals. A count that is zero and says
+        nothing, such as no awaiting approvals, is left out.
+    """
+    totals = view["totals"]
+    rows = [row for project in view["projects"] for row in project["rows"]]
+    states: dict[str, int] = {}
+    for row in rows:
+        word = state_cell(row).split(" ")[0].rstrip(";:")
+        states[word] = states.get(word, 0) + 1
+    hidden = view.get("hidden") or {}
+    held = sum(len(row["owned"]) for row in rows)
+    overdue = sum(len(row["overdue"]) for row in rows)
+    offered = sum(row["offers"] for row in rows)
+    unread = sum(max(0, _number(row["unread"])) for row in rows)
+    unacked = sum(max(0, _number(row["pending_ack"])) for row in rows)
+    leases = sum(row["leases"] for row in rows)
+    queued = sum(row["queued"] for row in rows)
+    stale = sum(row["stale_leases"] for row in rows)
+
+    def listed(parts: list[str]) -> str:
+        """Joins the parts that carry a count."""
+        return ", ".join(part for part in parts if part)
+
+    first = (
+        f"agent-parley top - {time.strftime('%H:%M:%S')}  "
+        f"server {'running' if view['running'] else 'not running'}  "
+        f"projects {len(view['projects'])}"
+        + (
+            f"  idle {tables.age(totals['idle'])} (most "
+            f"{totals['idle_leader']} "
+            f"{tables.age(totals['idle_leader_seconds'])})"
+            if totals.get("idle")
+            else ""
+        )
+        + (
+            f"  provider {','.join(view['providers'])}"
+            if view.get("providers")
+            else ""
+        )
+        + (
+            f"  read {view['read_seconds']:.2f}s"
+            if "read_seconds" in view
+            else ""
+        )
+    )
+    lanes_line = "Lanes: " + listed(
+        [f"{len(rows)} total"]
+        + [
+            f"{count} {word}"
+            for word, count in sorted(
+                states.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+        + [
+            f"{hidden['lanes']} hidden" if hidden.get("lanes") else "",
+            f"{hidden['projects']} projects gone"
+            if hidden.get("projects")
+            else "",
+        ]
+    )
+    if hidden.get("lanes") or hidden.get("projects"):
+        lanes_line += " (a or --all shows them)"
+    issues_line = "Issues: " + listed(
+        [
+            f"{held} held",
+            f"{overdue} overdue" if overdue else "",
+            f"{offered} offered" if offered else "",
+            f"{totals['awaiting_approval']} awaiting approval"
+            if totals.get("awaiting_approval")
+            else "",
+            f"{totals['ready_groups']} groups ready"
+            if totals.get("ready_groups")
+            else "",
+        ]
+    )
+    traffic = (
+        "Mail: "
+        + listed([f"{unread} unread", f"{unacked} unacked" if unacked else ""])
+        + "   Leases: "
+        + listed(
+            [
+                f"{leases} held",
+                f"{stale} stale" if stale else "",
+                f"{queued} queued" if queued else "",
+            ]
+        )
+        + "   Hooks ("
+        + (
+            f"last {tables.age(view['window'])}"
+            if view.get("window")
+            else "all retained"
+        )
+        + f"): {totals['events']} events, "
+        f"{totals['denials']} denied ({rate})"
+        + f"   Context: {tables.size(totals['context'])}"
+    )
+    return [first, f"{lanes_line}   {issues_line}", traffic]
+
+
 def layout(
     view: dict,
     width: int | None = None,
@@ -889,12 +1246,14 @@ def layout(
         height: Available lines, or None to print every row.
         cursor: Index of the selected row among the reported rows. The page
             moves to keep it visible, which is how the view pages.
-        columns: Column names to show; all of them when empty.
+        columns: Column names to show; ``DEFAULT_COLUMNS`` when empty.
 
     Returns:
         The lines to print, which rows they cover, the line holding the
         cursor, the lines carrying a warning, and a footer stating the
-        visible range when the frame holds more rows than the page.
+        visible range when the frame holds more rows than the page. Notes
+        take at most a third of a bounded page, and a last line counts the
+        ones left out.
     """
     selected, omitted = _widths(view, width, columns)
     header = "  ".join(name.ljust(size) for _, name, size in selected)
@@ -904,39 +1263,7 @@ def layout(
         if totals["events"]
         else "0%"
     )
-    lines = [
-        f"agent-parley top  server: "
-        f"{'running' if view['running'] else 'not running'}  "
-        f"state: {view['home']}",
-        f"projects {len(view['projects'])}  "
-        f"participants {totals['participants']}  "
-        f"hook events {totals['events']}  "
-        f"denials {totals['denials']} ({rate})  "
-        f"context {tables.size(totals['context'])}  "
-        f"ready groups {totals.get('ready_groups', 0)}  "
-        f"idle {tables.age(totals['idle'])}"
-        + (
-            f" (most {totals['idle_leader']} "
-            f"{tables.age(totals['idle_leader_seconds'])})"
-            if totals["idle_leader"]
-            else ""
-        )
-        + (
-            f"  awaiting approval {totals['awaiting_approval']}"
-            if totals.get("awaiting_approval")
-            else ""
-        )
-        + (
-            f"  provider {','.join(view['providers'])}"
-            if view.get("providers")
-            else ""
-        )
-        + (
-            f"  last {tables.age(view['window'])}"
-            if view.get("window")
-            else "  all retained"
-        ),
-    ]
+    lines = _summary(view, rate)
     if omitted:
         lines.append("Hidden columns: " + ", ".join(omitted))
     choice = view.get("selection") or {}
@@ -963,7 +1290,21 @@ def layout(
     ]
     total = len(order)
     cursor = min(max(cursor, 0), max(0, total - 1))
-    available = None if height is None else max(1, height - len(lines))
+    warnings = [line for block in blocks for line in block["notes"]]
+    room = (
+        len(warnings)
+        if height is None
+        else min(len(warnings), max(1, (height - len(lines)) // 3 - 1))
+    )
+    shown_notes = warnings[:room]
+    if len(warnings) > room:
+        shown_notes = warnings[: room - 1] + [
+            f"! {len(warnings) - room + 1} more; P lists every problem"
+        ]
+    trailer = [""] + shown_notes if shown_notes else []
+    available = (
+        None if height is None else max(1, height - len(lines) - len(trailer))
+    )
     start, page = _follow(blocks, order, cursor, available, header)
     footer = ""
     if available is not None and len(page["positions"]) < total:
@@ -980,9 +1321,7 @@ def layout(
         )
     offset = len(lines)
     lines.extend(page["lines"])
-    if height is None:
-        for paragraph in LEGEND:
-            lines.extend(["", paragraph])
+    lines.extend(trailer)
     if footer:
         lines.append(footer)
     if width is not None:
@@ -1053,11 +1392,11 @@ def render(
             a captured file keeps every column intact.
         height: Available lines, or None to print every row.
         cursor: Index of the selected row among the reported rows.
-        columns: Column names to show; all of them when empty.
+        columns: Column names to show; ``DEFAULT_COLUMNS`` when empty.
 
     Returns:
-        Header, one block per participant, and the legend when the output
-        is unbounded.
+        The summary header, one line per participant, and one note line per
+        warning a lane carries. The legend stays behind the ``?`` key.
     """
     return list(layout(view, width, height, cursor, columns)["lines"])
 
@@ -1193,6 +1532,7 @@ def _loop(
             shaping["reverse"],
             shaping["projects"],
             shaping["participants"],
+            not shaping.get("everything", False),
         )
         frame = layout(
             view,
@@ -1240,6 +1580,8 @@ def _loop(
             ]
         elif key == ord("r"):
             shaping["reverse"] = not shaping["reverse"]
+        elif key == ord("a"):
+            shaping["everything"] = not shaping.get("everything", False)
         elif key == ord("f"):
             shaping["participants"] = _ask(screen, "participants: ", interval)
         elif key == ord("o"):
@@ -1264,6 +1606,7 @@ def run(
     columns: tuple[str, ...] = (),
     operator_edits: bool = True,
     problems: Callable[[], list[str]] | None = None,
+    everything: bool = False,
 ) -> None:
     """Shows the dashboard, printing a plain snapshot when it cannot draw.
 
@@ -1279,11 +1622,14 @@ def run(
         reverse: Whether to reverse that order.
         projects: Repository roots to report; every project when empty.
         participants: Participant names to report; every one when empty.
-        columns: Column names to show; all of them when empty.
+        columns: Column names to show; ``DEFAULT_COLUMNS`` when empty.
         operator_edits: Whether each frame reads the base checkout for
             dirty paths that overlap a lane's reservation.
         problems: Produces the problem lines the ``P`` key shows in place
             of the table; the key does nothing when None.
+        everything: Whether to also show the stopped lanes that hold nothing
+            and the projects whose root is gone, which the view otherwise
+            counts in its header and leaves out.
 
     A snapshot is printed at the width of the terminal when one is
     attached and at the full width of the table when the output is a pipe,
@@ -1297,6 +1643,7 @@ def run(
         "projects": projects,
         "participants": participants,
         "columns": shown,
+        "everything": everything,
     }
     if once or not sys.stdout.isatty():
         view = select(
@@ -1312,12 +1659,15 @@ def run(
             reverse,
             projects,
             participants,
+            not everything,
         )
         available = (
             shutil.get_terminal_size().columns if sys.stdout.isatty() else None
         )
         for line in render(view, available, columns=shown):
             print(line)
+        if once:
+            print(ONCE_HINT)
         return
     curses.wrapper(
         _loop,

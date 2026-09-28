@@ -1,12 +1,13 @@
 """Checks that a failed launch never destroys the last resumable session."""
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, terminal
-from agent_parley.state import BridgeError, write_json
+from agent_parley import checkpoints, cli, lanes, roster, store, terminal
+from agent_parley.state import BridgeError, lock, write_json
 
 CONFIRMED = "12345678-abcd-1234-abcd-123456789abc"
 REPLACEMENT = "87654321-dcba-4321-dcba-cba987654321"
@@ -99,6 +100,27 @@ def test_a_confirmed_native_session_replaces_the_resumable_identity(
     assert state(lane)["resumable_session"] == REPLACEMENT
 
 
+def test_a_launch_moves_a_lane_sampled_stopped_to_starting_at_once(
+    bridge, repo, lane, monkeypatch
+):
+    root = roster.read(lane)["root"]
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, root, "claude", lanes.STOPPED, evidence="liveness: stopped"
+        )
+    seen = []
+
+    def client(*args, **kwargs):
+        with store.connect(bridge.home) as db:
+            seen.append(lanes.read(db, root, "claude"))
+        return 0
+
+    monkeypatch.setattr(terminal, "run", client)
+    assert bridge.launch("claude", repo, terminal.PROMPT, resume=True) == 0
+    assert seen[0]["state"] == lanes.STARTING
+    assert seen[0]["evidence"].startswith("launch:")
+
+
 def test_a_lane_that_never_reported_a_session_refuses_to_resume(
     bridge, repo, lane, monkeypatch
 ):
@@ -108,3 +130,40 @@ def test_a_lane_that_never_reported_a_session_refuses_to_resume(
     )
     with pytest.raises(BridgeError, match="No usable native session"):
         bridge.launch("claude", repo, terminal.PROMPT, resume=True)
+
+
+def test_the_launcher_waits_for_a_hook_holding_the_checkpoint_lock(
+    bridge, repo, lane, monkeypatch
+):
+    taken = threading.Event()
+    release = threading.Event()
+
+    def hook():
+        with lock(lane / "claude-checkpoint.lock"):
+            taken.set()
+            release.wait(10)
+            write_json(
+                lane / "claude-activity.json",
+                {
+                    "activity": "stopped",
+                    "session_id": CONFIRMED,
+                    "hook_marker": True,
+                },
+            )
+
+    writer = threading.Thread(target=hook, daemon=True)
+    writer.start()
+    assert taken.wait(10)
+    threading.Timer(0.3, release.set).start()
+    seen = []
+    monkeypatch.setattr(
+        terminal, "run", lambda *args, **kwargs: seen.append(state(lane))
+    )
+    bridge.launch("claude", repo, terminal.PROMPT, resume=True)
+    writer.join(10)
+    recorded = seen[0]
+    assert recorded["hook_marker"] is True
+    assert recorded["launcher_pid"]
+    assert "launcher_ticks" in recorded
+    assert recorded["session_started"]
+    assert recorded["session_id"] == ""

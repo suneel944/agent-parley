@@ -89,6 +89,35 @@ def test_a_message_over_the_cap_is_attached_and_referenced(
     assert len(notice.encode()) <= MAX_CONTEXT_BYTES
 
 
+def test_a_rolled_back_message_leaves_no_attachment(bridge, repo, paired):
+    lanes = actors(bridge, paired)
+    directory = bridge.project(repo)[1]
+    body = "line of evidence\n" * 400
+    with (
+        pytest.raises(RuntimeError),
+        store.connect(bridge.home, write=True) as db,
+    ):
+        result = store._send(
+            db,
+            lanes["claude"],
+            {
+                "to": ["codex"],
+                "subject": "Evidence",
+                "body_md": body,
+                "idempotency_key": "big-1",
+            },
+            directory=directory,
+        )
+        spilled = attachments.folder(directory) / f"{result['attachment']}.md"
+        assert spilled.exists()
+        raise RuntimeError("a later statement failed")
+    assert not spilled.exists()
+    assert not spilled.with_suffix(".json").exists()
+    retried = sent(bridge, lanes["claude"], "fits", key="small-1")
+    assert retried["id"] == result["id"]
+    assert not spilled.exists()
+
+
 def test_read_attachment_pages_and_is_scoped_to_the_addressed(
     bridge, repo, paired
 ):

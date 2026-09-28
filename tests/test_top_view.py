@@ -162,12 +162,52 @@ class Sink:
 
 def test_a_column_is_as_wide_as_its_widest_value_in_the_frame():
     view = snapshot(("/repo", [lane("codex", branch="release/candidate-77")]))
-    frame = dashboard.layout(view, 200)
+    frame = dashboard.layout(view, 210)
     assert frame["omitted"] == []
     row = next(line for line in frame["lines"] if line.startswith("codex "))
     assert "release/candidate-77" in row
     assert "…" not in row
     assert "…" in tables.fit("release/candidate-77", 18)
+
+
+@pytest.mark.parametrize(
+    ("value", "width", "expected"),
+    [
+        ("branch", 8, "branch  "),
+        ("branch/long", 6, "branc…"),
+        ("界界", 4, "界界"),
+        ("界界", 6, "界界  "),
+        ("界界界", 5, "界界…"),
+        ("界界界", 4, "界… "),
+        ("e" + chr(0x301) + "a", 3, "e" + chr(0x301) + "a "),
+        ("e" + chr(0x301) + "ab", 2, "e" + chr(0x301) + "…"),
+        ("👍", 3, "👍 "),
+        ("👍👍", 3, "👍…"),
+    ],
+)
+def test_a_cell_is_measured_padded_and_clipped_in_display_columns(
+    value, width, expected
+):
+    assert tables.fit(value, width) == expected
+    assert tables.measure(tables.fit(value, width)) == width
+
+
+def test_a_joined_emoji_never_overruns_its_column():
+    family = chr(0x200D).join(("\U0001f468", "\U0001f469", "\U0001f467"))
+    assert tables.measure(family) == 6
+    clipped = tables.fit(family, 4)
+    assert clipped == "\U0001f468… "
+    assert tables.measure(clipped) == 4
+
+
+def test_a_status_table_with_wide_text_stays_inside_its_width():
+    row = ("界面", "codex", "-", "live", "機能/分岐") + ("-",) * 6
+    rows = [(*row, "タスク" * 10)]
+    *table, hidden = tables.status_table(rows, 60)
+    assert hidden.startswith("Hidden columns:")
+    assert all(tables.measure(line) <= 60 for line in table)
+    assert tables.measure(table[1]) == 60
+    assert tables.widths(("A",), [("界界",)]) == [4]
 
 
 def test_a_narrow_terminal_drops_columns_instead_of_clipping_every_cell():
@@ -177,17 +217,21 @@ def test_a_narrow_terminal_drops_columns_instead_of_clipping_every_cell():
     hidden = next(line for line in lines if line.startswith("Hidden columns:"))
     assert "PARTICIPANT" not in hidden
     assert "MAIL" in text(lines)
-    for dropped in ("PROVIDER", "EVENT", "BRANCH"):
+    for dropped in ("BRANCH", "TOKENS"):
         assert dropped in hidden
+    assert "PROVIDER" not in text(lines)
 
 
 def test_columns_are_dropped_in_the_documented_order():
     view = snapshot(("/repo", lanes(2)))
-    wide = dashboard.layout(view, 150)["omitted"]
-    narrow = dashboard.layout(view, 100)["omitted"]
+    wide = dashboard.layout(view, 150, columns=("ALL",))["omitted"]
+    narrow = dashboard.layout(view, 100, columns=("ALL",))["omitted"]
     assert wide == list(dashboard.DROP_ORDER[: len(wide)])
     assert narrow == list(dashboard.DROP_ORDER[: len(narrow)])
     assert len(narrow) > len(wide) > 0
+    shown = dashboard.layout(view, 60)["omitted"]
+    kept = [name for name in dashboard.DROP_ORDER if name in shown]
+    assert shown == kept
 
 
 def test_a_clipped_cell_ends_in_a_marker():
@@ -209,20 +253,65 @@ def test_paging_follows_the_selected_row_to_the_last_one():
     assert frame["lines"][frame["cursor"]].startswith("lane-30")
 
 
-def test_an_unbounded_frame_shows_every_row_and_the_legend():
+def test_an_unbounded_frame_shows_every_row_and_leaves_the_legend_to_keys():
     lines = dashboard.render(snapshot(("/repo", lanes(31))))
     assert sum(line.startswith("lane-") for line in lines) == 31
     assert not any(line.startswith("rows 1-") for line in lines)
-    assert dashboard.LEGEND[0] in lines
+    assert dashboard.LEGEND[0] not in lines
+    assert lines[0].startswith("agent-parley top - ")
+    assert lines[1].startswith("Lanes: 31 total, 31 running")
+    assert lines[2].startswith("Mail: 0 unread")
 
 
-def test_a_page_keeps_a_lane_with_its_marker_and_last_prompt():
+def test_a_lane_is_one_row_with_its_task_and_one_note_per_warning():
     rows = lanes(6, stall="idle; message 3 waiting", prompt="build the gate")
-    frame = dashboard.layout(snapshot(("/repo", rows)), 120, 14)
-    shown = [line for line in frame["lines"] if line.startswith("    last:")]
-    assert len(shown) == frame["shown"] >= 1
-    markers = [line for line in frame["lines"] if "idle; message" in line]
-    assert len(markers) == frame["shown"]
+    frame = dashboard.layout(snapshot(("/repo", rows)), 120, 20)
+    drawn = [line for line in frame["lines"] if line.startswith("lane-")]
+    assert len(drawn) == frame["shown"] == 6
+    assert all("build the gate" in line for line in drawn)
+    notes = [line for line in frame["lines"] if line.startswith("! ")]
+    assert notes[0] == "! lane-0  idle; message 3 waiting"
+    assert notes[-1] == "! 3 more; P lists every problem"
+    assert len(notes) == 4
+
+
+def test_every_emphasised_row_names_its_cause_in_a_note():
+    row = lane(
+        "codex",
+        branch="spike",
+        drift=True,
+        errors=2,
+        unfit=None,
+        work_offer=True,
+        offer_kind="split",
+        review="fail",
+        reviewer="claude",
+    )
+    assert dashboard.alert(row)
+    assert dashboard.notes(row) == [
+        "on branch spike, not its assigned branch",
+        "2 rejected calls",
+        "work offered split",
+        "review failed by claude",
+    ]
+    assert not dashboard.notes(
+        lane("claude", unfit=None, work_offer=True, offer_kind="continue")
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "cell"),
+    [
+        ("paused; running", "paused"),
+        ("idle 3m; running", "idle 3m"),
+        ("paused; stopped", "paused; stopped"),
+        ("idle 3m; checkpoints unavailable",) * 2,
+    ],
+)
+def test_the_state_cell_keeps_a_liveness_reading_that_changes_the_action(
+    state, cell
+):
+    assert dashboard.state_cell({"state": state}) == cell
 
 
 def test_ordering_puts_the_largest_counted_value_first():
@@ -320,7 +409,7 @@ def test_a_snapshot_to_a_pipe_keeps_every_column(monkeypatch):
     dashboard.run(HOME, lambda: True, once=True)
     assert "release/candidate-77" in pipe.printed
     assert "Hidden columns:" not in pipe.printed
-    for name, _ in dashboard.COLUMNS:
+    for name in dashboard.DEFAULT_COLUMNS:
         assert name in pipe.printed
 
 
@@ -337,6 +426,7 @@ def test_a_snapshot_to_a_terminal_fits_its_width(monkeypatch):
     dashboard.run(HOME, lambda: True, once=True)
     assert all(len(line) <= 70 for line in terminal.printed.splitlines())
     assert "Hidden columns:" in terminal.printed
+    assert terminal.printed.splitlines()[-1] == dashboard.ONCE_HINT
 
 
 def drive(
@@ -463,3 +553,97 @@ def test_a_refused_write_is_reported_in_the_footer(monkeypatch):
     )
     footer = screen.frames[0][-1][0]
     assert "1 writes refused: addnstr() returned ERR" in footer
+
+
+def gone(root: str, rows: list[dict]) -> dict:
+    """Builds a collected view holding one project whose root is gone."""
+    view = snapshot((root, rows), ("/repo/live", [lane("worker")]))
+    view["projects"][0]["present"] = False
+    return view
+
+
+def test_a_stopped_lane_holding_nothing_is_counted_not_drawn():
+    stopped = "stopped; event 190223s ago"
+    view = snapshot(
+        (
+            "/repo",
+            [
+                lane("worker"),
+                lane("dead", state=stopped),
+                lane("owner", state=stopped, owned=["7"], issues="#7"),
+                lane("leaser", state=stopped, leases=1),
+                lane("mailed", state=stopped, unread=2),
+                lane("unreadable", state=stopped, unread="?"),
+                lane("offerer", state=stopped, offers=1),
+                lane("approval", state=stopped, awaiting_approval=True),
+                lane("unstored", state=stopped, usage_read=False),
+            ],
+        )
+    )
+    live = dashboard.select(view, live=True)
+    rendered = dashboard.render(live)
+    drawn = {line.split()[0] for line in rendered if line.strip()}
+    assert "dead" not in drawn
+    for name in (
+        "worker",
+        "owner",
+        "leaser",
+        "mailed",
+        "unreadable",
+        "offerer",
+        "approval",
+        "unstored",
+    ):
+        assert name in drawn
+    assert live["hidden"] == {"lanes": 1, "projects": 0}
+    assert "1 hidden (a or --all shows them)" in text(rendered)
+    everything = dashboard.render(dashboard.select(view))
+    assert "dead" in {line.split()[0] for line in everything if line.strip()}
+
+
+def test_the_lane_record_decides_whether_a_lane_is_live():
+    view = snapshot(
+        (
+            "/repo",
+            [
+                lane("crashed", state="dead 2h", lane_state="dead"),
+                lane("resumed", state="stopped", lane_state="working"),
+                lane("reclaimed", state="idle", lane_state="reclaimed"),
+            ],
+        )
+    )
+    live = dashboard.select(view, live=True)
+    rendered = dashboard.render(live)
+    drawn = {line.split()[0] for line in rendered if line.strip()}
+    assert "resumed" in drawn
+    assert "crashed" not in drawn
+    assert "reclaimed" not in drawn
+    assert live["hidden"] == {"lanes": 2, "projects": 0}
+
+
+def test_a_project_whose_root_is_gone_is_hidden_until_asked():
+    view = gone("/tmp/wiped", [lane("old", state="stopped"), lane("older")])
+    live = dashboard.select(view, live=True)
+    shown = text(dashboard.render(live))
+    assert "/tmp/wiped" not in shown
+    assert live["hidden"] == {"lanes": 2, "projects": 1}
+    assert live["totals"]["participants"] == 1
+    assert "/tmp/wiped" in text(dashboard.render(dashboard.select(view)))
+
+
+def test_the_a_key_shows_and_hides_what_the_live_view_left_out(monkeypatch):
+    screen = drive(
+        monkeypatch,
+        gone("/tmp/wiped", [lane("old", state="stopped")]),
+        [ord("a"), ord("a"), ord("q")],
+    )
+    frames = [text([line for line, _ in frame]) for frame in screen.frames]
+    assert "/tmp/wiped" not in frames[0]
+    assert "a or --all shows them" in frames[0]
+    assert "/tmp/wiped" in frames[1]
+    assert "/tmp/wiped" not in frames[2]
+
+
+def test_the_header_reports_how_long_the_frame_took_to_read():
+    view = {**snapshot(("/repo", lanes(1))), "read_seconds": 0.25}
+    assert "read 0.25s" in dashboard.render(view)[0]

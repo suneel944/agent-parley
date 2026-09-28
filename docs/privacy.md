@@ -6,27 +6,49 @@ policy describes what the software stores, where it stores it, and what it
 transmits. It applies to the published package, to the Claude plugin and to
 the Codex plugin, which share one coordination runtime.
 
-Last updated 2026-09-11.
+Last updated 2026-09-26.
 
 ## What the software transmits
 
-Coordination itself never leaves your machine.
+Coordination itself stays on your machine unless you turn on the
+notifications described below.
 
 The coordination server binds the loopback interface only, at
-`127.0.0.1` on a port you control. The command line tool and the plugin skill
+`127.0.0.1` on a port you control: `8876` unless `AGENT_PARLEY_PORT` names
+another when the state directory is first created. The command line tool and
+the plugin skill
 reach that server over `http://127.0.0.1:PORT` with proxy handling disabled,
 so requests are not forwarded to an external host. The runtime declares no
 third-party dependencies and uses only the Python standard library.
 
-A few commands deliberately reach the Git host you already use, through the
-native `gh` and `git` clients under your own sign-in. `participant pr` pushes
-that lane's branch to `origin` and opens a pull request carrying the lane's
-recorded report. Claiming an issue looks up its title and assigns it to your
-account, releasing it unassigns it, and a lane's first ready report posts its
-summary and evidence as a comment on the issues it claims. Agent Parley stores
-no forge token and adds no flag that bypasses a repository rule, and when no
-`gh` client, no GitHub remote or no network is available nothing is sent and
-the local record is unchanged.
+Some commands and the supervision service deliberately reach the Git host you
+already use, through the native `gh` and `git` clients under your own sign-in.
+`participant pr`, or a lane itself where the project sets
+`pull_request.self_service`, pushes that lane's branch to `origin` and opens a
+pull request carrying the lane's recorded report, its latest peer review, the
+verification command and counts of the lane's recorded hook decisions.
+Claiming an issue looks up its title and assigns it to your account, releasing
+it unassigns it, and a report that turns ready posts its summary and evidence
+as a comment on the issue it is bound to. `issue next`, `issue match` and
+`issue resolve` read open issues, their labels and the pull requests that
+close them, and the supervision service and `gc` read whether a lane's branch
+or issue has landed. Agent Parley stores no forge token and adds no flag that
+bypasses a repository rule, and when no `gh` client, no GitHub remote or no
+network is available nothing is sent and the local record is unchanged.
+
+Notifications are off unless `AGENT_PARLEY_NOTIFY` names `telegram`, `email`
+or both. Then a change that moves ownership or holds a lane, such as a handoff
+offer, a permission prompt, a native dialog or an idle lane, is sent to the
+Telegram Bot API with `AGENT_PARLEY_TELEGRAM_TOKEN` and
+`AGENT_PARLEY_TELEGRAM_CHAT`, or to the SMTP server named by
+`AGENT_PARLEY_SMTP_HOST` and its companion variables. A message names the
+repository, the lane, its provider, the event, the issue or offer, and the
+dialog text involved, capped at 1,536 bytes. With `AGENT_PARLEY_INBOUND` set
+to `telegram` and an `AGENT_PARLEY_INBOUND_PASSCODE`, the service long-polls
+the same bot and answers a passcoded `status` query from the configured chat
+with a status reading; no other command is accepted.
+These settings and secrets are read from the environment and never written
+into coordination state.
 
 There is no analytics, no crash reporting, no license check and no account.
 The publisher receives no data from your use of the software.
@@ -39,44 +61,75 @@ their own providers, and it does not read or forward their credentials.
 
 Coordination state is kept outside your repositories, in a private state
 directory created with mode `0700`. The default location is
-`~/.local/state/agent-parley`, and `AGENT_PARLEY_HOME` overrides it. The tool
-refuses to run if that directory is not private.
+`~/.local/state/agent-parley`, and `AGENT_PARLEY_HOME` or `--home` overrides
+it. The tool refuses to run if that directory is not private.
 
 The directory holds the coordination record you create by using the tool:
 
 - Participant names and the repositories and worktrees they were launched in.
 - Filesystem paths to those repositories.
+- The service's loopback port and bearer token, and each lane's own
+  coordination credential.
+- Provider and account profile definitions: executables, config home paths,
+  the names of required environment variables and non-secret overrides; a
+  value whose name looks like a token, key, secret or password is refused.
 - Issue numbers, who claims them, and the offers exchanged when work is
   handed over, including the summary and evidence text written into an offer.
+- Reports, peer review verdicts and recorded decisions, with any text too
+  long for its record kept as an attachment.
 - Advisory file reservations, which are path names.
 - Messages participants send each other through the tool.
-- An append-only event log of coordination activity with timestamps.
+- Each lane's state record and its transitions, and a log of the native hook
+  events each lane's client sent, with tool names, decisions and a short
+  cause.
+- Recovery checkpoints: Git bundles of the index and working tree, untracked
+  files that are not ignored included, of every claim a lane owns, refreshed
+  as the lane works and before a handoff, a restart or a forced reclaim.
+- The service log, `server.log`, and for a lane the service resumed, its wake
+  log: that client's terminal output while it ran unattended.
+- The capacity state, reset time and session identifier read from a lane's
+  native session records.
 
 Content is whatever you or your agents write into a summary, a message or a
 report. Do not put secrets in those fields; they are stored as plain text in
 files you own.
 
-`agent-parley top` additionally reads the session records your native clients
-already write under their own configuration directories, so it can report what
-each lane's client counted for its session. Those files are read locally and in
-place. Nothing from them is copied into coordination state, and no vendor is
-asked for anything.
+`agent-parley top`, `status` and the supervision service also read the session
+records your native clients already write under their own configuration
+directories, so they can report what each lane's client counted for its
+session and whether it reached a usage limit. Those files are read locally and
+in place, and no vendor is asked for anything. Only the capacity reading
+listed above is copied into coordination state.
 
 ## Retention and deletion
 
-The event log is pruned automatically. Entries older than fourteen days are
-removed when a session starts or ends.
+Logs are bounded automatically:
 
-Everything else persists until you delete it. To remove all coordination
-state, stop the server and delete the state directory:
+- A lane's hook event log rotates to one predecessor at 256 KiB, and entries
+  older than fourteen days are removed when a session starts or ends.
+- The service log keeps its newest 2,000 lines within 256 KiB and moves what
+  it drops to `server.log.1`, which is bounded the same way. A lane's report
+  log is bounded the same way, and an attachment goes with the report it
+  belonged to.
+- A wake log is cut back to empty before a write would take it past 1 MiB.
+- The store keeps the newest 2,000 served-call records and the newest 2,000
+  lane state transitions of each project.
+- An offer's attachment is removed when the offer is declined, cancelled or
+  released.
+
+Everything else, messages, decisions and recovery checkpoints included,
+persists until you delete it. To remove all coordination state, stop the
+server and delete the state directory:
 
 ```sh
 agent-parley down
 rm -rf ~/.local/state/agent-parley
 ```
 
-Deleting the directory does not touch your repositories, your worktrees or
-your commits.
+Lane worktrees live inside that directory, so deleting it also deletes every
+lane's worktree and any uncommitted work in it. Your base checkout and the
+branches and commits in your repository are not touched; `git worktree prune`
+then clears the registrations of the deleted worktrees.
 
 ## Children
 

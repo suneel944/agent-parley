@@ -12,6 +12,10 @@ from agent_parley.cli import git
 from agent_parley.state import BridgeError, lock, write_json
 
 GH_STUB = """#!/bin/sh
+if [ "$1" = "api" ]; then
+  echo operator
+  exit 0
+fi
 if [ "$1" = "issue" ]; then
   cat "$GH_ISSUE"
   exit 0

@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -121,6 +122,36 @@ def test_a_dirty_worktree_is_kept_and_its_changes_reported(
     assert worktree.exists()
 
 
+def test_an_ignored_file_keeps_the_worktree(bridge, repo, paired):
+    lane = actor(bridge, paired["root"], "claude")
+    worktree = Path(paired["lanes"]["claude"])
+    exclude = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(worktree),
+            "rev-parse",
+            "--git-path",
+            "info/exclude",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    exclude_path = Path(exclude)
+    if not exclude_path.is_absolute():
+        exclude_path = worktree / exclude_path
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    exclude_path.write_text(".env\n")
+    (worktree / ".env").write_text("TOKEN=local\n")
+
+    result = retire(bridge, lane)
+
+    assert result["worktree"] == retirement.KEPT
+    assert result["dirty"] == [".env"]
+    assert (worktree / ".env").read_text() == "TOKEN=local\n"
+
+
 def test_a_handed_off_issue_returns_to_the_pool_and_tells_its_sender(
     bridge, repo, paired
 ):
@@ -149,6 +180,40 @@ def test_a_handed_off_issue_returns_to_the_pool_and_tells_its_sender(
     )["messages"]
     assert "#7" in delivered[0]["subject"]
     assert "unclaimed again" in delivered[0]["body_md"]
+
+
+def test_a_readmitted_lane_that_retires_again_tells_its_sender_again(
+    bridge, repo, paired
+):
+    peer = actor(bridge, paired["root"], "codex")
+    told = []
+    for number in ("7", "9"):
+        bridge.add_participant(repo, "claude")
+        lane = actor(bridge, paired["root"], "claude")
+        bridge.issue(paired["lanes"]["codex"], "claim", number)
+        offered = bridge.issue(
+            paired["lanes"]["codex"],
+            "offer",
+            number,
+            to="claude",
+            summary="Parser",
+        )
+        bridge.issue(
+            paired["lanes"]["claude"],
+            "accept",
+            number,
+            offer_id=offered["offer"]["id"],
+        )
+        result = retire(bridge, lane)
+        assert result["released"] == [number]
+        assert result["notices"][0]["issues"] == [number]
+        assert result["credentials_invalidated"] == 1
+        told.append(result["notices"][0]["message_id"])
+    assert told[0] != told[1]
+    delivered = store.call(
+        bridge.home, peer, "fetch_inbox", {"include_bodies": True}
+    )["messages"]
+    assert sorted(message["id"] for message in delivered) == sorted(told)
 
 
 def test_an_offer_awaiting_a_retiring_lane_returns_to_its_owner(
@@ -274,3 +339,22 @@ def test_a_retirement_time_must_be_a_time(bridge, repo, paired):
     write_json(directory / "project.json", manifest)
     with pytest.raises(BridgeError, match="recorded as a time"):
         roster.read(directory)
+
+
+def test_a_lane_holding_ready_work_is_refused_before_releasing_any(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "4")
+    bridge.issue(lane, "claim", "5")
+    bridge.report(lane, "ready", "Done.", "", "make check", issue="5")
+    for _ in range(2):
+        with pytest.raises(BridgeError, match=r"ready work \(#5\)"):
+            retirement.withdraw(directory, "claude")
+    ledger = issues.snapshot(directory)["issues"]
+    assert [ledger[number]["owner"] for number in ("4", "5")] == [
+        "claude",
+        "claude",
+    ]
+    assert not roster.retired(entry(directory, "claude"))

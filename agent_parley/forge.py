@@ -25,6 +25,17 @@ from pathlib import Path
 MAX_TITLE = 200
 MAX_PATHS = 200
 MAX_OPEN_ISSUES = 100
+MAX_PULL_REQUESTS = 30
+FAILED_CHECKS = frozenset(
+    {
+        "FAILURE",
+        "ERROR",
+        "TIMED_OUT",
+        "CANCELLED",
+        "ACTION_REQUIRED",
+        "STARTUP_FAILURE",
+    }
+)
 PROVIDER_LABEL = "provider:"
 FORGES = ("github", "beads", "null")
 DEFAULT_FORGE = "github"
@@ -205,6 +216,273 @@ def branch_evidence(repo: Path, branch: str) -> dict | None:
         return None
 
 
+def issue_completion(repo: Path, number: str) -> dict | None:
+    """Reports whether one issue is closed and which pull request closed it.
+
+    A lane may land a claim through a pull request from any branch, so the
+    lane branch cannot say whether a claimed issue ended. The issue itself
+    can: its state, when it closed, and the pull requests the forge links to
+    it as closing it. The newest linked pull request supplies the head
+    branch and merge commit that identify who landed the work. Only the
+    GitHub forge links pull requests to issues, so every other forge reports
+    None and the caller falls back to the lane branch.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        number: Bare repository issue number.
+
+    Returns:
+        None when the forge cannot say. Otherwise the issue state, `OPEN` or
+        `CLOSED`, and for a closed issue the instant it closed in Unix
+        seconds, together with the closing pull request's state, number,
+        URL, head branch and merge commit, each empty when no pull request
+        is linked or it cannot be read. A closing pull request that merged
+        reports the state `MERGED`.
+    """
+    if _implementation(repo) != "github":
+        return None
+    project = _reachable(repo)
+    if not project:
+        return None
+    output = _run(
+        [
+            "gh",
+            "issue",
+            "view",
+            number,
+            "--repo",
+            project,
+            "--json",
+            "state,closedAt,closedByPullRequestsReferences",
+        ],
+        5,
+    )
+    try:
+        record = json.loads(output or "null")
+        state = str(record["state"]).upper()
+        if state != "CLOSED":
+            return {"state": state}
+        closed_at = _epoch(record["closedAt"])
+        linked = [
+            int(entry["number"])
+            for entry in record.get("closedByPullRequestsReferences") or []
+            if entry.get("number")
+        ]
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+    reading = {
+        "state": "CLOSED",
+        "closed_at": closed_at,
+        "pull_request": 0,
+        "url": "",
+        "branch": "",
+        "commit": "",
+    }
+    if not linked:
+        linked = _closing_references(project, number, closed_at)
+    if not linked:
+        return reading
+    pull = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(max(linked)),
+            "--repo",
+            project,
+            "--json",
+            "state,number,url,headRefName,mergeCommit",
+        ],
+        5,
+    )
+    try:
+        request = json.loads(pull or "null")
+        reading.update(
+            state="MERGED" if request.get("state") == "MERGED" else "CLOSED",
+            pull_request=int(request.get("number") or 0),
+            url=str(request.get("url") or ""),
+            branch=str(request.get("headRefName") or ""),
+            commit=str((request.get("mergeCommit") or {}).get("oid") or ""),
+        )
+    except (ValueError, TypeError, AttributeError):
+        reading["pull_request"] = max(linked)
+    return reading
+
+
+def _closing_references(project: str, number: str, closed_at: float) -> list:
+    """Finds merged pull requests that name an issue with a closing keyword.
+
+    GitHub links a closing pull request to an issue only when the pull
+    request targets the default branch. Work that lands on an integration
+    branch is closed by hand, so the link is empty. The issue timeline
+    still records each pull request that referenced the issue. A pull
+    request counts only when it merged in the same project no later than
+    the issue closed and its body closes this issue by keyword, so a pull
+    request that merely mentions the issue is never taken as its closer.
+
+    Args:
+        project: Forge project in `owner/name` form.
+        number: Bare repository issue number.
+        closed_at: Instant the issue closed, in Unix seconds.
+
+    Returns:
+        The matching pull request numbers, empty when none match or the
+        timeline cannot be read.
+    """
+    output = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{project}/issues/{number}/timeline?per_page=100",
+        ],
+        5,
+    )
+    keyword = re.compile(
+        rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{number}\b",
+        re.IGNORECASE,
+    )
+    try:
+        events = json.loads(output or "[]")
+        found = []
+        for event in events:
+            if event.get("event") != "cross-referenced":
+                continue
+            source = (event.get("source") or {}).get("issue") or {}
+            merged = (source.get("pull_request") or {}).get("merged_at")
+            home = (source.get("repository") or {}).get("full_name")
+            if (
+                merged
+                and home == project
+                and _epoch(merged) <= closed_at
+                and keyword.search(source.get("body") or "")
+            ):
+                found.append(int(source["number"]))
+        return found
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return []
+
+
+def open_pull_requests(repo: Path) -> list[dict] | None:
+    """Reports the check, review and merge state of open pull requests.
+
+    One bounded request reads at most `MAX_PULL_REQUESTS` open pull requests
+    with their head commit, the checks reported on it, the latest review of
+    each reviewer, whether the forge can merge it and the issues it closes.
+    The caller decides which lane a pull request belongs to and what changed
+    since its last reading. Only the GitHub forge opens pull requests, so
+    every other forge reports None.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+
+    Returns:
+        One reading per open pull request: its number, URL, head branch and
+        head commit, the checks verdict (`pending`, `green`, `red`, or
+        `none` when nothing reported), the sorted names of failing checks,
+        the latest reviews as author, state and submission time, the merge
+        state the forge reports and the bare numbers of the issues it
+        closes. None when the forge is unavailable or the response cannot
+        be read.
+    """
+    if _implementation(repo) != "github":
+        return None
+    project = _reachable(repo)
+    if not project:
+        return None
+    output = _run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            project,
+            "--state",
+            "open",
+            "--limit",
+            str(MAX_PULL_REQUESTS),
+            "--json",
+            "number,url,headRefName,headRefOid,mergeable,statusCheckRollup,"
+            "latestReviews,closingIssuesReferences",
+        ],
+        15,
+    )
+    try:
+        records = json.loads(output or "null")
+        if not isinstance(records, list):
+            return None
+        readings: list[dict] = []
+        for record in records:
+            checks, failing = _checks(record.get("statusCheckRollup"))
+            readings.append(
+                {
+                    "number": int(record["number"]),
+                    "url": str(record.get("url") or ""),
+                    "branch": str(record.get("headRefName") or ""),
+                    "sha": str(record.get("headRefOid") or ""),
+                    "checks": checks,
+                    "failing": failing,
+                    "reviews": [
+                        {
+                            "author": str(
+                                (review.get("author") or {}).get("login") or ""
+                            ),
+                            "state": str(review.get("state") or ""),
+                            "at": str(review.get("submittedAt") or ""),
+                        }
+                        for review in record.get("latestReviews") or []
+                    ],
+                    "mergeable": str(record.get("mergeable") or "UNKNOWN"),
+                    "issues": [
+                        str(entry["number"])
+                        for entry in record.get("closingIssuesReferences") or []
+                        if entry.get("number")
+                    ],
+                }
+            )
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+    return readings
+
+
+def _checks(rollup: list | None) -> tuple[str, list[str]]:
+    """Reduces a pull request's reported checks to one verdict.
+
+    A check run is pending until its status reads completed, and a commit
+    status is pending while its state reads pending or expected. The verdict
+    is `red` only once every check finished, so a lane is told once about a
+    finished run rather than about each job as it fails.
+
+    Args:
+        rollup: The forge's `statusCheckRollup` entries, check runs and
+            commit statuses mixed.
+
+    Returns:
+        The verdict and the sorted names of the failing checks, empty
+        unless the verdict is `red`.
+    """
+    failing: set[str] = set()
+    pending = False
+    for entry in rollup or []:
+        name = str(entry.get("name") or entry.get("context") or "unnamed")
+        if "status" in entry:
+            if str(entry.get("status") or "").upper() != "COMPLETED":
+                pending = True
+                continue
+            outcome = str(entry.get("conclusion") or "").upper()
+        else:
+            outcome = str(entry.get("state") or "").upper()
+            if outcome in {"", "PENDING", "EXPECTED"}:
+                pending = True
+                continue
+        if outcome in FAILED_CHECKS:
+            failing.add(name)
+    if pending:
+        return "pending", []
+    if failing:
+        return "red", sorted(failing)
+    return ("green" if rollup else "none"), []
+
+
 def _epoch(value: str) -> float:
     """Converts a forge timestamp to Unix seconds, or raises ValueError."""
     return datetime.fromisoformat(value).timestamp()
@@ -349,11 +627,29 @@ def open_issues(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, dict]:
     Returns:
         Bare issue number to its recorded title and label names.
     """
+    return open_issue_catalog(repo, limit) or {}
+
+
+def open_issue_catalog(
+    repo: Path, limit: int = MAX_OPEN_ISSUES, timeout: int = 15
+) -> dict[str, dict] | None:
+    """Reads the forge's open issues, telling absence apart from none open.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        limit: Most open issues to read in the one call.
+        timeout: Seconds the one client call may take.
+
+    Returns:
+        Bare issue number to its recorded title and label names, an empty
+        mapping when the forge reports no open issue, or None when the
+        project has no GitHub forge, no client, or the call failed.
+    """
     if _implementation(repo) != "github":
-        return {}
+        return None
     project = _reachable(repo)
     if project is None:
-        return {}
+        return None
     output = _run(
         [
             "gh",
@@ -368,10 +664,10 @@ def open_issues(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, dict]:
             "--json",
             "number,title,labels",
         ],
-        15,
+        timeout,
     )
     if output is None:
-        return {}
+        return None
     catalog: dict[str, dict] = {}
     try:
         for record in json.loads(output):
@@ -384,7 +680,7 @@ def open_issues(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, dict]:
                 ),
             }
     except (ValueError, TypeError, KeyError, AttributeError):
-        return {}
+        return None
     return catalog
 
 
@@ -491,12 +787,59 @@ def assign(repo: Path, number: str) -> bool:
     )
 
 
+def assigned(repo: Path, number: str) -> bool:
+    """Reports whether the operator's account already holds an issue.
+
+    Every lane runs under the operator's own account, so an assignment a
+    person set by hand and one a claim added name the same account. The
+    claim reads this before it assigns, so a release removes only an
+    assignment the claim added. The lookup is best effort and read only.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        number: Bare repository issue number.
+
+    Returns:
+        True only when the GitHub forge reports the signed-in account among
+        the issue's assignees; False for any other forge or any failure.
+    """
+    if _implementation(repo) != "github":
+        return False
+    project = _reachable(repo)
+    if project is None:
+        return False
+    login = _run(["gh", "api", "user", "--jq", ".login"], 15)
+    output = _run(
+        [
+            "gh",
+            "issue",
+            "view",
+            number,
+            "--repo",
+            project,
+            "--json",
+            "assignees",
+        ],
+        15,
+    )
+    if not login or output is None:
+        return False
+    try:
+        names = {
+            str(person["login"]) for person in json.loads(output)["assignees"]
+        }
+    except (ValueError, TypeError, KeyError):
+        return False
+    return login.strip() in names
+
+
 def unassign(repo: Path, number: str) -> bool:
     """Removes the operator's forge account from a released issue.
 
     This is the counterpart of :func:`assign` and carries the same best-effort
-    contract. It removes only the account Agent Parley added, so an assignee
-    a person set by hand is left in place.
+    contract. The claim path calls it only for an assignment its own claim
+    added, as `assigned` read it, so an assignee a person set by hand is left
+    in place.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
@@ -591,4 +934,31 @@ def comment(repo: Path, number: str, body: str) -> bool:
             20,
         )
         is not None
+    )
+
+
+def report_comment(summary: str, evidence: str) -> str:
+    """Shapes one lane's ready report for the issue it claims.
+
+    The comment reproduces the lane's own summary and evidence and adds no
+    assessment of its own, so a reader on the forge sees what was reported and
+    what that report is worth. It names neither the participant nor the
+    provider that produced the work: which assistant wrote a change belongs in
+    coordination state, where `top` and `status` read it, and never on the
+    user's forge.
+
+    Args:
+        summary: The lane's account of its result.
+        evidence: The verification evidence the lane recorded.
+
+    Returns:
+        Markdown for the issue comment.
+    """
+    return (
+        "Reported ready for review.\n\n"
+        f"{summary.strip()}\n\n"
+        "Verification recorded by the lane:\n\n"
+        f"{evidence.strip()}\n\n"
+        "A reported state is the participant's own account of its lane. It is "
+        "neither review nor independent verification."
     )

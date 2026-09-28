@@ -90,6 +90,23 @@ def test_closing_a_claim_supersedes_the_mail_it_sent(
     assert [row["reason"] for row in reasons] == ["issue #1 released"] * 2
 
 
+def test_superseding_a_claim_uses_an_index_on_an_upgraded_store(tmp_path):
+    store.initialize(tmp_path)
+    with store.connect(tmp_path, write=True) as db:
+        db.execute("DROP INDEX claims")
+    store.initialize(tmp_path)
+    with store.connect(tmp_path) as db:
+        plan = [
+            row["detail"]
+            for row in db.execute(
+                f"EXPLAIN QUERY PLAN {store.CLAIM_SUPERSESSION}",
+                ("root", "claim", "reason"),
+            )
+        ]
+    assert not [step for step in plan if step.startswith("SCAN")]
+    assert any("USING COVERING INDEX claims" in step for step in plan)
+
+
 def test_superseded_mail_never_names_a_lane_as_stalled(
     bridge, paired, correlated
 ):

@@ -283,7 +283,11 @@ def latest_review(
 
 
 def idle_intervals(
-    directory: Path, name: str, since: float = 0.0, now: float = 0.0
+    directory: Path,
+    name: str,
+    since: float = 0.0,
+    now: float = 0.0,
+    entries: list[dict] | None = None,
 ) -> dict:
     """Derives the intervals one lane spent without coordination activity.
 
@@ -299,6 +303,9 @@ def idle_intervals(
         since: Unix time floor for the window. Zero covers everything
             retained.
         now: Instant the window ends at; the current time when zero.
+        entries: Records the caller already read from this lane's log for
+            the same window, so one frame parses the log once; read here
+            when None.
 
     Returns:
         The intervals, their total in seconds, and whether the reading covers
@@ -307,10 +314,11 @@ def idle_intervals(
         than pretending to be exact.
     """
     ends = now or time.time()
-    try:
-        entries = checkpoints.read_events(directory, name, since)
-    except BridgeError:
-        return {"intervals": [], "seconds": 0, "complete": False}
+    if entries is None:
+        try:
+            entries = checkpoints.read_events(directory, name, since)
+        except BridgeError:
+            return {"intervals": [], "seconds": 0, "complete": False}
     stamps = sorted(
         (float(entry.get("ts", 0) or 0), str(entry.get("event", "")))
         for entry in entries

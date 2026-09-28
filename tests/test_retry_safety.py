@@ -2,8 +2,8 @@
 
 import pytest
 
-from agent_parley import issues, store
-from agent_parley.state import BridgeError
+from agent_parley import issues, lifecycle, store
+from agent_parley.state import BridgeError, LockBusy
 
 
 def actor(bridge, root, name):
@@ -188,6 +188,20 @@ def test_a_repeated_report_counts_one_attempt(bridge, repo, paired):
     assert issues.snapshot(directory)["issues"]["42"]["attempts"] == 1
 
 
+def test_a_late_replayed_report_leaves_the_lifecycle_alone(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "42")
+    stuck = ("blocked", "Waiting on schema.", "Apply the migration.", "")
+    bridge.report(lane, *stuck, key="stuck")
+    bridge.report(lane, "ready", "Migration applied.", "", "make check", "go")
+    bridge.report(lane, *stuck, key="stuck")
+    record = issues.snapshot(directory)["issues"]["42"]
+    assert lifecycle.state(record)["state"] == lifecycle.READY
+
+
 def test_a_report_key_reused_for_other_content_is_refused(bridge, repo, paired):
     lane = paired["lanes"]["claude"]
     bridge.issue(lane, "claim", "42")
@@ -196,3 +210,32 @@ def test_a_report_key_reused_for_other_content_is_refused(bridge, repo, paired):
         bridge.report(
             lane, "partial", "Parser done.", "Wire the server.", "", "step"
         )
+
+
+def test_a_claim_refused_by_contention_is_evaluated_again(
+    bridge, repo, paired, monkeypatch
+):
+    lane = paired["lanes"]["claude"]
+    applied = issues._change
+    contended = []
+
+    def busy_once(*arguments, **options):
+        if not contended:
+            contended.append(True)
+            raise LockBusy("Another operation owns a lock; retry later.")
+        return applied(*arguments, **options)
+
+    monkeypatch.setattr(issues, "_change", busy_once)
+    with pytest.raises(LockBusy):
+        bridge.issue(lane, "claim", "42", key="k1")
+    assert bridge.issue(lane, "claim", "42", key="k1")["owner"] == "claude"
+
+
+def test_a_claim_refused_by_another_owner_stays_refused(bridge, repo, paired):
+    lanes = paired["lanes"]
+    bridge.issue(lanes["codex"], "claim", "42")
+    with pytest.raises(BridgeError, match="is owned by codex"):
+        bridge.issue(lanes["claude"], "claim", "42", key="k2")
+    bridge.issue(lanes["codex"], "release", "42")
+    with pytest.raises(BridgeError, match="is owned by codex"):
+        bridge.issue(lanes["claude"], "claim", "42", key="k2")

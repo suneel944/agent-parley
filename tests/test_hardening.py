@@ -241,7 +241,14 @@ def test_dashboard_fits_terminal_and_names_hidden_participants(
     assert "MAIL" in "\n".join(lines)
     if width >= 80:
         assert "running; no hooks" in "\n".join(lines)
-    span = sum(size + 2 for _, size in dashboard.COLUMNS) - 2
+    span = (
+        sum(
+            size + 2
+            for name, size in dashboard.COLUMNS
+            if name in dashboard.DEFAULT_COLUMNS
+        )
+        - 2
+    )
     if width < span:
         assert "Hidden columns:" in "\n".join(lines)
 

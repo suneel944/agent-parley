@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 
 class BridgeError(Exception):

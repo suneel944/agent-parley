@@ -1,82 +1,202 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1067" height="516" viewBox="0 0 1067 516" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13">
-<rect width="1067" height="516" rx="10" fill="#0d1117"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1067" height="564" viewBox="0 0 1067 564" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13">
+<defs><radialGradient id="backdrop" cx="50%" cy="38%" r="75%"><stop offset="0" stop-color="#1b2a4a"/><stop offset="0.55" stop-color="#0d1117"/><stop offset="1" stop-color="#010409"/></radialGradient><linearGradient id="accent" x1="0" x2="1067" y1="0" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0.2" stop-color="#79c0ff"/><stop offset="0.5" stop-color="#d2a8ff"/><stop offset="0.8" stop-color="#7ee787"/></linearGradient></defs>
+<rect width="1067" height="564" rx="10" fill="#0d1117"/>
 <rect width="1067" height="30" rx="10" fill="#161b22"/>
 <rect y="20" width="1067" height="10" fill="#161b22"/>
 <circle cx="18" cy="15" r="5.5" fill="#ff5f57"/><circle cx="36" cy="15" r="5.5" fill="#febc2e"/><circle cx="54" cy="15" r="5.5" fill="#28c840"/>
+<rect y="516.0" width="1067" height="48.0" fill="#161b22"/>
+<rect y="516.0" width="1067" height="1" fill="#30363d"/>
 <g opacity="1">
-<animate attributeName="opacity" calcMode="discrete" values="1;0" keyTimes="0;0.058824" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley up</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley up</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Coordination server ready at http://127.0.0.1:48709/mcp/</text>
+<animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.025730;0.027324;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.000000;0.003643;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="217.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">AGENT PARLEY 0.13.0</text>
+<text x="533.5" y="273.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Many coding agents. One repository.</text>
+<text x="533.5" y="321.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Claims, advisory reservations, handoffs, plans, budgets</text>
+<text x="533.5" y="349.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">and unattended integration, for claude and codex side by side.</text>
+<text x="533.5" y="377.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Every frame below is real command output.</text>
+</g>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.058824;0.117647" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley setup /home/dev/payments-api</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley setup /home/dev/payments-api</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.027324;0.028918;0.042124;0.043718;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.027324;0.030967;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 1</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Parallel lanes</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">One coordination server. Each agent gets its own worktree,</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">identity and inbox; the base checkout is never edited.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.043718;0.045312;0.062799;0.064393;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type9600"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;117.1;117.1" keyTimes="0.000000;0.045312;0.047224;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type9600)">agent-parley up</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;150.8;150.8" keyTimes="0.000000;0.045312;0.047224;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.048135;0.048135;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.047907;0.049274;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Coordination server ready at http://127.0.0.1:51045/mcp/</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">One loopback coordination server serves every project.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.064393;0.065987;0.087472;0.089066;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type14140"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;320.2;320.2" keyTimes="0.000000;0.065987;0.071215;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type14140)">agent-parley setup /home/dev/payments-api</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;353.8;353.8" keyTimes="0.000000;0.065987;0.071215;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.072125;0.072125;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.071898;0.073264;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "version": 2,</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "root": "/home/dev/payments-api",</text>
-<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  "base": "0ec210b1a62a3b8fa3777f91c0d30ed9703fea36",</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  "base": "0611e61585ab0651af3b9c108cdf6dc7cba353b9",</text>
 <text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">  "verify": [],</text>
 <text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  "initialize": [],</text>
-<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  "forge": "github",</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">  "participants": {},</text>
-<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "lanes": {},</text>
-<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">  "branches": {}</text>
-<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">}</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">[2 lines not shown]</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">  "lanes": {},</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "branches": {}</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Register the repository once.</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.117647;0.176471" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley forge set null --repo /home/dev/payments-api</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley forge set null --repo /home/dev/payments-api</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.089066;0.090660;0.113002;0.114595;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type19558"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;445.2;445.2" keyTimes="0.000000;0.090660;0.097928;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type19558)">agent-parley forge set null --repo /home/dev/payments-api</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;478.8;478.8" keyTimes="0.000000;0.090660;0.097928;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.098839;0.098839;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.098611;0.099977;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">/home/dev/payments-api coordinates over the null forge (recorded), which opens no pull requests. Every forge e</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">xchange is best effort; the ledger decides ownership.</text>
 </g>
-<g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.176471;0.235294" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley participant add ada --provider claude</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley participant add ada --provider claude</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada: provider claude; identity ada; default account</text>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">No forge for this demo: everything stays local.</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.235294;0.294118" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley participant add grace --provider codex</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley participant add grace --provider codex</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.114595;0.116189;0.133039;0.134633;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type25164"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;390.5;390.5" keyTimes="0.000000;0.116189;0.122565;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type25164)">agent-parley participant add ada --provider claude</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;424.1;424.1" keyTimes="0.000000;0.116189;0.122565;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.123476;0.123476;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.123248;0.124614;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada: provider claude; identity ada; default account</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.134633;0.136227;0.153577;0.155171;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type29564"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;156.2;156.2" keyTimes="0.000000;0.136227;0.138777;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type29564)">agent-parley run ada</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;189.8;189.8" keyTimes="0.000000;0.136227;0.138777;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.139688;0.139688;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.139460;0.140826;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada (claude, default account): /home/dev/.local/state/agent-parley/projects/35c9925813d2d4c4/ada</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">Shared project: /home/dev/payments-api</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">ada runs on claude, in a worktree of its own.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.155171;0.156765;0.173742;0.175336;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type34074"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;398.3;398.3" keyTimes="0.000000;0.156765;0.163268;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type34074)">agent-parley participant add grace --provider codex</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;431.9;431.9" keyTimes="0.000000;0.156765;0.163268;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.164179;0.164179;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.163951;0.165317;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada: provider claude; identity ada; default account</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">grace: provider codex; identity grace; default account</text>
 </g>
-<g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.294118;0.352941" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley run ada</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley run ada</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">ada (claude, default account): /home/dev/.local/state/agent-parley/projects/ccb9cfa06185c228/ada</text>
-<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">Shared project: /home/dev/payments-api</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.352941;0.411765" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley run grace</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley run grace</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">grace (codex, default account): /home/dev/.local/state/agent-parley/projects/ccb9cfa06185c228/grace</text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.175336;0.176930;0.193442;0.195036;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type38502"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;171.8;171.8" keyTimes="0.000000;0.176930;0.179735;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type38502)">agent-parley run grace</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;205.4;205.4" keyTimes="0.000000;0.176930;0.179735;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.180646;0.180646;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.180418;0.181784;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">grace (codex, default account): /home/dev/.local/state/agent-parley/projects/35c9925813d2d4c4/grace</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">Shared project: /home/dev/payments-api</text>
 </g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">grace runs on codex, right beside it.</text>
+</g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.411765;0.470588" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley status</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley status</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.195036;0.196630;0.216631;0.218225;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 1 · Parallel lanes</text>
+<clipPath id="type42828"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;148.4;148.4" keyTimes="0.000000;0.196630;0.199053;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type42828)">agent-parley status</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;182.0;182.0" keyTimes="0.000000;0.196630;0.199053;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.199964;0.199964;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.199736;0.201102;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#79c0ff">Server: ready</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#79c0ff">State: /home/dev/.local/state/agent-parley</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9"></text>
 <text x="18.0" y="138.0" xml:space="preserve" fill="#79c0ff">Project: /home/dev/payments-api</text>
-<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">No issues claimed.</text>
-<text x="18.0" y="174.0" xml:space="preserve" fill="#79c0ff">PARTICIPANT  PROVIDER  SESSION                BRANCH                          OUTCOME  ISSUES  MAIL  LEASES  REPORTED  TASK</text>
-<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">ada          claude    working; event 0s ago  parley/ccb9cfa06185c228/lane-1  unknown  -       0/0   0       -         Check shared…</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">grace        codex     working; event 0s ago  parley/ccb9cfa06185c228/lane-2  unknown  -       0/0   0       -         Check shared…</text>
-<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">Hidden columns: ACCOUNT</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">Forge: open issues unavailable (no GitHub); claims on closed issues are not hidden</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">No open claims.</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">LANE   STATE    CLAIMS  TASK</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">ada    stopped  0       Check shared coordination state and await my task.</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">grace  active   0       Check shared coordination state and await my task.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Two providers, two lanes, one shared view.</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.470588;0.529412" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue claim 41</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue claim 41</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.218225;0.219819;0.233025;0.234619;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.218225;0.221868;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 2</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">A work order everyone reads</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Dependencies live in one reviewed TOML file,</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">not in anyone's head.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.234619;0.236213;0.257626;0.259219;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 2 · A work order everyone reads</text>
+<clipPath id="type51520"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;382.7;382.7" keyTimes="0.000000;0.236213;0.242461;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type51520)">agent-parley plan apply /home/dev/work-order.toml</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;416.3;416.3" keyTimes="0.000000;0.236213;0.242461;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.243372;0.243372;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.243144;0.244510;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Applied plan Refund rework (b2a296b4fdca): 1 dependencies recorded.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">#42 waits on #41; both belong to the refunds group.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.259219;0.260813;0.280286;0.281880;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 2 · A work order everyone reads</text>
+<clipPath id="type56922"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;171.8;171.8" keyTimes="0.000000;0.260813;0.263619;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type56922)">agent-parley plan show</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;205.4;205.4" keyTimes="0.000000;0.260813;0.263619;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.264529;0.264529;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.264302;0.265668;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Refund rework (b2a296b4fdca, applied by operator)</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  #41: unclaimed</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    #42: unclaimed</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  group refunds: #41, #42</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">The plan as a tree, with each issue's current owner.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.281880;0.283474;0.296680;0.298274;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.281880;0.285523;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 3</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Claims and advisory reservations</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">An agent claims an issue and reserves what it will touch.</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">A second agent is told, not silently overwritten.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.298274;0.299868;0.321435;0.323029;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 3 · Claims and advisory reservations</text>
+<clipPath id="type65498"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;210.9;210.9" keyTimes="0.000000;0.299868;0.303311;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type65498)">agent-parley issue claim 41</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;244.5;244.5" keyTimes="0.000000;0.299868;0.303311;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.304222;0.304222;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.303994;0.305360;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "owner": "ada",</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "offer": null,</text>
@@ -84,26 +204,22 @@
 <text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">  "blocked_by": [],</text>
 <text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  "history": [</text>
 <text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    {</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">      "action": "claim",</text>
-<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">      "actor": "ada",</text>
-<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">      "at": 1789596827.8120382,</text>
-<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada",</text>
-<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">      "offer": null,</text>
-<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">      "request": null,</text>
-<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">      "offer_id": null,</text>
-<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">      "claim_id": "684933cf6fcd4375"</text>
-<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">    }</text>
-<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
-<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">  "deadline": null,</text>
-<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9">  "attempts": 0,</text>
-<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">  "budget": null,</text>
-<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9">  "claim_id": "684933cf6fcd4375"</text>
-<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">}</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">[26 lines not shown]</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">    "progress": null,</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    "backlog": null</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">  }</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">ada claims #41 from inside its lane.</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.529412;0.588235" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">ada file_reservation_paths {"paths": ["src/payments/**"]}</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">ada </tspan><tspan fill="#e6edf3">file_reservation_paths {"paths": ["src/payments/**"]}</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.323029;0.324623;0.347457;0.349051;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 3 · Claims and advisory reservations</text>
+<clipPath id="type70934"><rect x="49.239999999999995" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;413.9;413.9" keyTimes="0.000000;0.324623;0.331381;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#d2a8ff">ada</text>
+<text x="49.239999999999995" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type70934)">file_reservation_paths {"paths": ["src/payments/**"]}</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="49.2;49.2;463.2;463.2" keyTimes="0.000000;0.324623;0.331381;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.332292;0.332292;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.332064;0.333430;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "granted": [</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    {</text>
@@ -114,10 +230,16 @@
 <text x="18.0" y="210.0" xml:space="preserve" fill="#ff7b72">  "conflicts": []</text>
 <text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">}</text>
 </g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">ada reserves the refund module.</text>
+</g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.588235;0.647059" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">grace file_reservation_paths {"paths": ["src/payments/**"]}</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">grace </tspan><tspan fill="#e6edf3">file_reservation_paths {"paths": ["src/payments/**"]}</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.349051;0.350644;0.376392;0.377986;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 3 · Claims and advisory reservations</text>
+<clipPath id="type76648"><rect x="64.86" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;413.9;413.9" keyTimes="0.000000;0.350644;0.357402;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#d2a8ff">grace</text>
+<text x="64.86" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type76648)">file_reservation_paths {"paths": ["src/payments/**"]}</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="64.9;64.9;478.8;478.8" keyTimes="0.000000;0.350644;0.357402;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.358313;0.358313;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.358086;0.359452;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "granted": [],</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#ff7b72">  "conflicts": [</text>
@@ -129,10 +251,16 @@
 <text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "has_more": false</text>
 <text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">}</text>
 </g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">grace asks for the same paths: a named collision.</text>
+</g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.647059;0.705882" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">grace request_reservation {"paths": ["src/payments/**"]}</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">grace </tspan><tspan fill="#e6edf3">request_reservation {"paths": ["src/payments/**"]}</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.377986;0.379580;0.408999;0.410592;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 3 · Claims and advisory reservations</text>
+<clipPath id="type83002"><rect x="64.86" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;390.5;390.5" keyTimes="0.000000;0.379580;0.385956;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#d2a8ff">grace</text>
+<text x="64.86" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type83002)">request_reservation {"paths": ["src/payments/**"]}</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="64.9;64.9;455.4;455.4" keyTimes="0.000000;0.379580;0.385956;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.386866;0.386866;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.386639;0.388005;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "granted": [],</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#ff7b72">  "conflicts": [</text>
@@ -152,39 +280,78 @@
 <text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">  ]</text>
 <text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">}</text>
 </g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">So grace queues behind ada instead of waiting blind.</text>
+</g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.705882;0.764706" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue offer 41 --to grace --summary Refund path reserved; tests green.</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue offer 41 --to grace --summary Refund path reserved; tests green.</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.410592;0.412186;0.425393;0.426987;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.410592;0.414236;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 4</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Guardrails in the native hooks</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Lanes stay on their assigned branch.</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">The refusal says why, and what to do instead.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.426987;0.428581;0.453481;0.455075;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 4 · Guardrails in the native hooks</text>
+<clipPath id="type93762"><rect x="49.239999999999995" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;359.3;359.3" keyTimes="0.000000;0.428581;0.434446;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#d2a8ff">ada</text>
+<text x="49.239999999999995" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type93762)">PreToolUse Bash: git checkout -b hotfix/refund</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="49.2;49.2;408.5;408.5" keyTimes="0.000000;0.428581;0.434446;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.435357;0.435357;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.435129;0.436495;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "hookSpecificOutput": {</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    "hookEventName": "PreToolUse",</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#ff7b72">    "permissionDecision": "deny",</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">    "permissionDecisionReason": "Agent Parley owns this worktree on 'parley/35c9925813d2d4c4/lane-1'; branch switches are blocked. C</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">reate or use a separate worktree for feature branches."</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  }</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">A branch switch inside a lane is refused before it runs.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.455075;0.456669;0.469876;0.471470;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.455075;0.458719;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 5</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Handoffs</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Work moves between agents explicitly,</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">with a summary, and only when the recipient accepts.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.471470;0.473063;0.498884;0.500478;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 5 · Handoffs</text>
+<clipPath id="type103530"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;788.8;788.8" keyTimes="0.000000;0.473063;0.480350;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type103530)">agent-parley issue offer 41 --to grace --summary 'Rounding traced to refund(); fix and tests remain.'</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;822.4;822.4" keyTimes="0.000000;0.473063;0.480350;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.481261;0.481261;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.481033;0.482399;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "owner": "ada",</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "offer": {</text>
-<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">    "id": "f57bfc5f0eff4911bbf171e9db531126",</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">    "id": "36586ae857c64d5b9c84ed41c6b5f626",</text>
 <text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">    "to": "grace",</text>
-<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">    "summary": "Refund path reserved; tests green.",</text>
-<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    "created": 1789596827.9261005,</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">    "deadline": null,</text>
-<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">    "commit": "0ec210b1a62a3b8fa3777f91c0d30ed9703fea36",</text>
-<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    "reservations": [</text>
-<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">      "src/payments/**"</text>
-<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">    ],</text>
-<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">    "remaining": []</text>
-<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">  },</text>
-<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">  "request": null,</text>
-<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[31 lines not shown]</text>
-<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">      "claim_id": "684933cf6fcd4375"</text>
-<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">    }</text>
-<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9">  ],</text>
-<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">  "deadline": null,</text>
-<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9">  "attempts": 0,</text>
-<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">  "budget": null,</text>
-<text x="18.0" y="480.0" xml:space="preserve" fill="#c9d1d9">  "claim_id": "684933cf6fcd4375"</text>
-<text x="18.0" y="498.0" xml:space="preserve" fill="#c9d1d9">}</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">    "summary": "Rounding traced to refund(); fix and tests remain.",</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    "created": 1790550397.1598384,</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">[58 lines not shown]</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">    "progress": null,</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    "backlog": null</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">  }</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">ada offers #41 to grace with a summary.</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.764706;0.823529" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue accept 41 --offer-id f57bfc5f0eff4911bbf171e9db531126</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue accept 41 --offer-id f57bfc5f0eff4911bbf171e9db531126</tspan></text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.500478;0.502072;0.528713;0.530306;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 5 · Handoffs</text>
+<clipPath id="type109900"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;562.3;562.3" keyTimes="0.000000;0.502072;0.509358;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type109900)">agent-parley issue accept 41 --offer-id 36586ae857c64d5b9c84ed41c6b5f626</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;595.9;595.9" keyTimes="0.000000;0.502072;0.509358;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.510269;0.510269;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.510041;0.511408;1.000000" dur="219.59s" repeatCount="indefinite"/>
 <text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "owner": "grace",</text>
 <text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "offer": null,</text>
@@ -192,73 +359,322 @@
 <text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">  "blocked_by": [],</text>
 <text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  "history": [</text>
 <text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">    {</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">      "action": "claim",</text>
-<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">      "actor": "ada",</text>
-<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">      "at": 1789596827.8120382,</text>
-<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">      "owner": "ada",</text>
-<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">      "offer": null,</text>
-<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">      "request": null,</text>
-<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">      "offer_id": null,</text>
-<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">      "claim_id": "684933cf6fcd4375"</text>
-<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[44 lines not shown]</text>
-<text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9">    "diff_bytes": 0,</text>
-<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">    "from": "ada",</text>
-<text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9">    "at": 1789596828.0047724</text>
-<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">  },</text>
-<text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9">  "reservations_moved": [</text>
-<text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">    "src/payments/**"</text>
-<text x="18.0" y="480.0" xml:space="preserve" fill="#c9d1d9">  ]</text>
-<text x="18.0" y="498.0" xml:space="preserve" fill="#c9d1d9">}</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">[71 lines not shown]</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">  "reservations_moved": [</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    "src/payments/**"</text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">  ]</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">grace accepts; only then does ownership move.</text>
 </g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.823529;0.882353" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley issue list</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley issue list</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">#41: grace (working; event 0s ago)</text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.530306;0.531900;0.556118;0.557712;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 5 · Handoffs</text>
+<clipPath id="type116450"><rect x="49.239999999999995" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;437.4;437.4" keyTimes="0.000000;0.531900;0.539041;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#d2a8ff">ada</text>
+<text x="49.239999999999995" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type116450)">release_file_reservations {"paths": ["src/payments/**"]}</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="49.2;49.2;486.6;486.6" keyTimes="0.000000;0.531900;0.539041;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.539952;0.539952;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.539724;0.541090;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "released": 0,</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  "granted": []</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">}</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">ada releases the paths; grace's queued request is next.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.557712;0.559306;0.575627;0.577221;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 5 · Handoffs</text>
+<clipPath id="type122468"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;179.6;179.6" keyTimes="0.000000;0.559306;0.562239;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type122468)">agent-parley issue list</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;213.2;213.2" keyTimes="0.000000;0.559306;0.562239;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.563150;0.563150;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.562922;0.564288;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">#41: grace (working; event 2s ago); last progress 0s ago; no deadline</text>
 <text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  Accepted from ada</text>
-<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  Commit: 0ec210b1a62a3b8fa3777f91c0d30ed9703fea36</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  Commit: 0611e61585ab0651af3b9c108cdf6dc7cba353b9</text>
 <text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  Reservations: src/payments/**</text>
 </g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Who holds what, at a glance.</text>
+</g>
 <g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.882353;0.941176" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">$ agent-parley top --once</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#7ee787">$ </tspan><tspan fill="#e6edf3">agent-parley top --once</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#79c0ff">agent-parley top  server: running  state: /home/dev/.local/state/agent-parley</text>
-<text x="18.0" y="102.0" xml:space="preserve" fill="#79c0ff">projects 1  participants 2  hook events 2  denials 0 (0%)  context 802B  ready groups 0  idle 0s  all retained</text>
-<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">Hidden columns: PROVIDER, EVENT, BRANCH, CONTEXT</text>
-<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9"></text>
-<text x="18.0" y="156.0" xml:space="preserve" fill="#79c0ff">project /home/dev/payments-api</text>
-<text x="18.0" y="174.0" xml:space="preserve" fill="#79c0ff">PARTICIPANT     STATE                   ISSUES      MAIL       LEASES     DENIALS    CALLS      TOKENS     IDLE      FIT</text>
-<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">ada             working; event 0s ago   -           0/0        0          0/1        1                     0s        fit</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">    last: Check shared coordination state and await my task.</text>
-<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">grace           working; event 0s ago   #41         0/0        1 0s       0/1        2                     0s        fit</text>
-<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9">    last: Check shared coordination state and await my task.</text>
-<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9"></text>
-<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9">A lane marked idle is alive, has served no coordination call within the configured interval, and holds unread or unacknowledged mai…</text>
-<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9"></text>
-<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9">An issue marked ! is past its recorded deadline or its attempt budget. It is still owned: a deadline reports, and only an explicit …</text>
-<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9"></text>
-<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[3 lines not shown]</text>
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.577221;0.578815;0.592021;0.593615;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.577221;0.580864;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 6</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Plan revisions</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">A lane can propose a change to the work order.</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">The operator approves it; the ledger never drifts silently.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.593615;0.595209;0.618525;0.620119;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 6 · Plan revisions</text>
+<clipPath id="type130352"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;734.1;734.1" keyTimes="0.000000;0.595209;0.602496;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type130352)">agent-parley plan propose --base 1 --add 42:43 --reason '#42 reuses the ledger #43 introduces'</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;767.8;767.8" keyTimes="0.000000;0.595209;0.602496;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.603406;0.603406;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.603179;0.604545;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">9ab8415199c9354f pending (by ada, base version 1)</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  add: #42 waits on #43</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  reason: #42 reuses the ledger #43 introduces</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  held: the applied plan defines no [revisions] envelope</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">  approve: agent-parley plan approve 9ab8415199c9354f</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">ada proposes a new dependency from its lane.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.620119;0.621713;0.643326;0.644920;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 6 · Plan revisions</text>
+<clipPath id="type136172"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;210.9;210.9" keyTimes="0.000000;0.621713;0.625156;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type136172)">agent-parley plan proposals</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;244.5;244.5" keyTimes="0.000000;0.621713;0.625156;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.626067;0.626067;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.625839;0.627205;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Plan version 1.</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">No envelope: every lane proposal waits for the operator.</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">9ab8415199c9354f pending (by ada, base version 1)</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  add: #42 waits on #43</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">  reason: #42 reuses the ledger #43 introduces</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  held: the applied plan defines no [revisions] envelope</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  approve: agent-parley plan approve 9ab8415199c9354f</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Proposals outside the [revisions] envelope wait here.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.644920;0.646514;0.664393;0.665987;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 6 · Plan revisions</text>
+<clipPath id="type141618"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;328.0;328.0" keyTimes="0.000000;0.646514;0.651869;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type141618)">agent-parley plan approve 9ab8415199c9354f</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;361.6;361.6" keyTimes="0.000000;0.646514;0.651869;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.652780;0.652780;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.652552;0.653919;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">9ab8415199c9354f accepted (by ada, base version 1)</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  add: #42 waits on #43</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">  reason: #42 reuses the ledger #43 introduces</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">The operator approves it.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.665987;0.667580;0.685505;0.687099;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 6 · Plan revisions</text>
+<clipPath id="type146244"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;171.8;171.8" keyTimes="0.000000;0.667580;0.670386;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type146244)">agent-parley plan show</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;205.4;205.4" keyTimes="0.000000;0.667580;0.670386;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.671297;0.671297;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.671069;0.672435;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Refund rework (120aa6340ed1, applied by ada)</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  #41: grace</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    #42: unclaimed</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">  #43: unclaimed</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">    #42: unclaimed</text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">  group refunds: #41, #42</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">The plan now carries the new edge.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.687099;0.688693;0.701899;0.703493;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.687099;0.690742;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 7</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">A run budget</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Cap the tokens, calls and hours a whole run may spend.</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Past the cap the service starts no wake, dispatch or launch.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.703493;0.705087;0.727091;0.728685;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 7 · A run budget</text>
+<clipPath id="type154480"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;382.7;382.7" keyTimes="0.000000;0.705087;0.711335;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type154480)">agent-parley budget enforce --calls 500 --hours 8</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;416.3;416.3" keyTimes="0.000000;0.705087;0.711335;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.712246;0.712246;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.712018;0.713384;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">/home/dev/payments-api enforces a run budget: calls 0 of 500, hours 0h of 8h used. Standing: within limits. Co</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">unts are what Parley observes, not billed spend.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Enforced for the project, observed by Parley itself.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.728685;0.730279;0.743486;0.745079;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.728685;0.732328;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 8</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">Unattended integration</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Named issues may merge without an operator,</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">only after the recorded gate passes on a ready report.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.745079;0.746673;0.766647;0.768241;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type163612"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;328.0;328.0" keyTimes="0.000000;0.746673;0.752029;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type163612)">agent-parley verify set 'git diff --check'</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;361.6;361.6" keyTimes="0.000000;0.746673;0.752029;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.752940;0.752940;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.752712;0.754078;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">/home/dev/payments-api runs `git diff --check` in the base checkout before every `participant merge`.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">The gate every merge runs in the base checkout.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.768241;0.769835;0.789972;0.791566;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type168698"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;343.6;343.6" keyTimes="0.000000;0.769835;0.775445;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type168698)">agent-parley unattended set 41 --target main</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;377.3;377.3" keyTimes="0.000000;0.769835;0.775445;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.776356;0.776356;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.776128;0.777494;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">/home/dev/payments-api authorizes unattended integration into main for issues #41, on the terms of `participan</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">t merge`.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">#41 may be integrated into main unattended.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.791566;0.793160;0.811558;0.813152;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type173820"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;312.4;312.4" keyTimes="0.000000;0.793160;0.798260;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type173820)">git commit -am 'Refund whole cents only'</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;346.0;346.0" keyTimes="0.000000;0.793160;0.798260;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.799171;0.799171;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.798943;0.800310;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">[parley/35c9925813d2d4c4/lane-2 cda7326] Refund whole cents only</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9"> 1 file changed, 5 insertions(+)</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">grace commits the fix in its lane.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.813152;0.814746;0.834737;0.836331;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type178560"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;952.8;952.8" keyTimes="0.000000;0.814746;0.822032;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type178560)">agent-parley report --issue 41 --state ready --summary 'Refunds clamp to whole cents' --evidence 'git diff --check: clean'</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;986.4;986.4" keyTimes="0.000000;0.814746;0.822032;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.822943;0.822943;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.822715;0.824081;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Recorded outcome: ready</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">She reports ready, with evidence.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.836331;0.837925;0.858755;0.860349;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type183650"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;257.7;257.7" keyTimes="0.000000;0.837925;0.842133;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type183650)">agent-parley unattended run grace</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;291.3;291.3" keyTimes="0.000000;0.837925;0.842133;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.843044;0.843044;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.842816;0.844182;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">Merged parley/35c9925813d2d4c4/lane-2 into main as a merge commit, carrying 1 commits from grace. The lane and its branch are unchan</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">ged; retire grace separately when the lane is no longer needed.</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">Integrated unattended under integration.unattended: issue #41 at cda7326f7d65 into main.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Her session has exited; the merge runs behind the gate.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.860349;0.861943;0.877973;0.879566;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type188924"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;156.2;156.2" keyTimes="0.000000;0.861943;0.864493;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type188924)">git log --oneline -3</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;189.8;189.8" keyTimes="0.000000;0.861943;0.864493;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.865404;0.865404;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.865176;0.866542;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">01ec6f1 (HEAD -&gt; main) Merge lane branch parley/35c9925813d2d4c4/lane-2</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">cda7326 (parley/35c9925813d2d4c4/lane-2) Refund whole cents only</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">0611e61 (parley/35c9925813d2d4c4/lane-1) Add the refund path</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">main now carries grace's commit.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.879566;0.881160;0.903129;0.904722;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 8 · Unattended integration</text>
+<clipPath id="type193144"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;296.8;296.8" keyTimes="0.000000;0.881160;0.886006;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type193144)">agent-parley history participant grace</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;330.4;330.4" keyTimes="0.000000;0.881160;0.886006;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.886917;0.886917;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.886689;0.888055;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">2026-09-27 23:06:37 reservation grace: reserved src/payments/**; claim 27a49968de054e38</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">2026-09-27 23:06:37 handoff #41 grace: accept #41; claim 27a49968de054e38</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">2026-09-27 23:06:39 report #41 grace: reported ready; claim 27a49968de054e38</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">2026-09-27 23:06:40 report #41 grace: integrated by merge; claim 27a49968de054e38</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9">2026-09-27 23:06:40 report #41 grace: unattended integration integrated; claim 27a49968de054e38</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">Every claim, handoff, report and merge is on record.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.904722;0.906316;0.919523;0.921117;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.904722;0.908366;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">CHAPTER 9</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">One pane for the operator</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Live state of every lane, and only the problems</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">that need a human.</text>
+</g>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.921117;0.922711;0.951419;0.953012;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 9 · One pane for the operator</text>
+<clipPath id="type202268"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;179.6;179.6" keyTimes="0.000000;0.922711;0.925643;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type202268)">agent-parley top --once</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;213.2;213.2" keyTimes="0.000000;0.922711;0.925643;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.926554;0.926554;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.926326;0.927693;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#79c0ff">agent-parley top  server: running  state: /home/dev/.local/state/agent-parley  read 0.08s</text>
+<text x="18.0" y="102.0" xml:space="preserve" fill="#79c0ff">projects 1  participants 1  hook events 1  denials 0 (0%)  context 401B  ready groups 0  idle 0s  all retained</text>
+<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">Hidden: 1 lanes (stopped, holding nothing), 0 projects (root gone); a or --all shows them</text>
+<text x="18.0" y="138.0" xml:space="preserve" fill="#c9d1d9">Hidden columns: PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS</text>
+<text x="18.0" y="156.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="174.0" xml:space="preserve" fill="#79c0ff">project /home/dev/payments-api</text>
+<text x="18.0" y="192.0" xml:space="preserve" fill="#79c0ff">PARTICIPANT     STATE                   REVIEW    ISSUES      MAIL       LEASES     DENIALS    IDLE      UNUSED   FIT</text>
+<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">grace           stopped; event 1s ago   -         -           0/0        1 3s       0/1        0s        -</text>
+<text x="18.0" y="228.0" xml:space="preserve" fill="#c9d1d9">    last: Check shared coordination state and await my task.</text>
+<text x="18.0" y="246.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="264.0" xml:space="preserve" fill="#c9d1d9">A lane marked idle is alive, has served no coordination call within the configured interval, and holds unread or unacknowledged mai…</text>
+<text x="18.0" y="282.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="300.0" xml:space="preserve" fill="#c9d1d9">An issue marked ! is past its recorded deadline or its attempt budget. It stays owned while its holder works; a holder that has run…</text>
+<text x="18.0" y="318.0" xml:space="preserve" fill="#c9d1d9"></text>
+<text x="18.0" y="336.0" xml:space="preserve" fill="#c9d1d9">An issue marked * is held by a lane whose session process is gone and which has been silent past the stall threshold; the line unde…</text>
+<text x="18.0" y="354.0" xml:space="preserve" fill="#c9d1d9">[4 lines not shown]</text>
 <text x="18.0" y="372.0" xml:space="preserve" fill="#c9d1d9"></text>
-<text x="18.0" y="390.0" xml:space="preserve" fill="#ff7b72">Columns: MAIL unread/pending acknowledgement; LEASES held leases, !past a declared time to live, +queued requests waiting on those …</text>
+<text x="18.0" y="390.0" xml:space="preserve" fill="#c9d1d9">FIT is the last capacity check the runtime read for that lane, with + when an advisory work offer is waiting for it; the line under…</text>
 <text x="18.0" y="408.0" xml:space="preserve" fill="#c9d1d9"></text>
-<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">FIT is the last capacity check the runtime read for that lane, with + when an advisory work offer is waiting for it; the line under…</text>
+<text x="18.0" y="426.0" xml:space="preserve" fill="#c9d1d9">REVIEW is the latest verdict a peer recorded against that lane's report; the reviewer and the report it judges are in the lane deta…</text>
 <text x="18.0" y="444.0" xml:space="preserve" fill="#c9d1d9"></text>
 <text x="18.0" y="462.0" xml:space="preserve" fill="#c9d1d9">CONTEXT counts only the bytes coordination injected into a lane's context. A message, report or offer above its cap is kept whole a…</text>
 <text x="18.0" y="480.0" xml:space="preserve" fill="#c9d1d9"></text>
 <text x="18.0" y="498.0" xml:space="preserve" fill="#c9d1d9">A row carrying drift, a stale lease, a rejected call, an overdue or orphaned issue or a stopped session is drawn in colour where th…</text>
 </g>
-<g opacity="0">
-<animate attributeName="opacity" calcMode="discrete" values="0;1;0" keyTimes="0;0.941176;1.0" dur="76.5s" repeatCount="indefinite"/>
-<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-size="12">ada PreToolUse Bash: git checkout -b hotfix/refund</text>
-<text x="18.0" y="66.0" xml:space="preserve"><tspan fill="#d2a8ff">ada </tspan><tspan fill="#e6edf3">PreToolUse Bash: git checkout -b hotfix/refund</tspan></text>
-<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">{</text>
-<text x="18.0" y="102.0" xml:space="preserve" fill="#c9d1d9">  "hookSpecificOutput": {</text>
-<text x="18.0" y="120.0" xml:space="preserve" fill="#c9d1d9">    "hookEventName": "PreToolUse",</text>
-<text x="18.0" y="138.0" xml:space="preserve" fill="#ff7b72">    "permissionDecision": "deny",</text>
-<text x="18.0" y="156.0" xml:space="preserve" fill="#ff7b72">    "permissionDecisionReason": "Agent Parley owns this worktree on 'parley/ccb9cfa06185c228/lane-1'; branch switches are blocked. C</text>
-<text x="18.0" y="174.0" xml:space="preserve" fill="#c9d1d9">reate or use a separate worktree for feature branches."</text>
-<text x="18.0" y="192.0" xml:space="preserve" fill="#c9d1d9">  }</text>
-<text x="18.0" y="210.0" xml:space="preserve" fill="#c9d1d9">}</text>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">The dashboard: state, issues, mail, leases, denials.</text>
 </g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0.000000;0.953012;0.954606;0.971082;0.972676;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="19" text-anchor="middle" fill="#8b949e" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">Chapter 9 · One pane for the operator</text>
+<clipPath id="type209272"><rect x="33.62" y="52.0" height="18.0" width="0"><animate attributeName="width" values="0;0;164.0;164.0" keyTimes="0.000000;0.954606;0.957284;1.000000" dur="219.59s" repeatCount="indefinite"/></rect></clipPath>
+<text x="18.0" y="66.0" xml:space="preserve" fill="#7ee787">$</text>
+<text x="33.62" y="66.0" xml:space="preserve" fill="#e6edf3" clip-path="url(#type209272)">agent-parley problems</text>
+<rect y="54.0" width="8" height="15" fill="#e6edf3"><animate attributeName="x" values="33.6;33.6;197.6;197.6" keyTimes="0.000000;0.954606;0.957284;1.000000" dur="219.59s" repeatCount="indefinite"/><animate attributeName="opacity" values="1;1;0;0" keyTimes="0.000000;0.958195;0.958195;1.000000" dur="219.59s" repeatCount="indefinite"/></rect>
+<g><animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.957967;0.959333;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="18.0" y="84.0" xml:space="preserve" fill="#c9d1d9">No problems: every lane, claim and store reading is clear.</text>
+</g>
+<rect x="18.0" y="528.0" width="4" height="24" rx="2" fill="url(#accent)"/><text x="34.0" y="545.0" fill="#e6edf3" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16">The operator's queue of things to decide.</text>
+</g>
+<g opacity="0">
+<animate attributeName="opacity" values="0;0;1;1" keyTimes="0.000000;0.972676;0.974270;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<rect width="1067" height="564" rx="10" fill="url(#backdrop)"/>
+<g><animateTransform type="translate" attributeName="transform" values="0 14;0 14;0 0;0 0" keyTimes="0.000000;0.972676;0.976320;1.000000" dur="219.59s" repeatCount="indefinite"/>
+<text x="533.5" y="230.0" text-anchor="middle" fill="#79c0ff" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" letter-spacing="4" font-weight="600">GET STARTED</text>
+<text x="533.5" y="286.0" text-anchor="middle" fill="url(#accent)" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="44" font-weight="800">uv tool install agent-parley</text>
+<text x="533.5" y="334.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">agent-parley setup .   ·   agent-parley run &lt;lane&gt;</text>
+<text x="533.5" y="362.0" text-anchor="middle" fill="#c9d1d9" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="18">Local-first. Standard library only. Your native CLIs, unchanged.</text>
+</g>
+</g>
+<rect x="29.2" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="232.8" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="300.8" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="438.1" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="485.6" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="615.9" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="733.1" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="777.5" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="965.3" y="560" width="2" height="4" fill="#30363d"/>
+<rect x="1037.8" y="560" width="2" height="4" fill="#30363d"/>
+<rect y="561" height="3" width="0" fill="url(#accent)"><animate attributeName="width" values="0;1067" dur="219.59s" repeatCount="indefinite"/></rect>
 </svg>

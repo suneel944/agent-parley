@@ -13,7 +13,12 @@ whole table, so a pipe or a file keeps every column.
 
 from __future__ import annotations
 
+import unicodedata
+
 GAP = "  "
+ZERO_WIDTH = "".join(
+    map(chr, (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, *range(0xFE00, 0xFE10)))
+)
 MINIMUM_TASK = 12
 STATUS_COLUMNS = (
     "PARTICIPANT",
@@ -30,6 +35,10 @@ STATUS_COLUMNS = (
     "TASK",
 )
 STATUS_DROP = (2, 10, 9, 1, 8, 6, 3, 5, 4, 7)
+WORK_COLUMNS = ("ISSUE", "TITLE", "OWNER", "STATE", "LAST EVENT", "PR")
+WORK_DROP = (4, 5, 1)
+TITLE_WIDTH = 40
+LANE_COLUMNS = ("LANE", "STATE", "CLAIMS", "TASK")
 
 
 def age(seconds: float) -> str:
@@ -52,20 +61,69 @@ def size(count: int) -> str:
     return f"{count / 1024 / 1024:.1f}MB"
 
 
+def _char_columns(char: str) -> int:
+    """Counts the terminal columns one code point occupies.
+
+    East Asian Wide and Fullwidth characters take two columns. Combining
+    marks, zero-width spaces and joiners, and variation selectors take none.
+    Every other character, including East Asian Ambiguous ones such as the
+    ellipsis, takes one, which matches a terminal in a non-CJK locale.
+    """
+    if char in ZERO_WIDTH or unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def measure(value: str) -> int:
+    """Measures text in terminal display columns rather than code points.
+
+    Each code point is counted on its own, so an emoji joined by zero-width
+    joiners into one glyph, such as a family sequence, counts the width of
+    every emoji it joins. A terminal that draws the sequence as one glyph
+    shows it narrower than measured, so a cell may carry spare padding but
+    never overruns its column budget.
+
+    Args:
+        value: Text as it will be printed.
+
+    Returns:
+        The number of terminal columns the text occupies.
+    """
+    return sum(_char_columns(char) for char in value)
+
+
 def fit(value: str, width: int) -> str:
     """Pads a cell, marking any value the column could not show in full.
 
+    Width is counted in terminal display columns, as `measure` defines them,
+    so wide characters and combining marks line up with the columns around
+    them.
+
     Args:
         value: Cell text.
-        width: Column width.
+        width: Column width in terminal display columns.
 
     Returns:
         Text padded to the column width, ending in an ellipsis when clipped,
-        so a truncated branch or issue list never reads as complete.
+        so a truncated branch or issue list never reads as complete. A
+        clipped cell keeps whole characters with their combining marks and,
+        when a wide character would cross the budget, pads with a space
+        instead of splitting it.
     """
-    if len(value) > width:
-        return value[: width - 1] + "…"
-    return value.ljust(width)
+    used = measure(value)
+    if used <= width:
+        return value + " " * (width - used)
+    budget = width - 1
+    kept: list[str] = []
+    used = 0
+    for char in value:
+        cost = _char_columns(char)
+        if used + cost > budget:
+            break
+        kept.append(char)
+        used += cost
+    text = "".join(kept).rstrip(ZERO_WIDTH)
+    return text + "…" + " " * (budget - used)
 
 
 def session(
@@ -106,12 +164,26 @@ def session(
     return liveness
 
 
+def idle_age(stalled: dict) -> float:
+    """Reads the idle age a stalled lane's session cell reports.
+
+    Args:
+        stalled: Stall report from `supervision.stall`.
+
+    Returns:
+        Seconds the lane has shown no sign of work, or the waiting item's age
+        when the lane has recorded no evidence of work at all.
+    """
+    silent = stalled.get("silent_seconds")
+    return stalled["age_seconds"] if silent is None else silent
+
+
 def widths(columns: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[int]:
-    """Measures each column against its heading and its widest value."""
+    """Measures each column's display width against its heading and values."""
     return [
-        max(len(name), *(len(row[index]) for row in rows), 1)
+        max(measure(name), *(measure(row[index]) for row in rows), 1)
         if rows
-        else len(name)
+        else measure(name)
         for index, name in enumerate(columns)
     ]
 
@@ -210,7 +282,7 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
             record["session"],
             record["paused"],
             record["idle"]["stalled"],
-            record["idle"]["age_seconds"],
+            idle_age(record["idle"]),
             record.get("retired_age_seconds"),
         ),
         record["branch"] + ("!" if record["drift"] else ""),
@@ -268,3 +340,101 @@ def status_table(
     if omitted:
         lines.append("Hidden columns: " + ", ".join(omitted))
     return lines
+
+
+def pull_cell(claim: dict) -> str:
+    """Names the pull request state one claim carries.
+
+    Args:
+        claim: One claim from a lane record of the status snapshot.
+
+    Returns:
+        ``ended`` with any observed branch state for a claim whose work ended
+        on the forge, the cached open pull request's number, check verdict
+        and any conflict, or ``-`` when none is cached.
+    """
+    if claim.get("ended"):
+        state = str(claim.get("branch_state") or "").lower()
+        return f"ended, {state}" if state else "ended"
+    pull = claim.get("pull_request")
+    if not pull:
+        return "-"
+    cell = f"#{pull['number']} CI {pull['checks'] or 'unknown'}"
+    if pull.get("mergeable") == "CONFLICTING":
+        cell += ", conflicting"
+    return cell
+
+
+def work_row(claim: dict, owner: str, state: str) -> tuple[str, ...]:
+    """Builds one open-work row from a claim and the lane holding it.
+
+    Args:
+        claim: One claim from a lane record of the status snapshot.
+        owner: Participant holding the claim.
+        state: State of the lane holding the claim.
+
+    Returns:
+        One cell per column of `WORK_COLUMNS`, the title clipped to
+        `TITLE_WIDTH` with an ellipsis.
+    """
+    title = str(claim.get("title") or "-")
+    seconds = claim.get("last_event_seconds")
+    return (
+        f"#{claim['issue']}",
+        fit(title, TITLE_WIDTH).rstrip(),
+        owner,
+        state,
+        age(seconds) if seconds is not None else "-",
+        pull_cell(claim),
+    )
+
+
+def work_table(rows: list[tuple[str, ...]], width: int | None) -> list[str]:
+    """Lays out the open-work rows of one project.
+
+    Args:
+        rows: Rows built by `work_row`, in the order they are reported.
+        width: Available terminal columns, or None for the whole table.
+
+    Returns:
+        The heading, one line per row, and a line naming any column the width
+        could not hold.
+    """
+    if not rows:
+        return []
+    selected, omitted = layout(
+        tuple(zip(WORK_COLUMNS, widths(WORK_COLUMNS, rows), strict=True)),
+        width,
+        WORK_DROP,
+    )
+    lines = [heading(selected)]
+    lines.extend(line(values, selected) for values in rows)
+    if omitted:
+        lines.append("Hidden columns: " + ", ".join(omitted))
+    return lines
+
+
+def lane_table(rows: list[tuple[str, ...]], width: int | None) -> list[str]:
+    """Lays out one line per lane: name, state, live claims and current task.
+
+    Args:
+        rows: One row per lane, one cell per column of `LANE_COLUMNS`.
+        width: Available terminal columns, or None for whole lines.
+
+    Returns:
+        The heading and one line per lane, each clipped to the width with an
+        ellipsis, so the task text is what a narrow terminal loses.
+    """
+    if not rows:
+        return []
+    measured = widths(LANE_COLUMNS, rows)
+    lines = [
+        GAP.join(
+            fit(value, cell)
+            for value, cell in zip(values, measured, strict=True)
+        ).rstrip()
+        for values in (LANE_COLUMNS, *rows)
+    ]
+    if width is None:
+        return lines
+    return [fit(text, width).rstrip() for text in lines]

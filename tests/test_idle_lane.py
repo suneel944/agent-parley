@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -95,6 +96,59 @@ def test_a_served_call_inside_the_interval_clears_the_marker(
     assert actor is not None
     store.call(bridge.home, actor, "list_participants", {})
     assert idle_for(bridge, paired, directory)["stalled"] is False
+
+
+def test_fresh_native_work_is_not_a_stall_whatever_the_mail_age(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    deliver(bridge, repo, paired, ack=True, aged=76 * 3600)
+    alive(directory, "claude", activity="working", updated=time.time() - 343)
+    assert idle_for(bridge, paired, directory)["stalled"] is False
+    alive(directory, "claude", reported_at=time.time() - 30)
+    assert idle_for(bridge, paired, directory)["stalled"] is False
+    alive(directory, "claude")
+    with (directory / "claude-events.jsonl").open("a") as stream:
+        stream.write(json.dumps({"ts": time.time() - 5, "event": "Stop"}))
+        stream.write("\n")
+    assert idle_for(bridge, paired, directory)["stalled"] is False
+
+
+def test_an_ignored_event_is_no_sign_of_work(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    deliver(bridge, repo, paired, aged=1800)
+    alive(directory, "claude")
+    with (directory / "claude-events.jsonl").open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "ts": time.time() - 5,
+                    "event": "PreToolUse",
+                    "reason_class": "session_mismatch",
+                }
+            )
+            + "\n"
+        )
+    assert idle_for(bridge, paired, directory)["stalled"] is True
+
+
+def test_the_idle_age_is_the_lanes_silence_not_the_mail_age(
+    bridge, repo, paired, capsys
+):
+    directory = bridge.project(repo)[1]
+    deliver(bridge, repo, paired, ack=True, aged=76 * 3600)
+    alive(directory, "claude", updated=time.time() - 3 * 3600)
+    report = idle_for(bridge, paired, directory)
+    assert report["stalled"] is True
+    assert report["age_seconds"] >= 76 * 3600
+    assert 3 * 3600 <= report["silent_seconds"] < 3 * 3600 + 60
+    view = dashboard.collect(bridge.home, False, {})
+    rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
+    assert rows["claude"]["state"].startswith("idle 3h;")
+    bridge.status(cli.Selection())
+    output = capsys.readouterr().out
+    assert "idle 3h;" in output, output
+    assert "idle 76h" not in output
 
 
 def test_a_stopped_lane_is_never_reported_as_idle(bridge, repo, paired):

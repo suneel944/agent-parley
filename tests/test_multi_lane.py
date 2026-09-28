@@ -181,11 +181,41 @@ def test_declining_the_plan_does_nothing(
         "--repo",
         str(repo),
         "--all",
+        expected=1,
     )
 
     assert "Declined: nothing was done." in printed
     with store.connect(bridge.home) as db:
         assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+
+def test_a_closed_stdin_declines_and_exits_non_zero(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    registered(bridge, paired, "claude", "codex")
+
+    def closed(prompt):
+        raise EOFError
+
+    monkeypatch.setattr(builtins, "input", closed)
+
+    printed = run(
+        bridge,
+        monkeypatch,
+        capsys,
+        "participant",
+        "pause",
+        "--repo",
+        str(repo),
+        "--all",
+        expected=1,
+    )
+
+    assert "Declined: nothing was done." in printed
+    _, data = state(bridge, repo)
+    assert not any(
+        lane.get("paused", False) for lane in data["participants"].values()
+    )
 
 
 def test_a_selector_matching_nothing_does_nothing_and_says_so(
@@ -313,13 +343,31 @@ def test_a_selected_merge_integrates_only_the_matched_lanes(
     assert not (repo / "second.txt").exists()
 
 
-def test_a_declined_merge_plan_merges_nothing(
+def test_an_empty_selection_integrates_nothing(bridge, repo, paired):
+    git(repo, "config", "user.name", "Bridge Test")
+    git(repo, "config", "user.email", "test@example.com")
+    worked(bridge, paired, "claude", "42", "first.txt")
+
+    report = bridge.integrate(repo, lanes=[])
+
+    assert report == (
+        "Selected ready lanes: no lane to integrate, so nothing merged."
+    )
+    assert not (repo / "first.txt").exists()
+
+
+def test_a_lane_ready_after_confirmation_is_not_merged(
     bridge, repo, paired, monkeypatch, capsys
 ):
     git(repo, "config", "user.name", "Bridge Test")
     git(repo, "config", "user.email", "test@example.com")
     worked(bridge, paired, "claude", "42", "first.txt")
-    monkeypatch.setattr(builtins, "input", lambda prompt: "")
+
+    def answer(prompt):
+        worked(bridge, paired, "codex", "43", "second.txt")
+        return "y"
+
+    monkeypatch.setattr(builtins, "input", answer)
 
     printed = run(
         bridge,
@@ -329,10 +377,90 @@ def test_a_declined_merge_plan_merges_nothing(
         "merge",
         "--repo",
         str(repo),
-        "--provider",
-        "claude",
+        "--all",
     )
 
     assert "Plan: integrate 1 lane." in printed
-    assert "Declined: nothing was merged." in printed
+    assert "Integrated 1 of 1 lanes: claude." in printed
+    assert (repo / "first.txt").exists()
+    assert not (repo / "second.txt").exists()
+
+
+def test_a_confirmed_lane_no_longer_ready_is_named_as_skipped(
+    bridge, repo, paired
+):
+    git(repo, "config", "user.name", "Bridge Test")
+    git(repo, "config", "user.email", "test@example.com")
+    worked(bridge, paired, "claude", "42", "first.txt")
+    codex = worked(bridge, paired, "codex", "43", "second.txt")
+    bridge.report(codex, "partial", "Reopened", "Fix the parser", "")
+
+    report = bridge.integrate(repo, confirmed=["claude", "codex"])
+
+    assert "- codex no longer ready, skipped." in report
+    assert "Integrated 1 of 1 lanes: claude." in report
+    assert not (repo / "second.txt").exists()
+
+
+def test_a_group_that_gained_a_lane_after_confirmation_is_refused(
+    bridge, repo, paired
+):
+    with pytest.raises(BridgeError, match="gained codex after its plan"):
+        bridge._confirmed_candidates(
+            "rewrite", {"claude": ["42"], "codex": ["43"]}, ["claude"]
+        )
+
+
+def test_a_merge_selector_matching_nothing_merges_nothing(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    git(repo, "config", "user.name", "Bridge Test")
+    git(repo, "config", "user.email", "test@example.com")
+    worked(bridge, paired, "claude", "42", "first.txt")
+    worked(bridge, paired, "codex", "43", "second.txt")
+
+    printed = run(
+        bridge,
+        monkeypatch,
+        capsys,
+        "participant",
+        "merge",
+        "--repo",
+        str(repo),
+        "--drifted",
+        "--yes",
+    )
+
+    assert "Selector matched no lane, so nothing merged." in printed
+    assert not (repo / "first.txt").exists()
+    assert not (repo / "second.txt").exists()
+
+
+def test_a_declined_merge_plan_merges_nothing(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    git(repo, "config", "user.name", "Bridge Test")
+    git(repo, "config", "user.email", "test@example.com")
+    worked(bridge, paired, "claude", "42", "first.txt")
+    monkeypatch.setattr(builtins, "input", lambda prompt: "")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "participant",
+            "merge",
+            "--repo",
+            str(repo),
+            "--provider",
+            "claude",
+        ],
+    )
+
+    assert cli.main() == 1
+    printed = capsys.readouterr()
+    assert "Plan: integrate 1 lane." in printed.out
+    assert "Declined: nothing was merged." in printed.err
     assert not (repo / "first.txt").exists()

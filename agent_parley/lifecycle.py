@@ -148,11 +148,19 @@ def claimed(record: dict, claim_id: str) -> dict:
     return execution
 
 
-def released(record: dict) -> dict:
+def released(record: dict, closed: bool = False) -> dict:
     """Returns unfinished work to its authorized queue after release.
+
+    A claim whose issue closed on the forge inside its generation has no
+    integration left to wait on, so even ready work may be released. It is
+    marked `ended_on_forge` rather than offered again as free work; the
+    next claim builds a fresh record without the mark, so a reopened issue
+    can still be taken.
 
     Args:
         record: Mutable issue ledger record.
+        closed: Whether the claim's issue closed on the forge inside the
+            current ownership generation.
 
     Returns:
         The execution mapping stored on the record.
@@ -161,11 +169,16 @@ def released(record: dict) -> dict:
         BridgeError: If ready work still awaits verified integration.
     """
     execution = state(record)
-    if execution["state"] == READY:
+    if execution["state"] == READY and not closed:
         raise BridgeError(
             "Ready work must remain claimed until verified integration "
             "completes."
         )
+    if closed:
+        record["ended_on_forge"] = {
+            "at": time.time(),
+            "claim_id": record.get("claim_id"),
+        }
     if execution["state"] != COMPLETE:
         execution.update(
             state=QUEUED,
@@ -207,7 +220,8 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
 
     Returns:
         Issue numbers ordered numerically. Owner work is limited to its
-        current generation. Free work must be queued and unowned.
+        current generation. Free work must be queued, unowned and not
+        released after its issue ended on the forge.
     """
     found = []
     for number, record in ledger.get("issues", {}).items():
@@ -217,7 +231,11 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
         if not dependencies_complete(ledger, record):
             continue
         if owner is None:
-            eligible = not record.get("owner") and execution["state"] == QUEUED
+            eligible = (
+                not record.get("owner")
+                and not record.get("ended_on_forge")
+                and execution["state"] == QUEUED
+            )
         else:
             eligible = (
                 record.get("owner") == owner
@@ -361,7 +379,7 @@ def record_report(
                     f"Resume issue #{resumed_by} is already complete."
                 )
             blockers = set(record.get("blocked_by", [])) | {resumed_by}
-            if _reaches(ledger["issues"], resumed_by, number):
+            if reaches(ledger["issues"], resumed_by, number):
                 raise BridgeError(
                     f"Issue #{number} waiting on #{resumed_by} would form "
                     "a dependency cycle."
@@ -441,7 +459,7 @@ def complete(
                 "completion."
             )
         execution = state(record)
-        if execution["state"] != READY:
+        if execution["state"] not in (READY, RECOVERY):
             raise BridgeError(
                 f"Issue #{issue} is {execution['state']}, not ready for "
                 "verification."
@@ -509,6 +527,103 @@ def complete(
         directory, claim_id, f"issue #{issue} completed"
     )
     return record
+
+
+def integration_failed(
+    directory: Path, issue: str, claim_id: str, reason: str, result: str
+) -> bool:
+    """Returns integrated work to its owner as repair work.
+
+    The claim stays with its current owner and generation: repair is that
+    owner's work, and moving it is left to the ordinary claim, handoff and
+    recovery rules, so it is never taken from a live lane here. The issue
+    moves to the recovery state, which its owner resumes and which is never
+    complete, so everything waiting on it stays held. Only the generation
+    the integration named is changed, and recording the same failure again
+    changes nothing.
+
+    Args:
+        directory: Private project state directory.
+        issue: Issue number whose integration failed.
+        claim_id: Ownership generation the integration carried.
+        reason: Bounded account of the failure.
+        result: Base commit left unverified, or empty for a conflict.
+
+    Returns:
+        Whether the ledger changed.
+
+    Raises:
+        BridgeError: If the ledger cannot be locked.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = _snapshot(directory)
+        record = ledger["issues"].get(issue)
+        if not record or record.get("claim_id") != claim_id:
+            return False
+        execution = state(record)
+        blocker = {"reason": reason, "commit": result}
+        if execution["state"] not in (READY, RECOVERY) or (
+            execution["state"] == RECOVERY and execution["blocker"] == blocker
+        ):
+            return False
+        execution.update(
+            state=RECOVERY,
+            next_action="repair integration",
+            updated_at=time.time(),
+            blocker=blocker,
+        )
+        record["execution"] = execution
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+    return True
+
+
+def settle_dependencies(directory: Path) -> list[tuple[str, str]]:
+    """Drops dependency edges whose blocker is complete or no longer recorded.
+
+    Completion frees its dependents at the instant it is recorded, which
+    misses an edge added afterwards and an edge to an issue the ledger does
+    not hold. Such an edge can never clear on its own, and while it stands
+    the waiting issue can neither report ready nor be listed as unclaimed,
+    whether or not anybody still owns it. The supervisor calls this on every
+    poll, so the edge is reconciled whoever holds the issue.
+
+    Args:
+        directory: Private state directory for the common repository.
+
+    Returns:
+        The waiting issue and dropped blocker of every removed edge.
+
+    Raises:
+        BridgeError: If the ledger cannot be locked.
+    """
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = _snapshot(directory)
+        records = ledger["issues"]
+        stale = sorted(
+            {
+                blocker
+                for record in records.values()
+                for blocker in record.get("blocked_by", [])
+                if blocker not in records
+                or state(records[blocker])["state"] == COMPLETE
+            },
+            key=int,
+        )
+        dropped = [
+            (number, blocker)
+            for number, record in records.items()
+            for blocker in record.get("blocked_by", [])
+            if blocker in stale
+        ]
+        if not dropped:
+            return []
+        now = time.time()
+        for blocker in stale:
+            _reconcile_dependents(ledger, blocker, now)
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+    return sorted(dropped, key=lambda edge: (int(edge[0]), int(edge[1])))
 
 
 def _reconcile_dependents(ledger: dict, issue: str, now: float) -> None:
@@ -695,8 +810,18 @@ def _issue_number(value: str, label: str = "Issue") -> str:
     return str(int(number))
 
 
-def _reaches(records: dict, start: str, target: str) -> bool:
-    """Reports whether dependency edges lead from start to target."""
+def reaches(records: dict, start: str, target: str) -> bool:
+    """Reports whether dependency edges lead from start to target.
+
+    Args:
+        records: Every issue record in the ledger, keyed by number.
+        start: Issue the walk starts from.
+        target: Issue whose reachability is asked about.
+
+    Returns:
+        True when following ``blocked_by`` edges from start arrives at target,
+        which is exactly when an edge from target to start closes a cycle.
+    """
     pending = [start]
     seen = set()
     while pending:

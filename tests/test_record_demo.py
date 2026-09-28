@@ -55,16 +55,64 @@ def test_recording_paths_are_replaced_by_the_published_shape():
     assert "/tmp/" not in rewritten.command + rewritten.output[0]
 
 
-def test_every_frame_owns_one_slice_of_the_loop():
+def test_a_step_limit_clips_below_the_frame_height():
+    rows = tuple(str(number) for number in range(40))
+    shown = record_demo.frame(
+        record_demo.Step("$", "agent-parley issue claim 41", rows, limit=8)
+    )
+    assert len(shown) == 8
+    assert shown[-1] == "39"
+
+
+def test_every_item_fades_in_on_one_shared_timeline(tmp_path):
+    captured = [
+        record_demo.Card("CHAPTER 01", "Lanes"),
+        step(command="agent-parley up", output=("ready",)),
+        step(command="agent-parley status", output=("ada working",)),
+    ]
+    total = record_demo.render(captured, tmp_path / "demo.svg")
+    root = ElementTree.fromstring((tmp_path / "demo.svg").read_text())
     starts = []
-    for index in range(4):
-        element = ElementTree.fromstring(record_demo.schedule(index, 4, 8.0))
-        assert element.get("repeatCount") == "indefinite"
-        assert element.get("dur") == "8.0s"
-        times = [float(value) for value in element.get("keyTimes").split(";")]
+    for group in root.findall(f"{SVG}g"):
+        fade = group.find(f"{SVG}animate")
+        assert fade.get("dur") == f"{total}s"
+        assert fade.get("repeatCount") == "indefinite"
+        times = [float(value) for value in fade.get("keyTimes").split(";")]
         assert times == sorted(times)
-        starts.append(times[-2] if index else 0.0)
-    assert starts == [0.0, 0.25, 0.5, 0.75]
+        assert times[0] == 0.0 and times[-1] == 1.0
+        starts.append(0.0 if group.get("opacity") == "1" else times[1])
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(captured)
+
+
+def test_a_caption_is_drawn_below_the_terminal_not_inside_it(tmp_path):
+    captioned = record_demo.Step(
+        "$", "agent-parley up", ("ready",), caption="One server per host."
+    )
+    record_demo.render([captioned], tmp_path / "demo.svg")
+    root = ElementTree.fromstring((tmp_path / "demo.svg").read_text())
+    band = (
+        record_demo.HEADER
+        + record_demo.MARGIN * 2
+        + record_demo.LINE * (record_demo.FRAME_LINES + 1)
+    )
+    for node in root.iter(f"{SVG}text"):
+        if node.text == "One server per host.":
+            assert float(node.get("y")) > band
+            break
+    else:
+        raise AssertionError("caption not drawn")
+
+
+def test_a_recording_run_from_a_lane_inherits_none_of_its_credentials(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-secret")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "outer")
+    values = record_demo.environment(tmp_path, tmp_path, tmp_path)
+    assert "AGENT_PARLEY_TOKEN" not in values
+    assert "CLAUDE_CODE_SESSION_ID" not in values
+    assert values["AGENT_PARLEY_HOME"] == str(tmp_path)
 
 
 def test_a_refusal_and_a_heading_are_not_drawn_as_body_text():
@@ -90,7 +138,7 @@ def test_the_asset_is_one_svg_showing_a_single_frame_at_a_time(tmp_path):
     drawn = [
         node.text or "".join(part.text or "" for part in node)
         for group in groups
-        for node in group.findall(f"{SVG}text")
+        for node in group.iter(f"{SVG}text")
     ]
     assert "agent-parley up" in "".join(drawn)
     assert "file_reservation_paths" in "".join(drawn)

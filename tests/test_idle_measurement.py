@@ -185,7 +185,10 @@ def test_top_shows_the_column_and_the_project_total(bridge, repo, paired):
     lines = dashboard.render(view)
     assert any("IDLE" in line for line in lines)
     assert any("idle 10m (most claude 10m)" in line for line in lines)
-    assert any("observed coordination inactivity" in line for line in lines)
+    assert any(
+        "observed coordination inactivity" in line
+        for line in dashboard.keymap()
+    )
 
 
 def test_status_and_export_carry_the_figures(bridge, repo, paired, capsys):

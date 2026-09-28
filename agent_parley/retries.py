@@ -140,3 +140,19 @@ def replayed(recorded: dict, operation: str, key: str, current: str) -> dict:
     if recorded["outcome"] == DENIED:
         raise BridgeError(recorded["result"])
     return {**recorded["result"], "replayed": True}
+
+
+def operator_key(name: str, subject: str, body: str) -> str:
+    """Derives a stable idempotency key from an operator message itself.
+
+    Args:
+        name: Participant the message addresses.
+        subject: Subject line of the message.
+        body: Message body.
+
+    Returns:
+        A key that repeats only for an identical message, so retyping the same
+        steer redelivers nothing while a changed one is a new message.
+    """
+    digest = hashlib.sha256("\x00".join((name, subject, body)).encode())
+    return f"operator-{digest.hexdigest()[:48]}"
