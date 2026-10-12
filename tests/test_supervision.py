@@ -733,6 +733,71 @@ def test_a_lane_blocked_past_the_bound_escalates_once(
     assert "blocked: approval" in sent[0][2]["detail"]
 
 
+@pytest.mark.parametrize("state", [lanes.WORKING, lanes.IDLE])
+def test_a_lane_that_leaves_blocked_clears_its_recorded_block(
+    bridge, paired, monkeypatch, state
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, paired["root"], "codex", lanes.BLOCKED, cause="approval"
+        )
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 60,
+        attempts=1,
+        result="resume requested (launcher 1)",
+        blocked="blocked: approval",
+        escalated_at=time.time() - 30,
+        exhausted_at=time.time() - 30,
+    )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(db, paired["root"], "codex", state)
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: pytest.fail("woke the lane")
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    record = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert record["blocked"] == ""
+    assert not record.get("escalated_at")
+    assert not record.get("exhausted_at")
+    assert record["attempts"] == 1
+
+
+def test_a_lane_still_blocked_keeps_its_recorded_block(bridge, paired):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, paired["root"], "codex", lanes.BLOCKED, cause="approval"
+        )
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 60,
+        attempts=1,
+        result="resume requested (launcher 1)",
+        blocked="blocked: approval",
+        escalated_at=1.0,
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    record = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert record["blocked"] == "blocked: approval"
+    assert record["escalated_at"] == 1.0
+
+
 def test_a_lane_blocked_notifies_once_per_block(bridge, monkeypatch):
     monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "telegram")
     monkeypatch.setenv("AGENT_PARLEY_TELEGRAM_TOKEN", "token")

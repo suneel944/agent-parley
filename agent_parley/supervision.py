@@ -8475,6 +8475,36 @@ def _defer_wake(
         )
 
 
+def _clear_block(home: Path, directory: Path, root: str, name: str) -> None:
+    """Clears a recorded block once the lane's state no longer holds it.
+
+    A blocked lane parks its wake record under a `blocked: <cause>` label
+    and may gain `escalated_at` and `exhausted_at` while it waits. A lane
+    that leaves the blocked state is often working, or idle with nothing
+    owed, and the wake path returns before any attempt for both, so the
+    stale label, escalation and exhaustion would outlive the block. They
+    are cleared here as soon as the recorded state is no longer blocked. A
+    block held by a refused tool call is left in place while that denial
+    still waits, because the denial, not the lane state, holds it.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant that owns the lane.
+    """
+    if denials.waiting(directory, name):
+        return
+    with lock(directory / f"{name}-wake.lock"):
+        record = wake_record(home, root, name, directory)
+        if not str(record.get("blocked") or "").startswith("blocked:"):
+            return
+        record.pop("escalated_at", None)
+        record.pop("exhausted_at", None)
+        record.update(blocked="", next_at=None)
+        store_wake(home, directory, root, name, record)
+
+
 def _escalate_blocked(
     home: Path,
     directory: Path,
@@ -8689,8 +8719,10 @@ def wake(
     is due, and spends nothing, so the budget is not consumed while nothing
     could have answered. A lane recorded blocked past
     `BLOCKED_ESCALATE_AFTER` is escalated once by `_escalate_blocked`
-    instead, because its deferred wakes never reach the attempt bound. When
-    the cause clears, the next attempt is due one
+    instead, because its deferred wakes never reach the attempt bound. A
+    lane whose recorded state leaves blocked has that block, escalation and
+    exhaustion cleared by `_clear_block` before anything else is decided.
+    When the cause clears, the next attempt is due one
     doubling window after the last one, or at the provider reset the capacity
     observation named, whichever is later. A lane that has actually spent its
     whole budget is recorded as exhausted and escalated once, and waking then
@@ -8790,6 +8822,8 @@ def wake(
             }
     else:
         session = recorded["session"]
+    if (recorded or {}).get("state") != lanes.BLOCKED:
+        _clear_block(home, directory, root, name)
     if not lanes.wakes(recorded):
         return
     observed = recorded_presence(recorded, observed)
