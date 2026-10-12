@@ -771,6 +771,44 @@ def test_a_stray_under_the_repository_claude_worktrees_moves(
     assert (strayed(idle, "pr-kyc") / ".git").exists()
 
 
+@pytest.fixture
+def untemporary(tmp_path, monkeypatch):
+    """Points the temporary directories away from the test's own folder."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(reclaim, "TEMPORARY", ())
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    return scratch
+
+
+def test_an_operator_worktree_outside_scratch_places_is_only_reported(
+    bridge, repo, idle, tmp_path, untemporary
+):
+    service = made(repo, tmp_path, "tm-arena")
+    aged(service)
+    scratch = made(repo, untemporary, "kyc-in-temp")
+    folder = repo / ".claude" / "worktrees"
+    folder.mkdir(parents=True)
+    inside = made(repo, folder, "pr-kyc")
+    lane_made = made(repo, tmp_path, "codex-pr-30")
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    row = worktree_of(moved, service)
+    assert row["reason"] == reclaim.FOREIGN
+    assert row["relocate"] is False
+    assert "moved" not in row
+    kept = worktree_of(swept, service)
+    assert kept["reason"] == reclaim.FOREIGN
+    assert not kept.get("removed")
+    assert (service / ".git").exists()
+    assert worktree_of(moved, scratch)["moved"] is True
+    assert worktree_of(moved, inside)["moved"] is True
+    assert worktree_of(moved, lane_made)["reason"] == reclaim.STRAYED
+    assert worktree_of(moved, lane_made)["moved"] is True
+
+
 def test_a_worktree_nested_under_the_state_directory_moves_to_strays(
     bridge, repo, idle
 ):

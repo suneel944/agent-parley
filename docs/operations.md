@@ -2659,7 +2659,12 @@ lanes lived before the rename, and so does one in the project's `strays`
 directory. Git records no creator, so a worktree no lane accounts for is
 assessed by the same rule wherever it sits; one outside those directories
 that any process works inside is kept with reason `a session is running in
-it`.
+it`. One outside the repository, the state root and the temporary
+directories (`/tmp`, `/var/tmp`, `/dev/shm` and the platform's temporary
+directory), such as a worktree a systemd unit runs from, belongs to the
+operator: it is never removed and is reported with reason `no lane made it
+and it sits outside the repository, the state directory and temporary
+directories`.
 
 The lane protocol names one place for those worktrees: `<lane>-wt/NAME`
 beside the lane in the project state directory, removed by the lane with
@@ -2669,11 +2674,14 @@ its `<lane>-wt` directory, such as one in the home directory, beside the
 repository or in `/tmp`, is moved to `<lane>-wt/<name>` with
 `git worktree move`, taking `<name>-2` and upward when the name is taken.
 Every other worktree the project repository registers outside the base
-checkout, the lanes, the spares and every `<lane>-wt` directory, wherever it
-sits, including `<repo>/.claude/worktrees/`, the home directory and `/tmp`,
-is moved the same way to `strays/<name>` in the project state directory,
-with reason `no lane made it and it sits outside the project's strays
-directory`. A move never deletes and never forces: uncommitted edits,
+checkout, the lanes, the spares and every `<lane>-wt` directory, that sits
+where throwaway checkouts are made, inside the repository, including
+`<repo>/.claude/worktrees/`, under the state root or in a temporary
+directory, is moved the same way to `strays/<name>` in the project state
+directory, with reason `no lane made it and it sits outside the project's
+strays directory`. One anywhere else, such as `~/.local/state/tm-arena`
+used by a systemd unit, is only reported under `relocations`, with the
+operator-owned reason above, and stays where it is. A move never deletes and never forces: uncommitted edits,
 unpushed commits and ignored files travel with the directory. A locked
 worktree, one whose lane runs a session or any process works inside, and one
 Git refuses to move, such as a move across filesystems, stay in place and

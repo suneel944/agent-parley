@@ -54,6 +54,7 @@ import os
 import shlex
 import sqlite3
 import subprocess
+import tempfile
 import time
 from pathlib import Path, PurePosixPath
 
@@ -107,8 +108,13 @@ UNLANDED = "nothing shows its branch landed"
 MOVED = "its worktree moved to another path Git registers"
 STRAYED = "it sits outside its lane and the lane's -wt directory"
 ADRIFT = "no lane made it and it sits outside the project's strays directory"
+FOREIGN = (
+    "no lane made it and it sits outside the repository, the state "
+    "directory and temporary directories"
+)
 REFUSED = "Git refused to move it"
 STRAYS = "strays"
+TEMPORARY = ("/tmp", "/var/tmp", "/dev/shm")
 REMOVABLE = frozenset(
     {
         MERGED,
@@ -710,6 +716,36 @@ def owned_roots(directory: Path) -> list[Path]:
     return found
 
 
+def _disposable(path: Path, directory: Path, root: str) -> bool:
+    """Reports whether a worktree sits where throwaway checkouts are made.
+
+    Agent Parley and the agents it runs make their scratch worktrees inside
+    the repository, such as under `.claude/worktrees`, under the state
+    root and in temporary directories. A worktree no lane accounts for
+    anywhere else, such as one a system service runs from, belongs to the
+    operator, so a sweep reports it and neither moves nor removes it.
+
+    Args:
+        path: Resolved worktree path.
+        directory: Private project state directory.
+        root: Base checkout of the project repository.
+
+    Returns:
+        Whether the worktree lies inside the repository, the state root,
+        a directory `owned_roots` names or a temporary directory.
+    """
+    places = [
+        Path(root).resolve(),
+        directory.parent.parent.resolve(),
+        *owned_roots(directory),
+        *(
+            Path(folder).resolve()
+            for folder in (*TEMPORARY, tempfile.gettempdir())
+        ),
+    ]
+    return any(_within(path, place) for place in places)
+
+
 def _unpushed(root: str, entry: dict, ahead: list[str]) -> list[str] | None:
     """Returns the commits beyond the base that no upstream carries either.
 
@@ -1000,14 +1036,15 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
     which `pool.sweep` assesses by their own rule. Each is attributed to a
     lane by path or branch. Git records no creator, so one no lane
     accounts for is assessed by the same rule wherever it sits, as one
-    Git refused to move into the project's `strays` directory is. A
-    worktree is removed only when Git holds no lock on it, no
-    session runs in its lane, no process works inside an unattributed one
-    outside `owned_roots`, it is clean, it holds no file Git ignores,
-    every commit beyond the base is on its upstream, and the base holds its
-    head, its lane retired, or it has not changed within the inactivity
-    threshold. A registration whose directory is already gone is reclaimed
-    by dropping that registration.
+    Git refused to move into the project's `strays` directory is, except
+    one outside the places throwaway checkouts are made, which is kept as
+    `FOREIGN` because the operator owns it. A worktree is removed only
+    when Git holds no lock on it, no session runs in its lane, no process
+    works inside an unattributed one outside `owned_roots`, it is clean,
+    it holds no file Git ignores, every commit beyond the base is on its
+    upstream, and the base holds its head, its lane retired, or it has not
+    changed within the inactivity threshold. A registration whose
+    directory is already gone is reclaimed by dropping that registration.
 
     Args:
         directory: Private project state directory holding the lanes.
@@ -1036,15 +1073,20 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
     for entry in _lane_made(directory, manifest, entries):
         path = Path(entry["path"])
         owner = _owner(path, entry["branch"], lanes, prefixes)
-        reason, paths = _stray(
-            manifest["root"],
-            entry,
-            busy=_busy(directory, owner)
-            if owner
-            else path.parent not in owned and _occupied(path),
-            retired=bool(owner) and bool(participants[owner].get("retired")),
-            after=after,
-        )
+        paths: list[str]
+        if not owner and not _disposable(path, directory, manifest["root"]):
+            reason, paths = FOREIGN, []
+        else:
+            reason, paths = _stray(
+                manifest["root"],
+                entry,
+                busy=_busy(directory, owner)
+                if owner
+                else path.parent not in owned and _occupied(path),
+                retired=bool(owner)
+                and bool(participants[owner].get("retired")),
+                after=after,
+            )
         row = {
             "worktree": entry["path"],
             "branch": entry["branch"],
@@ -1085,9 +1127,12 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
     its work lands. One a lane made elsewhere, in the operator's home, beside
     the repository or in a temporary directory, is attributed by its branch
     and planned into `<lane>-wt/<name>`. Git records no creator, so one no
-    lane accounts for, wherever it sits, including under the repository's
-    `.claude/worktrees`, is planned into the project's `strays` directory,
-    which `strays` treats as the project's own. A taken name gets a numeric
+    lane accounts for that sits where throwaway checkouts are made, inside
+    the repository, including its `.claude/worktrees`, the state root or a
+    temporary directory, is planned into the project's `strays` directory,
+    which `strays` treats as the project's own. One anywhere else, such as
+    a worktree a system service runs from, is reported as `FOREIGN` and
+    never moved. A taken name gets a numeric
     suffix. A move never deletes anything: Git renames the directory,
     so uncommitted edits, unpushed commits and ignored files travel with it.
     The base checkout, the lanes themselves, spares, a worktree already
@@ -1129,7 +1174,9 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
             folder, outside = unclaimed, ADRIFT
         destination = _free(folder, path.name, taken)
         taken.add(destination)
-        if entry["locked"]:
+        if not owner and not _disposable(path, directory, manifest["root"]):
+            reason = FOREIGN
+        elif entry["locked"]:
             reason = LOCKED
         elif (owner and _busy(directory, owner)) or _occupied(path):
             reason = SESSION
