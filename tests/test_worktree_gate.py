@@ -84,6 +84,8 @@ def test_an_add_inside_the_lane_wt_directory_is_allowed(
         "git -C {parent} worktree add --detach beside HEAD",
         "git worktree add {wt}",
         "git status && git worktree add /tmp/chained",
+        "git status\ngit worktree add /tmp/next-line",
+        "true\r\n\tgit worktree add ../beside",
     ],
 )
 def test_an_add_outside_the_lane_wt_directory_is_denied(
@@ -154,6 +156,7 @@ def test_the_denial_names_the_command_to_run_instead(paired):
         "git worktree add",
         "git status",
         "echo git worktree add /tmp/x",
+        "echo 'one\ngit worktree add /tmp/x'",
     ],
 )
 def test_other_commands_pass_the_gate(paired, command):

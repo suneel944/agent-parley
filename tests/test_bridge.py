@@ -527,6 +527,7 @@ def test_changed_lane_branch_is_rejected_without_resetting(
         "git branch -m personal-work",
         "git symbolic-ref HEAD refs/heads/personal-work",
         "gh pr checkout 42",
+        "git fetch -q\ngit checkout -b personal-work",
     ],
 )
 def test_native_hook_blocks_bridge_lane_branch_changes(

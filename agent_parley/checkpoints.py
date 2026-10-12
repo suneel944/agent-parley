@@ -1020,10 +1020,13 @@ def shell_segments(command: str) -> list[list[str]]:
         command: Shell text supplied to a native command tool.
 
     Returns:
-        Tokenized commands separated at shell control operators. Invalid shell
-        text returns no commands and remains subject to the post-action check.
+        Tokenized commands separated at shell control operators and at bare
+        newlines, which end a command just as `;` does; a quoted newline
+        stays inside its argument. Invalid shell text returns no commands and
+        remains subject to the post-action check.
     """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+    lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
@@ -1032,7 +1035,7 @@ def shell_segments(command: str) -> list[list[str]]:
         return []
     segments: list[list[str]] = [[]]
     for token in tokens:
-        if token and not token.strip(";&|"):
+        if token and not token.strip(";&|\n"):
             segments.append([])
         else:
             segments[-1].append(token)
