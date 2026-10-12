@@ -102,6 +102,17 @@ compaction, resends everything once. If a rename removed the assigned branch, th
 repair. Branch drift blocks completion once; a Stop retry can end the session
 while status continues to show the drift.
 
+A lane keeps any extra worktree in its `<lane>-wt/` directory, because Git
+records no creator and the sweep attributes a worktree by where it sits. The
+lane hook, for every provider, denies a `git worktree add` whose target
+resolves outside that directory (`worktree_refused`), and the denial names the
+directory and the same command aimed inside it. The target is read past `git
+-C DIR` and options such as `-b`, `-B`, `--detach`, `--lock` and `--reason`,
+and a relative one resolves against the call's working directory. `git
+worktree move`, `remove`, `list` and `prune` pass, and a session outside a
+lane carries no lane hook, so it is never gated. Like the branch guard, this is
+a guard on the agent's own tool calls, not an authority boundary.
+
 Pending mail and notices ride on the call as context and never refuse it. Only
 three hazards deny a tool call: a shell call that runs Agent Parley's CLI
 together with a variable, `cd`, `;`, `&&`, a pipe or a redirect

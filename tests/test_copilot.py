@@ -100,6 +100,34 @@ def test_a_native_branch_switch_is_refused_in_copilot_schema(lane):
     assert "hookSpecificOutput" not in output
 
 
+@pytest.mark.parametrize(
+    ("command", "denied"),
+    [
+        ("git worktree add {wt}/fix -b fix/foo", False),
+        ("git -C .. worktree add {name}-wt/up", False),
+        ("git worktree add /tmp/x -b fix/foo", True),
+        ("git worktree add -b fix/foo ../beside", True),
+        ("git -C .. worktree add beside", True),
+    ],
+)
+def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
+    path = Path(lane["lane"]).resolve()
+    text = command.format(wt=f"{path}-wt", name=path.name)
+    output = fire(
+        lane,
+        "PreToolUse",
+        {
+            "session_id": "session-wt",
+            "cwd": str(path),
+            "tool_name": "shell",
+            "tool_input": {"command": text},
+        },
+    )
+    assert (output.get("permissionDecision") == "deny") is denied
+    if denied:
+        assert f"inside {path}-wt/" in output["permissionDecisionReason"]
+
+
 def test_a_native_session_start_records_activity_and_session(lane):
     output = fire(
         lane,

@@ -166,6 +166,34 @@ def test_a_native_branch_switch_is_refused_in_hook_schema(lane):
     assert "hookSpecificOutput" not in output
 
 
+@pytest.mark.parametrize(
+    ("command", "denied"),
+    [
+        ("git worktree add {wt}/fix -b fix/foo", False),
+        ("git -C .. worktree add {name}-wt/up", False),
+        ("git worktree add /tmp/x -b fix/foo", True),
+        ("git worktree add -b fix/foo ../beside", True),
+        ("git -C .. worktree add beside", True),
+    ],
+)
+def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
+    path = Path(lane["lane"]).resolve()
+    text = command.format(wt=f"{path}-wt", name=path.name)
+    output = fire(
+        lane,
+        "tool:pre-execute",
+        {
+            "threadId": "T-wt",
+            "cwd": str(path),
+            "toolName": "Bash",
+            "input": {"cmd": text},
+        },
+    )
+    assert (output.get("action") == "reject") is denied
+    if denied:
+        assert f"inside {path}-wt/" in output["reason"]
+
+
 def test_an_allowed_tool_call_leaves_the_decision_to_amp(lane):
     output = fire(
         lane,

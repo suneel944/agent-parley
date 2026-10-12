@@ -58,6 +58,7 @@ import time
 from pathlib import Path, PurePosixPath
 
 from agent_parley import forge, issues, pool, retirement, store
+from agent_parley.lanes import extras
 from agent_parley.state import BridgeError, LockBusy, lock
 
 GIT_SECONDS = 5
@@ -107,7 +108,6 @@ MOVED = "its worktree moved to another path Git registers"
 STRAYED = "it sits outside its lane and the lane's -wt directory"
 ADRIFT = "no lane made it and it sits outside the project's strays directory"
 REFUSED = "Git refused to move it"
-EXTRAS = "-wt"
 STRAYS = "strays"
 REMOVABLE = frozenset(
     {
@@ -589,18 +589,6 @@ def _entries(root: str) -> list[dict] | None:
         elif found and key == "locked":
             found[-1]["locked"] = True
     return found
-
-
-def extras(lane: Path | str) -> Path:
-    """Names the one directory a lane keeps its extra worktrees in.
-
-    Args:
-        lane: The lane's own worktree.
-
-    Returns:
-        The `<lane>-wt` directory beside the lane, in the same parent.
-    """
-    return Path(f"{lane}{EXTRAS}")
 
 
 def relocated(root: str, lane: Path, branch: str) -> str:

@@ -226,7 +226,8 @@ acknowledging or marking anything for it.
 
 Mail never blocks work: it arrives as context, most relevant first. A tool call
 is refused only when it is unsafe now, such as a write to a path a peer
-reserved. Broadcasts reach only the lanes they concern, and a newer note on a
+reserved or a `git worktree add` outside the lane's `<lane>-wt/` directory.
+Broadcasts reach only the lanes they concern, and a newer note on a
 topic replaces the older one.
 
 When a lane's work is ready, integrate it from the base checkout, or send it

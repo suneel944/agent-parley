@@ -75,6 +75,7 @@ GIT_OPTIONS_WITH_VALUE = frozenset(
         "--work-tree",
     }
 )
+WORKTREE_ADD_VALUES = frozenset({"-b", "-B", "--reason"})
 DIAGNOSTIC_TOOLS = frozenset(
     {"Glob", "Grep", "NotebookRead", "Read", "ToolSearch"}
 )
@@ -198,6 +199,7 @@ class Reason(StrEnum):
     WAKE_REQUESTED = "wake_requested"
     ATTRIBUTION_REFUSED = "attribution_refused"
     BUDGET_REFUSED = "budget_refused"
+    WORKTREE_REFUSED = "worktree_refused"
     OPERATOR_PAUSED = "operator_paused"
     OPERATOR_RESUMED = "operator_resumed"
     OPERATOR_STOPPED = "operator_stopped"
@@ -1139,6 +1141,61 @@ def changes_lane_branch(payload: dict, lane: Path) -> bool:
             if len(positional) > 1 and positional[0] == "HEAD":
                 return True
     return False
+
+
+def stray_worktree(payload: dict, lane: Path) -> tuple[Path, str] | None:
+    """Reports a `git worktree add` whose target leaves the lane's -wt.
+
+    Git records no creator for a worktree, so the sweep attributes a lane's
+    extra worktrees by where they sit. The target is the first positional
+    argument after `add`, past options such as `-b NAME`, `-B NAME`,
+    `--reason TEXT`, `--detach` and `--lock`, resolved against the directory
+    `git -C` selects or the tool's working directory, with a leading `~`
+    expanded. The check reads the command line only and runs nothing.
+
+    Args:
+        payload: Native lifecycle hook payload.
+        lane: Assigned bridge worktree, resolved.
+
+    Returns:
+        The resolved target and the same command aimed inside the lane's
+        `-wt` directory, or ``None`` when no add leaves that directory.
+    """
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return None
+    command = str(tool_input.get("command", tool_input.get("cmd", "")))
+    cwd = Path(payload.get("cwd", str(lane))).resolve()
+    allowed = lanes.extras(lane)
+    for segment in shell_segments(command):
+        words = invoked(segment)
+        action = git_action(words, cwd)
+        if action is None:
+            continue
+        base, subcommand, args = action
+        if subcommand != "worktree" or args[:1] != ["add"]:
+            continue
+        index = len(words) - len(args) + 1
+        while index < len(words):
+            word = words[index]
+            if word == "--":
+                index += 1
+                break
+            if word == "-" or not word.startswith("-"):
+                break
+            index += 2 if word in WORKTREE_ADD_VALUES else 1
+        if index >= len(words):
+            continue
+        target = (base / Path(words[index]).expanduser()).resolve()
+        if target != allowed and target.is_relative_to(allowed):
+            continue
+        suggested = [
+            *words[:index],
+            str(allowed / target.name),
+            *words[index + 1 :],
+        ]
+        return target, shlex.join(suggested)
+    return None
 
 
 def _subcommand(words: list[str]) -> list[str]:
@@ -3372,6 +3429,22 @@ def checkpoint(
             }
         }
         record(directory, agent, payload, Reason.BUDGET_REFUSED, refused)
+        return refused
+    if event == "PreToolUse" and (stray := stray_worktree(payload, lane)):
+        allowed = lanes.extras(lane)
+        refused = {
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"A lane adds extra worktrees only inside {allowed}/, "
+                    "so the sweep can tell which lane made them; "
+                    f"{stray[0]} is outside it. Run `{stray[1]}` instead. "
+                    "This is a guard, not an authority boundary."
+                ),
+            }
+        }
+        record(directory, agent, payload, Reason.WORKTREE_REFUSED, refused)
         return refused
     if payload.get("agent_id"):
         record(directory, agent, payload, Reason.OBSERVED, None)

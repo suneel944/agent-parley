@@ -135,6 +135,22 @@ ACCOUNT_FIELDS = (
     "owns",
     "accounted",
 )
+EXTRAS = "-wt"
+
+
+def extras(lane: Path | str) -> Path:
+    """Names the one directory a lane keeps its extra worktrees in.
+
+    The lane hook and the reclaim sweep both read it, so it lives with the
+    lane record, which the hook already loads, rather than in the sweep.
+
+    Args:
+        lane: The lane's own worktree.
+
+    Returns:
+        The `<lane>-wt` directory beside the lane, in the same parent.
+    """
+    return Path(f"{lane}{EXTRAS}")
 
 
 def ensure(db: sqlite3.Connection) -> None:

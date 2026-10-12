@@ -405,6 +405,10 @@ other one outside the lanes, spares and `-wt` directories into the project's
 `strays/<name>`, because Git records no creator; a locked one, one whose lane
 runs a session or any process works inside, and one Git refuses stay where
 they are, and one Git refused is assessed in place.
+Before any of that, `checkpoints.stray_worktree` lets the lane hook deny a
+`git worktree add` whose target resolves outside `lanes.extras`, the
+`<lane>-wt` directory, so new lane-made worktrees land where attribution by
+path finds them.
 A recorded lane path that no longer exists is re-resolved by branch through
 `reclaim.relocated`, so a moved lane is kept and reported, never retired.
 `reclaim.remove` takes a worktree out only through
