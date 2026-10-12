@@ -847,6 +847,7 @@ class StatusMixin(BridgeCore):
         """
         import sqlite3
 
+        from agent_parley import lifecycle
         from agent_parley.cli import (
             activity,
             budgets,
@@ -1019,6 +1020,11 @@ class StatusMixin(BridgeCore):
                     "title": record.get("title") or "",
                     "ended": issues.ended(record),
                     "last_event_seconds": since(issues.last_progress(record)),
+                    "ready_seconds": (
+                        since(lifecycle.state(record).get("updated_at") or 0)
+                        if lifecycle.state(record)["state"] == lifecycle.READY
+                        else None
+                    ),
                     "pull_request": pull_request(
                         frame.get("pull_requests") or [],
                         number,

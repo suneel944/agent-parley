@@ -72,6 +72,7 @@ HELD = "held by a native dialog"
 READY = "ready to retire"
 ORPHANED = "orphaned claims"
 INTEGRATE = "ready to integrate"
+UNOPENED = "ready without a pull request"
 HOLDING = "holding a refused key"
 FOREIGN = "second session"
 REFUSED = "recovery refused"
@@ -584,6 +585,75 @@ def _integrate_rows(
     ]
 
 
+def _unopened_rows(
+    record: dict, name: str, repo: str, root: str, directory: Path | None
+) -> list[dict]:
+    """Reports ready claims that no open pull request carries.
+
+    A lane is told its ready claims wait on CI and review, but a claim
+    whose pull requests all merged or closed while the issue stayed open
+    waits on nothing, so it would stay claimed for good. The cached forge
+    reading holds only open pull requests, so a missing one is the signal.
+    A project with no forge reading proves nothing, and a pending approval
+    is a real wait, so neither raises a row.
+
+    Args:
+        record: One participant record from the status reading.
+        name: Participant that owns the lane.
+        repo: Rendered `--repo` argument naming the project.
+        root: Canonical project key.
+        directory: Private project state directory holding the cached
+            pull request reading, or None when there is none to consult.
+
+    Returns:
+        One row naming the longest-ready such claim and counting the rest,
+        or no row while each ready claim has an open pull request, the
+        project has no forge reading, an approval is pending, or none has
+        been ready longer than `supervision.DEFAULT_WAIT_CEILING`.
+    """
+    if (
+        directory is None
+        or not (directory / supervision.PULL_REQUEST_RECORD).is_file()
+    ):
+        return []
+    approval = record.get("approval")
+    if approval and approval.get("state") != approvals.APPROVED:
+        return []
+    stale = sorted(
+        (
+            claim
+            for claim in record["claims"]
+            if not claim.get("pull_request")
+            and (claim.get("ready_seconds") or 0)
+            > supervision.DEFAULT_WAIT_CEILING
+        ),
+        key=lambda claim: -claim["ready_seconds"],
+    )
+    if not stale:
+        return []
+    oldest = stale[0]
+    numbers = ", ".join(f"#{claim['issue']}" for claim in stale)
+    detail = (
+        f"issue #{oldest['issue']} is ready with no open pull request"
+        if len(stale) == 1
+        else f"{len(stale)} ready claims have no open pull request: {numbers}"
+    )
+    return [
+        _row(
+            UNOPENED,
+            detail,
+            f"open its pull request, close #{oldest['issue']} if the work "
+            "merged, or agent-parley issue release "
+            f"{oldest['issue']} {repo}",
+            oldest["ready_seconds"],
+            name,
+            root,
+            BY_OPERATOR,
+            len(stale),
+        )
+    ]
+
+
 def _retire_rows(
     record: dict, name: str, repo: str, root: str, ceiling: float
 ) -> list[dict]:
@@ -1080,6 +1150,7 @@ def _lane_rows(
             )
         )
     rows.extend(_claim_rows(record, name, repo, root))
+    rows.extend(_unopened_rows(record, name, repo, root, directory))
     rows.extend(
         _cap_rows(record, name, repo, root, config["max_claims_per_lane"])
     )

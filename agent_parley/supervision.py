@@ -2436,8 +2436,11 @@ def _waiting_claims(ledger: dict, held: list[str]) -> list[str]:
 
     Returns:
         One phrase per held claim with no action the lane can take now, in
-        the order held: ready work waits on CI and review before verified
-        integration, blocked work on its recorded condition, and work whose
+        the order held: ready work waits on CI and review of its pull
+        request before verified integration, and the lane is told to open
+        one or release the claim when none is open, since the ledger cannot
+        tell that apart; blocked work waits on its recorded condition, and
+        work whose
         dependency is unfinished on that dependency. A claim whose issue
         closed waits on nothing, so it is left out.
     """
@@ -2456,7 +2459,11 @@ def _waiting_claims(ledger: dict, held: list[str]) -> list[str]:
             != lifecycle.COMPLETE
         ]
         if execution["state"] == lifecycle.READY:
-            reason = "ready, waits on CI and review before integration"
+            reason = (
+                "ready, waits on CI and review of its pull request before "
+                "integration; if none is open, open one, or release the "
+                "claim when its work already merged"
+            )
         elif pending:
             reason = "waits on dependency " + ", ".join(pending)
         else:

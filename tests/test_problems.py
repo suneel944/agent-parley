@@ -1604,6 +1604,42 @@ def test_a_ready_report_waiting_on_its_pull_request_replaces_retirement(
     assert "approve" in declared()
 
 
+def test_a_ready_claim_with_no_open_pull_request_is_reported(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(supervision, "dirty_paths", lambda lane: [])
+    ceiling = supervision.DEFAULT_WAIT_CEILING
+
+    def rows(ready, pull=None, approval=None, directory=tmp_path):
+        claims = [{**ORPHANED[0], "ready_seconds": ready, "pull_request": pull}]
+        record = lane_record(claims=claims, approval=approval)
+        return [
+            row
+            for row in problems._lane_rows(
+                record,
+                {"lane": "/lane", "branch": "work"},
+                "/root",
+                {**supervision.DEFAULTS, "wake": False},
+                600,
+                time.time(),
+                directory,
+            )
+            if row["condition"] == problems.UNOPENED
+        ]
+
+    assert not rows(ceiling + 1)
+    (tmp_path / supervision.PULL_REQUEST_RECORD).write_text("{}")
+    [row] = rows(ceiling + 1)
+    assert row["detail"] == "issue #42 is ready with no open pull request"
+    assert row["command"].endswith("agent-parley issue release 42 --repo /root")
+    assert row["seconds"] == ceiling + 1
+    assert not rows(ceiling)
+    assert not rows(None)
+    assert not rows(ceiling + 1, pull={"number": 830})
+    assert not rows(ceiling + 1, approval={"state": "pending"})
+    assert not rows(ceiling + 1, directory=None)
+
+
 def test_a_lane_pull_request_past_the_newest_window_blocks_retirement(
     bridge, paired, monkeypatch
 ):
