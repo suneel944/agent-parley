@@ -3095,7 +3095,8 @@ class Bridge(
 
         A worktree a lane made outside its `<lane>-wt` directory is planned
         into it, and one no lane accounts for into the project's `strays`
-        directory, by `reclaim.relocations` and moved with
+        directory when it sits inside the repository, under the state root
+        or in a temporary directory, by `reclaim.relocations` and moved with
         `git worktree move`, which never deletes. It runs before the
         reclaim sweeps, so a moved worktree is attributed by path in the
         same pass.
