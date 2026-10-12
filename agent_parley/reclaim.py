@@ -63,6 +63,7 @@ from agent_parley.lanes import extras
 from agent_parley.state import BridgeError, LockBusy, lock
 
 GIT_SECONDS = 5
+RELOCATE_AFTER = 3600
 MAX_REPORTED_PATHS = 10
 RENAMED_HOMES = {"agent-parley": "agent-bridge"}
 RETIRED_FILES = ("-work.json", "-wake-work.json", "-mcp.json", "-wake.log")
@@ -113,6 +114,7 @@ FOREIGN = (
     "directory and temporary directories"
 )
 REFUSED = "Git refused to move it"
+FRESH = "it changed within the relocation grace period"
 STRAYS = "strays"
 TEMPORARY = ("/tmp", "/var/tmp", "/dev/shm")
 REMOVABLE = frozenset(
@@ -475,6 +477,33 @@ def _changed(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _used(path: Path) -> float:
+    """Reads when a worktree was last in use, as far as the disk records.
+
+    A session working from the base checkout never keeps its working
+    directory inside the worktree, and editing a file in a subdirectory
+    leaves the worktree directory's own time alone. Git rewrites the
+    worktree's index on status, add and commit, and its HEAD on every
+    commit or checkout, so the latest of the three times marks recent use.
+
+    Args:
+        path: Linked worktree whose `.git` file names its Git directory.
+
+    Returns:
+        The latest modification time of the worktree directory, its index
+        and its HEAD, or the directory's alone when its `.git` file cannot
+        be read.
+    """
+    try:
+        pointer = (path / ".git").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return _changed(path)
+    gitdir = path / pointer.removeprefix("gitdir:").strip()
+    return max(
+        _changed(path), _changed(gitdir / "index"), _changed(gitdir / "HEAD")
+    )
 
 
 def _quiet(directory: Path, name: str, lane: Path, after: float) -> bool:
@@ -1138,8 +1167,10 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
     The base checkout, the lanes themselves, spares, a worktree already
     inside a lane, its `-wt` directory or the `strays` directory, and one
     whose directory is gone are not planned at all. A locked worktree, one
-    whose lane runs a session and one any process works inside are planned
-    but refused.
+    whose lane runs a session, one any process works inside and one whose
+    directory, index or HEAD changed within `RELOCATE_AFTER` seconds are
+    planned but refused, the last because a session working from the base
+    checkout edits it without ever entering it.
 
     Args:
         directory: Private project state directory holding the lanes.
@@ -1180,6 +1211,8 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
             reason = LOCKED
         elif (owner and _busy(directory, owner)) or _occupied(path):
             reason = SESSION
+        elif time.time() - _used(path) < RELOCATE_AFTER:
+            reason = FRESH
         elif _within(destination, path):
             reason = REFUSED
         else:

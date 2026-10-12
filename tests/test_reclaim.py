@@ -401,12 +401,17 @@ def aged(path, seconds=3600):
 
 @pytest.fixture
 def idle(bridge, repo, paired, monkeypatch):
-    """Leaves the codex lane stopped, empty, clean and long untouched."""
+    """Leaves the codex lane stopped, empty, clean and long untouched.
+
+    The relocation grace period is lifted, so a worktree a test has just
+    made can be moved; the grace period has its own test.
+    """
     directory = bridge.project(repo, create=False)[1]
     manifest = roster.read(directory)
     lane = Path(paired["lanes"]["codex"])
     aged(lane)
     completion(monkeypatch, None)
+    monkeypatch.setattr(reclaim, "RELOCATE_AFTER", 0)
     return {
         "directory": directory,
         "lane": lane,
@@ -769,6 +774,31 @@ def test_a_stray_under_the_repository_claude_worktrees_moves(
     assert row["moved"] is True
     assert not path.exists()
     assert (strayed(idle, "pr-kyc") / ".git").exists()
+
+
+def test_a_worktree_in_use_stays_until_its_grace_period_passes(
+    bridge, repo, idle, monkeypatch
+):
+    monkeypatch.setattr(reclaim, "RELOCATE_AFTER", 3600)
+    folder = repo / ".claude" / "worktrees"
+    folder.mkdir(parents=True)
+    path = made(repo, folder, "1015-sweep-record")
+    (path / "shared.txt").write_text("in progress\n")
+    aged(path)
+    gitdir = Path(git(path, "rev-parse", "--absolute-git-dir"))
+
+    fresh = bridge.relocate_worktrees(repo, apply=True)
+    aged(gitdir / "index")
+    aged(gitdir / "HEAD")
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    row = worktree_of(fresh, path)
+    assert row["reason"] == reclaim.FRESH
+    assert row["relocate"] is False
+    assert "moved" not in row
+    assert worktree_of(moved, path)["moved"] is True
+    destination = strayed(idle, "1015-sweep-record")
+    assert (destination / "shared.txt").read_text() == "in progress\n"
 
 
 @pytest.fixture

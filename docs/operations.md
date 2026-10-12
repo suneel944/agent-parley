@@ -2683,8 +2683,11 @@ strays directory`. One anywhere else, such as `~/.local/state/tm-arena`
 used by a systemd unit, is only reported under `relocations`, with the
 operator-owned reason above, and stays where it is. A move never deletes and never forces: uncommitted edits,
 unpushed commits and ignored files travel with the directory. A locked
-worktree, one whose lane runs a session or any process works inside, and one
-Git refuses to move, such as a move across filesystems, stay in place and
+worktree, one whose lane runs a session or any process works inside, one
+whose directory, Git index or HEAD changed within the last hour, reported as
+`it changed within the relocation grace period` because a session working
+from the base checkout edits it without entering it, and one Git refuses to
+move, such as a move across filesystems, stay in place and
 are reported; one Git refused is then assessed in place by the same rule.
 The base checkout, the lanes themselves and spares are never moved. The
 moves are published under `relocations` in `reclaim.json`; `agent-parley gc`
