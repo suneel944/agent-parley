@@ -1105,6 +1105,16 @@ def test_a_lane_worktree_moved_by_the_operator_is_never_retired(
     )
 
 
+def test_a_vanished_lane_branch_checked_out_in_the_base_is_not_moved(
+    repo, idle
+):
+    shutil.rmtree(idle["lane"])
+    git(repo, "worktree", "prune")
+    git(repo, "switch", idle["branch"])
+
+    assert reclaim.relocated(str(repo), idle["lane"], idle["branch"]) == ""
+
+
 def test_restore_names_where_a_moved_lane_worktree_went(
     bridge, repo, idle, tmp_path
 ):

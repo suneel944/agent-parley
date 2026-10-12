@@ -597,7 +597,10 @@ def relocated(root: str, lane: Path, branch: str) -> str:
     A worktree moved with `git worktree move`, by the sweep or by the
     operator, keeps its branch and its registration under a new path, so a
     recorded path that no longer exists is read against the registrations
-    by branch before anything treats it as gone.
+    by branch before anything treats it as gone. The main worktree, which
+    Git always lists first, is skipped: a lane worktree cannot be moved
+    onto the base checkout, so that branch match means the operator checked
+    the branch out there after the lane vanished.
 
     Args:
         root: Base checkout the worktree is registered with.
@@ -605,13 +608,13 @@ def relocated(root: str, lane: Path, branch: str) -> str:
         branch: The branch that worktree has checked out.
 
     Returns:
-        The existing path Git registers that branch at, or an empty string
-        when the recorded path still exists, the branch is empty, or no
-        other existing registration carries it.
+        The existing linked worktree path Git registers that branch at, or
+        an empty string when the recorded path still exists, the branch is
+        empty, or no other existing linked registration carries it.
     """
     if not branch or lane.exists():
         return ""
-    for entry in _entries(root) or []:
+    for entry in (_entries(root) or [])[1:]:
         if entry["branch"] == branch and Path(entry["path"]).exists():
             return entry["path"]
     return ""
