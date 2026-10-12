@@ -2653,10 +2653,11 @@ name or branch followed by `-` or `/`, such as `claude-pr-12`. One directly
 inside the project state directory belongs to the project, and so does one
 directly inside a project folder under the `agent-bridge` folder beside a
 state root named `agent-parley`, such as `~/.local/state/agent-bridge`, where
-lanes lived before the rename. One nested deeper, such as a worktree an
-operator adds under a directory of their own, is the operator's. A worktree
-nothing accounts for is reported with reason `no lane made it` and never
-touched, even with `--force`.
+lanes lived before the rename, and so does one in the project's `strays`
+directory. Git records no creator, so a worktree no lane accounts for is
+assessed by the same rule wherever it sits; one outside those directories
+that any process works inside is kept with reason `a session is running in
+it`.
 
 The lane protocol names one place for those worktrees: `<lane>-wt/NAME`
 beside the lane in the project state directory, removed by the lane with
@@ -2664,12 +2665,18 @@ beside the lane in the project state directory, removed by the lane with
 every worktree attributed to a lane that sits outside that lane and outside
 its `<lane>-wt` directory, such as one in the home directory, beside the
 repository or in `/tmp`, is moved to `<lane>-wt/<name>` with
-`git worktree move`, taking `<name>-2` and upward when the name is taken. A
-move never deletes and never forces: uncommitted edits, unpushed commits and
-ignored files travel with the directory. A locked worktree, one whose lane
-runs a session, and one Git refuses to move, such as a move across
-filesystems, stay in place and are reported. The base checkout, the lanes
-themselves, spares and a worktree no lane accounts for are never moved. The
+`git worktree move`, taking `<name>-2` and upward when the name is taken.
+Every other worktree the project repository registers outside the base
+checkout, the lanes, the spares and every `<lane>-wt` directory, wherever it
+sits, including `<repo>/.claude/worktrees/`, the home directory and `/tmp`,
+is moved the same way to `strays/<name>` in the project state directory,
+with reason `no lane made it and it sits outside the project's strays
+directory`. A move never deletes and never forces: uncommitted edits,
+unpushed commits and ignored files travel with the directory. A locked
+worktree, one whose lane runs a session or any process works inside, and one
+Git refuses to move, such as a move across filesystems, stay in place and
+are reported; one Git refused is then assessed in place by the same rule.
+The base checkout, the lanes themselves and spares are never moved. The
 moves are published under `relocations` in `reclaim.json`; `agent-parley gc`
 lists them as `to move to` without `--apply`, performs them with it, and
 `--json` carries them as `relocations`.

@@ -256,8 +256,9 @@ agent-parley gc --project ROOT --apply  # drop a gone root's project state
 
 A lane is reclaimed only when it is idle, holds no claim, has nothing
 uncommitted or unpushed, and its pull request merged or its branch is gone.
-Every kept lane is reported with the reason. A worktree no lane made is never
-touched, and uncommitted work is removed only with `--force`, after a recovery
+Every kept lane is reported with the reason. A stray worktree is moved into
+the project state directory first, never deleted by the move, and uncommitted
+work is removed only with `--force`, after a recovery
 checkpoint. A quiet lane-made worktree whose unpushed commits already landed
 through another branch is removed without `--force`, its commits bundled into
 a recovery checkpoint first.

@@ -3053,13 +3053,15 @@ class Bridge(
 
         Lanes add worktrees for pull requests and sub-tasks that no lane
         root accounts for. Each one the project repository registers is
-        assessed by `reclaim.strays`, and a worktree no lane made is never
-        removed. Git's own removal refuses a dirty or locked worktree, so
-        nothing with uncommitted work is lost unless the operator forces
-        it, and a forced removal writes a recovery checkpoint first. The
-        spare worktrees a project pool keeps are assessed by `pool.sweep`
-        in the same pass: a stale spare or one beyond the pool size is
-        removed with its branch, and a usable one is kept.
+        assessed by `reclaim.strays`, whether or not a lane made it, and
+        one no lane made that a process works inside, outside the project
+        state directory, is kept. Git's own removal refuses a dirty or
+        locked worktree, so nothing with uncommitted work is lost unless
+        the operator forces it, and a forced removal writes a recovery
+        checkpoint first. The spare worktrees a project pool keeps are
+        assessed by `pool.sweep` in the same pass: a stale spare or one
+        beyond the pool size is removed with its branch, and a usable one
+        is kept.
 
         Args:
             repo: Any checkout of the target repository.
@@ -3089,12 +3091,14 @@ class Bridge(
     def relocate_worktrees(
         self, repo: Path, *, apply: bool = False
     ) -> list[dict]:
-        """Reports, and optionally performs, moves of stray lane worktrees.
+        """Reports, and optionally performs, moves of stray worktrees.
 
         A worktree a lane made outside its `<lane>-wt` directory is planned
-        into it by `reclaim.relocations` and moved with `git worktree move`,
-        which never deletes. It runs before the reclaim sweeps, so a moved
-        worktree is attributed by path in the same pass.
+        into it, and one no lane accounts for into the project's `strays`
+        directory, by `reclaim.relocations` and moved with
+        `git worktree move`, which never deletes. It runs before the
+        reclaim sweeps, so a moved worktree is attributed by path in the
+        same pass.
 
         Args:
             repo: Any checkout of the target repository.

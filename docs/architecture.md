@@ -400,12 +400,14 @@ record moves to `reclaimed`. Worktrees lanes made for themselves are read from
 lane, its `<lane>-wt` directory or directly inside the project state
 directory, or by branch. Before the sweep, `reclaim.relocations` plans and
 `reclaim.relocate` performs a `git worktree move` of each lane-attributed one
-outside its lane and its `-wt` directory into `<lane>-wt/<name>`; a locked
-one, one whose lane runs a session and one Git refuses stay where they are.
+outside its lane and its `-wt` directory into `<lane>-wt/<name>`, and of every
+other one outside the lanes, spares and `-wt` directories into the project's
+`strays/<name>`, because Git records no creator; a locked one, one whose lane
+runs a session or any process works inside, and one Git refuses stay where
+they are, and one Git refused is assessed in place.
 A recorded lane path that no longer exists is re-resolved by branch through
-`reclaim.relocated`, so a moved lane is kept and reported, never retired. One no
-lane made, including one nested deeper under the state directory, is never
-touched, and `reclaim.remove` takes an attributed one out only through
+`reclaim.relocated`, so a moved lane is kept and reported, never retired.
+`reclaim.remove` takes a worktree out only through
 `git worktree remove`, which refuses a dirty or locked worktree. A lane-made
 worktree holding files Git ignores is always kept, because no force can
 checkpoint untracked content. A quiet lane-made worktree whose unpushed

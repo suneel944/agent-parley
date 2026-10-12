@@ -720,28 +720,121 @@ def test_caches_beside_user_files_keep_a_worktree(bridge, repo, idle):
     assert (path / ".venv" / "data").exists()
 
 
-def test_a_worktree_no_lane_made_is_never_touched(bridge, repo, idle, tmp_path):
-    path = made(repo, tmp_path, "operator-wt")
-    aged(path)
-
-    swept = bridge.reclaim_worktrees(repo, apply=True, force=True)
-
-    assert worktree_of(swept, path)["reason"] == reclaim.FOREIGN
-    assert path.exists()
+def strayed(idle, name):
+    """Names where the sweep moves a worktree no lane made."""
+    return idle["directory"].resolve() / reclaim.STRAYS / name
 
 
-def test_a_worktree_nested_under_the_state_directory_is_never_touched(
+def test_an_unattributed_stray_moves_and_is_reclaimed_once_landed(
+    bridge, repo, idle, tmp_path
+):
+    clean = made(repo, tmp_path, "kyc-walk-baseline")
+    dirty = made(repo, tmp_path, "fix-1871")
+    (dirty / "work.txt").write_text("work\n")
+    commit(dirty, "Unpushed work")
+
+    planned = bridge.relocate_worktrees(repo)
+    moved = bridge.relocate_worktrees(repo, apply=True)
+    for name in ("kyc-walk-baseline", "fix-1871"):
+        aged(strayed(idle, name))
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    plan = worktree_of(planned, clean)
+    assert plan["participant"] == ""
+    assert plan["reason"] == reclaim.ADRIFT
+    assert plan["destination"] == str(strayed(idle, "kyc-walk-baseline"))
+    assert worktree_of(planned, dirty)["relocate"] is True
+    assert worktree_of(moved, clean)["moved"] is True
+    assert not clean.exists()
+    assert not dirty.exists()
+    gone = worktree_of(swept, strayed(idle, "kyc-walk-baseline"))
+    assert gone["reason"] == reclaim.CONTAINED
+    assert gone["removed"] is True
+    kept = worktree_of(swept, strayed(idle, "fix-1871"))
+    assert kept["reason"] == reclaim.UNPUSHED
+    assert not kept.get("removed")
+    assert (strayed(idle, "fix-1871") / "work.txt").exists()
+
+
+def test_a_stray_under_the_repository_claude_worktrees_moves(
+    bridge, repo, idle
+):
+    folder = repo / ".claude" / "worktrees"
+    folder.mkdir(parents=True)
+    path = made(repo, folder, "pr-kyc")
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    row = worktree_of(moved, path)
+    assert row["moved"] is True
+    assert not path.exists()
+    assert (strayed(idle, "pr-kyc") / ".git").exists()
+
+
+def test_a_worktree_nested_under_the_state_directory_moves_to_strays(
     bridge, repo, idle
 ):
     nested = idle["directory"] / "operator-wt"
     nested.mkdir()
     path = made(repo, nested, "fix/616-c2")
-    aged(path)
 
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    destination = strayed(idle, "616-c2")
+    assert worktree_of(moved, path)["destination"] == str(destination)
+    assert (destination / ".git").exists()
+
+
+def test_a_locked_unattributed_stray_is_left_in_place(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "operator-wt")
+    git(repo, "worktree", "lock", str(path))
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
     swept = bridge.reclaim_worktrees(repo, apply=True, force=True)
 
-    assert worktree_of(swept, path)["reason"] == reclaim.FOREIGN
+    row = worktree_of(moved, path)
+    assert row["reason"] == reclaim.LOCKED
+    assert row["relocate"] is False
+    assert worktree_of(swept, path)["reason"] == reclaim.LOCKED
     assert path.exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cwd").exists(), reason="needs /proc")
+def test_an_unattributed_stray_a_process_works_in_is_left_alone(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "operator-wt")
+    aged(path)
+    shell = subprocess.Popen(["sleep", "60"], cwd=path)
+    try:
+        moved = bridge.relocate_worktrees(repo, apply=True)
+        swept = bridge.reclaim_worktrees(repo, apply=True)
+    finally:
+        shell.kill()
+        shell.wait()
+
+    assert worktree_of(moved, path)["reason"] == reclaim.SESSION
+    assert worktree_of(swept, path)["reason"] == reclaim.SESSION
+    assert path.exists()
+
+
+def test_a_stray_git_refuses_to_move_is_assessed_in_place(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "operator-wt")
+    aged(path)
+    (idle["directory"] / reclaim.STRAYS).write_text("not a directory\n")
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    assert worktree_of(moved, path)["reason"] == reclaim.REFUSED
+    row = worktree_of(swept, path)
+    assert row["reason"] == reclaim.CONTAINED
+    assert row["removed"] is True
+    assert not path.exists()
 
 
 def test_a_worktree_under_the_pre_rename_state_root_is_reclaimed(
@@ -758,7 +851,7 @@ def test_a_worktree_under_the_pre_rename_state_root_is_reclaimed(
     )
     swept = bridge.reclaim_worktrees(repo, apply=True)
 
-    assert worktree_of(unrenamed, path)["reason"] == reclaim.FOREIGN
+    assert worktree_of(unrenamed, path)["reason"] == reclaim.CONTAINED
     row = worktree_of(swept, path)
     assert row["reason"] == reclaim.CONTAINED
     assert row["removed"] is True
@@ -899,22 +992,13 @@ def test_a_move_git_refuses_is_reported_and_moves_nothing(
     assert path.exists()
 
 
-def test_a_worktree_no_lane_accounts_for_is_never_moved(
-    bridge, repo, idle, tmp_path
-):
-    path = made(repo, tmp_path, "operator-wt")
-
-    moved = bridge.relocate_worktrees(repo, apply=True)
-
-    assert all(row["worktree"] != str(path.resolve()) for row in moved)
-    assert path.exists()
-
-
 def test_gc_dry_run_lists_planned_moves_and_apply_performs_them(
     bridge, repo, idle, tmp_path, monkeypatch, capsys
 ):
     path = made(repo, tmp_path, "codex-pr-25")
     destination = reclaim.extras(idle["lane"].resolve()) / "codex-pr-25"
+    stray = made(repo, tmp_path, "kyc-walk-baseline")
+    adrift = strayed(idle, "kyc-walk-baseline")
     arguments = ["agent-parley", "--home", str(bridge.home), "gc"]
     arguments += ["--repo", str(repo)]
 
@@ -926,8 +1010,11 @@ def test_gc_dry_run_lists_planned_moves_and_apply_performs_them(
     applied = capsys.readouterr().out
 
     assert f"to move to {destination}" in planned
+    assert f"worktree {stray.resolve()}: to move to {adrift}" in planned
     assert f"moved to {destination}" in applied
+    assert f"moved to {adrift}" in applied
     assert destination.exists() and not path.exists()
+    assert adrift.exists() and not stray.exists()
 
 
 def test_a_lane_worktree_moved_by_the_operator_is_never_retired(
@@ -1149,8 +1236,12 @@ def test_the_sweep_publishes_the_worktrees_it_reclaimed(bridge, repo, idle):
         (idle["directory"] / supervision.RECLAIM_PUBLICATION).read_text()
     )
     assert not path.exists()
-    assert [row["worktree"] for row in published["worktrees"]] == [
+    assert not strayed(idle, "pr-4").exists()
+    assert [row["worktree"] for row in published["relocations"]] == [
         str(path.resolve())
+    ]
+    assert [row["worktree"] for row in published["worktrees"]] == [
+        str(strayed(idle, "pr-4"))
     ]
     assert row_of(published["lanes"], "codex")["reason"] == reclaim.STOPPED
 
