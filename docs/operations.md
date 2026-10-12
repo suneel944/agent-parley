@@ -2680,7 +2680,11 @@ are reported; one Git refused is then assessed in place by the same rule.
 The base checkout, the lanes themselves and spares are never moved. The
 moves are published under `relocations` in `reclaim.json`; `agent-parley gc`
 lists them as `to move to` without `--apply`, performs them with it, and
-`--json` carries them as `relocations`.
+`--json` carries them as `relocations`. `reclaim.json` describes only the
+latest sweep, so the service also writes one `reclaim` line to `server.log`
+for every worktree a sweep moved, every move Git refused and every lane or
+worktree it removed. The log's rotation into `server.log.1` keeps that record
+after later sweeps find nothing left to do.
 
 A worktree moved underneath Agent Parley, by the sweep or by the operator,
 is found again by branch through `git worktree list` before anything acts

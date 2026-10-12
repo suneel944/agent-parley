@@ -1310,6 +1310,38 @@ def test_the_sweep_publishes_the_worktrees_it_reclaimed(bridge, repo, idle):
     assert row_of(published["lanes"], "codex")["reason"] == reclaim.STOPPED
 
 
+def test_the_sweep_logs_what_it_moved_and_removed_for_later_reading(
+    bridge, repo, idle, capsys
+):
+    store.initialize(bridge.home)
+    path = made(repo, idle["directory"], "pr-5")
+    aged(path)
+
+    supervision.poll(bridge.home, idle["directory"])
+    first = capsys.readouterr().out
+    publication = idle["directory"] / supervision.RECLAIM_PUBLICATION
+    published = json.loads(publication.read_text())
+    published["swept"] -= supervision.RECLAIM_INTERVAL
+    publication.write_text(json.dumps(published))
+    supervision.poll(bridge.home, idle["directory"])
+    second = capsys.readouterr().out
+
+    entries = [line for line in first.splitlines() if " reclaim " in line]
+    name = idle["directory"].name
+    assert any(
+        f"reclaim {name}: worktree {path.resolve()}: moved to "
+        f"{strayed(idle, 'pr-5')}" in line
+        for line in entries
+    )
+    assert any(
+        f"worktree {strayed(idle, 'pr-5')}: reclaimed" in line
+        for line in entries
+    )
+    assert any(" codex: reclaimed " in line for line in entries)
+    assert " reclaim " not in second
+    assert not json.loads(publication.read_text())["relocations"]
+
+
 def test_a_missing_project_root_is_retired_within_one_interval(
     bridge, repo, paired
 ):

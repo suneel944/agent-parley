@@ -6847,7 +6847,11 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     next attempt and gives the operator the account of what was removed and
     what was kept. Before either sweep, every worktree a lane made outside
     its `<lane>-wt` directory is moved there, never deleted, and the moves
-    and refusals are published under `relocations`. The worktrees lanes
+    and refusals are published under `relocations`. The publication only
+    describes the latest pass, so every move, every move Git refused and
+    every removal is also written to the service log as a `reclaim` entry,
+    whose rotation keeps the record after later sweeps find nothing left.
+    The worktrees lanes
     made for themselves are swept in the
     same pass and published beside the lanes, without their sizes, because
     measuring them walks every file they hold. The files retired lanes no
@@ -6868,7 +6872,7 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
         directory: Private project state directory holding the lanes.
         manifest: Project manifest naming the root and the participants.
     """
-    from agent_parley import cli
+    from agent_parley import cli, server
 
     now = time.time()
     if not reclaim_due(directory, now, RECLAIM_INTERVAL):
@@ -6905,6 +6909,13 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
                     "bundles_pruned": len(bundles),
                 },
             )
+    acted = [
+        row
+        for row in moved
+        if row.get("moved") or row["reason"] == reclaim.REFUSED
+    ] + [row for row in rows + made if row.get("removed")]
+    for line in reclaim.lines(acted):
+        server.log(home, "reclaim", f"{directory.name}: {line}")
     removed = [row["participant"] for row in rows if row.get("removed")]
     if removed:
         with store.connect(home, write=True) as db:
