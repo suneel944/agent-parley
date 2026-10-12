@@ -6845,7 +6845,10 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     it never runs on the ordinary thirty second cadence. Its outcome is
     published whether it succeeded, refused or failed, which both bounds the
     next attempt and gives the operator the account of what was removed and
-    what was kept. The worktrees lanes made for themselves are swept in the
+    what was kept. Before either sweep, every worktree a lane made outside
+    its `<lane>-wt` directory is moved there, never deleted, and the moves
+    and refusals are published under `relocations`. The worktrees lanes
+    made for themselves are swept in the
     same pass and published beside the lanes, without their sizes, because
     measuring them walks every file they hold. The files retired lanes no
     longer need and wake logs past their retention are then deleted, as
@@ -6872,10 +6875,12 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
         return
     rows: list[dict] = []
     made: list[dict] = []
+    moved: list[dict] = []
     pruned: list[str] = []
     bundles: list[str] = []
     bridge = cli.Bridge(home)
     try:
+        moved = bridge.relocate_worktrees(Path(manifest["root"]), apply=True)
         rows = bridge.reclaim(Path(manifest["root"]), apply=True)
         made = bridge.reclaim_worktrees(Path(manifest["root"]), apply=True)
         pruned = reclaim.prune(directory, roster.read(directory), now)
@@ -6892,6 +6897,7 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
                     "swept": now,
                     "lanes": rows,
                     "worktrees": made,
+                    "relocations": moved,
                     "pruned": pruned,
                     "state_bytes": reclaim.size(directory),
                     "reclaimable": sum(row["reclaim"] for row in left),

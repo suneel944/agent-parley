@@ -350,8 +350,10 @@ class BridgeCore:
         would report an unavailable worktree as a drifted one.
 
         Raises:
-            BridgeError: If a checked lane left its assigned branch, or no
-                manifest exists and creation is not allowed.
+            BridgeError: If a checked lane left its assigned branch, Git
+                registers its worktree at another path, which names the
+                command that moves it back, or no manifest exists and
+                creation is not allowed.
         """
         from agent_parley.cli import (
             drift,
@@ -360,6 +362,7 @@ class BridgeCore:
             json,
             lane_branch,
             preserve_pending,
+            reclaim,
             roster,
             write_json,
         )
@@ -377,8 +380,15 @@ class BridgeCore:
                 participant = participants[name]
                 if roster.retired(participant):
                     continue
-                actual = lane_branch(Path(participant["lane"]))
+                lane = Path(participant["lane"])
+                actual = lane_branch(lane)
                 if actual != participant["branch"]:
+                    if moved := reclaim.relocated(
+                        data["root"], lane, participant["branch"]
+                    ):
+                        raise BridgeError(
+                            f"{name}: {reclaim.moved_remedy(lane, moved)}."
+                        )
                     raise BridgeError(
                         drift(name, participant, actual),
                         next_command=f"agent-parley participant restore {name}",

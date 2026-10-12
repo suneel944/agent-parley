@@ -2647,7 +2647,8 @@ that ends the idle session.
 Worktrees a lane made for itself, such as one per pull request, are swept in
 the same pass and published under `worktrees` in `reclaim.json`. Every
 worktree `git worktree list` reports is attributed to a lane by path, when it
-sits inside a lane's worktree, or by branch, when its branch is the lane's
+sits inside a lane's worktree or its `<lane>-wt` directory beside it, or by
+branch, when its branch is the lane's
 name or branch followed by `-` or `/`, such as `claude-pr-12`. One directly
 inside the project state directory belongs to the project, and so does one
 directly inside a project folder under the `agent-bridge` folder beside a
@@ -2656,6 +2657,29 @@ lanes lived before the rename. One nested deeper, such as a worktree an
 operator adds under a directory of their own, is the operator's. A worktree
 nothing accounts for is reported with reason `no lane made it` and never
 touched, even with `--force`.
+
+The lane protocol names one place for those worktrees: `<lane>-wt/NAME`
+beside the lane in the project state directory, removed by the lane with
+`git worktree remove` once its pull request merges. Before either sweep,
+every worktree attributed to a lane that sits outside that lane and outside
+its `<lane>-wt` directory, such as one in the home directory, beside the
+repository or in `/tmp`, is moved to `<lane>-wt/<name>` with
+`git worktree move`, taking `<name>-2` and upward when the name is taken. A
+move never deletes and never forces: uncommitted edits, unpushed commits and
+ignored files travel with the directory. A locked worktree, one whose lane
+runs a session, and one Git refuses to move, such as a move across
+filesystems, stay in place and are reported. The base checkout, the lanes
+themselves, spares and a worktree no lane accounts for are never moved. The
+moves are published under `relocations` in `reclaim.json`; `agent-parley gc`
+lists them as `to move to` without `--apply`, performs them with it, and
+`--json` carries them as `relocations`.
+
+A worktree moved underneath Agent Parley, by the sweep or by the operator,
+is found again by branch through `git worktree list` before anything acts
+on its recorded path. A lane whose own worktree an operator moved is never
+retired for it: the sweep keeps it with reason `its worktree moved to another
+path Git registers` and names the `git worktree move` that returns it, and
+launch and `participant restore` refuse with the same command.
 
 An attributed worktree is removed with `git worktree remove` when it is not
 locked, has no session running in its lane, has nothing uncommitted, and

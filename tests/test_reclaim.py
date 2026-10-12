@@ -27,7 +27,7 @@ from agent_parley import (
     terminal,
 )
 from agent_parley.cli import git
-from agent_parley.state import lock
+from agent_parley.state import BridgeError, lock
 
 
 def commit(worktree, message):
@@ -777,6 +777,174 @@ def test_a_merged_lane_worktree_outside_the_state_directory_is_reclaimed(
     assert row["reason"] == reclaim.CONTAINED
     assert row["removed"] is True
     assert not path.exists()
+
+
+def test_a_worktree_in_the_lane_wt_directory_is_attributed_by_path(
+    bridge, repo, idle
+):
+    folder = reclaim.extras(idle["lane"].resolve())
+    folder.mkdir()
+    path = made(repo, folder, "kyc-walk-baseline")
+    aged(path)
+    manifest = roster.read(idle["directory"])
+
+    children = reclaim.child_worktrees(idle["directory"], manifest, "codex")
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    assert children == [path.resolve()]
+    row = worktree_of(swept, path)
+    assert row["participant"] == "codex"
+    assert row["reason"] == reclaim.CONTAINED
+    assert row["removed"] is True
+
+
+def test_a_stray_lane_worktree_moves_with_its_unfinished_work(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-20")
+    (path / "work.txt").write_text("work\n")
+    commit(path, "Unpushed work")
+    (path / "draft.txt").write_text("unsaved\n")
+    excluded(repo, ".env")
+    (path / ".env").write_text("SECRET=1\n")
+    destination = reclaim.extras(idle["lane"].resolve()) / "codex-pr-20"
+
+    planned = bridge.relocate_worktrees(repo)
+    moved = bridge.relocate_worktrees(repo, apply=True)
+    swept = bridge.reclaim_worktrees(repo)
+
+    plan = worktree_of(planned, path)
+    assert plan["relocate"] is True
+    assert plan["reason"] == reclaim.STRAYED
+    assert plan["destination"] == str(destination)
+    assert "moved" not in plan
+    assert worktree_of(moved, path)["moved"] is True
+    assert not path.exists()
+    assert (destination / "draft.txt").read_text() == "unsaved\n"
+    assert (destination / ".env").read_text() == "SECRET=1\n"
+    assert git(destination, "log", "-1", "--format=%s") == "Unpushed work"
+    row = worktree_of(swept, destination)
+    assert row["participant"] == "codex"
+    assert row["reason"] == reclaim.UNCOMMITTED
+
+
+def test_a_relocation_takes_a_free_name_beside_a_taken_one(
+    bridge, repo, idle, tmp_path
+):
+    folder = reclaim.extras(idle["lane"].resolve())
+    (folder / "codex-pr-21").mkdir(parents=True)
+    path = made(repo, tmp_path, "codex-pr-21")
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    row = worktree_of(moved, path)
+    assert row["destination"] == str(folder / "codex-pr-21-2")
+    assert row["moved"] is True
+    assert (folder / "codex-pr-21-2" / ".git").exists()
+
+
+def test_a_locked_stray_worktree_is_left_in_place(bridge, repo, idle, tmp_path):
+    path = made(repo, tmp_path, "codex-pr-22")
+    git(repo, "worktree", "lock", str(path))
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    row = worktree_of(moved, path)
+    assert row["reason"] == reclaim.LOCKED
+    assert row["relocate"] is False
+    assert "moved" not in row
+    assert path.exists()
+
+
+def test_a_stray_worktree_of_a_busy_lane_is_left_in_place(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-23")
+
+    with lock(idle["directory"] / "codex.session.lock"):
+        moved = bridge.relocate_worktrees(repo, apply=True)
+
+    assert worktree_of(moved, path)["reason"] == reclaim.SESSION
+    assert path.exists()
+
+
+def test_a_move_git_refuses_is_reported_and_moves_nothing(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-24")
+    planned = worktree_of(bridge.relocate_worktrees(repo), path)
+    Path(planned["destination"]).mkdir(parents=True)
+
+    row = reclaim.relocate(str(repo), planned)
+
+    assert row["reason"] == reclaim.REFUSED
+    assert row["moved"] is False
+    assert path.exists()
+
+
+def test_a_worktree_no_lane_accounts_for_is_never_moved(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "operator-wt")
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    assert all(row["worktree"] != str(path.resolve()) for row in moved)
+    assert path.exists()
+
+
+def test_gc_dry_run_lists_planned_moves_and_apply_performs_them(
+    bridge, repo, idle, tmp_path, monkeypatch, capsys
+):
+    path = made(repo, tmp_path, "codex-pr-25")
+    destination = reclaim.extras(idle["lane"].resolve()) / "codex-pr-25"
+    arguments = ["agent-parley", "--home", str(bridge.home), "gc"]
+    arguments += ["--repo", str(repo)]
+
+    monkeypatch.setattr("sys.argv", arguments)
+    assert cli.main() == 0
+    planned = capsys.readouterr().out
+    monkeypatch.setattr("sys.argv", [*arguments, "--apply"])
+    assert cli.main() == 0
+    applied = capsys.readouterr().out
+
+    assert f"to move to {destination}" in planned
+    assert f"moved to {destination}" in applied
+    assert destination.exists() and not path.exists()
+
+
+def test_a_lane_worktree_moved_by_the_operator_is_never_retired(
+    bridge, repo, idle, tmp_path
+):
+    elsewhere = tmp_path / "codex-elsewhere"
+    git(repo, "worktree", "move", str(idle["lane"]), str(elsewhere))
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+    made_rows = bridge.reclaim_worktrees(repo, apply=True)
+    swept = bridge.reclaim(repo, apply=True)
+
+    kept = row_of(swept, "codex")
+    assert kept["reason"] == reclaim.MOVED
+    assert kept["reclaim"] is False
+    assert kept["paths"] == [str(elsewhere.resolve())]
+    assert "git worktree move" in kept["remedy"]
+    assert "codex" in roster.read(idle["directory"])["participants"]
+    assert elsewhere.exists()
+    assert idle["branch"] in branches(repo)
+    assert all(row["worktree"] != str(elsewhere.resolve()) for row in moved)
+    assert all(
+        row.get("worktree") != str(elsewhere.resolve()) for row in made_rows
+    )
+
+
+def test_restore_names_where_a_moved_lane_worktree_went(
+    bridge, repo, idle, tmp_path
+):
+    elsewhere = tmp_path / "codex-moved"
+    git(repo, "worktree", "move", str(idle["lane"]), str(elsewhere))
+
+    with pytest.raises(BridgeError, match="git worktree move"):
+        bridge.restore(repo, "codex")
 
 
 def test_a_worktree_of_a_retired_lane_is_reclaimed_at_once(

@@ -227,6 +227,7 @@ class LaunchMixin(BridgeCore):
 
     def protocol(self, agent: str, data: dict) -> str:
         """Builds coordination instructions without embedding tokens."""
+        from agent_parley import reclaim
         from agent_parley.cli import delivery, protocol, shlex
 
         participant = data["participants"][agent]
@@ -295,7 +296,10 @@ the peer depends on. When finished, send a handoff containing the exact commit
 then release your reservations. Avoid repeated empty inbox polling.
 
 Edit only your worktree. Do not reset, clean, switch, merge, or modify a peer
-worktree or the main checkout. Preserve existing work on your branch. Shared
+worktree or the main checkout. Preserve existing work on your branch. Add any
+extra worktree only as {reclaim.extras(data["lanes"][agent])}/NAME;
+the supervisor moves one made elsewhere there. Remove it with
+`git worktree remove` once its pull request merges. Shared
 ports/databases need coordination; worktrees do not isolate those resources.
 Follow repository commit rules. Attribution of any kind is refused: a commit,
 merge, tag or pull request that credits an assistant, names a vendor or model in
