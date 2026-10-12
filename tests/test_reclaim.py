@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -863,6 +864,22 @@ def test_a_stray_worktree_of_a_busy_lane_is_left_in_place(
 
     with lock(idle["directory"] / "codex.session.lock"):
         moved = bridge.relocate_worktrees(repo, apply=True)
+
+    assert worktree_of(moved, path)["reason"] == reclaim.SESSION
+    assert path.exists()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cwd").exists(), reason="needs /proc")
+def test_a_stray_worktree_a_process_works_in_is_left_in_place(
+    bridge, repo, idle, tmp_path
+):
+    path = made(repo, tmp_path, "codex-pr-25")
+    shell = subprocess.Popen(["sleep", "60"], cwd=path)
+    try:
+        moved = bridge.relocate_worktrees(repo, apply=True)
+    finally:
+        shell.kill()
+        shell.wait()
 
     assert worktree_of(moved, path)["reason"] == reclaim.SESSION
     assert path.exists()

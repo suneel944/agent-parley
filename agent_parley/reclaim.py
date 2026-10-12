@@ -311,6 +311,36 @@ def _busy(directory: Path, name: str) -> bool:
         return True
 
 
+def _occupied(path: Path) -> bool:
+    """Reports whether any process works inside a worktree.
+
+    Moving a directory out from under a process strands its shell or
+    session, whoever started it, so every process whose working directory
+    is the worktree or lies inside it counts. Linux exposes that through
+    `/proc`; a host without it, such as macOS, reports none, and only the
+    owning lane's session lock guards the move there.
+
+    Args:
+        path: Worktree about to be moved.
+
+    Returns:
+        Whether a readable process has its working directory inside it.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+    target = path.resolve()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(entry / "cwd")).is_relative_to(target):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def assess(
     directory: Path,
     manifest: dict,
@@ -1067,8 +1097,9 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
     so uncommitted edits, unpushed commits and ignored files travel with it.
     The base checkout, the lanes themselves, spares, a worktree already
     inside its lane or its `-wt` directory, one whose directory is gone and
-    one no lane accounts for are not planned at all. A locked worktree and
-    one whose lane runs a session are planned but refused.
+    one no lane accounts for are not planned at all. A locked worktree, one
+    whose lane runs a session and one any process works inside are planned
+    but refused.
 
     Args:
         directory: Private project state directory holding the lanes.
@@ -1098,7 +1129,7 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
         taken.add(destination)
         if entry["locked"]:
             reason = LOCKED
-        elif _busy(directory, owner):
+        elif _busy(directory, owner) or _occupied(path):
             reason = SESSION
         elif _within(destination, path):
             reason = REFUSED
