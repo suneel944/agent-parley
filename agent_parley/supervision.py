@@ -7925,6 +7925,12 @@ def _work_backlog(
     polls that publish no offer, so the same text is never delivered again;
     only a change to the text gives the lane a new offer to answer.
 
+    A continue offer whose `lead` names queued, unowned work is not
+    waiting-only: the lane can claim that lead now. While the lead stays
+    free and the lane stays fit, the offer is delivered again on the usual
+    backoff, so one delivered wake the lane did not act on never silences
+    the next claim it could make.
+
     The offer is derived again the way `work` derived it: the leads the
     lanes before this one in name order publish are the issues taken
     earlier in that sweep, so an unchanged sweep reproduces the same offer.
@@ -7966,12 +7972,13 @@ def _work_backlog(
     stretches = {
         peer: idle_seconds(directory, peer) for peer in manifest["participants"]
     }
+    free = lifecycle.actionable(pool)
     current = _work_offer(
         name,
         results,
         stretches,
         owned,
-        _first_untaken(lifecycle.actionable(pool), taken),
+        _first_untaken(free, taken),
         pool,
         config["stalled_after"],
         share_recipients(
@@ -8006,6 +8013,7 @@ def _work_backlog(
             or current["id"] in (record.get("delivered") or [])
         )
         and not lifecycle.actionable(ledger, name)
+        and not (results[name]["fit"] and current.get("lead") in free)
     ):
         return None
     return (
@@ -8147,6 +8155,28 @@ def _write_work_dispatch(
             ]
         current["dispatch"] = dispatch
         write_json(path, current)
+
+
+def forget_delivered(directory: Path, name: str) -> None:
+    """Forgets which work offers reached a lane's previous native session.
+
+    A rotation starts a fresh native session that never read the offers the
+    old one was given, so the `delivered` list and the dispatch mark no
+    longer describe what the lane knows. Clearing them lets `_work_backlog`
+    deliver the current offer once more to the new session.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose lane is rotating.
+    """
+    path = directory / f"{name}-work.json"
+    with lock(directory / f"{name}-work.lock", timeout=1):
+        current = published_work(directory, name)
+        dispatch = current.get("dispatch") or {}
+        listed = current.pop("delivered", None)
+        marked = dispatch.pop("delivered", None)
+        if listed or marked:
+            write_json(path, current)
 
 
 def _wake_flags(home: Path, directory: Path, name: str) -> dict:

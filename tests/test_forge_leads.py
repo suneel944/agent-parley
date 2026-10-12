@@ -209,6 +209,59 @@ def test_three_waiting_lanes_get_three_distinct_next_leads(
         )
 
 
+def delivered(directory, name):
+    """Marks the lane's published offer delivered and returns the record."""
+    record = supervision.published_work(directory, name)
+    record["dispatch"] = {**record["dispatch"], "delivered": True}
+    record["delivered"] = [record["offer"]["id"]]
+    write_json(directory / f"{name}-work.json", record)
+    return supervision.published_work(directory, name)
+
+
+def test_a_delivered_continue_offer_naming_a_free_lead_is_kept(
+    bridge, repo, paired
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    store.initialize(bridge.home)
+    store.register(bridge.home, paired["root"], "claude")
+    alive(directory, "claude")
+    write_json(
+        directory / "issues.json",
+        {"revision": 1, "issues": {"1": ready("claude")}},
+    )
+    cached(directory, {"7": "Seven"})
+    manifest, config = swept(bridge, directory)
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "continue"
+    assert offer["lead"] == "7"
+    record = delivered(directory, "claude")
+    assert supervision._work_backlog(
+        bridge.home, directory, manifest, "claude", config, record
+    ) == (f"work:{offer['id']}:{offer['progress']}", offer)
+
+
+def test_a_delivered_waiting_only_offer_stays_suppressed(bridge, repo, paired):
+    directory = Path(paired["lanes"]["claude"]).parent
+    store.initialize(bridge.home)
+    store.register(bridge.home, paired["root"], "claude")
+    alive(directory, "claude")
+    write_json(
+        directory / "issues.json",
+        {"revision": 1, "issues": {"1": ready("claude")}},
+    )
+    manifest, config = swept(bridge, directory)
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "continue"
+    assert "lead" not in offer
+    record = delivered(directory, "claude")
+    assert (
+        supervision._work_backlog(
+            bridge.home, directory, manifest, "claude", config, record
+        )
+        is None
+    )
+
+
 def test_three_idle_lanes_get_three_distinct_first_pull_picks(
     bridge, repo, paired
 ):

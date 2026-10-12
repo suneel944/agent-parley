@@ -107,6 +107,34 @@ def test_a_resume_at_a_rotation_point_starts_a_fresh_session(
     assert "rotation" not in recorded
 
 
+def test_a_rotation_forgets_the_offers_the_old_session_was_given(
+    bridge, repo, lane, monkeypatch
+):
+    write_json(
+        lane / "claude-work.json",
+        {
+            "offer": {"id": "abc"},
+            "dispatch": {"state": "pending", "delivered": True},
+            "delivered": ["abc"],
+        },
+    )
+    at_rotation_point(lane)
+    captured_launch(bridge, repo, monkeypatch)
+    published = json.loads((lane / "claude-work.json").read_text())
+    assert "delivered" not in published
+    assert "delivered" not in published["dispatch"]
+    assert published["offer"] == {"id": "abc"}
+
+
+def test_a_resume_without_rotation_keeps_the_delivered_offers(
+    bridge, repo, lane, monkeypatch
+):
+    write_json(lane / "claude-work.json", {"delivered": ["abc"]})
+    captured_launch(bridge, repo, monkeypatch)
+    published = json.loads((lane / "claude-work.json").read_text())
+    assert published["delivered"] == ["abc"]
+
+
 def test_the_fresh_session_bootstrap_names_lane_claims_and_last_report(
     bridge, repo, lane, monkeypatch
 ):

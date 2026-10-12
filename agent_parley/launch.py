@@ -432,7 +432,10 @@ reported.
         one, unless the supervision setting ``rotate`` is off. Every
         adapter starts a fresh session by omitting its resume argument, so
         no provider is skipped. Any launch consumes the point, and the
-        session it replaced is kept as ``rotated_from``. A detached
+        session it replaced is kept as ``rotated_from``. The rotation also
+        forgets which work offers reached the old session, through
+        `supervision.forget_delivered`, so the fresh one is told its current
+        offer again. A detached
         launcher is told the setting so it can end an idle session at a
         rotation point, which the service then resumes this way; it is
         withheld for a lane the service would not resume.
@@ -597,6 +600,8 @@ reported.
             )
             if rotating:
                 task = rotation_task(agent, data, lane.parent, seen, task)
+                with contextlib.suppress(BridgeError, OSError):
+                    supervision.forget_delivered(lane.parent, agent)
             prompt = self.protocol(agent, data)
             hooks = self.hooks(agent, lane.parent)
             env = {

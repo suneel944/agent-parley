@@ -338,7 +338,10 @@ last result. An unchanged actionable offer joins the wake backlog even after a
 checkpoint injected it. A continue offer for a lane with no claim it can move
 now only names what its claims wait on and where to look next, so once a wake
 reached the lane that generation leaves the backlog; a change to the ledger or
-to those leads publishes a new generation, delivered once. The launcher reads the revalidated wake selection from
+to those leads publishes a new generation, delivered once. A continue offer
+whose lead is queued, unowned work stays in the backlog while that lead is free
+and the lane is fit, and a rotation to a fresh native session forgets which
+offers the old session was given. The launcher reads the revalidated wake selection from
 private state after admitting the wake, so generated work context does not
 cross the wake socket. The attempt bound measures lane progress rather than
 elapsed wakes: each attempt records the lane's own progress marker, built from
