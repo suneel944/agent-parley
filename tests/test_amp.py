@@ -174,10 +174,12 @@ def test_a_native_branch_switch_is_refused_in_hook_schema(lane):
         ("git worktree add /tmp/x -b fix/foo", True),
         ("git worktree add -b fix/foo ../beside", True),
         ("git -C .. worktree add beside", True),
+        ("git worktree add ~/stray-wt", True),
     ],
 )
 def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
     path = Path(lane["lane"]).resolve()
+    home = Path("~/stray-wt").expanduser().resolve()
     text = command.format(wt=f"{path}-wt", name=path.name)
     output = fire(
         lane,
@@ -192,6 +194,8 @@ def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
     assert (output.get("action") == "reject") is denied
     if denied:
         assert f"inside {path}-wt/" in output["reason"]
+    if "~" in command:
+        assert f"{home} is outside it" in output["reason"]
 
 
 def test_an_allowed_tool_call_leaves_the_decision_to_amp(lane):

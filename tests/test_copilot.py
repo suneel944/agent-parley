@@ -108,10 +108,12 @@ def test_a_native_branch_switch_is_refused_in_copilot_schema(lane):
         ("git worktree add /tmp/x -b fix/foo", True),
         ("git worktree add -b fix/foo ../beside", True),
         ("git -C .. worktree add beside", True),
+        ("git worktree add ~/stray-wt", True),
     ],
 )
 def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
     path = Path(lane["lane"]).resolve()
+    home = Path("~/stray-wt").expanduser().resolve()
     text = command.format(wt=f"{path}-wt", name=path.name)
     output = fire(
         lane,
@@ -126,6 +128,9 @@ def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
     assert (output.get("permissionDecision") == "deny") is denied
     if denied:
         assert f"inside {path}-wt/" in output["permissionDecisionReason"]
+    if "~" in command:
+        reason = output["permissionDecisionReason"]
+        assert f"{home} is outside it" in reason
 
 
 def test_a_native_session_start_records_activity_and_session(lane):

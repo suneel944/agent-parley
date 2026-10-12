@@ -837,6 +837,42 @@ def test_a_stray_git_refuses_to_move_is_assessed_in_place(
     assert not path.exists()
 
 
+@pytest.fixture
+def elsewhere(bridge):
+    """Makes a directory on a filesystem other than the state directory's."""
+    device = os.stat(bridge.home).st_dev
+    for candidate in ("/dev/shm", tempfile.gettempdir(), "/tmp", "/var/tmp"):
+        try:
+            other = os.stat(candidate).st_dev != device
+        except OSError:
+            continue
+        if other and os.access(candidate, os.W_OK):
+            folder = Path(tempfile.mkdtemp(dir=candidate))
+            yield folder
+            shutil.rmtree(folder, ignore_errors=True)
+            return
+    pytest.skip("needs a second writable filesystem")
+
+
+def test_a_stray_on_another_filesystem_is_refused_and_assessed_in_place(
+    bridge, repo, idle, elsewhere
+):
+    path = made(repo, elsewhere, "kyc-other-device")
+    aged(path)
+
+    moved = bridge.relocate_worktrees(repo, apply=True)
+    swept = bridge.reclaim_worktrees(repo, apply=True)
+
+    row = worktree_of(moved, path)
+    assert row["reason"] == reclaim.REFUSED
+    assert row["moved"] is False
+    assert not strayed(idle, "kyc-other-device").exists()
+    gone = worktree_of(swept, path)
+    assert gone["reason"] == reclaim.CONTAINED
+    assert gone["removed"] is True
+    assert not path.exists()
+
+
 def test_a_worktree_under_the_pre_rename_state_root_is_reclaimed(
     bridge, repo, idle, tmp_path, monkeypatch
 ):
@@ -1015,6 +1051,34 @@ def test_gc_dry_run_lists_planned_moves_and_apply_performs_them(
     assert f"moved to {adrift}" in applied
     assert destination.exists() and not path.exists()
     assert adrift.exists() and not stray.exists()
+
+
+def test_gc_dry_run_lists_every_scattered_stray_and_moves_nothing(
+    bridge, repo, idle, tmp_path, tmp_path_factory, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    folder = repo / ".claude" / "worktrees"
+    folder.mkdir(parents=True)
+    scratch = tmp_path_factory.mktemp("scratch")
+    strays = [
+        made(repo, home, "kyc-in-home"),
+        made(repo, repo.parent, "kyc-beside"),
+        made(repo, folder, "kyc-dot-worktrees"),
+        made(repo, scratch, "kyc-in-temp"),
+    ]
+    arguments = ["agent-parley", "--home", str(bridge.home), "gc"]
+
+    monkeypatch.setattr("sys.argv", [*arguments, "--repo", str(repo)])
+    assert cli.main() == 0
+    planned = capsys.readouterr().out
+
+    for path in strays:
+        destination = strayed(idle, path.name)
+        assert f"worktree {path.resolve()}: to move to {destination}" in planned
+        assert (path / ".git").exists()
+        assert not destination.exists()
 
 
 def test_a_lane_worktree_moved_by_the_operator_is_never_retired(

@@ -1,11 +1,12 @@
 """Checks the lane hook gate on `git worktree add` outside `<lane>-wt`."""
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import lanes
+from agent_parley import lanes, retirement
 from agent_parley.checkpoints import checkpoint, stray_worktree
 from agent_parley.state import write_json
 
@@ -99,6 +100,20 @@ def test_an_add_outside_the_lane_wt_directory_is_denied(
     record = json.loads(events.splitlines()[-1])
     assert reasons(lane, name)[-1] == "worktree_refused"
     assert record["decision"] == "deny"
+
+
+@pytest.mark.parametrize("name", PROVIDERS)
+def test_a_session_outside_a_lane_is_not_gated(bridge, paired, name, tmp_path):
+    lane = Path(paired["lanes"][name]).resolve()
+    retirement.mark(lane.parent, name, time.time())
+    command = "git worktree add /tmp/anything"
+
+    output = checkpoint(
+        bridge.home, lane.parent, name, payload(lane, command, tmp_path)
+    )
+
+    assert not refused(output)
+    assert reasons(lane, name) == ["retired"]
 
 
 def test_a_relative_target_resolves_against_the_working_directory(paired):
