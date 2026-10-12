@@ -115,6 +115,7 @@ FOREIGN = (
 )
 REFUSED = "Git refused to move it"
 FRESH = "it changed within the relocation grace period"
+NESTED = "another registered worktree sits inside it"
 STRAYS = "strays"
 TEMPORARY = ("/tmp", "/var/tmp", "/dev/shm")
 REMOVABLE = frozenset(
@@ -1166,7 +1167,10 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
     so uncommitted edits, unpushed commits and ignored files travel with it.
     The base checkout, the lanes themselves, spares, a worktree already
     inside a lane, its `-wt` directory or the `strays` directory, and one
-    whose directory is gone are not planned at all. A locked worktree, one
+    whose directory is gone are not planned at all. One whose directory
+    holds another registered worktree is planned but refused, because the
+    move would carry the nested one away from its registration and a later
+    sweep would drop that registration as gone. A locked worktree, one
     whose lane runs a session, one any process works inside and one whose
     directory, index or HEAD changed within `RELOCATE_AFTER` seconds are
     planned but refused, the last because a session working from the base
@@ -1187,6 +1191,7 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
     lanes, prefixes = _owner_index(manifest)
     homes = {name: Path(lane) for lane, name in lanes.items()}
     unclaimed = directory.resolve() / STRAYS
+    registered = [Path(entry["path"]) for entry in entries]
     taken: set[Path] = set()
     rows = []
     for entry in _lane_made(directory, manifest, entries):
@@ -1207,6 +1212,10 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
         taken.add(destination)
         if not owner and not _disposable(path, directory, manifest["root"]):
             reason = FOREIGN
+        elif any(
+            other != path and _within(other, path) for other in registered
+        ):
+            reason = NESTED
         elif entry["locked"]:
             reason = LOCKED
         elif (owner and _busy(directory, owner)) or _occupied(path):

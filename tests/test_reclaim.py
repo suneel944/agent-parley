@@ -801,6 +801,27 @@ def test_a_worktree_in_use_stays_until_its_grace_period_passes(
     assert (destination / "shared.txt").read_text() == "in progress\n"
 
 
+def test_a_worktree_holding_another_worktree_is_not_moved_over_it(
+    bridge, repo, idle, tmp_path
+):
+    outer = made(repo, tmp_path, "review")
+    folder = outer / ".claude" / "worktrees"
+    folder.mkdir(parents=True)
+    inner = made(repo, folder, "feat")
+
+    first = bridge.relocate_worktrees(repo, apply=True)
+    second = bridge.relocate_worktrees(repo, apply=True)
+
+    row = worktree_of(first, outer)
+    assert row["reason"] == reclaim.NESTED
+    assert row["relocate"] is False
+    assert "moved" not in row
+    assert worktree_of(first, inner)["moved"] is True
+    assert worktree_of(second, outer)["moved"] is True
+    moved = strayed(idle, "feat")
+    assert git(moved, "rev-parse", "--abbrev-ref", "HEAD") == "feat"
+
+
 @pytest.fixture
 def untemporary(tmp_path, monkeypatch):
     """Points the temporary directories away from the test's own folder."""

@@ -2682,8 +2682,12 @@ directory, with reason `no lane made it and it sits outside the project's
 strays directory`. One anywhere else, such as `~/.local/state/tm-arena`
 used by a systemd unit, is only reported under `relocations`, with the
 operator-owned reason above, and stays where it is. A move never deletes and never forces: uncommitted edits,
-unpushed commits and ignored files travel with the directory. A locked
-worktree, one whose lane runs a session or any process works inside, one
+unpushed commits and ignored files travel with the directory. A worktree
+whose directory holds another registered worktree, such as one with its own
+`.claude/worktrees/`, is reported as `another registered worktree sits
+inside it` and stays until the nested one has moved out, so the move never
+strands the nested worktree's registration. A locked worktree, one whose
+lane runs a session or any process works inside, one
 whose directory, Git index or HEAD changed within the last hour, reported as
 `it changed within the relocation grace period` because a session working
 from the base checkout edits it without entering it, and one Git refuses to
