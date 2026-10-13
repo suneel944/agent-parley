@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent_parley import BridgeError
+from agent_parley import BridgeError, protocol
 from agent_parley.core import BridgeCore
 
 if TYPE_CHECKING:
@@ -137,6 +137,27 @@ def lane_state(record: dict) -> str:
     if condition := record.get("condition"):
         return str(condition["state"])
     return str(record["availability"]["state"])
+
+
+def service_state(server: dict) -> str:
+    """Names the coordination service's state in the shared wording.
+
+    `status`, `problems`, `top` and `doctor` print the same words for the
+    same fact, so a stopped service reads ``not running`` everywhere.
+
+    Args:
+        server: The ``server`` record of `status_snapshot`.
+
+    Returns:
+        ``running`` for a ready service, `protocol.STOPPED` when nothing
+        answered, and ``not ready`` for a service that answered but cannot
+        serve, such as one running stale code or over an unusable store.
+    """
+    if server["ready"]:
+        return "running"
+    if server.get("state") in ("", "not ready"):
+        return protocol.STOPPED
+    return "not ready"
 
 
 def folded(record: dict, after: float) -> bool:
@@ -1347,15 +1368,14 @@ class StatusMixin(BridgeCore):
         }
 
     def _health(self, report: dict) -> None:
-        """Prints the server, code, store, notify and state directory lines.
+        """Prints the service, code, store, notify and state directory lines.
 
         Args:
             report: Reading produced by `status_snapshot`.
         """
-        from agent_parley.cli import notification_line, protocol, store
+        from agent_parley.cli import notification_line, store
 
-        ready = "ready" if report["server"]["ready"] else "not ready"
-        print(f"Server: {ready}")
+        print(f"Service: {service_state(report['server'])}")
         if report["server"].get("state") == protocol.STALE:
             print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
         schema = store.schema_state(store.schema_version(self.home))

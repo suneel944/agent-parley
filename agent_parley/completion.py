@@ -31,10 +31,20 @@ VALUE_KINDS = {
     "from": "participants",
     "provider": "providers",
     "credential": "credentials",
+    "credentials": "credentials",
     "profile": "credentials",
     "project": "projects",
     "repo": "projects",
     "issue": "issues",
+    "number": "issues",
+}
+
+NAME_KINDS = {
+    "participant": "participants",
+    "history": "participants",
+    "issue": "participants",
+    "provider": "providers",
+    "credentials": "credentials",
 }
 
 
@@ -217,12 +227,108 @@ def value_flags(parser: argparse.ArgumentParser) -> dict:
     return found
 
 
-def _bash(entries: list, values: dict, program: str, mode: str) -> str:
+def _slot(path: str, action: argparse.Action) -> str:
+    """Names what one positional argument accepts.
+
+    A positional called ``name`` takes its kind from the command family, so
+    ``participant restart`` offers participants and ``provider show`` offers
+    providers. An ``add`` command names something new, so it offers nothing.
+
+    Args:
+        path: Space-joined command path the argument belongs to.
+        action: The positional argument.
+
+    Returns:
+        ``@`` and a name in `KINDS` for a state-backed value, the
+        space-joined choices for a fixed set, or an empty string when the
+        value is free text.
+    """
+    if action.choices:
+        return " ".join(str(choice) for choice in action.choices)
+    words = path.split()
+    kind = VALUE_KINDS.get(action.dest, "")
+    if action.dest == "name" and words and words[-1] != "add":
+        kind = NAME_KINDS.get(words[0], "")
+    return f"@{kind}" if kind else ""
+
+
+def positionals(parser: argparse.ArgumentParser) -> dict:
+    """Maps each command path's positional arguments to what they accept.
+
+    Args:
+        parser: Root parser of the program.
+
+    Returns:
+        ``path#index`` mapped to the result of `_slot`, where the index counts
+        every positional of that command from zero. Free-text positionals are
+        omitted, so the shell falls back to the command's flags there.
+    """
+    found: dict = {}
+    pending = [("", parser)]
+    while pending:
+        path, node = pending.pop(0)
+        index = 0
+        for action in node._actions:
+            if action.option_strings or isinstance(
+                action, argparse._SubParsersAction
+            ):
+                continue
+            slot = _slot(path, action)
+            if slot:
+                found[f"{path}#{index}"] = slot
+            index += 1
+        for name, child in sorted(_subcommands(node).items()):
+            pending.append((f"{path} {name}".strip(), child))
+    return found
+
+
+def value_options(parser: argparse.ArgumentParser) -> list[str]:
+    """Lists every option string that consumes the word after it.
+
+    The shell scripts skip that word when they walk the command line, so
+    ``--home DIR participant`` still reaches the ``participant`` command.
+
+    Args:
+        parser: Root parser of the program.
+
+    Returns:
+        Sorted option strings, across the whole tree, whose action takes a
+        value.
+    """
+    found: set[str] = set()
+    pending = [parser]
+    while pending:
+        node = pending.pop(0)
+        for action in node._actions:
+            if action.option_strings and action.nargs != 0:
+                found.update(action.option_strings)
+        pending.extend(_subcommands(node).values())
+    return sorted(found)
+
+
+def _bash(
+    entries: list,
+    values: dict,
+    slots: dict,
+    takes: list,
+    program: str,
+    mode: str,
+) -> str:
     """Emits a Bash completion function for the walked tree.
+
+    The function walks the typed words, skipping each option and the value
+    an option in ``takes`` consumes, descends the command tree while the
+    words name subcommands, and counts the positionals after that. The count
+    selects the positional slot to complete; a word starting with ``-``
+    completes the command's flags instead. The command and slot tables are
+    ``case`` lookups rather than associative arrays, because macOS ships
+    Bash 3.2, which has none.
 
     Args:
         entries: Result of `tree`.
         values: Result of `value_flags`.
+        slots: Result of `positionals`.
+        takes: Result of `value_options`.
         program: Installed command name to complete.
         mode: Hidden subcommand that prints state-backed candidates.
 
@@ -231,21 +337,33 @@ def _bash(entries: list, values: dict, program: str, mode: str) -> str:
     """
     name = f"_{program.replace('-', '_')}"
     table = "\n".join(
-        f'    ["{path}"]="{" ".join([*children, *flags])}"'
+        f'    "{f"{program} {path}".strip()}") '
+        f'node="{" ".join([*children, *flags])}";;'
         for path, children, flags in entries
+    )
+    slot_table = "\n".join(
+        f'    "{f"{program} {key}".replace(" #", "#")}") slot="{slot}";;'
+        for key, slot in sorted(slots.items())
     )
     cases = "\n".join(
         f"        {option}) _kind={kind};;"
         for option, kind in sorted(values.items())
     )
-    return f"""{name}_tree() {{
-  declare -gA {name.upper()}_TREE=(
+    return f"""{name}_node() {{
+  case "$1" in
 {table}
-  )
+    *) return 1;;
+  esac
+}}
+{name}_slot() {{
+  slot=""
+  case "$1" in
+{slot_table}
+  esac
 }}
 {name}() {{
-  local cur prev key probe word opts _kind i
-  {name}_tree
+  local cur prev key probe word node slot _kind i n skip takes
+  takes=" {" ".join(takes)} "
   cur="${{COMP_WORDS[COMP_CWORD]}}"
   prev="${{COMP_WORDS[COMP_CWORD-1]}}"
   _kind=""
@@ -256,30 +374,71 @@ def _bash(entries: list, values: dict, program: str, mode: str) -> str:
     COMPREPLY=( $(compgen -W "$({program} {mode} "$_kind")" -- "$cur") )
     return
   fi
-  key=""
+  key="{program}"
+  n=0
+  skip=0
   for ((i=1; i<COMP_CWORD; i++)); do
     word="${{COMP_WORDS[i]}}"
-    case "$word" in -*) continue;; esac
-    probe="${{key:+$key }}$word"
-    if [ -n "${{{name.upper()}_TREE[$probe]+x}}" ]; then
+    if [ "$skip" = 1 ]; then
+      skip=0
+      continue
+    fi
+    case "$word" in
+      --*=*) continue;;
+      -*)
+        case "$takes" in *" $word "*) skip=1;; esac
+        continue;;
+    esac
+    probe="$key $word"
+    if [ "$n" = 0 ] && {name}_node "$probe"; then
       key="$probe"
     else
-      break
+      n=$((n+1))
     fi
   done
-  opts="${{{name.upper()}_TREE[$key]}}"
-  COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+  if [ "$skip" = 1 ]; then
+    COMPREPLY=( $(compgen -f -- "$cur") )
+    return
+  fi
+  case "$cur" in
+    -*) ;;
+    *)
+      {name}_slot "$key#$n"
+      case "$slot" in
+        @*)
+          COMPREPLY=( $(compgen -W "$({program} {mode} "${{slot#@}}")" \\
+            -- "$cur") )
+          return;;
+        ?*)
+          COMPREPLY=( $(compgen -W "$slot" -- "$cur") )
+          return;;
+      esac;;
+  esac
+  {name}_node "$key"
+  COMPREPLY=( $(compgen -W "$node" -- "$cur") )
 }}
 complete -F {name} {program}
 """
 
 
-def _zsh(entries: list, values: dict, program: str, mode: str) -> str:
+def _zsh(
+    entries: list,
+    values: dict,
+    slots: dict,
+    takes: list,
+    program: str,
+    mode: str,
+) -> str:
     """Emits a Zsh completion function for the walked tree.
+
+    The walk matches the one `_bash` emits, so both shells offer the same
+    candidates for the same words.
 
     Args:
         entries: Result of `tree`.
         values: Result of `value_flags`.
+        slots: Result of `positionals`.
+        takes: Result of `value_options`.
         program: Installed command name to complete.
         mode: Hidden subcommand that prints state-backed candidates.
 
@@ -288,8 +447,11 @@ def _zsh(entries: list, values: dict, program: str, mode: str) -> str:
     """
     name = f"_{program.replace('-', '_')}"
     table = "\n".join(
-        f'  "{path}"="{" ".join([*children, *flags])}"'
+        f'    ["{path}"]="{" ".join([*children, *flags])}"'
         for path, children, flags in entries
+    )
+    slot_table = "\n".join(
+        f'    ["{key}"]="{slot}"' for key, slot in sorted(slots.items())
     )
     cases = "\n".join(
         f"    {option}) _kind={kind};;"
@@ -297,11 +459,15 @@ def _zsh(entries: list, values: dict, program: str, mode: str) -> str:
     )
     return f"""#compdef {program}
 {name}() {{
-  local -A nodes
-  local key probe word opts _kind
+  local -A nodes slots
+  local key probe word opts slot takes _kind n skip
   nodes=(
 {table}
   )
+  slots=(
+{slot_table}
+  )
+  takes=" {" ".join(takes)} "
   _kind=""
   case "${{words[CURRENT-1]}}" in
 {cases}
@@ -311,15 +477,43 @@ def _zsh(entries: list, values: dict, program: str, mode: str) -> str:
     return
   fi
   key=""
+  n=0
+  skip=0
   for word in ${{words[2,CURRENT-1]}}; do
-    [[ "$word" == -* ]] && continue
+    if (( skip )); then
+      skip=0
+      continue
+    fi
+    if [[ "$word" == --*=* ]]; then
+      continue
+    fi
+    if [[ "$word" == -* ]]; then
+      [[ "$takes" == *" $word "* ]] && skip=1
+      continue
+    fi
     probe="${{key:+$key }}$word"
-    if [[ -n "${{nodes[$probe]+x}}" ]]; then
+    if (( n == 0 )) && [[ -n "${{nodes[$probe]+x}}" ]]; then
       key="$probe"
     else
-      break
+      (( n += 1 ))
     fi
   done
+  if (( skip )); then
+    _files
+    return
+  fi
+  if [[ "${{words[CURRENT]}}" != -* ]]; then
+    probe="$key#$n"
+    slot="${{slots[$probe]}}"
+    if [[ "$slot" == @* ]]; then
+      compadd -- ${{(f)"$({program} {mode} ${{slot#@}})"}}
+      return
+    fi
+    if [[ -n "$slot" ]]; then
+      compadd -- ${{=slot}}
+      return
+    fi
+  fi
   opts="${{nodes[$key]}}"
   compadd -- ${{=opts}}
 }}
@@ -327,37 +521,71 @@ compdef {name} {program}
 """
 
 
-def _fish(entries: list, values: dict, program: str, mode: str) -> str:
+def _fish_condition(path: str) -> str:
+    """Builds the Fish condition that holds once a command path is typed.
+
+    Args:
+        path: Space-joined command path; empty for the root.
+
+    Returns:
+        A condition for `complete -n`.
+    """
+    if not path:
+        return "__fish_use_subcommand"
+    return "; and ".join(
+        f"__fish_seen_subcommand_from {word}" for word in path.split()
+    )
+
+
+def _fish(
+    entries: list,
+    values: dict,
+    slots: dict,
+    takes: list,
+    program: str,
+    mode: str,
+) -> str:
     """Emits Fish completion rules for the walked tree.
+
+    Fish matches rules by condition rather than by position, so a command's
+    positional values are offered for each of its positional words, and the
+    options a value follows are declared with ``-x`` so Fish completes their
+    value instead of a subcommand.
 
     Args:
         entries: Result of `tree`.
         values: Result of `value_flags`.
+        slots: Result of `positionals`.
+        takes: Result of `value_options`, unused because Fish already skips
+            the value of an option declared to take one.
         program: Installed command name to complete.
         mode: Hidden subcommand that prints state-backed candidates.
 
     Returns:
-        One `complete` line per command path and per state-backed option.
+        One `complete` line per command path, per positional slot and per
+        state-backed option.
     """
     lines: list[str] = []
     for path, children, flags in entries:
         offered = " ".join([*children, *flags])
         if not offered:
             continue
-        if not path:
-            condition = "__fish_use_subcommand"
-        else:
-            condition = "; and ".join(
-                f"__fish_seen_subcommand_from {word}" for word in path.split()
-            )
         lines.append(
-            f"complete -c {program} -f -n '{condition}' -a '{offered}'"
+            f"complete -c {program} -f -n '{_fish_condition(path)}' "
+            f"-a '{offered}'"
+        )
+    for key, slot in sorted(slots.items()):
+        path = key.rpartition("#")[0]
+        offered = f"({program} {mode} {slot[1:]})" if slot[0] == "@" else slot
+        lines.append(
+            f"complete -c {program} -f -n '{_fish_condition(path)}' "
+            f"-a '{offered}'"
         )
     for option, kind in sorted(values.items()):
         flag = option.lstrip("-")
         switch = "-l" if option.startswith("--") else "-s"
         lines.append(
-            f"complete -c {program} -f {switch} {flag} "
+            f"complete -c {program} -x {switch} {flag} "
             f"-a '({program} {mode} {kind})'"
         )
     return "\n".join(lines) + "\n"
@@ -391,4 +619,11 @@ def script(
         raise ValueError(
             f"Unknown shell {shell}. Choose from: {', '.join(SHELLS)}."
         )
-    return EMITTERS[shell](tree(parser), value_flags(parser), program, mode)
+    return EMITTERS[shell](
+        tree(parser),
+        value_flags(parser),
+        positionals(parser),
+        value_options(parser),
+        program,
+        mode,
+    )

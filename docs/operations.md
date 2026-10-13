@@ -54,6 +54,13 @@ terminal. `make install-dev` installs an editable checkout.
 its environment under `/opt/agent-parley`. Each user's runtime state remains
 private.
 
+Shell completion comes from `agent-parley completion bash`, `zsh` or `fish`.
+Load it with `eval "$(agent-parley completion bash)"` (or `zsh`) or
+`agent-parley completion fish | source`. It offers commands and flags, and
+reads participant names, issue numbers, providers and credential profiles from
+the state directory, both for positional values such as `say NAME` and
+`participant restart NAME` and for options such as `--credentials`.
+
 Upgrading needs no action: the store upgrades in place on first use, keeping
 every message, claim and lease. Issue ledgers upgrade lazily: 0.11 derives
 lifecycle defaults for older records without an `execution` field and persists
@@ -487,7 +494,7 @@ condition, that count, its age and what clears it:
 | Condition | When | Clears with |
 | --- | --- | --- |
 | `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
-| `service` | The coordination server is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
+| `service` | The coordination service is not running, is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
 | `supervision failing` | The supervision poll of a project has been failing since the time the row ages from, naming the last failure. | Read `server.log` in the state directory and fix the stage it names; the next clean poll clears the row. |
 | `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | Whatever the lane's state allows, from the remedy table below. |
 | `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
@@ -1139,7 +1146,7 @@ branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
 the oldest, delivered context, denials against retained hook events, served
 MCP calls with rejections, and the tokens that lane's own native client
-recorded. The header carries server health, the project's denial rate and
+recorded. The header carries service health, the project's denial rate and
 how long the frame took to read. The view is read-only and makes no model
 call; `q` leaves it.
 

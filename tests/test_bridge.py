@@ -1414,7 +1414,7 @@ def test_top_reports_every_participant_and_writes_no_state(
     dashboard.run(bridge.home, lambda: False, once=True)
     output = capsys.readouterr().out
     assert "agent-parley top - " in output
-    assert "server not running" in output
+    assert "service not running" in output
     assert "0 denied (0%)" in output
     assert "#77" in output
     assert "Wire the dashboard" in output
@@ -2478,7 +2478,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             check=True,
             timeout=10,
         )
-        assert "Server: ready" in health.stdout
+        assert "Service: running" in health.stdout
         report = subprocess.run(
             [str(executable), "doctor"],
             cwd=tmp_path,

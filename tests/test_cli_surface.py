@@ -3,10 +3,11 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, protocol, roster, store, views
+from agent_parley import cli, protocol, roster, start, store, views
 
 NEW_COMMANDS = (
     ("version",),
@@ -207,6 +208,59 @@ def test_every_subcommand_action_carries_help():
                     bare.append(" ".join((*path, name)))
                 pending.append(((*path, name), child))
     assert bare == []
+
+
+def test_every_argument_carries_help():
+    parser, _ = cli.root_parser(None)
+    pending = [((), parser)]
+    bare = []
+    while pending:
+        path, current = pending.pop()
+        for action in current._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for name, child in action.choices.items():
+                    pending.append(((*path, name), child))
+            elif not action.help:
+                named = action.option_strings or [action.dest]
+                bare.append(" ".join((*path, named[0])))
+    assert bare == []
+
+
+def test_demo_help_describes_the_demo(monkeypatch, capsys):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(sys, "argv", ["agent-parley", "demo", "--help"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    described = " ".join(capsys.readouterr().out.split())
+    assert "stub lanes in a throwaway sandbox" in described
+    assert "press q or Ctrl-C to stop early" in described
+
+
+def test_every_surface_names_a_stopped_service_the_same_way(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    lane = paired["lanes"]["claude"]
+    monkeypatch.chdir(lane)
+    printed = []
+    for arguments in (
+        ("status",),
+        ("top", "--once"),
+        ("problems",),
+        ("doctor",),
+    ):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["agent-parley", "--home", str(bridge.home), *arguments],
+        )
+        cli.main()
+        printed.append(capsys.readouterr().out.lower())
+    found = start.look(bridge.home, Path(lane))
+    printed.append(start.render(found).lower())
+    for output in printed:
+        assert "service" in output
+        assert protocol.STOPPED in output
 
 
 @pytest.mark.parametrize(

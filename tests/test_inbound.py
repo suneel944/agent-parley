@@ -80,7 +80,7 @@ def test_the_right_passcode_answers_with_the_status_reading(
     assert verdict == inbound.ACCEPTED
     assert [method for method, _ in calls] == ["deleteMessage", "sendMessage"]
     assert calls[0][1] == {"chat_id": "42", "message_id": 7}
-    assert replies(calls)[0].startswith("Server:")
+    assert replies(calls)[0].startswith("Service:")
     assert str(bridge.home) in replies(calls)[0]
 
 
