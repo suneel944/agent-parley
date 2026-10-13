@@ -41,6 +41,7 @@ from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
     branch_guard,
+    changes_lane_branch,
     checkpoint,
     event_summary,
     mailbox,
@@ -544,6 +545,94 @@ def test_native_hook_blocks_bridge_lane_branch_changes(
     result = checkpoint(bridge.home, lane.parent, "codex", payload)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert git(lane, "branch", "--show-current") == data["branches"]["codex"]
+
+
+def branch_payload(lane, command, cwd=None):
+    """Builds a native shell payload for the lane branch gate."""
+    return {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(cwd or lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(git switch other)",
+        "{ git switch other; }",
+        "if true; then git switch other; fi",
+        "bash -c 'git switch other'",
+        "sh -ec 'git switch other'",
+        "eval git switch other",
+        "env git switch other",
+        "env -i PATH=/bin git switch other",
+        "env -S 'git switch other'",
+        "timeout 5 git switch other",
+        "timeout -s KILL 5 git switch other",
+        "nice -n 5 git switch other",
+        "nohup git switch other",
+        "exec git switch other",
+        "echo $(git switch other)",
+        'echo "$(git switch other)"',
+        "echo `git switch other`",
+        "! git switch other",
+        "time git switch other",
+        "echo other | xargs git switch",
+        "git -c alias.sw=switch sw other",
+        "git -c 'alias.sw=!git switch' sw other",
+        "for b in other; do git switch $b; done",
+        "while true; do git switch other; done",
+        "git checkout main",
+        "git checkout -b n",
+        "git checkout -",
+        "git checkout main --",
+        "git checkout --detach",
+    ],
+)
+def test_a_wrapped_branch_switch_is_refused(paired, command):
+    lane = Path(paired["lanes"]["codex"])
+    assert changes_lane_branch(branch_payload(lane, command), lane)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo 'git switch x'",
+        "echo '$(git switch x)'",
+        "git log --grep=switch",
+        "git log --grep switch",
+        "printf '%s' \"git switch x\"",
+        "git checkout .",
+        "git checkout a.py",
+        "git checkout HEAD -- a.py",
+        "git checkout -- a.py",
+        "git checkout -p",
+        "git checkout --patch HEAD",
+        "git checkout main a.py b.py",
+        "git checkout tracked.txt",
+    ],
+)
+def test_a_file_restore_or_plain_text_passes_the_branch_gate(paired, command):
+    lane = Path(paired["lanes"]["codex"])
+    (lane / "a.py").write_text("x\n")
+    git(lane, "add", "a.py")
+    tracked = lane / "tracked.txt"
+    tracked.write_text("x\n")
+    git(lane, "add", "tracked.txt")
+    tracked.unlink()
+    assert not changes_lane_branch(branch_payload(lane, command), lane)
+
+
+def test_a_leading_cd_moves_the_branch_gate_out_of_the_lane(paired, tmp_path):
+    lane = Path(paired["lanes"]["codex"])
+    elsewhere = f"cd {tmp_path} && git switch x"
+    assert not changes_lane_branch(branch_payload(lane, elsewhere), lane)
+    back = f"cd {tmp_path} && cd {lane} && git switch x"
+    assert changes_lane_branch(branch_payload(lane, back), lane)
+    unknown = "cd $SOMEWHERE && git switch x"
+    assert changes_lane_branch(branch_payload(lane, unknown), lane)
 
 
 def test_native_hook_blocks_drift_until_exact_restore(bridge, repo, paired):
