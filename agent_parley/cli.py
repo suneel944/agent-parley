@@ -3695,6 +3695,51 @@ def secret_settings(
     return values
 
 
+def webhook_settings(
+    current: dict[str, str], answering: bool
+) -> dict[str, str]:
+    """Reads a webhook URL and signing secret without placing them in argv.
+
+    A webhook URL is a bearer secret, so it is read like the bot token: from
+    a prompt without echo, or as the first line of standard input, with the
+    optional signing secret on the second. The webhook is added to the
+    transports already stored, so a Telegram setup keeps notifying.
+
+    Args:
+        current: Settings already stored in the state root.
+        answering: Whether inbound answering was requested, which only
+            Telegram carries.
+
+    Returns:
+        The settings to store, keyed by environment variable name.
+
+    Raises:
+        BridgeError: If inbound answering is requested, or the URL is empty
+            or not allowed.
+    """
+    if answering:
+        raise BridgeError(
+            "Inbound answering is Telegram only; run `agent-parley notify "
+            "setup --chat CHAT_ID --inbound`."
+        )
+    url = secret("Webhook URL: ")
+    fault = notify.webhook_fault(url)
+    if fault:
+        raise BridgeError(fault + " Nothing stored.")
+    names = [
+        name.strip()
+        for name in current.get("AGENT_PARLEY_NOTIFY", "").split(",")
+        if name.strip() and name.strip() != "webhook"
+    ]
+    return {
+        "AGENT_PARLEY_NOTIFY": ",".join([*names, "webhook"]),
+        "AGENT_PARLEY_WEBHOOK_URL": url,
+        "AGENT_PARLEY_WEBHOOK_SECRET": secret(
+            "Webhook signing secret (empty for none): "
+        ),
+    }
+
+
 def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     """Declares every command and renders the root help's listing.
 
@@ -4574,11 +4619,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     storing = notices.add_parser(
         "setup",
         help=(
-            "Store the Telegram chat and bot token in the state root, "
-            "owner-only; the token is read from a prompt or standard input."
+            "Store the Telegram chat and bot token, or a webhook URL, in the "
+            "state root, owner-only; secrets are read from a prompt or "
+            "standard input."
         ),
     )
-    storing.add_argument("--chat", required=True, help="Telegram chat id.")
+    destination = storing.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--chat", help="Telegram chat id.")
+    destination.add_argument(
+        "--webhook",
+        action="store_true",
+        help=(
+            "Post to a Slack, Discord, Teams or other HTTPS webhook; the URL "
+            "and an optional signing secret are read after it."
+        ),
+    )
     storing.add_argument(
         "--inbound",
         action="store_true",
@@ -5962,7 +6017,9 @@ def main() -> int:
         elif args.command == "notify" and args.action == "setup":
             path = notify.store(
                 bridge.home,
-                secret_settings(args.chat, args.inbound, args.users),
+                webhook_settings(notify.stored(bridge.home), args.inbound)
+                if args.webhook
+                else secret_settings(args.chat, args.inbound, args.users),
             )
             print(
                 f"Notification settings stored in {path}.\n"

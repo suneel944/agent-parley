@@ -17,7 +17,9 @@ or bounty commitment is offered. Security fixes target the latest released versi
 - HTTP is loopback-only and authenticated. Never expose it through a public proxy.
   The health credential cannot call tools; lane credentials are project-scoped.
 - Notifications are off by default. When on, coordination details leave the
-  host to the configured Telegram chat or SMTP recipients. With
+  host to the configured Telegram chat, SMTP recipients or webhook URL. A
+  webhook URL is a bearer secret: it is stored owner-only, never printed, and
+  must be HTTPS unless it names a loopback relay. With
   `AGENT_PARLEY_INBOUND=telegram`, the service long-polls the Telegram Bot API
   and accepts status queries and decision answers only from the configured
   chat, with a passcode of at least 12 characters held as a salted hash. Five

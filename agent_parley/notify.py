@@ -15,6 +15,7 @@ status queries and decision answers back from the configured chat.
 """
 
 import hashlib
+import hmac
 import json
 import os
 import threading
@@ -43,7 +44,12 @@ STORED_KEYS = (
     "AGENT_PARLEY_TELEGRAM_USERS",
     "AGENT_PARLEY_INBOUND",
     "AGENT_PARLEY_INBOUND_PASSCODE",
+    "AGENT_PARLEY_WEBHOOK_URL",
+    "AGENT_PARLEY_WEBHOOK_SECRET",
 )
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+SIGNATURE_HEADER = "X-Agent-Parley-Signature"
+REDACTED_URL = "<webhook URL>"
 UNCONFIGURED = (
     "No notification transport is configured; run `agent-parley notify "
     "setup`, or set AGENT_PARLEY_NOTIFY."
@@ -261,6 +267,8 @@ def reported(values: Mapping[str, str]) -> dict:
             "Telegram needs AGENT_PARLEY_TELEGRAM_TOKEN and "
             "AGENT_PARLEY_TELEGRAM_CHAT; run `agent-parley notify setup`."
         )
+    if not fault and "webhook" in config["transports"]:
+        fault = webhook_fault(config["webhook"]["url"])
     return {
         "enabled": True,
         "transports": config["transports"],
@@ -370,6 +378,10 @@ def settings(environ: Mapping[str, str] | None = None) -> dict:
             "sender": values.get("AGENT_PARLEY_SMTP_FROM", "").strip(),
             "recipients": recipients,
             "tls": mode,
+        },
+        "webhook": {
+            "url": values.get("AGENT_PARLEY_WEBHOOK_URL", "").strip(),
+            "secret": values.get("AGENT_PARLEY_WEBHOOK_SECRET", ""),
         },
     }
 
@@ -574,9 +586,96 @@ def email(config: dict, subject: str, body: str) -> None:
         session.send_message(message)
 
 
+def webhook_fault(url: str) -> str:
+    """Names why a webhook URL cannot receive notifications.
+
+    A webhook URL is a bearer secret, so the sentence never repeats it. Plain
+    HTTP is accepted only to a loopback relay, because anywhere else it would
+    carry the URL and the message in the clear.
+
+    Args:
+        url: Configured ``AGENT_PARLEY_WEBHOOK_URL``.
+
+    Returns:
+        The refusal sentence, or an empty string when the URL is usable.
+    """
+    import urllib.parse
+
+    if not url:
+        return (
+            "Webhook needs AGENT_PARLEY_WEBHOOK_URL; run `agent-parley notify "
+            "setup --webhook`."
+        )
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        parts = None
+    if parts is not None and parts.hostname:
+        if parts.scheme == "https":
+            return ""
+        if parts.scheme == "http" and parts.hostname in LOOPBACK_HOSTS:
+            return ""
+    return (
+        "AGENT_PARLEY_WEBHOOK_URL must be an https:// URL, or http:// to "
+        "127.0.0.1 or localhost."
+    )
+
+
+def webhook(config: dict, subject: str, body: str) -> None:
+    """Posts one message as JSON to the configured webhook.
+
+    The ``text`` key satisfies Slack and Teams incoming webhooks and
+    ``content`` satisfies Discord; ``subject`` and ``body`` serve a generic
+    receiver. With a secret configured, the `SIGNATURE_HEADER` carries the
+    HMAC-SHA256 of the exact request body, so a receiver can verify the
+    sender. The URL is a bearer secret and is replaced by `REDACTED_URL` in
+    any failure text.
+
+    Args:
+        config: Resolved notification configuration.
+        subject: Subject line, sent as the message's first line.
+        body: Message body.
+
+    Raises:
+        BridgeError: If the URL is missing or not allowed, or the receiver
+            answers with a status outside 2xx.
+        OSError: If the request cannot be completed.
+    """
+    import urllib.request
+
+    values = config["webhook"]
+    fault = webhook_fault(values["url"])
+    if fault:
+        raise BridgeError(fault)
+    text = f"{subject}\n\n{body}"
+    data = json.dumps(
+        {"text": text, "content": text, "subject": subject, "body": body}
+    ).encode()
+    headers = {"Content-Type": "application/json"}
+    if values["secret"]:
+        digest = hmac.new(
+            values["secret"].encode(), data, hashlib.sha256
+        ).hexdigest()
+        headers[SIGNATURE_HEADER] = f"sha256={digest}"
+    request = urllib.request.Request(
+        values["url"], data=data, headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            status = response.status
+    except OSError as exc:
+        raise OSError(str(exc).replace(values["url"], REDACTED_URL)) from None
+    if not 200 <= status < 300:
+        raise BridgeError(f"Webhook answered {status}.")
+
+
 Transport = Callable[[dict, str, str], None]
 
-TRANSPORTS: dict[str, Transport] = {"telegram": telegram, "email": email}
+TRANSPORTS: dict[str, Transport] = {
+    "telegram": telegram,
+    "email": email,
+    "webhook": webhook,
+}
 
 
 def send(config: dict, subject: str, body: str) -> list[dict]:
@@ -584,7 +683,8 @@ def send(config: dict, subject: str, body: str) -> list[dict]:
 
     Delivery is best effort: a transport that fails is reported and the next
     one is still attempted. Nothing is queued for a later retry. Every SMTP
-    failure is an ``OSError``, so one reading covers both transports.
+    and HTTP failure is an ``OSError``, so one reading covers every
+    transport.
 
     Args:
         config: Resolved notification configuration.
