@@ -1,6 +1,7 @@
 """Checks blueprints: ordered deterministic and agent steps for one claim."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -278,6 +279,79 @@ def test_the_command_line_sets_and_shows_a_blueprint(
     shown = capsys.readouterr().out
     assert "lint [run] ruff check . ok->stop fail->lint retries=0" in shown
     assert "stop [report] blocked" in shown
+
+
+@pytest.mark.parametrize("template", sorted(blueprints.templates()))
+def test_every_shipped_template_is_a_valid_blueprint(template):
+    nodes = blueprints.parse(blueprints.filled(template, ["make", "check"]))
+    commands = [node["command"] for node in nodes if node["kind"] == "run"]
+    assert all(command == ["make", "check"] for command in commands)
+    assert nodes[-1]["kind"] == "report"
+
+
+def test_blueprint_templates_lists_every_shipped_file(capsys, monkeypatch):
+    folder = Path(blueprints.__file__).parent / blueprints.TEMPLATES
+    files = sorted(path.stem for path in folder.glob("*.json"))
+    assert {"pr-loop", "test-first", "review-only"} <= set(files)
+    monkeypatch.setattr(
+        sys, "argv", ["agent-parley", "blueprint", "templates", "--json"]
+    )
+    assert main() == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [row["name"] for row in listed] == files
+    assert all(row["description"] for row in listed)
+
+
+def test_a_template_records_with_the_verify_command_filled_in(
+    bridge, repo, claimed, monkeypatch, capsys
+):
+    with pytest.raises(BridgeError, match="verification command"):
+        blueprints.define(bridge, repo, "feature", None, "pr-loop")
+    with pytest.raises(BridgeError, match="operator shell"):
+        blueprints.define(
+            bridge, claimed, "feature", None, "pr-loop", "make check"
+        )
+    with pytest.raises(BridgeError, match="No blueprint template"):
+        blueprints.define(bridge, repo, "feature", None, "missing", "true")
+    home = ["agent-parley", "--home", str(bridge.home), "blueprint"]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            *home,
+            "set",
+            "feature",
+            "--template",
+            "pr-loop",
+            "--verify",
+            "make check",
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert main() == 0
+    _, directory = bridge.project(repo)
+    data = roster.read(directory)
+    assert data["blueprints"]["feature"] == blueprints.parse(
+        blueprints.filled("pr-loop", ["make", "check"])
+    )
+    assert data["blueprint_templates"] == {"feature": "pr-loop"}
+    monkeypatch.setattr(
+        sys, "argv", [*home, "show", "feature", "--repo", str(repo)]
+    )
+    assert main() == 0
+    shown = capsys.readouterr().out
+    assert "Blueprint feature (from template pr-loop):" in shown
+    assert "verify [run] make check ok->push fail->implement" in shown
+
+    bridge.verification(repo, "true")
+    blueprints.define(bridge, repo, "first", None, "test-first")
+    data = roster.read(directory)
+    assert data["blueprints"]["first"][1]["command"] == ["true"]
+    blueprints.define(bridge, repo, "first", None)
+    assert roster.read(directory)["blueprint_templates"] == {
+        "feature": "pr-loop"
+    }
 
 
 def checks(directory, branch, head, verdict, **extra):
@@ -704,3 +778,40 @@ def test_supervision_advances_a_run_on_a_lane_report_and_a_ci_verdict(
     run = poll()
     assert run["status"] == "done"
     assert run["passed"] == ["implement", "tests", "ci"]
+
+
+def test_a_timed_out_run_node_stops_its_whole_process_tree(tmp_path):
+    pid = tmp_path / "pid"
+    command = [
+        "sh",
+        "-c",
+        f"echo $$ > '{pid}'; echo started; sleep 30 & sleep 30",
+    ]
+    run = {}
+    began = time.monotonic()
+    passed = blueprints._execute(command, tmp_path, tmp_path, 1, run)
+    assert not passed
+    assert time.monotonic() - began < 10
+    assert "ran past 1 seconds" in run["output"]
+    assert "started" in run["output"]
+    group = int(pid.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    with pytest.raises(ProcessLookupError):
+        os.killpg(group, 0)
+
+
+def test_a_run_node_that_exits_keeps_its_output_and_status(tmp_path):
+    run = {}
+    command = ["sh", "-c", "echo out; echo err >&2; exit 3"]
+    assert not blueprints._execute(command, tmp_path, tmp_path, 5, run)
+    assert run["output"].startswith("`sh -c")
+    assert "exited 3:" in run["output"]
+    assert "out" in run["output"]
+    assert "err" in run["output"]
+    assert blueprints._execute(["true"], tmp_path, tmp_path, 5, run)

@@ -118,8 +118,18 @@ def read_until(stream, marker, deadline):
     return seen
 
 
-@pytest.mark.parametrize("stop", ["q", "ctrl-c"])
-def test_q_or_ctrl_c_stops_the_demo_and_removes_everything(stop):
+@pytest.mark.parametrize(
+    ("stop", "status"),
+    [
+        ("q", 130),
+        ("ctrl-c", 130),
+        (signal.SIGTERM, 143),
+        (signal.SIGHUP, 129),
+    ],
+)
+def test_q_ctrl_c_or_a_signal_stops_the_demo_and_removes_everything(
+    stop, status
+):
     controller, keyboard = pty.openpty()
     child = subprocess.Popen(
         [sys.executable, "-m", "agent_parley", "demo"],
@@ -134,8 +144,10 @@ def test_q_or_ctrl_c_stops_the_demo_and_removes_everything(stop):
         seen = read_until(child.stdout, b"ada runs on claude", deadline)
         if stop == "q":
             os.write(controller, b"q")
-        else:
+        elif stop == "ctrl-c":
             os.killpg(child.pid, signal.SIGINT)
+        else:
+            os.kill(child.pid, stop)
         rest, _ = child.communicate(timeout=60)
     finally:
         os.close(controller)
@@ -143,7 +155,7 @@ def test_q_or_ctrl_c_stops_the_demo_and_removes_everything(stop):
             child.kill()
             child.wait()
     text = (seen + rest).decode()
-    assert child.returncode == 130, text
+    assert child.returncode == status, text
     assert "Stopped." in text
     assert "The sandbox is removed." in text
     found = SANDBOX.search(text)
