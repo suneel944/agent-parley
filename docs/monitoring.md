@@ -91,9 +91,9 @@ dialog, is read. A framed dialog counts only while it shows at least two
 numbered options and its own footer (`Esc to cancel`, `Enter to select` and
 similar), and a usage limit counts only on the client's own notice line. Text
 that merely quotes a dialog, in scrollback or in the agent's output, never
-parks the lane. Once a dialog is answered, by the launcher or by a digit or
-Enter you type in the lane's terminal, the next screen output releases the
-lane; any other key leaves it held.
+parks the lane. Once a dialog is answered, by the launcher or by a digit,
+Enter, Esc or Ctrl-C you type in the lane's terminal, the next screen output
+releases the lane; any other key leaves it held.
 
 `directory-trust` is the screen that asks whether you trust the folder. Codex
 records that trust for the repository root, so trusting a lane's worktree also

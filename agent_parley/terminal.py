@@ -28,7 +28,7 @@ MAX_WORK_PROMPT = 2_000
 SUBMIT_DELAY = 0.2
 ESCAPE_TIMEOUT = 0.5
 ERASE = frozenset({0x08, 0x7F})
-ANSWERING = re.compile(rb"[\r\n0-9]")
+ANSWERING = re.compile(rb"[\r\n0-9\x03]")
 DETACHED_ROWS = 24
 DETACHED_COLUMNS = 80
 STRING_SEQUENCES = frozenset({ord("]"), ord("P"), ord("X"), ord("^"), ord("_")})
@@ -929,7 +929,11 @@ def _session(
 
     A control prefix the operator leaves incomplete for `ESCAPE_TIMEOUT`
     seconds resolves as a keypress, as terminal programs resolve a lone Esc,
-    so it adds no text and stops refusing wakes as pending input.
+    so it adds no text and stops refusing wakes as pending input. A read
+    ending in a lone Esc, or carrying a Ctrl-C, on a held dialog dismisses
+    it like an answer at once, because the client redraws before the Esc
+    resolves, and the dismissed dialog is never judged again as the screen
+    that replaces it.
 
     Args:
         pid: Native client process.
@@ -1041,7 +1045,9 @@ def _session(
                 control_at = time.monotonic()
                 pending_input = draft(carried + entered, pending_input)
                 os.write(master, entered)
-                if watch.holding and ANSWERING.search(operator):
+                if watch.holding and (
+                    ANSWERING.search(operator) or pending_control == b"\x1b"
+                ):
                     watch.answered()
             if (
                 pending_control
