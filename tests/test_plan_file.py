@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from agent_parley import cli, issues, plan, views
+from agent_parley import cli, issues, lifecycle, plan, views
 from agent_parley.state import BridgeError
 
 PLAN = """
@@ -74,6 +74,34 @@ def test_a_diff_reports_what_an_apply_would_add(bridge, repo, paired):
     assert reported["unlisted"] == []
     bridge.work_plan(repo, "apply", path)
     assert bridge.work_plan(repo, "diff", path)["add"] == []
+
+
+def test_a_diff_lists_an_edge_to_a_completed_blocker_as_satisfied(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    path = written(repo.parent, PLAN)
+    bridge.work_plan(repo, "apply", path)
+    ledger_path = directory / "issues.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger["issues"]["17"]["execution"]["state"] = lifecycle.COMPLETE
+    for number in ("42", "43"):
+        ledger["issues"][number]["blocked_by"] = []
+    ledger_path.write_text(json.dumps(ledger))
+    reported = bridge.work_plan(repo, "diff", path)
+    assert reported["add"] == []
+    assert reported["satisfied"] == [("42", "17"), ("43", "17")]
+    assert (
+        bridge.work_plan(repo, "apply", written(repo.parent, PLAN + "\n"))[
+            "added"
+        ]
+        == []
+    )
+    assert "satisfied (blocker complete): #42 waits on #17" in (
+        plan.render_diff(reported)
+    )
+    document = views.plan_diff(reported)
+    assert document["satisfied"][0] == {"issue": "42", "waits_on": "17"}
 
 
 def test_an_edge_recorded_by_hand_is_reported_as_such(bridge, repo, paired):

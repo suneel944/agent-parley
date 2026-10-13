@@ -376,6 +376,8 @@ def diff(directory: Path, path: Path) -> dict:
         recorded edges the file does not name, which applying never removes,
         and the edges to add that an accepted revision removed, each with
         the proposal that removed it, which applying refuses without force.
+        Edges whose blocker is complete are listed as satisfied instead of
+        as additions, since applying skips them.
 
     Raises:
         BridgeError: If the plan file is unusable.
@@ -384,10 +386,17 @@ def diff(directory: Path, path: Path) -> dict:
     state = snapshot(directory)
     current = edges(state)
     intended = planned(document)
+    satisfied = {
+        (issue, blocker)
+        for issue, blocker in intended - current
+        if lifecycle.state(state["issues"].get(blocker, {}))["state"]
+        == lifecycle.COMPLETE
+    }
     return {
         "plan": document["name"],
         "digest": document["digest"],
-        "add": sorted(intended - current),
+        "add": sorted(intended - current - satisfied),
+        "satisfied": sorted(satisfied),
         "unlisted": sorted(current - intended),
         "revoked": _revoked(recorded(directory), state, document),
     }
@@ -1292,6 +1301,10 @@ def render_diff(reported: dict) -> str:
     lines = [f"{reported['plan']} ({reported['digest'][:12]})"]
     for issue, blocker in reported["add"]:
         lines.append(f"  add: #{issue} waits on #{blocker}")
+    for issue, blocker in reported.get("satisfied", []):
+        lines.append(
+            f"  satisfied (blocker complete): #{issue} waits on #{blocker}"
+        )
     for issue, blocker in reported["unlisted"]:
         lines.append(f"  unlisted: #{issue} waits on #{blocker}")
     for issue, blocker, proposal in reported.get("revoked", []):
