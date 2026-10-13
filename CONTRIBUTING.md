@@ -58,8 +58,10 @@ uv run --locked pre-commit install
 uv run --locked pre-commit run --all-files
 ```
 
-`.pre-commit-config.yaml` runs Ruff lint/format checks, type checking and the
-repository policy gate using locked tools. It does not rewrite files on commit.
+`.pre-commit-config.yaml` installs a pre-commit hook that runs Ruff
+lint/format checks, type checking and the repository policy gate using locked
+tools, and a commit-msg hook that runs the same policy gate on the commit
+message. It does not rewrite files on commit.
 CI runs the complete gate independently of local hook installation.
 
 The `Check` workflow scopes pull requests by the paths they change;
@@ -67,7 +69,8 @@ The `Check` workflow scopes pull requests by the paths they change;
 `make check` on Ubuntu with Python 3.12. Changes to `plugins/`, `scripts/`,
 `tests/`, `Makefile`, `.github/actions/`, plugin manifests, `server.json`,
 `glama.json`, `.release-manifest.json`, `.gitignore` or `LICENSE` add Python
-3.13, 3.14 and macOS. Changes to `agent_parley/`, `tests/test_wsl.py`,
+3.13, 3.14, macOS and the `install` legs, which build the wheel and install it
+on Ubuntu and macOS outside the checkout. Changes to `agent_parley/`, `tests/test_wsl.py`,
 `pyproject.toml`, `uv.lock` or `.github/workflows/check.yml` also add `wsl`.
 Documentation, templates and other workflows run only the Ubuntu 3.12 leg. A
 path no list recognises, a push to `main` and a manual run select every leg.
@@ -77,8 +80,10 @@ ran that leg on the same code. Runs on `main` group by commit, so the run for
 a version bump starts at once instead of queueing behind the run for the
 merge before it; pull request runs still cancel when a new commit arrives.
 Skipped legs still report their required check names. The `check` job fails
-if a needed Python or macOS leg did not succeed; `wsl` reports as its own
-required check and gates the merge, so it carries no `continue-on-error`.
+if a needed Python, macOS or install leg did not succeed; `wsl` reports as its
+own required check and gates the merge, so the job carries no
+`continue-on-error`; only its first WSL setup step does, so the retry step can
+run.
 Each of its steps has its own `timeout-minutes`, and a failed or hung WSL
 setup is retried once inside the job, so a stuck runner fails within the
 step's ceiling instead of holding a green pull request at the job's.
