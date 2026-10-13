@@ -25,6 +25,7 @@ ACTOR = (
     r"(?:ai\b|claude\b|codex\b|chatgpt\b|copilot\b|openai\b|anthropic\b|"
     r"gemini\b|\bamp\b)"
 )
+MARKUP = r"[\[*_`\"']*"
 TRAILER = (
     r"co-authored-by|author|authored-by|committer|signed-off-by|"
     r"assisted-by|generated-by|created-by|reviewed-by"
@@ -33,8 +34,9 @@ RULES: tuple[tuple[str, str], ...] = (
     (
         "assistant_credit",
         r"\b(?:generated|written|created|authored|assisted|powered)\s+"
-        r"(?:with|by)\s+(?:(?:an?|the)\s+)?" + ACTOR,
+        r"(?:with|by)\s+(?:(?:an?|the)\s+)?" + MARKUP + ACTOR,
     ),
+    ("assistant_link", r"\bclaude\.(?:ai|com)/(?:claude-)?code\b"),
     ("assistant_trailer", r"^co-authored-by:\s*[^\n]*" + ACTOR),
     ("generated_pull_request", r"\bthis\s+pr\s+was\s+generated\s+with\b"),
     ("robot_signature", r"\U0001f916|:robo[t]:|\bbeep\s*\*?\s*boop\b"),
