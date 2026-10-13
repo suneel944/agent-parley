@@ -1641,14 +1641,37 @@ MESSAGE_OPTIONS = {
     "merge": ("-m", "--message"),
     "tag": ("-m", "--message"),
     "revert": ("-m", "--message"),
+    "notes": ("-m", "--message"),
 }
 MESSAGE_FILES = {
     "commit": ("-F", "--file"),
     "merge": ("-F", "--file"),
     "tag": ("-F", "--file"),
+    "notes": ("-F", "--file"),
 }
 PULL_REQUEST_OPTIONS = ("-t", "--title", "-b", "--body")
 PULL_REQUEST_FILES = ("-F", "--body-file")
+FORGE_TEXT_COMMANDS = frozenset(
+    {
+        ("pr", "create"),
+        ("pr", "edit"),
+        ("pr", "comment"),
+        ("pr", "merge"),
+        ("pr", "review"),
+        ("issue", "create"),
+        ("issue", "edit"),
+        ("issue", "comment"),
+        ("release", "create"),
+        ("release", "edit"),
+    }
+)
+FORGE_TEXT_OPTIONS = PULL_REQUEST_OPTIONS + ("-n", "--notes", "--subject")
+FORGE_TEXT_FILES = PULL_REQUEST_FILES + ("--notes-file",)
+HEREDOC = re.compile(
+    r"(?<!<)<<(?!<)-?[ \t]*([\"']?)([A-Za-z_][\w.-]*)\1([^\n]*)\n"
+    r"(.*?)^[ \t]*\2[ \t]*$",
+    re.S | re.M,
+)
 MESSAGE_FILE_LIMIT = 65536
 
 
@@ -1677,14 +1700,31 @@ def message_files(base: Path, names: list[str]) -> list[str]:
     return texts
 
 
+def heredocs(command: str) -> tuple[str, list[str]]:
+    """Separates terminated here-documents from the command that feeds them.
+
+    Args:
+        command: Shell text supplied to a native command tool.
+
+    Returns:
+        The command with every here-document body and its terminator removed,
+        keeping the rest of each opening line, and the removed bodies. A body
+        is free text, so leaving it in place would split it into commands or
+        make an apostrophe end the parse.
+    """
+    bodies = [match.group(4) for match in HEREDOC.finditer(command)]
+    return HEREDOC.sub(lambda match: match.group(3), command), bodies
+
+
 def attributed_command(payload: dict, lane: Path) -> tuple[str, str] | None:
     """Reports the attribution a native command would publish, if any.
 
     A lane reaches Git and the forge through its own tools, so the text that
-    would land in a commit, a merge, a tag or a pull request is inspected
-    where the agent asks for it, before anything is written. The check reads
-    the command line and the message files it names: it runs nothing, writes
-    nothing and never consults the network.
+    would land in a commit, a merge, a tag, a note, or a pull request, issue,
+    comment, review or release on the forge is inspected where the agent asks
+    for it, before anything is written. The check reads the command line, the
+    message files it names and its here-documents, which stand in for standard
+    input: it runs nothing, writes nothing and never consults the network.
 
     Args:
         payload: Native lifecycle hook payload.
@@ -1699,17 +1739,21 @@ def attributed_command(payload: dict, lane: Path) -> tuple[str, str] | None:
         return None
     command = str(tool_input.get("command", tool_input.get("cmd", "")))
     cwd = Path(payload.get("cwd", str(lane))).resolve()
+    command, bodies = heredocs(command)
     for segment in shell_segments(command):
         words = invoked(segment)
         if not words:
             continue
         texts: list[str] = []
         if Path(words[0]).name == "gh":
-            if words[1:3] == ["pr", "create"] and cwd.is_relative_to(lane):
-                texts = option_values(
-                    words[3:], PULL_REQUEST_OPTIONS
-                ) + message_files(
-                    cwd, option_values(words[3:], PULL_REQUEST_FILES)
+            pair = tuple(words[1:3])
+            if pair in FORGE_TEXT_COMMANDS and cwd.is_relative_to(lane):
+                texts = (
+                    option_values(words[3:], FORGE_TEXT_OPTIONS)
+                    + message_files(
+                        cwd, option_values(words[3:], FORGE_TEXT_FILES)
+                    )
+                    + bodies
                 )
         else:
             action = git_action(segment, cwd)
@@ -1717,11 +1761,13 @@ def attributed_command(payload: dict, lane: Path) -> tuple[str, str] | None:
                 continue
             target, subcommand, args = action
             if subcommand in MESSAGE_OPTIONS and target.is_relative_to(lane):
-                texts = option_values(
-                    args, MESSAGE_OPTIONS[subcommand]
-                ) + message_files(
-                    target,
-                    option_values(args, MESSAGE_FILES.get(subcommand, ())),
+                texts = (
+                    option_values(args, MESSAGE_OPTIONS[subcommand])
+                    + message_files(
+                        target,
+                        option_values(args, MESSAGE_FILES.get(subcommand, ())),
+                    )
+                    + bodies
                 )
         for text in texts:
             rule = policy.matched_rule(text)
