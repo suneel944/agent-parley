@@ -2917,8 +2917,11 @@ like any other lane's.
 Each delivery appends a batch headed `## Batch N, written <UTC time>`, and
 delivery never marks mail read, because the lane may not have read the file
 yet. A batch stays while any message it carried is unread and leaves once the
-lane calls `mark_message_read` for all of them; a batch without mail stays
-only until a newer one is written, and at most eight are kept. A quiet
+lane calls `mark_message_read` for all of them. A batch without mail, such as
+a work offer or an operator edit on a reserved path that is shown once, stays
+until the lane makes a coordination call that writes, such as
+`mark_message_read`, after the batch was written; the newest one also stays
+while nothing newer is written. At most eight batches are kept. A quiet
 interval drops read batches and removes the file once none remain, so a lane
 tells a new batch from one it already read by its number.
 
