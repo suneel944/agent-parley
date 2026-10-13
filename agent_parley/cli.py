@@ -1106,12 +1106,13 @@ def inbound_status(home: Path | None = None) -> dict:
             or None to read the process environment alone.
 
     Returns:
-        Whether the reader was asked for and the fault, if any, stopping it.
+        Whether the reader was asked for, the fault, if any, stopping it,
+        and the Unix time a passcode lock ends, zero when none holds.
     """
     values = notify.environment(home)
     if not values.get("AGENT_PARLEY_INBOUND", "").strip():
-        return {"enabled": False, "fault": ""}
-    return inbound.reported(values)
+        return {"enabled": False, "fault": "", "locked_until": 0.0}
+    return inbound.reported(values, home)
 
 
 def notification_line(outbound: dict, received: dict) -> str:
@@ -1130,6 +1131,11 @@ def notification_line(outbound: dict, received: dict) -> str:
         sent = "outbound on (" + ", ".join(outbound["transports"]) + ")"
     if received["fault"]:
         read = f"inbound off: {received['fault']}"
+    elif received["enabled"] and received.get("locked_until"):
+        moment = time.strftime(
+            "%Y-%m-%d %H:%M UTC", time.gmtime(received["locked_until"])
+        )
+        read = f"inbound locked until {moment} after wrong passcodes"
     elif received["enabled"]:
         read = "inbound on"
     else:
@@ -3641,7 +3647,9 @@ def secret(prompt: str) -> str:
     return sys.stdin.readline().strip()
 
 
-def secret_settings(chat: str, answering: bool) -> dict[str, str]:
+def secret_settings(
+    chat: str, answering: bool, users: str = ""
+) -> dict[str, str]:
     """Reads the notification secrets without placing them in argv.
 
     A terminal is prompted without echo; otherwise each secret is one line
@@ -3650,13 +3658,21 @@ def secret_settings(chat: str, answering: bool) -> dict[str, str]:
     Args:
         chat: Telegram chat id the notifications go to.
         answering: Whether to read and store the inbound passcode as well.
+        users: Comma-separated Telegram user ids allowed to answer, empty
+            to allow the chat itself.
 
     Returns:
         The settings to store, keyed by environment variable name.
 
     Raises:
-        BridgeError: If the token is empty or the passcode is too short.
+        BridgeError: If the token is empty, the passcode is too short, or
+            inbound answers are asked for in a group chat without users.
     """
+    if answering and chat.strip().startswith("-") and not users.strip():
+        raise BridgeError(
+            "A group chat needs --users with the Telegram user ids allowed "
+            "to answer; nothing stored."
+        )
     token = secret("Telegram bot token: ")
     if not token:
         raise BridgeError("The Telegram bot token is empty; nothing stored.")
@@ -3665,6 +3681,8 @@ def secret_settings(chat: str, answering: bool) -> dict[str, str]:
         "AGENT_PARLEY_TELEGRAM_CHAT": chat.strip(),
         "AGENT_PARLEY_TELEGRAM_TOKEN": token,
     }
+    if users.strip():
+        values["AGENT_PARLEY_TELEGRAM_USERS"] = users.strip()
     if answering:
         passcode = secret("Inbound passcode: ")
         if len(passcode) < inbound.MINIMUM_PASSCODE:
@@ -4567,6 +4585,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help=(
             "Also answer status queries from the chat; the passcode is read "
             "after the token."
+        ),
+    )
+    storing.add_argument(
+        "--users",
+        default="",
+        help=(
+            "Comma-separated Telegram user ids allowed to answer; required "
+            "with --inbound for a group chat."
         ),
     )
     planning = commands.add_parser(
@@ -5935,7 +5961,8 @@ def main() -> int:
             )
         elif args.command == "notify" and args.action == "setup":
             path = notify.store(
-                bridge.home, secret_settings(args.chat, args.inbound)
+                bridge.home,
+                secret_settings(args.chat, args.inbound, args.users),
             )
             print(
                 f"Notification settings stored in {path}.\n"
@@ -5948,6 +5975,11 @@ def main() -> int:
                 print(
                     "A running service reads inbound settings at start: "
                     "agent-parley down && agent-parley up"
+                )
+            if args.inbound and args.chat.strip().startswith("-"):
+                print(
+                    "In a group chat, typed queries reach the bot only after "
+                    "its privacy mode is disabled with BotFather."
                 )
         elif args.command == "notify":
             probed = notify.probe(args.repo.resolve().name, bridge.home)

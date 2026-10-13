@@ -25,6 +25,7 @@ stay in `notify`.
 
 import hashlib
 import json
+import secrets
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -49,6 +50,8 @@ KEPT_SETTLED = 200
 CALLBACK_PREFIX = "d"
 CONFIRMED = "y"
 MAX_TEXT_BYTES = 1024
+NONCE_BYTES = 3
+OCCURRENCE = "."
 
 
 def identifier(project: str, lane: str, kind: str, key: str) -> str:
@@ -148,7 +151,9 @@ def open_or_refresh(
     A repeat observation of an open situation extends its expiry and keeps
     its identifier, its delivery state and its text, so the operator is not
     asked twice. A situation whose previous decision was answered, closed or
-    expired opens a fresh one.
+    expired opens a fresh one under the same identifier with a new random
+    occurrence nonce, so a button or reply posted for the earlier occurrence
+    no longer answers it.
 
     Args:
         directory: Private project state directory.
@@ -194,6 +199,7 @@ def open_or_refresh(
         else:
             record = {
                 "id": name,
+                "nonce": secrets.token_hex(NONCE_BYTES),
                 "project": project,
                 "lane": lane,
                 "issue": str(issue),
@@ -491,11 +497,26 @@ def options(record: Mapping[str, object]) -> list[str]:
     return [str(option) for option in offered]
 
 
+def occurrence(record: Mapping[str, object]) -> str:
+    """Names the one occurrence of a decision a button or digest is for.
+
+    Args:
+        record: Decision record.
+
+    Returns:
+        The identifier, `OCCURRENCE` and the record's nonce, or the bare
+        identifier for a record written before nonces existed.
+    """
+    nonce = str(record.get("nonce") or "")
+    name = str(record["id"])
+    return f"{name}{OCCURRENCE}{nonce}" if nonce else name
+
+
 def callback(name: str, index: int, confirmed: bool = False) -> str:
     """Encodes the Telegram callback payload for one option.
 
     Args:
-        name: Decision identifier.
+        name: Decision occurrence as `occurrence` names it.
         index: Position of the option in the record's options.
         confirmed: Whether this is the second tap an irreversible option
             asks for.
@@ -514,7 +535,7 @@ def tapped(data: str) -> tuple[str, int, bool]:
         data: The ``callback_data`` a button tap carried.
 
     Returns:
-        The decision identifier, the option index and whether the tap
+        The decision occurrence, the option index and whether the tap
         confirms an irreversible option.
 
     Raises:
@@ -551,7 +572,7 @@ def keyboard(records: Sequence[Mapping[str, object]]) -> dict:
                         if option == record.get("recommended")
                         else option
                     ),
-                    "callback_data": callback(str(record["id"]), index),
+                    "callback_data": callback(occurrence(record), index),
                 }
                 for index, option in enumerate(options(record))
             ]
@@ -572,7 +593,9 @@ def _block(record: Mapping[str, object]) -> str:
     lines = [str(record.get("question", ""))]
     if record.get("detail"):
         lines.append(str(record["detail"]))
-    lines.append(f"decision: {record['id']} ({record.get('reversibility')})")
+    lines.append(
+        f"decision: {occurrence(record)} ({record.get('reversibility')})"
+    )
     lines.append(
         "options: "
         + ", ".join(

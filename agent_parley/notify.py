@@ -40,6 +40,7 @@ STORED_KEYS = (
     "AGENT_PARLEY_NOTIFY",
     "AGENT_PARLEY_TELEGRAM_CHAT",
     "AGENT_PARLEY_TELEGRAM_TOKEN",
+    "AGENT_PARLEY_TELEGRAM_USERS",
     "AGENT_PARLEY_INBOUND",
     "AGENT_PARLEY_INBOUND_PASSCODE",
 )
@@ -352,6 +353,13 @@ def settings(environ: Mapping[str, str] | None = None) -> dict:
         "telegram": {
             "token": values.get("AGENT_PARLEY_TELEGRAM_TOKEN", "").strip(),
             "chat": values.get("AGENT_PARLEY_TELEGRAM_CHAT", "").strip(),
+            "users": [
+                user.strip()
+                for user in values.get("AGENT_PARLEY_TELEGRAM_USERS", "").split(
+                    ","
+                )
+                if user.strip()
+            ],
             "api": values.get("AGENT_PARLEY_TELEGRAM_API", TELEGRAM_API),
         },
         "email": {
