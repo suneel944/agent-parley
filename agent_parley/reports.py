@@ -40,6 +40,8 @@ class ReportsMixin(BridgeCore):
         resume_on: str = "",
         backlog: int | None = None,
         until: float = 0.0,
+        pid: int | None = None,
+        output: str = "",
     ) -> str:
         """Records an explicitly reported outcome independently of activity.
 
@@ -59,6 +61,16 @@ class ReportsMixin(BridgeCore):
         show it as waiting on that reason with its next-check time rather
         than a bare idle lane, and the supervisor defers waking it until that
         time, capped by the project's `deadlines.wait` ceiling.
+
+        A report may name the process still doing its work and the file
+        that process writes. Both are recorded on the activity record by
+        `supervision.work_evidence`, and while `supervision.live_work` finds
+        that work running the supervisor holds the reported claim as it does
+        for a wait in force. Each report replaces the evidence the last one
+        named, so a report that names none clears it. The evidence is
+        validated before any attachment is stored, so a refused report
+        leaves none behind, and a retry whose key names a recorded report
+        returns that result without validating it again.
 
         A ready or blocked report on a claim ends the lane's work on that
         claim, so it records a rotation point on the activity record: the
@@ -83,6 +95,9 @@ class ReportsMixin(BridgeCore):
                 leaves any recorded count as it stands.
             until: Required seconds from now for a waiting report's next
                 check; unused otherwise.
+            pid: Process ID of work still running for this lane, or None.
+            output: File that running work writes, resolved against the
+                lane when relative, or empty.
 
         Returns:
             The completion the holder owes on an observed-complete claim for
@@ -134,16 +149,6 @@ class ReportsMixin(BridgeCore):
                     f"{metrics.MAX_REPORT_BYTES}-byte budget; put the detail "
                     "in --evidence, which is attached when it is longer."
                 )
-        identifier = uuid.uuid4().hex[:16]
-        evidence, attached = attachments.spill(
-            directory,
-            "report",
-            identifier,
-            evidence,
-            metrics.MAX_REPORT_BYTES,
-            agent,
-            [],
-        )
         scope = retries.scope(agent, "report", retries.validate(key))
         fingerprint = retries.digest(
             "report",
@@ -157,9 +162,38 @@ class ReportsMixin(BridgeCore):
                 "resume_on": resume_on,
                 "backlog": backlog,
                 "until": until,
+                "pid": pid,
+                "output": output,
             },
         )
         path = directory / f"{agent}-activity.json"
+        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+            state = json.loads(path.read_text()) if path.exists() else {}
+        if key and (recorded := state.get("retries", {}).get(scope)):
+            retries.replayed(recorded, "report", key, fingerprint)
+            return ""
+        ceiling = (data.get("deadlines") or {}).get(
+            "wait", supervision.DEFAULT_WAIT_CEILING
+        )
+        work = supervision.work_evidence(
+            lane,
+            pid,
+            output,
+            str(claim["issue"]) if claim["issue"] is not None else "",
+            claim["claim_id"] or "",
+            ceiling,
+            state.get("session_pid"),
+        )
+        identifier = uuid.uuid4().hex[:16]
+        evidence, attached = attachments.spill(
+            directory,
+            "report",
+            identifier,
+            evidence,
+            metrics.MAX_REPORT_BYTES,
+            agent,
+            [],
+        )
         with lock(directory / f"{agent}-report.lock", timeout=1):
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
@@ -188,6 +222,10 @@ class ReportsMixin(BridgeCore):
                     evidence=evidence,
                     reported_at=time.time(),
                 )
+                if work:
+                    state["work"] = work
+                else:
+                    state.pop("work", None)
                 if outcome in ROTATION_OUTCOMES and claim["issue"] is not None:
                     state["rotation"] = {
                         "at": time.time(),
@@ -205,9 +243,6 @@ class ReportsMixin(BridgeCore):
                     )
                 write_json(path, state)
         if outcome == "waiting":
-            ceiling = (data.get("deadlines") or {}).get(
-                "wait", supervision.DEFAULT_WAIT_CEILING
-            )
             supervision.record_wait(
                 directory, agent, summary, time.time() + until, ceiling
             )

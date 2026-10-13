@@ -1,12 +1,26 @@
 """Shared isolated state and Git repository fixtures."""
 
 import socket
+import subprocess
+import sys
 
 import pytest
 
 from agent_parley import forge
 from agent_parley.cli import Bridge, git
 from agent_parley.state import write_json
+
+
+@pytest.fixture
+def worker():
+    """Runs a child process standing in for a lane's background job."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"]
+    )
+    yield child.pid
+    child.kill()
+    child.wait()
+
 
 GIT_SETTINGS = {
     "user.name": "Bridge Test",

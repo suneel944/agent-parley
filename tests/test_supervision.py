@@ -1056,6 +1056,114 @@ def test_a_declared_wait_defers_a_wake_until_its_next_check(
     assert retried["result"] == "accepted"
 
 
+def test_direct_mail_about_a_held_issue_wakes_through_a_declared_wait(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    supervision.record_wait(
+        directory, "codex", "gpu forecast run", time.time() + 900, 3600
+    )
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, directory, "codex")
+    path = directory / "codex-wake.json"
+    other = store.call(
+        bridge.home,
+        actors["claude"],
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Lunch",
+            "body_md": "Unrelated to #70",
+            "idempotency_key": "other",
+        },
+    )
+    assert (
+        supervision.held_issue_mail(bridge.home, directory, paired, "codex")
+        == []
+    )
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=0,
+        backlog=[str(other["id"])],
+        attempts=1,
+        result="manual attention required",
+    )
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    assert not calls
+    assert (
+        "waiting on gpu forecast run" in json.loads(path.read_text())["blocked"]
+    )
+
+    asked = store.call(
+        bridge.home,
+        actors["claude"],
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Forecast",
+            "body_md": "Is #7 still running?",
+            "idempotency_key": "asked",
+        },
+    )
+    assert supervision.held_issue_mail(
+        bridge.home, directory, paired, "codex"
+    ) == [str(asked["id"])]
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    woken = json.loads(path.read_text())
+    assert calls
+    assert woken["result"] == "accepted"
+    assert str(asked["id"]) in woken["backlog"]
+    assert str(other["id"]) in woken["backlog"]
+
+
+def test_held_issue_mail_is_searched_only_while_a_wait_is_in_force(tmp_path):
+    searched = []
+    observed = {"record": {}, "process_alive": True}
+
+    def search():
+        searched.append(True)
+        return []
+
+    assert supervision._wake_block(
+        tmp_path, "codex", observed, {}, 60, search
+    ) == ("", 0.0)
+    assert searched == []
+    supervision.record_wait(
+        tmp_path, "codex", "gpu forecast run", time.time() + 900, 3600
+    )
+    blocked, _ = supervision._wake_block(
+        tmp_path, "codex", observed, {}, 60, search
+    )
+    assert blocked == "waiting on gpu forecast run"
+    assert searched == [True]
+    assert supervision._wake_block(
+        tmp_path, "codex", observed, {}, 60, lambda: ["1"]
+    ) == ("", 0.0)
+
+
 def test_a_declared_wait_is_capped_by_its_project_ceiling(tmp_path):
     now = time.time()
 

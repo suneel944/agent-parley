@@ -173,6 +173,48 @@ def test_a_waiting_second_claim_keeps_tool_calls_counting_on_the_first(
         assert "overdue_recovery" not in kept["7"]
 
 
+def reported(directory, pid, number):
+    """Records evidence of running work bound to one of claude's claims."""
+    claim_id = issues.snapshot(directory)["issues"][number]["claim_id"]
+    work = supervision.work_evidence(directory, pid, "", number, claim_id)
+    path = directory / "claude-activity.json"
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+    return work
+
+
+def test_reported_running_work_holds_only_the_claim_it_names(
+    bridge, paired, worker
+):
+    directory = busy_with_one_idle_claim(bridge, paired)
+    reported(directory, worker, "7")
+    assert step(bridge, directory)["8"]["overdue_recovery"]["step"] == "wake"
+
+    reported(directory, worker, "8")
+    kept = step(bridge, directory)["8"]
+    assert kept["offer"] is None
+    assert "overdue_recovery" not in kept
+
+
+def test_reported_work_holds_nothing_without_a_claim_or_once_reclaimed(
+    bridge, paired, worker
+):
+    directory = busy_with_one_idle_claim(bridge, paired)
+    work = reported(directory, worker, "8")
+    assert supervision.live_work(directory, "claude", "8")
+    with pytest.raises(BridgeError, match="bound to a claim"):
+        supervision.work_evidence(directory, worker, "")
+
+    path = directory / "claude-activity.json"
+    unbound = {**work, "issue": ""}
+    write_json(path, {**json.loads(path.read_text()), "work": unbound})
+    assert supervision.live_work(directory, "claude", "7") == ""
+    assert supervision.live_work(directory, "claude") == ""
+
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+    edit(directory, "8", lambda record: record.update(claim_id="reclaimed"))
+    assert supervision.live_work(directory, "claude", "8") == ""
+
+
 def test_progress_on_the_idle_claim_drops_its_recovery(bridge, paired):
     directory = busy_with_one_idle_claim(bridge, paired)
     assert step(bridge, directory)["8"]["overdue_recovery"]["step"] == "wake"

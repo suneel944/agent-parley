@@ -8,15 +8,17 @@ from pathlib import Path
 import pytest
 
 from agent_parley import (
+    attachments,
     denials,
     issues,
     lanes,
     lifecycle,
+    metrics,
     process,
     store,
     supervision,
 )
-from agent_parley.state import write_json
+from agent_parley.state import BridgeError, write_json
 
 WINDOW = 300
 
@@ -432,6 +434,170 @@ def test_a_declared_wait_holds_the_overdue_transition(bridge, paired):
         directory / "claude-wait.json", {**wait, "until": time.time() - 1}
     )
     assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def reported_work(directory, work):
+    """Records the process evidence a holder's latest report named."""
+    path = directory / "claude-activity.json"
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+
+
+def bound(directory, lane, pid, output=""):
+    """Builds work evidence bound to claude's claim on #7."""
+    claim_id = issues.snapshot(directory)["issues"]["7"]["claim_id"]
+    return supervision.work_evidence(lane, pid, output, "7", claim_id)
+
+
+def test_a_reported_live_process_holds_the_overdue_transition(
+    bridge, paired, worker
+):
+    directory = overdue(bridge, paired)
+    work = bound(directory, directory, worker)
+    reported_work(directory, work)
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert "overdue_recovery" not in kept
+    reported_work(directory, {**work, "ticks": "recycled"})
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_reported_work_holds_no_longer_than_the_wait_ceiling(
+    bridge, paired, worker
+):
+    directory = overdue(bridge, paired)
+    claim_id = issues.snapshot(directory)["issues"]["7"]["claim_id"]
+    work = supervision.work_evidence(
+        directory, worker, "", "7", claim_id, ceiling=60
+    )
+    assert work["until"] == pytest.approx(work["recorded_at"] + 60)
+    reported_work(directory, work)
+    assert step(bridge, directory, paired)["offer"] is None
+    reported_work(directory, {**work, "until": time.time() - 1})
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_a_report_naming_a_process_that_is_not_its_work_is_refused(
+    tmp_path,
+):
+    for pid, refusal in (
+        (1, "is not running"),
+        (os.getpid(), "lane's own session"),
+        (os.getppid(), "lane's own session"),
+    ):
+        with pytest.raises(BridgeError, match=refusal):
+            supervision.work_evidence(tmp_path, pid, "", "7", "c")
+
+
+def test_a_report_naming_its_session_or_another_users_process_is_refused(
+    tmp_path, worker, monkeypatch
+):
+    with pytest.raises(BridgeError, match="lane's own session"):
+        supervision.work_evidence(tmp_path, worker, "", "7", "c", 60, worker)
+    monkeypatch.setattr(process, "read_ps_field", lambda field, pid: "0")
+    monkeypatch.setattr(supervision.os, "getuid", lambda: 4242)
+    with pytest.raises(BridgeError, match="belongs to another user"):
+        supervision.work_evidence(tmp_path, worker, "", "7", "c")
+
+
+def test_an_output_file_outside_the_lane_is_refused(bridge, paired):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    for outside in (
+        directory / "claude-activity.json",
+        bridge.home / "state.db",
+        lane.parent.parent / "elsewhere.log",
+        "../claude-activity.json",
+    ):
+        with pytest.raises(BridgeError, match="inside the lane worktree"):
+            bound(directory, lane, None, str(outside))
+    scratch = lanes.extras(lane) / "job.log"
+    assert bound(directory, lane, None, str(scratch))["output"] == str(
+        scratch.resolve()
+    )
+
+
+def test_an_advancing_output_file_holds_the_overdue_transition(bridge, paired):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    output = lanes.extras(lane) / "forecast.log"
+    output.parent.mkdir()
+    output.write_text("epoch 1\n")
+    stamp = time.time() - 3600
+    os.utime(output, (stamp, stamp))
+    reported_work(directory, bound(directory, lane, None, str(output)))
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+    output.write_text("epoch 2\n")
+    kept = step(bridge, directory, paired)
+    assert kept["offer"] is None and "overdue_recovery" not in kept
+    stale = time.time() - supervision.TOOL_TIMEOUT - 5
+    os.utime(output, (stale, stale))
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_a_waiting_report_records_the_work_it_names(bridge, paired, worker):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    output = lanes.extras(lane) / "forecast.log"
+    bridge.report(
+        lane,
+        "waiting",
+        "gpu forecast run",
+        "",
+        "",
+        issue="7",
+        until=1,
+        pid=worker,
+        output=str(output),
+    )
+    work = json.loads((directory / "claude-activity.json").read_text())["work"]
+    assert work["pid"] == worker
+    assert work["ticks"] == process.start_ticks(worker)
+    assert work["output"] == str(output.resolve())
+    assert work["mtime"] == 0.0
+    assert (
+        work["claim_id"]
+        == issues.snapshot(directory)["issues"]["7"]["claim_id"]
+    )
+    wait = json.loads((directory / "claude-wait.json").read_text())
+    write_json(
+        directory / "claude-wait.json", {**wait, "until": time.time() - 1}
+    )
+    assert supervision.holder_held(
+        bridge.home, directory, paired["root"], "claude"
+    ) == (f"working: process {worker} is alive")
+    bridge.report(lane, "partial", "paused", "resume it", "", issue="7")
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert "work" not in state
+
+
+def test_a_refused_report_stores_no_attachment_and_a_retry_replays(
+    bridge, paired, worker, monkeypatch
+):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    long = "x" * (metrics.MAX_REPORT_BYTES + 1)
+    with pytest.raises(BridgeError, match="is not running"):
+        bridge.report(lane, "partial", "s", "r", long, issue="7", pid=2**22 + 1)
+    assert not attachments.folder(directory).exists() or not any(
+        attachments.folder(directory).iterdir()
+    )
+    bridge.report(
+        lane, "partial", "s", "r", long, key="once", issue="7", pid=worker
+    )
+    stored = sorted(attachments.folder(directory).rglob("*"))
+    monkeypatch.setattr(process, "running", lambda pid: False)
+    assert (
+        bridge.report(
+            lane, "partial", "s", "r", long, key="once", issue="7", pid=worker
+        )
+        == ""
+    )
+    assert sorted(attachments.folder(directory).rglob("*")) == stored
+
+
+def test_a_report_naming_a_stopped_process_is_refused(tmp_path):
+    with pytest.raises(BridgeError, match="is not running"):
+        supervision.work_evidence(tmp_path, 2**22 + 1, "")
 
 
 def test_a_held_holder_is_not_named_to_idle_peers(bridge, paired):

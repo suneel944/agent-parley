@@ -4364,6 +4364,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     report.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        metavar="PID",
+        help=(
+            "Process still doing this report's work; while it runs the "
+            "supervisor holds the reported claim."
+        ),
+    )
+    report.add_argument(
+        "--output-file",
+        default="",
+        metavar="PATH",
+        help=(
+            "File the running work writes; a write after this report holds "
+            "the reported claim while it is recent."
+        ),
+    )
+    report.add_argument(
         "--idempotency-key", default="", metavar="KEY", help=RETRY_HELP
     )
     steer = commands.add_parser(
@@ -6253,6 +6272,8 @@ def main() -> int:
                 resume_on=args.resume_on,
                 backlog=args.backlog,
                 until=args.until,
+                pid=args.pid,
+                output=args.output_file,
             )
             print(f"Recorded outcome: {args.state}")
             if owed:
