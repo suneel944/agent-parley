@@ -110,7 +110,8 @@ session, so coordination is delivered by polling instead of by checkpoint.
 Read {path}
 at the start of every turn and again after any long command. It is checked
 about every {interval():.0f}s. Each delivery adds a numbered batch with the
-UTC time it was written, and a batch stays until you mark its mail read, so
+UTC time it was written, and a batch stays until you mark its mail read, or
+for a batch without mail until your next coordination call that writes, so
 compare batch numbers to tell new mail from a batch you already read. An
 absent or unchanged file means nothing new arrived. Reading it is
 not acknowledgement: call mark_message_read for each message you reviewed,
@@ -233,6 +234,31 @@ def _unread(home: Path, root: str, name: str, ids: list[int]) -> set[int]:
     return {row[0] for row in rows}
 
 
+def _active(home: Path, root: str, name: str) -> float:
+    """Reads when the lane last called a coordination tool that writes.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project identifier.
+        name: The lane's registered identity name.
+
+    Returns:
+        The Unix time of the lane's last recorded write through the
+        mailbox, truncated to the second, or zero when none is recorded.
+    """
+    path = home / store.DATABASE
+    with contextlib.closing(
+        sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.3)
+    ) as db:
+        row = db.execute(
+            "SELECT CAST(strftime('%s', a.last_active_ts) AS REAL) "
+            "FROM agents a JOIN projects p ON p.id=a.project_id "
+            "WHERE p.human_key=? AND a.name=?",
+            (root, name),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else 0.0
+
+
 def _publish(directory: Path, agent: str, batches: list[dict]) -> None:
     """Writes the retained batches, or removes the file when none remain."""
     path = mail_file(directory, agent)
@@ -249,8 +275,11 @@ def deliver(home: Path, directory: Path, agent: str) -> int:
     written. A polled lane may not read the file before the next interval,
     so delivery never marks mail read: an earlier batch stays in the file
     while any message it carried is unread, and leaves once the lane calls
-    `mark_message_read` for all of them. A batch carrying no mail stays
-    only until a newer batch is written. At most `MAX_BATCHES` are kept,
+    `mark_message_read` for all of them. A batch carrying no mail, such as
+    a work offer or an operator edit shown once, stays until the lane
+    records a coordination write after it was written, and the newest such
+    batch stays while nothing newer is written. A batch recorded without
+    its write time is treated as seen. At most `MAX_BATCHES` are kept,
     and a quiet interval still drops batches whose mail was read. The
     lane's recorded cursor advances only for the previews that fit the
     context bound, so the remainder arrives on the next interval. New
@@ -330,11 +359,22 @@ def deliver(home: Path, directory: Path, agent: str) -> int:
         identity["name"],
         [number for batch in batches for number in batch["ids"]],
     )
+    active = (
+        _active(home, manifest["root"], identity["name"])
+        if any(not batch["ids"] and "written" in batch for batch in batches)
+        else 0.0
+    )
     kept = [
         batch
         for batch in batches
         if unread & set(batch["ids"])
-        or (not batch["ids"] and not text and batch is batches[-1])
+        or (
+            not batch["ids"]
+            and (
+                batch.get("written", 0.0) > active
+                or (not text and batch is batches[-1])
+            )
+        )
     ]
     if not text:
         settled = not advanced and "base_advance" in read
@@ -355,12 +395,14 @@ def deliver(home: Path, directory: Path, agent: str) -> int:
         if any(state.get(key) != read.get(key) for key in COMPOSED_FROM):
             return 0
         number = int(state.get("batch", 0)) + 1
-        written = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        now = time.time()
+        written = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
         kept.append(
             {
                 "number": number,
                 "ids": [message["id"] for message in delivered],
                 "text": f"## Batch {number}, written {written}\n\n{text}",
+                "written": now,
             }
         )
         kept = kept[-MAX_BATCHES:]

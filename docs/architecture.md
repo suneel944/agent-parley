@@ -685,8 +685,10 @@ owed-acknowledgement and relevance-ordered mail digest come from the same
 because the lane may not have read the file yet. Each delivery appends a
 numbered batch with the UTC time it was written; a batch stays while any
 message it carried is unread and leaves once the lane calls
-`mark_message_read` for all of them, a batch without mail stays only until a
-newer one is written, and at most `MAX_BATCHES` (8) are kept. A read that
+`mark_message_read` for all of them, a batch without mail stays until the
+lane's recorded `last_active_ts` moves past the batch's write time, so a
+one-shot offer or operator-edit notice survives until the lane has acted, and
+at most `MAX_BATCHES` (8) are kept. A read that
 fails is retried on the next interval rather than raised, because losing
 delivery must never end a native session, and delivery decides nothing: a
 missing guard still refuses the launch.

@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -81,6 +82,47 @@ def test_two_polls_before_a_read_keep_both_batches(bridge, polled):
     mark(bridge, polled, later)
     delivery.deliver(bridge.home, directory, "helper")
     assert not published.exists()
+
+
+def test_a_notice_only_batch_stays_until_the_lane_acts(
+    bridge, polled, monkeypatch
+):
+    directory = Path(polled["lanes"]["helper"]).parent
+    published = delivery.mail_file(directory, "helper")
+    delivery.deliver(bridge.home, directory, "helper")
+    mark(
+        bridge,
+        polled,
+        checkpoints.activity(directory, "helper")["batches"][0]["ids"],
+    )
+    offer = "Take over issue #7 from claude."
+    write_json(
+        directory / "helper-work.json", {"offer": {"id": "o7", "text": offer}}
+    )
+    monkeypatch.setattr(
+        delivery.supervision,
+        "readings",
+        lambda home, manifest: ({"helper": ["src/app.py"]}, {}),
+    )
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    send(bridge, polled, "helper", "later", "Later mail")
+
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+
+    text = published.read_text()
+    assert offer in text and "Later mail" in text
+    assert "Operator edit on a path you reserved: src/app.py" in text
+
+    name = roster.read(directory)["participants"]["helper"]["display"]
+    with sqlite3.connect(bridge.home / store.DATABASE) as db:
+        db.execute(
+            "UPDATE agents SET last_active_ts=datetime('now', '+5 seconds') "
+            "WHERE name=?",
+            (name,),
+        )
+    delivery.deliver(bridge.home, directory, "helper")
+    text = published.read_text()
+    assert offer not in text and "Later mail" in text
 
 
 def test_polled_delivery_orders_mail_by_relevance(bridge, polled):
