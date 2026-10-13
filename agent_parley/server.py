@@ -752,6 +752,35 @@ class Server(ThreadingHTTPServer):
         log(self.home, "failed", "request handling\n" + traceback.format_exc())
 
 
+def argument_refusal(tool: dict, args: dict) -> str | None:
+    """Names what is wrong with the keys of one tool call, if anything.
+
+    An agent told only that its arguments were wrong re-sends the same
+    call, so the refusal names the tool, each unexpected key, each missing
+    required key and every accepted key. It names keys only and never
+    echoes an argument value, which may carry a message body, and it is
+    clipped so an oversized key cannot inflate the reply.
+
+    Args:
+        tool: Declared tool whose input schema the call must match.
+        args: Arguments object the caller sent.
+
+    Returns:
+        The refusal text, or None when the keys match the schema.
+    """
+    schema = tool["inputSchema"]
+    accepted = sorted(schema["properties"])
+    extra = sorted(set(args) - set(accepted))
+    missing = sorted(set(schema["required"]) - set(args))
+    if not extra and not missing:
+        return None
+    parts = [f"unexpected {', '.join(extra)}" if extra else ""]
+    parts.append(f"missing {', '.join(missing)}" if missing else "")
+    named = "; ".join(part for part in parts if part)
+    text = f"{tool['name']}: {named}. Accepted: {', '.join(accepted)}."
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
 class Handler(BaseHTTPRequestHandler):
     """Implements the JSON-response subset of stateless Streamable HTTP."""
 
@@ -1281,13 +1310,16 @@ class Handler(BaseHTTPRequestHandler):
                 (t for t in TOOLS if t["name"] == params.get("name")), None
             )
             args = params.get("arguments", {})
-            if tool is None or not isinstance(args, dict):
-                raise BridgeError("Unknown tool or invalid arguments.")
-            schema = tool["inputSchema"]
-            if set(args) - set(schema["properties"]) or set(
-                schema["required"]
-            ) - set(args):
-                raise BridgeError("Unexpected or missing tool arguments.")
+            if tool is None:
+                raise BridgeError(
+                    f"Unknown tool {str(params.get('name'))[:80]!r}; "
+                    "tools/list names the available tools."
+                )
+            if not isinstance(args, dict):
+                raise BridgeError("arguments must be a JSON object.")
+            wrong = argument_refusal(tool, args)
+            if wrong is not None:
+                raise BridgeError(wrong)
             if roster.paused(self.server.home, actor["project"], actor["name"]):
                 raise BridgeError(roster.PAUSED_REASON)
             if tool["name"] == waits.TOOL:
