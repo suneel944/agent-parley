@@ -1,5 +1,7 @@
 """Checks that pending coordination arrives as context, not as a denial."""
 
+import shlex
+import sys
 import time
 from pathlib import Path
 
@@ -217,6 +219,29 @@ def test_the_protocol_form_cli_is_exempt_like_the_console_script(
 def test_a_protocol_form_chained_or_redirected_is_not_exempt(command):
     payload = {"tool_name": "Bash", "tool_input": {"command": command}}
 
+    assert not checkpoints.diagnosable(payload)
+
+
+@pytest.mark.parametrize("flags", [["-P"], []])
+def test_the_bridge_cli_is_detected_with_or_without_safe_path(flags):
+    words = [sys.executable, *flags, "-m", "agent_parley.cli", "status"]
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": shlex.join(words)},
+    }
+
+    assert checkpoints.bridge_invocation(words)
+    assert checkpoints.diagnosable(payload)
+
+
+def test_an_isolated_interpreter_is_not_the_bridge_cli():
+    words = [sys.executable, "-I", "-m", "agent_parley.cli", "status"]
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": shlex.join(words)},
+    }
+
+    assert not checkpoints.bridge_invocation(words)
     assert not checkpoints.diagnosable(payload)
 
 

@@ -709,7 +709,8 @@ def bridge_shell(screen: str, text: str, data: bytes) -> bool:
     The protocol prompt orders every lane to run `protocol.cli_command`
     through its shell tool, so a lane launched before the operator's opt-in
     parks on the first such command. Only a prompt titled as a shell command
-    whose command begins with that exact interpreter and module, and whose
+    whose command begins with that exact interpreter and module, spelled as
+    `protocol.cli_command` or `protocol.legacy_cli_command`, and whose
     remainder carries no shell operator that could chain a second command,
     qualifies. A newline chains commands too, and the flattened screen
     cannot show one, so the drawn rows must hold the command on one row
@@ -731,8 +732,18 @@ def bridge_shell(screen: str, text: str, data: bytes) -> bool:
     if title < 0:
         return False
     shown = " ".join(BOX.sub(" ", head[title + len(SHELL_TITLE) :]).split())
-    command = protocol.cli_command() + " "
-    if not shown.startswith(command):
+    command = next(
+        (
+            spelled + " "
+            for spelled in (
+                protocol.cli_command(),
+                protocol.legacy_cli_command(),
+            )
+            if shown.startswith(spelled + " ")
+        ),
+        None,
+    )
+    if command is None:
         return False
     if SHELL_OPERATORS.search(shown[len(command) :]) is not None:
         return False

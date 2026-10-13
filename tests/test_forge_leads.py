@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import forge, issues, recommend, store, supervision
+from agent_parley import (
+    forge,
+    issues,
+    lifecycle,
+    recommend,
+    store,
+    supervision,
+)
+from agent_parley.cli import git
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
 from agent_parley.status import FORGE_ISSUES, FORGE_STALE
@@ -160,6 +168,152 @@ def test_a_stale_or_missing_forge_cache_adds_nothing(tmp_path):
     assert issues.with_forge(tmp_path, ledger) is ledger
     (tmp_path / FORGE_ISSUES).write_text("not json")
     assert issues.with_forge(tmp_path, ledger) is ledger
+
+
+def committed(path, message):
+    """Records one empty commit with the given message."""
+    git(
+        path,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--allow-empty",
+        "-m",
+        message,
+    )
+
+
+def integrated(tmp_path):
+    """Clones a remote whose integration branch closes #7 and #9.
+
+    The default branch closes #3 too, which crossed already and so is not
+    integration work, and a keyword inside a code span closes nothing.
+    """
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    git(tmp_path, "init", "--bare", "-b", "main", str(remote))
+    git(tmp_path, "init", "-b", "main", str(seed))
+    committed(seed, "feat: start\n\nCloses #3")
+    git(seed, "remote", "add", "origin", str(remote))
+    git(seed, "push", "origin", "main")
+    git(seed, "switch", "-c", "integration/1")
+    committed(seed, "fix: one (#20)\n\nCloses #7")
+    committed(seed, "fix: two (#21)\n\nFixes #9, not `Closes #11`")
+    git(seed, "push", "origin", "integration/1")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", str(remote), str(clone))
+    return clone
+
+
+def queued():
+    """Builds one unowned, authorized ledger record nothing blocks."""
+    return {
+        "owner": None,
+        "offer": None,
+        "blocked_by": [],
+        "execution": {"authorized": True},
+    }
+
+
+def test_integration_closed_reads_keywords_beyond_the_default_branch(
+    tmp_path,
+):
+    clone = integrated(tmp_path)
+    assert supervision.integration_closed(clone, "integration/1") == [
+        "7",
+        "9",
+    ]
+    assert supervision.integration_closed(clone, "") == []
+    assert supervision.integration_closed(clone, "integration/none") == []
+    git(clone, "remote", "set-head", "origin", "--delete")
+    assert supervision.integration_closed(clone, "integration/1") == []
+
+
+def test_integration_closed_falls_back_to_the_local_branch(tmp_path):
+    clone = integrated(tmp_path)
+    git(clone, "switch", "-c", "integration/2", "origin/main")
+    committed(clone, "fix: three\n\nResolves #12")
+    assert supervision.integration_closed(clone, "integration/2") == ["12"]
+
+
+def test_an_issue_updated_after_its_closing_commit_is_not_landed(
+    tmp_path, monkeypatch
+):
+    clone = integrated(tmp_path)
+    stamp = int(git(clone, "log", "-1", "--format=%ct", "origin/integration/1"))
+    reopened = {"7": stamp + 3600.0, "9": float(stamp)}
+    assert supervision.integration_closed(clone, "integration/1", reopened) == [
+        "9"
+    ]
+    directory = tmp_path / "state"
+    directory.mkdir()
+    monkeypatch.setattr(supervision.forge, "select", lambda *args: "github")
+    monkeypatch.setattr(
+        supervision.forge,
+        "open_issue_catalog",
+        lambda *args, **kwargs: {
+            "7": {"title": "Reopened", "updated_at": stamp + 3600.0},
+        },
+    )
+    manifest = {"root": str(clone), "integration_base": "integration/1"}
+    supervision.refresh_forge_issues(directory, manifest)
+    cache = json.loads((directory / FORGE_ISSUES).read_text())
+    assert cache["integration_closed"] == ["9"]
+    assert cache["issues"]["7"]["updated_at"] == stamp + 3600.0
+    pool = issues.with_forge(directory, issues.snapshot(directory))
+    assert issues.unclaimed(pool) == ["7"]
+
+
+def test_work_the_integration_base_closed_is_never_offered(tmp_path):
+    ledger = {
+        "revision": 1,
+        "issues": {"7": queued(), "8": queued(), "9": ready("codex")},
+    }
+    write_json(
+        tmp_path / FORGE_ISSUES,
+        {
+            "read_at": time.time(),
+            "integration_closed": ["7", "9", "50"],
+            "issues": {
+                "7": {"title": "Landed"},
+                "8": {"title": "Open"},
+                "50": {"title": "Landed, never claimed"},
+                "51": {"title": "New"},
+            },
+        },
+    )
+    pool = issues.with_forge(tmp_path, ledger)
+    assert issues.unclaimed(pool) == ["8", "51"]
+    assert lifecycle.actionable(pool) == ["8", "51"]
+    assert pool["issues"]["9"]["owner"] == "codex"
+    assert "7" in ledger["issues"]
+    ranked = recommend.rank(pool, {}, {}, {}, "claude")
+    assert [record["issue"] for record in ranked] == ["8", "51"]
+
+
+def test_the_forge_refresh_records_what_the_integration_base_closed(
+    tmp_path, monkeypatch
+):
+    clone = integrated(tmp_path)
+    directory = tmp_path / "state"
+    directory.mkdir()
+    monkeypatch.setattr(supervision.forge, "select", lambda *args: "github")
+    monkeypatch.setattr(
+        supervision.forge,
+        "open_issue_catalog",
+        lambda *args, **kwargs: {
+            "7": {"title": "Landed"},
+            "8": {"title": "Open"},
+        },
+    )
+    manifest = {"root": str(clone), "integration_base": "integration/1"}
+    supervision.refresh_forge_issues(directory, manifest)
+    cache = json.loads((directory / FORGE_ISSUES).read_text())
+    assert cache["integration_closed"] == ["7", "9"]
+    pool = issues.with_forge(directory, issues.snapshot(directory))
+    assert issues.unclaimed(pool) == ["8"]
 
 
 def test_a_forge_only_issue_is_a_pull_offer_and_an_idle_lead(

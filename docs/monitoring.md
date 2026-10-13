@@ -168,12 +168,19 @@ and spends no wake attempt, because the outcome is known from the manifest, so
 the lane is never escalated for it and its backlog waits for the opt-in or
 your own resume. `problems` reports the lane under `wake attention` with the
 command that records the opt-in and the `run --resume` command for your own
-terminal; when several lanes of one project share the gap, they share one row. With it on, the launch adds two native permission rules: `mcp__agent_parley`, which
+terminal; when several lanes of one project share the gap, they share one row. With it on, the launch adds two native permission rules, plus one legacy rule described below: `mcp__agent_parley`, which
 allows this bridge's own coordination tools, and
-`Bash(<interpreter> -m agent_parley.cli *)`, which allows the exact interpreter
+`Bash(<interpreter> -P -m agent_parley.cli *)`, which allows the exact interpreter
 and module the protocol prompt orders every lane to run for `issue claim`,
 `issue list`, `report` and the other CLI commands. Both are spelled from the
-same string the prompt prints, so they cannot drift apart. Nothing else is
+same string the prompt prints, so they cannot drift apart. For release 0.19.0
+only, the launch also adds the legacy rule
+`Bash(<interpreter> -m agent_parley.cli *)`, the spelling earlier releases
+ordered, and the watcher answers a prompt for either spelling, so a lane
+launched before the upgrade, whose prompt text and allow rule name the legacy
+form, is not parked by the move to `-P`. The release after 0.19.0 drops the
+legacy rule and its watcher match; restart any lane still running from an
+earlier release before upgrading past 0.19.0. Nothing else is
 allowed: no file tool, no other shell command, no other MCP server, no bypass
 flag and no weakened decision. A lane launched before you recorded the opt-in
 still draws the shell prompt for that command; its watcher reads the opt-in

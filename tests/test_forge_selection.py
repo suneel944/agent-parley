@@ -113,6 +113,26 @@ def test_github_reads_whether_the_signed_in_account_holds_an_issue(
     assert forge.assigned(repo, "568") is None
 
 
+def test_the_open_issue_catalog_records_the_forge_update_time(
+    repo, monkeypatch
+):
+    calls = []
+    reply = (
+        '[{"number": 7, "title": "Reopened", "labels": [], "assignees": [],'
+        ' "updatedAt": "2026-10-13T10:00:00Z"},'
+        ' {"number": 8, "title": "Plain", "labels": [], "assignees": []}]'
+    )
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    monkeypatch.setattr(
+        forge, "_run", lambda args, timeout: calls.append(args) or reply
+    )
+    catalog = forge.open_issue_catalog(repo)
+    assert "updatedAt" in calls[0][calls[0].index("--json") + 1]
+    assert catalog["7"]["updated_at"] == 1791885600.0
+    assert "updated_at" not in catalog["8"]
+
+
 @pytest.mark.parametrize(
     ("stderr", "kind"),
     [

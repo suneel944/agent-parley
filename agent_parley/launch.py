@@ -643,7 +643,7 @@ reported.
                 }
                 if dialogs.pre_approved(data, agent):
                     native["permissions"] = {
-                        "allow": [protocol.TOOL_PREFIX, protocol.cli_rule()]
+                        "allow": [protocol.TOOL_PREFIX, *protocol.cli_rules()]
                     }
                 if dialogs.auto_mode(data, agent):
                     native.setdefault("permissions", {})["defaultMode"] = "auto"

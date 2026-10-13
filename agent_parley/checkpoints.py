@@ -1911,8 +1911,9 @@ def bridge_invocation(words: list[str]) -> bool:
     """Reports whether one simple command runs this bridge's own CLI.
 
     The installed console script and the protocol form a lane is ordered to
-    run, an interpreter followed by ``-m agent_parley.cli``, reach the same
-    code, so an exemption granted to one is granted to the other.
+    run, an interpreter followed by ``-m agent_parley.cli`` with or without
+    ``-P`` before it, reach the same code, so an exemption granted to one is
+    granted to the other.
 
     Args:
         words: Tokenized simple command with its wrappers already stripped.
@@ -1926,7 +1927,8 @@ def bridge_invocation(words: list[str]) -> bool:
     executable = Path(words[0]).name
     if executable == BRIDGE_COMMAND:
         return True
-    return words[1:3] == ["-m", protocol.CLI_MODULE] and (
+    module = words[2:4] if words[1:2] == ["-P"] else words[1:3]
+    return module == ["-m", protocol.CLI_MODULE] and (
         words[0] == sys.executable
         or bool(re.fullmatch(r"python[0-9.]*(\.exe)?", executable))
     )
