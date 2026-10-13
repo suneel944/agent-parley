@@ -2495,7 +2495,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         report = subprocess.run(
             [str(executable), "doctor"],
             cwd=tmp_path,
-            env=environment,
+            env={**environment, "HOME": str(tmp_path / "doctor-home")},
             capture_output=True,
             text=True,
             check=False,

@@ -467,6 +467,7 @@ reported.
                 is unknown, or a ``copilot`` lane's profile already runs
                 another live lane's hooks.
         """
+        from agent_parley import plugins, records
         from agent_parley.cli import (
             COPILOT_EVENTS,
             LAUNCH_LOCK_SECONDS,
@@ -535,15 +536,32 @@ reported.
                 f"Install and sign in to the native {entry['command']} CLI "
                 "first."
             )
-        manifest = protocol.manifests(protocol.plugin_root()).get(
+        loaded = None
+        if entry["adapter"] in plugins.HOME_ENV:
+            selected = account.get(entry.get("home_env", ""))
+            loaded = plugins.installed_manifest(
+                entry["adapter"],
+                Path(selected)
+                if selected
+                else Path(records.DEFAULT_HOMES[entry["adapter"]]).expanduser(),
+            )
+        manifest = loaded or protocol.manifests(protocol.plugin_root()).get(
             entry["adapter"]
         )
         if manifest is not None and manifest.exists():
-            declared = protocol.installed(manifest)
-            if not protocol.compatible(declared):
+            reading = plugins.assessed(manifest)
+            if reading["state"] == protocol.MISMATCH:
                 raise BridgeError(
-                    protocol.mismatch("installed plugin", declared),
+                    protocol.mismatch("installed plugin", reading["protocol"]),
                     next_command="agent-parley plugins install",
+                )
+            if loaded and reading["state"] == protocol.STALE:
+                print(
+                    f"The {entry['adapter']} plugin this lane loads is "
+                    f"{reading['version'] or 'of unknown version'}, the "
+                    f"launcher is {protocol.launcher_version()}. "
+                    f"{protocol.UPDATE}",
+                    file=sys.stderr,
                 )
         missing = [
             event
