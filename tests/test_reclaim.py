@@ -740,6 +740,8 @@ def test_an_unattributed_stray_moves_and_is_reclaimed_once_landed(
 
     planned = bridge.relocate_worktrees(repo)
     moved = bridge.relocate_worktrees(repo, apply=True)
+    assert worktree_of(moved, clean)["moved"] is True, moved
+    assert worktree_of(moved, dirty)["moved"] is True, moved
     for name in ("kyc-walk-baseline", "fix-1871"):
         aged(strayed(idle, name))
     swept = bridge.reclaim_worktrees(repo, apply=True)
@@ -749,7 +751,6 @@ def test_an_unattributed_stray_moves_and_is_reclaimed_once_landed(
     assert plan["reason"] == reclaim.ADRIFT
     assert plan["destination"] == str(strayed(idle, "kyc-walk-baseline"))
     assert worktree_of(planned, dirty)["relocate"] is True
-    assert worktree_of(moved, clean)["moved"] is True
     assert not clean.exists()
     assert not dirty.exists()
     gone = worktree_of(swept, strayed(idle, "kyc-walk-baseline"))

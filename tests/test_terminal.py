@@ -706,10 +706,13 @@ def test_a_resumed_lane_keeps_its_wake_log_under_the_cap():
         lane = directory / "lane"
         lane.mkdir()
         log = directory / "lane-wake.log"
+        chunk = 1 << 16
+        chunks = (terminal.LOG_LIMIT * 2 + terminal.LOG_LIMIT // 2) // chunk
         script = (
-            "import os\nline = b'x' * 1023 + b'\\n'\n"
-            "for _ in range(10240):\n"
-            "    os.write(1, line)\n"
+            f"import sys\nline = b'x' * {chunk - 1} + b'\\n'\n"
+            f"for _ in range({chunks}):\n"
+            "    sys.stdout.buffer.write(line)\n"
+            "sys.stdout.buffer.flush()\n"
             "print('DONE', flush=True)\n"
         )
         with log.open("ab") as output:

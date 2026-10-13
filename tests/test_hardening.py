@@ -323,3 +323,23 @@ def test_the_hook_module_imports_without_launcher_only_dependencies():
         timeout=30,
     ).stdout.strip()
     assert loaded == "[]"
+
+
+def test_the_suite_reads_only_its_own_git_configuration(tmp_path):
+    listed = subprocess.run(
+        ["git", "config", "--show-scope", "--list"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout.splitlines()
+    assert sorted(listed) == [
+        "global\tcommit.gpgsign=false",
+        "global\tgc.auto=0",
+        "global\tinit.defaultbranch=main",
+        "global\tmaintenance.auto=false",
+        "global\ttag.gpgsign=false",
+        "global\tuser.email=test@example.com",
+        "global\tuser.name=Bridge Test",
+    ]

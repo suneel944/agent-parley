@@ -1275,9 +1275,35 @@ def test_the_evidence_phase_refuses_a_minor_release_by_name(
     release.main()
 
 
-def test_the_acceptance_suite_passes_on_this_commit():
-    root = Path(__file__).resolve().parents[1]
-    assert release.run_acceptance_suite(root) == ""
+def test_a_passing_acceptance_suite_run_reports_nothing(tmp_path, monkeypatch):
+    (tmp_path / "test_tiny.py").write_text("def test_tiny():\n    pass\n")
+    monkeypatch.setattr(release, "ACCEPTANCE_SUITE", "test_tiny.py")
+    assert release.run_acceptance_suite(tmp_path) == ""
+
+
+def test_a_failing_acceptance_suite_run_reports_its_last_line(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "test_tiny.py").write_text("def test_tiny():\n    fail\n")
+    monkeypatch.setattr(release, "ACCEPTANCE_SUITE", "test_tiny.py")
+    assert release.run_acceptance_suite(tmp_path).startswith("1 failed")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.TimeoutExpired(["pytest"], 600),
+        OSError("no interpreter"),
+    ],
+)
+def test_an_acceptance_suite_that_cannot_finish_names_why(
+    tmp_path, monkeypatch, error
+):
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(release.subprocess, "run", fail)
+    assert release.run_acceptance_suite(tmp_path) == str(error)
 
 
 def test_the_version_workflow_gates_the_release_on_evidence():
