@@ -129,9 +129,10 @@ two independent checks, the configured chat identifier and a passcode read from
 the environment at service start; only a salted digest of that passcode is held
 in memory, it is compared with `hmac.compare_digest`, and it is never written to
 state, to the event log or to the service log. A message failing either check is
-dropped in silence. Five failures inside ten minutes lock the path for an hour
-and emit one outbound notification; the counter and the lock are process memory
-and are forgotten on restart. A passcode that is unset or shorter than twelve
+dropped in silence. Five failures from one sender inside ten minutes lock that
+sender out for an hour and emit one outbound notification; the failure times
+and the lock persist per sender in `inbound-gate.json` in the state root, with
+no passcode material, so a restart keeps them. A passcode that is unset or shorter than twelve
 characters stops the poller from starting at all and is reported by `status` as
 a configuration fault rather than leaving a dead poller behind.
 

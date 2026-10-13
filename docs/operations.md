@@ -2538,10 +2538,23 @@ no webhook is registered. A message must start with the passcode, come from the
 configured chat, and carry `status` with the filters `agent-parley status`
 takes; the reply is that reading.
 
+A private chat with the operator is the supported shape. In a group chat every
+member could answer, so the reader refuses to start until
+`AGENT_PARLEY_TELEGRAM_USERS` (or `notify setup --users`) lists the numeric
+Telegram user ids allowed to answer; a message or tap from anyone else is
+dropped without counting toward the lock. Telegram's default privacy mode keeps
+plain group messages from the bot, so typed queries in a group arrive only
+after privacy mode is disabled with BotFather.
+
 The bot also takes answers to decisions. A tap on a decision's button is
-admitted without a passcode, because only a member of the configured chat can
-tap a button the bot posted there, and only for an open decision this state
-root issued; a tap from any other chat is dropped. A typed answer is
+admitted without a passcode, because only the chat's allowed users can tap a
+button the bot posted there, and only for the open occurrence of a decision
+this state root issued that the button was posted for; a tap from any other
+chat is dropped. A decision that reopens after it was answered, closed or
+expired keeps its identifier but gets a new occurrence nonce, carried by its
+buttons and its digest's `decision:` line, so a button, confirm button or reply
+from the earlier occurrence is refused as replaced and its row is removed from
+the message; a typed `decide ID` answers the current occurrence. A typed answer is
 `decide ID OPTION [NOTE]` after the passcode, or a reply to a message that
 holds exactly one decision, starting with the option. The answer is recorded
 under the decision lock, so of two answers racing the second is refused with
@@ -2556,9 +2569,12 @@ A note is quoted in that mail and labelled as not an instruction. Nothing
 else crosses the channel: no claim, handoff, approval or free text is carried
 out for a lane, and nothing is typed into a session except the option key of
 a native dialog, described below. A message from another chat, or with a
-wrong passcode, gets no reply. Five wrong passcodes inside ten
-minutes lock the inbound path for an hour and send one `inbound_locked`
-notification; the counter and the lock live only in memory. Only a salted hash
+wrong passcode, gets no reply. Five wrong passcodes from one sender inside ten
+minutes lock that sender out for an hour and send one `inbound_locked`
+notification. The failure times and the lock are kept per sender in
+`inbound-gate.json` in the state root, owner-only and without any passcode or
+guess, so a service restart keeps them, and `status` shows the inbound path
+as locked with its expiry while a lock holds. Only a salted hash
 of the passcode is held, compared in constant time, and never written to state
 or logs. The reader refuses to start when the passcode is unset or too short,
 and `status` prints that fault on its `Inbound:` line and under `inbound` in

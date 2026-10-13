@@ -42,6 +42,7 @@ def test_a_repeat_observation_refreshes_the_one_open_decision(tmp_path):
     first = opened(tmp_path, now=100.0)
     again = opened(tmp_path, now=200.0)
     assert again["id"] == first["id"]
+    assert again["nonce"] == first["nonce"]
     assert again["refreshed"] == 200.0
     assert again["expires"] == 200.0 + decisions.DEFAULT_TTL
     assert [
@@ -101,9 +102,10 @@ def test_due_decisions_go_out_as_one_digest_with_a_row_each(tmp_path, sent):
     assert "accept (recommended)" in sent[0]["body"]
     rows = sent[0]["markup"]["inline_keyboard"]
     assert [button["callback_data"] for button in rows[0]] == [
-        f"d:{first['id']}:0",
-        f"d:{first['id']}:1",
+        f"d:{first['id']}.{first['nonce']}:0",
+        f"d:{first['id']}.{first['nonce']}:1",
     ]
+    assert f"decision: {first['id']}.{first['nonce']} " in sent[0]["body"]
     assert rows[0][0]["text"] == "accept *"
     assert all(
         len(button["callback_data"].encode()) <= 64
