@@ -1,6 +1,5 @@
 """Observes lane availability and reminds holders about waiting peers."""
 
-import collections
 import contextlib
 import contextvars
 import copy
@@ -2536,6 +2535,8 @@ def _idle_leads(
     backtest or a long CI loop, and naming such a claim offered running work
     to other lanes. A claim its holder reported blocked, including one held
     on purpose until an operator decides, is not active and is never named.
+    Nor is a claim whose holder `holder_held` reports held by an operator
+    decision, a blocked lane state or a declared wait.
 
     Args:
         home: Private bridge state root.
@@ -2591,6 +2592,9 @@ def _idle_leads(
         and not record.get("request")
         and lifecycle.state(record)["state"] in lifecycle.ACTIVE
         and now - issues.last_progress(record) >= after
+        and not holder_held(
+            home, directory, manifest["root"], str(record["owner"])
+        )
     )
     return {
         "mail": [f"#{item['id']} from {item['sender']}" for item in mail[:5]],
@@ -3590,17 +3594,26 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
                 if timing["budget_exceeded"]
                 else f"is overdue by {timing['overdue_seconds']}s"
             )
+            execution = lifecycle.state(record)
+            blocker = execution.get("blocker") or {}
+            reason = (
+                blocker.get("reason") if isinstance(blocker, dict) else blocker
+            ) or "a recorded condition"
+            outcome = (
+                f"It is blocked on {reason}; the supervisor does not move it, "
+                f"and {holder} keeps it until it resolves, hands it on or "
+                "releases it."
+                if execution["state"] == lifecycle.BLOCKED
+                else f"{holder} still owns it while it works. Hand it off or "
+                "release it explicitly; a holder that stays silent is woken, "
+                "then offered away, then released by the supervisor."
+            )
             record["deadline_notice"] = {
                 "id": identifier,
                 "holder": holder,
                 "waiting": waiting,
                 "created": time.time(),
-                "text": (
-                    f"Issue #{number} {cause}. {holder} still owns it while "
-                    "it works. Hand it off or release it explicitly; a holder "
-                    "that stays silent is woken, then offered away, then "
-                    "released by the supervisor."
-                ),
+                "text": f"Issue #{number} {cause}. {outcome}",
             }
             changed = True
         if changed:
@@ -3761,6 +3774,79 @@ def holder_silent(
     if silence is None:
         return bool(observed.get("stale"))
     return silence >= window
+
+
+def holder_held(home: Path, directory: Path, root: str, name: str) -> str:
+    """States why a holder's quiet is not its own to end, if it is not.
+
+    The wake gate holds every wake of a lane with an open permission-denial
+    decision, a lane recorded blocked and a lane inside a wait it declared.
+    Such a lane cannot answer an overdue wake, and the operator or the
+    declared deadline owns its next step, so the supervisor neither moves
+    its claims nor names them to idle peers while that holds.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant holding the claim.
+
+    Returns:
+        The cause holding the lane, or an empty string when nothing does.
+    """
+    if held := denials.waiting(directory, name):
+        return f"blocked: {denials.CAUSE} ({held['id']})"
+    lane = condition(home, root, name) or {}
+    if lane.get("state") == lanes.BLOCKED:
+        return f"blocked: {lane.get('cause', '')}"
+    wait = published_wait(directory, name)
+    if wait and float(wait["until"]) > time.time():
+        return f"waiting on {wait['reason']}"
+    return ""
+
+
+def wake_attempt(
+    home: Path, directory: Path, root: str, name: str, key: str, since: float
+) -> tuple[float, bool]:
+    """Reports the wake attempt that carried one backlog key to a lane.
+
+    The overdue transition used to advance from its wake step on time alone,
+    so a holder the wake gate never woke was offered away as if it had
+    ignored a wake. An attempt counts here only when the dispatcher recorded
+    one whose backlog carries the key, at or after the step. A busy result
+    is not an attempt: the launcher declined it for now and the dispatcher
+    tries again. An unanswered socket, a setup gap or a lane that needs
+    manual attention is an attempt that did not reach the session, which
+    no retry changes, so the transition may go on without claiming the
+    holder was woken.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant the wake is for.
+        key: Backlog key the wake must carry.
+        since: Unix time the wake was asked for.
+
+    Returns:
+        Unix time of the attempt, zero when none was made, and whether it
+        reached the lane's session.
+    """
+    record = wake_record(home, root, name, directory)
+    result = str(record.get("result") or "")
+    at = float(record.get("at", 0) or 0)
+    if (
+        key not in (record.get("backlog") or [])
+        or at < since
+        or not result
+        or result.startswith("busy")
+    ):
+        return 0.0, False
+    return at, result not in (
+        WAKE_UNAVAILABLE,
+        WAKE_ATTENTION,
+        OPT_IN_MISSING,
+    )
 
 
 def idle_claim(
@@ -4054,7 +4140,18 @@ def overdue_claims(
     no progress of its own for `claim_idle_after` takes the same transition
     while its holder stays busy elsewhere, and its wake step tells the holder
     and the lanes waiting on the issue why. Progress recorded on the claim
-    drops the recovery as a tool call does for a silent holder.
+    drops the recovery as a tool call does for a silent holder. A lane's
+    tool calls count as progress on a claim when that claim is the only
+    work the lane can continue, whatever ready, blocked or closed claims it
+    also holds.
+
+    Some quiet is not the holder's to end, and such a claim is not moved:
+    work its holder reported blocked stays with that holder, a handoff the
+    holder offered stands until it is answered or expires, and a holder
+    held by an open denial decision, a blocked lane state or a wait it
+    declared waits for that to clear. A silent holder's wake step advances
+    only once the dispatcher recorded a wake attempt for it, and its window
+    runs from that attempt rather than from the step.
 
     Args:
         home: Private bridge state root.
@@ -4066,35 +4163,43 @@ def overdue_claims(
     from agent_parley import recovery
 
     window = config["inactive_after"]
+    root = manifest["root"]
     now = time.time()
-    ledger = issues.snapshot(directory)["issues"]
-    held = collections.Counter(
-        record.get("owner") for record in ledger.values()
-    )
+    snapshot = issues.snapshot(directory)
+    ledger = snapshot["issues"]
+    workable: dict[str, list[str]] = {}
     for number, record in ledger.items():
         holder = record.get("owner")
         current = record.get("overdue_recovery") or {}
         identifier = f"{number}:{record.get('claim_id')}"
         timing = issues.deadline_state(record, now)
+        ours = current.get("id") == identifier
         idle = 0
         if (
             holder in manifest["participants"]
             and record.get("claim_id")
-            and (current.get("id") == identifier or not record.get("offer"))
+            and (ours or not record.get("offer"))
         ):
+            if holder not in workable:
+                workable[holder] = lifecycle.actionable(snapshot, holder)
             idle = idle_claim(
                 directory,
                 record,
-                held[holder] == 1,
+                workable[holder] == [number],
                 config["claim_idle_after"],
                 now,
             )
         if record.get("claim_id"):
-            _idle_blocker(directory, manifest["root"], ledger, number, idle)
+            _idle_blocker(directory, root, ledger, number, idle)
         if (
             holder not in manifest["participants"]
             or not record.get("claim_id")
             or observed_complete(record)
+            or lifecycle.state(record)["state"] == lifecycle.BLOCKED
+            or (
+                record.get("offer")
+                and not (ours and current.get("step") == "offer")
+            )
             or not (
                 (
                     timing["overdue"]
@@ -4107,17 +4212,35 @@ def overdue_claims(
                 )
                 or idle
             )
+            or holder_held(home, directory, root, holder)
         ):
             if current:
                 _overdue_step(directory, number, identifier, None)
             continue
-        cause = (
-            f"is overdue by {timing['overdue_seconds']}s and {holder} stayed "
-            "silent after a wake"
-            if timing["overdue"] and not idle
-            else f"has recorded no progress for {idle}s while {holder} holds it"
-        )
+        silent = bool(timing["overdue"] and not idle)
         elapsed = now - float(current.get("at", 0) or 0)
+        cause = f"has recorded no progress for {idle}s while {holder} holds it"
+        if silent and ours and current.get("step") == "wake":
+            attempted, delivered = wake_attempt(
+                home,
+                directory,
+                root,
+                holder,
+                f"overdue:{identifier}",
+                float(current.get("at", 0) or 0),
+            )
+            elapsed = now - attempted if attempted else 0.0
+            moment = time.strftime(
+                "%Y-%m-%d %H:%M:%S UTC", time.gmtime(attempted)
+            )
+            cause = (
+                f"is overdue by {timing['overdue_seconds']}s and {holder} "
+                + (
+                    f"stayed silent after a wake delivered at {moment}"
+                    if delivered
+                    else f"could not be woken at {moment}"
+                )
+            )
         if current.get("id") != identifier:
             _overdue_step(
                 directory,
@@ -4159,14 +4282,6 @@ def overdue_claims(
                         if item.get("claim_id") == record.get("claim_id")
                     ),
                     {},
-                )
-            if record.get("offer"):
-                issues.change(
-                    directory,
-                    holder,
-                    "cancel",
-                    number,
-                    participants=set(manifest["participants"]),
                 )
             issues.change(
                 directory,

@@ -186,11 +186,19 @@ silent, meaning its session process is gone or it has run no tool call for the
 project's inactivity window; a holder parked on a dialog only the operator can
 answer is not silent. The second is any claim with no progress of its own for
 `claim_idle_after` (3600 seconds), even while its holder works elsewhere.
-Progress is a report naming the claim, or any tool call when it is the lane's
-only claim. Both take the same steps:
+Progress is a report naming the claim, or any tool call when it is the only
+claim the lane can work on now; its ready, blocked or closed claims do not
+count. Some quiet is not the holder's to end, and such a claim is never moved:
+work its holder reported `blocked`, whose deadline notice says so instead of
+promising a takeover; a handoff the holder offered, until it is answered or
+expires; and a holder with an open denial decision, a lane recorded blocked or
+a `report --state waiting` still in force. Both take the same steps:
 
 1. The supervisor wakes the holder once. For an idle claim, the notice also
-   goes to the lanes waiting on the issue.
+   goes to the lanes waiting on the issue. For a silent holder the next window
+   runs from the wake the dispatcher actually attempted, so a wake still
+   waiting its turn moves nothing, and the offer says whether it reached the
+   holder.
 2. If nothing changes one window later, the supervisor offers the claim to the
    fit, running, unpaused peer below `max_claims_per_lane` that holds the
    fewest claims, with the claim's recovery checkpoint named in the summary
