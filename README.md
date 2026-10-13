@@ -212,7 +212,10 @@ start one: `setup` and `run` stop with "This repository has no commits yet"
 and suggest a first commit. If the checkout has uncommitted or untracked
 changes when the project is first registered, they are stashed, not
 discarded, and the command prints the `git stash apply <entry>` line that
-restores them. Commit first to carry them into the lanes.
+restores them; `run` in a terminal prints it again after the native CLI
+exits. Until the entry is dropped, `agent-parley` in that checkout lists it
+as `Stashed   git stash apply <entry>`. Commit first to carry the changes
+into the lanes.
 
 Prompt the native CLI as you always do. Another account or provider is one
 more terminal. Each tab title names its lane, state and progress, such as

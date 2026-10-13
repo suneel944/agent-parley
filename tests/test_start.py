@@ -116,6 +116,67 @@ def test_dirty_repository_points_at_its_uncommitted_work(
     assert "git status" not in printed
 
 
+def test_registration_stash_is_listed_with_its_restore_command(
+    path, bridge, repo, capsys
+):
+    path("claude")
+    claude_plugin()
+    (repo / "shared.txt").write_text("changed\n")
+    bridge.setup(repo)
+    assert bridge.preserved
+    entry = subprocess.run(
+        ["git", "rev-parse", "refs/stash"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    printed = screen(capsys, bridge.home, repo)
+    assert f"  Stashed   git stash apply {entry}" in printed
+    subprocess.run(["git", "stash", "drop", "-q"], cwd=repo, check=True)
+    assert "Stashed" not in screen(capsys, bridge.home, repo)
+
+
+def test_a_stash_of_other_work_is_not_listed(path, bridge, repo, capsys):
+    path("claude")
+    claude_plugin()
+    bridge.setup(repo)
+    assert not bridge.preserved
+    (repo / "shared.txt").write_text("changed\n")
+    subprocess.run(["git", "stash", "-q"], cwd=repo, check=True)
+    assert "Stashed" not in screen(capsys, bridge.home, repo)
+
+
+@pytest.mark.parametrize("attached", [True, False])
+def test_run_repeats_the_stash_notice_after_an_attached_client_exits(
+    bridge, repo, monkeypatch, capsys, attached
+):
+    def launch(self, *args, **kwargs):
+        self.preserved = "Preserved your pending changes as stash entry abc"
+        print("client ran", file=sys.stderr)
+        return 0
+
+    monkeypatch.setattr(cli.Bridge, "launch", launch)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: attached)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "run",
+            "claude",
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() == 0
+    error = capsys.readouterr().err
+    repeated = error.split("client ran", 1)[1]
+    assert ("stash entry abc" in repeated) is attached
+
+
 def test_no_native_cli_offers_the_demo(path, repo, tmp_path, capsys):
     printed = screen(capsys, tmp_path / "home", repo)
     assert "CLIs      none on PATH (claude, codex)" in printed

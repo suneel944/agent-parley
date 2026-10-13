@@ -9,8 +9,10 @@ Every reading is read-only and local. Nothing starts the service, registers
 a repository, creates the state directory or runs a native CLI: the service
 is judged from its published record and the process that record names, the
 registration from the recorded manifests, and each native CLI's plugin from
-the record that CLI keeps (`plugins.recorded`). The only process started is
-one bounded `git status` in the working directory. For a registered project
+the record that CLI keeps (`plugins.recorded`). The only processes started
+are one bounded `git status` in the working directory and, in a registered
+base checkout, one bounded `git stash list` that finds the entry
+registration made of its pending changes. For a registered project
 whose service runs, the screen also reads what `agent-parley problems`
 would list, from the readings supervision cached, and whether outbound
 notification is configured, so a returning operator learns what needs
@@ -29,6 +31,7 @@ from typing import NamedTuple
 
 from agent_parley import BridgeError, plugins, process
 from agent_parley.status import registered_root
+from agent_parley.worktrees import PENDING_MESSAGE
 
 GIT_SECONDS = 2.0
 DEFAULT_HOME = "~/.local/state/agent-parley"
@@ -52,6 +55,8 @@ class Found(NamedTuple):
         lanes: How many lanes the project has registered.
         unborn: Whether the checkout's branch has no commit yet, so no
             lane can start from it.
+        stash: Commit of the newest stash entry registration made of the
+            base checkout's pending changes, empty when there is none.
     """
 
     repository: bool
@@ -63,6 +68,7 @@ class Found(NamedTuple):
     notify: bool = True
     lanes: int = 0
     unborn: bool = False
+    stash: str = ""
 
 
 def checkout(directory: Path) -> tuple[bool, bool | None, bool]:
@@ -118,6 +124,48 @@ def checkout(directory: Path) -> tuple[bool, bool | None, bool]:
         len(headers) < len(lines),
         "# branch.oid (initial)" in headers,
     )
+
+
+def stashed(root: Path) -> str:
+    """Finds the stash entry registration made of a checkout's pending work.
+
+    `worktrees.preserve_pending` stashes with a message that starts with
+    `worktrees.PENDING_MESSAGE`; Git records it after an ``On <branch>: ``
+    prefix, and a branch name cannot hold a colon. The entry stays listed
+    until it is dropped, because ``git stash apply`` keeps it.
+
+    Args:
+        root: Base checkout the project was registered from.
+
+    Returns:
+        The newest such entry's commit, or an empty string when there is
+        none or Git did not answer within `GIT_SECONDS`.
+    """
+    try:
+        finished = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "stash",
+                "list",
+                "--format=%H %s",
+            ],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if finished.returncode:
+        return ""
+    for line in finished.stdout.splitlines():
+        entry, _, subject = line.partition(" ")
+        if subject.partition(": ")[2].startswith(PENDING_MESSAGE):
+            return entry
+    return ""
 
 
 def serving(home: Path) -> bool:
@@ -199,8 +247,16 @@ def look(home: Path, directory: Path) -> Found:
         client.name: plugins.recorded(client.name)
         for client, _ in plugins.detected()
     }
+    resolved = directory.resolve()
+    base = bool(root) and Path(root) in (resolved, *resolved.parents)
     found = Found(
-        repository, dirty, bool(root), clis, serving(home), unborn=unborn
+        repository,
+        dirty,
+        bool(root),
+        clis,
+        serving(home),
+        unborn=unborn,
+        stash=stashed(Path(root)) if base else "",
     )
     if not (root and found.service):
         return found
@@ -335,6 +391,11 @@ def render(found: Found) -> str:
             "",
             "Found:",
             f"  Here      {repository}",
+            *(
+                [f"  Stashed   git stash apply {found.stash}"]
+                if found.stash
+                else []
+            ),
             "  Project   "
             + ("registered" if found.registered else "not registered"),
             f"  CLIs      {clis}",
