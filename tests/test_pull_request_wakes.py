@@ -124,8 +124,55 @@ def test_becoming_mergeable_after_a_rebase_wakes_the_lane(
     )
     observe(bridge, project, monkeypatch, reading(project, sha=NEXT))
     notices = received(bridge, "claude")
+    assert len(notices) == 2
+    assert "merge state is now CONFLICTING" in notices[0]
+    assert "merge state is now MERGEABLE" in notices[1] and NEXT in notices[1]
+
+
+def test_a_conflict_reached_through_unknown_wakes_the_lane_once(
+    bridge, project, monkeypatch
+):
+    for state in ["MERGEABLE", "UNKNOWN", "CONFLICTING", "UNKNOWN"]:
+        observe(bridge, project, monkeypatch, reading(project, mergeable=state))
+    observe(
+        bridge, project, monkeypatch, reading(project, mergeable="CONFLICTING")
+    )
+    notices = received(bridge, "claude")
     assert len(notices) == 1
-    assert "merge state is now MERGEABLE" in notices[0] and NEXT in notices[0]
+    assert "merge state is now CONFLICTING" in notices[0]
+
+
+def test_a_green_pull_request_first_seen_conflicting_wakes_once(
+    bridge, project, monkeypatch
+):
+    conflicting = reading(project, mergeable="CONFLICTING")
+    observe(bridge, project, monkeypatch, {**conflicting, "checks": "green"})
+    observe(bridge, project, monkeypatch, {**conflicting, "checks": "green"})
+    notices = received(bridge, "claude")
+    assert len(notices) == 1
+    assert "merge state is now CONFLICTING" in notices[0]
+
+
+def test_the_merge_state_compares_against_the_last_settled_reading():
+    def reading_of(state):
+        return {
+            "checks": "pending",
+            "sha": "a",
+            "failing": [],
+            "reviews": [],
+            "mergeable": state,
+        }
+
+    changes = supervision._pull_request_changes
+    settled = {**reading_of("UNKNOWN"), "mergeable_settled": "MERGEABLE"}
+    assert changes({}, reading_of("CONFLICTING")) == [
+        "merge state is now CONFLICTING"
+    ]
+    assert changes(reading_of("MERGEABLE"), reading_of("UNKNOWN")) == []
+    assert changes(settled, reading_of("CONFLICTING")) == [
+        "merge state is now CONFLICTING"
+    ]
+    assert changes({}, reading_of("MERGEABLE")) == []
 
 
 def test_nothing_changed_wakes_nobody(bridge, project, monkeypatch):
