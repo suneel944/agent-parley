@@ -333,6 +333,37 @@ def ready_groups(
     )
 
 
+def _revoked(
+    history: dict, state: dict, document: dict
+) -> list[tuple[str, str, str]]:
+    """Names the revision-removed edges applying a plan file would restore.
+
+    An edge counts while the latest retained version that touched it is an
+    accepted revision that removed it, the ledger no longer records it, and
+    the file lists it.
+
+    Args:
+        history: Recorded plan versions.
+        state: Published issue ledger.
+        document: Plan file as `read` returns it.
+
+    Returns:
+        Each edge as its issue, its blocker and the identifier of the
+        proposal that removed it, in edge order.
+    """
+    removed: dict[tuple[str, str], str] = {}
+    for version in history["versions"]:
+        for edge in version.get("added", []):
+            removed.pop(tuple(edge), None)
+        for edge in version.get("removed", []):
+            removed[tuple(edge)] = version.get("proposal", "")
+    return sorted(
+        (issue, blocker, removed[(issue, blocker)])
+        for issue, blocker in planned(document) - edges(state)
+        if (issue, blocker) in removed
+    )
+
+
 def diff(directory: Path, path: Path) -> dict:
     """Reports the edges a plan file would add, and those it does not name.
 
@@ -341,20 +372,24 @@ def diff(directory: Path, path: Path) -> dict:
         path: Plan file to compare against the ledger.
 
     Returns:
-        The plan's name and digest, the edges applying it would add, and the
-        recorded edges the file does not name, which applying never removes.
+        The plan's name and digest, the edges applying it would add, the
+        recorded edges the file does not name, which applying never removes,
+        and the edges to add that an accepted revision removed, each with
+        the proposal that removed it, which applying refuses without force.
 
     Raises:
         BridgeError: If the plan file is unusable.
     """
     document = read(path)
-    current = edges(snapshot(directory))
+    state = snapshot(directory)
+    current = edges(state)
     intended = planned(document)
     return {
         "plan": document["name"],
         "digest": document["digest"],
         "add": sorted(intended - current),
         "unlisted": sorted(current - intended),
+        "revoked": _revoked(recorded(directory), state, document),
     }
 
 
@@ -373,7 +408,12 @@ def _blank() -> dict:
     }
 
 
-def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
+def apply(
+    directory: Path,
+    path: Path,
+    actor: str = roster.OPERATOR,
+    force: bool = False,
+) -> dict:
     """Records a plan's dependencies and the version that recorded them.
 
     Applying authorizes every issue the plan names and adds edges. An edge to
@@ -388,17 +428,26 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
     starts a new plan version, which leaves every open proposal stale and
     resets the automatic revision count and the contradiction record.
 
+    An apply that would restore an edge an accepted revision removed is
+    refused unless forced, so a re-applied file never silently undoes a
+    decision. Re-applying the file the latest whole-plan version recorded,
+    when it would add no edge and authorize no issue, is a replay: it
+    writes nothing and keeps open proposals and the revision counts.
+
     Args:
         directory: Private state directory for the common repository.
         path: Plan file to apply.
         actor: Identity recorded with the version, the operator by default.
+        force: Whether to restore edges accepted revisions removed.
 
     Returns:
-        The recorded version and the edges this apply added.
+        The recorded version and the edges this apply added, or the latest
+        version marked `replayed` when the apply changed nothing.
 
     Raises:
         BridgeError: If the plan file is unusable, an edge would close a
-            dependency cycle, or the ledger cannot be locked.
+            dependency cycle, an unforced apply would restore an edge a
+            revision removed, or the ledger cannot be locked.
     """
     document = read(path)
     with (
@@ -409,6 +458,18 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
         if _recover(directory, history):
             write_json(directory / PLAN, history)
         state = snapshot(directory)
+        restored = _revoked(history, state, document)
+        if restored and not force:
+            raise BridgeError(
+                "Applying this plan would restore edges accepted revisions "
+                "removed: "
+                + "; ".join(
+                    f"#{issue} waits on #{blocker} (proposal {proposal})"
+                    for issue, blocker, proposal in restored
+                )
+                + ". Drop them from the file, or pass --force to restore "
+                "them."
+            )
         added = []
         approved = set(document["dependencies"])
         approved.update(
@@ -420,6 +481,10 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
             member
             for members in document["groups"].values()
             for member in members
+        )
+        fresh = any(
+            not lifecycle.state(state["issues"].get(issue, {}))["authorized"]
+            for issue in approved
         )
         for issue in sorted(approved, key=int):
             record = state["issues"].setdefault(issue, _blank())
@@ -448,6 +513,20 @@ def apply(directory: Path, path: Path, actor: str = roster.OPERATOR) -> dict:
                     "issues; drop one with issue unblock."
                 )
             record["blocked_by"] = sorted(waiting, key=int)
+        baseline: dict = next(
+            (
+                version
+                for version in reversed(history["versions"])
+                if "proposal" not in version
+            ),
+            {},
+        )
+        if (
+            baseline.get("digest") == document["digest"]
+            and not added
+            and not fresh
+        ):
+            return {**history["versions"][-1], "replayed": True}
         if approved:
             state["revision"] += 1
             write_json(directory / "issues.json", state)
@@ -1215,6 +1294,11 @@ def render_diff(reported: dict) -> str:
         lines.append(f"  add: #{issue} waits on #{blocker}")
     for issue, blocker in reported["unlisted"]:
         lines.append(f"  unlisted: #{issue} waits on #{blocker}")
+    for issue, blocker, proposal in reported.get("revoked", []):
+        lines.append(
+            f"  revoked: #{issue} waits on #{blocker} was removed by "
+            f"proposal {proposal}; apply refuses it without --force"
+        )
     if len(lines) == 1:
         lines.append("  The ledger already matches this plan.")
     return "\n".join(lines)

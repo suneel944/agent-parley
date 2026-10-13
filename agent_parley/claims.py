@@ -916,7 +916,11 @@ class ClaimsMixin(ReportsMixin):
         }
 
     def work_plan(
-        self, repo: Path, action: str, path: Path | None = None
+        self,
+        repo: Path,
+        action: str,
+        path: Path | None = None,
+        force: bool = False,
     ) -> dict:
         """Applies, compares or reports the repository's work-order plan.
 
@@ -932,6 +936,7 @@ class ClaimsMixin(ReportsMixin):
                 for apply.
             action: Apply, diff, or show.
             path: Plan file for apply and diff.
+            force: Whether apply restores edges accepted revisions removed.
 
         Returns:
             The recorded version for apply, the comparison for diff, or the
@@ -961,7 +966,7 @@ class ClaimsMixin(ReportsMixin):
                     "checkout, because a plan sets the revision envelope "
                     "lanes are held to."
                 )
-        return plan.apply(directory, path)
+        return plan.apply(directory, path, force=force)
 
     def plan_revision(
         self,

@@ -591,13 +591,17 @@ the project base checkout; a lane's `plan apply` is refused, because the plan's
 `plan show` prints the applied plan as an indented tree, each issue under the
 issues it waits on, with its current owner and any recorded forge title beside
 it. Each apply records a version carrying the file's digest and the identity
-that applied it, and the twenty most recent versions are kept.
+that applied it, and the twenty most recent versions are kept. Re-applying
+the file the latest apply recorded, when it would add no edge, records
+nothing and keeps open revision proposals and the revision budget.
 
 Applying adds edges and never removes one. An edge entered with `issue block`
 after the apply is listed as `recorded by hand`, and an edge the file no longer
 names stays in the ledger and is reported by `plan diff` as `unlisted` until
 `issue unblock` removes it, so the document and the ledger never silently
-disagree.
+disagree. An edge an accepted revision removed is not restored by a later
+apply: `plan diff` lists it as `revoked` with the removing proposal, and
+`plan apply` refuses until the file drops it or `--force` restores it.
 
 A plan that names a malformed issue number, exceeds a bound, or describes a
 dependency cycle is refused before any edge is written. The cycle check covers
