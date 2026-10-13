@@ -125,8 +125,8 @@ def test_a_silent_holder_is_woken_then_offered_away_then_released(
     assert woken["attempts"] == 1
     assert woken["history"][-1]["action"] == "overdue-wake"
 
-    aged(directory)
     assert step(bridge, directory, paired)["offer"] is None
+    aged(directory)
     woke(bridge, directory, paired, woken)
     offered = step(bridge, directory, paired)
     assert offered["owner"] == "claude"
@@ -399,6 +399,20 @@ def test_a_wake_that_could_not_reach_the_holder_says_so(bridge, paired):
     summary = step(bridge, directory, paired)["offer"]["summary"]
     assert "could not be woken at" in summary
     assert "after a wake" not in summary
+
+
+def test_a_wake_never_attempted_advances_one_window_after_the_step(
+    bridge, paired
+):
+    directory = overdue(bridge, paired)
+    step(bridge, directory, paired)
+    aged(directory)
+    asked = issues.snapshot(directory)["issues"]["7"]["overdue_recovery"]["at"]
+    offered = step(bridge, directory, paired)
+    moment = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(asked + WINDOW))
+    assert offered["offer"]["to"] == "codex"
+    assert f"could not be woken at {moment}" in offered["offer"]["summary"]
+    assert offered["history"][-1]["action"] == "overdue-offer"
 
 
 def test_a_declared_wait_holds_the_overdue_transition(bridge, paired):

@@ -4149,9 +4149,12 @@ def overdue_claims(
     work its holder reported blocked stays with that holder, a handoff the
     holder offered stands until it is answered or expires, and a holder
     held by an open denial decision, a blocked lane state or a wait it
-    declared waits for that to clear. A silent holder's wake step advances
-    only once the dispatcher recorded a wake attempt for it, and its window
-    runs from that attempt rather than from the step.
+    declared waits for that to clear. A silent holder's wake step waits for
+    the dispatcher to record a wake attempt, and its window runs from that
+    attempt rather than from the step. A holder no attempt reached within
+    one window of the step, because the wake was refused or found nothing
+    to send, advances then as one that could not be woken, so the claim
+    never stays parked on a wake that will not come.
 
     Args:
         home: Private bridge state root.
@@ -4221,15 +4224,20 @@ def overdue_claims(
         elapsed = now - float(current.get("at", 0) or 0)
         cause = f"has recorded no progress for {idle}s while {holder} holds it"
         if silent and ours and current.get("step") == "wake":
+            asked = float(current.get("at", 0) or 0)
             attempted, delivered = wake_attempt(
                 home,
                 directory,
                 root,
                 holder,
                 f"overdue:{identifier}",
-                float(current.get("at", 0) or 0),
+                asked,
             )
-            elapsed = now - attempted if attempted else 0.0
+            if not attempted or attempted > asked + window:
+                attempted, delivered = asked + window, False
+                elapsed = now - asked
+            else:
+                elapsed = now - attempted
             moment = time.strftime(
                 "%Y-%m-%d %H:%M:%S UTC", time.gmtime(attempted)
             )
