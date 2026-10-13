@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts import codex_bundle, release_artifacts
 from scripts.codex_bundle import build
 from scripts.release_artifacts import checksums, release_notes
 from scripts.release_publish import asset_names, verify_assets
@@ -108,3 +109,80 @@ def test_package_description_shows_the_video_as_a_still_frame(tmp_path):
         description,
     )
     assert (ROOT / "docs/assets/launch.webp").is_file()
+
+
+@pytest.fixture
+def source_tree(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    for name in (
+        "pyproject.toml",
+        "CHANGELOG.md",
+        "scripts/install.sh",
+        ".agents/plugins/marketplace.json",
+        ".claude-plugin/marketplace.json",
+    ):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, root / name)
+    shutil.copytree(ROOT / "plugins", root / "plugins")
+    version = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+        "version"
+    ]
+    (root / "dist").mkdir()
+    for name in (
+        f"agent_parley-{version}-py3-none-any.whl",
+        f"agent_parley-{version}.tar.gz",
+    ):
+        (root / "dist" / name).write_text(f"Package: {name}\n")
+
+    def export(command, **kwargs):
+        Path(command[command.index("--output-file") + 1]).write_text("")
+        return subprocess.CompletedProcess(command, 0)
+
+    def codex(source, output):
+        archive = output / f"agent-parley-{version}-codex-skills.zip"
+        archive.write_text("codex\n")
+        return archive
+
+    monkeypatch.setattr(
+        release_artifacts, "__file__", str(root / "scripts" / "x.py")
+    )
+    monkeypatch.setattr(release_artifacts.subprocess, "run", export)
+    monkeypatch.setattr(codex_bundle, "build", codex)
+    monkeypatch.delenv("RELEASE_TAG", raising=False)
+    return root, version
+
+
+def test_main_writes_every_asset_under_its_release_name(source_tree):
+    root, version = source_tree
+    release_artifacts.main()
+    output = root / "dist" / "release"
+    assert {path.name for path in output.iterdir()} == asset_names(version) | {
+        "SHA256SUMS"
+    }
+    assert verify_assets(output, version) != ""
+    (output / "install.sh").write_text("tampered\n")
+    with pytest.raises(ValueError):
+        verify_assets(output, version)
+
+
+def test_main_rejects_a_tag_that_differs_from_the_package(
+    source_tree, monkeypatch
+):
+    monkeypatch.setenv("RELEASE_TAG", "v0.0.0")
+    with pytest.raises(ValueError, match="Release tag"):
+        release_artifacts.main()
+
+
+def test_main_rejects_a_plugin_on_another_version(source_tree):
+    root, _ = source_tree
+    manifest = root / "plugins/agent-parley/.codex-plugin/plugin.json"
+    manifest.write_text('{"version": "0.0.0"}')
+    with pytest.raises(ValueError, match="codex plugin"):
+        release_artifacts.main()
+
+
+def test_main_fails_without_the_built_packages(source_tree):
+    root, _ = source_tree
+    shutil.rmtree(root / "dist")
+    with pytest.raises(FileNotFoundError):
+        release_artifacts.main()

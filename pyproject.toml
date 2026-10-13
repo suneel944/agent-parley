@@ -70,6 +70,7 @@ include = ["/agent_parley", "/plugins", "/tests", "/scripts", "/docs", "/README.
 dev = [
     "pytest>=8.3,<10",
     "pytest-xdist>=3.6,<4",
+    "pytest-cov>=6,<8",
     "pyyaml>=6,<7",
     "ruff>=0.14,<1",
     "mcp>=2.1.1,<3",
@@ -95,6 +96,13 @@ convention = "google"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["agent_parley", "scripts"]
+
+[tool.coverage.report]
+skip_covered = true
+fail_under = 80
 
 [tool.mypy]
 files = ["agent_parley", "scripts"]

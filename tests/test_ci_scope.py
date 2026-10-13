@@ -49,7 +49,8 @@ def test_docs_and_other_workflows_run_one_ubuntu_leg(paths):
 
 
 @pytest.mark.parametrize(
-    "path", ["scripts/check_policy.py", "tests/test_bridge.py", "Makefile"]
+    "path",
+    ["scripts/check_policy.py", "tests/test_bridge.py", "Makefile", "uv.lock"],
 )
 def test_tooling_runs_every_python_leg_without_wsl(path):
     assert legs(["README.md", path]) == {**EVERY_LEG, "wsl": False}
@@ -60,7 +61,7 @@ def test_tooling_runs_every_python_leg_without_wsl(path):
     [
         "agent_parley/launch.py",
         "tests/test_wsl.py",
-        "uv.lock",
+        "pyproject.toml",
         ".github/workflows/check.yml",
     ],
 )
@@ -109,7 +110,7 @@ def test_a_pushed_version_bump_runs_every_leg_but_wsl():
     [
         (["docs/operations.md"], frozenset()),
         ([*RELEASE, "agent_parley/launch.py"], BUMPS),
-        (RELEASE, BUMPS - {"uv.lock"}),
+        (RELEASE, BUMPS - {"pyproject.toml"}),
     ],
 )
 def test_a_push_runs_wsl_unless_it_only_bumps_versions(paths, bumps):
