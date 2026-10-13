@@ -413,3 +413,129 @@ def test_an_unscoped_table_fails_the_export_instead_of_leaking(
     with pytest.raises(BridgeError, match="No export rule"):
         archive.export(bridge.home, output)
     assert not output.exists()
+
+
+def crafted(
+    source: Path, target: Path, projects: list, extra: dict[str, bytes]
+) -> Path:
+    """Repacks an archive with a new project list and correct digests."""
+    contents = {**members(source), **extra}
+    manifest = json.loads(contents.pop(archive.MANIFEST))
+    manifest["projects"] = projects
+    manifest["files"] = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+    contents[archive.MANIFEST] = json.dumps(manifest).encode()
+    with tarfile.open(target, "w") as tar:
+        for name, data in contents.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return target
+
+
+def test_a_manifest_project_key_outside_projects_is_refused(
+    bridge, repo, tmp_path
+):
+    directory = registered(bridge, repo)
+    root = str(bridge.project(repo)[0])
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+    planted = {"planted/project.json": json.dumps({"root": "/x"}).encode()}
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    for key in ("../planted", "a/b", "..", "", "a\\b"):
+        escape = crafted(
+            output,
+            tmp_path / "escape.tar",
+            [{"key": key, "root": "/x"}],
+            planted,
+        )
+        with pytest.raises(BridgeError, match="project key"):
+            archive.import_archive(home, escape)
+    for projects in (
+        ["oops"],
+        [{"root": "/x"}],
+        [{"key": "k", "root": "relative"}],
+        [{"key": "k", "root": "/x"}, {"key": "k", "root": "/y"}],
+        [{"key": "k", "root": "/x", "participants": ["claude"]}],
+    ):
+        malformed = crafted(output, tmp_path / "bad.tar", projects, {})
+        with pytest.raises(BridgeError):
+            archive.read_manifest(malformed)
+    assert list(home.iterdir()) == []
+
+    moved = crafted(
+        output,
+        tmp_path / "moved.tar",
+        [{"key": directory.name, "root": "/elsewhere"}],
+        {},
+    )
+    with pytest.raises(BridgeError, match="not rooted at /elsewhere"):
+        archive.import_archive(home, moved)
+    assert not (home / "projects" / directory.name).exists()
+    assert not (home / store.DATABASE).exists()
+    result = archive.import_archive(home, output)
+    assert [entry["root"] for entry in result["projects"]] == [root]
+
+
+def test_imported_providers_are_validated_and_never_replace_a_preset(
+    bridge, repo, tmp_path, capsys, monkeypatch
+):
+    registered(bridge, repo)
+    custom = {
+        "adapter": "claude",
+        "command": "claude",
+        "home_env": "CLAUDE_CONFIG_DIR",
+        "env": {"ANTHROPIC_BASE_URL": "https://example.test"},
+        "require_env": ["ANTHROPIC_AUTH_TOKEN"],
+        "budget": {"calls": 10},
+    }
+    write_json(
+        bridge.home / roster.PROVIDERS,
+        {
+            "version": 1,
+            "entries": {
+                "claude": {
+                    **custom,
+                    "command": "/tmp/not-claude",
+                    "env": {"LD_PRELOAD": "/tmp/x.so"},
+                },
+                "leaky": {**custom, "env": {"ANTHROPIC_API_KEY": "x"}},
+                "odd": {**custom, "adapter": "shell"},
+                "custom": custom,
+            },
+        },
+    )
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    result = archive.import_archive(home, output)
+    assert roster.provider(home, "claude") == roster.PRESETS["claude"]
+    assert roster.provider(home, "custom") == custom
+    providers = result["providers"]
+    assert providers["added"] == ["custom"]
+    assert providers["skipped"] == ["claude"]
+    assert [entry["name"] for entry in providers["refused"]] == [
+        "leaky",
+        "odd",
+    ]
+    assert "credential" in providers["refused"][0]["reason"]
+    with pytest.raises(BridgeError, match="Unknown provider"):
+        roster.provider(home, "leaky")
+
+    merged = tmp_path / "merged"
+    merged.mkdir(mode=0o700)
+    roster.define_provider(merged, "mine", "codex", "codex", "", [], [])
+    argv = ["agent-parley", "--home", str(merged), "state", "import"]
+    monkeypatch.setattr(sys, "argv", argv + [str(output), "--merge"])
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "Providers added: custom" in out
+    assert "Providers kept as defined here: claude" in out
+    assert "Provider leaky refused" in out
+    assert roster.provider(merged, "custom") == custom
+    assert roster.provider(merged, "mine")["command"] == "codex"

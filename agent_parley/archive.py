@@ -341,6 +341,61 @@ def _safe_name(name: str) -> str:
     return name
 
 
+def _check_projects(projects: list) -> None:
+    """Refuses manifest project entries an import cannot place safely.
+
+    The manifest carries no digest of its own, so its project keys and roots
+    are as untrusted as the members. A key becomes a directory name below
+    ``projects/`` and must be the single path component `export` writes; a
+    root keys the store rows and must be an absolute path.
+
+    Args:
+        projects: The manifest's ``projects`` list.
+
+    Raises:
+        BridgeError: If an entry is not an object, its key is not one safe
+            path component, its root is not absolute, its participants are
+            not objects, or a key or root repeats.
+    """
+    keys: set[str] = set()
+    roots: set[str] = set()
+    for entry in projects:
+        if not isinstance(entry, dict):
+            raise BridgeError(
+                f"{MANIFEST} lists a project that is not an object."
+            )
+        key = entry.get("key")
+        if (
+            not isinstance(key, str)
+            or key in ("", ".", "..")
+            or "/" in key
+            or "\\" in key
+            or "\x00" in key
+            or key in keys
+        ):
+            raise BridgeError(f"Refusing archive project key {key!r}.")
+        root = entry.get("root")
+        if (
+            not isinstance(root, str)
+            or not PurePosixPath(root).is_absolute()
+            or "\x00" in root
+            or root in roots
+        ):
+            raise BridgeError(f"Refusing archive project root {root!r}.")
+        participants = entry.get("participants", [])
+        if not isinstance(participants, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("lane", ""), str)
+            for item in participants
+        ):
+            raise BridgeError(
+                f"{MANIFEST} lists malformed participants for {root}."
+            )
+        keys.add(key)
+        roots.add(root)
+
+
 def read_manifest(archive: Path) -> dict:
     """Reads and validates the manifest and member table of one archive.
 
@@ -385,6 +440,7 @@ def read_manifest(archive: Path) -> dict:
                 or not isinstance(manifest.get("projects"), list)
             ):
                 raise BridgeError(f"{MANIFEST} is not an export manifest.")
+            _check_projects(manifest["projects"])
             missing = sorted(set(files) - names)
             unlisted = sorted(names - set(files) - {MANIFEST})
             if missing or unlisted:
@@ -467,8 +523,9 @@ def import_archive(
         merge: Whether to add projects beside existing state.
 
     Returns:
-        The restored projects and every participant whose lane path does not
-        exist on this machine.
+        The restored projects, every participant whose lane path does not
+        exist on this machine, and the archived provider definitions that
+        were added, skipped because the name is taken, or refused.
 
     Raises:
         BridgeError: If the archive is unsafe, newer than this build, the
@@ -498,6 +555,7 @@ def import_archive(
         staged = Path(scratch)
         _extract(archive, manifest, staged)
         _rebind(staged, selected)
+        offered = _archived_providers(staged)
         placed = []
         try:
             for entry in selected:
@@ -505,6 +563,18 @@ def import_archive(
                 if not (source / "project.json").exists():
                     raise BridgeError(
                         f"The archive lacks a manifest for {entry['root']}."
+                    )
+                try:
+                    recorded = json.loads((source / "project.json").read_text())
+                except ValueError:
+                    recorded = None
+                if (
+                    not isinstance(recorded, dict)
+                    or recorded.get("root") != entry["root"]
+                ):
+                    raise BridgeError(
+                        f"The archived project {entry['key']} is not rooted "
+                        f"at {entry['root']} as the manifest claims."
                     )
                 target = home / PROJECTS / entry["key"]
                 shutil.move(str(source), str(target))
@@ -517,9 +587,7 @@ def import_archive(
                     for entry in selected
                 },
             )
-            providers = staged / roster.PROVIDERS
-            if providers.exists() and not (home / roster.PROVIDERS).exists():
-                shutil.move(str(providers), str(home / roster.PROVIDERS))
+            providers = roster.adopt_providers(home, offered)
         except BaseException:
             for target in placed:
                 shutil.rmtree(target, ignore_errors=True)
@@ -530,7 +598,41 @@ def import_archive(
         for item in entry.get("participants", [])
         if not item.get("lane") or not Path(item["lane"]).is_dir()
     ]
-    return {"projects": selected, "missing_lanes": missing}
+    return {
+        "projects": selected,
+        "missing_lanes": missing,
+        "providers": providers,
+    }
+
+
+def _archived_providers(staged: Path) -> dict:
+    """Reads the provider entries an archive offers, without trusting them.
+
+    Args:
+        staged: Directory the archive was extracted into.
+
+    Returns:
+        Provider entries by name, for `roster.adopt_providers` to validate;
+        empty when the archive carries no registry.
+
+    Raises:
+        BridgeError: If the archived registry is not a provider registry.
+    """
+    path = staged / roster.PROVIDERS
+    if not path.exists():
+        return {}
+    try:
+        stored = json.loads(path.read_text())
+    except ValueError as exc:
+        raise BridgeError(
+            f"The archived {roster.PROVIDERS} is unreadable."
+        ) from exc
+    entries = stored.get("entries", {}) if isinstance(stored, dict) else None
+    if not isinstance(entries, dict):
+        raise BridgeError(
+            f"The archived {roster.PROVIDERS} is not a provider registry."
+        )
+    return entries
 
 
 def _extract(archive: Path, manifest: dict, staged: Path) -> None:
