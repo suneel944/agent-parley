@@ -210,10 +210,9 @@ it on, a launched `claude` lane's session settings carry
 routine commands and still stops a risky one. The client ignores `auto` from a
 project's own `.claude/settings.json`, which is why the launch carries it. The
 default is off, a lane entry overrides the project, a value that is not a
-boolean is refused, and no bypass mode is ever passed. Codex CLI
-0.153.4 has no per-tool approval surface of its own — its approval settings are
-whole-session policies — so its launch is left untouched and its prompts are
-reported for you to answer.
+boolean is refused, and no bypass mode is ever passed. Both opt-ins apply to
+`claude` lanes only. Codex, Gemini, Copilot, OpenCode and Amp launches are left
+untouched, and their prompts are reported for you to answer.
 
 ## Tab titles
 
@@ -226,7 +225,9 @@ lane. The supervision key `titles` turns the tab title off; the details are in
 
 ## `status`
 
-`status` prints the server line, the code line, the state directory and then,
+`status` prints the `Service:` line, a `Code:` line only when the service is
+stale, a `Store:` line only when the schema needs a repair, the `Notify:` line
+and the `State:` line, and then,
 per project, the open work: each live claim's issue, title, owner, lane state,
 last event and pull request, then one line per lane with its state, live claim
 count and current task. The task is the lane's last report while the lane still
@@ -256,11 +257,12 @@ ownership, activity and outcomes.
   <img src="https://cdn.jsdelivr.net/gh/suneel944/agent-parley@main/docs/assets/screenshot-status.svg" width="880" alt="agent-parley status listing issue owners, a pending handoff, and a lane on the wrong branch">
 </p>
 
-`Code: stale` says the running service is older than the installed code. The
-service is up and answering, so nothing reports it as down, but it is serving
-the build it was started from rather than the one on disk: restart it with
-`agent-parley down && agent-parley up` before reading the next frame as current.
-`Code: ok` says the running service matches the checkout.
+`Code: stale` says the service found the sources on disk changed since it
+started. It stops accepting connections, answers every request as stale until
+it exits, and the next hook or `agent-parley up` starts a service on the
+current code; the line ends with that remedy: `agent-parley up starts a
+service on the code in the checkout.` When the service matches the code, no
+`Code:` line is printed.
 
 Narrow the table by appending a participant name, which reports that lane in
 full instead of as a row, or by filters that combine:
@@ -520,9 +522,12 @@ Then `projects` names each registered root that no longer exists, `notify`
 says whether outbound and inbound notification are active, `approvals` names
 each lane lacking the resume opt-in, and a platform line names the kernel
 release, the WSL generation and whether `pidfd_open` is available. `doctor`
-exits non-zero on a version mismatch, a missing project root, or notification
-configured but unable to send, so a script can gate on it; notification that
-is off and an `approvals` setup gap leave it at zero. It reads only, and
+exits non-zero on a plugin protocol mismatch, a store schema this build cannot
+use, a stale service, a service that is not running while a registered project
+has lanes, a missing project root, a damaged decisions record kept aside,
+outbound notification configured but unable to send, or an inbound poller
+fault such as a passcode shorter than twelve characters, so a script can gate
+on it; notification that is off and an `approvals` setup gap leave it at zero. It reads only, and
 prints no credential.
 
 ## `metrics`
