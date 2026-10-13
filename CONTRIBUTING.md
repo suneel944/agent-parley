@@ -68,10 +68,12 @@ The `Check` workflow scopes pull requests by the paths they change;
 `scripts/ci_scope.py` holds the lists. Every pull request runs `secrets` and
 `make check` on Ubuntu with Python 3.12. Changes to `plugins/`, `scripts/`,
 `tests/`, `Makefile`, `.github/actions/`, plugin manifests, `server.json`,
-`glama.json`, `.release-manifest.json`, `.gitignore` or `LICENSE` add Python
-3.13, 3.14, macOS and the `install` legs, which build the wheel and install it
-on Ubuntu and macOS outside the checkout. Changes to `agent_parley/`, `tests/test_wsl.py`,
-`pyproject.toml`, `uv.lock` or `.github/workflows/check.yml` also add `wsl`.
+`glama.json`, `.release-manifest.json`, `.gitignore`, `LICENSE` or `uv.lock`
+add Python 3.13, 3.14, macOS and the `install` legs, which build the wheel and
+install it on Ubuntu and macOS outside the checkout; the lock pins only
+development tools while runtime dependencies stay empty. Changes to
+`agent_parley/`, `tests/test_wsl.py`, `pyproject.toml` or
+`.github/workflows/check.yml` also add `wsl`.
 Documentation, templates and other workflows run only the Ubuntu 3.12 leg. A
 path no list recognises, a push to `main` and a manual run select every leg.
 One exception: a file whose only edits are version lines, as in the release

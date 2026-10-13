@@ -14,6 +14,12 @@ same code, and the WSL leg is the slowest one, so a bump pushed straight after
 a crossing merge would otherwise hold ``main`` for another full suite. Every
 Ubuntu and macOS leg still runs for it.
 
+``uv.lock`` counts as tooling too. The package declares no runtime
+dependencies, which ``scripts/check_policy.py`` enforces, so the lock pins
+only development tools and a lock-only bump cannot change behaviour under
+WSL. Should runtime dependencies ever be allowed, the lock moves back to the
+WSL paths.
+
 The ruleset on ``main`` requires the macOS and WSL check names, so the
 workflow skips those jobs with a job-level condition rather than a trigger
 filter: a skipped job still reports its check, while a workflow that never
@@ -36,10 +42,10 @@ WSL_PATHS = (
     "agent_parley/",
     "tests/test_wsl.py",
     "pyproject.toml",
-    "uv.lock",
     ".github/workflows/check.yml",
 )
 FULL_PATHS = (
+    "uv.lock",
     "plugins/",
     "scripts/",
     "tests/",

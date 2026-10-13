@@ -1,7 +1,10 @@
 """Exercises ownership and issue validation at the GitHub metadata boundary."""
 
+import subprocess
+
 import pytest
 
+from scripts import check_pr_hygiene
 from scripts.check_pr_hygiene import (
     issue_numbers,
     validate,
@@ -147,3 +150,67 @@ def test_nonreleasing_prs_do_not_require_commit_references(title):
     assert (
         validate_commit_references(pr, commit_messages("No references")) == []
     )
+
+
+@pytest.mark.parametrize("paginate", [False, True])
+def test_api_reads_one_object_or_every_paginated_line(monkeypatch, paginate):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        out = '{"a": 1}\n{"a": 2}\n' if paginate else '{"a": 1}'
+        return subprocess.CompletedProcess(command, 0, stdout=out)
+
+    monkeypatch.setattr(check_pr_hygiene.subprocess, "run", run)
+    result = check_pr_hygiene.api("repos/o/r/x", paginate=paginate)
+    assert result == ([{"a": 1}, {"a": 2}] if paginate else {"a": 1})
+    assert ("--paginate" in calls[0]) is paginate
+
+
+CREDIT = "Co-Authored-By:" + " Codex <bot@example.com>"
+
+
+def serve(monkeypatch, pr, *, commit="ci: x\n\nRefs #7", comment="ok"):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("PR_NUMBER", "5")
+    replies = {
+        "repos/o/r/pulls/5": pr,
+        "repos/o/r/issues/7": {"number": 7, "milestone": {"number": 1}},
+        "repos/o/r/pulls/5/commits?per_page=100": commit_messages(commit),
+    }
+
+    def api(path, *, paginate=False):
+        return replies.get(path, [{"body": comment}])
+
+    monkeypatch.setattr(check_pr_hygiene, "api", api)
+
+
+def test_main_passes_clean_metadata(monkeypatch, capsys):
+    serve(monkeypatch, metadata())
+    check_pr_hygiene.main()
+    assert "PR #5" in capsys.readouterr().out
+
+
+def test_main_rejects_credits_in_commits_and_comments(monkeypatch):
+    pr = metadata()
+    pr["labels"] = []
+    serve(monkeypatch, pr, commit=f"ci: x\n\n{CREDIT}", comment=CREDIT)
+    with pytest.raises(SystemExit) as failure:
+        check_pr_hygiene.main()
+    message = str(failure.value)
+    assert "Add a change-type label." in message
+    assert "attribution from commit messages" in message
+    assert "attribution from PR comments" in message
+
+
+def test_main_rejects_credits_in_linked_issues(monkeypatch):
+    serve(monkeypatch, metadata())
+    issue = {"number": 7, "milestone": {"number": 1}, "body": CREDIT}
+    real = check_pr_hygiene.api
+    monkeypatch.setattr(
+        check_pr_hygiene,
+        "api",
+        lambda path, **kw: issue if path.endswith("/7") else real(path, **kw),
+    )
+    with pytest.raises(SystemExit, match="linked issues"):
+        check_pr_hygiene.main()
