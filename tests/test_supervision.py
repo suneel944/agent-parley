@@ -1139,6 +1139,31 @@ def test_direct_mail_about_a_held_issue_wakes_through_a_declared_wait(
     assert str(other["id"]) in woken["backlog"]
 
 
+def test_held_issue_mail_is_searched_only_while_a_wait_is_in_force(tmp_path):
+    searched = []
+    observed = {"record": {}, "process_alive": True}
+
+    def search():
+        searched.append(True)
+        return []
+
+    assert supervision._wake_block(
+        tmp_path, "codex", observed, {}, 60, search
+    ) == ("", 0.0)
+    assert searched == []
+    supervision.record_wait(
+        tmp_path, "codex", "gpu forecast run", time.time() + 900, 3600
+    )
+    blocked, _ = supervision._wake_block(
+        tmp_path, "codex", observed, {}, 60, search
+    )
+    assert blocked == "waiting on gpu forecast run"
+    assert searched == [True]
+    assert supervision._wake_block(
+        tmp_path, "codex", observed, {}, 60, lambda: ["1"]
+    ) == ("", 0.0)
+
+
 def test_a_declared_wait_is_capped_by_its_project_ceiling(tmp_path):
     now = time.time()
 

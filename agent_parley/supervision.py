@@ -5,6 +5,7 @@ import contextvars
 import copy
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -1603,8 +1604,36 @@ def record_wait(
     return record
 
 
+def _reporting_chain() -> set[int]:
+    """Names the reporting process and every process above it.
+
+    A report runs inside the lane's own session, or inside the service that
+    serves it, so neither that process nor any ancestor of it is work the
+    lane started and can end its turn on.
+
+    Returns:
+        Process IDs of the current process and its ancestors, as far as the
+        platform could read them.
+    """
+    pid = os.getpid()
+    chain = {pid}
+    with contextlib.suppress(OSError, IndexError, ValueError, TypeError):
+        for _ in range(process.ANCESTRY_LIMIT):
+            pid = process.PLATFORM.parent_pid(pid)
+            if pid <= 1:
+                break
+            chain.add(pid)
+    return chain
+
+
 def work_evidence(
-    base: Path, pid: int | None, output: str, issue: str = ""
+    lane: Path,
+    pid: int | None,
+    output: str,
+    issue: str = "",
+    claim_id: str = "",
+    ceiling: float = DEFAULT_WAIT_CEILING,
+    session: object = None,
 ) -> dict:
     """Builds the process evidence a report names for work still running.
 
@@ -1615,34 +1644,73 @@ def work_evidence(
     work, and the output file with its modification time at the report, so
     only a later write reads as the work advancing.
 
+    Evidence is bound to the claim the report names, by issue and claim
+    identity, and holds that claim for at most `ceiling` seconds after the
+    report, the same `deadlines.wait` cap a declared wait has. The process
+    must be one the reporting user owns and must not be PID 1, the lane's
+    own session process, or the reporting process and its ancestors, since
+    none of those is work the lane started. The output file must lie in the
+    lane worktree or its `lanes.extras` scratch directory, so a bridge state
+    file the service rewrites on every tool call never reads as work.
+
     Args:
-        base: Directory a relative output path is resolved against.
+        lane: Lane worktree; a relative output path is resolved against it.
         pid: Process ID of the running work, or None to name none.
         output: Path of the file the work writes, or empty to name none.
-        issue: Issue number of the claim the report is bound to, or empty
-            when it names no claim.
+        issue: Issue number of the claim the report is bound to.
+        claim_id: Claim identity of that claim, so a release or reclaim
+            voids the evidence.
+        ceiling: Seconds after the report the evidence may hold at most.
+        session: Process ID the lane's activity record names for its
+            session, if any.
 
     Returns:
         The evidence record with any `pid`, `ticks`, `output` and `mtime`,
-        its `issue` and its `recorded_at` time, or an empty record when
-        nothing is named.
+        its `issue`, `claim_id`, `recorded_at` and `until` times, or an
+        empty record when nothing is named.
 
     Raises:
-        BridgeError: If the named process is not running.
+        BridgeError: If evidence is named without a claim, the process is
+            not running or is not the lane's own work, or the output file
+            lies outside the lane.
     """
     record: dict = {}
     if pid is not None:
-        if pid <= 0 or not process.running(pid):
+        if pid <= 1 or not process.running(pid):
             raise BridgeError(f"Process {pid} is not running.")
+        if pid == session or pid in _reporting_chain():
+            raise BridgeError(
+                f"Process {pid} is the lane's own session, not its work."
+            )
+        if process.read_ps_field("uid=", pid) != str(os.getuid()):
+            raise BridgeError(f"Process {pid} belongs to another user.")
         record.update(pid=pid, ticks=process.start_ticks(pid))
     if output.strip():
-        path = (base / Path(output.strip()).expanduser()).resolve()
+        root = lane.resolve()
+        path = (root / Path(output.strip()).expanduser()).resolve()
+        if not any(
+            path.is_relative_to(place) for place in (root, lanes.extras(root))
+        ):
+            raise BridgeError(
+                f"--output-file {path} must lie inside the lane worktree "
+                "or its scratch directory."
+            )
         mtime = 0.0
         with contextlib.suppress(OSError):
             mtime = path.stat().st_mtime
         record.update(output=str(path), mtime=mtime)
     if record:
-        record.update(issue=issue, recorded_at=time.time())
+        if not issue or not claim_id:
+            raise BridgeError(
+                "--pid and --output-file need the report bound to a claim."
+            )
+        now = time.time()
+        record.update(
+            issue=issue,
+            claim_id=claim_id,
+            recorded_at=now,
+            until=now + float(ceiling),
+        )
     return record
 
 
@@ -1654,8 +1722,10 @@ def live_work(directory: Path, name: str, issue: str = "") -> str:
     output file counts once it was written after the report, and only while
     that write is younger than `TOOL_TIMEOUT`, the span a tool call is
     trusted as work in flight, so a job that stopped writing stops holding
-    its lane. Evidence from a report bound to one claim speaks only for that
-    claim.
+    its lane. Either holds only until the evidence's `until` cap, and only
+    while the lane still holds the claim the evidence names under the same
+    claim identity, so a release or reclaim voids it. Evidence that names
+    no claim holds nothing.
 
     Args:
         directory: Private project state directory.
@@ -1665,16 +1735,29 @@ def live_work(directory: Path, name: str, issue: str = "") -> str:
 
     Returns:
         The clause naming the live work, or an empty string when the lane
-        named none, named it for another claim, or none of it shows work now.
+        named none, named it for another or a released claim, its cap
+        passed, or none of it shows work now.
     """
     try:
         state = json.loads((directory / f"{name}-activity.json").read_text())
     except (OSError, ValueError):
         return ""
     work = state.get("work") if isinstance(state, dict) else None
-    if not isinstance(work, dict) or (
-        issue and work.get("issue") and str(work["issue"]) != issue
+    if not isinstance(work, dict):
+        return ""
+    bound = str(work.get("issue") or "")
+    until = work.get("until")
+    if (
+        not bound
+        or not work.get("claim_id")
+        or (issue and bound != issue)
+        or not isinstance(until, int | float)
+        or isinstance(until, bool)
+        or time.time() > until
     ):
+        return ""
+    held = issues.snapshot(directory)["issues"].get(bound) or {}
+    if held.get("owner") != name or held.get("claim_id") != work["claim_id"]:
         return ""
     pid = work.get("pid")
     ticks = work.get("ticks")
@@ -9017,7 +9100,7 @@ def _wake_block(
     observed: dict,
     record: dict,
     window: float,
-    through_wait: bool = False,
+    through_wait: Callable[[], object] | None = None,
 ) -> tuple[str, float]:
     """Names what stops a wake attempt now and when it could clear.
 
@@ -9050,7 +9133,9 @@ def _wake_block(
     holds, found by `held_issue_mail`, is the exception: the wait is the
     lane's own guess about when it next has work, and a peer asking about
     that work proves the guess wrong, so the caller lets such mail through
-    the wait and the lane is woken on the normal delivery interval.
+    the wait and the lane is woken on the normal delivery interval. The
+    caller passes that search as a callable, run only while a wait is in
+    force, so a poll of a lane with no wait never reads its mail for it.
 
     A lane whose tool call a native permission layer refused waits on the
     operator's decision about it, so while `denials.waiting` finds that
@@ -9064,8 +9149,9 @@ def _wake_block(
         observed: The lane's `recorded_presence`.
         record: The lane's last durable wake record.
         window: Inactivity window the attempts are spaced by.
-        through_wait: Whether mail the lane must answer ends its declared
-            wait early.
+        through_wait: Called only while a declared wait is in force; a
+            true result, mail the lane must answer, ends that wait early.
+            None lets no mail through.
 
     Returns:
         The blocking cause, empty when an attempt can be made, and the earliest
@@ -9089,7 +9175,11 @@ def _wake_block(
     if lane.get("state") == lanes.BLOCKED:
         return f"blocked: {lane['cause']}", 0.0
     wait = published_wait(directory, name)
-    if not through_wait and wait and float(wait["until"]) > time.time():
+    if (
+        wait
+        and float(wait["until"]) > time.time()
+        and not (through_wait and through_wait())
+    ):
         return f"waiting on {wait['reason']}", float(wait["until"])
     if (
         observed["process_alive"] is False
@@ -9582,7 +9672,7 @@ def wake(
         observed,
         parked,
         window,
-        bool(held_issue_mail(home, directory, manifest, name)),
+        lambda: held_issue_mail(home, directory, manifest, name),
     )
     if blocked:
         _defer_wake(home, directory, root, name, blocked, ready_at, window)

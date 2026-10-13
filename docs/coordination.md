@@ -189,8 +189,20 @@ creation identity and the file with its modification time at the report.
 While that same process is alive, or the file was written after the report
 and within the last 600 seconds, the supervisor treats the holder as working
 on the claim that report was bound to and holds it as it does for a waiting
-report, even once the report's `--until` has passed. Other claims of the lane
-are still judged on their own progress. Each report replaces the evidence the
+report, even once the report's `--until` has passed. That hold ends at the
+project's `deadlines.wait` ceiling after the report, the same cap a declared
+wait has, and ends early when the claim is released or reclaimed, because the
+evidence records the claim's identity. Other claims of the lane are still
+judged on their own progress, and evidence needs a report bound to one claim:
+a report that resolves to no claim and names `--pid` or `--output-file` is
+refused, so evidence never holds every claim. The process must belong to the
+reporting user and cannot be PID 1, the lane's own session process, or the
+reporting process or one of its ancestors, such as the service. The output
+file must resolve inside the lane worktree or its `<lane>-wt` scratch
+directory; anything else, including the bridge's own state files beside the
+lane, is refused. A retried report whose idempotency key names a recorded
+report returns that result without checking the process again. Each report
+replaces the evidence the
 previous one named.
 
 An overdue claim whose holder is still working on it stays owned. Two cases get

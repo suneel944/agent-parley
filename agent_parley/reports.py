@@ -67,7 +67,10 @@ class ReportsMixin(BridgeCore):
         `supervision.work_evidence`, and while `supervision.live_work` finds
         that work running the supervisor holds the reported claim as it does
         for a wait in force. Each report replaces the evidence the last one
-        named, so a report that names none clears it.
+        named, so a report that names none clears it. The evidence is
+        validated before any attachment is stored, so a refused report
+        leaves none behind, and a retry whose key names a recorded report
+        returns that result without validating it again.
 
         A ready or blocked report on a claim ends the lane's work on that
         claim, so it records a rotation point on the activity record: the
@@ -146,16 +149,6 @@ class ReportsMixin(BridgeCore):
                     f"{metrics.MAX_REPORT_BYTES}-byte budget; put the detail "
                     "in --evidence, which is attached when it is longer."
                 )
-        identifier = uuid.uuid4().hex[:16]
-        evidence, attached = attachments.spill(
-            directory,
-            "report",
-            identifier,
-            evidence,
-            metrics.MAX_REPORT_BYTES,
-            agent,
-            [],
-        )
         scope = retries.scope(agent, "report", retries.validate(key))
         fingerprint = retries.digest(
             "report",
@@ -173,13 +166,34 @@ class ReportsMixin(BridgeCore):
                 "output": output,
             },
         )
+        path = directory / f"{agent}-activity.json"
+        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+            state = json.loads(path.read_text()) if path.exists() else {}
+        if key and (recorded := state.get("retries", {}).get(scope)):
+            retries.replayed(recorded, "report", key, fingerprint)
+            return ""
+        ceiling = (data.get("deadlines") or {}).get(
+            "wait", supervision.DEFAULT_WAIT_CEILING
+        )
         work = supervision.work_evidence(
             lane,
             pid,
             output,
             str(claim["issue"]) if claim["issue"] is not None else "",
+            claim["claim_id"] or "",
+            ceiling,
+            state.get("session_pid"),
         )
-        path = directory / f"{agent}-activity.json"
+        identifier = uuid.uuid4().hex[:16]
+        evidence, attached = attachments.spill(
+            directory,
+            "report",
+            identifier,
+            evidence,
+            metrics.MAX_REPORT_BYTES,
+            agent,
+            [],
+        )
         with lock(directory / f"{agent}-report.lock", timeout=1):
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
@@ -229,9 +243,6 @@ class ReportsMixin(BridgeCore):
                     )
                 write_json(path, state)
         if outcome == "waiting":
-            ceiling = (data.get("deadlines") or {}).get(
-                "wait", supervision.DEFAULT_WAIT_CEILING
-            )
             supervision.record_wait(
                 directory, agent, summary, time.time() + until, ceiling
             )
