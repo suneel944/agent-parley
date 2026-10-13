@@ -463,14 +463,9 @@ def _conditions(
             "Unattended integration never repairs an unverified base. "
             + merges.integration_hold(root, directory, standing)
         )
-    if record.get("blocked_by") or not lifecycle.dependencies_complete(
-        ledger, record
-    ):
-        waits = ", ".join(f"#{item}" for item in record.get("blocked_by", []))
-        return (
-            f"Issue #{issue} still waits on {waits or 'a dependency'} "
-            "to be verified complete."
-        )
+    waits = merges.dependency_refusal(ledger, issue)
+    if waits:
+        return waits
     if not data["verify"]:
         return (
             "This project configures no verification command, so no green "

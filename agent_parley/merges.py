@@ -6,16 +6,18 @@ import json
 import shlex
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
 
-from agent_parley import lifecycle, policy, process, roster
+from agent_parley import approvals, lifecycle, policy, process, roster
 from agent_parley.checkpoints import (
     activity,
+    branch_head,
     current_branch,
     lane_branch,
     participant_liveness,
 )
+from agent_parley.issues import merge_claim
 from agent_parley.state import BridgeError, write_json
 from agent_parley.worktrees import GIT_SECONDS, drift, git, has_branch
 
@@ -193,7 +195,12 @@ def merge_blockers(
 
 
 def merge_preview(
-    root: Path, lane: Path, name: str, branch: str, session: str
+    root: Path,
+    lane: Path,
+    name: str,
+    branch: str,
+    session: str,
+    admission: Sequence[str] = (),
 ) -> str:
     """Reports what a lane merge would bring in and what would refuse it.
 
@@ -215,6 +222,7 @@ def merge_preview(
         branch: Bridge branch the merge would integrate.
         session: Session state when the participant holds a running session,
             or an empty string when no session blocks the merge.
+        admission: Approval and claim refusals from `admission_refusals`.
 
     Returns:
         An account of the commits the merge would carry, the files they
@@ -250,6 +258,7 @@ def merge_preview(
     if actual != branch:
         blockers.append(drift(name, {"branch": branch}, actual))
     blockers += merge_blockers(root, lane, name, branch, session)
+    blockers += admission
     if blockers:
         report.append(refused)
         report += [f"- {blocker}" for blocker in blockers]
@@ -444,7 +453,11 @@ def reported_ready(directory: Path) -> set[str]:
 def ready_lanes(
     directory: Path, data: dict, state: dict
 ) -> dict[str, list[str]]:
-    """Maps every lane whose latest report is ready to the issues it holds.
+    """Maps every lane whose latest report is ready to the issues it merges.
+
+    Only claims reported ready, or awaiting integration recovery, are the
+    ones `merge_claim` can pick, so only their dependency edges order a run.
+    A lane's other claims, still running, never add a lane edge.
 
     Args:
         directory: Private state directory for the common repository.
@@ -453,7 +466,7 @@ def ready_lanes(
 
     Returns:
         One entry per participant whose latest report is the ready state,
-        carrying the issues that participant currently holds.
+        carrying the ready or recovering issues that participant holds.
     """
     return {
         name: sorted(
@@ -461,6 +474,8 @@ def ready_lanes(
                 number
                 for number, record in state["issues"].items()
                 if record["owner"] == name
+                and lifecycle.state(record)["state"]
+                in (lifecycle.READY, lifecycle.RECOVERY)
             ),
             key=int,
         )
@@ -507,12 +522,13 @@ def group_lanes(
 def lane_refusals(
     root: Path, directory: Path, participant: dict, name: str
 ) -> list[str]:
-    """Collects every condition that refuses one lane's merge right now.
+    """Collects every Git and session condition refusing one lane's merge.
 
-    The conditions are exactly the ones `participant merge --preview` lists,
-    read the same way and in the same words, so a bulk preflight can never
-    admit a lane the single-lane command would refuse. Every check reads; the
-    participant's session lock is never taken.
+    The conditions are the ones `participant merge --preview` lists, read
+    the same way and in the same words. A bulk preflight adds
+    `admission_refusals`, so it can never admit a lane the single-lane
+    command would refuse. Every check reads; the participant's session lock
+    is never taken.
 
     Args:
         root: Common repository root, which is always the base checkout.
@@ -542,6 +558,136 @@ def lane_refusals(
             and integration_holds(root, held)
         ):
             refusals.append(integration_hold(root, directory, held))
+    return refusals
+
+
+def stale_ready(name: str, issue: str) -> str:
+    """Builds the refusal for a lane that committed after reporting ready.
+
+    Args:
+        name: Participant that owns the lane.
+        issue: Issue whose ready report the lane head no longer matches.
+
+    Returns:
+        The message both a merge and its preflight report.
+    """
+    return (
+        f"{name} committed since issue #{issue} was reported ready; record a "
+        "new report before merging."
+    )
+
+
+def dependency_refusal(
+    state: dict, issue: str, earlier: Collection[str] = ()
+) -> str:
+    """Names the work one issue still waits on before it can be merged.
+
+    `lifecycle.complete` refuses an issue that still waits, so merging its
+    work first would leave the base holding an integration it can never
+    record complete. A blocker held by a lane that the same ordered run
+    merges earlier is integrated first and is not counted.
+
+    Args:
+        state: Published issue ledger.
+        issue: Issue whose work would be merged.
+        earlier: Issues held by lanes an ordered run merges before this one.
+
+    Returns:
+        The refusal naming each wait and the lane holding it, or an empty
+        string when the issue waits on nothing outside ``earlier``.
+    """
+    records = state["issues"]
+    waits = [
+        number
+        for number in records.get(issue, {}).get("blocked_by", [])
+        if number not in earlier
+    ]
+    if not waits:
+        return ""
+    named = []
+    for number in waits:
+        owner = records.get(number, {}).get("owner")
+        named.append(f"#{number}" + (f" (held by {owner})" if owner else ""))
+    return (
+        f"Issue #{issue} still waits on {', '.join(named)} to be verified "
+        "complete; integrate those first or drop the edge with "
+        f"`agent-parley issue unblock {issue} --on {waits[0]}`."
+    )
+
+
+def admission_refusals(
+    root: Path,
+    directory: Path,
+    data: dict,
+    state: dict,
+    name: str,
+    earlier: Collection[str] = (),
+) -> list[str]:
+    """Collects the approval and claim conditions that refuse a lane merge.
+
+    These are the refusals `participant merge` reaches before it merges
+    anything: a missing operator approval, no single ready claim, a claim
+    not reported ready, a lane that committed after its ready report, and
+    a claim that still waits on incomplete work. Reading them up front lets
+    a preview name them and a group preflight refuse the whole group before
+    its first merge. Every check reads.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the roster and approval policy.
+        state: Published issue ledger.
+        name: Participant that owns the lane.
+        earlier: Issues held by lanes an ordered run merges before this one.
+
+    Returns:
+        One refusal message per unmet condition, empty when none applies.
+    """
+    participant = data["participants"][name]
+    refusals = []
+    if "merge" in data["approval"]:
+        try:
+            reviewed = approvals.review(
+                directory,
+                data,
+                name,
+                branch_head(root, participant["branch"]),
+            )
+        except BridgeError as unreadable:
+            refusals.append(str(unreadable))
+        else:
+            refused = approvals.refusal(name, "merge", reviewed)
+            if refused:
+                refusals.append(refused)
+    try:
+        claim = merge_claim(directory, name)
+    except BridgeError as ambiguous:
+        return [*refusals, str(ambiguous)]
+    if claim["issue"] is None:
+        return refusals
+    issue = str(claim["issue"])
+    execution = lifecycle.state(state["issues"].get(issue, {}))
+    repairing = False
+    if execution["state"] == lifecycle.RECOVERY:
+        try:
+            held = integration_record(directory)
+        except BridgeError:
+            held = None
+        repairing = (
+            held is not None
+            and integration_owner(directory, held) == name
+            and integration_holds(root, held)
+        )
+    if execution["state"] != lifecycle.READY and not repairing:
+        return [*refusals, f"Issue #{issue} is not reported ready."]
+    source = execution.get("source_commit") or execution.get("commit")
+    lane = Path(participant["lane"])
+    if source and lane.exists() and git(lane, "rev-parse", "HEAD") != source:
+        refusals.append(stale_ready(name, issue))
+    if not repairing:
+        waits = dependency_refusal(state, issue, earlier)
+        if waits:
+            refusals.append(waits)
     return refusals
 
 
