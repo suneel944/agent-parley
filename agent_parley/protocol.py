@@ -106,6 +106,29 @@ def cli_rule() -> str:
     return f"Bash({cli_command()} *)"
 
 
+def legacy_cli_command() -> str:
+    """Spells the CLI command releases before ``-P`` ordered lanes to run.
+
+    A lane launched before the upgrade holds an allow rule and prompt text
+    for this spelling, so a launch allows it and the watcher accepts it for
+    one release beside `cli_command`. docs/monitoring.md records when it
+    goes.
+
+    Returns:
+        The shell-quoted interpreter and module without ``-P``.
+    """
+    return shlex.join([sys.executable, "-m", CLI_MODULE])
+
+
+def cli_rules() -> list[str]:
+    """Returns every native shell permission rule a launch writes.
+
+    Returns:
+        `cli_rule` followed by the same rule for `legacy_cli_command`.
+    """
+    return [cli_rule(), f"Bash({legacy_cli_command()} *)"]
+
+
 def manifests(root: Path) -> dict[str, Path]:
     """Locates the shipped plugin manifest of each supported client."""
     return {

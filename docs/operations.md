@@ -1483,12 +1483,21 @@ never written for this.
 **Work already merged into the integration base is not offered.** A
 `Closes #N` merged into the recorded integration base leaves the issue open
 on the forge until the base crosses to the default branch. Each forge refresh
-also reads `git log origin/HEAD..<integration base> --format=%B` in the base
-checkout, preferring the remote-tracking branch, and records the issues those
+also reads the messages and committer dates of
+`git log origin/HEAD..<integration base>` in the base checkout, preferring the remote-tracking branch, and records the issues those
 messages close as `integration_closed` in `forge-issues.json`. Pull offers,
 next leads and `issue next` then leave out each such issue nobody owns or has
 a pending offer for. Without an integration base, without `origin/HEAD`, or
 when Git refuses or takes longer than three seconds, nothing is left out.
+
+A squash crossing writes one new commit to the default branch, so the old
+integration commits never become ancestors of `origin/HEAD` and keep naming
+their issues while the base stays recorded. An issue the forge last updated
+after the committer date of every commit that closes it, as a reopened issue
+is, is therefore not left out. After a crossing, point the base at the next
+milestone's branch with `agent-parley branch integration BRANCH`, or clear it
+with `agent-parley branch integration ""`, so finished milestones stop
+filtering offers.
 
 **An idle holder offers the split itself.** A claim held by a lane that has
 gone quiet on it is a defect that reads as healthy: the claim is held, the

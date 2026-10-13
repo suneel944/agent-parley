@@ -6157,7 +6157,13 @@ def refresh_forge_issues(
     if full and len(catalog) < FORGE_LIMIT:
         end_closed_issues(directory, catalog, now)
     landed = integration_closed(
-        root, str(manifest.get("integration_base") or "")
+        root,
+        str(manifest.get("integration_base") or ""),
+        {
+            number: float(item.get("updated_at") or 0)
+            for number, item in catalog.items()
+            if isinstance(item, dict)
+        },
     )
     assigned = any(
         isinstance(item, dict) and item.get("assignees")
@@ -6177,6 +6183,11 @@ def refresh_forge_issues(
                     "title": str(item.get("title") or ""),
                     "labels": list(item.get("labels") or []),
                     "assignees": list(item.get("assignees") or []),
+                    **(
+                        {"updated_at": float(item["updated_at"])}
+                        if item.get("updated_at")
+                        else {}
+                    ),
                 }
                 for number, item in catalog.items()
                 if isinstance(item, dict)
@@ -6185,7 +6196,9 @@ def refresh_forge_issues(
     )
 
 
-def integration_closed(root: Path, base: str) -> list[str]:
+def integration_closed(
+    root: Path, base: str, updated: dict[str, float] | None = None
+) -> list[str]:
     """Lists the issues commits on the integration base close by keyword.
 
     A pull request merged into the integration base with ``Closes #N``
@@ -6198,9 +6211,17 @@ def integration_closed(root: Path, base: str) -> list[str]:
     base, no remote default branch, or a refused or slow call reads as
     nothing closed, so selection falls back to the forge's own reading.
 
+    A squash crossing leaves the old integration commits outside the
+    default branch's history, so a recorded base that is never moved would
+    keep naming their issues. An issue the forge last updated after the
+    committer date of every commit that closes it, as a reopened one is,
+    is therefore not listed.
+
     Args:
         root: Base checkout.
         base: Recorded integration base, empty when none is recorded.
+        updated: Forge update time in Unix seconds by bare issue number;
+            an issue it does not name is taken as never updated.
 
     Returns:
         Bare issue numbers in ascending order, without repeats.
@@ -6211,9 +6232,26 @@ def integration_closed(root: Path, base: str) -> list[str]:
     if not default:
         return []
     for head in (f"refs/remotes/origin/{base}", f"refs/heads/{base}"):
-        log = _read(str(root), "log", "--format=%B", f"{default}..{head}", "--")
-        if log is not None:
-            return sorted(set(forge.closing_numbers(log)), key=int)
+        log = _read(
+            str(root), "log", "--format=%x00%ct%n%B", f"{default}..{head}", "--"
+        )
+        if log is None:
+            continue
+        closed: dict[str, int] = {}
+        for entry in log.split("\0"):
+            stamp, _, body = entry.partition("\n")
+            if not stamp.strip().isdigit():
+                continue
+            for number in forge.closing_numbers(body):
+                closed[number] = max(closed.get(number, 0), int(stamp))
+        return sorted(
+            (
+                number
+                for number, committed in closed.items()
+                if (updated or {}).get(number, 0) <= committed
+            ),
+            key=int,
+        )
     return []
 
 

@@ -1215,8 +1215,9 @@ def open_issue_catalog(
         since: Unix seconds; when given, read issues updated since then.
 
     Returns:
-        Bare issue number to its recorded title, label names and assignee
-        logins, plus ``state`` when `since` is given; an empty mapping when
+        Bare issue number to its recorded title, label names, assignee
+        logins and, when the forge reports one, ``updated_at`` in Unix
+        seconds, plus ``state`` when `since` is given; an empty mapping when
         the forge reports no such issue, or None when the project has no
         GitHub forge, no client, or the call failed.
     """
@@ -1225,7 +1226,7 @@ def open_issue_catalog(
     project = _reachable(repo)
     if project is None:
         return None
-    fields = "number,title,labels,assignees"
+    fields = "number,title,labels,assignees,updatedAt"
     selection = ["--state", "open"]
     if since is not None:
         stamp = datetime.fromtimestamp(since, UTC).strftime(
@@ -1264,6 +1265,15 @@ def open_issue_catalog(
                     str(person["login"])
                     for person in record.get("assignees") or []
                     if person.get("login")
+                ),
+                **(
+                    {
+                        "updated_at": datetime.fromisoformat(
+                            str(record["updatedAt"])
+                        ).timestamp()
+                    }
+                    if record.get("updatedAt")
+                    else {}
                 ),
                 **(
                     {"state": str(record.get("state") or "")}

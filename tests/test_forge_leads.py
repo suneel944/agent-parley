@@ -238,6 +238,34 @@ def test_integration_closed_falls_back_to_the_local_branch(tmp_path):
     assert supervision.integration_closed(clone, "integration/2") == ["12"]
 
 
+def test_an_issue_updated_after_its_closing_commit_is_not_landed(
+    tmp_path, monkeypatch
+):
+    clone = integrated(tmp_path)
+    stamp = int(git(clone, "log", "-1", "--format=%ct", "origin/integration/1"))
+    reopened = {"7": stamp + 3600.0, "9": float(stamp)}
+    assert supervision.integration_closed(clone, "integration/1", reopened) == [
+        "9"
+    ]
+    directory = tmp_path / "state"
+    directory.mkdir()
+    monkeypatch.setattr(supervision.forge, "select", lambda *args: "github")
+    monkeypatch.setattr(
+        supervision.forge,
+        "open_issue_catalog",
+        lambda *args, **kwargs: {
+            "7": {"title": "Reopened", "updated_at": stamp + 3600.0},
+        },
+    )
+    manifest = {"root": str(clone), "integration_base": "integration/1"}
+    supervision.refresh_forge_issues(directory, manifest)
+    cache = json.loads((directory / FORGE_ISSUES).read_text())
+    assert cache["integration_closed"] == ["9"]
+    assert cache["issues"]["7"]["updated_at"] == stamp + 3600.0
+    pool = issues.with_forge(directory, issues.snapshot(directory))
+    assert issues.unclaimed(pool) == ["7"]
+
+
 def test_work_the_integration_base_closed_is_never_offered(tmp_path):
     ledger = {
         "revision": 1,

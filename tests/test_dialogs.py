@@ -718,7 +718,7 @@ def test_status_names_the_prompt_and_how_long_it_has_waited(tmp_path):
     assert "; waiting 90s" in line
 
 
-BRIDGE_RULES = [protocol.TOOL_PREFIX, protocol.cli_rule()]
+BRIDGE_RULES = [protocol.TOOL_PREFIX, *protocol.cli_rules()]
 
 
 @pytest.mark.parametrize("scope", ["project", "lane"])
@@ -1027,12 +1027,24 @@ def test_the_prompt_and_the_launch_rule_spell_one_command():
     """Keeps the allow rule on the exact string the prompt orders."""
     assert protocol.cli_rule() == f"Bash({protocol.cli_command()} *)"
     assert protocol.cli_command().endswith(" -P -m agent_parley.cli")
+    assert protocol.cli_rules() == [
+        protocol.cli_rule(),
+        f"Bash({protocol.legacy_cli_command()} *)",
+    ]
+    assert protocol.legacy_cli_command() == protocol.cli_command().replace(
+        " -P ", " "
+    )
 
 
-def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):
+@pytest.mark.parametrize(
+    "command", [protocol.cli_command(), protocol.legacy_cli_command()]
+)
+def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(
+    tmp_path, command
+):
     """Unparks a lane on the command the protocol prompt ordered."""
     write_json(tmp_path / "lane-activity.json", {"activity": "working"})
-    screen = _shell_prompt(protocol.cli_command() + " issue list")
+    screen = _shell_prompt(command + " issue list")
     watch = dialogs.Watch(tmp_path, "lane", bridge=True)
     watch.advance(screen.encode(), 0.0)
     assert watch.advance(b"", 0.5) == b"1\r"
