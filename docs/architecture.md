@@ -256,7 +256,10 @@ marking read, reserving files, queueing a request for a key a peer holds,
 cancelling that request, releasing reservations, listing participants, reading
 one thread, searching mail, searching decisions, reviewing a peer's report,
 retiring the calling lane and recommending the next issue. A tool name
-outside that list, and unknown arguments, fail. A body
+outside that list, and unknown arguments, fail. One MCP request may carry
+twice the 65536-byte attachment cap plus 16 KiB, room for the largest
+accepted body after JSON escaping; a larger request is refused with HTTP 413
+and a JSON-RPC error that names the limits. A body
 above its cap is spilled whole to `attachments/` under the project state
 directory by `agent_parley/attachments.py`, keyed by an opaque
 `kind-identifier` reference that is validated by pattern and resolved only

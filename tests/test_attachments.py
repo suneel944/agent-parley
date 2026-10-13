@@ -1,9 +1,11 @@
 """Oversized payloads spill to attachments and travel as references."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agent_parley import attachments, checkpoints, cli, issues, metrics, store
@@ -45,6 +47,44 @@ def run(bridge, monkeypatch, capsys, *arguments):
     )
     assert cli.main() == 0
     return capsys.readouterr().out
+
+
+def test_a_body_at_the_attachment_cap_spills_over_mcp_transport(
+    bridge, repo, paired
+):
+    bridge.up()
+    tokens = {
+        name: asyncio.run(bridge.identity(name, paired))["registration_token"]
+        for name in paired["participants"]
+    }
+    body = '"quoted"\n' * (attachments.MAX_ATTACHMENT_BYTES // 9)
+    assert len(body.encode()) > 60000
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "send_message",
+            "arguments": {
+                "to": ["codex"],
+                "subject": "Evidence",
+                "body_md": body,
+                "idempotency_key": "transport-1",
+            },
+        },
+    }
+    with httpx.Client(base_url=bridge.url, trust_env=False) as client:
+        response = client.post(
+            "/mcp/",
+            json=request,
+            headers={"Authorization": f"Bearer {tokens['claude']}"},
+        )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert not result.get("isError")
+    sent = json.loads(result["content"][0]["text"])
+    assert sent["attachment"] == f"message-{sent['id']}"
+    assert sent["attachment_bytes"] == len(body.encode())
 
 
 def test_a_message_over_the_cap_is_attached_and_referenced(

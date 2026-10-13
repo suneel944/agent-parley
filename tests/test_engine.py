@@ -555,14 +555,15 @@ def test_transport_scopes_identity_and_rejects_foreign_origins(bridge, actors):
             ).status_code
             == 400
         )
-        assert (
-            client.post(
-                "/mcp/",
-                content=b"x" * (MAX_REQUEST_BYTES + 1),
-                headers={**headers, "Content-Type": "application/json"},
-            ).status_code
-            == 413
+        oversized = client.post(
+            "/mcp/",
+            content=b"x" * (MAX_REQUEST_BYTES + 1),
+            headers={**headers, "Content-Type": "application/json"},
         )
+        assert oversized.status_code == 413
+        error = oversized.json()["error"]
+        assert error["code"] == -32600
+        assert f"{MAX_REQUEST_BYTES} bytes" in error["message"]
         request["params"]["arguments"]["agent_name"] = "GreenCastle"
         assert client.post("/mcp/", json=request, headers=headers).json()[
             "result"
