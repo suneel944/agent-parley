@@ -474,7 +474,10 @@ class StatusMixin(BridgeCore):
             does not have, so reporting it as compatible would describe a
             healthy system while every lane is denied. A registered project
             whose root checkout no longer exists is not consistent either,
-            and the `projects` component names each such root. The report
+            and the `projects` component names each such root. A damaged
+            decisions record a writer kept aside is not consistent until
+            the operator recovers and removes it, and the `decisions`
+            component names each copy. The report
             also names
             the kernel release, the WSL generation or ``none``, and whether
             ``pidfd_open`` is available, so a platform gap is read here
@@ -485,6 +488,7 @@ class StatusMixin(BridgeCore):
             `supervision.opt_in_missing` reports as a setup gap; it is the
             operator's choice, so it leaves the set consistent.
         """
+        from agent_parley import decisions
         from agent_parley.cli import (
             inbound_status,
             json,
@@ -575,6 +579,19 @@ class StatusMixin(BridgeCore):
                     else ""
                 ),
                 "compatible": not gone,
+            }
+        )
+        kept = decisions.damaged(self.home)
+        components.append(
+            {
+                "component": "decisions",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": protocol.DAMAGED if kept else protocol.OK,
+                "remedy": (
+                    protocol.RECOVER_DECISIONS + ", ".join(kept) if kept else ""
+                ),
+                "compatible": not kept,
             }
         )
         outbound = notify.reported(notify.environment(self.home))

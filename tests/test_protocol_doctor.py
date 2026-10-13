@@ -194,6 +194,7 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         "store",
         "service",
         "projects",
+        "decisions",
         "notify",
         "approvals",
     }

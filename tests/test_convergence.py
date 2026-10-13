@@ -73,6 +73,38 @@ def test_only_failure_counts_and_hard_markers_are_failures(text, outcome):
     assert convergence.classify(text)[0] == outcome
 
 
+@pytest.mark.parametrize(
+    ("text", "outcome"),
+    [
+        ("make check failed, 41 passed", convergence.FAIL),
+        ("tests did not pass", convergence.FAIL),
+        ("pytest: 3 fail, 40 pass", convergence.FAIL),
+        ("gate not green yet", convergence.FAIL),
+        ("ci failing on test_wsl; lint ok", convergence.FAIL),
+        ("make check failed: ruff E501", convergence.FAIL),
+        ("error: build failed", convergence.FAIL),
+        ("exit 1", convergence.FAIL),
+        ("1 failed, 40 passed", convergence.FAIL),
+        ("412 passed in 30s", convergence.PASS),
+        ("make check: ok", convergence.PASS),
+        ("no regressions, tests pass", convergence.PASS),
+    ],
+)
+def test_negated_or_mixed_evidence_is_never_a_pass(text, outcome):
+    assert convergence.classify(text)[0] == outcome
+
+
+def test_a_failing_make_check_across_commits_reaches_the_approach():
+    outcome, mark = convergence.classify("make check failed")
+    entry = folded(
+        item(outcome, "a" * 40, 1.0, mark),
+        item(outcome, "b" * 40, 2.0, mark),
+        item(outcome, "c" * 40, 3.0, mark),
+    )
+    assert entry["failures"] == 3 and entry["repeats"] == 3
+    assert convergence.decide(entry, 4.0, 3, 14400) == convergence.APPROACH
+
+
 def test_ready_evidence_without_a_pass_word_is_not_a_pass():
     record = {
         "kind": "report",

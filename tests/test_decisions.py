@@ -191,3 +191,51 @@ def test_no_credential_reaches_a_decision_record(tmp_path, monkeypatch, sent):
     assert record["reversibility"] == decisions.IRREVERSIBLE
     assert record["recommended"] == "deny"
     assert record["sent"]
+
+
+def test_a_damaged_record_is_kept_aside_before_a_writer_replaces_it(
+    tmp_path,
+):
+    from agent_parley import issues
+
+    opened(tmp_path, key="s1", lane="l1")
+    opened(tmp_path, key="s2", lane="l2")
+    path = tmp_path / decisions.RECORD_NAME
+    damaged = path.read_bytes()[:-5]
+    path.write_bytes(damaged)
+    assert decisions.list_open(tmp_path, 100.0) == []
+    assert path.read_bytes() == damaged
+    opened(tmp_path, key="s3", lane="l3")
+    kept = list(tmp_path.glob(f"{decisions.RECORD_NAME}.corrupt-*"))
+    assert len(kept) == 1 and kept[0].read_bytes() == damaged
+    assert str(kept[0]) in issues.supervision_error(tmp_path)["detail"]
+    assert [
+        record["lane"] for record in decisions.list_open(tmp_path, 100.0)
+    ] == ["l3"]
+    path.write_text("[]")
+    opened(tmp_path, key="s4", lane="l4")
+    copies = sorted(tmp_path.glob(f"{decisions.RECORD_NAME}.corrupt-*"))
+    assert len(copies) == 2 and copies[0].read_bytes() == damaged
+
+
+def test_a_missing_record_reads_as_empty_and_keeps_no_side_file(tmp_path):
+    assert decisions.list_open(tmp_path) == []
+    opened(tmp_path)
+    assert {path.name for path in tmp_path.iterdir()} == {
+        decisions.LOCK_NAME,
+        decisions.RECORD_NAME,
+    }
+
+
+def test_doctor_names_every_damaged_decision_copy(bridge):
+    from agent_parley import protocol
+
+    project = bridge.home / "projects" / "p1"
+    project.mkdir(parents=True)
+    kept = project / f"{decisions.RECORD_NAME}.corrupt-100"
+    kept.write_text("{")
+    reported = bridge.doctor()
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["decisions"]["state"] == protocol.DAMAGED
+    assert str(kept) in named["decisions"]["remedy"]
+    assert reported["consistent"] is False

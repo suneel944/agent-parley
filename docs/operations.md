@@ -2020,10 +2020,13 @@ The account stores only that hash, never report text or logs.
 
 Only verified improvement resets the account: a passing gate line in a
 report of any state, or a passing review of a report no older than the latest
-recorded failure; a failure is a non-zero failure or error count, pytest's
-`FAILED`, a traceback, an `AssertionError`, `not ok` or a non-zero exit
-status, never prose such as `fixed error handling`. Improvement records a
-milestone with its commit. Commits, reservations, reports without
+recorded failure; a failure is a non-zero failure or error count, a gate word
+followed by a failure word such as `make check failed`, pytest's `FAILED`, a
+traceback, an `AssertionError`, `not ok`, a non-zero exit status or a pass
+word negated within three words such as `tests did not pass`, never prose such
+as `fixed error handling`. A failure anywhere in the evidence outweighs a pass
+beside it, so `make check failed, 41 passed` is a failure. Improvement records
+a milestone with its commit. Commits, reservations, reports without
 verification evidence and failing reports never reset it, so a lane that keeps
 editing, reserving and reporting while the same gate fails is still counted.
 The same failure restated at the same commit counts once. A different failure
@@ -2544,7 +2547,12 @@ send is retried on the next supervision poll with a backoff that doubles from
 reaches the operator. Decisions due together go out as one digest; on Telegram
 it carries one row of buttons per decision, and every transport shows the text
 reply each takes. Decisions are recorded only while notifications are on, and
-a record holds no credential.
+a record holds no credential. A `decisions.json` that no longer decodes is
+never overwritten: the next writer moves it to
+`decisions.json.corrupt-<unix time>`, records a supervision note naming the
+copy and continues from no decisions, and `doctor` reports the `decisions`
+component `damaged`, naming every copy, until the operator recovers the
+decisions it holds and deletes it.
 
 The same Telegram bot can answer status queries. Set
 `AGENT_PARLEY_INBOUND=telegram` and `AGENT_PARLEY_INBOUND_PASSCODE` to a

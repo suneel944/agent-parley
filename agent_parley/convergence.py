@@ -70,14 +70,19 @@ _ZERO = re.compile(
     re.IGNORECASE,
 )
 _FAILED = re.compile(
-    r"\b(?:[1-9]\d*\s+(?:failed|failures?|errors?)"
+    r"\b(?:[1-9]\d*\s+(?:failed|failures?|errors?|fails?|failing)"
     r"|(?:failed|failures?|errors?)\s*[:=]\s*[1-9]\d*"
-    r"|traceback|assertionerror|not ok|exit (?:status|code) [1-9]\d*)\b"
+    r"|(?:checks?|tests?|builds?|ci|gates?|lint|pytest|ruff|mypy|make)"
+    r"\W{0,3}(?:failed|fails|failing|fail)"
+    r"|traceback|assertionerror|not ok"
+    r"|exit(?:ed)? (?:(?:with )?(?:status|code) )?[1-9]\d*)\b"
 )
 _FAILED_TOKEN = re.compile(r"\bFAILED\b")
-_PASSED = re.compile(
-    r"\b(?:passed|passes|pass|green|succeeded|success|ok"
-    r"|exit (?:status|code) 0)\b"
+_PASS_WORD = r"(?:passed|passes|pass|green|succeeded|success|ok)"
+_PASSED = re.compile(rf"\b(?:{_PASS_WORD}|exit (?:status|code) 0)\b")
+_NEGATED = re.compile(
+    r"\b(did not|didn't|isn't|never|not|yet|no)\s+"
+    rf"(?:[\w']+\s+){{0,2}}{_PASS_WORD}\b"
 )
 _PATH = re.compile(r"(?:[\w.~-]*/)+([\w.-]+)")
 _HEX = re.compile(r"\b(?:0x[0-9a-f]+|[0-9a-f]{7,64})\b")
@@ -111,12 +116,17 @@ def classify(text: str) -> tuple[str, str]:
 
     Counts of zero (`0 failed`, `errors: 0`, `no errors`) are removed first.
     A failure is only a non-zero failure or error count (`2 failed`,
-    `errors: 1`), pytest's upper-case `FAILED` token, a traceback, an
-    `AssertionError`, a TAP `not ok` or a non-zero exit status, so prose
-    such as `fixed error handling` or `ran without errors` is never one.
-    Any such marker makes the text a failure, whose signature is taken from
-    the first line carrying one. Otherwise a pass word makes it a pass. Text
-    with neither is no verification evidence.
+    `errors: 1`, `3 fail`), a gate word followed by a failure word
+    (`make check failed`, `ci failing`), pytest's upper-case `FAILED`
+    token, a traceback, an `AssertionError`, a TAP `not ok`, a non-zero
+    exit status (`exit 1`) or a pass word negated within three words
+    (`tests did not pass`, `not green yet`), so prose such as `fixed error
+    handling` or `ran without errors` is never one. Any such marker makes
+    the text a failure, whose signature is taken from the first line
+    carrying one, even when another part of it passed. Otherwise a pass
+    word that no negation precedes makes it a pass; `no` only discards
+    the pass word it negates. Text with neither is no verification
+    evidence.
 
     Args:
         text: Evidence text a lane or a reviewer recorded.
@@ -127,9 +137,15 @@ def classify(text: str) -> tuple[str, str]:
     """
     lines = [_ZERO.sub(" ", line) for line in text.splitlines()]
     for line in lines:
-        if _FAILED_TOKEN.search(line) or _FAILED.search(line.lower()):
+        lowered = line.lower()
+        negated = _NEGATED.search(lowered)
+        if (
+            _FAILED_TOKEN.search(line)
+            or _FAILED.search(lowered)
+            or (negated and negated.group(1) != "no")
+        ):
             return FAIL, signature(line)
-    if any(_PASSED.search(line.lower()) for line in lines):
+    if any(_PASSED.search(_NEGATED.sub(" ", line.lower())) for line in lines):
         return PASS, ""
     return NONE, ""
 
