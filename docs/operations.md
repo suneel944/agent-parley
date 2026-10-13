@@ -1480,6 +1480,16 @@ by default). A cache older than twice
 the refresh interval, or a missing one, adds nothing, and the ledger itself is
 never written for this.
 
+**Work already merged into the integration base is not offered.** A
+`Closes #N` merged into the recorded integration base leaves the issue open
+on the forge until the base crosses to the default branch. Each forge refresh
+also reads `git log origin/HEAD..<integration base> --format=%B` in the base
+checkout, preferring the remote-tracking branch, and records the issues those
+messages close as `integration_closed` in `forge-issues.json`. Pull offers,
+next leads and `issue next` then leave out each such issue nobody owns or has
+a pending offer for. Without an integration base, without `origin/HEAD`, or
+when Git refuses or takes longer than three seconds, nothing is left out.
+
 **An idle holder offers the split itself.** A claim held by a lane that has
 gone quiet on it is a defect that reads as healthy: the claim is held, the
 remaining work is untouched, and no row says anything is wrong. The runtime

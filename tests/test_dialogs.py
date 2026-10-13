@@ -1026,7 +1026,7 @@ def _shell_prompt(command: str, row: str = "\r\n") -> str:
 def test_the_prompt_and_the_launch_rule_spell_one_command():
     """Keeps the allow rule on the exact string the prompt orders."""
     assert protocol.cli_rule() == f"Bash({protocol.cli_command()} *)"
-    assert protocol.cli_command().endswith(" -m agent_parley.cli")
+    assert protocol.cli_command().endswith(" -P -m agent_parley.cli")
 
 
 def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):

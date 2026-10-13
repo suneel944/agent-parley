@@ -561,13 +561,21 @@ def with_forge(directory: Path, state: dict) -> dict:
     `status.FORGE_STALE` seconds, or a missing or unreadable one, adds
     nothing.
 
+    An issue the cached ``integration_closed`` names was closed by keyword
+    in a commit on the integration base, so its fix landed though the forge
+    keeps it open until the base crosses to the default branch. It is not
+    added, and its record leaves the reading unless a lane owns it or an
+    offer for it is pending, so finished work is never offered again.
+
     Args:
         directory: Private project state directory holding the cache.
         state: Published issue ledger.
 
     Returns:
-        The ledger itself when the cache adds nothing, otherwise a shallow
-        copy whose ``issues`` mapping also holds the forge-only records.
+        The ledger itself when the cache changes nothing, otherwise a
+        shallow copy whose ``issues`` mapping also holds the forge-only
+        records and leaves out the unowned issues the integration base
+        closed.
     """
     from agent_parley.status import FORGE_ISSUES, FORGE_STALE
 
@@ -588,9 +596,20 @@ def with_forge(directory: Path, state: dict) -> dict:
     recorded = state.get("issues", {})
     named = cached.get("skip_labels", FORGE_SKIP_LABELS)
     skip = set(named if isinstance(named, list | tuple) else FORGE_SKIP_LABELS)
+    merged = cached.get("integration_closed")
+    landed = {str(n) for n in merged} if isinstance(merged, list) else set()
+    kept = {
+        number: record
+        for number, record in recorded.items()
+        if number not in landed or record.get("owner") or record.get("offer")
+    }
     added: dict[str, dict] = {}
     for number, item in listed.items():
-        if str(number) in recorded or not str(number).isdigit():
+        if (
+            str(number) in recorded
+            or str(number) in landed
+            or not str(number).isdigit()
+        ):
             continue
         if isinstance(item, dict) and (
             set(item.get("assignees") or []) - {cached.get("login")}
@@ -606,9 +625,9 @@ def with_forge(directory: Path, state: dict) -> dict:
             "forge_only": True,
             "execution": {"authorized": True},
         }
-    if not added:
+    if not added and len(kept) == len(recorded):
         return state
-    return {**state, "issues": {**recorded, **added}}
+    return {**state, "issues": {**kept, **added}}
 
 
 def forge_assignees(directory: Path, number: str) -> list[str]:

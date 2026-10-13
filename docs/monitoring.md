@@ -170,7 +170,7 @@ your own resume. `problems` reports the lane under `wake attention` with the
 command that records the opt-in and the `run --resume` command for your own
 terminal; when several lanes of one project share the gap, they share one row. With it on, the launch adds two native permission rules: `mcp__agent_parley`, which
 allows this bridge's own coordination tools, and
-`Bash(<interpreter> -m agent_parley.cli *)`, which allows the exact interpreter
+`Bash(<interpreter> -P -m agent_parley.cli *)`, which allows the exact interpreter
 and module the protocol prompt orders every lane to run for `issue claim`,
 `issue list`, `report` and the other CLI commands. Both are spelled from the
 same string the prompt prints, so they cannot drift apart. Nothing else is

@@ -266,7 +266,7 @@ def test_provider_inspection_names_the_delivery_path(bridge, polled):
     assert "canonical project identifier is an identity" in prompt
     assert str(delivery.mail_file(directory, "helper")) in prompt
     assert "Reading it is\nnot acknowledgement" in prompt
-    command = shlex.join([sys.executable, "-m", "agent_parley.cli"])
+    command = shlex.join([sys.executable, "-P", "-m", "agent_parley.cli"])
     assert f"`{command} issue claim NUMBER`" in prompt
     assert f"`{command} issue release NUMBER`" in prompt
     assert "`agent-parley issue" not in prompt

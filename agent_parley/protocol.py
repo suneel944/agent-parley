@@ -85,12 +85,15 @@ def cli_command() -> str:
     """Spells the command a lane runs to reach this bridge's own CLI.
 
     The interpreter is the one running this code, so a lane never resolves a
-    different installed version from its login shell.
+    different installed version from its login shell. ``-P`` keeps the
+    working directory off the module path, so a lane whose worktree is a
+    checkout of this project runs the installed code rather than that
+    checkout's source, which may be releases behind.
 
     Returns:
         The shell-quoted interpreter and module, without arguments.
     """
-    return shlex.join([sys.executable, "-m", CLI_MODULE])
+    return shlex.join([sys.executable, "-P", "-m", CLI_MODULE])
 
 
 def cli_rule() -> str:

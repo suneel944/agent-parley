@@ -6083,7 +6083,8 @@ def refresh_forge_issues(
     dropped. A delta that fills a page is taken as truncated and a full
     read runs instead. ``complete_at`` records the last full reading; a file
     without it was written by a full reading. Each refresh also records the
-    signed-in ``login`` and `skip_labels` for `issues.with_forge`.
+    signed-in ``login``, `skip_labels` and the issues `integration_closed`
+    reads from the integration base for `issues.with_forge`.
 
     Args:
         directory: Private project state directory.
@@ -6155,6 +6156,9 @@ def refresh_forge_issues(
         return
     if full and len(catalog) < FORGE_LIMIT:
         end_closed_issues(directory, catalog, now)
+    landed = integration_closed(
+        root, str(manifest.get("integration_base") or "")
+    )
     assigned = any(
         isinstance(item, dict) and item.get("assignees")
         for item in catalog.values()
@@ -6167,6 +6171,7 @@ def refresh_forge_issues(
             "limit": FORGE_LIMIT,
             "login": forge.login(root) if assigned else cached.get("login"),
             "skip_labels": list(skip_labels),
+            "integration_closed": landed,
             "issues": {
                 number: {
                     "title": str(item.get("title") or ""),
@@ -6178,6 +6183,38 @@ def refresh_forge_issues(
             },
         },
     )
+
+
+def integration_closed(root: Path, base: str) -> list[str]:
+    """Lists the issues commits on the integration base close by keyword.
+
+    A pull request merged into the integration base with ``Closes #N``
+    leaves its issue open on the forge, because a closing keyword acts only
+    on the default branch, so the forge's open issues still name finished
+    work. The messages of the commits the base carries beyond the remote
+    default branch, ``origin/HEAD``, are read as `forge.closing_numbers`
+    reads a body. The base is read from its remote-tracking branch, else
+    its local branch. Each Git call is bounded by `_read`'s timeout. No
+    base, no remote default branch, or a refused or slow call reads as
+    nothing closed, so selection falls back to the forge's own reading.
+
+    Args:
+        root: Base checkout.
+        base: Recorded integration base, empty when none is recorded.
+
+    Returns:
+        Bare issue numbers in ascending order, without repeats.
+    """
+    if not base:
+        return []
+    default = _read(str(root), "symbolic-ref", "-q", "refs/remotes/origin/HEAD")
+    if not default:
+        return []
+    for head in (f"refs/remotes/origin/{base}", f"refs/heads/{base}"):
+        log = _read(str(root), "log", "--format=%B", f"{default}..{head}", "--")
+        if log is not None:
+            return sorted(set(forge.closing_numbers(log)), key=int)
+    return []
 
 
 def end_closed_issues(directory: Path, opened: dict, since: float) -> None:
