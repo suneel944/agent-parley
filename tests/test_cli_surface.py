@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, protocol, roster, start, store, views
+from agent_parley import BridgeError, cli, protocol, roster, start, store, views
 
 NEW_COMMANDS = (
     ("version",),
@@ -762,7 +762,14 @@ def test_provider_show_prints_labeled_fields(bridge, monkeypatch, capsys):
 def test_credentials_show_reports_an_empty_profile_in_words(
     bridge, monkeypatch, capsys
 ):
-    roster.define_credential(bridge.home, "bare", "", [], [])
+    (bridge.home / roster.CREDENTIALS).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "entries": {"bare": {"home": "", "env": [], "require_env": []}},
+            }
+        )
+    )
     printed = text(
         monkeypatch,
         capsys,
@@ -777,7 +784,110 @@ def test_credentials_show_reports_an_empty_profile_in_words(
         "Config home: none",
         "Environment: none",
         "Required from shell: none",
+        "Account: selects no account",
     ]
+
+
+def test_credentials_add_without_a_selector_exits_2_and_writes_nothing(
+    bridge, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "add",
+            "work",
+        ],
+    )
+    with pytest.raises(SystemExit) as exited:
+        cli.main()
+    assert exited.value.code == 2
+    assert roster.EMPTY_CREDENTIAL in capsys.readouterr().err
+    assert not (bridge.home / roster.CREDENTIALS).exists()
+
+
+def test_unknown_credentials_show_ends_on_an_add_with_a_selector(
+    bridge, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "show",
+            "work",
+        ],
+    )
+    assert cli.main() == 1
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        "next: agent-parley credentials add work --config-home ~/.claude-work"
+    )
+
+
+def test_a_lane_name_that_names_no_provider_points_at_provider_flag(
+    bridge, repo
+):
+    with pytest.raises(BridgeError) as raised:
+        bridge.add_participant(repo, "ada")
+    assert "a new lane name needs --provider" in str(raised.value)
+    assert raised.value.next_command == (
+        "agent-parley run ada --provider claude"
+    )
+    bridge.add_participant(repo, "ada", "claude")
+    assert "ada" in roster.read(bridge.project(repo)[1])["participants"]
+
+
+def test_mail_list_from_the_main_checkout_names_as(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "mail",
+            "list",
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert "--as NAME" in lines[0]
+    assert lines[-1] == "next: agent-parley mail list --as claude"
+
+
+@pytest.mark.parametrize(
+    "command", [("say", "nobody", "hi"), ("watch", "nobody")]
+)
+def test_say_and_watch_to_an_unknown_lane_end_on_the_participant_list(
+    bridge, repo, paired, monkeypatch, capsys, command
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            *command,
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert "nobody is not a participant" in lines[0]
+    assert lines[-1] == "next: agent-parley participant list"
 
 
 def test_detail_clips_long_values_on_a_narrow_terminal(

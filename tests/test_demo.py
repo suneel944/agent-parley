@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import demo, demo_scenario, server
+from agent_parley import demo, demo_scenario, roster, server
 
 STAGES = (
     ("One loopback coordination server", "$ agent-parley up"),
@@ -97,6 +97,11 @@ def test_the_demo_tells_every_stage_and_removes_everything(monkeypatch):
         ), (caption, command, text)
     assert "PARTICIPANT" in text
     assert "\x1b[" not in text
+    closing_hint = text.rstrip().splitlines()[-1]
+    assert closing_hint.endswith(
+        "agent-parley setup . && agent-parley run claude"
+    )
+    assert "claude" in roster.PRESETS
     (base,) = created
     assert not base.exists()
     assert remaining_before_sweep == []

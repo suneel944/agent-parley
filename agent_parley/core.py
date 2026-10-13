@@ -445,7 +445,9 @@ class BridgeCore:
             repo: Main checkout or linked worktree of the target repository.
             name: Participant name, unique within this project.
             provider: Provider definition; defaults to the registered one, or
-                to a provider named exactly like the participant.
+                to a provider named exactly like the participant. A new name
+                that names no provider is refused with a ``--provider``
+                remedy rather than a provider definition.
             credential: Credential profile selecting one account; defaults to
                 the profile already registered for this participant.
 
@@ -470,9 +472,20 @@ class BridgeCore:
             data = self._project(root, directory, verify={name}, preserve=True)
             participants = data["participants"]
             existing = participants.get(name)
-            provider = provider or (existing or {}).get("provider") or name
+            chosen = provider or (existing or {}).get("provider")
+            provider = chosen or name
             if credential is None:
                 credential = (existing or {}).get("credential")
+            if not chosen and provider not in roster.providers(self.home):
+                raise BridgeError(
+                    f"No provider named {name!r}; a new lane name needs "
+                    f"--provider. Run agent-parley run {name} --provider "
+                    "claude, or agent-parley provider list.",
+                    next_command=(
+                        f"agent-parley run {shlex.quote(name)} "
+                        "--provider claude"
+                    ),
+                )
             roster.provider(self.home, provider)
             if credential is not None:
                 roster.credential(self.home, credential)

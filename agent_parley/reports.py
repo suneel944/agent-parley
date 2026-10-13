@@ -573,7 +573,8 @@ class ReportsMixin(BridgeCore):
             if value not in data["participants"]:
                 raise BridgeError(
                     f"{value} is not a participant in this project; "
-                    "run agent-parley participant list."
+                    "run agent-parley participant list.",
+                    next_command="agent-parley participant list",
                 )
             participant = value
         elif subject == "claim":

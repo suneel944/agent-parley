@@ -79,6 +79,10 @@ MANIFEST_VERSION = 2
 APPROVAL_STEPS = ("merge", "pr")
 PROVIDERS = "providers.json"
 CREDENTIALS = "credentials.json"
+EMPTY_CREDENTIAL = (
+    "A credential profile must select an account: pass --config-home DIR "
+    "(or --env/--require-env)."
+)
 
 PRESETS: dict[str, dict] = {
     "claude": {
@@ -1043,8 +1047,11 @@ def credential(home: Path, name: str) -> dict:
     if entry is None:
         raise BridgeError(
             f"Unknown credential profile {name!r}. Define it with "
-            "`agent-parley credentials add`.",
-            next_command=f"agent-parley credentials add {shlex.quote(name)}",
+            "`agent-parley credentials add NAME --config-home DIR`.",
+            next_command=(
+                f"agent-parley credentials add {shlex.quote(name)} "
+                f"--config-home ~/{shlex.quote(f'.claude-{name}')}"
+            ),
         )
     return entry
 
@@ -1056,6 +1063,9 @@ def define_credential(
 
     The profile records a config home and variable names. The native CLI still
     performs its own sign-in inside that home, so bridge state holds no token.
+    A profile with none of the three would launch on the default account
+    under a name implying a separate one, so it is refused before anything
+    is written.
 
     Args:
         home: Private bridge state root.
@@ -1068,9 +1078,12 @@ def define_credential(
         The stored credential profile.
 
     Raises:
-        BridgeError: If the name, directory, or variables are invalid.
+        BridgeError: If the name, directory, or variables are invalid, or
+            the profile selects no account.
     """
     identifier(name, "Credential profile name")
+    if not (config_home or env or require):
+        raise BridgeError(EMPTY_CREDENTIAL)
     resolved = ""
     if config_home:
         directory = Path(config_home).expanduser()
@@ -1578,12 +1591,19 @@ def read(directory: Path) -> dict:
         ) from exc
 
 
-def resolve(manifest: dict, lane: Path) -> str:
+def resolve(manifest: dict, lane: Path, mail_reader: bool = False) -> str:
     """Returns the participant that owns a worktree.
+
+    The read-only mail verbs accept ``--as NAME``, so their refusal from the
+    main checkout tells the operator to name a lane there, ending on a
+    ``mail list --as`` for the first active lane, instead of pointing at a
+    participant listing that cannot read anything.
 
     Args:
         manifest: Manifest using the participant roster layout.
         lane: Resolved worktree path.
+        mail_reader: Whether the caller is a read-only mail verb that reads
+            a named lane's mail with ``--as NAME``.
 
     Returns:
         The owning participant name.
@@ -1594,6 +1614,21 @@ def resolve(manifest: dict, lane: Path) -> str:
     for name, participant in manifest["participants"].items():
         if Path(participant["lane"]) == lane:
             return name
+    if mail_reader:
+        active = sorted(
+            name
+            for name, participant in manifest["participants"].items()
+            if not retired(participant)
+        )
+        raise BridgeError(
+            "Read a lane's mail from the main checkout with --as NAME, or run "
+            "this inside the lane's worktree.",
+            next_command=(
+                f"agent-parley mail list --as {shlex.quote(active[0])}"
+                if active
+                else "agent-parley run claude"
+            ),
+        )
     raise BridgeError(
         "Run this from an assigned agent worktree, not the main checkout.",
         next_command="agent-parley participant list",

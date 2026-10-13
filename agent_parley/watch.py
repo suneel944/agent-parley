@@ -385,7 +385,8 @@ def run(
     if name not in manifest["participants"]:
         raise BridgeError(
             f"{name} is not a participant in this project; "
-            "run agent-parley participant list."
+            "run agent-parley participant list.",
+            next_command="agent-parley participant list",
         )
     floor = time.time() - since if since else 0.0
 

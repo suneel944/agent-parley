@@ -638,14 +638,20 @@ def credential_detail(name: str, entry: dict) -> dict:
     Returns:
         The config home the native CLI signs in under, the override names the
         launcher sets, and the variables it requires from the caller's shell.
-        No recorded value is reported.
+        No recorded value is reported. A profile recorded before empty
+        profiles were refused sets none of the three and launches on the
+        default account, so it also carries ``account`` reading ``selects no
+        account``.
     """
-    return {
+    shown = {
         "credential": name,
         "config_home": entry.get("home", ""),
         "env": redacted(entry.get("env") or {}),
         "require_env": list(entry.get("require_env") or []),
     }
+    if not (shown["config_home"] or shown["env"] or shown["require_env"]):
+        shown["account"] = "selects no account"
+    return shown
 
 
 def _count(value: object) -> int | None:

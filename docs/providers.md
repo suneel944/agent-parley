@@ -84,8 +84,10 @@ repository, and a project holds at most 32 participants.
 
 `--provider` defaults to the participant name. `agent-parley run claude-2` with
 no other flag therefore looks for a provider called `claude-2` and refuses with
-`Unknown provider 'claude-2'`, even though the `claude` preset exists. Name the
-provider whenever the participant is not named after it.
+`No provider named 'claude-2'; a new lane name needs --provider.` and
+`next: agent-parley run claude-2 --provider claude`, even though the `claude`
+preset exists. Name the provider whenever the participant is not named after
+it.
 
 ### Which names are already taken
 

@@ -3803,7 +3803,10 @@ def checkpoint(
     manifest = roster.read(directory)
     participant = manifest["participants"].get(agent)
     if participant is None:
-        raise BridgeError(f"{agent} is not a participant in this project.")
+        raise BridgeError(
+            f"{agent} is not a participant in this project.",
+            next_command="agent-parley participant list",
+        )
     if roster.retired(participant):
         told = retired_output(event, agent)
         record(directory, agent, payload, Reason.RETIRED, told, "retired")

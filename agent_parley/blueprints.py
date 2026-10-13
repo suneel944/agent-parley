@@ -644,7 +644,8 @@ def start(
     if name not in data["participants"]:
         raise BridgeError(
             f"{name} is not a participant in this project; run "
-            "agent-parley participant list."
+            "agent-parley participant list.",
+            next_command="agent-parley participant list",
         )
     nodes = (data.get("blueprints") or {}).get(blueprint)
     if nodes is None:

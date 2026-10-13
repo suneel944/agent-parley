@@ -326,7 +326,7 @@ def closing(recorder: Recorder) -> None:
     recorder.chapter(
         "GET STARTED",
         "uv tool install agent-parley",
-        "agent-parley setup .   ·   agent-parley run <lane>",
+        "agent-parley setup .   ·   agent-parley run claude",
         "Local-first. Standard library only. Your native CLIs, unchanged.",
         seconds=6.0,
     )

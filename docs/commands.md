@@ -126,8 +126,8 @@ on standard output and export to a file.
 | `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |
 | `provider budget NAME` | Show or set the advisory limits every lane on that provider inherits. |
 | `credentials list` | List native account profiles. |
-| `credentials show NAME` | Show one profile with every recorded value redacted: the config home, the override names and the variables required from your shell. |
-| `credentials add NAME` | Define a config home and environment requirements. |
+| `credentials show NAME` | Show one profile with every recorded value redacted: the config home, the override names and the variables required from your shell. A profile that sets none of them reads `Account: selects no account`, because it launches on the default account. |
+| `credentials add NAME` | Define a config home and environment requirements. It needs at least one of `--config-home`, `--env` or `--require-env`; a profile with none would select no account, so it exits 2 and writes nothing. |
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
 | `branch show` | Show the prefix new lane branches are created under and the recorded integration base. |
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
@@ -231,8 +231,8 @@ and why, then, when one command resolves it, a `next:` line naming that
 command exactly:
 
 ```text
-agent-parley: Unknown credential profile 'work'. Define it with `agent-parley credentials add`.
-next: agent-parley credentials add work
+agent-parley: Unknown credential profile 'work'. Define it with `agent-parley credentials add NAME --config-home DIR`.
+next: agent-parley credentials add work --config-home ~/.claude-work
 ```
 
 The `next:` line is the command to run, with the refusal's own values filled
