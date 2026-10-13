@@ -1,5 +1,6 @@
 """Regression coverage for lane, configuration and inbox hardening."""
 
+import asyncio
 import json
 import os
 import signal
@@ -9,7 +10,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, dashboard, process, roster
+from agent_parley import (
+    checkpoints,
+    cli,
+    dashboard,
+    process,
+    recovery,
+    roster,
+    store,
+)
 from agent_parley.state import BridgeError, write_json
 
 
@@ -44,6 +53,98 @@ def test_child_tool_events_guard_the_lane_without_changing_parent_activity(
         checkpoints.checkpoint(bridge.home, lane.parent, "codex", payload) == {}
     )
     assert json.loads(state_path.read_text()) == parent
+
+
+DAMAGED_RECORDS = ["", "{trunc", "null", "[]", "1"]
+
+
+@pytest.fixture
+def lane(bridge, paired):
+    """Returns the codex lane with its identity registered."""
+    path = Path(paired["lanes"]["codex"])
+    store.initialize(bridge.home)
+    data = json.loads((path.parent / "project.json").read_text())
+    asyncio.run(bridge.identity("codex", data))
+    return path
+
+
+def tool_payload(lane):
+    return {
+        "hook_event_name": "PreToolUse",
+        "session_id": "lane-session",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+    }
+
+
+@pytest.mark.parametrize("damaged", DAMAGED_RECORDS)
+def test_a_damaged_activity_record_is_kept_aside_and_replaced(
+    bridge, lane, damaged
+):
+    directory = lane.parent
+    state_path = directory / "codex-activity.json"
+    state_path.write_text(damaged)
+    assert checkpoints.activity(directory, "codex") == {}
+    result = checkpoints.checkpoint(
+        bridge.home, directory, "codex", tool_payload(lane)
+    )
+    assert (result.get("hookSpecificOutput") or {}).get(
+        "permissionDecision"
+    ) != "deny"
+    assert isinstance(json.loads(state_path.read_text()), dict)
+    kept = list(directory.glob("codex-activity.json.corrupt-*"))
+    assert [path.read_text() for path in kept] == [damaged]
+    noted = [
+        json.loads(line)
+        for line in (directory / "codex-events.jsonl").read_text().splitlines()
+    ]
+    named = [
+        entry
+        for entry in noted
+        if entry["reason_class"] == checkpoints.Reason.STATE_UNREADABLE
+    ]
+    assert len(named) == 1
+    assert str(kept[0]) in named[0]["cause"]
+    checkpoints.checkpoint(bridge.home, directory, "codex", tool_payload(lane))
+    assert len(list(directory.glob("codex-activity.json.corrupt-*"))) == 1
+
+
+@pytest.mark.parametrize("damaged", DAMAGED_RECORDS)
+def test_a_damaged_activity_record_never_blocks_a_served_tool_call(
+    bridge, lane, damaged
+):
+    (lane.parent / "codex-activity.json").write_text(damaged)
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "payload": tool_payload(lane),
+    }
+    assert checkpoints.serve(bridge.home, request)["status"] == 0
+
+
+@pytest.mark.parametrize("damaged", ["null", "[]", "1", "{trunc"])
+def test_writers_and_fence_reads_survive_a_non_object_record(lane, damaged):
+    directory = lane.parent
+    state_path = directory / "codex-activity.json"
+    state_path.write_text(damaged)
+    payload = tool_payload(lane)
+    assert recovery.stale_session(directory, "codex", payload) is None
+    pending = {"markers": {"cursor": 1}, "session_id": "lane-session"}
+    checkpoints.deliver(directory, "codex", pending)
+    state_path.write_text(damaged)
+    checkpoints.recover(directory, "codex", payload)
+    assert len(list(directory.glob("codex-activity.json.corrupt-*"))) == 2
+
+
+def test_a_damaged_identity_names_the_file_and_the_resume(bridge, lane):
+    identity = lane.parent / "codex-identity.json"
+    identity.write_text("{trunc")
+    with pytest.raises(BridgeError, match="run agent-parley run codex"):
+        checkpoints.checkpoint(
+            bridge.home, lane.parent, "codex", tool_payload(lane)
+        )
+    assert identity.read_text() == "{trunc"
 
 
 def test_copilot_preserves_custom_config_and_does_not_duplicate_hooks(tmp_path):

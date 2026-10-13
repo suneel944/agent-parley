@@ -272,6 +272,77 @@ def test_a_store_not_yet_created_is_consistent(bridge, repo, paired, answering):
     assert bridge.doctor()["consistent"] is True
 
 
+GARBAGE = b"this is not a sqlite database at all, only text" * 4
+
+
+def damage_store(bridge):
+    bridge.home.mkdir(parents=True, exist_ok=True)
+    (bridge.home / store.DATABASE).write_bytes(GARBAGE)
+
+
+def test_a_damaged_store_is_never_reported_absent(bridge, repo, paired):
+    damage_store(bridge)
+    state = store.schema_state(store.schema_version(bridge.home))
+    assert state == store.SCHEMA_DAMAGED
+    assert store.remedy(state) == protocol.REPAIR
+    assert "not a database" in store.damage(bridge.home)
+    assert reported_store(bridge)["state"] == store.SCHEMA_DAMAGED
+    assert bridge.doctor()["consistent"] is False
+    reconciled = store.reconcile(bridge.home)
+    assert "is damaged" in reconciled
+    assert protocol.REPAIR in reconciled
+    assert protocol.REPAIR in checkpoints.outage(bridge.home, "boom")
+
+
+def test_status_names_a_damaged_store_and_its_repair(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    damage_store(bridge)
+    monkeypatch.setattr(
+        sys, "argv", ["agent-parley", "--home", str(bridge.home), "status"]
+    )
+    cli.main()
+    assert (
+        "Store: damaged (file is not a database); run agent-parley store "
+        "repair" in capsys.readouterr().out
+    )
+
+
+def test_the_repair_keeps_the_damaged_bytes_and_opens_a_fresh_store(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    damage_store(bridge)
+    (bridge.home / f"{store.DATABASE}-wal").write_bytes(b"wal")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "store", "repair"],
+    )
+    cli.main()
+    printed = capsys.readouterr().out
+    kept = {
+        path.name.split(".corrupt-")[0]: path
+        for path in bridge.home.glob(f"{store.DATABASE}*.corrupt-*")
+    }
+    assert kept[store.DATABASE].read_bytes() == GARBAGE
+    assert kept[f"{store.DATABASE}-wal"].read_bytes() == b"wal"
+    assert all(str(path) in printed for path in kept.values())
+    assert store.schema_version(bridge.home) == store.SCHEMA_VERSION
+    with store.connect(bridge.home) as db:
+        db.execute("SELECT 1").fetchone()
+    cli.main()
+    assert "nothing was moved" in capsys.readouterr().out
+    assert len(list(bridge.home.glob("*.corrupt-*"))) == len(kept)
+
+
+def test_a_missing_store_still_reads_absent_after_the_check(bridge):
+    assert store.damage(bridge.home) == ""
+    assert store.schema_state(store.schema_version(bridge.home)) == (
+        store.SCHEMA_ABSENT
+    )
+    assert store.repair(bridge.home) == ("", [])
+
+
 def test_a_behind_store_exits_non_zero(bridge, repo, paired, monkeypatch):
     store_schema(bridge, store.SCHEMA_VERSION - 1)
     monkeypatch.setattr(

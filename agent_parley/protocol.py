@@ -54,6 +54,10 @@ UPDATE = (
 )
 MIGRATE = "agent-parley up migrates the store in place; no lane is stopped."
 UPGRADE = "A newer agent-parley wrote this store; install that version."
+REPAIR = (
+    "run agent-parley store repair; it keeps the damaged file beside a new "
+    "empty store."
+)
 RELAUNCH = "agent-parley up starts a service on the code in the checkout."
 START = "agent-parley up starts the coordination service these lanes need."
 CLI_MODULE = "agent_parley.cli"

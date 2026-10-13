@@ -32,6 +32,8 @@ SCHEMA_ABSENT = "absent"
 SCHEMA_BEHIND = "needs migration"
 SCHEMA_CURRENT = "ok"
 SCHEMA_UNSUPPORTED = "unsupported"
+SCHEMA_DAMAGED = "damaged"
+DAMAGED_SCHEMA = -1
 SCHEMA_USABLE = frozenset({SCHEMA_ABSENT, SCHEMA_CURRENT})
 BUSY_TIMEOUT = 5.0
 MAX_BODY_BYTES = 4096
@@ -2950,17 +2952,131 @@ def schema_version(home: Path) -> int:
         home: Private bridge state root.
 
     Returns:
-        The declared schema, or zero when no store has been created yet or the
-        file cannot be opened. Reading never creates or upgrades a store.
+        The declared schema, zero when no store has been created yet or the
+        file cannot be opened for now, and `DAMAGED_SCHEMA` when the file
+        exists but SQLite cannot read it as a database. Reading never creates
+        or upgrades a store.
     """
     path = home / DATABASE
     if not path.exists():
         return 0
     try:
-        with contextlib.closing(sqlite3.connect(path)) as db:
+        with contextlib.closing(_reader(path)) as db:
             return int(db.execute("PRAGMA user_version").fetchone()[0])
     except sqlite3.Error:
-        return 0
+        return DAMAGED_SCHEMA if damage(home) else 0
+
+
+def damage(home: Path) -> str:
+    """Names why an existing store cannot be read as a database.
+
+    A busy or unopenable file is an operational failure that passes, so only
+    the errors SQLite raises for a file that is not a readable database
+    count as damage.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        The SQLite message for a damaged store, or an empty string when the
+        store is missing or readable.
+    """
+    path = home / DATABASE
+    if not path.exists():
+        return ""
+    try:
+        with contextlib.closing(_reader(path)) as db:
+            db.execute("PRAGMA user_version").fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    return ""
+
+
+def _reader(path: Path, timeout: float = 5.0) -> sqlite3.Connection:
+    """Opens a store file read-only, so that probing it changes nothing.
+
+    Closing the last writable connection to a file SQLite cannot read
+    deletes its ``-wal`` file, which may hold the only intact pages, so
+    every probe of a store that may be damaged reads through this instead.
+
+    Args:
+        path: Store database file.
+        timeout: Seconds to wait for a lock held by another connection.
+
+    Returns:
+        A read-only connection.
+    """
+    return sqlite3.connect(
+        f"{path.resolve().as_uri()}?mode=ro", timeout=timeout, uri=True
+    )
+
+
+def _integrity(path: Path) -> str:
+    """Runs SQLite's quick integrity check over one store file.
+
+    Args:
+        path: Store database file.
+
+    Returns:
+        The failure SQLite reports, or an empty string when the check passes.
+
+    Raises:
+        BridgeError: If the store is busy and cannot be checked now.
+    """
+    try:
+        with contextlib.closing(_reader(path, BUSY_TIMEOUT)) as db:
+            rows = [str(row[0]) for row in db.execute("PRAGMA quick_check")]
+    except sqlite3.OperationalError as exc:
+        raise BridgeError(f"Could not check the store {path}: {exc}") from exc
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    return "" if rows == ["ok"] else "; ".join(rows[:3])
+
+
+def repair(home: Path) -> tuple[str, list[Path]]:
+    """Sets a damaged store aside and creates an empty one in its place.
+
+    The check and the move run under the store lock, so no process creates
+    or migrates the store meanwhile. The database and its ``-wal`` and
+    ``-shm`` side files move to ``<name>.corrupt-<unix time>`` beside it,
+    never over an earlier copy and never deleted, so the bytes stay
+    available for manual salvage. A store that passes the check is left
+    untouched. The repair runs only on an explicit operator command.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        The integrity failure found, or an empty string when the store
+        passed or does not exist, and the paths the damaged files moved to.
+
+    Raises:
+        BridgeError: If the store is busy and cannot be checked now.
+    """
+    path = home / DATABASE
+    kept: list[Path] = []
+    with lock(home / "store.lock"):
+        fault = (damage(home) or _integrity(path)) if path.exists() else ""
+        if fault:
+            names = [
+                name
+                for name in (DATABASE, f"{DATABASE}-wal", f"{DATABASE}-shm")
+                if (home / name).exists()
+            ]
+            stamp = int(time.time())
+            while any(
+                (home / f"{name}.corrupt-{stamp}").exists() for name in names
+            ):
+                stamp += 1
+            for name in names:
+                target = home / f"{name}.corrupt-{stamp}"
+                (home / name).replace(target)
+                kept.append(target)
+    if fault:
+        initialize(home)
+    return fault, kept
 
 
 def schema_state(schema: int) -> str:
@@ -2978,9 +3094,12 @@ def schema_state(schema: int) -> str:
     Returns:
         `SCHEMA_ABSENT` when no store has been created, `SCHEMA_CURRENT` when
         the store matches this build, `SCHEMA_BEHIND` when it predates this
-        build and has not been migrated, and `SCHEMA_UNSUPPORTED` when a newer
-        build wrote it, which is refused rather than downgraded.
+        build and has not been migrated, `SCHEMA_UNSUPPORTED` when a newer
+        build wrote it, which is refused rather than downgraded, and
+        `SCHEMA_DAMAGED` when the file exists but cannot be read.
     """
+    if schema == DAMAGED_SCHEMA:
+        return SCHEMA_DAMAGED
     if not schema:
         return SCHEMA_ABSENT
     if schema < SCHEMA_VERSION:
@@ -3008,6 +3127,8 @@ def remedy(state: str) -> str:
         return protocol.MIGRATE
     if state == SCHEMA_UNSUPPORTED:
         return protocol.UPGRADE
+    if state == SCHEMA_DAMAGED:
+        return protocol.REPAIR
     return ""
 
 
@@ -3071,6 +3192,11 @@ def reconcile(home: Path, cause: str = "") -> str:
         )
     if state == SCHEMA_UNSUPPORTED:
         return f"Store schema {schema} is newer; {needed}. {protocol.UPGRADE}"
+    if state == SCHEMA_DAMAGED:
+        return (
+            f"Store {home / DATABASE} is damaged ({damage(home)}); "
+            f"{protocol.REPAIR}"
+        )
     return ""
 
 

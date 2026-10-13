@@ -306,6 +306,7 @@ class Reason(StrEnum):
     OUTSIDE_LANE = "outside_lane"
     PERMISSION_DENIED = "permission_denied"
     CHAINED_CLI = "chained_cli"
+    STATE_UNREADABLE = "state_unreadable"
 
 
 UNOBSERVED = frozenset(
@@ -316,6 +317,7 @@ UNOBSERVED = frozenset(
         Reason.SUPERSEDED,
         Reason.WAKE_REQUESTED,
         Reason.NOTIFICATION_FAILED,
+        Reason.STATE_UNREADABLE,
     }
 )
 
@@ -2942,9 +2944,47 @@ def activity(directory: Path, agent: str) -> dict:
     """
     path = directory / f"{agent}-activity.json"
     try:
-        return dict(json.loads(path.read_text()))
+        state = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _lane_state(path: Path) -> tuple[dict, str]:
+    """Reads a lane's activity record for a writer, keeping a damaged one.
+
+    A writer that failed on a damaged record would fail on every later event
+    too, since its own write is what would replace the file, so every tool
+    call in the lane was refused until an operator deleted it. A record that
+    does not decode to a mapping is instead moved to
+    ``<name>.corrupt-<unix time>``, never over an earlier copy, and the
+    writer continues as from a missing record.
+
+    Args:
+        path: The lane's ``<agent>-activity.json``.
+
+    Returns:
+        The record and an empty string, an empty mapping and an empty string
+        when the file is missing, or an empty mapping and a sentence naming
+        the damage and the copy it was kept as.
+    """
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}, ""
+    try:
+        state = json.loads(text)
+    except ValueError as exc:
+        fault = str(exc)
+    else:
+        if isinstance(state, dict):
+            return state, ""
+        fault = f"a JSON {type(state).__name__}, not an object"
+    stamp = int(time.time())
+    while (kept := path.with_name(f"{path.name}.corrupt-{stamp}")).exists():
+        stamp += 1
+    os.replace(path, kept)
+    return {}, f"Damaged activity record kept as {kept}: {fault}"
 
 
 def work_offer(directory: Path, agent: str) -> dict | None:
@@ -3899,7 +3939,16 @@ def checkpoint(
     if payload.get("agent_id"):
         record(directory, agent, payload, Reason.OBSERVED, None)
         return {}
-    identity = json.loads((directory / f"{agent}-identity.json").read_text())
+    identity_path = directory / f"{agent}-identity.json"
+    try:
+        identity = json.loads(identity_path.read_text())
+    except ValueError:
+        identity = None
+    if not isinstance(identity, dict) or "name" not in identity:
+        raise BridgeError(
+            f"Lane identity {identity_path} is damaged; run agent-parley "
+            f"run {agent} --resume to register the lane again."
+        )
     state_path = directory / f"{agent}-activity.json"
     context = not record_only and event in CONTEXT_EVENTS
     scanned: dict | Exception = {}
@@ -3925,9 +3974,17 @@ def checkpoint(
     waits = settle if event in SETTLING or record_only else LOCK_SECONDS
     with lock(directory / f"{agent}-checkpoint.lock", timeout=waits):
         stages.enter("state")
-        state = (
-            json.loads(state_path.read_text()) if state_path.exists() else {}
-        )
+        state, damaged = _lane_state(state_path)
+        if damaged:
+            record(
+                directory,
+                agent,
+                payload,
+                Reason.STATE_UNREADABLE,
+                None,
+                "",
+                damaged,
+            )
         applied = state.get("updated")
         stale = isinstance(applied, (int, float)) and applied > arrived
         if event in SETTLING and stale:
@@ -4447,7 +4504,17 @@ def deliver(
         return False
     path = directory / f"{agent}-activity.json"
     with lock(directory / f"{agent}-checkpoint.lock", timeout=timeout):
-        state = json.loads(path.read_text()) if path.exists() else {}
+        state, damaged = _lane_state(path)
+        if damaged:
+            record(
+                directory,
+                agent,
+                {"session_id": pending.get("session_id", "")},
+                Reason.STATE_UNREADABLE,
+                None,
+                "",
+                damaged,
+            )
         if state.get("session_id", "") != pending.get("session_id", ""):
             return False
         current = state.get("updated") == pending.get("updated")
@@ -4535,9 +4602,19 @@ def recover(
     with lock(directory / f"{agent}-checkpoint.lock", timeout=timeout):
         if recovery.stale_session(directory, agent, payload):
             return False
-        if not path.exists():
+        state, damaged = _lane_state(path)
+        if damaged:
+            record(
+                directory,
+                agent,
+                payload,
+                Reason.STATE_UNREADABLE,
+                None,
+                "",
+                damaged,
+            )
+        if damaged or not path.exists():
             return True
-        state = json.loads(path.read_text())
         before = {
             "recovery_checkpoints": state.get("recovery_checkpoints", []),
             "recovery_error": state.get("recovery_error"),

@@ -3162,6 +3162,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "run",
             "plan",
             "state",
+            "store",
             "gc",
             "version",
             "plugins",
@@ -4148,6 +4149,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--merge",
         action="store_true",
         help="Add archived projects beside existing state.",
+    )
+    storing_state = commands.add_parser(
+        "store", help="Check or repair the coordination store."
+    )
+    store_actions = storing_state.add_subparsers(dest="action", required=True)
+    store_actions.add_parser(
+        "repair",
+        help=(
+            "Keep a damaged store aside as <name>.corrupt-<time> and create "
+            "an empty one."
+        ),
     )
     setup = commands.add_parser(
         "setup",
@@ -5825,6 +5837,15 @@ def main() -> int:
             )
         elif args.command == "state":
             print(bridge.state_archive(args))
+        elif args.command == "store":
+            fault, damaged_copies = store.repair(bridge.home)
+            print(
+                f"Store was damaged ({fault}); kept "
+                f"{', '.join(map(str, damaged_copies))} and created an "
+                "empty store."
+                if fault
+                else "Store passed its integrity check; nothing was moved."
+            )
         elif args.command == "setup":
             registered = bridge.setup(args.repo.resolve())
             print(

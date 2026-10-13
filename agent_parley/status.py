@@ -1360,6 +1360,8 @@ class StatusMixin(BridgeCore):
             print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
+            if schema == store.SCHEMA_DAMAGED:
+                schema = f"{schema} ({store.damage(self.home)})"
             print(f"Store: {schema}; {repair}")
         if "outbound" in report:
             print(notification_line(report["outbound"], report["inbound"]))
