@@ -3025,6 +3025,36 @@ refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
 
+### Damaged state files
+
+```sh
+agent-parley store repair
+```
+
+A coordination store that exists but SQLite cannot read, such as one reporting
+`file is not a database` or `database disk image is malformed`, is reported as
+`damaged`, never as a store not yet created. `status` prints
+`Store: damaged (<sqlite message>); run agent-parley store repair`, `doctor`
+reports the store component as inconsistent, and a hook refused by the outage
+names the same command. Probing the store opens it read-only, so a damaged
+file and its `-wal` and `-shm` side files are left exactly as found.
+
+`store repair` runs only when the operator invokes it, never from a hook. Under
+the store lock it runs SQLite's `PRAGMA quick_check`; a store that passes is
+left untouched and the command says nothing was moved. A store that fails is
+moved, with its side files, to `<name>.corrupt-<unix time>` in the state
+directory, never over an earlier copy and never deleted, and an empty store is
+created in its place. The command prints every path it kept, for manual
+salvage.
+
+A lane's `<lane>-activity.json` that does not decode to a JSON object is moved
+to `<lane>-activity.json.corrupt-<unix time>` by the next hook event, which
+continues as from a missing record and writes a valid one, so the tool call
+goes ahead. The lane's event log carries one `state_unreadable` record naming
+the kept copy. A damaged `<lane>-identity.json` cannot be rebuilt in a hook, so
+tool calls stay refused with a message naming the file and
+`agent-parley run <lane> --resume`, which registers the lane again.
+
 ### Exporting and importing the state directory
 
 ```sh

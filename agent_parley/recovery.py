@@ -1592,6 +1592,8 @@ def stale_session(directory: Path, agent: str, payload: dict) -> dict | None:
         )
     except (OSError, ValueError):
         return None
+    if not isinstance(activity, dict):
+        return None
     fence = activity.get("ownership_fence") or {}
     session = str(payload.get("session_id") or "")
     if not fence or session != str(fence.get("session_id") or ""):
