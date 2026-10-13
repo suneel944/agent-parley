@@ -353,6 +353,10 @@ JSON_HELP = (
     "Print one JSON document on standard output instead of the table. "
     "Field names are documented in docs/operations.md."
 )
+REPO_HELP = (
+    "Repository root or any of its worktrees; defaults to the current "
+    "directory."
+)
 RETRY_HELP = (
     "Idempotency key. Retry a failed command with the key it first used and "
     "the repeat returns the first result without applying the change again. "
@@ -3359,7 +3363,9 @@ def add_say_arguments(command: argparse.ArgumentParser) -> None:
         default="",
         help="Message body the participant reads.",
     )
-    command.add_argument("--repo", type=Path, default=Path.cwd())
+    command.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     command.add_argument(
         "--subject",
         default="",
@@ -3759,10 +3765,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     completing = commands.add_parser(
         "completion",
         help="Print a shell completion script for this command.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Install it for the current shell session:\n"
+            '  bash: eval "$(agent-parley completion bash)"\n'
+            '  zsh:  eval "$(agent-parley completion zsh)"\n'
+            "  fish: agent-parley completion fish | source"
+        ),
     )
-    completing.add_argument("shell", choices=completion.SHELLS)
+    completing.add_argument(
+        "shell",
+        choices=completion.SHELLS,
+        help="Shell to print the script for.",
+    )
     candidates = commands.add_parser("__complete", help=argparse.SUPPRESS)
-    candidates.add_argument("kind", choices=completion.KINDS)
+    candidates.add_argument(
+        "kind",
+        choices=completion.KINDS,
+        help="Kind of value to list from local state.",
+    )
     released = commands.add_parser(
         "version",
         help="Print the installed version and the state directory in use.",
@@ -3773,6 +3794,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help=(
             "Run the coordination story with stub lanes in a throwaway "
             "sandbox; no native CLI, model or network."
+        ),
+        description=(
+            "Run the coordination story with stub lanes in a throwaway "
+            "sandbox: lanes claim, collide, are refused, hand off and appear "
+            "in top. No native CLI, model, account or network is used, and "
+            "your state and repositories are never touched. It takes about "
+            "30 seconds; press q or Ctrl-C to stop early, and the sandbox is "
+            "removed either way."
         ),
     )
     starting = commands.add_parser(
@@ -3787,7 +3816,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     health = commands.add_parser(
         "status",
         help=(
-            "Show server health and registered workspaces as one table; "
+            "Show this project's open work and the service's health; "
             "`top` draws the live dashboard and `watch` follows one lane."
         ),
     )
@@ -3987,7 +4016,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     follow.add_argument("participant", help="Participant name to follow.")
-    follow.add_argument("--repo", type=Path, default=Path.cwd())
+    follow.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
     follow.add_argument(
         "--json",
         action="store_true",
@@ -4035,8 +4064,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     ):
         listing = subjects.add_parser(subject, help=summary)
-        listing.add_argument(argument)
-        listing.add_argument("--repo", type=Path, default=Path.cwd())
+        listing.add_argument(argument, help=f"The {subject} to read.")
+        listing.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
         listing.add_argument("--json", action="store_true", help=JSON_HELP)
         listing.add_argument(
             "--kind",
@@ -4049,9 +4080,19 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 + ". Repeat the flag to report several."
             ),
         )
-        listing.add_argument("--participant", default="")
-        listing.add_argument("--provider", default="")
-        listing.add_argument("--issue", default="")
+        listing.add_argument(
+            "--participant",
+            default="",
+            help="Report only records this lane filed.",
+        )
+        listing.add_argument(
+            "--provider",
+            default="",
+            help="Report only records of lanes on this provider.",
+        )
+        listing.add_argument(
+            "--issue", default="", help="Report only records of this issue."
+        )
         listing.add_argument(
             "--output",
             type=Path,
@@ -4084,7 +4125,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 else "Print the retained records on standard output."
             ),
         )
-        export.add_argument("--repo", type=Path, default=Path.cwd())
+        export.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
         export.add_argument(
             "--participant",
             action="append",
@@ -4133,12 +4176,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     showing = archives.add_parser(
         "show", help="List what an archive holds without importing it."
     )
-    showing.add_argument("archive", type=Path)
+    showing.add_argument(
+        "archive", type=Path, help="Archive written by state export."
+    )
     showing.add_argument("--json", action="store_true", help=JSON_HELP)
     importing = archives.add_parser(
         "import", help="Restore an archive into the state directory."
     )
-    importing.add_argument("archive", type=Path)
+    importing.add_argument(
+        "archive", type=Path, help="Archive written by state export."
+    )
     importing.add_argument(
         "--project",
         type=Path,
@@ -4165,7 +4212,11 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "setup",
         help="Register a repository for coordination from committed HEAD.",
     )
-    setup.add_argument("repo", type=Path)
+    setup.add_argument(
+        "repo",
+        type=Path,
+        help="Repository root or any of its worktrees to register.",
+    )
     setup.add_argument("--json", action="store_true", help=JSON_HELP)
     run = commands.add_parser(
         "run", help="Launch one participant's native CLI in this terminal."
@@ -4181,10 +4232,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     run.add_argument(
         "--credentials", help="Credential profile selecting one account."
     )
-    run.add_argument("--repo", type=Path, default=Path.cwd())
-    run.add_argument("--resume", action="store_true")
+    run.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
     run.add_argument(
-        "--task", default="Check shared coordination state and await my task."
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume the lane's last recorded native session instead of "
+            "starting a new one."
+        ),
+    )
+    run.add_argument(
+        "--task",
+        default="Check shared coordination state and await my task.",
+        help=(
+            "Opening prompt for the session, not an issue; use --issue to "
+            "claim one."
+        ),
     )
     run.add_argument(
         "--issue",
@@ -4210,17 +4273,23 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Record a partial, blocked, ready-for-review or waiting handoff."
         ),
     )
-    report.add_argument("--repo", type=Path, default=Path.cwd())
+    report.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
     report.add_argument(
-        "--state", choices=("partial", "blocked", "ready", "waiting")
+        "--state",
+        choices=("partial", "blocked", "ready", "waiting"),
+        help="Where the work stands.",
     )
-    report.add_argument("--summary", default="")
+    report.add_argument(
+        "--summary", default="", help="One line on what was done."
+    )
     records = report.add_subparsers(dest="action")
     showing_report = records.add_parser(
         "show", help="Print one recorded report of this lane."
     )
-    showing_report.add_argument("report_id")
-    showing_report.add_argument("--repo", type=Path, default=Path.cwd())
+    showing_report.add_argument("report_id", help="Report to print.")
+    showing_report.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     showing_report.add_argument(
         "--full",
         action="store_true",
@@ -4231,8 +4300,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "review",
         help="Record this lane's verdict on another lane's report.",
     )
-    reviewing_report.add_argument("report_id")
-    reviewing_report.add_argument("--repo", type=Path, default=Path.cwd())
+    reviewing_report.add_argument("report_id", help="Report to review.")
+    reviewing_report.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     reviewing_report.add_argument(
         "--verdict",
         choices=metrics.VERDICTS,
@@ -4248,8 +4319,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="What was checked; longer evidence is attached as a report's is.",
     )
     reviewing_report.add_argument("--json", action="store_true", help=JSON_HELP)
-    report.add_argument("--remaining", default="")
-    report.add_argument("--evidence", default="")
+    report.add_argument(
+        "--remaining", default="", help="What is still left to do."
+    )
+    report.add_argument(
+        "--evidence",
+        default="",
+        help="What was checked; longer evidence is attached to the report.",
+    )
     report.add_argument(
         "--issue",
         default="",
@@ -4314,11 +4391,13 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ("request", "Ask the holder of an issue to hand it to this lane."),
     ):
         command = actions.add_parser(action, help=summary)
-        command.add_argument("--repo", type=Path, default=Path.cwd())
+        command.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
         if action == "list":
             command.add_argument("--json", action="store_true", help=JSON_HELP)
         else:
-            command.add_argument("number")
+            command.add_argument("number", help="Issue number.")
             command.add_argument(
                 "--idempotency-key",
                 default="",
@@ -4348,8 +4427,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 ),
             )
         if action == "offer":
-            command.add_argument("--to", required=True)
-            command.add_argument("--summary", required=True)
+            command.add_argument(
+                "--to", required=True, help="Lane the ownership is offered to."
+            )
+            command.add_argument(
+                "--summary",
+                required=True,
+                help="Where the work stands, for the receiving lane.",
+            )
             command.add_argument(
                 "--remaining",
                 action="append",
@@ -4386,9 +4471,18 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 ),
             )
         if action in ("accept", "decline"):
-            command.add_argument("--offer-id", required=True)
+            command.add_argument(
+                "--offer-id",
+                required=True,
+                help="Offer being answered, as issue list prints it.",
+            )
         if action in ("block", "unblock"):
-            command.add_argument("--on", required=True)
+            command.add_argument(
+                "--on",
+                required=True,
+                metavar="NUMBER",
+                help="Issue this one depends on.",
+            )
     recovering = actions.add_parser(
         "recover",
         help=(
@@ -4396,8 +4490,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "capacity observation is later published."
         ),
     )
-    recovering.add_argument("number")
-    recovering.add_argument("--repo", type=Path, default=Path.cwd())
+    recovering.add_argument("number", help="Issue number.")
+    recovering.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     recovering.add_argument(
         "--reason",
         required=True,
@@ -4410,8 +4506,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "request already landed, recording the forge evidence."
         ),
     )
-    resolving.add_argument("number")
-    resolving.add_argument("--repo", type=Path, default=Path.cwd())
+    resolving.add_argument("number", help="Issue number.")
+    resolving.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     resolving.add_argument(
         "--reason",
         default="",
@@ -4434,7 +4532,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "reason for each; it claims nothing."
         ),
     )
-    choosing.add_argument("--repo", type=Path, default=Path.cwd())
+    choosing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     choosing.add_argument("--json", action="store_true", help=JSON_HELP)
     choosing.add_argument(
         "--limit",
@@ -4450,7 +4550,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "the forge tracks is claimed rather than opened twice."
         ),
     )
-    matching.add_argument("--repo", type=Path, default=Path.cwd())
+    matching.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     matching.add_argument("--json", action="store_true", help=JSON_HELP)
     matching.add_argument(
         "goal",
@@ -4467,8 +4569,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "assign",
         help="Offer an issue to a lane as the operator, or withdraw it.",
     )
-    assigning.add_argument("--repo", type=Path, default=Path.cwd())
-    assigning.add_argument("number")
+    assigning.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    assigning.add_argument("number", help="Issue number.")
     assigning.add_argument(
         "name",
         nargs="?",
@@ -4500,8 +4604,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "offer, held reservations and recorded history."
         ),
     )
-    inspecting.add_argument("number")
-    inspecting.add_argument("--repo", type=Path, default=Path.cwd())
+    inspecting.add_argument("number", help="Issue number.")
+    inspecting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     inspecting.add_argument("--json", action="store_true", help=JSON_HELP)
     checking = commands.add_parser(
         "doctor",
@@ -4557,8 +4663,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "unanswered, clearing that condition and nothing else."
         ),
     )
-    acking.add_argument("message_id", type=int)
-    acking.add_argument("--repo", type=Path, default=Path.cwd())
+    acking.add_argument(
+        "message_id", type=int, help="Message to acknowledge, as listed."
+    )
+    acking.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
     acking.add_argument("--json", action="store_true", help=JSON_HELP)
     collecting = commands.add_parser(
         "gc",
@@ -4569,7 +4677,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "`reclaim` is a compatibility alias."
         ),
     )
-    collecting.add_argument("--repo", type=Path, default=Path.cwd())
+    collecting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     sweeping = collecting.add_mutually_exclusive_group()
     sweeping.add_argument(
         "--apply",
@@ -4651,7 +4761,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "whether the service is reading inbound queries."
         ),
     )
-    probing.add_argument("--repo", type=Path, default=Path.cwd())
+    probing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     probing.add_argument("--json", action="store_true", help=JSON_HELP)
     storing = notices.add_parser(
         "setup",
@@ -4697,7 +4809,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ("show", "Print the applied plan as a tree with owners."),
     ):
         command = steps.add_parser(action, help=summary)
-        command.add_argument("--repo", type=Path, default=Path.cwd())
+        command.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
         if action != "show":
             command.add_argument(
                 "path", type=Path, help="TOML plan file to read."
@@ -4718,11 +4832,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     }
     for action, summary in revising.items():
         command = steps.add_parser(action, help=summary)
-        command.add_argument("--repo", type=Path, default=Path.cwd())
+        command.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
         command.add_argument("--json", action="store_true", help=JSON_HELP)
         if action in ("approve", "reject"):
-            command.add_argument("proposal_id")
-            command.add_argument("--reason", default="")
+            command.add_argument(
+                "proposal_id", help="Revision, as plan proposals lists it."
+            )
+            command.add_argument(
+                "--reason", default="", help="Rationale kept with the verdict."
+            )
         elif action == "propose":
             command.add_argument(
                 "--base",
@@ -4736,9 +4856,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     action="append",
                     default=[],
                     metavar="ISSUE:BLOCKER",
+                    help=f"Dependency edge to {edge}; repeatable.",
                 )
-            command.add_argument("--reason", required=True)
-            command.add_argument("--evidence", action="append", default=[])
+            command.add_argument(
+                "--reason", required=True, help="Why the plan should change."
+            )
+            command.add_argument(
+                "--evidence",
+                action="append",
+                default=[],
+                help="What supports the change; repeatable.",
+            )
     mail = commands.add_parser(
         "mail",
         help=(
@@ -4750,16 +4878,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     reading = letters.add_parser(
         "thread", help="Read this lane's messages in one thread."
     )
-    reading.add_argument("thread_id")
-    reading.add_argument("--repo", type=Path, default=Path.cwd())
-    reading.add_argument("--after-id", type=int, default=0)
+    reading.add_argument("thread_id", help="Thread to read.")
+    reading.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    reading.add_argument(
+        "--after-id",
+        type=int,
+        default=0,
+        help="Read only messages after this message id.",
+    )
     add_reader_argument(reading)
     reading.add_argument("--json", action="store_true", help=JSON_HELP)
     showing_mail = letters.add_parser(
         "show", help="Print one message you sent or received."
     )
-    showing_mail.add_argument("message_id", type=int)
-    showing_mail.add_argument("--repo", type=Path, default=Path.cwd())
+    showing_mail.add_argument("message_id", type=int, help="Message to print.")
+    showing_mail.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     showing_mail.add_argument(
         "--full",
         action="store_true",
@@ -4768,9 +4905,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     add_reader_argument(showing_mail)
     showing_mail.add_argument("--json", action="store_true", help=JSON_HELP)
     finding = letters.add_parser("search", help="Search this lane's mail.")
-    finding.add_argument("query")
-    finding.add_argument("--repo", type=Path, default=Path.cwd())
-    finding.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
+    finding.add_argument("query", help="Text to search for.")
+    finding.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    finding.add_argument(
+        "--limit",
+        type=int,
+        default=store.MAX_SEARCH_HITS,
+        help="Most messages to list.",
+    )
     add_reader_argument(finding)
     finding.add_argument("--json", action="store_true", help=JSON_HELP)
     inbox = letters.add_parser(
@@ -4780,8 +4924,13 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "query to write."
         ),
     )
-    inbox.add_argument("--repo", type=Path, default=Path.cwd())
-    inbox.add_argument("--limit", type=int, default=store.MAX_SEARCH_HITS)
+    inbox.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    inbox.add_argument(
+        "--limit",
+        type=int,
+        default=store.MAX_SEARCH_HITS,
+        help="Most messages to list.",
+    )
     add_reader_argument(inbox)
     inbox.add_argument("--json", action="store_true", help=JSON_HELP)
     sending = letters.add_parser(
@@ -4795,13 +4944,19 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     waiting = letters.add_parser(
         "pending", help="List operator items recorded but not delivered."
     )
-    waiting.add_argument("--repo", type=Path, default=Path.cwd())
+    waiting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     waiting.add_argument("--json", action="store_true", help=JSON_HELP)
     dropping = letters.add_parser(
         "cancel", help="Remove one recorded operator item before delivery."
     )
-    dropping.add_argument("item_id", type=int)
-    dropping.add_argument("--repo", type=Path, default=Path.cwd())
+    dropping.add_argument(
+        "item_id", type=int, help="Pending item, as mail pending lists it."
+    )
+    dropping.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     dropping.add_argument("--json", action="store_true", help=JSON_HELP)
     deciding = commands.add_parser(
         "decide",
@@ -4811,7 +4966,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     deciding.add_argument("text", help="Decision text participants read.")
-    deciding.add_argument("--repo", type=Path, default=Path.cwd())
+    deciding.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     deciding.add_argument(
         "--subject", default="", help="Subject the decision is found under."
     )
@@ -4841,9 +4998,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         default="",
         help="Text to match; without it the newest decisions are listed.",
     )
-    decision_list.add_argument("--repo", type=Path, default=Path.cwd())
     decision_list.add_argument(
-        "--limit", type=int, default=store.MAX_SEARCH_HITS
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    decision_list.add_argument(
+        "--limit",
+        type=int,
+        default=store.MAX_SEARCH_HITS,
+        help="Most decisions to list.",
     )
     decision_list.add_argument(
         "--since",
@@ -4863,7 +5025,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     listing = roles.add_parser(
         "list", help="List the project's lanes and their identities."
     )
-    listing.add_argument("--repo", type=Path, default=Path.cwd())
+    listing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     listing.add_argument("--json", action="store_true", help=JSON_HELP)
     reporting_lane = roles.add_parser(
         "show",
@@ -4872,16 +5036,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "current claims and last coordination."
         ),
     )
-    reporting_lane.add_argument("name")
-    reporting_lane.add_argument("--repo", type=Path, default=Path.cwd())
+    reporting_lane.add_argument("name", help="Lane to print.")
+    reporting_lane.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     reporting_lane.add_argument("--json", action="store_true", help=JSON_HELP)
     joining = roles.add_parser(
         "add", help="Create a lane with an optional provider and credentials."
     )
-    joining.add_argument("name")
-    joining.add_argument("--provider")
-    joining.add_argument("--credentials")
-    joining.add_argument("--repo", type=Path, default=Path.cwd())
+    joining.add_argument("name", help="Name of the new lane.")
+    joining.add_argument(
+        "--provider",
+        help="Provider definition; defaults to the participant name.",
+    )
+    joining.add_argument(
+        "--credentials", help="Credential profile selecting one account."
+    )
+    joining.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     for action, summary in (
         ("restore", "Restore the assigned branch while preserving work."),
         ("retire", "Retire a lane while preserving recoverable work."),
@@ -4894,12 +5067,23 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     ):
         command = roles.add_parser(action, help=summary)
         if action in BULK_PARTICIPANT or action == "merge":
-            command.add_argument("name", nargs="?", default="")
+            command.add_argument(
+                "name",
+                nargs="?",
+                default="",
+                help="Lane to act on; a lane selector may replace it.",
+            )
         else:
-            command.add_argument("name")
-        command.add_argument("--repo", type=Path, default=Path.cwd())
+            command.add_argument("name", help="Lane to act on.")
+        command.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
         if action == "merge":
-            command.add_argument("--preview", action="store_true")
+            command.add_argument(
+                "--preview",
+                action="store_true",
+                help="Report what the merge would do; change nothing.",
+            )
             command.add_argument(
                 "--renew-recovery",
                 action="store_true",
@@ -4951,7 +5135,11 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         elif action in BULK_PARTICIPANT:
             add_selector(command)
         if action == "restart":
-            command.add_argument("--task", default="")
+            command.add_argument(
+                "--task",
+                default="",
+                help="Opening prompt for the new session.",
+            )
         if action == "retire":
             command.add_argument(
                 "--yes",
@@ -4968,8 +5156,10 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "crossing one marks the lane and stops nothing."
         ),
     )
-    limiting.add_argument("name")
-    limiting.add_argument("--repo", type=Path, default=Path.cwd())
+    limiting.add_argument("name", help="Lane whose limits are shown or set.")
+    limiting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     add_budget_flags(limiting)
     granting = commands.add_parser(
         "approve",
@@ -4978,7 +5168,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     granting.add_argument(
         "participant", help="Participant whose ready report you approve."
     )
-    granting.add_argument("--repo", type=Path, default=Path.cwd())
+    granting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     granting.add_argument("--json", action="store_true", help=JSON_HELP)
     refusing = commands.add_parser(
         "reject",
@@ -4990,7 +5182,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     refusing.add_argument(
         "reason", help="Explanation delivered to the lane as operator mail."
     )
-    refusing.add_argument("--repo", type=Path, default=Path.cwd())
+    refusing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     refusing.add_argument("--json", action="store_true", help=JSON_HELP)
     requirement = commands.add_parser(
         "approval",
@@ -5000,7 +5194,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     stating = requirements.add_parser(
         "show", help="Show which steps require a recorded approval first."
     )
-    stating.add_argument("--repo", type=Path, default=Path.cwd())
+    stating.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     stating.add_argument("--json", action="store_true", help=JSON_HELP)
     requiring = requirements.add_parser(
         "set", help="Require an approval before merge, pr, both or none."
@@ -5016,7 +5212,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             + "; pass none to require no approval."
         ),
     )
-    requiring.add_argument("--repo", type=Path, default=Path.cwd())
+    requiring.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     resuming = requirements.add_parser(
         "resume",
         help=(
@@ -5039,7 +5237,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         default="",
         help="Lane to record on; the project default when omitted.",
     )
-    resuming.add_argument("--repo", type=Path, default=Path.cwd())
+    resuming.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     gate = commands.add_parser(
         "verify",
         help="Show or set the command a repository requires before a merge.",
@@ -5048,7 +5248,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     showing = gates.add_parser(
         "show", help="Show the project's configured pre-merge command."
     )
-    showing.add_argument("--repo", type=Path, default=Path.cwd())
+    showing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     showing.add_argument("--json", action="store_true", help=JSON_HELP)
     setting = gates.add_parser(
         "set", help="Set the pre-merge command; empty removes it."
@@ -5061,7 +5263,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "empty string to remove the gate. No flag skips it."
         ),
     )
-    setting.add_argument("--repo", type=Path, default=Path.cwd())
+    setting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     standing = commands.add_parser(
         "unattended",
         help="Show, set or run the project's unattended integration policy.",
@@ -5070,7 +5274,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     standing_show = standings.add_parser(
         "show", help="Show the unattended integration policy."
     )
-    standing_show.add_argument("--repo", type=Path, default=Path.cwd())
+    standing_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     standing_set = standings.add_parser(
         "set", help="Authorize unattended integration of named issues."
     )
@@ -5087,7 +5293,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--target",
         help="Branch the base checkout must have checked out.",
     )
-    standing_set.add_argument("--repo", type=Path, default=Path.cwd())
+    standing_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     standing_run = standings.add_parser(
         "run", help="Integrate one eligible lane under the policy."
     )
@@ -5102,7 +5310,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "defaults to its only ready claim."
         ),
     )
-    standing_run.add_argument("--repo", type=Path, default=Path.cwd())
+    standing_run.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     waiting_kind = commands.add_parser(
         "timeout",
         help=(
@@ -5114,7 +5324,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     waiting_show = waiting_kinds.add_parser(
         "show", help="List every decision kind with its timeout."
     )
-    waiting_show.add_argument("--repo", type=Path, default=Path.cwd())
+    waiting_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     waiting_set = waiting_kinds.add_parser(
         "set", help="Make a reversible kind always ask, or wait longer."
     )
@@ -5135,7 +5347,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "--after the kind returns to its default."
         ),
     )
-    waiting_set.add_argument("--repo", type=Path, default=Path.cwd())
+    waiting_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     blueprint = commands.add_parser(
         "blueprint",
         help="Set, show or run the ordered steps a claim runs through.",
@@ -5147,7 +5361,12 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     blueprint_show = blueprint_actions.add_parser(
         "show", help="Show one blueprint node by node, or list them all."
     )
-    blueprint_show.add_argument("name", nargs="?", metavar="NAME")
+    blueprint_show.add_argument(
+        "name",
+        nargs="?",
+        metavar="NAME",
+        help="Blueprint to show; all are listed when omitted.",
+    )
     blueprint_templates = blueprint_actions.add_parser(
         "templates", help="List the starter blueprints shipped with the tool."
     )
@@ -5159,9 +5378,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Record a blueprint from a JSON file or a starter template. "
         "Base checkout only.",
     )
-    blueprint_set.add_argument("name", metavar="NAME")
+    blueprint_set.add_argument(
+        "name", metavar="NAME", help="Name to record the blueprint under."
+    )
     blueprint_source = blueprint_set.add_mutually_exclusive_group(required=True)
-    blueprint_source.add_argument("file", type=Path, nargs="?", metavar="FILE")
+    blueprint_source.add_argument(
+        "file",
+        type=Path,
+        nargs="?",
+        metavar="FILE",
+        help="JSON file holding the blueprint.",
+    )
     blueprint_source.add_argument(
         "--template",
         metavar="TEMPLATE",
@@ -5176,31 +5403,50 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     blueprint_remove = blueprint_actions.add_parser(
         "remove", help="Remove a recorded blueprint. Base checkout only."
     )
-    blueprint_remove.add_argument("name", metavar="NAME")
+    blueprint_remove.add_argument(
+        "name", metavar="NAME", help="Blueprint to remove."
+    )
     blueprint_run = blueprint_actions.add_parser(
         "run",
         help="Start a lane's claim on a blueprint. Base checkout only.",
     )
-    blueprint_run.add_argument("participant", metavar="NAME")
-    blueprint_run.add_argument("blueprint", metavar="BLUEPRINT")
-    blueprint_run.add_argument("--issue", required=True)
+    blueprint_run.add_argument(
+        "participant", metavar="NAME", help="Lane whose claim runs."
+    )
+    blueprint_run.add_argument(
+        "blueprint", metavar="BLUEPRINT", help="Recorded blueprint to run."
+    )
+    blueprint_run.add_argument(
+        "--issue", required=True, help="Claimed issue the run belongs to."
+    )
     blueprint_advance = blueprint_actions.add_parser(
         "advance",
         help="Move a claim's run on after its lane reports. Base checkout "
         "only.",
     )
-    blueprint_advance.add_argument("--issue", required=True)
+    blueprint_advance.add_argument(
+        "--issue", required=True, help="Claimed issue whose run moves on."
+    )
     blueprint_progress = blueprint_actions.add_parser(
         "progress", help="Show each run's current node and nodes passed."
     )
-    blueprint_progress.add_argument("--issue")
+    blueprint_progress.add_argument(
+        "--issue", help="Show only the run of this issue."
+    )
     blueprint_default = blueprint_actions.add_parser(
         "default",
         help="Map an issue label to the blueprint run --issue starts; omit "
         "BLUEPRINT to clear it. Base checkout only.",
     )
-    blueprint_default.add_argument("label", metavar="LABEL")
-    blueprint_default.add_argument("blueprint", nargs="?", metavar="BLUEPRINT")
+    blueprint_default.add_argument(
+        "label", metavar="LABEL", help="Issue label to map."
+    )
+    blueprint_default.add_argument(
+        "blueprint",
+        nargs="?",
+        metavar="BLUEPRINT",
+        help="Blueprint the label starts; omit to clear the mapping.",
+    )
     for blueprint_action in (
         blueprint_list,
         blueprint_show,
@@ -5211,7 +5457,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         blueprint_progress,
         blueprint_default,
     ):
-        blueprint_action.add_argument("--repo", type=Path, default=Path.cwd())
+        blueprint_action.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
     preparation = commands.add_parser(
         "init",
         help="Show or set the command every new lane runs before it starts.",
@@ -5220,7 +5468,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     reporting = preparations.add_parser(
         "show", help="Show the command every new lane runs before it starts."
     )
-    reporting.add_argument("--repo", type=Path, default=Path.cwd())
+    reporting.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     reporting.add_argument("--json", action="store_true", help=JSON_HELP)
     recording = preparations.add_parser(
         "set", help="Set the command every new lane runs before it starts."
@@ -5234,7 +5484,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "checkout while it runs. No flag skips it."
         ),
     )
-    recording.add_argument("--repo", type=Path, default=Path.cwd())
+    recording.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     pooling = commands.add_parser(
         "pool",
         help="Show or set how many prepared spare worktrees new lanes take.",
@@ -5243,7 +5495,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     pool_show = pools.add_parser(
         "show", help="Show the pool size and the condition of each spare."
     )
-    pool_show.add_argument("--repo", type=Path, default=Path.cwd())
+    pool_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     pool_show.add_argument("--json", action="store_true", help=JSON_HELP)
     pool_set = pools.add_parser(
         "set", help="Set how many spare worktrees to keep prepared."
@@ -5257,11 +5511,15 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "with init already run; 0 keeps none."
         ),
     )
-    pool_set.add_argument("--repo", type=Path, default=Path.cwd())
+    pool_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     pool_fill = pools.add_parser(
         "fill", help="Prepare missing spares now and remove stale ones."
     )
-    pool_fill.add_argument("--repo", type=Path, default=Path.cwd())
+    pool_fill.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     naming = commands.add_parser(
         "branch",
         help="Show or set the prefix new lane branches are created under.",
@@ -5270,7 +5528,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     naming_show = namings.add_parser(
         "show", help="Show the lane branch prefix and integration branch."
     )
-    naming_show.add_argument("--repo", type=Path, default=Path.cwd())
+    naming_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     naming_show.add_argument("--json", action="store_true", help=JSON_HELP)
     naming_set = namings.add_parser(
         "set", help="Set the prefix new lane branches are created under."
@@ -5283,7 +5543,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "keep the branch they were created with."
         ),
     )
-    naming_set.add_argument("--repo", type=Path, default=Path.cwd())
+    naming_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     naming_base = namings.add_parser(
         "integration",
         help=(
@@ -5300,7 +5562,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "empty string removes it."
         ),
     )
-    naming_base.add_argument("--repo", type=Path, default=Path.cwd())
+    naming_base.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     tracker = commands.add_parser(
         "forge",
         help="Show or set the issue tracker this project coordinates over.",
@@ -5309,7 +5573,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     tracker_show = trackers.add_parser(
         "show", help="Show the issue tracker this project coordinates over."
     )
-    tracker_show.add_argument("--repo", type=Path, default=Path.cwd())
+    tracker_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     tracker_show.add_argument("--json", action="store_true", help=JSON_HELP)
     tracker_set = trackers.add_parser(
         "set", help="Select the issue tracker; only github opens PRs."
@@ -5323,7 +5589,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "carries a .beads/ ledger, and null keeps issue numbers bare."
         ),
     )
-    tracker_set.add_argument("--repo", type=Path, default=Path.cwd())
+    tracker_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     budgets = commands.add_parser(
         "deadlines",
         help="Show or set this project's deadline and attempt defaults.",
@@ -5332,12 +5600,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     budget_show = budget_actions.add_parser(
         "show", help="Show the deadline and attempt defaults."
     )
-    budget_show.add_argument("--repo", type=Path, default=Path.cwd())
+    budget_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     budget_show.add_argument("--json", action="store_true", help=JSON_HELP)
     budget_set = budget_actions.add_parser(
         "set", help="Set the deadline windows and attempt limit."
     )
-    budget_set.add_argument("--repo", type=Path, default=Path.cwd())
+    budget_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     for field, described in (
         ("claim", "a claim"),
         ("offer", "a handoff offer"),
@@ -5373,12 +5645,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     ceiling_show = ceiling_actions.add_parser(
         "show", help="Show the advisory limits every lane inherits."
     )
-    ceiling_show.add_argument("--repo", type=Path, default=Path.cwd())
+    ceiling_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     ceiling_show.add_argument("--json", action="store_true", help=JSON_HELP)
     ceiling_set = ceiling_actions.add_parser(
         "set", help="Set the advisory limits every lane inherits."
     )
-    ceiling_set.add_argument("--repo", type=Path, default=Path.cwd())
+    ceiling_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     add_budget_flags(ceiling_set)
     ceiling_enforce = ceiling_actions.add_parser(
         "enforce",
@@ -5387,7 +5663,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "lane that stop new wakes, dispatch, retries and launches."
         ),
     )
-    ceiling_enforce.add_argument("--repo", type=Path, default=Path.cwd())
+    ceiling_enforce.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     for field, kind in (("tokens", int), ("calls", int), ("hours", float)):
         ceiling_enforce.add_argument(
             f"--{field}",
@@ -5402,7 +5680,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "resume",
         help="Clear an exhausted run budget so the service dispatches again.",
     )
-    ceiling_resume.add_argument("--repo", type=Path, default=Path.cwd())
+    ceiling_resume.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     ceiling_resume.add_argument(
         "--reset",
         action="store_true",
@@ -5416,7 +5696,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     declared_show = declarations.add_parser(
         "show", help="Show the named resources lanes may reserve."
     )
-    declared_show.add_argument("--repo", type=Path, default=Path.cwd())
+    declared_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     declared_show.add_argument("--json", action="store_true", help=JSON_HELP)
     declared_set = declarations.add_parser(
         "set", help="Declare the named resources lanes may reserve."
@@ -5429,7 +5711,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "pass an empty string to accept any well-formed name again."
         ),
     )
-    declared_set.add_argument("--repo", type=Path, default=Path.cwd())
+    declared_set.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     provider = commands.add_parser(
         "provider", help="Inspect or define providers that drive a native CLI."
     )
@@ -5439,21 +5723,50 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     ).add_argument("--json", action="store_true", help=JSON_HELP)
     definitions.add_parser(
         "remove", help="Delete a local definition, restoring any preset."
-    ).add_argument("name")
+    ).add_argument("name", help="Provider definition to delete.")
     provider_show = definitions.add_parser(
         "show", help="Print one provider definition and its hook support."
     )
-    provider_show.add_argument("name")
+    provider_show.add_argument("name", help="Provider to print.")
     provider_show.add_argument("--json", action="store_true", help=JSON_HELP)
     defining = definitions.add_parser(
         "add", help="Define a provider; warn when shadowing a preset."
     )
-    defining.add_argument("name")
-    defining.add_argument("--adapter", choices=roster.ADAPTERS, required=True)
-    defining.add_argument("--executable", required=True)
-    defining.add_argument("--home-env", default="")
-    defining.add_argument("--env", action="append", default=[])
-    defining.add_argument("--require-env", action="append", default=[])
+    defining.add_argument("name", help="Name of the provider to define.")
+    defining.add_argument(
+        "--adapter",
+        choices=roster.ADAPTERS,
+        required=True,
+        help="Native CLI family whose launch and hooks the provider uses.",
+    )
+    defining.add_argument(
+        "--executable",
+        required=True,
+        help="Command resolved on PATH that starts the native CLI.",
+    )
+    defining.add_argument(
+        "--home-env",
+        default="",
+        metavar="NAME",
+        help=(
+            "Variable naming the CLI's config home, which a credential "
+            "profile's --config-home sets."
+        ),
+    )
+    defining.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Variable set for every launch; repeatable, never a secret.",
+    )
+    defining.add_argument(
+        "--require-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Variable the launching shell must export; repeatable.",
+    )
     capping = definitions.add_parser(
         "budget",
         help=(
@@ -5461,7 +5774,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "inherits unless its own budget says otherwise."
         ),
     )
-    capping.add_argument("name")
+    capping.add_argument("name", help="Provider whose limits are shown or set.")
     add_budget_flags(capping)
     accounts = commands.add_parser(
         "credentials", help="Inspect or define per-account profiles."
@@ -5472,20 +5785,42 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     ).add_argument("--json", action="store_true", help=JSON_HELP)
     profiles.add_parser(
         "remove", help="Delete a profile; keep native files and logins."
-    ).add_argument("name")
+    ).add_argument("name", help="Profile to delete.")
     credential_show = profiles.add_parser(
         "show",
         help=("Print one account profile with every recorded value redacted."),
     )
-    credential_show.add_argument("name")
+    credential_show.add_argument("name", help="Profile to print.")
     credential_show.add_argument("--json", action="store_true", help=JSON_HELP)
     profile = profiles.add_parser(
         "add", help="Define a config home and environment requirements."
     )
-    profile.add_argument("name")
-    profile.add_argument("--config-home", default="")
-    profile.add_argument("--env", action="append", default=[])
-    profile.add_argument("--require-env", action="append", default=[])
+    profile.add_argument(
+        "name", help="Profile name that run --credentials selects."
+    )
+    profile.add_argument(
+        "--config-home",
+        default="",
+        metavar="DIR",
+        help=(
+            "Separate config directory for this account, set as the "
+            "provider's config-home variable at launch; sign in there once."
+        ),
+    )
+    profile.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Variable set for this account's launches; repeatable.",
+    )
+    profile.add_argument(
+        "--require-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Variable the launching shell must export; repeatable.",
+    )
     parser.epilog = command_help(commands)
 
 

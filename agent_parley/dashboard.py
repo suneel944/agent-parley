@@ -1247,7 +1247,7 @@ def _summary(view: dict, rate: str) -> list[str]:
 
     first = (
         f"agent-parley top - {time.strftime('%H:%M:%S')}  "
-        f"server {'running' if view['running'] else 'not running'}  "
+        f"service {'running' if view['running'] else 'not running'}  "
         f"projects {len(view['projects'])}"
         + (
             f"  idle {tables.age(totals['idle'])} (most "

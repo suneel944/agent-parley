@@ -51,6 +51,7 @@ from agent_parley.status import (
     FORGE_STALE,
     fold_line,
     folded,
+    service_state,
 )
 
 STORE = "store"
@@ -2130,7 +2131,11 @@ def derive(
         rows.append(_row(STORE, f"schema is {schema}", repair))
     if not report["server"]["ready"]:
         rows.append(
-            _row(SERVICE, "coordination server is not ready", "agent-parley up")
+            _row(
+                SERVICE,
+                f"coordination service is {service_state(report['server'])}",
+                "agent-parley up",
+            )
         )
     manifests = {
         data["root"]: (path.parent, data)

@@ -555,7 +555,7 @@ def test_status_names_the_drift_a_stale_service_reports(
     moved_sources(monkeypatch)
     bridge.status()
     printed = capsys.readouterr().out
-    assert "Server: not ready" in printed
+    assert "Service: not ready" in printed
     assert f"Code: {protocol.STALE}" in printed
     assert protocol.RELAUNCH in printed
 

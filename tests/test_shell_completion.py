@@ -2,12 +2,15 @@
 
 import argparse
 import json
+import os
+import shlex
 import shutil
 import subprocess
+import sys
 
 import pytest
 
-from agent_parley import completion
+from agent_parley import cli, completion
 from agent_parley.state import lock, write_json
 
 
@@ -281,3 +284,105 @@ def test_providers_and_credentials_come_from_the_registry(bridge):
 def test_the_manifest_reader_tolerates_an_absent_projects_directory(bridge):
     assert completion.candidates(bridge.home, "participants") == []
     assert json.dumps(completion.candidates(bridge.home, "issues")) == "[]"
+
+
+def test_positionals_name_what_each_command_slot_accepts():
+    slots = completion.positionals(cli.root_parser(None)[0])
+    assert slots["say#0"] == "@participants"
+    assert "say#1" not in slots
+    assert slots["completion#0"] == "bash zsh fish"
+    assert slots["participant restart#0"] == "@participants"
+    assert slots["provider show#0"] == "@providers"
+    assert slots["credentials show#0"] == "@credentials"
+    assert "participant add#0" not in slots
+
+
+def test_the_credentials_option_completes_profiles():
+    values = completion.value_flags(cli.root_parser(None)[0])
+    assert values["--credentials"] == "credentials"
+
+
+def test_value_options_include_home_but_not_switches():
+    taking = completion.value_options(cli.root_parser(None)[0])
+    assert "--home" in taking
+    assert "--credentials" in taking
+    assert "--json" not in taking
+
+
+def offered(shell, script, line, environment):
+    """Runs one shell's generated completion for a typed command line."""
+    words = ["agent-parley", *line.split(), ""]
+    quoted = " ".join(shlex.quote(word) for word in words)
+    if shell == "bash":
+        command = [
+            "bash",
+            "-c",
+            f"source {script}; COMP_WORDS=({quoted}); "
+            f"COMP_CWORD={len(words) - 1}; _agent_parley; "
+            'printf "%s\\n" "${COMPREPLY[@]}"',
+        ]
+    elif shell == "zsh":
+        command = [
+            "zsh",
+            "-f",
+            "-c",
+            "compdef() { :; }; _files() { :; }; "
+            'compadd() { [[ $1 == -- ]] && shift; print -l -- "$@"; }; '
+            f"source {script}; words=({quoted}); CURRENT={len(words)}; "
+            "_agent_parley",
+        ]
+    else:
+        typed = shlex.quote(f"agent-parley {line} ")
+        command = [
+            "fish",
+            "--no-config",
+            "-c",
+            f"source {script}; complete -C {typed}",
+        ]
+    finished = subprocess.run(
+        command,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    return {row.split("\t")[0] for row in finished.stdout.splitlines()}
+
+
+@pytest.mark.parametrize("shell", completion.SHELLS)
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    (
+        ("say", {"claude-2"}),
+        ("participant restart", {"claude-2"}),
+        ("completion", {"bash", "zsh", "fish"}),
+        ("--home elsewhere participant", {"restart", "list", "show"}),
+        ("run claude --credentials", {"work"}),
+    ),
+)
+def test_a_live_shell_completes_positionals_and_values(
+    bridge, tmp_path, monkeypatch, shell, line, expected
+):
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    project(bridge, "/tmp/one", ["claude-2"])
+    write_json(
+        bridge.home / "credentials.json",
+        {"version": 1, "entries": {"work": {"config_home": ""}}},
+    )
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    stub = tools / "agent-parley"
+    stub.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m agent_parley "$@"\n'
+    )
+    stub.chmod(0o755)
+    script = tmp_path / f"completion.{shell}"
+    script.write_text(completion.script(cli.root_parser(None)[0], shell))
+    environment = {
+        **os.environ,
+        "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+        "AGENT_PARLEY_HOME": str(bridge.home),
+    }
+    assert expected <= offered(shell, script, line, environment)
