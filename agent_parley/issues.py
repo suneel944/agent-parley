@@ -23,6 +23,7 @@ MAX_RESERVATIONS = 32
 MAX_RESERVATION_BYTES = 240
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
 ENDED = "pull request ended"
+FORGE_SKIP_LABELS = ("blocked", "wontfix", "question", "duplicate")
 
 
 def delivered(record: dict) -> bool:
@@ -546,6 +547,13 @@ def with_forge(directory: Path, state: dict) -> dict:
     and `recommend.rank` treat it as free, unblocked work. The opened issue
     itself is the operator's authorization to work on it.
 
+    An issue the forge lists as assigned to any login other than the
+    operator's own, or carrying a label in the cached ``skip_labels``
+    (`FORGE_SKIP_LABELS` when the cache names none), is somebody's work or
+    not ready, so it is left out; it can still be claimed by number. A
+    cached entry without assignees or labels reads as unassigned and
+    unlabelled.
+
     The result is a reading for candidate selection only and is never
     published: claiming the issue still writes its first ledger record. A
     number the ledger already records keeps its record, so a closed, ended
@@ -578,9 +586,16 @@ def with_forge(directory: Path, state: dict) -> dict:
     if time.time() - read_at >= FORGE_STALE:
         return state
     recorded = state.get("issues", {})
+    named = cached.get("skip_labels", FORGE_SKIP_LABELS)
+    skip = set(named if isinstance(named, list | tuple) else FORGE_SKIP_LABELS)
     added: dict[str, dict] = {}
     for number, item in listed.items():
         if str(number) in recorded or not str(number).isdigit():
+            continue
+        if isinstance(item, dict) and (
+            set(item.get("assignees") or []) - {cached.get("login")}
+            or skip & set(item.get("labels") or [])
+        ):
             continue
         title = item.get("title") if isinstance(item, dict) else item
         added[str(number)] = {
@@ -594,6 +609,28 @@ def with_forge(directory: Path, state: dict) -> dict:
     if not added:
         return state
     return {**state, "issues": {**recorded, **added}}
+
+
+def forge_assignees(directory: Path, number: str) -> list[str]:
+    """Names who else the cached forge reading lists as an issue's assignees.
+
+    Args:
+        directory: Private project state directory holding the cache.
+        number: Bare repository issue number.
+
+    Returns:
+        Sorted logins other than the operator's own, empty when the cache
+        is missing, unreadable or names nobody else.
+    """
+    from agent_parley.status import FORGE_ISSUES
+
+    try:
+        cached = json.loads((directory / FORGE_ISSUES).read_text())
+        item = cached["issues"][number]
+        people = set(item.get("assignees") or [])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return []
+    return sorted(str(person) for person in people - {cached.get("login")})
 
 
 def holders(state: dict) -> dict[str, list[str]]:

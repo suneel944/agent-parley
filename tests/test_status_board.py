@@ -34,9 +34,12 @@ def offline(monkeypatch):
         The fake's state: ``calls`` records each read and ``answer`` is the
         catalog the next read returns, None for a failed read.
     """
-    fake = {"calls": [], "answer": None}
+    fake = {"calls": [], "answer": None, "since": [], "delta": None}
 
-    def catalog(repo, limit, timeout):
+    def catalog(repo, limit, timeout, since=None):
+        if since is not None:
+            fake["since"].append(since)
+            return fake["delta"]
         fake["calls"].append(timeout)
         return fake["answer"]
 
@@ -465,13 +468,77 @@ def test_a_fresh_forge_reading_hides_closed_issues_and_titles_the_rest(
         for line in lines
     )
     assert json.loads(cache.read_text())["issues"] == {
-        "42": {"title": "Wire the forge"}
+        "42": {"title": "Wire the forge", "labels": [], "assignees": []}
     }
     offline["answer"] = {}
     poll_forge(bridge, repo)
     lines = board(monkeypatch, bridge, capsys, "--all")
     assert offline["calls"] == [FORGE_TIMEOUT]
     assert rows(lines) == ["#42", "#43"]
+
+
+def test_the_full_read_gets_two_seconds_a_page():
+    assert FORGE_TIMEOUT == 3 + 2 * 10
+
+
+def test_between_full_reads_the_catalog_follows_updated_issues(
+    bridge, repo, paired, offline, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    cache = directory / FORGE_ISSUES
+    offline["answer"] = {
+        "42": {"title": "Wire", "labels": [], "assignees": []},
+        "43": {"title": "Old", "labels": [], "assignees": ["teammate"]},
+    }
+    monkeypatch.setattr(forge, "login", lambda root: "operator")
+    poll_forge(bridge, repo)
+    first = json.loads(cache.read_text())
+    assert first["login"] == "operator"
+    assert first["complete_at"] == first["read_at"]
+    assert first["issues"]["43"]["assignees"] == ["teammate"]
+    write_json(cache, {**first, "read_at": first["read_at"] - 3600 + 1})
+    offline["delta"] = {
+        "43": {"title": "Old", "assignees": [], "state": "CLOSED"},
+        "44": {"title": "New", "labels": ["bug"], "state": "OPEN"},
+    }
+    poll_forge(bridge, repo)
+    second = json.loads(cache.read_text())
+    assert offline["calls"] == [FORGE_TIMEOUT]
+    assert offline["since"] == [first["read_at"] - 3600 + 1 - 120]
+    assert sorted(second["issues"]) == ["42", "44"]
+    assert second["issues"]["44"]["labels"] == ["bug"]
+    assert second["complete_at"] == first["complete_at"]
+    write_json(cache, {**second, "read_at": 0, "complete_at": 0})
+    poll_forge(bridge, repo)
+    assert offline["calls"] == [FORGE_TIMEOUT, FORGE_TIMEOUT]
+
+
+def test_a_failed_delta_keeps_the_reading_and_records_the_cause(
+    bridge, repo, paired, offline, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    cache = directory / FORGE_ISSUES
+    reading = {
+        "read_at": time.time() - 600,
+        "complete_at": time.time() - 600,
+        "limit": 1000,
+        "issues": {"42": {"title": "Wire"}},
+    }
+    write_json(cache, reading)
+
+    def refused(repo, limit, timeout, since=None):
+        forge._record_failure("auth", "HTTP 401: Bad credentials")
+        return None
+
+    monkeypatch.setattr(forge, "open_issue_catalog", refused)
+    poll_forge(bridge, repo)
+    after = json.loads(cache.read_text())
+    assert after["issues"] == reading["issues"]
+    assert after["failure"] == {
+        "kind": "auth",
+        "detail": "HTTP 401: Bad credentials",
+    }
+    assert after["failed_at"] > after["read_at"]
 
 
 def test_a_released_issue_closed_on_the_forge_leaves_free_work(

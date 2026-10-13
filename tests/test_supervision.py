@@ -1988,3 +1988,50 @@ def test_a_recovery_burst_queues_one_capture_with_merged_evidence(
 
     assert [payload for payload, _ in calls] == [{"step": 0}, {"step": 3}]
     assert [evidence for _, evidence in calls] == [None, passing]
+
+
+def test_a_failed_issue_reading_is_not_repeated_inside_the_retry_window(
+    tmp_path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        supervision.forge,
+        "issue_completion",
+        lambda root, number: calls.append(number),
+    )
+    for _ in range(5):
+        assert supervision._issue_reading(tmp_path, "7") is None
+    assert calls == ["7"]
+    key = (str(tmp_path), "7")
+    supervision._issue_readings[key] = (time.time() - 1, None)
+    supervision._issue_reading(tmp_path, "7")
+    assert calls == ["7", "7"]
+
+
+def test_a_refusing_forge_is_left_alone_until_the_retry_window_ends(
+    tmp_path, monkeypatch
+):
+    def unread(*args, **kwargs):
+        raise AssertionError("the forge is not read while it refuses")
+
+    monkeypatch.setattr(supervision.forge, "issue_completion", unread)
+    monkeypatch.setattr(supervision.forge, "open_pull_requests", unread)
+    monkeypatch.setattr(supervision.forge, "integration_landings", unread)
+    monkeypatch.setattr(
+        supervision.forge,
+        "_failure",
+        {"at": time.time(), "kind": "auth", "detail": "HTTP 401"},
+    )
+    manifest = {
+        "root": str(tmp_path),
+        "participants": {"claude": {"branch": "lane"}},
+    }
+    ledger = {"issues": {"9": {"owner": "claude"}}}
+    assert supervision.completed_claims(manifest, ledger) == {}
+    assert supervision._landing_reading(tmp_path, "integration") == {}
+    supervision.pull_request_wakes(tmp_path, tmp_path, manifest)
+    assert not (tmp_path / supervision.PULL_REQUEST_RECORD).exists()
+    supervision.forge._failure["kind"] = "missing"
+    assert not supervision._forge_backoff()
+    supervision.forge._failure.update(kind="rate", at=time.time() - 61)
+    assert not supervision._forge_backoff()

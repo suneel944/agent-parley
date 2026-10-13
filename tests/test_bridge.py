@@ -25,6 +25,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from agent_parley import (
     checkpoints,
+    claims,
     cli,
     dashboard,
     evidence,
@@ -2108,6 +2109,90 @@ def test_a_release_keeps_an_assignee_the_claim_did_not_add(
     bridge.issue(claude, "claim", "568")
     bridge.issue(claude, "release", "568")
     assert mirrored == [("assign", "568")]
+
+
+def test_an_unread_assignee_is_never_taken_over_or_later_removed(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    mirrored = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign",
+        lambda directory, number: not mirrored.append(("assign", number)),
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.unassign",
+        lambda directory, number: not mirrored.append(("unassign", number)),
+    )
+    bridge.issue(claude, "claim", "568")
+    bridge.issue(claude, "release", "568")
+    assert mirrored == []
+
+
+def test_a_failed_unassign_keeps_its_mark_until_a_poll_removes_it(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    directory = bridge.project(repo)[1]
+    answers = [False]
+    mirrored = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: False
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign", lambda directory, number: True
+    )
+
+    def unassign(directory, number):
+        mirrored.append(number)
+        return answers[-1]
+
+    monkeypatch.setattr("agent_parley.cli.forge.unassign", unassign)
+    bridge.issue(claude, "claim", "610")
+    bridge.issue(claude, "release", "610")
+    marks = directory / claims.FORGE_MARKS
+    assert json.loads(marks.read_text()) == {"610": True}
+    bridge.issue(claude, "claim", "611")
+    answers.append(True)
+    supervision.release_forge_marks(directory, roster.read(directory))
+    assert mirrored == ["610", "610"]
+    assert json.loads(marks.read_text()) == {"611": True}
+
+
+def test_claiming_an_issue_someone_else_holds_names_them_instead(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    directory = bridge.project(repo)[1]
+    write_json(
+        directory / supervision.FORGE_ISSUES,
+        {
+            "read_at": time.time(),
+            "login": "operator",
+            "issues": {"612": {"title": "Theirs", "assignees": ["teammate"]}},
+        },
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+
+    def refuse(directory, number):
+        raise AssertionError("someone else's issue is never co-assigned")
+
+    monkeypatch.setattr("agent_parley.cli.forge.assigned", refuse)
+    monkeypatch.setattr("agent_parley.cli.forge.assign", refuse)
+    record = bridge.issue(claude, "claim", "612")
+    assert record["owner"] == "claude"
+    assert record["forge_assignees"] == ["teammate"]
 
 
 def test_a_report_requires_one_claim_and_comments_on_that_issue(

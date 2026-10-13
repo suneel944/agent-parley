@@ -1,6 +1,7 @@
 """Checks that the forge is selected per project and every choice holds."""
 
 import os
+import subprocess
 import sys
 
 import pytest
@@ -106,9 +107,44 @@ def test_github_reads_whether_the_signed_in_account_holds_an_issue(
     replies["issue"] = '{"assignees": [{"login": "operator"}]}'
     assert forge.assigned(repo, "568") is True
     replies["issue"] = "not json"
-    assert forge.assigned(repo, "568") is False
+    assert forge.assigned(repo, "568") is None
+    replies["issue"] = '{"assignees": [{"login": "operator"}]}'
     replies["api"] = None
-    assert forge.assigned(repo, "568") is False
+    assert forge.assigned(repo, "568") is None
+
+
+@pytest.mark.parametrize(
+    ("stderr", "kind"),
+    [
+        ("HTTP 401: Bad credentials (https://api.github.com/user)", "auth"),
+        ("To get started with GitHub CLI, please run:  gh auth login", "auth"),
+        ("HTTP 403: API rate limit exceeded for user ID 1.", "rate"),
+        ("HTTP 429: Too Many Requests", "rate"),
+        ("gh: Not Found (HTTP 404)", "missing"),
+        ("HTTP 403: Resource not accessible by integration", "error"),
+    ],
+)
+def test_a_failed_forge_call_records_its_class(monkeypatch, stderr, kind):
+    failed = subprocess.CompletedProcess(["gh"], 1, "", stderr)
+    monkeypatch.setattr(forge.subprocess, "run", lambda *a, **k: failed)
+    assert forge._run(["gh", "api", "user"], 5) is None
+    failure = forge.last_failure()
+    assert failure["kind"] == kind
+    assert failure["detail"] == stderr
+    passed = subprocess.CompletedProcess(["gh"], 0, "ok", "")
+    monkeypatch.setattr(forge.subprocess, "run", lambda *a, **k: passed)
+    assert forge._run(["gh", "api", "user"], 5) == "ok"
+    assert forge.last_failure() is None
+
+
+def test_a_forge_timeout_is_recorded_as_one(monkeypatch):
+    def slow(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["gh"], 5)
+
+    monkeypatch.setattr(forge.subprocess, "run", slow)
+    assert forge._run(["gh", "issue", "list"], 5) is None
+    assert forge.last_failure()["kind"] == "timeout"
+    forge._failure.clear()
 
 
 def test_beads_speaks_through_bd_and_absorbs_failure(

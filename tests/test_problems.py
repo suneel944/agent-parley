@@ -787,6 +787,33 @@ def test_a_missing_root_names_the_live_lanes_it_keeps(
     )
 
 
+def test_a_forge_refusing_the_account_names_the_gh_auth_remedy(
+    bridge, repo, paired, served
+):
+    directory = bridge.project(repo)[1]
+    cache = directory / status.FORGE_ISSUES
+    assert not rows(bridge, problems.FORGE_REFUSED)
+    failed = {
+        "read_at": time.time() - 900,
+        "failed_at": time.time() - 30,
+        "issues": {},
+        "failure": {"kind": "auth", "detail": "HTTP 401: Bad credentials"},
+    }
+    write_json(cache, failed)
+    [row] = rows(bridge, problems.FORGE_REFUSED)
+    assert row["project"] == paired["root"]
+    assert row["seconds"] >= 30
+    assert "(auth): HTTP 401: Bad credentials" in row["detail"]
+    assert row["command"].startswith("gh auth status, then gh auth switch")
+    write_json(cache, {**failed, "failure": {"kind": "rate", "detail": ""}})
+    [row] = rows(bridge, problems.FORGE_REFUSED)
+    assert "retries at" in row["command"]
+    write_json(cache, {**failed, "failure": {"kind": "timeout"}})
+    assert not rows(bridge, problems.FORGE_REFUSED)
+    write_json(cache, {**failed, "read_at": time.time()})
+    assert not rows(bridge, problems.FORGE_REFUSED)
+
+
 def test_two_overdue_claims_on_one_lane_are_one_row(
     bridge, repo, paired, served
 ):

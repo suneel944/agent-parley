@@ -31,8 +31,11 @@ FORGE_ISSUES = "forge-issues.json"
 FORGE_TTL = 300.0
 FORGE_STALE = 2 * FORGE_TTL
 FORGE_RETRY = 60.0
-FORGE_TIMEOUT = 5
 FORGE_LIMIT = 1000
+FORGE_PAGE = 100
+FORGE_TIMEOUT = 3 + 2 * -(-FORGE_LIMIT // FORGE_PAGE)
+FORGE_FULL_SECONDS = 3600.0
+FORGE_OVERLAP = 120.0
 
 
 def reading(
@@ -1463,7 +1466,14 @@ class StatusMixin(BridgeCore):
         if forge.select(Path(root), manifest) != "github":
             return reading(issues, limit, now - read_at, False, "no GitHub")
         failed = float(cached.get("failed_at") or 0) > read_at
-        reason = "forge unreachable" if failed else "service not refreshing"
+        failure = cached.get("failure")
+        kind = failure.get("kind") if isinstance(failure, dict) else None
+        reason = (
+            "forge unreachable"
+            + (f": {kind}" if kind and kind != "error" else "")
+            if failed
+            else "service not refreshing"
+        )
         return reading(issues, limit, now - read_at, False, reason)
 
     def _board_project(

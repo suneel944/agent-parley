@@ -154,10 +154,11 @@ the table even when the reading lacks its number, because an issue opened and
 claimed inside the poll interval is not closed, only newer than the reading.
 
 Titles and open state come from one bounded read of the project's open GitHub
-issues, the same list `issue list` reads, with a 5-second timeout. The service's
-poll takes that reading, not `status`: it caches it as `forge-issues.json` in
-the project's state directory and reads again once the cache is 300 seconds
-old. When the read fails, the poll keeps the last reading and waits 60 seconds
+issues, the same list `issue list` reads, with a timeout of 3 seconds plus 2
+seconds per 100 issues read. The service's poll takes that reading, not
+`status`: it caches it as `forge-issues.json` in the project's state directory
+and reads again once the cache is 300 seconds old. Between full reads, at most
+hourly, it reads only the issues updated since the last reading. When the read fails, the poll keeps the last reading and waits 60 seconds
 before trying again. `status` only reads the cache; a reading over 600 seconds
 old prints one `Forge:` line with its age and the cause, a failed read or a
 service that is not refreshing it. With no reading at all, or no GitHub forge,
@@ -245,8 +246,11 @@ the repository's `origin` remote points at GitHub. Without any of those the
 title is simply absent and nothing else changes: the claim still succeeds and
 every listing, dependency and handoff behaves the same.
 
-Under the same conditions a claim assigns the issue to your GitHub account, a
-release unassigns it, and a lane's first `report --state ready` posts that
+Under the same conditions a claim assigns the issue to your GitHub account
+unless someone else already holds it there, in which case the claim records
+their names instead. A release, `issue resolve --release` or the supervisor's
+poll unassigns only an assignee agent-parley added; a failed unassign keeps its
+mark and the poll retries it. A lane's a lane's first `report --state ready` posts that
 lane's summary and evidence as a comment on every issue it claims. These
 mirrors use your own `gh` sign-in and run after the local ledger is written, so
 a forge that is missing, offline or unwilling changes nothing about ownership.
@@ -509,6 +513,7 @@ condition, that count, its age and what clears it:
 | `ci rounds exhausted` | An open pull request's head is red after it used its CI rounds: the `ci_rounds` supervision setting (2) plus any round the operator granted. A round is a head commit whose checks finished; a re-run on the same head is not a new round. The lane was told once to stop pushing and report blocked, and one decision offers `grant one more round` or `take over`. The row replaces `checks failed` for that pull request and clears on a green head. | Answer the decision: a grant lets the lane push once more; a takeover stops further decisions for that pull request. The limit is advisory and never refuses a push. |
 | `checks refused` | A required check the forge never started blocks one or more open pull requests. One row per check name and forge conclusion names every pull request it blocks. | Resolve it at the forge (billing, spending limit or manual approval), then re-run once. |
 | `session outliving its claim` | The lane holds no claim, yet a native session in a worktree the lane made showed activity in the last 60 seconds. | `agent-parley status NAME`; Agent Parley never stops such a session. |
+| `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
 | `root missing` | The project root checkout is gone. Once it has been gone an interval, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
 | `escalated plan revision` | A lane's plan revision touched an edge already revised back and forth under the current plan version, so it was escalated instead of applied. One row per escalated proposal, on the proposing lane, among the retained proposals. | `agent-parley plan approve ID` or `agent-parley plan reject ID --reason TEXT` |
 | `plan revisions pending` | Plan revisions outside the operator's envelope wait for a decision. One row per project counts them and ages from the oldest. | `agent-parley plan proposals`, then approve or reject each |
@@ -1467,7 +1472,10 @@ nothing is claimed for a lane.
 the ledger only when it is claimed, planned or assigned, so pull offers, next
 leads and `issue next` also read the open issues in the poll's
 `forge-issues.json` cache. An open issue the ledger has no record of counts
-as unclaimed and unblocked, with its forge title. A cache older than twice
+as unclaimed and unblocked, with its forge title, unless a forge account other
+than yours is assigned to it or it carries one of the `forge_skip_labels`
+supervision setting's labels (`blocked`, `wontfix`, `question` and `duplicate`
+by default). A cache older than twice
 the refresh interval, or a missing one, adds nothing, and the ledger itself is
 never written for this.
 

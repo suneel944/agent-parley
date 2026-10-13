@@ -31,6 +31,7 @@ from agent_parley import (
     approvals,
     budgets,
     dialogs,
+    forge,
     issues,
     lanes,
     merges,
@@ -44,7 +45,13 @@ from agent_parley import (
     tables,
 )
 from agent_parley.state import BridgeError
-from agent_parley.status import fold_line, folded
+from agent_parley.status import (
+    FORGE_ISSUES,
+    FORGE_RETRY,
+    FORGE_STALE,
+    fold_line,
+    folded,
+)
 
 STORE = "store"
 SERVICE = "service"
@@ -89,6 +96,7 @@ CHECKS_REFUSED = "checks refused"
 CI_ROUNDS_EXHAUSTED = "ci rounds exhausted"
 CHILD_SESSION = "session outliving its claim"
 CHILD_RECENT = 60
+FORGE_REFUSED = "forge refused"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -1588,6 +1596,58 @@ def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
     ]
 
 
+def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
+    """Reports a forge that refuses the supervisor's catalog read.
+
+    The supervisor records the class of a failed catalog read beside
+    ``failed_at`` in `FORGE_ISSUES`. A refused credential or a project the
+    signed-in account cannot see stops every pull request and completion
+    wake, so it is named with the `gh auth` remedy; a rate limit names the
+    next retry instead.
+
+    Args:
+        directory: Private project state directory.
+        root: Canonical project key.
+        now: Unix time the failure's age is measured against.
+
+    Returns:
+        One row while the newest catalog read failed for one of those
+        reasons less than `FORGE_STALE` seconds ago, or none.
+    """
+    try:
+        cached = json.loads((directory / FORGE_ISSUES).read_text())
+        failed_at = float(cached.get("failed_at") or 0)
+        read_at = float(cached.get("read_at") or 0)
+        kind = str(cached["failure"]["kind"])
+        detail = str(cached["failure"].get("detail") or "")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return []
+    if failed_at <= read_at or now - failed_at >= FORGE_STALE:
+        return []
+    if kind in ("auth", "missing"):
+        project = forge.slug(Path(root)) or "<owner>/<name>"
+        owner = project.split("/")[0]
+        command = f"gh auth status, then gh auth switch --user {owner}"
+        cause = "refused the signed-in account"
+    elif kind == "rate":
+        retry = time.strftime(
+            "%H:%M:%S", time.localtime(failed_at + FORGE_RETRY)
+        )
+        command = f"none; the supervisor retries at {retry}"
+        cause = "rate limited the supervisor"
+    else:
+        return []
+    return [
+        _row(
+            FORGE_REFUSED,
+            f"forge {cause} ({kind}): {detail}".rstrip(": "),
+            command,
+            _age(failed_at, now),
+            project=root,
+        )
+    ]
+
+
 def _plan_rows(directory: Path, root: str, now: float) -> list[dict]:
     """Reports the plan revisions that wait on the operator.
 
@@ -2069,6 +2129,7 @@ def derive(
         aged.extend(_refused_rows(directory, project["root"], stamp))
         aged.extend(_integration_rows(directory, project["root"], stamp))
         aged.extend(_root_rows(directory, project["root"], stamp))
+        aged.extend(_forge_rows(directory, project["root"], stamp))
         aged.extend(_plan_rows(directory, project["root"], stamp))
         aged.extend(_run_rows(directory, data, project["root"], stamp))
         aged.extend(_checks_rows(directory, project["root"], stamp))

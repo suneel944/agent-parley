@@ -19,7 +19,8 @@ import json
 import re
 import shutil
 import subprocess
-from datetime import datetime
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 MAX_TITLE = 200
@@ -879,8 +880,65 @@ def _epoch(value: str) -> float:
     return datetime.fromisoformat(value).timestamp()
 
 
+_failure: dict[str, object] = {}
+
+
+def _failure_kind(detail: str) -> str:
+    """Names the class of a failed forge call from what the client printed.
+
+    Args:
+        detail: The client's error output.
+
+    Returns:
+        ``auth`` for a refused or missing credential, ``rate`` for a rate
+        limit, ``missing`` for a project or object the account cannot see,
+        else ``error``.
+    """
+    text = detail.lower()
+    if any(
+        marker in text
+        for marker in (
+            "http 401",
+            "gh auth login",
+            "authentication",
+            "bad credentials",
+        )
+    ):
+        return "auth"
+    if "http 429" in text or ("http 403" in text and "rate limit" in text):
+        return "rate"
+    if "http 404" in text:
+        return "missing"
+    return "error"
+
+
+def last_failure() -> dict | None:
+    """Reports the newest forge call failure since the last success.
+
+    `_run` records each failed call and clears the record on the next call
+    that succeeds, so callers can wait out a refused or throttled forge
+    instead of repeating every call on every poll.
+
+    Returns:
+        ``at`` in Unix seconds, ``kind`` as `_failure_kind` names it or
+        ``timeout``, and up to 200 characters of ``detail``; None when the
+        newest call succeeded or none failed.
+    """
+    return dict(_failure) or None
+
+
+def _record_failure(kind: str, detail: str) -> None:
+    """Records one failed forge call for `last_failure`."""
+    _failure.clear()
+    _failure.update({"at": time.time(), "kind": kind, "detail": detail[:200]})
+
+
 def _run(args: list[str], timeout: int) -> str | None:
-    """Runs a forge client, reporting absence instead of raising."""
+    """Runs a forge client, reporting absence instead of raising.
+
+    A failure is recorded for `last_failure` with its class and the
+    client's own explanation, which is otherwise discarded.
+    """
     try:
         result = subprocess.run(
             args,
@@ -889,9 +947,18 @@ def _run(args: list[str], timeout: int) -> str | None:
             timeout=timeout,
             check=False,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        _record_failure("timeout", f"{args[0]} gave no answer in {timeout} s")
         return None
-    return None if result.returncode else result.stdout
+    except OSError as error:
+        _record_failure("error", str(error))
+        return None
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        _record_failure(_failure_kind(detail), detail)
+        return None
+    _failure.clear()
+    return result.stdout
 
 
 def issue_title(repo: Path, number: str) -> str | None:
@@ -1130,25 +1197,42 @@ def open_issues(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, dict]:
 
 
 def open_issue_catalog(
-    repo: Path, limit: int = MAX_OPEN_ISSUES, timeout: int = 15
+    repo: Path,
+    limit: int = MAX_OPEN_ISSUES,
+    timeout: int = 15,
+    since: float | None = None,
 ) -> dict[str, dict] | None:
     """Reads the forge's open issues, telling absence apart from none open.
+
+    Given `since`, the call instead reads every issue updated from that
+    instant on, open or closed, so a cached catalog can be brought current
+    without paging through every open issue again.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
         limit: Most open issues to read in the one call.
         timeout: Seconds the one client call may take.
+        since: Unix seconds; when given, read issues updated since then.
 
     Returns:
-        Bare issue number to its recorded title and label names, an empty
-        mapping when the forge reports no open issue, or None when the
-        project has no GitHub forge, no client, or the call failed.
+        Bare issue number to its recorded title, label names and assignee
+        logins, plus ``state`` when `since` is given; an empty mapping when
+        the forge reports no such issue, or None when the project has no
+        GitHub forge, no client, or the call failed.
     """
     if _implementation(repo) != "github":
         return None
     project = _reachable(repo)
     if project is None:
         return None
+    fields = "number,title,labels,assignees"
+    selection = ["--state", "open"]
+    if since is not None:
+        stamp = datetime.fromtimestamp(since, UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        fields += ",state"
+        selection = ["--state", "all", "--search", f"updated:>={stamp}"]
     output = _run(
         [
             "gh",
@@ -1156,12 +1240,11 @@ def open_issue_catalog(
             "list",
             "--repo",
             project,
-            "--state",
-            "open",
+            *selection,
             "--limit",
             str(limit),
             "--json",
-            "number,title,labels",
+            fields,
         ],
         timeout,
     )
@@ -1176,6 +1259,16 @@ def open_issue_catalog(
                     str(label["name"])
                     for label in record.get("labels") or []
                     if label.get("name")
+                ),
+                "assignees": sorted(
+                    str(person["login"])
+                    for person in record.get("assignees") or []
+                    if person.get("login")
+                ),
+                **(
+                    {"state": str(record.get("state") or "")}
+                    if since is not None
+                    else {}
                 ),
             }
     except (ValueError, TypeError, KeyError, AttributeError):
@@ -1286,7 +1379,22 @@ def assign(repo: Path, number: str) -> bool:
     )
 
 
-def assigned(repo: Path, number: str) -> bool:
+def login(repo: Path) -> str | None:
+    """Reads the login of the account the GitHub client is signed in as.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+
+    Returns:
+        The login, or None for any other forge or when the read failed.
+    """
+    if _implementation(repo) != "github":
+        return None
+    output = _run(["gh", "api", "user", "--jq", ".login"], 15)
+    return (output or "").strip() or None
+
+
+def assigned(repo: Path, number: str) -> bool | None:
     """Reports whether the operator's account already holds an issue.
 
     Every lane runs under the operator's own account, so an assignment a
@@ -1300,14 +1408,16 @@ def assigned(repo: Path, number: str) -> bool:
 
     Returns:
         True only when the GitHub forge reports the signed-in account among
-        the issue's assignees; False for any other forge or any failure.
+        the issue's assignees; False for any other forge or an unreachable
+        project; None when the GitHub forge could not be read, so the caller
+        neither assigns nor marks an issue it knows nothing about.
     """
     if _implementation(repo) != "github":
         return False
     project = _reachable(repo)
     if project is None:
         return False
-    login = _run(["gh", "api", "user", "--jq", ".login"], 15)
+    account = login(repo)
     output = _run(
         [
             "gh",
@@ -1321,15 +1431,15 @@ def assigned(repo: Path, number: str) -> bool:
         ],
         15,
     )
-    if not login or output is None:
-        return False
+    if not account or output is None:
+        return None
     try:
         names = {
             str(person["login"]) for person in json.loads(output)["assignees"]
         }
     except (ValueError, TypeError, KeyError):
-        return False
-    return login.strip() in names
+        return None
+    return account in names
 
 
 def unassign(repo: Path, number: str) -> bool:

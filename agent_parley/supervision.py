@@ -18,7 +18,7 @@ import traceback
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TypeGuard, cast
+from typing import Any, TypeGuard, cast
 
 from agent_parley import (
     budgets,
@@ -42,8 +42,11 @@ from agent_parley import (
 )
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 from agent_parley.status import (
+    FORGE_FULL_SECONDS,
     FORGE_ISSUES,
     FORGE_LIMIT,
+    FORGE_OVERLAP,
+    FORGE_PAGE,
     FORGE_RETRY,
     FORGE_TIMEOUT,
     FORGE_TTL,
@@ -51,7 +54,7 @@ from agent_parley.status import (
 
 DEFAULT_WAIT_CEILING = 3600
 
-DEFAULTS = {
+DEFAULTS: dict[str, Any] = {
     "interval": 30,
     "inactive_after": 300,
     "stalled_after": 600,
@@ -71,6 +74,7 @@ DEFAULTS = {
     "rotate": True,
     "ci_rounds": 2,
     "fold_after": 86400,
+    "forge_skip_labels": list(issues.FORGE_SKIP_LABELS),
 }
 
 MAX_COMPLETION_REMINDERS = 100
@@ -241,6 +245,12 @@ def settings(value: dict) -> dict:
     ):
         if type(result[field]) is not bool:
             raise BridgeError(f"{field} must be a boolean.")
+    labels = result["forge_skip_labels"]
+    if not isinstance(labels, list | tuple) or not all(
+        isinstance(label, str) for label in labels
+    ):
+        raise BridgeError("forge_skip_labels must be a list of label names.")
+    result["forge_skip_labels"] = list(labels)
     return result
 
 
@@ -5559,7 +5569,28 @@ claimed_since = issues.claimed_since
 
 
 ISSUE_READING_SECONDS = 300.0
-_issue_readings: dict[tuple[str, str], tuple[float, dict]] = {}
+FORGE_BACKOFF_KINDS = frozenset({"auth", "rate", "timeout"})
+_issue_readings: dict[tuple[str, str], tuple[float, dict | None]] = {}
+
+
+def _forge_backoff() -> bool:
+    """Reports whether the forge refused or throttled a call too recently.
+
+    A revoked token, a client signed in to the wrong account, a rate limit
+    or a network timeout answers every call the same way, so the poll's
+    own forge reads wait `FORGE_RETRY` seconds after such a failure rather
+    than repeating each call on every poll.
+
+    Returns:
+        True while `forge.last_failure` names a failure of a kind in
+        `FORGE_BACKOFF_KINDS` younger than `FORGE_RETRY` seconds.
+    """
+    failure = forge.last_failure()
+    return bool(
+        failure
+        and failure.get("kind") in FORGE_BACKOFF_KINDS
+        and time.time() - float(failure.get("at") or 0) < FORGE_RETRY
+    )
 
 
 def _issue_reading(root: Path, number: str) -> dict | None:
@@ -5567,18 +5598,18 @@ def _issue_reading(root: Path, number: str) -> dict | None:
 
     The supervisor polls every few seconds and a forge round trip costs about
     a second, so one reading per issue is reused for
-    `ISSUE_READING_SECONDS`. A failed reading is never kept, so a forge that
-    comes back is read again on the next poll.
+    `ISSUE_READING_SECONDS`. A failed reading is kept as absent for
+    `FORGE_RETRY` seconds, so a forge that is down costs one call per issue
+    per retry window and one that comes back is read again after it.
     """
     key = (str(root), number)
     kept = _issue_readings.get(key)
-    if kept and time.time() - kept[0] < ISSUE_READING_SECONDS:
+    now = time.time()
+    if kept and now < kept[0]:
         return kept[1]
     reading = forge.issue_completion(root, number)
-    if reading is None:
-        _issue_readings.pop(key, None)
-    else:
-        _issue_readings[key] = (time.time(), reading)
+    life = FORGE_RETRY if reading is None else ISSUE_READING_SECONDS
+    _issue_readings[key] = (now + life, reading)
     return reading
 
 
@@ -5599,6 +5630,8 @@ def _landing_reading(root: Path, base: str) -> dict:
     kept = _landings.get(key)
     if kept and now < kept[0]:
         return kept[1]
+    if _forge_backoff():
+        return {}
     reading = forge.integration_landings(root, base)
     if reading is None:
         _landings[key] = (now + FORGE_RETRY, {})
@@ -5623,6 +5656,8 @@ def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
     issue open until the branch crosses to the default branch, yet the
     claim's work has landed, so it is observed as a merge like any other.
 
+    Nothing is read, and nothing observed, while `_forge_backoff` holds.
+
     Args:
         manifest: Current participant manifest.
         ledger: Published issue ledger.
@@ -5640,6 +5675,8 @@ def completed_claims(manifest: dict, ledger: dict) -> dict[str, dict]:
         observed when its issue closed before the generation or closed with
         no closing pull request, with `closed` set to `before` or `by hand`.
     """
+    if _forge_backoff():
+        return {}
     root = Path(manifest["root"])
     base = str(manifest.get("integration_base") or "")
     landings: dict | None = None
@@ -5762,22 +5799,114 @@ def branch_lane(manifest: dict, branch: str) -> str:
     return owners[0] if len(owners) == 1 else ""
 
 
-def refresh_forge_issues(directory: Path, manifest: dict) -> None:
+FORGE_UNCLAIMS = 3
+
+
+def forge_upkeep(
+    directory: Path,
+    manifest: dict,
+    skip_labels: list[str] | tuple[str, ...] = issues.FORGE_SKIP_LABELS,
+) -> None:
+    """Runs the poll's forge catalog refresh and unassign retry off the poll.
+
+    A catalog read pages through every open issue and can take tens of
+    seconds, so `refresh_forge_issues` and then `release_forge_marks` run on
+    one daemon thread per project, and a poll that finds the previous run
+    still going starts none. A failure inside the thread is dropped, and the
+    next poll tries again.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        skip_labels: Labels that keep an open forge issue out of the work
+            offered to lanes; the `forge_skip_labels` supervision setting.
+    """
+    key = (str(directory), FORGE_ISSUES)
+    with _REFRESHING_LOCK:
+        if key in _REFRESHING:
+            return
+        _REFRESHING.add(key)
+
+    def upkeep() -> None:
+        """Refreshes the catalog, then releases stale forge marks."""
+        try:
+            with contextlib.suppress(Exception):
+                refresh_forge_issues(directory, manifest, skip_labels)
+            with contextlib.suppress(Exception):
+                release_forge_marks(directory, manifest)
+        finally:
+            with _REFRESHING_LOCK:
+                _REFRESHING.discard(key)
+
+    threading.Thread(target=upkeep, name="forge upkeep", daemon=True).start()
+
+
+def release_forge_marks(directory: Path, manifest: dict) -> None:
+    """Removes forge assignments claims added to issues nobody holds now.
+
+    Only a lane's own `issue release` removed the assignment its claim
+    added. A supervisor release, `issue resolve --release`, a retirement or
+    a timed-out claim returned the issue to the queue and left it assigned,
+    and an unassign that failed was never tried again. Every issue still
+    marked in `claims.FORGE_MARKS` that the ledger shows unowned is
+    unassigned through `claims.forge_unclaim`, at most `FORGE_UNCLAIMS` per
+    call, and none while `_forge_backoff` holds.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    from agent_parley import claims
+
+    try:
+        marks = json.loads((directory / claims.FORGE_MARKS).read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(marks, dict):
+        return
+    ledger = issues.snapshot(directory)["issues"]
+    pending = [
+        number
+        for number, marked in sorted(marks.items())
+        if marked is True and not (ledger.get(number) or {}).get("owner")
+    ]
+    for number in pending[:FORGE_UNCLAIMS]:
+        if _forge_backoff():
+            return
+        claims.forge_unclaim(Path(manifest["root"]), directory, number)
+
+
+def refresh_forge_issues(
+    directory: Path,
+    manifest: dict,
+    skip_labels: list[str] | tuple[str, ...] = issues.FORGE_SKIP_LABELS,
+) -> None:
     """Keeps the cached reading of the forge's open issues current.
 
     `status` hides claims on closed issues and shows titles from
     `FORGE_ISSUES`, but stays read-only, so the poll owns the forge read.
     One bounded call reads every open issue once the cached reading is
-    `FORGE_TTL` seconds old. A failed call is recorded and retried no sooner
-    than `FORGE_RETRY` seconds later, so a forge that is down costs one
-    timeout per retry window, and the last good reading is kept meanwhile.
-    A project without a GitHub forge is never read. A reading that holds
-    every open issue also retires the unowned issues it leaves out, through
-    `end_closed_issues`.
+    `FORGE_TTL` seconds old, given `FORGE_TIMEOUT` seconds, two per page. A
+    failed call is recorded with the class `forge.last_failure` names and
+    retried no sooner than `FORGE_RETRY` seconds later, so a forge that is
+    down costs one timeout per retry window, and the last good reading is
+    kept meanwhile. A project without a GitHub forge is never read. A
+    reading that holds every open issue also retires the unowned issues it
+    leaves out, through `end_closed_issues`.
+
+    Between full readings, which run every `FORGE_FULL_SECONDS`, the cache
+    is brought current from the issues updated since the last reading, less
+    `FORGE_OVERLAP` seconds: open ones are added or replaced and closed ones
+    dropped. A delta that fills a page is taken as truncated and a full
+    read runs instead. ``complete_at`` records the last full reading; a file
+    without it was written by a full reading. Each refresh also records the
+    signed-in ``login`` and `skip_labels` for `issues.with_forge`.
 
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
+        skip_labels: Labels that keep an open forge issue out of the work
+            offered to lanes.
     """
     path = directory / FORGE_ISSUES
     try:
@@ -5797,20 +5926,72 @@ def refresh_forge_issues(directory: Path, manifest: dict) -> None:
         return
     if now - float(cached.get("failed_at") or 0) < FORGE_RETRY:
         return
-    catalog = forge.open_issue_catalog(root, FORGE_LIMIT, FORGE_TIMEOUT)
+    kept = cached.get("issues")
+    complete_at = float(cached.get("complete_at") or cached.get("read_at") or 0)
+    full = not isinstance(kept, dict) or now - complete_at >= FORGE_FULL_SECONDS
+    catalog: dict | None = None
+    if isinstance(kept, dict) and not full:
+        delta = forge.open_issue_catalog(
+            root,
+            FORGE_PAGE,
+            FORGE_TIMEOUT,
+            since=float(cached.get("read_at") or 0) - FORGE_OVERLAP,
+        )
+        full = delta is not None and len(delta) >= FORGE_PAGE
+        if delta is not None and not full:
+            catalog = {
+                **{
+                    number: item
+                    for number, item in kept.items()
+                    if number not in delta
+                },
+                **{
+                    number: item
+                    for number, item in delta.items()
+                    if item.get("state") == "OPEN"
+                },
+            }
+    if full:
+        catalog = forge.open_issue_catalog(root, FORGE_LIMIT, FORGE_TIMEOUT)
+        complete_at = now
     if catalog is None:
-        write_json(path, {**cached, "failed_at": now})
+        failure = forge.last_failure() or {}
+        if float(failure.get("at") or 0) < now:
+            failure = {}
+        write_json(
+            path,
+            {
+                **cached,
+                "failed_at": now,
+                "failure": {
+                    "kind": failure.get("kind", "error"),
+                    "detail": failure.get("detail", ""),
+                },
+            },
+        )
         return
-    if len(catalog) < FORGE_LIMIT:
+    if full and len(catalog) < FORGE_LIMIT:
         end_closed_issues(directory, catalog, now)
+    assigned = any(
+        isinstance(item, dict) and item.get("assignees")
+        for item in catalog.values()
+    )
     write_json(
         path,
         {
             "read_at": now,
+            "complete_at": complete_at,
             "limit": FORGE_LIMIT,
+            "login": forge.login(root) if assigned else cached.get("login"),
+            "skip_labels": list(skip_labels),
             "issues": {
-                number: {"title": str(item.get("title") or "")}
+                number: {
+                    "title": str(item.get("title") or ""),
+                    "labels": list(item.get("labels") or []),
+                    "assignees": list(item.get("assignees") or []),
+                }
                 for number, item in catalog.items()
+                if isinstance(item, dict)
             },
         },
     )
@@ -5987,7 +6168,10 @@ def pull_request_wakes(
     if not isinstance(seen, dict):
         seen = {}
     now = time.time()
-    if now - float(seen.get("read_at") or 0) < PULL_REQUEST_SECONDS:
+    if (
+        now - float(seen.get("read_at") or 0) < PULL_REQUEST_SECONDS
+        or _forge_backoff()
+    ):
         return
     readings = forge.open_pull_requests(Path(manifest["root"]))
     if readings is None:
@@ -7308,7 +7492,13 @@ def _poll(home: Path, directory: Path) -> None:
         config,
     )
     stage("dependencies", lifecycle.settle_dependencies, directory)
-    stage("forge issues", refresh_forge_issues, directory, manifest)
+    stage(
+        "forge issues",
+        forge_upkeep,
+        directory,
+        manifest,
+        config["forge_skip_labels"],
+    )
     if config["prompts"]:
         stage(
             "completions",
