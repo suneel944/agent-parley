@@ -652,6 +652,128 @@ def preserve(directory: Path, worktree: Path) -> dict:
     return record
 
 
+def preserved(directory: Path) -> list[dict]:
+    """Lists the checkpoints written before a sweep removed a worktree.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        Every readable `worktree-*` record, oldest first.
+    """
+    records = []
+    for path in _folder(directory).glob("worktree-*.json"):
+        if not PRESERVED_NAME.fullmatch(path.stem):
+            continue
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(saved, dict) and saved.get("id") == path.stem:
+            records.append(saved)
+    return sorted(records, key=lambda saved: saved.get("captured_at") or 0)
+
+
+def restore_preserved(
+    directory: Path, root: Path, identifier: str, destination: Path
+) -> dict:
+    """Recreates a removed worktree from its preserved checkpoint.
+
+    The bundle is fetched into a temporary ref of the base checkout. A new
+    worktree is added at the destination on the saved branch when that
+    branch still points at the saved head, on a new branch of that name
+    when it is gone, and detached at the head otherwise. The saved index
+    and worktree are then applied with the same patches `restore` uses.
+    Files Git ignored were never part of the checkpoint.
+
+    Args:
+        directory: Private project state directory.
+        root: Base checkout the worktree is registered with.
+        identifier: The `worktree-*` checkpoint identifier.
+        destination: Path the worktree is recreated at; must not exist.
+
+    Returns:
+        The checkpoint record with the destination it was restored to.
+
+    Raises:
+        BridgeError: If the checkpoint is unknown or fails its integrity
+            check, the destination exists, or Git refuses a step.
+    """
+    if not PRESERVED_NAME.fullmatch(identifier):
+        raise BridgeError(f"{identifier} is not a preserved worktree id.")
+    folder = _folder(directory)
+    try:
+        saved = json.loads((folder / f"{identifier}.json").read_text())
+    except (OSError, ValueError):
+        raise BridgeError(f"No preserved worktree {identifier}.") from None
+    artifact = saved.get("artifact") or {}
+    bundle = folder / f"{identifier}.bundle"
+    try:
+        intact = (
+            saved.get("id") == identifier
+            and bundle.stat().st_size == artifact.get("bytes")
+            and _digest(bundle) == artifact.get("sha256")
+        )
+    except OSError:
+        intact = False
+    if not intact:
+        raise BridgeError(f"Preserved worktree {identifier} is damaged.")
+    if destination.exists() or destination.is_symlink():
+        raise BridgeError(f"{destination} already exists.")
+    head = str(saved["head"])
+    branch = str(saved.get("branch") or "")
+    temporary_ref = f"{TEMPORARY_REF_NAMESPACE}restore/{identifier}"
+    _git(
+        root,
+        "fetch",
+        "--no-write-fetch-head",
+        str(bundle),
+        f"{saved['worktree_commit']}:{temporary_ref}",
+    )
+    try:
+        tip = _text(root, "rev-parse", "--verify", "-q", f"refs/heads/{branch}")
+    except BridgeError:
+        tip = ""
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        target = ["--detach", str(destination), head]
+        if branch and not tip:
+            target = ["-b", branch, str(destination), head]
+        elif branch and tip == head:
+            target = [str(destination), branch]
+        _git(root, "worktree", "add", *target)
+        index_patch = _git(
+            destination, "diff", "--binary", head, str(saved["index_commit"])
+        )
+        if index_patch:
+            _git(
+                destination,
+                "apply",
+                "--index",
+                "--binary",
+                "-",
+                input_data=index_patch,
+            )
+        worktree_patch = _git(
+            destination,
+            "diff",
+            "--binary",
+            str(saved["index_commit"]),
+            str(saved["worktree_commit"]),
+        )
+        if worktree_patch:
+            _git(
+                destination,
+                "apply",
+                "--binary",
+                "-",
+                input_data=worktree_patch,
+            )
+    finally:
+        _git(root, "update-ref", "-d", temporary_ref)
+    return {**saved, "restored_to": str(destination.resolve())}
+
+
 def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
     """Reads the checkpoint for one exact ownership generation."""
     identifier = _identifier(issue, claim_id)
@@ -669,6 +791,8 @@ def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
 
 
 CHECKPOINT_NAME = re.compile(r"issue-([1-9][0-9]{0,17})-([0-9a-f]{16})")
+PRESERVED_NAME = re.compile(r"worktree-[0-9a-f]{24}")
+PRESERVED_RETENTION = 30 * 24 * 3600
 TEMPORARY_MAX_AGE = 3600
 
 
@@ -682,7 +806,9 @@ def prune(directory: Path, ledger: dict) -> list[str]:
     identifier, or its issue closed on the forge. A capture also leaves a
     same-sized temporary bundle behind when the process is killed between
     `tempfile.mkstemp` and the rename that publishes it; one old enough that
-    no capture still in progress could have written it is removed too.
+    no capture still in progress could have written it is removed too. A
+    checkpoint `preserve` wrote before a sweep removed a worktree is kept
+    for `PRESERVED_RETENTION` seconds after its capture, then removed.
 
     Args:
         directory: Private project state directory.
@@ -718,6 +844,12 @@ def prune(directory: Path, ledger: dict) -> list[str]:
         (folder / f"{record_path.stem}-approval.json").unlink(missing_ok=True)
         (folder / f"{record_path.stem}-quiesce.json").unlink(missing_ok=True)
         removed.append(record_path.stem)
+    expired = time.time() - PRESERVED_RETENTION
+    for saved in preserved(directory):
+        if float(saved.get("captured_at") or 0) < expired:
+            (folder / f"{saved['id']}.bundle").unlink(missing_ok=True)
+            (folder / f"{saved['id']}.json").unlink(missing_ok=True)
+            removed.append(saved["id"])
     threshold = time.time() - TEMPORARY_MAX_AGE
     for stray in folder.glob("tmp*"):
         with contextlib.suppress(OSError):

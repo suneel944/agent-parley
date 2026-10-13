@@ -7039,9 +7039,11 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     what was kept. Before either sweep, every worktree a lane made outside
     its `<lane>-wt` directory is moved there, never deleted, and the moves
     and refusals are published under `relocations`. The publication only
-    describes the latest pass, so every move, every move Git refused and
-    every removal is also written to the service log as a `reclaim` entry,
-    whose rotation keeps the record after later sweeps find nothing left.
+    describes the latest pass, so every move, every removal and every
+    refused move the previous publication did not already hold for the
+    same worktree and reason is also written to the service log as a
+    `reclaim` entry, whose rotation keeps the record after later sweeps
+    find nothing left, without one line per sweep for the same refusal.
     The worktrees lanes
     made for themselves are swept in the
     same pass and published beside the lanes, without their sizes, because
@@ -7068,6 +7070,15 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     now = time.time()
     if not reclaim_due(directory, now, RECLAIM_INTERVAL):
         return
+    try:
+        published = json.loads((directory / RECLAIM_PUBLICATION).read_text())
+        refused = {
+            (row["worktree"], row["reason"])
+            for row in published["relocations"]
+            if row.get("moved") is False
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        refused = set()
     rows: list[dict] = []
     made: list[dict] = []
     moved: list[dict] = []
@@ -7103,7 +7114,11 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     acted = [
         row
         for row in moved
-        if row.get("moved") or row["reason"] == reclaim.REFUSED
+        if row.get("moved")
+        or (
+            row.get("moved") is False
+            and (row["worktree"], row["reason"]) not in refused
+        )
     ] + [row for row in rows + made if row.get("removed")]
     for line in reclaim.lines(acted):
         server.log(home, "reclaim", f"{directory.name}: {line}")
