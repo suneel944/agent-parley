@@ -61,6 +61,12 @@ class BridgeCore:
                         {"port": port, "token": secrets.token_urlsafe(32)},
                     )
         self.config = json.loads(path.read_text())
+        for key in ("port", "token"):
+            if key not in self.config:
+                raise BridgeError(
+                    f"{path} lacks {key!r}; the file is incomplete or "
+                    "corrupt. Remove it so the bridge writes a new one."
+                )
         self.url = f"http://127.0.0.1:{self.config['port']}"
 
     def server_process(self) -> process.ServerProcess | None:
