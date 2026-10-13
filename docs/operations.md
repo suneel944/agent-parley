@@ -240,8 +240,9 @@ hour limits and exits non-zero when one matches; the budget informs and does
 not gate. `--issue` reports the lanes that hold or are offered one issue. A selection
 that matches nothing prints one line naming the filters that were applied.
 
-`--drifted` and `--pending` exit non-zero when at least one lane matches, so a
-shell gate fails on drift or on unfinished coordination without parsing text.
+`--drifted`, `--pending` and `--over-budget` exit non-zero when at least one
+lane matches, so a shell gate fails on drift, unfinished coordination or a
+crossed budget without parsing text.
 Every other reading exits zero. `--json` prints the same document as an
 unfiltered `status --json`, holding only the matching rows.
 
@@ -698,7 +699,7 @@ agent-parley participant merge --outcome ready
 agent-parley issue assign 42 --idle --provider codex
 ```
 
-`say`, `issue assign`, `participant stop`, `participant pause`,
+`say`, `mail send`, `issue assign`, `participant stop`, `participant pause`,
 `participant resume`, `participant pr` and `participant merge` take a lane
 selector where they otherwise take a positional name. `--all` selects every
 lane; `--provider NAME`, `--outcome STATE`, `--drifted`, `--idle` and
@@ -786,7 +787,7 @@ agent-parley issue offer 42 --to codex --summary "commit, checks" --within 30m
 agent-parley issue request 42 --summary "claude is idle" --within 30m
 agent-parley say codex "Confirm the schema change" --ack --within 15m
 agent-parley deadlines show
-agent-parley deadlines set --claim 4h --offer 30m --request 30m --ack 15m --attempts 3
+agent-parley deadlines set --claim 4h --offer 30m --request 30m --ack 15m --wait 2h --attempts 3
 ```
 
 **An overdue claim moves only when its holder is silent.** Past its deadline
@@ -809,6 +810,13 @@ acknowledgement inherits when it passes no `--within`, so lanes carry a budget
 without repeating a flag. Windows take the same units as `--since` (`45m`,
 `6h`, `7d`), and a project that records none gives a claim, an offer or a
 request a deadline only when they ask for one.
+
+A lane that waits on something outside its control reports
+`report --state waiting --until SECONDS` with a summary naming what it waits
+on. The claim keeps its phase, `status` and `top` show the lane as waiting on
+that reason with its next-check time, and the supervisor defers waking it
+until then. `--wait` caps how far ahead `--until` may put that next check; with
+none recorded the cap is 3600 seconds.
 
 **Every acknowledgement request carries a deadline.** A send marked
 `ack_required` that names no window takes the project's `--ack` default, and a
@@ -1944,13 +1952,22 @@ every project series `project`. The lane families are
 `agent_parley_lane_hook_events_total`,
 `agent_parley_lane_hook_denials_total`,
 `agent_parley_lane_served_calls_total`,
-`agent_parley_lane_served_rejections_total` and
-`agent_parley_lane_tokens_total`. The project families are
+`agent_parley_lane_served_rejections_total`,
+`agent_parley_lane_tokens_total`,
+`agent_parley_lane_pull_requests_opened_total`,
+`agent_parley_lane_pull_requests_merged_total`,
+`agent_parley_lane_pull_requests_closed_total`,
+`agent_parley_lane_first_pass_ratio`, `agent_parley_lane_ci_rounds_unknown`,
+`agent_parley_lane_ci_rounds_median` and
+`agent_parley_lane_claim_to_merge_seconds_median`. The project families are
 `agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
 `agent_parley_project_context_bytes_total`,
-`agent_parley_project_hook_events_total` and
-`agent_parley_project_hook_denials_total`, each summed over the rows that
-project reports, so a total never counts a lane the export does not show.
+`agent_parley_project_hook_events_total`,
+`agent_parley_project_hook_denials_total` and
+`agent_parley_project_pull_requests_excluded`; the summed families add up the
+rows that project reports, so a total never counts a lane the export does not
+show. The pull request families are explained in
+[Monitoring](monitoring.md).
 `agent_parley_lane_hook_denials_by_cause_total` splits a lane's denials by
 `reason` and `tool`, so a refusal over a reserved path or an expiring offer
 reads apart from a policy refusal.

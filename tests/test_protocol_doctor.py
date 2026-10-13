@@ -76,6 +76,13 @@ def test_the_documented_table_matches_the_code_constants():
     assert int(schema) == store.SCHEMA_VERSION
 
 
+def test_the_monitoring_guide_names_the_stale_remedy_status_prints():
+    text = " ".join((ROOT / "docs/monitoring.md").read_text().split())
+    assert "Code: ok" not in text
+    assert "down && agent-parley up" not in text
+    assert protocol.RELAUNCH in text
+
+
 def test_the_launcher_version_follows_the_checkout():
     declared = (ROOT / "pyproject.toml").read_text()
     version = re.search(r'^version = "([^"]+)"', declared, re.M)[1]

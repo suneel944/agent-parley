@@ -3,12 +3,23 @@
 import json
 import re
 import sys
+from pathlib import Path
 
 import pytest
 
 from agent_parley import cli, views
 
 NAME = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_the_operations_guide_lists_every_exported_family():
+    text = (ROOT / "docs/operations.md").read_text()
+    section = text.split("### Metrics a monitoring stack can read")[1]
+    section = section.split("\n#")[0]
+    documented = set(re.findall(r"`(agent_parley_[a-z_]+)`", section))
+    exported = {family["name"] for family in views.families({"projects": []})}
+    assert documented == exported
 
 
 def run(monkeypatch, capsys, *arguments):
