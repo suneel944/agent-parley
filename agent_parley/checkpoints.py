@@ -224,6 +224,22 @@ def clip(text: str, budget: int) -> str:
     return text.encode()[:budget].decode(errors="ignore")
 
 
+def excerpt(text: str, budget: int) -> str:
+    """Flattens peer text onto one line, then clips it to a byte budget.
+
+    Collapsing every whitespace run, newlines included, keeps a subject or
+    body from opening a line that reads as a bridge-generated header.
+
+    Args:
+        text: Peer-controlled text such as a subject or message body.
+        budget: Maximum UTF-8 bytes kept.
+
+    Returns:
+        The single-line excerpt.
+    """
+    return clip(" ".join(text.split()), budget)
+
+
 def operator_prompt(prompt: str) -> bool:
     """Reports whether a submitted prompt came from the operator.
 
@@ -1973,7 +1989,8 @@ def feed_notice(news: dict) -> str:
     return clip(
         "Project feed, newest first: "
         + "; ".join(
-            f"{item['sender']}: {item['subject']}" for item in news["items"]
+            f"{item['sender']}: {excerpt(item['subject'], 400)}"
+            for item in news["items"]
         )
         + f" ({news['superseded']} superseded)",
         400,
@@ -2110,8 +2127,8 @@ def digest(
         ack = " [ACK REQUIRED]" if message["ack_required"] else ""
         preview = (
             f"Message {message['id']} from {message['sender']}{ack}: "
-            f"{clip(message['subject'], 80)}\n"
-            f"{clip(message['body_md'], 160)}"
+            f"{excerpt(message['subject'], 80)}\n"
+            f"> {excerpt(message['body_md'], 160)}"
         )
         tail = str(dict(message).get("body_tail") or "")
         if "[attachment " in tail:
