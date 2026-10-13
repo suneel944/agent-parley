@@ -1,9 +1,13 @@
 """Checks outbound notification selection, formatting and delivery."""
 
+import hashlib
+import hmac
+import http.server
 import io
 import json
 import smtplib
 import sys
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -558,3 +562,148 @@ def test_the_inbound_reader_counts_only_after_the_latest_start(tmp_path):
     with log.open("a") as stream:
         stream.write("2026-09-29T11:00:00+0000 bound 127.0.0.1:1\n")
     assert not inbound.polling(tmp_path)
+
+
+@pytest.fixture
+def receiver():
+    """Serves one loopback webhook receiver that records each request."""
+    received: list[dict] = []
+    answer = {"status": 204}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append(
+                {"headers": dict(self.headers), "data": self.rfile.read(length)}
+            )
+            self.send_response(answer["status"])
+            self.end_headers()
+
+        def log_message(self, *args):
+            return None
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {
+            "url": f"http://127.0.0.1:{server.server_port}/hook/s3cret",
+            "received": received,
+            "answer": answer,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def webhook_config(url, secret=""):
+    """Resolves a webhook-only configuration for one URL."""
+    return notify.settings(
+        {
+            "AGENT_PARLEY_NOTIFY": "webhook",
+            "AGENT_PARLEY_WEBHOOK_URL": url,
+            "AGENT_PARLEY_WEBHOOK_SECRET": secret,
+        }
+    )
+
+
+def test_the_webhook_posts_json_every_chat_service_reads(receiver):
+    results = notify.send(webhook_config(receiver["url"]), "subject", "body")
+    assert results == [{"transport": "webhook", "ok": True, "error": ""}]
+    (request,) = receiver["received"]
+    document = json.loads(request["data"])
+    assert document == {
+        "text": "subject\n\nbody",
+        "content": "subject\n\nbody",
+        "subject": "subject",
+        "body": "body",
+    }
+    assert request["headers"]["Content-Type"] == "application/json"
+    assert notify.SIGNATURE_HEADER not in request["headers"]
+
+
+def test_a_webhook_secret_signs_the_exact_body(receiver):
+    notify.webhook(webhook_config(receiver["url"], "k3y"), "subject", "body")
+    (request,) = receiver["received"]
+    expected = hmac.new(b"k3y", request["data"], hashlib.sha256).hexdigest()
+    assert request["headers"][notify.SIGNATURE_HEADER] == f"sha256={expected}"
+
+
+def test_a_refused_webhook_never_reports_its_url(receiver):
+    receiver["answer"]["status"] = 404
+    (result,) = notify.send(webhook_config(receiver["url"]), "s", "b")
+    assert not result["ok"]
+    assert "404" in result["error"]
+    assert "s3cret" not in result["error"]
+    receiver["answer"]["status"] = 202
+    assert notify.send(webhook_config(receiver["url"]), "s", "b")[0]["ok"]
+
+
+def test_an_unreachable_webhook_never_reports_its_url(monkeypatch):
+    url = "https://hooks.example.com/services/s3cret"
+
+    def urlopen(request, timeout=0):
+        raise OSError(f"cannot reach {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (result,) = notify.send(webhook_config(url), "s", "b")
+    assert not result["ok"]
+    assert "s3cret" not in result["error"]
+    assert notify.REDACTED_URL in result["error"]
+
+
+def test_only_https_or_a_loopback_relay_may_receive_the_webhook():
+    assert not notify.webhook_fault("https://hooks.slack.com/services/x")
+    assert not notify.webhook_fault("http://localhost:8080/relay")
+    assert not notify.webhook_fault("http://127.0.0.1/relay")
+    for url in ("http://hooks.example.com/s3cret", "ftp://x/y", "https://"):
+        fault = notify.webhook_fault(url)
+        assert "https://" in fault
+        assert "s3cret" not in fault
+    assert "AGENT_PARLEY_WEBHOOK_URL" in notify.webhook_fault("")
+    (result,) = notify.send(
+        webhook_config("http://hooks.example.com/s3cret"), "s", "b"
+    )
+    assert not result["ok"]
+    assert "s3cret" not in result["error"]
+
+
+def test_status_names_a_missing_webhook_url():
+    report = notify.reported({"AGENT_PARLEY_NOTIFY": "webhook"})
+    assert report["transports"] == ["webhook"]
+    assert "AGENT_PARLEY_WEBHOOK_URL" in report["fault"]
+    usable = notify.reported(
+        {
+            "AGENT_PARLEY_NOTIFY": "webhook",
+            "AGENT_PARLEY_WEBHOOK_URL": "https://hooks.example.com/x",
+        }
+    )
+    assert usable["fault"] == ""
+
+
+def test_setup_adds_the_webhook_and_keeps_telegram(
+    tmp_path, unset, monkeypatch, capsys
+):
+    home = tmp_path / "agent_parley_home"
+    home.mkdir(mode=0o700)
+    notify.store(home, {"AGENT_PARLEY_NOTIFY": "telegram"})
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO("https://hooks.example.com/s3cret\nk3y\n")
+    )
+    assert not invoke(monkeypatch, "notify", "setup", "--webhook")
+    assert "s3cret" not in capsys.readouterr().out
+    stored = notify.stored(home)
+    assert stored["AGENT_PARLEY_NOTIFY"] == "telegram,webhook"
+    assert stored["AGENT_PARLEY_WEBHOOK_URL"].endswith("/s3cret")
+    assert stored["AGENT_PARLEY_WEBHOOK_SECRET"] == "k3y"
+    assert (home / notify.STORED_NAME).stat().st_mode & 0o077 == 0
+
+
+def test_setup_refuses_a_plain_http_webhook_and_stores_nothing(
+    tmp_path, unset, monkeypatch
+):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("http://example.com/x\n"))
+    with pytest.raises(BridgeError, match="Nothing stored"):
+        cli.webhook_settings({}, False)
+    with pytest.raises(BridgeError, match="Telegram only"):
+        cli.webhook_settings({}, True)

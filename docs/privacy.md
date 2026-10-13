@@ -43,12 +43,14 @@ and adds no flag that bypasses a repository rule, and when no `gh` client, no
 GitHub remote or no network is available nothing is sent and the local record
 is unchanged.
 
-Notifications are off unless `AGENT_PARLEY_NOTIFY` names `telegram`, `email`
-or both. Then a change that moves ownership or holds a lane, such as a handoff
-offer, a permission prompt, a native dialog or an idle lane, is sent to the
-Telegram Bot API with `AGENT_PARLEY_TELEGRAM_TOKEN` and
-`AGENT_PARLEY_TELEGRAM_CHAT`, or to the SMTP server named by
-`AGENT_PARLEY_SMTP_HOST` and its companion variables.
+Notifications are off unless `AGENT_PARLEY_NOTIFY` names `telegram`, `email`,
+`webhook` or a mix. Then a change that moves ownership or holds a lane, such
+as a handoff offer, a permission prompt, a native dialog or an idle lane, is
+sent to the Telegram Bot API with `AGENT_PARLEY_TELEGRAM_TOKEN` and
+`AGENT_PARLEY_TELEGRAM_CHAT`, to the SMTP server named by
+`AGENT_PARLEY_SMTP_HOST` and its companion variables, or as a JSON POST to
+`AGENT_PARLEY_WEBHOOK_URL`, which must be HTTPS unless it names a loopback
+relay.
 `AGENT_PARLEY_TELEGRAM_API` replaces the Telegram Bot API address,
 `https://api.telegram.org` by default, so messages go to the host it names. A
 message names the

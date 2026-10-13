@@ -339,8 +339,9 @@ permission settings still apply.
 
 ## Notifications when you step away
 
-Agent Parley can forward the moments that need you to a Telegram bot or an
-email address. Email is outbound only. The Telegram bot can also take status
+Agent Parley can forward the moments that need you to a Telegram bot, an
+email address, or a Slack, Discord, Teams or other HTTPS webhook. Email and
+webhooks are outbound only. The Telegram bot can also take status
 queries and decision answers back once inbound is on, as described in
 [Asking for status from the chat](#asking-for-status-from-the-chat). With
 inbound off, nothing arrives over the channel and a permission prompt is
@@ -382,7 +383,7 @@ agent-parley notify test
 
 | Variable | Meaning |
 | --- | --- |
-| `AGENT_PARLEY_NOTIFY` | Comma-separated transports: `telegram`, `email`, or both. Unset means notifications are off. |
+| `AGENT_PARLEY_NOTIFY` | Comma-separated transports: `telegram`, `email`, `webhook`, or any mix. Unset means notifications are off. |
 | `AGENT_PARLEY_TELEGRAM_TOKEN` | Bot token from BotFather. |
 | `AGENT_PARLEY_TELEGRAM_CHAT` | Chat identifier the bot posts to. |
 | `AGENT_PARLEY_SMTP_HOST` | SMTP server host. |
@@ -392,9 +393,23 @@ agent-parley notify test
 | `AGENT_PARLEY_SMTP_PASSWORD` | SMTP password. |
 | `AGENT_PARLEY_SMTP_FROM` | Sender address. |
 | `AGENT_PARLEY_SMTP_TO` | Comma-separated recipients. |
+| `AGENT_PARLEY_WEBHOOK_URL` | Webhook URL; `https://`, or `http://` to `127.0.0.1` or `localhost` for a local relay. Treat it as a secret. |
+| `AGENT_PARLEY_WEBHOOK_SECRET` | Optional; signs each request with an `X-Agent-Parley-Signature: sha256=<HMAC of the body>` header. |
 
 ```bash
 export AGENT_PARLEY_NOTIFY=telegram,email
+agent-parley notify test
+```
+
+A webhook receives one JSON POST per message. `text` suits Slack and Teams
+incoming webhooks, `content` suits Discord, and `subject` and `body` suit any
+other receiver. The URL is read from a hidden prompt or standard input, the
+signing secret from the next line, and both are stored owner-only beside the
+Telegram settings; the webhook is added to the transports already stored.
+Neither `notify test` nor an error ever prints the URL.
+
+```bash
+agent-parley notify setup --webhook   # paste https://hooks.slack.com/services/...
 agent-parley notify test
 ```
 
