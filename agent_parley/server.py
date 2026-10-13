@@ -1091,7 +1091,10 @@ class Handler(BaseHTTPRequestHandler):
         lock until one of them lost and denied a native call. Expiry is
         therefore answered with `hook.DECIDING`, which tells the client the
         decision is held here: it emits no context and exits successfully
-        rather than repeating the event.
+        rather than repeating the event. A tool call a guard refuses from
+        its command line and the roster alone is the exception: it is
+        answered with that denial, by `checkpoints.deadline_refusal`, so a
+        slow decision drops only coordination context, never a refusal.
 
         Only the decisions a lane abandoned are counted, keyed by the lane's
         project and name because one service serves every project and lane
@@ -1197,12 +1200,21 @@ class Handler(BaseHTTPRequestHandler):
         if finished and isinstance(late, dict):
             if owed := late.pop("recovery", None):
                 self.server.recover(lane, owed)
+        refused = checkpoints.deadline_refusal(request)
         log(
             self.server.home,
             "expired",
             f"{self.path} {participant} undecided after {spent:.3f} "
-            "seconds; answered as still deciding: " + stages.report(),
+            "seconds; answered as "
+            + (
+                "refused by a command guard: "
+                if refused
+                else "still deciding: "
+            )
+            + stages.report(),
         )
+        if refused is not None:
+            return refused
         self._reply(hook.DECIDING, {"detail": UNDECIDED})
         return None
 

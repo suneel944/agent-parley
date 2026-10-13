@@ -3034,7 +3034,9 @@ call.
 A hook payload that cannot be decided, one past 1,000,000 bytes such as a
 `Write` of a large file or one that is not a JSON hook object, is allowed and
 recorded as `oversize_payload` or `unreadable_payload` in the lane's event log,
-because a denial would refuse the same call on every retry.
+because a denial would refuse the same call on every retry. An oversize tool
+call still meets the reservation and command guards, and an oversize shell
+command is denied: write it to a script file and run that.
 
 A lane whose shell cwd left its worktree is told on its next prompt to run
 `cd LANE` before any tool work, and every tool call from outside is denied with

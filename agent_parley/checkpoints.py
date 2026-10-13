@@ -81,6 +81,8 @@ DIAGNOSTIC_TOOLS = frozenset(
 )
 READ_ONLY_TOOLS = DIAGNOSTIC_TOOLS | {"WebFetch", "WebSearch"}
 PATH_FIELDS = ("file_path", "notebook_path", "path")
+COMMAND_FIELDS = ("command", "cmd")
+KEPT_FIELDS = ("hook_event_name", "event", "tool_name", "cwd", "session_id")
 OFFER_REPLY_SECONDS = 120.0
 DIGEST_HEADER_BYTES = 120
 BRIDGE_COMMAND = "agent-parley"
@@ -3157,6 +3159,67 @@ def branch_guard(
     return None, Reason.BRANCH_OK
 
 
+def static_refusal(
+    payload: dict, lane: Path, expected: str
+) -> tuple[dict, Reason] | None:
+    """Runs the ``PreToolUse`` refusals a parse of the command decides.
+
+    `checkpoint` reaches these guards only after the roster, the session
+    fence and `branch_guard`'s Git subprocess, so a slow step there used
+    to leave a decision unfinished at the service's deadline and the call
+    allowed. This runs the same checks with no Git and no store: a branch
+    switch, an attributed message, a run budget lift and a stray worktree.
+    A command that switches back to ``expected`` is left to `checkpoint`,
+    which knows whether the lane drifted; a rename that restores a missing
+    branch is refused here, and the lane's next call decides it in full.
+
+    Args:
+        payload: Native ``PreToolUse`` payload, its cwd inside the lane.
+        lane: Resolved lane worktree.
+        expected: Manifest-owned branch name.
+
+    Returns:
+        The native denial and its reason, or None when no guard refuses.
+    """
+    if changes_lane_branch(payload, lane) and not restores_lane_branch(
+        payload, lane, expected
+    ):
+        reason = Reason.BRANCH_SWITCH
+        text = (
+            f"Agent Parley owns this worktree on {expected!r}; branch "
+            "switches are blocked. Create or use a separate worktree "
+            "for feature branches."
+        )
+    elif attributed := attributed_command(payload, lane):
+        reason = Reason.ATTRIBUTION_REFUSED
+        text = policy.refusal("This command's message", attributed[1])
+    elif lifts_run_budget(payload):
+        reason = Reason.BUDGET_REFUSED
+        text = (
+            "Recording or resuming the run budget is the operator's "
+            "decision; a lane does not run agent-parley budget "
+            "enforce or resume. Report the need and stop. This is a "
+            "guard, not an authority boundary."
+        )
+    elif stray := stray_worktree(payload, lane):
+        reason = Reason.WORKTREE_REFUSED
+        text = (
+            f"A lane adds extra worktrees only inside {lanes.extras(lane)}/, "
+            "so the sweep can tell which lane made them; "
+            f"{stray[0]} is outside it. Run `{stray[1]}` instead. "
+            "This is a guard, not an authority boundary."
+        )
+    else:
+        return None
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": text,
+        }
+    }, reason
+
+
 def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
     """Reads a bounded mailbox batch without marking or acknowledging mail.
 
@@ -4502,6 +4565,127 @@ def merge_recovery(waiting: dict, owed: dict) -> dict:
     return {**owed, "evidence": earlier}
 
 
+def adapter_module(name: object) -> ModuleType | None:
+    """Imports the provider adapter a lane selected, so only that one loads.
+
+    Args:
+        name: Adapter the hook command line named; anything else is native.
+
+    Returns:
+        The adapter module, or None for the native hook schema.
+    """
+    if name == "gemini":
+        from agent_parley import gemini
+
+        return gemini
+    if name == "copilot":
+        from agent_parley import copilot
+
+        return copilot
+    if name == "opencode":
+        from agent_parley import opencode
+
+        return opencode
+    if name == "amp":
+        from agent_parley import amp
+
+        return amp
+    return None
+
+
+def lane_refusal(
+    directory: Path, agent: str, payload: dict, home: Path | None = None
+) -> tuple[dict, Reason] | None:
+    """Refuses a ``PreToolUse`` call that cannot wait for a full decision.
+
+    The lane comes from the roster alone. A cwd outside the lane is refused
+    as `checkpoint` refuses it, then `static_refusal` runs. With ``home``,
+    the reservation and offer hazards `unscanned_hazard` reads from the
+    store run too; the service's deadline path passes none, because its
+    remaining budget cannot cover a store read.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        payload: Native ``PreToolUse`` payload.
+        home: Private bridge state root, to also check the hazards.
+
+    Returns:
+        The native denial and its reason, or None when nothing refuses.
+
+    Raises:
+        OSError: If the roster or the identity cannot be read.
+        ValueError: If either holds malformed JSON.
+        KeyError: If the lane record lacks its lane or branch.
+    """
+    manifest = roster.read(directory)
+    participant = manifest["participants"].get(agent)
+    if participant is None or roster.retired(participant):
+        return None
+    lane = Path(participant["lane"]).resolve()
+    cwd = Path(payload.get("cwd", str(lane))).resolve()
+    if not cwd.is_relative_to(lane):
+        if returned := lane_return(payload, cwd, lane):
+            payload = {**payload, "cwd": str(returned)}
+        elif outside := outside_lane_output("PreToolUse", cwd, lane):
+            return outside, Reason.OUTSIDE_LANE
+        else:
+            return None
+    if refused := static_refusal(payload, lane, participant["branch"]):
+        return refused
+    if home is None:
+        return None
+    name = json.loads((directory / f"{agent}-identity.json").read_text())[
+        "name"
+    ]
+    urgent = unscanned_hazard(
+        home, directory, manifest["root"], name, payload, lane, agent
+    )
+    if urgent is None:
+        return None
+    denial = hazard_denial(home, manifest["root"], name, payload, lane, *urgent)
+    return denial, urgent[1][0]
+
+
+def deadline_refusal(request: dict) -> dict | None:
+    """Answers a tool call whose decision missed the service's deadline.
+
+    The service answers an unfinished decision with `hook.DECIDING`, which
+    the client reads as an allow. A ``PreToolUse`` call that `lane_refusal`
+    refuses without Git or the store is refused instead, so only the
+    coordination context is lost on a deadline, never a guard. Nothing is
+    recorded here: the abandoned decision still runs the same guards and
+    records the refusal when it finishes.
+
+    Args:
+        request: Hook request as `serve` takes it.
+
+    Returns:
+        ``status``, ``stdout`` and ``stderr`` carrying the denial, or None
+        when no guard refuses or the lane cannot be read.
+    """
+    payload = request.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        adapter = adapter_module(request.get("adapter"))
+        if adapter is not None:
+            payload = adapter.payload(payload)
+        if payload.get("hook_event_name") != "PreToolUse":
+            return None
+        refused = lane_refusal(
+            Path(str(request.get("directory", ""))),
+            str(request.get("participant", "")),
+            payload,
+        )
+    except (OSError, ValueError, KeyError, TypeError, BridgeError):
+        return None
+    if refused is None:
+        return None
+    output = adapter.response(refused[0]) if adapter else refused[0]
+    return {"status": 0, "stdout": json.dumps(output) + "\n", "stderr": ""}
+
+
 def serve(
     home: Path,
     request: dict,
@@ -4576,14 +4760,7 @@ def serve(
     try:
         if not isinstance(payload, dict):
             raise ValueError("Expected a hook object")
-        if request.get("adapter") == "gemini":
-            from agent_parley import gemini as adapter
-        elif request.get("adapter") == "copilot":
-            from agent_parley import copilot as adapter
-        elif request.get("adapter") == "opencode":
-            from agent_parley import opencode as adapter
-        elif request.get("adapter") == "amp":
-            from agent_parley import amp as adapter
+        adapter = adapter_module(request.get("adapter"))
         if adapter is not None:
             payload = adapter.payload(payload)
         if not protocol.compatible(declared):
@@ -4726,17 +4903,110 @@ def _hook_pid() -> int:
     return value if value > 1 else os.getpid()
 
 
+def kept_fields(raw: str) -> dict:
+    """Reads the small fields of a payload too large to parse whole.
+
+    Each field in `KEPT_FIELDS`, `PATH_FIELDS` and `COMMAND_FIELDS` is
+    taken from its first complete JSON string in the kept text. The native
+    payload names them before the large content, and a quote inside a JSON
+    string is always escaped, so a key never matches inside a value. A
+    string the bound cut off is left out.
+
+    Args:
+        raw: Payload text that was kept, at most `hook.MAX_INPUT_BYTES`.
+
+    Returns:
+        A hook payload of the fields found, the tool's under
+        ``tool_input``.
+    """
+    payload: dict = {}
+    tool_input: dict = {}
+    for key in (*KEPT_FIELDS, *PATH_FIELDS, *COMMAND_FIELDS):
+        found = re.search(rf'"{key}"\s*:\s*("[^"\\]*(?:\\.[^"\\]*)*")', raw)
+        if found is None:
+            continue
+        try:
+            value = json.loads(found.group(1))
+        except ValueError:
+            continue
+        target = payload if key in KEPT_FIELDS else tool_input
+        target[key] = value
+    if tool_input:
+        payload["tool_input"] = tool_input
+    return payload
+
+
+def oversize_refusal(
+    home: Path,
+    directory: Path,
+    agent: str,
+    raw: str,
+    adapter: ModuleType | None,
+) -> dict | None:
+    """Runs the tool call guards that need only a payload's small fields.
+
+    A command the bound cut off cannot be parsed for the branch,
+    worktree, attribution and budget guards, so it is refused with the
+    remedy of running it from a script file. A call whose path and
+    command survived goes through `lane_refusal`, so a write into a peer's
+    reservation or a guarded command is refused as a readable call is.
+
+    Args:
+        home: Private bridge state root.
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        raw: Payload text that was kept, at most `hook.MAX_INPUT_BYTES`.
+        adapter: Provider adapter the lane selected, or None for native.
+
+    Returns:
+        Native hook output denying the call, or None to allow it.
+    """
+    fields = kept_fields(raw)
+    try:
+        payload = adapter.payload(fields) if adapter else fields
+        if payload.get("hook_event_name") != "PreToolUse":
+            return None
+        found = fields.get("tool_input", {})
+        if not any(key in found for key in COMMAND_FIELDS) and re.search(
+            r'"(?:command|cmd)"\s*:\s*"', raw
+        ):
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        "Agent Parley cannot check a command larger than "
+                        f"{hook.MAX_INPUT_BYTES} characters. Write it to a "
+                        "script file and run that."
+                    ),
+                }
+            }
+        refused = lane_refusal(directory, agent, payload, home)
+    except (OSError, ValueError, KeyError, TypeError, BridgeError):
+        return None
+    return refused[0] if refused else None
+
+
 def unreadable(
-    directory: Path, agent: str, raw: str, size: int, cause: Exception
+    directory: Path,
+    agent: str,
+    raw: str,
+    size: int,
+    cause: Exception,
+    home: Path | None = None,
+    adapter: ModuleType | None = None,
 ) -> int:
-    """Allows a native event whose payload could not be read, and records it.
+    """Decides a native event whose payload could not be read, and records it.
 
     A payload past `hook.MAX_INPUT_BYTES`, as a ``Write`` of a large file
-    carries, or one that is not a JSON hook object, cannot be decided. It
-    is observed and allowed rather than denied: a denial would refuse the
-    same call on every retry, and no coordination rule needs the content
-    of a file being written. The event name is read from the text that was
-    kept, which precedes the tool input in the native payload.
+    carries, or one that is not a JSON hook object, cannot be decided in
+    full. It is observed and allowed rather than denied: a denial would
+    refuse the same call on every retry, and no coordination rule needs the
+    content of a file being written. A tool call past the bound with
+    ``home`` is the exception: `oversize_refusal` still runs the guards
+    its small fields allow, so its size never skips them. The event name
+    is read from the text that was kept, which precedes the tool input in
+    the native payload.
 
     Args:
         directory: Common project state directory.
@@ -4744,9 +5014,11 @@ def unreadable(
         raw: Payload text that was kept, at most `hook.MAX_INPUT_BYTES`.
         size: Characters the payload held in full.
         cause: Why the payload could not be decided.
+        home: Private bridge state root, to guard an oversize tool call.
+        adapter: Provider adapter the lane selected, or None for native.
 
     Returns:
-        Exit status 0, after writing an empty decision.
+        Exit status 0, after writing the decision.
     """
     found = re.search(r'"hook_event_name"\s*:\s*"([A-Za-z]{1,64})"', raw)
     event = found.group(1) if found else ""
@@ -4756,9 +5028,24 @@ def unreadable(
         else Reason.UNREADABLE_PAYLOAD
     )
     detail = f"{event or 'unnamed'} payload of {size} characters: {cause}"
-    record(directory, agent, {"hook_event_name": event}, reason, {}, "", detail)
-    sys.stdout.write("{}\n")
-    sys.stderr.write(f"Agent Parley checkpoint skipped: {detail}\n")
+    refused = None
+    if reason is Reason.OVERSIZE_PAYLOAD and home is not None:
+        refused = oversize_refusal(home, directory, agent, raw, adapter)
+    record(
+        directory,
+        agent,
+        {"hook_event_name": event},
+        reason,
+        refused or {},
+        "",
+        detail,
+    )
+    if refused is None:
+        sys.stdout.write("{}\n")
+        sys.stderr.write(f"Agent Parley checkpoint skipped: {detail}\n")
+        return 0
+    output = adapter.response(refused) if adapter else refused
+    sys.stdout.write(json.dumps(output) + "\n")
     return 0
 
 
@@ -4799,7 +5086,15 @@ def main(fallback: str = "", size: int = 0) -> int:
         if not isinstance(payload, dict):
             raise ValueError("not a hook object")
     except (ValueError, RecursionError) as exc:
-        return unreadable(args.directory, args.participant, raw, size, exc)
+        return unreadable(
+            args.directory,
+            args.participant,
+            raw,
+            size,
+            exc,
+            args.home,
+            adapter_module(args.adapter),
+        )
     served = serve(
         args.home,
         {
