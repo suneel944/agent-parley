@@ -1340,3 +1340,222 @@ def test_approval_resume_records_the_service_resume_opt_ins(
     )
     assert cli.main() != 0
     assert "nobody is not a participant" in capsys.readouterr().err
+
+
+def test_setup_confirms_in_plain_text_and_json_carries_the_envelope(
+    bridge, repo, monkeypatch, capsys
+):
+    printed = text(
+        monkeypatch, capsys, "--home", str(bridge.home), "setup", str(repo)
+    )
+    assert not printed.startswith("{")
+    first, second = printed.splitlines()
+    assert first.startswith(f"Registered {repo.resolve()} at ")
+    assert first.endswith(".") and "Forge: " in first
+    assert second == "Next: agent-parley run claude"
+    document = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "setup",
+            str(repo),
+            "--json",
+        ),
+        "setup",
+    )
+    assert document["root"] == str(repo.resolve())
+    assert first.split(" at ")[1].startswith(document["base"][:12])
+
+
+def test_credentials_add_names_its_settings_without_values(
+    bridge, tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "claude-work"
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "credentials",
+        "add",
+        "work",
+        "--config-home",
+        str(config),
+        "--env",
+        "WORK_REGION=eu-west",
+        "--require-env",
+        "WORK_TOKEN",
+    )
+    assert printed == (
+        f"Defined credential profile work (config home {config}; "
+        "sets WORK_REGION; requires WORK_TOKEN).\n"
+        "Next: agent-parley run claude --credentials work\n"
+    )
+    assert "eu-west" not in printed
+    document = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "add",
+            "home",
+            "--require-env",
+            "HOME_TOKEN",
+            "--json",
+        ),
+        "credentials",
+    )
+    assert [entry["name"] for entry in document["credentials"]] == [
+        "home",
+        "work",
+    ]
+
+
+def test_provider_add_confirms_in_plain_text_and_json_carries_the_envelope(
+    bridge, monkeypatch, capsys
+):
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "provider",
+        "add",
+        "claude-work",
+        "--adapter",
+        "claude",
+        "--executable",
+        "claude",
+    )
+    assert printed == (
+        "Defined provider claude-work (claude adapter; runs claude).\n"
+        "Next: agent-parley provider show claude-work\n"
+    )
+    document = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "provider",
+            "add",
+            "codex-work",
+            "--adapter",
+            "codex",
+            "--executable",
+            "codex",
+            "--json",
+        ),
+        "providers",
+    )
+    names = [entry["name"] for entry in document["providers"]]
+    assert "claude-work" in names and "codex-work" in names
+
+
+RESOLVED = {
+    "issue": 42,
+    "outcome": "complete",
+    "holder": "claude",
+    "owner": None,
+    "state": "complete",
+    "evidence": {
+        "branch": "parley/claude",
+        "state": "MERGED",
+        "observed_at": 1760000000.0,
+    },
+}
+
+
+def test_issue_resolve_says_what_it_ended_and_json_carries_the_envelope(
+    bridge, repo, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli.Bridge, "issue_resolve", lambda *args, **kwargs: dict(RESOLVED)
+    )
+    arguments = (
+        "--home",
+        str(bridge.home),
+        "issue",
+        "resolve",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    printed = text(monkeypatch, capsys, *arguments)
+    assert printed == (
+        "Resolved issue #42: recorded complete, ending claude's claim on "
+        "parley/claude (merged).\n"
+        "Next: agent-parley issue show 42\n"
+    )
+    document = envelope(
+        run(monkeypatch, capsys, *arguments, "--json"), "issue_resolve"
+    )
+    assert document["outcome"] == "complete"
+    assert document["evidence"]["observed_at"] == "2025-10-09T08:53:20Z"
+
+
+def test_issue_resolve_release_says_the_work_went_back_to_the_queue(
+    bridge, repo, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli.Bridge,
+        "issue_resolve",
+        lambda *args, **kwargs: {**RESOLVED, "outcome": "release"},
+    )
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "issue",
+        "resolve",
+        "42",
+        "--release",
+        "--repo",
+        str(repo),
+    )
+    assert printed.startswith("Resolved issue #42: returned to the queue, ")
+
+
+def test_issue_recover_says_what_it_approved_and_json_carries_the_envelope(
+    bridge, repo, monkeypatch, capsys
+):
+    approval = {
+        "id": "authorization:c1:s1",
+        "issue": "42",
+        "claim_id": "c1",
+        "owner": "claude",
+        "session_id": "s1",
+        "reason": "stuck on capacity",
+        "authorized_by": "operator",
+        "authorized_at": 1760000000.0,
+    }
+    monkeypatch.setattr(
+        cli.Bridge, "authorize_recovery", lambda *args: dict(approval)
+    )
+    arguments = (
+        "--home",
+        str(bridge.home),
+        "issue",
+        "recover",
+        "42",
+        "--reason",
+        "stuck on capacity",
+        "--repo",
+        str(repo),
+    )
+    printed = text(monkeypatch, capsys, *arguments)
+    assert printed == (
+        "Recovery approved for issue #42: claude's claim stops once a "
+        "matching capacity observation is published; nothing has moved "
+        "yet.\n"
+    )
+    document = envelope(
+        run(monkeypatch, capsys, *arguments, "--json"), "issue_recover"
+    )
+    assert document["claim_id"] == "c1"
+    assert document["authorized_at"] == "2025-10-09T08:53:20Z"

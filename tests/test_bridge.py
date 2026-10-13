@@ -2533,7 +2533,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             timeout=30,
         )
     result = subprocess.run(
-        [str(executable), "setup", str(repo)],
+        [str(executable), "setup", str(repo), "--json"],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
