@@ -149,10 +149,18 @@ credits an assistant, names a vendor or model in an authorship position, or
 carries a generator signature is denied before it lands and again at
 integration, on every repository and with no flag that skips it.
 
-Record outcomes with `agent-parley report --state partial|blocked|ready --summary
-"result"`. Partial/blocked requires `--remaining`; ready requires `--evidence`.
-When the operator tells you to hold a claim until a decision, report it blocked
-with that order as `--remaining`, so no idle peer is pointed at it as stalled.
+Record outcomes with `agent-parley report --state partial|blocked|ready|waiting
+--summary "result"`. Partial/blocked requires `--remaining`; ready requires
+`--evidence`; waiting requires `--until SECONDS`, capped by the project's wait
+deadline. When you wait on a peer, a CI run or an operator decision, report
+`--state waiting --until SECONDS` with a summary naming what you wait on: you
+keep your session and the supervisor defers waking you until then. Report
+blocked only when you cannot continue and want the claim treated as stopped.
+`--resume-on NUMBER` (blocked only) resumes the lane when that issue completes.
+`--issue NUMBER` picks the claim to report on when you hold more than one. To
+ask a holder for an issue, run `agent-parley issue request NUMBER --summary
+"why"`. For a prerequisite you discover, run `agent-parley plan propose --base
+N --add ISSUE:BLOCKER --reason "why"`.
 `issue claim`, `release`, `offer`, `accept`, `decline`, `cancel`, `block`,
 `unblock` and `request`, and `report`, accept `--idempotency-key KEY`; a script
 that retries with the key it first used records one attempt, not two.
