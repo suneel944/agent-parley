@@ -13,7 +13,8 @@ budget:
 * Served: `CONNECT_TIMEOUT` to reach the service, then at most
   `server.DECISION_SECONDS` until it answers with a decision or with
   `DECIDING`. `DECIDING` ends the hook immediately with no context, so a
-  slow decision costs 0.25 + 1.5 seconds and is never repeated. The client
+  slow decision costs 0.25 + 1.5 seconds and is never repeated. A tool
+  call a command guard refuses is answered with that denial instead. The client
   confirms a whole reply with `RECEIPT`, and a decision that injected
   coordination closes the reply after at most `server.DELIVERY_SECONDS`
   more, once the lane records it as delivered.
@@ -198,7 +199,8 @@ def write_client(home: str, python: str) -> str:
     ``claude`` hook call arrived empty. ``cat`` reads descriptor 0 as it
     was given, for one short process. A
     payload past `MAX_INPUT_BYTES` goes straight to the in-process path,
-    which records it as oversize and allows the call.
+    which records it as oversize and runs only the guards its small fields
+    allow.
 
     The reply body is read to its declared length and then confirmed with
     `RECEIPT`, which the request announces in `RECEIPT_HEADER`. A write
@@ -509,8 +511,8 @@ def main() -> int:
     in-process decision.
 
     A payload past `MAX_INPUT_BYTES` is never posted: the service would
-    refuse it, and the in-process path records it as oversize and allows
-    the call.
+    refuse it, and the in-process path records it as oversize and runs
+    only the guards its small fields allow.
     """
     raw, size = read_input(sys.stdin)
     selected = options(sys.argv[1:])

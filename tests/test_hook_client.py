@@ -1316,6 +1316,54 @@ def test_a_decision_past_its_deadline_is_never_decided_again(
     assert len(events(lane.parent)) == 1
 
 
+@pytest.mark.parametrize(
+    ("command", "refused"),
+    [
+        ("git switch other", True),
+        ("git worktree add /tmp/elsewhere", True),
+        (
+            "git commit -m fix --trailer "
+            + json.dumps("Co-Authored-By:" + " Codex <bot@example.com>"),
+            True,
+        ),
+        ("agent-parley budget resume", True),
+        ("ls", False),
+    ],
+)
+def test_a_guarded_command_is_refused_past_the_deadline(
+    bridge, repo, paired, service, monkeypatch, command, refused
+):
+    branch = checkpoints.current_branch
+
+    def slow(lane):
+        time.sleep(server.DECISION_SECONDS + 1.5)
+        return branch(lane)
+
+    monkeypatch.setattr(server.checkpoints, "current_branch", slow)
+    lane = Path(paired["lanes"]["codex"])
+    started = time.monotonic()
+    served = run_hook(
+        bridge,
+        lane.parent,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": str(lane),
+            "session_id": "s1",
+        },
+    )
+    assert time.monotonic() - started < checkpoints.HOOK_TIMEOUT
+    assert served.returncode == 0, served.stderr
+    answered = json.loads(served.stdout)
+    if refused:
+        details = answered["hookSpecificOutput"]
+        assert details["permissionDecision"] == "deny"
+    else:
+        assert answered == {}
+    settled(lane.parent, 1)
+
+
 def test_an_abandoned_stop_leaves_its_coordination_undelivered(
     bridge, repo, paired, service, monkeypatch
 ):
@@ -1812,6 +1860,49 @@ def test_an_oversize_payload_is_allowed_and_recorded(
     assert (
         f"PreToolUse payload of {len(json.dumps(payload))}" in (entry["cause"])
     )
+
+
+def test_an_oversize_write_into_a_peer_reservation_is_refused(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "claude-identity.json").read_text())
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    store.call(
+        bridge.home,
+        actor,
+        "file_reservation_paths",
+        {"paths": ["big.json"], "ttl_seconds": 300, "exclusive": True},
+    )
+    answered = run_hook(bridge, lane.parent, written(lane, 2_000_000))
+    assert answered.returncode == 0, answered.stderr
+    details = json.loads(answered.stdout)["hookSpecificOutput"]
+    assert details["permissionDecision"] == "deny"
+    assert "big.json" in details["permissionDecisionReason"]
+    entry = events(lane.parent)[-1]
+    assert entry["reason_class"] == "oversize_payload"
+    assert entry["decision"] == "deny"
+
+
+@pytest.mark.parametrize("client", ["python", "shell"])
+def test_an_oversize_command_is_refused(bridge, repo, paired, service, client):
+    if client == "shell" and not shutil.which("bash"):
+        pytest.skip("requires bash")
+    lane = Path(paired["lanes"]["codex"])
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo " + "x" * 2_000_000},
+    }
+    runner = run_shell if client == "shell" else run_hook
+    answered = runner(bridge, lane.parent, payload)
+    assert answered.returncode == 0, answered.stderr
+    details = json.loads(answered.stdout)["hookSpecificOutput"]
+    assert details["permissionDecision"] == "deny"
+    assert "script file" in details["permissionDecisionReason"]
+    assert events(lane.parent)[-1]["decision"] == "deny"
 
 
 def test_a_post_tool_use_carrying_a_large_write_exits_zero(

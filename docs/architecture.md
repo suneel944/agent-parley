@@ -1351,7 +1351,11 @@ read it in blocks, keep its head, and the in-process path records one
 `oversize_payload` event naming the event and the full size, then allows the
 call with exit status 0. A payload that is not a JSON hook object is recorded
 as `unreadable_payload` and allowed the same way. Neither can be decided, and
-denying one would refuse the same call on every retry.
+denying one would refuse the same call on every retry. An oversize
+`PreToolUse` still runs the guards its small fields allow: its path and
+command are read from the kept head, a write into a peer's exclusive
+reservation and a guarded command are refused, and a command the bound cut
+off is refused with the advice to run it from a script file.
 
 Status 202 is the exception, and it is not an outage. It means the service is
 still running a decision for this lane and abandoned only the reply. Such a
@@ -1359,7 +1363,10 @@ decision keeps the lane's checkpoint lock and still writes the lane's activity
 file and event record, so deciding the same event again in the hook process
 would contend with it and could deny a native call over coordination work
 already in progress. The client therefore injects no context and exits
-successfully. The service counts the decisions a lane abandoned at that
+successfully. A `PreToolUse` whose command a parse alone refuses (a branch
+switch, a stray worktree, an attributed message, a run budget lift) is
+answered with that denial instead of 202, so a slow decision drops context,
+never a refusal. The service counts the decisions a lane abandoned at that
 deadline, keyed by project and lane name because one service serves every
 project and lane names repeat across them. While a lane holds one, its later
 events are decided record-only: the activity label, event record, session
