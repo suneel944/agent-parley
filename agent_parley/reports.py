@@ -40,6 +40,8 @@ class ReportsMixin(BridgeCore):
         resume_on: str = "",
         backlog: int | None = None,
         until: float = 0.0,
+        pid: int | None = None,
+        output: str = "",
     ) -> str:
         """Records an explicitly reported outcome independently of activity.
 
@@ -59,6 +61,13 @@ class ReportsMixin(BridgeCore):
         show it as waiting on that reason with its next-check time rather
         than a bare idle lane, and the supervisor defers waking it until that
         time, capped by the project's `deadlines.wait` ceiling.
+
+        A report may name the process still doing its work and the file
+        that process writes. Both are recorded on the activity record by
+        `supervision.work_evidence`, and while `supervision.live_work` finds
+        that work running the supervisor holds the reported claim as it does
+        for a wait in force. Each report replaces the evidence the last one
+        named, so a report that names none clears it.
 
         A ready or blocked report on a claim ends the lane's work on that
         claim, so it records a rotation point on the activity record: the
@@ -83,6 +92,9 @@ class ReportsMixin(BridgeCore):
                 leaves any recorded count as it stands.
             until: Required seconds from now for a waiting report's next
                 check; unused otherwise.
+            pid: Process ID of work still running for this lane, or None.
+            output: File that running work writes, resolved against the
+                lane when relative, or empty.
 
         Returns:
             The completion the holder owes on an observed-complete claim for
@@ -157,7 +169,15 @@ class ReportsMixin(BridgeCore):
                 "resume_on": resume_on,
                 "backlog": backlog,
                 "until": until,
+                "pid": pid,
+                "output": output,
             },
+        )
+        work = supervision.work_evidence(
+            lane,
+            pid,
+            output,
+            str(claim["issue"]) if claim["issue"] is not None else "",
         )
         path = directory / f"{agent}-activity.json"
         with lock(directory / f"{agent}-report.lock", timeout=1):
@@ -188,6 +208,10 @@ class ReportsMixin(BridgeCore):
                     evidence=evidence,
                     reported_at=time.time(),
                 )
+                if work:
+                    state["work"] = work
+                else:
+                    state.pop("work", None)
                 if outcome in ROTATION_OUTCOMES and claim["issue"] is not None:
                     state["rotation"] = {
                         "at": time.time(),

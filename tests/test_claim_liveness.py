@@ -173,6 +173,22 @@ def test_a_waiting_second_claim_keeps_tool_calls_counting_on_the_first(
         assert "overdue_recovery" not in kept["7"]
 
 
+def test_reported_running_work_holds_only_the_claim_it_names(
+    bridge, paired, tmp_path
+):
+    directory = busy_with_one_idle_claim(bridge, paired)
+    path = directory / "claude-activity.json"
+    work = supervision.work_evidence(tmp_path, os.getpid(), "", "7")
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+    assert step(bridge, directory)["8"]["overdue_recovery"]["step"] == "wake"
+
+    work = supervision.work_evidence(tmp_path, os.getpid(), "", "8")
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+    kept = step(bridge, directory)["8"]
+    assert kept["offer"] is None
+    assert "overdue_recovery" not in kept
+
+
 def test_progress_on_the_idle_claim_drops_its_recovery(bridge, paired):
     directory = busy_with_one_idle_claim(bridge, paired)
     assert step(bridge, directory)["8"]["overdue_recovery"]["step"] == "wake"

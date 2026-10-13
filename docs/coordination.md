@@ -178,7 +178,20 @@ A holder that waits on a peer, a CI run or an operator decision files
 `agent-parley report --state waiting --until SECONDS --summary "what it waits
 on"`. `status` and `top` show the lane as waiting on that reason with its
 next-check time, and the supervisor defers waking it until then, capped by the
-project's `deadlines.wait` ceiling.
+project's `deadlines.wait` ceiling. Unread direct mail from a peer that names
+an issue the lane holds as `#N` ends that deferral: the lane is woken on the
+normal delivery interval, as if it had declared no wait. Feed posts and mail
+about other issues still wait for the next-check time.
+
+A report can also name the work still running for the lane with
+`--pid PID` and `--output-file PATH`. The process is recorded with its
+creation identity and the file with its modification time at the report.
+While that same process is alive, or the file was written after the report
+and within the last 600 seconds, the supervisor treats the holder as working
+on the claim that report was bound to and holds it as it does for a waiting
+report, even once the report's `--until` has passed. Other claims of the lane
+are still judged on their own progress. Each report replaces the evidence the
+previous one named.
 
 An overdue claim whose holder is still working on it stays owned. Two cases get
 a terminating transition. The first is an overdue claim whose holder is
@@ -191,8 +204,9 @@ claim the lane can work on now; its ready, blocked or closed claims do not
 count. Some quiet is not the holder's to end, and such a claim is never moved:
 work its holder reported `blocked`, whose deadline notice says so instead of
 promising a takeover; a handoff the holder offered, until it is answered or
-expires; and a holder with an open denial decision, a lane recorded blocked or
-a `report --state waiting` still in force. Both take the same steps:
+expires; and a holder with an open denial decision, a lane recorded blocked,
+a `report --state waiting` still in force or running work its latest report
+named with `--pid` or `--output-file`. Both take the same steps:
 
 1. The supervisor wakes the holder once. For an idle claim, the notice also
    goes to the lanes waiting on the issue. For a silent holder the next window

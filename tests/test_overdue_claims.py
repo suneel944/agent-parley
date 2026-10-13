@@ -16,7 +16,7 @@ from agent_parley import (
     store,
     supervision,
 )
-from agent_parley.state import write_json
+from agent_parley.state import BridgeError, write_json
 
 WINDOW = 300
 
@@ -432,6 +432,82 @@ def test_a_declared_wait_holds_the_overdue_transition(bridge, paired):
         directory / "claude-wait.json", {**wait, "until": time.time() - 1}
     )
     assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def reported_work(directory, work):
+    """Records the process evidence a holder's latest report named."""
+    path = directory / "claude-activity.json"
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+
+
+def test_a_reported_live_process_holds_the_overdue_transition(
+    bridge, paired, tmp_path
+):
+    directory = overdue(bridge, paired)
+    work = supervision.work_evidence(tmp_path, os.getpid(), "")
+    reported_work(directory, work)
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert "overdue_recovery" not in kept
+    reported_work(directory, {**work, "ticks": "recycled"})
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_an_advancing_output_file_holds_the_overdue_transition(
+    bridge, paired, tmp_path
+):
+    directory = overdue(bridge, paired)
+    output = tmp_path / "forecast.log"
+    output.write_text("epoch 1\n")
+    stamp = time.time() - 3600
+    os.utime(output, (stamp, stamp))
+    reported_work(
+        directory, supervision.work_evidence(tmp_path, None, output.name)
+    )
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+    output.write_text("epoch 2\n")
+    kept = step(bridge, directory, paired)
+    assert kept["offer"] is None and "overdue_recovery" not in kept
+    stale = time.time() - supervision.TOOL_TIMEOUT - 5
+    os.utime(output, (stale, stale))
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_a_waiting_report_records_the_work_it_names(bridge, paired, tmp_path):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    output = tmp_path / "forecast.log"
+    bridge.report(
+        lane,
+        "waiting",
+        "gpu forecast run",
+        "",
+        "",
+        issue="7",
+        until=1,
+        pid=os.getpid(),
+        output=str(output),
+    )
+    work = json.loads((directory / "claude-activity.json").read_text())["work"]
+    assert work["pid"] == os.getpid()
+    assert work["ticks"] == process.start_ticks(os.getpid())
+    assert work["output"] == str(output.resolve())
+    assert work["mtime"] == 0.0
+    wait = json.loads((directory / "claude-wait.json").read_text())
+    write_json(
+        directory / "claude-wait.json", {**wait, "until": time.time() - 1}
+    )
+    assert supervision.holder_held(
+        bridge.home, directory, paired["root"], "claude"
+    ) == (f"working: process {os.getpid()} is alive")
+    bridge.report(lane, "partial", "paused", "resume it", "", issue="7")
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert "work" not in state
+
+
+def test_a_report_naming_a_stopped_process_is_refused(tmp_path):
+    with pytest.raises(BridgeError, match="is not running"):
+        supervision.work_evidence(tmp_path, 2**22 + 1, "")
 
 
 def test_a_held_holder_is_not_named_to_idle_peers(bridge, paired):

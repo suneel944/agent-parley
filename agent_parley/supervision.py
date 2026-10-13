@@ -1603,6 +1603,100 @@ def record_wait(
     return record
 
 
+def work_evidence(
+    base: Path, pid: int | None, output: str, issue: str = ""
+) -> dict:
+    """Builds the process evidence a report names for work still running.
+
+    A lane that ends its turn while a process it started keeps working names
+    that process and the file it writes, so supervision can read the work
+    itself rather than only the report timer. The process is recorded with
+    its creation identity, so a recycled process ID never reads as the same
+    work, and the output file with its modification time at the report, so
+    only a later write reads as the work advancing.
+
+    Args:
+        base: Directory a relative output path is resolved against.
+        pid: Process ID of the running work, or None to name none.
+        output: Path of the file the work writes, or empty to name none.
+        issue: Issue number of the claim the report is bound to, or empty
+            when it names no claim.
+
+    Returns:
+        The evidence record with any `pid`, `ticks`, `output` and `mtime`,
+        its `issue` and its `recorded_at` time, or an empty record when
+        nothing is named.
+
+    Raises:
+        BridgeError: If the named process is not running.
+    """
+    record: dict = {}
+    if pid is not None:
+        if pid <= 0 or not process.running(pid):
+            raise BridgeError(f"Process {pid} is not running.")
+        record.update(pid=pid, ticks=process.start_ticks(pid))
+    if output.strip():
+        path = (base / Path(output.strip()).expanduser()).resolve()
+        mtime = 0.0
+        with contextlib.suppress(OSError):
+            mtime = path.stat().st_mtime
+        record.update(output=str(path), mtime=mtime)
+    if record:
+        record.update(issue=issue, recorded_at=time.time())
+    return record
+
+
+def live_work(directory: Path, name: str, issue: str = "") -> str:
+    """States the running work a lane's latest report named, if it still runs.
+
+    The evidence comes from `work_evidence` on the lane's activity record. A
+    named process counts while it is still that same live process. A named
+    output file counts once it was written after the report, and only while
+    that write is younger than `TOOL_TIMEOUT`, the span a tool call is
+    trusted as work in flight, so a job that stopped writing stops holding
+    its lane. Evidence from a report bound to one claim speaks only for that
+    claim.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant whose reported work is read.
+        issue: Issue number of the claim being judged, or empty to read the
+            evidence for the lane whatever claim it names.
+
+    Returns:
+        The clause naming the live work, or an empty string when the lane
+        named none, named it for another claim, or none of it shows work now.
+    """
+    try:
+        state = json.loads((directory / f"{name}-activity.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    work = state.get("work") if isinstance(state, dict) else None
+    if not isinstance(work, dict) or (
+        issue and work.get("issue") and str(work["issue"]) != issue
+    ):
+        return ""
+    pid = work.get("pid")
+    ticks = work.get("ticks")
+    if (
+        type(pid) is int
+        and isinstance(ticks, str)
+        and process.alive(pid, ticks)
+    ):
+        return f"working: process {pid} is alive"
+    output = work.get("output")
+    if not isinstance(output, str) or not output:
+        return ""
+    try:
+        written = Path(output).stat().st_mtime
+        recorded = float(work.get("mtime", 0) or 0)
+    except (OSError, TypeError, ValueError):
+        return ""
+    if written > recorded and time.time() - written <= TOOL_TIMEOUT:
+        return f"working: {output} advanced"
+    return ""
+
+
 def record_capacity(directory: Path, name: str, observation: dict) -> dict:
     """Persists a newer validated capacity or bounded-probe outcome.
 
@@ -2593,7 +2687,7 @@ def _idle_leads(
         and lifecycle.state(record)["state"] in lifecycle.ACTIVE
         and now - issues.last_progress(record) >= after
         and not holder_held(
-            home, directory, manifest["root"], str(record["owner"])
+            home, directory, manifest["root"], str(record["owner"]), number
         )
     )
     return {
@@ -3776,20 +3870,29 @@ def holder_silent(
     return silence >= window
 
 
-def holder_held(home: Path, directory: Path, root: str, name: str) -> str:
+def holder_held(
+    home: Path, directory: Path, root: str, name: str, issue: str = ""
+) -> str:
     """States why a holder's quiet is not its own to end, if it is not.
 
     The wake gate holds every wake of a lane with an open permission-denial
     decision, a lane recorded blocked and a lane inside a wait it declared.
     Such a lane cannot answer an overdue wake, and the operator or the
     declared deadline owns its next step, so the supervisor neither moves
-    its claims nor names them to idle peers while that holds.
+    its claims nor names them to idle peers while that holds. Running work
+    the holder's latest report named, read by `live_work`, holds the claim
+    that report was bound to the same way, also after its declared wait
+    ends, because the report timer alone says nothing about a process still
+    writing its output. It holds only that claim, so a live process never
+    protects another claim its lane does not work on.
 
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
         root: Canonical project key.
         name: Participant holding the claim.
+        issue: Issue number of the claim being judged, or empty when the
+            judgment is about the lane rather than one claim.
 
     Returns:
         The cause holding the lane, or an empty string when nothing does.
@@ -3802,7 +3905,7 @@ def holder_held(home: Path, directory: Path, root: str, name: str) -> str:
     wait = published_wait(directory, name)
     if wait and float(wait["until"]) > time.time():
         return f"waiting on {wait['reason']}"
-    return ""
+    return live_work(directory, name, issue)
 
 
 def wake_attempt(
@@ -4148,8 +4251,9 @@ def overdue_claims(
     Some quiet is not the holder's to end, and such a claim is not moved:
     work its holder reported blocked stays with that holder, a handoff the
     holder offered stands until it is answered or expires, and a holder
-    held by an open denial decision, a blocked lane state or a wait it
-    declared waits for that to clear. A silent holder's wake step waits for
+    held by an open denial decision, a blocked lane state, a wait it
+    declared or running work its latest report named waits for that to
+    clear. A silent holder's wake step waits for
     the dispatcher to record a wake attempt, and its window runs from that
     attempt rather than from the step. A holder no attempt reached within
     one window of the step, because the wake was refused or found nothing
@@ -4215,7 +4319,7 @@ def overdue_claims(
                 )
                 or idle
             )
-            or holder_held(home, directory, root, holder)
+            or holder_held(home, directory, root, holder, number)
         ):
             if current:
                 _overdue_step(directory, number, identifier, None)
@@ -8913,6 +9017,7 @@ def _wake_block(
     observed: dict,
     record: dict,
     window: float,
+    through_wait: bool = False,
 ) -> tuple[str, float]:
     """Names what stops a wake attempt now and when it could clear.
 
@@ -8941,7 +9046,11 @@ def _wake_block(
     its turn to wait on background work it started is not woken before it
     said it would check again. Once that time passes with no fresher wait,
     the gate clears on its own and the lane is asked for a turn like any
-    other idle lane.
+    other idle lane. Unread direct peer mail that names an issue the lane
+    holds, found by `held_issue_mail`, is the exception: the wait is the
+    lane's own guess about when it next has work, and a peer asking about
+    that work proves the guess wrong, so the caller lets such mail through
+    the wait and the lane is woken on the normal delivery interval.
 
     A lane whose tool call a native permission layer refused waits on the
     operator's decision about it, so while `denials.waiting` finds that
@@ -8955,6 +9064,8 @@ def _wake_block(
         observed: The lane's `recorded_presence`.
         record: The lane's last durable wake record.
         window: Inactivity window the attempts are spaced by.
+        through_wait: Whether mail the lane must answer ends its declared
+            wait early.
 
     Returns:
         The blocking cause, empty when an attempt can be made, and the earliest
@@ -8978,7 +9089,7 @@ def _wake_block(
     if lane.get("state") == lanes.BLOCKED:
         return f"blocked: {lane['cause']}", 0.0
     wait = published_wait(directory, name)
-    if wait and float(wait["until"]) > time.time():
+    if not through_wait and wait and float(wait["until"]) > time.time():
         return f"waiting on {wait['reason']}", float(wait["until"])
     if (
         observed["process_alive"] is False
@@ -9178,6 +9289,60 @@ def _mail_digest(rows: list) -> list[str]:
         latest[thread] = max(latest.get(thread, 0), int(row["id"]))
     newest = sorted(latest.values())[-WAKE_DIGEST_THREADS:]
     return [str(identifier) for identifier in newest]
+
+
+def held_issue_mail(
+    home: Path, directory: Path, manifest: dict, name: str
+) -> list[str]:
+    """Finds unread direct peer mail that names an issue a lane holds.
+
+    A message counts when another identity sent it to the lane directly,
+    rather than on the project feed, the lane has not read it, and its
+    subject or body cites a held issue as ``#N``, the form status uses to
+    tie mail to a report.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant whose mail is read.
+
+    Returns:
+        Message identifiers as text in ascending order, empty when the lane
+        holds no claim, has no such mail, or the store cannot be read.
+    """
+    held = [
+        number
+        for number, record in issues.snapshot(directory)["issues"].items()
+        if record.get("owner") == name and record.get("claim_id")
+    ]
+    if not held:
+        return []
+    cited = re.compile(
+        "#(?:" + "|".join(re.escape(number) for number in held) + r")\b"
+    )
+    try:
+        with store.connect(home) as db:
+            rows = db.execute(
+                "SELECT m.id,m.subject,m.body_md FROM messages m "
+                "JOIN message_recipients r ON r.message_id=m.id "
+                "JOIN agents a ON a.id=r.agent_id "
+                "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
+                "AND a.name=? AND m.feed=0 AND m.sender_id<>r.agent_id "
+                "AND r.superseded_ts IS NULL AND r.read_ts IS NULL "
+                "ORDER BY m.id",
+                (
+                    manifest["root"],
+                    manifest["participants"][name]["display"],
+                ),
+            ).fetchall()
+    except (BridgeError, OSError, sqlite3.Error):
+        return []
+    return [
+        str(row["id"])
+        for row in rows
+        if cited.search(f"{row['subject']}\n{row['body_md']}")
+    ]
 
 
 def session_held(directory: Path, name: str) -> bool:
@@ -9411,7 +9576,14 @@ def wake(
     if not lanes.wakes(recorded):
         return
     observed = recorded_presence(recorded, observed)
-    blocked, ready_at = _wake_block(directory, name, observed, parked, window)
+    blocked, ready_at = _wake_block(
+        directory,
+        name,
+        observed,
+        parked,
+        window,
+        bool(held_issue_mail(home, directory, manifest, name)),
+    )
     if blocked:
         _defer_wake(home, directory, root, name, blocked, ready_at, window)
         _escalate_blocked(home, directory, manifest, name, recorded, blocked)
