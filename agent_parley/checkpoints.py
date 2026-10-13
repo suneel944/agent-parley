@@ -2984,7 +2984,7 @@ def _lane_state(path: Path) -> tuple[dict, str]:
     while (kept := path.with_name(f"{path.name}.corrupt-{stamp}")).exists():
         stamp += 1
     os.replace(path, kept)
-    return {}, f"Damaged activity record kept as {kept}: {fault}"
+    return {}, f"Damaged activity record kept as {kept.name}: {fault}"
 
 
 def work_offer(directory: Path, agent: str) -> dict | None:

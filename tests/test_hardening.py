@@ -105,7 +105,7 @@ def test_a_damaged_activity_record_is_kept_aside_and_replaced(
         if entry["reason_class"] == checkpoints.Reason.STATE_UNREADABLE
     ]
     assert len(named) == 1
-    assert str(kept[0]) in named[0]["cause"]
+    assert kept[0].name in named[0]["cause"]
     checkpoints.checkpoint(bridge.home, directory, "codex", tool_payload(lane))
     assert len(list(directory.glob("codex-activity.json.corrupt-*"))) == 1
 
