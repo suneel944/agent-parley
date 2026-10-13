@@ -25,11 +25,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
-from agent_parley import BridgeError, plugins, process
+from agent_parley import BridgeError, plugins, process, roster
 from agent_parley.status import registered_root
 from agent_parley.worktrees import PENDING_MESSAGE
 
@@ -45,8 +46,9 @@ class Found(NamedTuple):
         dirty: Whether that checkout has uncommitted changes, or None when
             Git did not answer in time.
         registered: Whether the checkout belongs to a registered project.
-        clis: Each supported native CLI on PATH, mapped to whether its
-            plugin record lists the Agent Parley plugin.
+        clis: Each built-in provider whose command is on PATH, mapped to
+            whether its plugin record lists the Agent Parley plugin, or
+            None for a provider that takes no plugin.
         service: Whether the recorded coordination service is running.
         problems: The rows `agent-parley problems` would list, most urgent
             first; read only for a registered project with a running
@@ -63,7 +65,7 @@ class Found(NamedTuple):
     repository: bool
     dirty: bool | None
     registered: bool
-    clis: dict[str, bool]
+    clis: dict[str, bool | None]
     service: bool
     problems: tuple[dict, ...] = ()
     notify: bool = True
@@ -230,6 +232,37 @@ def attention(home: Path, root: str) -> tuple[tuple[dict, ...], bool, int]:
     return rows, configured, lanes
 
 
+def installed(home: Path) -> dict[str, bool | None]:
+    """Finds each built-in provider whose command is on PATH.
+
+    The built-in names are `roster.ADAPTERS`; a local definition with the
+    same name supplies its own command, and an unreadable provider registry
+    falls back to the built-in presets. Only the clients in
+    `plugins.CLIENTS` take a marketplace plugin, so every other provider is
+    ready as soon as its command is found.
+
+    Args:
+        home: Private state directory, which need not exist.
+
+    Returns:
+        Each provider found, in `roster.ADAPTERS` order, mapped to whether
+        its plugin is recorded, or None when it takes no plugin.
+    """
+    try:
+        defined = roster.providers(home)
+    except (OSError, ValueError, AttributeError):
+        defined = roster.PRESETS
+    plugged = {client.name for client in plugins.CLIENTS}
+    found: dict[str, bool | None] = {}
+    for name in roster.ADAPTERS:
+        entry = defined.get(name)
+        command = entry.get("command") if isinstance(entry, dict) else None
+        if not isinstance(command, str) or not shutil.which(command):
+            continue
+        found[name] = plugins.recorded(name) if name in plugged else None
+    return found
+
+
 def look(home: Path, directory: Path) -> Found:
     """Reads everything the screen reports, writing nothing.
 
@@ -245,17 +278,13 @@ def look(home: Path, directory: Path) -> Found:
         root = registered_root(home, directory) if repository else ""
     except (OSError, ValueError, KeyError, TypeError):
         root = ""
-    clis = {
-        client.name: plugins.recorded(client.name)
-        for client, _ in plugins.detected()
-    }
     resolved = directory.resolve()
     base = bool(root) and Path(root) in (resolved, *resolved.parents)
     found = Found(
         repository,
         dirty,
         bool(root),
-        clis,
+        installed(home),
         serving(home),
         unborn=unborn,
         stash=stashed(Path(root)) if base else "",
@@ -313,7 +342,7 @@ def advice(found: Found) -> list[tuple[str, str]]:
         steps.append(
             ("agent-parley notify setup", "Get told when a lane needs you.")
         )
-    missing = [name for name, added in found.clis.items() if not added]
+    missing = [name for name, added in found.clis.items() if added is False]
     if missing:
         steps.append(
             (
@@ -322,7 +351,7 @@ def advice(found: Found) -> list[tuple[str, str]]:
             )
         )
     chosen = next(
-        (name for name, added in found.clis.items() if added),
+        (name for name, added in found.clis.items() if added is not False),
         next(iter(found.clis)),
     )
     if not found.repository:
@@ -366,13 +395,20 @@ def render(found: Found) -> str:
     else:
         repository = "Git repository, clean"
     if found.clis:
-        clis = ", ".join(
-            f"{name} (plugin {'added' if added else 'missing'})"
-            for name, added in found.clis.items()
-        )
+        rows: list[list[str]] = []
+        for name, added in found.clis.items():
+            item = (
+                f"{name} (no plugin needed)"
+                if added is None
+                else f"{name} (plugin {'added' if added else 'missing'})"
+            )
+            if rows and len(", ".join([*rows[-1], item])) < 68:
+                rows[-1].append(item)
+            else:
+                rows.append([item])
+        clis = (",\n" + " " * 12).join(", ".join(row) for row in rows)
     else:
-        names = ", ".join(client.name for client in plugins.CLIENTS)
-        clis = f"none on PATH ({names})"
+        clis = f"none on PATH ({', '.join(roster.ADAPTERS)})"
     steps = advice(found)
     width = max(len(command) for command, _ in steps) + 2
     pending = []
