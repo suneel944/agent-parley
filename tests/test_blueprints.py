@@ -795,14 +795,15 @@ def test_a_timed_out_run_node_stops_its_whole_process_tree(tmp_path):
     assert "ran past 1 seconds" in run["output"]
     assert "started" in run["output"]
     group = int(pid.read_text())
+    gone = (ProcessLookupError, PermissionError)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:
             os.killpg(group, 0)
-        except ProcessLookupError:
+        except gone:
             break
         time.sleep(0.05)
-    with pytest.raises(ProcessLookupError):
+    with pytest.raises(gone):
         os.killpg(group, 0)
 
 
