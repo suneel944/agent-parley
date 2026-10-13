@@ -243,3 +243,18 @@ def test_each_refusal_names_its_rule(text, rule):
 )
 def test_ordinary_text_breaks_no_rule(text):
     assert policy.matched_rule(text) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(git commit -m " + json.dumps(TRAILER) + ")",
+        "env GIT_AUTHOR_NAME=x git commit -m " + json.dumps(TRAILER),
+        "timeout 5 git commit -m " + json.dumps(TRAILER),
+    ],
+)
+def test_a_wrapped_attributed_commit_is_refused(paired, command):
+    lane = Path(paired["lanes"]["claude"])
+    found = attributed_command(payload(lane, command), lane)
+    assert found is not None
+    assert found[0] == TRAILER

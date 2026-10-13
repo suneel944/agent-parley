@@ -86,6 +86,14 @@ def test_an_add_inside_the_lane_wt_directory_is_allowed(
         "git status && git worktree add /tmp/chained",
         "git status\ngit worktree add /tmp/next-line",
         "true\r\n\tgit worktree add ../beside",
+        "(git worktree add /tmp/x)",
+        "bash -c 'git worktree add /tmp/x'",
+        "env git worktree add /tmp/x",
+        "git -c alias.wa='worktree add' wa /tmp/x",
+        "git worktree move {wt}/x /tmp/x",
+        "git worktree move -f {wt}/x ../beside",
+        "cd /tmp && git worktree add x",
+        "git worktree add $HOME/x",
     ],
 )
 def test_an_add_outside_the_lane_wt_directory_is_denied(
@@ -149,7 +157,6 @@ def test_the_denial_names_the_command_to_run_instead(paired):
 @pytest.mark.parametrize(
     "command",
     [
-        "git worktree move /tmp/a /tmp/b",
         "git worktree remove /tmp/x",
         "git worktree list",
         "git worktree prune",
@@ -157,11 +164,48 @@ def test_the_denial_names_the_command_to_run_instead(paired):
         "git status",
         "echo git worktree add /tmp/x",
         "echo 'one\ngit worktree add /tmp/x'",
+        "printf '%s' \"git worktree add /tmp/x\"",
+        "git worktree move {wt}/x {wt}/y",
+        "git worktree move /elsewhere/x {wt}/x",
+        "cd {wt} && git worktree add x",
     ],
 )
 def test_other_commands_pass_the_gate(paired, command):
     lane = Path(paired["lanes"]["claude"]).resolve()
-    assert stray_worktree(payload(lane, command), lane) is None
+    text = command.format(wt=lanes.extras(lane))
+    assert stray_worktree(payload(lane, text), lane) is None
+
+
+def test_a_move_out_of_the_lane_wt_names_a_destination_inside_it(paired):
+    lane = Path(paired["lanes"]["claude"]).resolve()
+    wt = lanes.extras(lane)
+    target, suggested = stray_worktree(
+        payload(lane, f"git worktree move {wt}/x /tmp/x"), lane
+    )
+    assert target == Path("/tmp/x").resolve()
+    assert suggested == f"git worktree move {wt}/x {wt}/x"
+
+
+def test_a_leading_cd_moves_the_add_target(paired):
+    lane = Path(paired["lanes"]["claude"]).resolve()
+    target, suggested = stray_worktree(
+        payload(lane, "cd /tmp && git worktree add x"), lane
+    )
+    assert target == Path("/tmp/x").resolve()
+    assert suggested == f"git worktree add {lanes.extras(lane)}/x"
+
+
+def test_a_variable_target_is_refused_without_a_suggestion(bridge, paired):
+    lane = Path(paired["lanes"]["claude"]).resolve()
+    command = "git worktree add $HOME/x"
+    assert stray_worktree(payload(lane, command), lane) == (
+        Path("$HOME/x"),
+        "",
+    )
+    lane, output = decide(bridge, paired, "claude", command)
+    reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "not a literal path" in reason
+    assert "Run `" not in reason
 
 
 def test_a_call_without_a_shell_command_passes_the_gate(paired):

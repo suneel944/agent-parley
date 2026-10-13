@@ -86,6 +86,77 @@ DIGEST_HEADER_BYTES = 120
 BRIDGE_COMMAND = "agent-parley"
 HARNESS_PROMPT_TAGS = ("<task-notification>", "<system-reminder>")
 UNCHECKED_SHELL = ("<", ">", "`", "$(", "\n", "\r")
+SHELL_KEYWORDS = frozenset(
+    {
+        "!",
+        "{",
+        "}",
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "do",
+        "done",
+        "while",
+        "until",
+    }
+)
+SHELLS = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
+SHELL_DEPTH = 2
+WRAPPER_VALUES = {
+    "builtin": frozenset(),
+    "command": frozenset(),
+    "env": frozenset(
+        {"-C", "-S", "-u", "--chdir", "--split-string", "--unset"}
+    ),
+    "exec": frozenset({"-a"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "nohup": frozenset(),
+    "rtk": frozenset(),
+    "stdbuf": frozenset({"-e", "-i", "-o", "--error", "--input", "--output"}),
+    "sudo": frozenset(
+        {
+            "-C",
+            "-D",
+            "-g",
+            "-p",
+            "-R",
+            "-r",
+            "-T",
+            "-t",
+            "-U",
+            "-u",
+            "--chdir",
+            "--group",
+            "--prompt",
+            "--user",
+        }
+    ),
+    "time": frozenset({"-f", "-o", "--format", "--output"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+    "xargs": frozenset(
+        {
+            "-a",
+            "-d",
+            "-E",
+            "-I",
+            "-L",
+            "-n",
+            "-P",
+            "-s",
+            "--arg-file",
+            "--delimiter",
+            "--max-args",
+            "--max-procs",
+        }
+    ),
+}
+CHECKOUT_SWITCHES = frozenset(
+    {"-b", "-B", "-t", "--detach", "--orphan", "--track"}
+)
+CHECKOUT_PATCHES = frozenset({"-p", "--patch"})
+RESTORE_CHECK_SECONDS = 2.0
 OUTAGE_CHECK = "Run agent-parley status for the bridge's own report."
 OUTAGE_GUIDANCE = (
     "Reads and agent-parley commands still run; hold edits, commits and "
@@ -1016,6 +1087,13 @@ def prune(directory: Path, agent: str, now: float = 0.0) -> int:
 def shell_segments(command: str) -> list[list[str]]:
     """Splits a shell command into simple commands without executing it.
 
+    Subshell parentheses also separate commands, and the reserved words in
+    `SHELL_KEYWORDS` that open a command, such as `if`, `do`, `{` or `!`,
+    are dropped, so a compound command yields the simple commands it runs.
+    The bodies of command substitutions that the tokenizer keeps inside a
+    word, within double quotes or between backticks, follow as commands of
+    their own.
+
     Args:
         command: Shell text supplied to a native command tool.
 
@@ -1025,7 +1103,7 @@ def shell_segments(command: str) -> list[list[str]]:
         stays inside its argument. Invalid shell text returns no commands and
         remains subject to the post-action check.
     """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n()")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -1035,31 +1113,96 @@ def shell_segments(command: str) -> list[list[str]]:
         return []
     segments: list[list[str]] = [[]]
     for token in tokens:
-        if token and not token.strip(";&|\n"):
+        if token and not token.strip(";&|\n()"):
             segments.append([])
-        else:
+        elif segments[-1] or token not in SHELL_KEYWORDS:
             segments[-1].append(token)
+    for body in substitutions(command):
+        segments.extend(shell_segments(body))
     return [segment for segment in segments if segment]
+
+
+def substitutions(command: str) -> list[str]:
+    """Finds the command substitutions the shell tokenizer keeps in a word.
+
+    Args:
+        command: Shell text supplied to a native command tool.
+
+    Returns:
+        The text between backticks outside single quotes and inside each
+        outermost `$(...)` within double quotes. An unquoted `$(...)` is
+        already split at its parentheses, so it is not repeated here.
+    """
+    bodies: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if character == "\\" and quote != "'":
+            index += 1
+        elif character == "'" and quote != '"':
+            quote = "" if quote else "'"
+        elif character == '"' and quote != "'":
+            quote = "" if quote else '"'
+        elif character == "`" and quote != "'":
+            end = command.find("`", index + 1)
+            if end < 0:
+                break
+            bodies.append(command[index + 1 : end])
+            index = end
+        elif quote == '"' and command.startswith("$(", index):
+            depth = 0
+            end = index + 1
+            while end < len(command):
+                depth += {"(": 1, ")": -1}.get(command[end], 0)
+                if not depth:
+                    break
+                end += 1
+            bodies.append(command[index + 2 : end])
+            index = end
+        index += 1
+    return bodies
 
 
 def invoked(words: list[str]) -> list[str]:
     """Strips the wrappers that hide the executable a segment really runs.
 
+    The wrappers are the programs in `WRAPPER_VALUES` that run the rest of
+    their command line, such as `env`, `timeout`, `nice`, `exec`, `sudo`,
+    `xargs` or the token proxy, with their options and the options' values.
+    `env -S TEXT` is split as the shell would split TEXT.
+
     Args:
         words: Tokenized simple command.
 
     Returns:
-        The same command without leading environment assignments, the shell's
-        ``command`` builtin, or a token-proxy wrapper, so the executable is the
-        first remaining word.
+        The same command without leading environment assignments or
+        wrappers, so the executable is the first remaining word.
     """
-    while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+    while words:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0]):
+            words = words[1:]
+            continue
+        wrapper = words[0]
+        if wrapper not in WRAPPER_VALUES:
+            break
         words = words[1:]
-    if words[:1] == ["command"]:
-        words = words[1:]
-    if words[:1] == ["rtk"]:
-        words = words[1:]
-        if words[:1] == ["proxy"]:
+        while words and words[0].startswith("-") and words[0] != "-":
+            option = words[0]
+            words = words[1:]
+            if option == "--":
+                break
+            if option in WRAPPER_VALUES[wrapper] and words:
+                if option in {"-S", "--split-string"}:
+                    try:
+                        words = shlex.split(words[0]) + words[1:]
+                    except ValueError:
+                        return []
+                    break
+                words = words[1:]
+        if wrapper == "timeout" or (
+            wrapper == "rtk" and words[:1] == ["proxy"]
+        ):
             words = words[1:]
     return words
 
@@ -1107,8 +1250,171 @@ def git_action(
     return target, args[index], args[index + 1 :]
 
 
+def unaliased(words: list[str]) -> list[str]:
+    """Expands a Git alias the command line itself defines.
+
+    Only `git -c alias.NAME=VALUE NAME ...` is expanded: aliases in the
+    repository's configuration are not read, so the check runs nothing.
+
+    Args:
+        words: Unwrapped simple command.
+
+    Returns:
+        The command with the alias replaced by its value, a shell alias
+        (`!TEXT`) as `sh -c` running TEXT with the remaining arguments, or
+        the words unchanged when no inline alias applies.
+    """
+    if not words or Path(words[0]).name != "git":
+        return words
+    aliases = {}
+    index = 1
+    while index < len(words) and words[index].startswith("-"):
+        if words[index] == "-c" and index + 1 < len(words):
+            key, _, value = words[index + 1].partition("=")
+            if key.startswith("alias."):
+                aliases[key.removeprefix("alias.")] = value
+        index += 2 if words[index] in GIT_OPTIONS_WITH_VALUE else 1
+    if index >= len(words) or words[index] not in aliases:
+        return words
+    value = aliases[words[index]]
+    rest = words[index + 1 :]
+    if value.startswith("!"):
+        return ["sh", "-c", f"{value[1:]} {shlex.join(rest)}"]
+    try:
+        return [*words[:index], *shlex.split(value), *rest]
+    except ValueError:
+        return words
+
+
+def shell_text(words: list[str]) -> str | None:
+    """Reads the shell text a command hands to another shell to run.
+
+    Args:
+        words: Unwrapped simple command.
+
+    Returns:
+        The argument of `sh -c` and the other shells in `SHELLS`, the joined
+        arguments of `eval`, or ``None`` when the command runs no shell text.
+    """
+    name = Path(words[0]).name
+    if name == "eval":
+        return " ".join(words[1:])
+    if name not in SHELLS:
+        return None
+    index = 1
+    while index < len(words) and words[index][:1] in {"-", "+"}:
+        option = words[index]
+        if option[:2] not in {"--", "++"} and "c" in option[1:]:
+            return words[index + 1] if index + 1 < len(words) else None
+        index += 2 if option[1:] in {"o", "O"} else 1
+    return None
+
+
+def gate_commands(
+    command: str, cwd: Path, depth: int = SHELL_DEPTH
+) -> list[tuple[Path, list[str]]]:
+    """Lists the simple commands a shell call runs and where each runs.
+
+    Every segment is unwrapped with `invoked` and `unaliased`. Shell text a
+    segment hands on through `sh -c`, `eval` or a Git shell alias is split
+    in turn, up to `depth` levels. A `cd DIR` moves the directory later
+    commands resolve against; a `cd -` or a target naming a variable or a
+    substitution returns to the tool's own directory, because the real one
+    cannot be read from the text. This is a guard, not an authority
+    boundary: code an interpreter runs, such as `python -c` or a script,
+    is out of its reach.
+
+    Args:
+        command: Shell text supplied to a native command tool.
+        cwd: Native tool working directory, resolved.
+        depth: How many levels of nested shell text are searched.
+
+    Returns:
+        Each command's words with the directory it runs in.
+    """
+    found: list[tuple[Path, list[str]]] = []
+    directory = cwd
+    for segment in shell_segments(command):
+        words = unaliased(invoked(segment))
+        if not words:
+            continue
+        if words[0] == "cd":
+            names = [word for word in words[1:] if not word.startswith("-")]
+            name = names[0] if names else "~"
+            directory = (
+                cwd
+                if "-" in words[1:] or "$" in name or "`" in name
+                else (directory / Path(name).expanduser()).resolve()
+            )
+            continue
+        nested = shell_text(words)
+        if nested is None:
+            found.append((directory, words))
+        elif depth:
+            found.extend(gate_commands(nested, directory, depth - 1))
+    return found
+
+
+def checkout_switches(directory: Path, args: list[str]) -> bool:
+    """Reports whether a `git checkout` can move HEAD rather than restore.
+
+    Branch-creating and detaching options switch, and a patch restore never
+    does. Paths after `--`, or more than one name before it, are a restore.
+    A single name that is `.` or exists in the directory is a path; any
+    other single name switches unless Git tracks it as a path, which costs
+    one `git ls-files` bounded by `RESTORE_CHECK_SECONDS`. A name Git does
+    not track is refused because Git may create a tracking branch from it.
+
+    Args:
+        directory: Directory the command runs in.
+        args: Arguments following the `checkout` subcommand.
+
+    Returns:
+        Whether the command may switch the branch.
+    """
+    options = {argument.partition("=")[0] for argument in args}
+    if options & CHECKOUT_SWITCHES:
+        return True
+    if options & CHECKOUT_PATCHES:
+        return False
+    split = args.index("--") if "--" in args else len(args)
+    names = [
+        argument
+        for argument in args[:split]
+        if argument == "-" or not argument.startswith("-")
+    ]
+    if args[split + 1 :] or len(names) != 1:
+        return False
+    name = names[0]
+    if name == "." or (name != "-" and (directory / name).exists()):
+        return False
+    try:
+        listed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(directory),
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                name,
+            ],
+            capture_output=True,
+            timeout=RESTORE_CHECK_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return listed.returncode != 0
+
+
 def changes_lane_branch(payload: dict, lane: Path) -> bool:
     """Reports whether a native tool command can change the lane branch.
+
+    Commands are read through `gate_commands`, so wrappers, compound
+    syntax, nested shell text, inline Git aliases and a preceding `cd` are
+    seen through. A `git checkout` that only restores files is allowed, as
+    `checkout_switches` decides.
 
     Args:
         payload: Native lifecycle hook payload.
@@ -1122,8 +1428,8 @@ def changes_lane_branch(payload: dict, lane: Path) -> bool:
         return False
     command = str(tool_input.get("command", tool_input.get("cmd", "")))
     cwd = Path(payload.get("cwd", str(lane))).resolve()
-    for segment in shell_segments(command):
-        action = git_action(segment, cwd)
+    for directory, words in gate_commands(command, cwd):
+        action = git_action(words, directory)
         if action is None:
             continue
         target, subcommand, args = action
@@ -1131,7 +1437,9 @@ def changes_lane_branch(payload: dict, lane: Path) -> bool:
             continue
         if subcommand == "switch":
             return True
-        if subcommand == "checkout" and args[:1] != ["--"]:
+        if subcommand == "checkout" and (
+            Path(words[0]).name == "gh" or checkout_switches(target, args)
+        ):
             return True
         if subcommand == "branch" and any(
             argument in {"-m", "-M", "--move"} for argument in args
@@ -1147,14 +1455,17 @@ def changes_lane_branch(payload: dict, lane: Path) -> bool:
 
 
 def stray_worktree(payload: dict, lane: Path) -> tuple[Path, str] | None:
-    """Reports a `git worktree add` whose target leaves the lane's -wt.
+    """Reports a `git worktree add` or `move` whose target leaves the -wt.
 
     Git records no creator for a worktree, so the sweep attributes a lane's
     extra worktrees by where they sit. The target is the first positional
-    argument after `add`, past options such as `-b NAME`, `-B NAME`,
-    `--reason TEXT`, `--detach` and `--lock`, resolved against the directory
-    `git -C` selects or the tool's working directory, with a leading `~`
-    expanded. The check reads the command line only and runs nothing.
+    argument after `add`, or the second, the destination, after `move`,
+    past options such as `-b NAME`, `-B NAME`, `--reason TEXT`, `--detach`,
+    `--lock` and `--force`. It is resolved against the directory `git -C`
+    selects, else the directory `gate_commands` tracks, with a leading `~`
+    expanded. A target naming a variable or a substitution is reported
+    unresolved, because only the shell knows where it points. The check
+    reads the command line only and runs nothing.
 
     Args:
         payload: Native lifecycle hook payload.
@@ -1162,7 +1473,8 @@ def stray_worktree(payload: dict, lane: Path) -> tuple[Path, str] | None:
 
     Returns:
         The resolved target and the same command aimed inside the lane's
-        `-wt` directory, or ``None`` when no add leaves that directory.
+        `-wt` directory, the literal target and an empty command when it
+        cannot be resolved, or ``None`` when nothing leaves that directory.
     """
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
@@ -1170,25 +1482,29 @@ def stray_worktree(payload: dict, lane: Path) -> tuple[Path, str] | None:
     command = str(tool_input.get("command", tool_input.get("cmd", "")))
     cwd = Path(payload.get("cwd", str(lane))).resolve()
     allowed = lanes.extras(lane)
-    for segment in shell_segments(command):
-        words = invoked(segment)
-        action = git_action(words, cwd)
+    for directory, words in gate_commands(command, cwd):
+        action = git_action(words, directory)
         if action is None:
             continue
         base, subcommand, args = action
-        if subcommand != "worktree" or args[:1] != ["add"]:
+        if subcommand != "worktree" or args[:1] not in (["add"], ["move"]):
             continue
+        names: list[int] = []
         index = len(words) - len(args) + 1
         while index < len(words):
             word = words[index]
             if word == "--":
-                index += 1
+                names.extend(range(index + 1, len(words)))
                 break
             if word == "-" or not word.startswith("-"):
-                break
+                names.append(index)
             index += 2 if word in WORKTREE_ADD_VALUES else 1
-        if index >= len(words):
+        wanted = 0 if args[0] == "add" else 1
+        if len(names) <= wanted:
             continue
+        index = names[wanted]
+        if "$" in words[index] or "`" in words[index]:
+            return Path(words[index]), ""
         target = (base / Path(words[index]).expanduser()).resolve()
         if target != allowed and target.is_relative_to(allowed):
             continue
@@ -3435,14 +3751,19 @@ def checkpoint(
         return refused
     if event == "PreToolUse" and (stray := stray_worktree(payload, lane)):
         allowed = lanes.extras(lane)
+        remedy = (
+            f"{stray[0]} is outside it. Run `{stray[1]}` instead."
+            if stray[1]
+            else f"{stray[0]} is not a literal path, so it cannot be "
+            f"checked; name a literal path inside {allowed}/ instead."
+        )
         refused = {
             "hookSpecificOutput": {
                 "hookEventName": event,
                 "permissionDecision": "deny",
                 "permissionDecisionReason": (
                     f"A lane adds extra worktrees only inside {allowed}/, "
-                    "so the sweep can tell which lane made them; "
-                    f"{stray[0]} is outside it. Run `{stray[1]}` instead. "
+                    f"so the sweep can tell which lane made them; {remedy} "
                     "This is a guard, not an authority boundary."
                 ),
             }
