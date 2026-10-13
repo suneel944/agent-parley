@@ -154,10 +154,14 @@ def configure(
 ) -> Path:
     """Copies the user's OpenCode configuration into a lane-private directory.
 
-    The lane's MCP server is added under ``mcp`` and one plugin file is
-    written that runs the shared hook command for each event in ``EVENTS``.
-    Every other key of the user's ``opencode.json`` is carried unchanged, the
-    source directory is never written, and OpenCode's own authentication
+    Every file of the source directory except ``node_modules`` and ``.git``
+    is copied, so the lane sees the same agents, commands, plugins and
+    ``AGENTS.md`` as the operator. The lane's MCP server is then added under
+    ``mcp`` and one plugin file is written that runs the shared hook command
+    for each event in ``EVENTS``. Every other key of the user's
+    ``opencode.json`` is carried unchanged, except that relative
+    ``instructions`` entries are made absolute under the source directory.
+    The source directory is never written, and OpenCode's own authentication
     store outside the configuration directory stays in effect.
 
     Args:
@@ -173,7 +177,8 @@ def configure(
 
     Raises:
         BridgeError: If the user's configuration cannot safely accept the
-            lane server or plugin.
+            lane server or plugin, or already holds a plugin file named
+            ``agent-parley.js``.
     """
     source = Path(
         source_dir
@@ -211,9 +216,33 @@ def configure(
     }
     command = shlex.split(hooks["PreToolUse"][0]["hooks"][0]["command"])
     command += ["--adapter", "opencode"]
+    if (source / "plugin" / "agent-parley.js").exists():
+        raise BridgeError(
+            f"{source / 'plugin' / 'agent-parley.js'} would be replaced by "
+            "the lane's bridge plugin; rename it first."
+        )
+    instructions = settings.get("instructions")
+    if isinstance(instructions, list):
+        settings["instructions"] = [
+            str(source / entry)
+            if isinstance(entry, str)
+            and not entry.startswith(("~", "http://", "https://"))
+            and not Path(entry).is_absolute()
+            else entry
+            for entry in instructions
+        ]
     overlay = directory / f"{name}-opencode"
     shutil.rmtree(overlay, ignore_errors=True)
-    (overlay / "plugin").mkdir(parents=True, mode=0o700)
+    if source.is_dir():
+        shutil.copytree(
+            source,
+            overlay,
+            symlinks=True,
+            ignore=shutil.ignore_patterns("node_modules", ".git"),
+        )
+    overlay.mkdir(parents=True, mode=0o700, exist_ok=True)
+    overlay.chmod(0o700)
+    (overlay / "plugin").mkdir(mode=0o700, exist_ok=True)
     write_json(overlay / CONFIG, settings)
     write_text(
         overlay / "plugin" / "agent-parley.js",
