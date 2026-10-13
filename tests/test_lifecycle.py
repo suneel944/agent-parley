@@ -701,9 +701,9 @@ def test_history_is_capped_but_keeps_the_claim_marker():
 def test_repeated_claim_release_cycles_never_grow_past_the_cap(tmp_path):
     """A lane cycling one issue keeps its ledger entry bounded.
 
-    At most three retained marker entries (claim, take and complete) can
-    sit outside the capped recent window, so the total never exceeds the
-    cap by more than that fixed amount, however many cycles run.
+    At most four retained marker entries (claim, accept, take and complete)
+    can sit outside the capped recent window, so the total never exceeds
+    the cap by more than that fixed amount, however many cycles run.
     """
     for _ in range(lifecycle.MAX_HISTORY + 20):
         claim(tmp_path, "42")
@@ -715,7 +715,7 @@ def test_repeated_claim_release_cycles_never_grow_past_the_cap(tmp_path):
             participants={"codex", "claude"},
         )
     record = issues.snapshot(tmp_path)["issues"]["42"]
-    assert len(record["history"]) <= lifecycle.MAX_HISTORY + 3
+    assert len(record["history"]) <= lifecycle.MAX_HISTORY + 4
 
 
 def test_a_replayed_claim_omits_history_from_the_retained_result(tmp_path):

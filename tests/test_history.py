@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from agent_parley import cli, history, issues, store
+from agent_parley import cli, history, issues, lifecycle, store
 from agent_parley.state import BridgeError
 
 
@@ -53,7 +53,100 @@ def test_every_claim_generation_carries_its_own_identifier(
         "codex",
     ]
     assert held[0]["ended"] is not None and held[0]["seconds"] >= 0
+    accepted_at = issues.snapshot(directory)["issues"]["42"]["history"][-1]
+    assert accepted_at["action"] == "accept"
+    assert held[1]["ended"] == accepted_at["at"]
     assert held[-1]["ended"] is None
+
+
+def ledger(directory, record):
+    """Publishes one synthetic issue record as issue 42."""
+    (directory / "issues.json").write_text(
+        json.dumps({"revision": 1, "issues": {"42": record}})
+    )
+
+
+@pytest.mark.parametrize("action", ["complete", "resolve"])
+def test_a_finished_issue_leaves_no_generation_held(tmp_path, action):
+    record = {"owner": None, "claim_id": None}
+    lifecycle.append_history(
+        record,
+        {"action": "claim", "actor": "alpha", "at": 1000.0, "claim_id": "c1"},
+    )
+    lifecycle.append_history(
+        record,
+        {"action": action, "actor": "operator", "at": 2000.0, "owner": None},
+    )
+    ledger(tmp_path, record)
+    held = history.holdings(tmp_path, "42")
+    assert held == [
+        {
+            "participant": "alpha",
+            "claim_id": "c1",
+            "started": 1000.0,
+            "ended": 2000.0,
+            "seconds": 1000,
+        }
+    ]
+
+
+def test_a_capped_history_still_names_the_owner_an_accept_moved_to(
+    tmp_path,
+):
+    record = {"owner": "beta", "claim_id": "c2"}
+    lifecycle.append_history(
+        record,
+        {"action": "claim", "actor": "alpha", "at": 1000.0, "claim_id": "c1"},
+    )
+    lifecycle.append_history(
+        record, {"action": "offer", "actor": "alpha", "at": 2000.0}
+    )
+    lifecycle.append_history(
+        record,
+        {
+            "action": "accept",
+            "actor": "beta",
+            "at": 3000.0,
+            "owner": "beta",
+            "claim_id": "c2",
+        },
+    )
+    for step in range(60):
+        lifecycle.append_history(
+            record,
+            {"action": "block", "actor": "beta", "at": 4000.0 + step},
+        )
+    ledger(tmp_path, record)
+    held = history.holdings(tmp_path, "42")
+    assert [generation["participant"] for generation in held] == [
+        "alpha",
+        "beta",
+    ]
+    assert held[0]["ended"] == 3000.0
+    assert held[-1]["claim_id"] == "c2" and held[-1]["ended"] is None
+
+
+def test_an_owner_missing_from_history_is_reported_as_the_holder(tmp_path):
+    record = {
+        "owner": "beta",
+        "claim_id": "c2",
+        "history": [
+            {
+                "action": "claim",
+                "actor": "alpha",
+                "at": 1000.0,
+                "claim_id": "c1",
+            }
+        ],
+    }
+    ledger(tmp_path, record)
+    held = history.holdings(tmp_path, "42")
+    assert [generation["participant"] for generation in held] == [
+        "alpha",
+        "beta",
+    ]
+    assert held[0]["ended"] is not None
+    assert held[-1]["claim_id"] == "c2" and held[-1]["ended"] is None
 
 
 def test_history_of_an_issue_lists_its_transitions(bridge, repo, paired):

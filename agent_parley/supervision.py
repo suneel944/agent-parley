@@ -61,6 +61,7 @@ DEFAULTS: dict[str, Any] = {
     "start_deadline": 30,
     "completion_reminders": 3,
     "orphan_retire_after": 3600,
+    "root_gone_after": 3600,
     "claim_idle_after": 3600,
     "takeover_grace": 300,
     "max_claims_per_lane": 2,
@@ -85,6 +86,7 @@ ENDED = issues.ENDED
 RECLAIM_INTERVAL = 900.0
 RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
+ROOT_RETURNED = "root-returned.json"
 RECOVERED_FOLDER = "recovered"
 BOOT_RECORD = "boot.json"
 READINGS_PUBLICATION = "git-readings.json"
@@ -199,6 +201,7 @@ def settings(value: dict) -> dict:
         "stalled_after",
         "start_deadline",
         "orphan_retire_after",
+        "root_gone_after",
         "claim_idle_after",
         "takeover_grace",
         "convergence_after",
@@ -7234,13 +7237,18 @@ def root_retired(directory: Path) -> bool:
 def missing_root(
     home: Path, directory: Path, manifest: dict, config: dict
 ) -> None:
-    """Retires a project whose root checkout has been gone an interval.
+    """Retires a project whose root checkout has been gone `root_gone_after`.
 
     A root removed under a live project, such as a temporary directory a
     reboot wiped, leaves every lane reported as an unavailable worktree and
     every status poll walking it. The first poll that finds the root gone
-    only records when; a root still gone one supervision interval later is
-    a root that is not coming back. Each lane that has not retired is then
+    only records when. A rename and rename back, a re-clone, a remount or a
+    resume from sleep all hide a root for seconds to minutes, so only a root
+    still gone `root_gone_after` later (an hour by default) is a root that
+    is not coming back. A root whose parent directory cannot be listed sits
+    on an unmounted volume or a removed mount point; it is recorded as
+    `unreachable` and never retires anything. Each lane that has not
+    retired is then
     captured into a recovery checkpoint where Git can still read it,
     retired through `retirement.withdraw`, which releases its claims and
     declines offers made to it, and its credential is invalidated. The
@@ -7249,7 +7257,8 @@ def missing_root(
     issue next can restore the work. It names the state directory for the
     operator to remove with `agent-parley gc --project ROOT --apply`
     (`forget`); nothing here deletes it. A root that reappears clears the
-    record on the next poll.
+    record on the next poll, keeping it as `ROOT_RETURNED` when it retired
+    lanes (`root_returned`).
 
     A lane whose session process is still alive is never retired here: a
     moved repository or a dropped mount leaves its client running, and
@@ -7275,13 +7284,23 @@ def missing_root(
     except (OSError, ValueError):
         recorded = {}
     since = recorded.get("since") if isinstance(recorded, dict) else None
+    reachable = _parent_readable(Path(manifest["root"]))
     if not isinstance(since, int | float) or isinstance(since, bool):
         write_json(
             path,
-            {"since": now, "retired": None, "state_directory": str(directory)},
+            {
+                "since": now,
+                "retired": None,
+                "state_directory": str(directory),
+                "unreachable": not reachable,
+            },
         )
         return
-    if recorded.get("retired") or now - since < config["interval"]:
+    if recorded.get("retired"):
+        return
+    if bool(recorded.get("unreachable")) == reachable:
+        write_json(path, {**recorded, "unreachable": not reachable})
+    if not reachable or now - since < config["root_gone_after"]:
         return
     lanes = list(recorded.get("lanes") or [])
     live = []
@@ -7324,10 +7343,90 @@ def missing_root(
             "since": since,
             "retired": None if live else now,
             "state_directory": str(directory),
+            "unreachable": False,
             "lanes": lanes,
             "live": live,
         },
     )
+
+
+def _parent_readable(root: Path) -> bool:
+    """Reports whether the directory that held a missing root can be listed.
+
+    A root under an unmounted volume or a removed mount point is unreachable
+    rather than gone, so its lanes must not retire. A listable parent is the
+    evidence that the root itself was removed or moved.
+
+    Args:
+        root: Project root checkout that no longer exists.
+
+    Returns:
+        Whether the root's parent directory exists and can be listed.
+    """
+    try:
+        next(root.parent.iterdir(), None)
+    except OSError:
+        return False
+    return True
+
+
+def root_returned(directory: Path, manifest: dict) -> None:
+    """Keeps the record of lanes retired while the root was gone.
+
+    A root that reappears after `missing_root` retired lanes leaves those
+    lanes retired and their claims released. Deleting the publication then
+    would hide why, so it moves to `ROOT_RETURNED` with the time the root
+    returned, and `problems` names each lane with its re-admit command. A
+    second return merges its lanes into a record already kept, deduplicated
+    by participant, so lanes still retired from an earlier loss stay named.
+    The record is removed once every lane it names has been re-admitted, or
+    when the operator deletes the file. A publication that retired nothing
+    is simply removed.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+    """
+    path = directory / ROOT_PUBLICATION
+    kept = directory / ROOT_RETURNED
+    try:
+        recorded = json.loads(path.read_text())
+    except (OSError, ValueError):
+        recorded = None
+    if isinstance(recorded, dict) and recorded.get("lanes"):
+        try:
+            earlier = json.loads(kept.read_text())
+        except (OSError, ValueError):
+            earlier = None
+        lanes = list(recorded["lanes"])
+        named = {
+            str(lane.get("participant"))
+            for lane in lanes
+            if isinstance(lane, dict)
+        }
+        if isinstance(earlier, dict):
+            lanes.extend(
+                lane
+                for lane in earlier.get("lanes") or []
+                if isinstance(lane, dict)
+                and str(lane.get("participant")) not in named
+            )
+        write_json(
+            kept, {**recorded, "lanes": lanes, "returned_at": time.time()}
+        )
+    path.unlink(missing_ok=True)
+    try:
+        returned = json.loads(kept.read_text())
+    except (OSError, ValueError):
+        return
+    participants = manifest["participants"]
+    if not isinstance(returned, dict) or not any(
+        roster.retired(participants[str(lane.get("participant"))])
+        for lane in returned.get("lanes") or []
+        if isinstance(lane, dict)
+        and str(lane.get("participant")) in participants
+    ):
+        kept.unlink(missing_ok=True)
 
 
 def forget(
@@ -7513,7 +7612,7 @@ def _poll(home: Path, directory: Path) -> None:
     if not Path(manifest["root"]).exists():
         missing_root(home, directory, manifest, config)
         return
-    (directory / ROOT_PUBLICATION).unlink(missing_ok=True)
+    root_returned(directory, manifest)
     failures: list[str] = []
     stages: dict[str, float] = {}
     started = time.time()

@@ -85,6 +85,7 @@ FOREIGN = "second session"
 REFUSED = "recovery refused"
 INTEGRATION = "integration unverified"
 ROOT = "root missing"
+ROOT_RETURNED = "root returned"
 ESCALATED = "escalated plan revision"
 PROPOSED = "plan revisions pending"
 RUN_BUDGET = "run budget exhausted"
@@ -1552,16 +1553,22 @@ def _integration_rows(directory: Path, root: str, now: float) -> list[dict]:
     ]
 
 
-def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
+def _root_rows(
+    directory: Path, manifest: dict, root: str, now: float
+) -> list[dict]:
     """Reports a project whose root checkout is gone, naming the lanes kept.
 
-    The supervisor retires every lane one interval after the root goes
-    missing, except a lane whose session process is still alive or whose
-    activity record cannot be read. Those lanes keep the project out of
-    retirement until their sessions end, so the row names them.
+    The supervisor retires every lane once the root has been missing
+    `root_gone_after`, except a lane whose session process is still alive or
+    whose activity record cannot be read. Those lanes keep the project out
+    of retirement until their sessions end, so the row names them. A root
+    whose parent cannot be listed is reported unreachable and retires
+    nothing. With no missing root, a root that returned after lanes retired
+    is reported by `_returned_rows`.
 
     Args:
         directory: Private project state directory.
+        manifest: Normalized project manifest, read for retired lanes.
         root: Canonical project key.
         now: Unix time the absence is measured against.
 
@@ -1573,7 +1580,7 @@ def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
             (directory / supervision.ROOT_PUBLICATION).read_text()
         )
     except (OSError, ValueError):
-        return []
+        return _returned_rows(directory, manifest, root, now)
     if not isinstance(recorded, dict) or recorded.get("retired"):
         return []
     live = [str(name) for name in recorded.get("live") or []]
@@ -1581,7 +1588,11 @@ def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
         f"project root is gone; live lanes kept from retirement: "
         f"{', '.join(live)}"
         if live
-        else "project root is gone; lanes retire one interval after it went"
+        else "project root is unreachable: its parent directory cannot be "
+        "listed, so no lane retires"
+        if recorded.get("unreachable")
+        else "project root is gone; lanes retire once it has been gone "
+        "root_gone_after"
     )
     return [
         _row(
@@ -1592,6 +1603,60 @@ def _root_rows(directory: Path, root: str, now: float) -> list[dict]:
             _age(recorded.get("since"), now),
             project=root,
             count=max(len(live), 1),
+        )
+    ]
+
+
+def _returned_rows(
+    directory: Path, manifest: dict, root: str, now: float
+) -> list[dict]:
+    """Reports lanes retired while a project root was gone that came back.
+
+    The supervisor keeps `supervision.ROOT_RETURNED` once a root reappears
+    after lanes retired for its absence, and removes it when every lane it
+    names is re-admitted. Until then the row names only the lanes the
+    roster still reads as retired, so a lane already re-admitted is never
+    offered a second `participant add`.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Normalized project manifest, read for retired lanes.
+        root: Canonical project key.
+        now: Unix time the record's age is measured against.
+
+    Returns:
+        One row naming the retired lanes and their re-admit commands, or none.
+    """
+    try:
+        recorded = json.loads(
+            (directory / supervision.ROOT_RETURNED).read_text()
+        )
+    except (OSError, ValueError):
+        return []
+    if not isinstance(recorded, dict):
+        return []
+    participants = manifest.get("participants") or {}
+    names = [
+        name
+        for lane in recorded.get("lanes") or []
+        if isinstance(lane, dict) and lane.get("participant")
+        for name in [str(lane["participant"])]
+        if name in participants and roster.retired(participants[name])
+    ]
+    if not names:
+        return []
+    repo = f"--repo {shlex.quote(root)}"
+    return [
+        _row(
+            ROOT_RETURNED,
+            "project root returned after these lanes retired for its "
+            f"absence: {', '.join(names)}",
+            "; ".join(
+                f"agent-parley participant add {name} {repo}" for name in names
+            ),
+            _age(recorded.get("returned_at"), now),
+            project=root,
+            count=len(names),
         )
     ]
 
@@ -2128,7 +2193,7 @@ def derive(
         aged.extend(_retired_rows(home, project))
         aged.extend(_refused_rows(directory, project["root"], stamp))
         aged.extend(_integration_rows(directory, project["root"], stamp))
-        aged.extend(_root_rows(directory, project["root"], stamp))
+        aged.extend(_root_rows(directory, data, project["root"], stamp))
         aged.extend(_forge_rows(directory, project["root"], stamp))
         aged.extend(_plan_rows(directory, project["root"], stamp))
         aged.extend(_run_rows(directory, data, project["root"], stamp))
