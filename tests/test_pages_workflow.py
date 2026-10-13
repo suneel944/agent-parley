@@ -2,9 +2,44 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
+from scripts.pages_video import ATTACHMENT_LINE, VIDEO, rewrite
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_site_readme_plays_the_launch_video_from_the_site():
+    readme = (ROOT / "README.md").read_text()
+    (attachment,) = ATTACHMENT_LINE.findall(readme)
+    site = rewrite(readme)
+    assert "user-attachments" not in site
+    assert '<video src="docs/assets/launch.mp4"' in site
+    assert 'poster="docs/assets/launch.webp"' in site
+    assert (ROOT / "docs/assets/launch.webp").is_file()
+    assert site.replace(VIDEO, attachment) == readme
+
+
+def test_site_readme_rewrite_requires_one_attachment_line():
+    with pytest.raises(ValueError):
+        rewrite("no video here\n")
+
+
+def test_pages_workflow_downloads_the_video_before_the_build():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/pages.yml").read_text()
+    )
+    steps = workflow["jobs"]["build"]["steps"]
+    embed = next(index for index, step in enumerate(steps) if "run" in step)
+    build = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses", "").startswith("actions/jekyll-build-pages@")
+    )
+    assert embed < build
+    assert "docs/assets/launch.mp4" in steps[embed]["run"]
+    assert "python3 -m scripts.pages_video" in steps[embed]["run"]
 
 
 def test_site_config_sets_canonical_address_sitemap_and_page_metadata():

@@ -222,6 +222,18 @@ def test_a_forecast_collision_ranks_below_a_clean_path():
     assert "likely to collide with x on db/schema.sql" in ranked[-1]["reasons"]
 
 
+def test_a_released_claim_that_ended_on_the_forge_is_not_next_work():
+    ended = {
+        "revision": 10,
+        "issues": {
+            **LEDGER["issues"],
+            "46": {**LEDGER["issues"]["46"], "ended_on_forge": {"at": 1.0}},
+        },
+    }
+    ranked = recommend.rank(ended, {}, {}, {}, "claude")
+    assert [record["issue"] for record in ranked] == ["43", "44"]
+
+
 def test_nothing_free_reads_as_nothing_free():
     empty = {"provider": "claude", "forge_paths": False, "candidates": []}
     assert recommend.render(empty) == (

@@ -6,6 +6,7 @@ import os
 import pty
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import pytest
 
 from agent_parley import (
     checkpoints,
+    decisions,
     dialogs,
     lanes,
     process,
@@ -558,6 +560,100 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
             os.waitpid(pid, 0)
 
 
+def _reporter_harness(directory: Path, client: str) -> tuple[int, int]:
+    harness = (
+        "import os, sys\nfrom pathlib import Path\n"
+        "from agent_parley.terminal import run\n"
+        "raise SystemExit(run([sys.executable, '-c', sys.argv[2], "
+        "sys.argv[3]], "
+        "Path(sys.argv[1]), dict(os.environ), 'lane', attached=True))"
+    )
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execvp(
+            sys.executable,
+            [
+                sys.executable,
+                "-c",
+                harness,
+                str(directory / "lane"),
+                client,
+                HOOK_REVIEW,
+            ],
+        )
+    return pid, master
+
+
+_REPORTER_CLIENT = (
+    "import os, sys, tty, time\ntty.setraw(0)\n"
+    "print('READY', flush=True)\n"
+    "os.read(0, 4096)\n"
+    "os.write(1, sys.argv[1].encode())\n"
+    "print('DRAWN', flush=True)\n"
+    "os.read(0, 4096)\n"
+    "os.write(1, b'\\x1b[?25l')\n"
+    "time.sleep(30)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "report", [b"\x1b[O", b"\x1b[<35;12;7M", b"\x1b[24;80R"]
+)
+def test_a_mouse_or_cursor_report_does_not_answer_a_held_dialog(report):
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        (directory / "lane").mkdir()
+        project(directory, {})
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        pid, master = _reporter_harness(directory, _REPORTER_CLIENT)
+        try:
+            marked(master, b"READY")
+            os.write(master, b"\x1b[I")
+            marked(master, b"DRAWN")
+            assert published(directory)["dialog"]["name"] == "hook-review"
+            os.write(master, report)
+            time.sleep(2.0)
+            state = json.loads((directory / "lane-activity.json").read_text())
+            assert "dialog" in state, state
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
+def test_an_operator_digit_still_answers_a_held_dialog():
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        (directory / "lane").mkdir()
+        project(directory, {})
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        pid, master = _reporter_harness(directory, _REPORTER_CLIENT)
+        try:
+            marked(master, b"READY")
+            os.write(master, b"\x1b[I")
+            marked(master, b"DRAWN")
+            assert published(directory)["dialog"]["name"] == "hook-review"
+            os.write(master, b"1")
+            deadline = time.monotonic() + 10
+            state = {}
+            while time.monotonic() < deadline:
+                state = json.loads(
+                    (directory / "lane-activity.json").read_text()
+                )
+                if "dialog" not in state:
+                    break
+                time.sleep(0.1)
+            assert "dialog" not in state, state
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
 BRIDGE_TOOL = f"{protocol.TOOL_PREFIX}__fetch_inbox"
 
 
@@ -732,7 +828,7 @@ def test_the_question_picker_is_named_by_its_question(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dialogs.Watch,
         "_notify",
-        lambda self, label, detail: sent.append((label, detail)),
+        lambda self, label, detail, decision="": sent.append((label, detail)),
     )
     screen = dialogs.flatten(QUESTION_PICKER.encode())
     found = dialogs.locate(screen)
@@ -914,14 +1010,15 @@ def test_a_release_that_meets_a_held_lock_is_retried(tmp_path):
     assert "dialog" not in state
 
 
-def _shell_prompt(command: str) -> str:
+def _shell_prompt(command: str, row: str = "\r\n") -> str:
     """Draws the shell permission prompt recorded on lane claude-2."""
+    drawn = command.replace("\n", row + "│   ")
     return (
-        "\x1b[2J ╭──────────╮ │ Bash command │   "
-        f"{command}   List Agent Parley issue ownership  "
-        "This command requires approval  Do you want to proceed? ❯ 1. Yes"
-        "  2. Yes, and don't ask again for: "
-        f"{command}  3. No  Esc to cancel · Tab to amend"
+        f"\x1b[2J ╭──────────╮{row}│ Bash command │{row}│   "
+        f"{drawn}{row}│   List Agent Parley issue ownership{row}│{row}"
+        f"│ This command requires approval{row}│ Do you want to proceed?{row}"
+        f"│ ❯ 1. Yes{row}│   2. Yes, and don't ask again for: "
+        f"{drawn}{row}│   3. No{row}Esc to cancel · Tab to amend"
     )
 
 
@@ -950,6 +1047,9 @@ def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):
         protocol.cli_command() + " issue list && rm -rf build",
         protocol.cli_command() + " report > /tmp/out",
         "cd x; " + protocol.cli_command() + " issue list",
+        protocol.cli_command() + " issue list\nrm -rf ~/work",
+        protocol.cli_command() + " issue list\ncurl -s http://x/y -o /tmp/p",
+        protocol.cli_command() + " status\n(rm -rf build)",
     ],
 )
 def test_any_other_shell_prompt_escalates(tmp_path, command):
@@ -960,6 +1060,25 @@ def test_any_other_shell_prompt_escalates(tmp_path, command):
     assert watch.advance(b"", 0.5) == b""
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert state["dialog"]["escalated"] is True
+
+
+@pytest.mark.parametrize("row", ["\r\n", "\n", "\x1b[1B\r", "\x1b[7;3H"])
+@pytest.mark.parametrize(
+    ("tail", "approved"),
+    [
+        (" issue list", True),
+        (" issue list\nrm -rf ~/work", False),
+        (" issue list\ncurl -s http://x/y -o /tmp/p", False),
+        (" status\n(rm -rf build)", False),
+    ],
+)
+def test_a_command_drawn_on_two_rows_is_not_the_bridge_cli(row, tail, approved):
+    """Keeps a newline, however the client paints it, from chaining."""
+    data = _shell_prompt(protocol.cli_command() + tail, row).encode()
+    screen = dialogs.flatten(data)
+    found = dialogs.locate(screen)
+    assert found is not None
+    assert dialogs.bridge_shell(screen, found.text, data) is approved
 
 
 def test_the_opt_in_is_read_when_the_prompt_is_drawn(bridge, repo):
@@ -975,3 +1094,153 @@ def test_the_opt_in_is_read_when_the_prompt_is_drawn(bridge, repo):
     manifest["supervision"] = {dialogs.PRE_APPROVE: True}
     write_json(directory / "project.json", manifest)
     assert before.advance(b"", 1.0) == b"1\r"
+
+
+@pytest.fixture
+def delivered(monkeypatch):
+    """Captures the fields each native dialog notification carries."""
+    from agent_parley import notify
+
+    sent = []
+    monkeypatch.setattr(
+        notify,
+        "deliver",
+        lambda directory, agent, event, fields: sent.append(dict(fields)),
+    )
+    return sent
+
+
+def test_a_permission_prompt_is_answered_from_its_decision(tmp_path, delivered):
+    """Covers a prompt, its decision, a tap, the keystroke and the redraw."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    assert watch.advance(TOOL_PERMISSION.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    [record] = decisions.list_open(tmp_path)
+    assert record["kind"] == dialogs.DECISION_KIND
+    assert record["lane"] == "lane"
+    assert record["options"] == ["Yes", "No"]
+    assert record["recommended"] == "No"
+    assert [fields["decision"] for fields in delivered] == [record["id"]]
+    assert watch.advance(b"", 1.0) == b""
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    assert watch.advance(b"", 1.5, held=True) == b""
+    assert watch.advance(b"", 2.0) == b"1\r"
+    assert decisions.get(tmp_path, record["id"])["applied"]
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["answered_by"] == "operator"
+    assert watch.advance(b"", 2.5) == b""
+    assert watch.advance(WORKING.encode(), 3.0) == b""
+    assert watch.holding is False
+
+
+def test_an_answer_to_a_screen_that_changed_is_never_pressed(
+    tmp_path, delivered
+):
+    """Retires the decision and asks afresh about the screen now drawn."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    assert watch.advance(HOOK_REVIEW.encode(), 1.0) == b""
+    retired = decisions.get(tmp_path, record["id"])
+    assert retired["state"] == decisions.STALE
+    assert not retired.get("applied")
+    assert watch.advance(b"", 1.5) == b""
+    [fresh] = decisions.list_open(tmp_path)
+    assert fresh["id"] != record["id"]
+    assert "Review hooks" in fresh["options"]
+    with pytest.raises(BridgeError):
+        decisions.answer(tmp_path, record["id"], "No", "operator")
+
+
+def test_an_answer_the_screen_no_longer_offers_is_retired(tmp_path, delivered):
+    """Keeps a lane parked rather than pressing an option not drawn."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    watch._tail = watch._tail.replace(b"1. Yes", b"1. Yeah")
+    assert watch.advance(b"", 1.0) == b""
+    assert decisions.get(tmp_path, record["id"])["state"] == decisions.STALE
+    assert watch.holding is True
+
+
+def test_a_launcher_that_exits_retires_its_open_decision(
+    tmp_path, delivered, monkeypatch
+):
+    """Refuses an answer once no launcher is left to press it."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    monkeypatch.setattr(dialogs, "watcher", lambda directory, name: watch)
+    master, slave = os.openpty()
+    os.close(slave)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        terminal._session(
+            0,
+            master,
+            listener,
+            [signal.SIGTERM],
+            name="lane",
+            lane=tmp_path / "lane",
+            activity=tmp_path / "lane-activity.json",
+            ledger=tmp_path / "issues.json",
+            attached=False,
+            saved=None,
+            titling=False,
+            bounded=False,
+            inactive_after=60.0,
+            home=None,
+        )
+    retired = decisions.get(tmp_path, record["id"])
+    assert retired["state"] == decisions.STALE
+    with pytest.raises(BridgeError):
+        decisions.answer(tmp_path, record["id"], "Yes", "operator")
+
+
+def test_an_option_that_widens_a_permission_needs_confirming(
+    tmp_path, delivered
+):
+    """Holds "don't ask again" to the second answer an irreversible needs."""
+    watch = dialogs.Watch(tmp_path, "lane", bridge=False)
+    watch.advance(_shell_prompt("rm -rf build").encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    yes, widening, refusing = record["options"]
+    assert widening.startswith("Yes, and don't ask again")
+    assert record["confirm"] == [widening]
+    assert record["recommended"] == refusing == "No"
+    assert decisions.confirming(record, widening) is True
+    assert decisions.confirming(record, yes) is False
+
+
+def test_a_question_decision_offers_the_picker_choices_only(
+    tmp_path, delivered
+):
+    """Leaves out the free-text option, since chat text is never typed."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(QUESTION_PICKER.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    assert len(record["options"]) == 3
+    assert record["options"][2] == "Chat about this"
+    assert not any(
+        dialogs.FREE_TEXT in option.lower() for option in record["options"]
+    )
+    assert record["recommended"] == record["options"][0]
+    decisions.answer(tmp_path, record["id"], record["options"][1], "operator")
+    assert watch.advance(b"", 1.0) == b"2\r"
+
+
+def test_an_unreadable_prompt_is_named_terminal_only(tmp_path, delivered):
+    """Names the prompt no decision can answer rather than skipping it."""
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    watch.advance(UNKNOWN_PROMPT.encode(), 0.0)
+    watch.advance(b"", 1.5)
+    assert decisions.list_open(tmp_path) == []
+    [fields] = delivered
+    assert "decision" not in fields
+    assert fields["detail"].startswith(dialogs.TERMINAL_ONLY)

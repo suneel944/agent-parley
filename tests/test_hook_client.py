@@ -26,6 +26,7 @@ from agent_parley import (
     roster,
     server,
     store,
+    supervision,
 )
 from agent_parley.state import lock, write_json
 
@@ -1017,6 +1018,17 @@ def test_the_shell_client_asks_for_a_timeout_bash_3_2_accepts(bridge):
     assert '\\"hook_pid\\":$AGENT_PARLEY_HOOK_PID' in script.read_text()
 
 
+def test_rewriting_the_client_leaves_a_reader_the_whole_old_script(bridge):
+    script = Path(hook.write_client(str(bridge.home), sys.executable))
+    old = script.read_text()
+    with script.open() as reader:
+        hook.write_client(str(bridge.home), "/opt/other/python3")
+        assert reader.read() == old
+    assert "/opt/other/python3" in script.read_text()
+    assert script.stat().st_mode & 0o777 == 0o755
+    assert [path.name for path in script.parent.glob("*.tmp")] == []
+
+
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
 def test_the_launcher_configures_the_shell_client(bridge, repo, paired):
     lane = Path(paired["lanes"]["codex"])
@@ -1345,6 +1357,133 @@ def test_an_abandoned_stop_leaves_its_coordination_undelivered(
     assert state["cursor"] > 0
     assert state["work_offer"] == "offer-1"
     assert state["activity"] == "working"
+
+
+def mailed(bridge, lane, subject):
+    """Sends one message from ``claude`` to ``codex``."""
+    identity = json.loads((lane.parent / "claude-identity.json").read_text())
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": subject,
+            "body_md": "Read this.",
+            "idempotency_key": subject,
+        },
+    )
+
+
+def unread(bridge, paired):
+    return checkpoints.mailbox(bridge.home, paired["root"], "codex")["unread"]
+
+
+def counted_deliveries(monkeypatch):
+    """Counts the deliveries the service records."""
+    recorded = []
+    deliver = server.checkpoints.deliver
+
+    def counting(*args, **kwargs):
+        recorded.append(args)
+        return deliver(*args, **kwargs)
+
+    monkeypatch.setattr(server.checkpoints, "deliver", counting)
+    return recorded
+
+
+def test_a_reply_the_client_never_confirms_leaves_its_mail_unread(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    mailed(bridge, lane, "Unconfirmed change")
+    recorded = counted_deliveries(monkeypatch)
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    port = bridge.config["port"]
+    body = json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**START, "cwd": str(lane)},
+        }
+    ).encode()
+    head = (
+        f"POST {hook.PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Authorization: Bearer {identity['registration_token']}\r\n"
+        "Content-Type: application/json\r\n"
+        f"{hook.RECEIPT_HEADER}: {hook.RECEIPT}\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode()
+    reply = b""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(head + body)
+        while chunk := sock.recv(65536):
+            reply += chunk
+    assert reply.split(b" ", 2)[1] == b"200"
+    assert b"Unconfirmed change" in reply
+    assert recorded == []
+    assert unread(bridge, paired) == 1
+    assert "reply was not confirmed by the client" in capsys.readouterr().out
+    served = run_hook(bridge, lane.parent, {**START, "cwd": str(lane)})
+    context = json.loads(served.stdout)["hookSpecificOutput"]
+    assert "Unconfirmed change" in context["additionalContext"]
+    assert len(recorded) == 1
+    assert unread(bridge, paired) == 0
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_a_shell_client_past_its_timeout_leaves_the_mail_for_later(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    mailed(bridge, lane, "Late change")
+    recorded = counted_deliveries(monkeypatch)
+    authorize = server.Handler._authorize
+
+    def slow(self):
+        time.sleep(hook.SHELL_TIMEOUT - server.DECISION_SECONDS + 0.3)
+        return authorize(self)
+
+    monkeypatch.setattr(server.Handler, "_authorize", slow)
+    stalling(monkeypatch, server.DECISION_SECONDS - 0.2)
+    payload = {**START, "cwd": str(lane), "session_id": "s1"}
+    late = run_shell(bridge, lane.parent, payload)
+    assert late.returncode == 0, late.stderr
+    printed = ""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (
+        " undelivered " in printed or " expired " in printed
+    ):
+        time.sleep(0.05)
+        printed += capsys.readouterr().out
+    assert recorded == []
+    if "Late change" not in late.stdout:
+        assert unread(bridge, paired) == 1
+    monkeypatch.setattr(server.Handler, "_authorize", authorize)
+    monkeypatch.setattr(server.checkpoints, "serve", checkpoints.serve)
+    if "Late change" not in late.stdout:
+        served = run_shell(bridge, lane.parent, payload)
+        assert "Late change" in served.stdout
+    assert unread(bridge, paired) == 0
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+@pytest.mark.parametrize("client", ["module", "shell"])
+def test_a_confirmed_reply_records_its_delivery_once(
+    bridge, repo, paired, service, monkeypatch, capsys, client
+):
+    lane = Path(paired["lanes"]["codex"])
+    mailed(bridge, lane, "Confirmed change")
+    recorded = counted_deliveries(monkeypatch)
+    payload = {**START, "cwd": str(lane), "session_id": "s1"}
+    run = run_shell if client == "shell" else run_hook
+    served = run(bridge, lane.parent, payload)
+    context = json.loads(served.stdout)["hookSpecificOutput"]
+    assert "Confirmed change" in context["additionalContext"]
+    assert len(recorded) == 1
+    assert unread(bridge, paired) == 0
+    assert "not confirmed" not in capsys.readouterr().out
 
 
 def test_a_delivery_for_an_ended_session_is_discarded(bridge, repo, paired):
@@ -2019,3 +2158,99 @@ def test_a_foreign_process_editing_as_the_lane_is_denied(bridge, repo, paired):
     assert "session s1" in decision["permissionDecisionReason"]
     assert "session s2" in decision["permissionDecisionReason"]
     assert events(directory)[-1]["reason_class"] == "session_mismatch"
+
+
+def test_a_forked_session_is_bound_once_the_recorded_process_exits(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    old, recorded = held_process()
+    fork, forked = held_process()
+    try:
+        write_json(
+            directory / "codex-activity.json",
+            {
+                "session_id": "s1",
+                "session_pid": recorded.pid,
+                "session_ticks": recorded.ticks,
+                "activity": "idle",
+                "updated": time.time() - 60,
+            },
+        )
+        fork_event = {**ALLOW, "session_id": "s2", "cwd": str(lane)}
+        checkpoints.checkpoint(
+            bridge.home, directory, "codex", fork_event, forked
+        )
+        assert events(directory)[-1]["reason_class"] == "session_mismatch"
+        release(old)
+        assert supervision.presence(directory, "codex")["process_alive"] is (
+            False
+        )
+
+        assert supervision.rebind_sessions(bridge.home, directory, paired) == [
+            "codex"
+        ]
+
+        state = checkpoints.activity(directory, "codex")
+        assert state["session_id"] == "s2"
+        assert state["session_pid"] == fork.pid
+        assert state["rebound"]["pid"] == fork.pid
+        assert "foreign_session" not in state
+        assert supervision.presence(directory, "codex")["process_alive"]
+        checkpoints.checkpoint(
+            bridge.home,
+            directory,
+            "codex",
+            fork_event,
+            forked,
+            record_only=True,
+        )
+        assert events(directory)[-1]["reason_class"] == "observed"
+        state = checkpoints.activity(directory, "codex")
+        assert state["activity"] == "working"
+    finally:
+        if old.poll() is None:
+            release(old)
+        release(fork)
+
+
+def test_an_undelivered_wake_is_noted_in_the_next_hook_context(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": own.pid,
+            "session_ticks": own.ticks,
+            "activity": "idle",
+            "updated": time.time() - 60,
+        },
+    )
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        paired["root"],
+        "codex",
+        {
+            "at": time.time(),
+            "attempts": 1,
+            "backlog": ["1"],
+            "result": supervision.WAKE_UNAVAILABLE,
+        },
+    )
+    prompt = {**PROMPT, "session_id": "s1", "cwd": str(lane)}
+
+    output = checkpoints.checkpoint(
+        bridge.home, directory, "codex", prompt, own
+    )
+
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "wake attempted at " in context
+    assert "not delivered: no launcher answered" in context
+    again = checkpoints.checkpoint(bridge.home, directory, "codex", prompt, own)
+    assert "not delivered" not in json.dumps(again)

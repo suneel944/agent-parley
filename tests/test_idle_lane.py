@@ -1,5 +1,6 @@
 """Checks the idle marker for a live lane that owes an answer."""
 
+import contextlib
 import json
 import os
 import sys
@@ -72,6 +73,29 @@ def test_an_unacknowledged_message_is_named_as_the_waiting_item(
     assert report["stalled"] is True
     assert report["kind"] == "acknowledgement"
     assert "acknowledgement of message" in supervision.stall_marker(report)
+
+
+def test_a_second_boundary_between_queries_keeps_the_acknowledgement(
+    bridge, repo, paired, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    alive(directory, "claude")
+    deliver(bridge, repo, paired, ack=True, aged=1800)
+    original = store.connect
+
+    def pause_before_unread(sql):
+        if "r.read_ts IS NULL" in sql:
+            time.sleep(1.1)
+
+    @contextlib.contextmanager
+    def slow_unread_query(home, **options):
+        with original(home, **options) as db:
+            db.set_trace_callback(pause_before_unread)
+            yield db
+
+    monkeypatch.setattr(store, "connect", slow_unread_query)
+    report = idle_for(bridge, paired, directory)
+    assert report["kind"] == "acknowledgement"
 
 
 def test_a_recent_message_or_a_recent_call_is_not_a_stall(bridge, repo, paired):

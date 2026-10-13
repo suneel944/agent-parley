@@ -62,18 +62,46 @@ uv run --locked pre-commit run --all-files
 repository policy gate using locked tools. It does not rewrite files on commit.
 CI runs the complete gate independently of local hook installation.
 
-Open a focused issue before proposing a substantial behavior change. Branch from
+The `Check` workflow scopes pull requests by the paths they change;
+`scripts/ci_scope.py` holds the lists. Every pull request runs `secrets` and
+`make check` on Ubuntu with Python 3.12. Changes to `plugins/`, `scripts/`,
+`tests/`, `Makefile`, `.github/actions/`, plugin manifests, `server.json`,
+`glama.json`, `.release-manifest.json`, `.gitignore` or `LICENSE` add Python
+3.13, 3.14 and macOS. Changes to `agent_parley/`, `tests/test_wsl.py`,
+`pyproject.toml`, `uv.lock` or `.github/workflows/check.yml` also add `wsl`.
+Documentation, templates and other workflows run only the Ubuntu 3.12 leg. A
+path no list recognises, a push to `main` and a manual run select every leg.
+One exception: a file whose only edits are version lines, as in the release
+version bump commit, does not add `wsl`, because the commit before it already
+ran that leg on the same code. Runs on `main` group by commit, so the run for
+a version bump starts at once instead of queueing behind the run for the
+merge before it; pull request runs still cancel when a new commit arrives.
+Skipped legs still report their required check names. The `check` job fails
+if a needed Python or macOS leg did not succeed; `wsl` reports as its own
+required check and gates the merge, so it carries no `continue-on-error`.
+Each of its steps has its own `timeout-minutes`, and a failed or hung WSL
+setup is retried once inside the job, so a stuck runner fails within the
+step's ceiling instead of holding a green pull request at the job's.
+
+Open a focused issue before proposing a substantial behavior change. The
+`Issue hygiene` workflow checks every opened or edited issue: a `bug: ` or
+`feature: ` title, each required section of the matching template, an
+assignee, a change-type label and a milestone. Issue forms only apply in the
+web form, so an issue filed with `gh issue create --body` must carry the same
+sections by hand. Branch from
 current `main`, keep commits reviewable, and use the PR template. Explain the
 problem, final behavior, exact verification, and compatibility risks. Every PR
 must pass the required checks and resolve review conversations. Protected `main`
-requires a PR and rejects force pushes and deletion. CI, secret scanning,
-PR hygiene, current-base checks and resolved conversations apply to everyone,
-including administrators, without exemptions.
+requires a squash-merged PR and linear history, and rejects force pushes and
+deletion. The required checks are `check`, `secrets`, `pr-hygiene`,
+`python (3.12, macos-latest)` and `wsl`, run against a current base. They and
+resolved conversations apply to everyone, including administrators. The one
+exception is the release GitHub App, which pushes the
+`chore(main): release X.Y.Z` commit and its tag directly.
 
-A separate ruleset requires independent approval. While the repository has one
-maintainer, `@suneel944` has a named exception to that review-only ruleset when
-merging a PR. It does not exempt the account from any required check or permit
-direct pushes. Revisit the review exception when additional maintainers join.
+Pull requests need no approving review while the repository has one
+maintainer. Add an approval requirement to the main ruleset when additional
+maintainers join.
 
 Use Conventional Commit PR titles, such as `fix: preserve pending messages` or
 `ci: validate release metadata`; squash merges retain that title for changelogs.
@@ -88,8 +116,10 @@ tooling and documentation work `ci`, `build`, `chore`, `test`, `refactor` or
 eligible product changes proceed to version preparation and publication.
 Assign an owner, add a change-type label, and reference an existing
 local issue with `Refs #N` or a closing keyword. Match linked issue milestones
-when present. Release PRs always require a milestone. Bot-generated descriptions
-retain their native format, but ownership and issue rules still apply.
+when present. PRs labelled `release` always require a milestone. Bot-generated descriptions
+retain their native format and need no local issue, because Dependabot opens
+its pull requests without one, but the owner and change-type label still apply
+and `.github/dependabot.yml` supplies both.
 
 Contribution text must omit generator credits, assistant attribution, robot
 signatures, and assistant coauthor trailers. This applies to tracked files,
@@ -117,7 +147,10 @@ that merges it, so a breaking change lands with the merge that completes a
 milestone rather than partway through one; landing it earlier cuts the major
 release and leaves the remaining milestone work for the release after it.
 
-When eligibility is met, the release application raises every version marker,
+For a minor or major version, Auto version first requires
+`tests/test_fault_acceptance.py` to pass on the release commit; a live
+acceptance run is not required. When eligibility is met, the release
+application raises every version marker,
 records a changelog entry built from the counted commits, runs the policy gate
 against the raised markers, commits `chore(main): release X.Y.Z` to `main`,
 pushes the annotated tag, and the job's repository token dispatches Release
@@ -126,7 +159,7 @@ marketplace, release manifest and lockfile versions must agree; the policy gate
 runs before the commit, so a marker the bump misses fails the run. The release
 commit subject is the loop guard, so a release cannot trigger another release.
 No pull request is involved, and nothing approves or merges on your behalf.
-Independent approval continues to apply to every human pull request.
+Human pull requests still pass every required check before merging.
 
 A maintainer can also dispatch Auto version with a `kind` of `patch`, `minor`
 or `major` to release what is on `main` now without waiting for a marker. The
@@ -167,13 +200,14 @@ make check
 
 CI runs the same locked dependency, lint, formatting, typing, policy, build, and
 test gate. A separate secret scan examines Git history. Actions are pinned to
-commit IDs and receive read-only permissions unless release publication needs
-write access. Dependency updates are proposed through Dependabot PRs.
+commit IDs and receive read-only permissions except where releasing or Pages
+deployment needs write access. Dependency updates are proposed through Dependabot PRs.
 Do not weaken
 checks to make a change pass. Explain any narrowly justified rule exception.
 Tests should exercise behavior, especially concurrency, persistence, cancellation,
 and permission boundaries. Distinguish real MCP transport tests from native model
-behavior; the latter requires an explicit two-terminal trial.
+behavior; the latter requires a live run such as the
+[unattended acceptance run](docs/acceptance.md).
 
 Update the README and architecture diagrams when responsibilities or flows change.
 Keep runtime code in the top-level `agent_parley/` package. `make build` must

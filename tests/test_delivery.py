@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, delivery, roster, store
+from agent_parley import checkpoints, delivery, issues, roster, store
 from agent_parley.state import lock, write_json
 
 SUBJECT = "Interface change"
@@ -41,17 +41,46 @@ def unread(bridge, data):
     return checkpoints.mailbox(bridge.home, data["root"], name)["unread"]
 
 
-def test_polled_mail_carries_the_digest_header_and_is_marked_read(
-    bridge, polled
-):
+def mark(bridge, data, ids):
+    """Marks mail read as the helper lane's mark_message_read would."""
+    directory = Path(data["lanes"]["helper"]).parent
+    name = roster.read(directory)["participants"]["helper"]["display"]
+    store.mark_read(bridge.home, data["root"], name, ids)
+
+
+def test_polled_mail_carries_the_digest_header_and_stays_unread(bridge, polled):
     directory = Path(polled["lanes"]["helper"]).parent
     assert unread(bridge, polled) == 1
 
     assert delivery.deliver(bridge.home, directory, "helper") > 0
 
     text = delivery.mail_file(directory, "helper").read_text()
+    assert text.startswith("## Batch 1, written ")
     assert "Mail: 1 of 1 unread, most relevant first; 0 superseded." in text
-    assert unread(bridge, polled) == 0
+    assert unread(bridge, polled) == 1
+
+
+def test_two_polls_before_a_read_keep_both_batches(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    published = delivery.mail_file(directory, "helper")
+    delivery.deliver(bridge.home, directory, "helper")
+    first = checkpoints.activity(directory, "helper")["batches"][0]["ids"]
+    send(bridge, polled, "helper", "second", "Second batch")
+    delivery.deliver(bridge.home, directory, "helper")
+
+    text = published.read_text()
+    assert SUBJECT in text and "Second batch" in text
+    assert text.index("## Batch 1,") < text.index("## Batch 2,")
+
+    mark(bridge, polled, first)
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
+    text = published.read_text()
+    assert "## Batch 1," not in text and "Second batch" in text
+
+    later = checkpoints.activity(directory, "helper")["batches"][0]["ids"]
+    mark(bridge, polled, later)
+    delivery.deliver(bridge.home, directory, "helper")
+    assert not published.exists()
 
 
 def test_polled_delivery_orders_mail_by_relevance(bridge, polled):
@@ -87,6 +116,32 @@ def test_polled_delivery_names_owed_acknowledgements_once(bridge, polled):
     text = delivery.mail_file(directory, "helper").read_text()
     assert f"Acknowledgements owed: message {asked['id']} from" in text
     assert delivery.deliver(bridge.home, directory, "helper") == 0
+
+
+def test_a_standing_reminder_is_injected_at_most_the_ceiling(bridge, polled):
+    lane = Path(polled["lanes"]["helper"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "1")
+    reminder = "Issue #1: pull request ended. helper, send a completion note."
+    shown = 0
+    for _ in range(checkpoints.MAX_NOTICE_REPEATS + 3):
+        ledger = issues.snapshot(directory)
+        ledger["issues"]["1"]["handoff_prompt"] = {
+            "id": "1:0:pull request ended",
+            "holder": "helper",
+            "trigger": "pull request ended",
+            "created": time.time(),
+            "text": reminder,
+        }
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+        assert delivery.deliver(bridge.home, directory, "helper") > 0
+        batch = checkpoints.activity(directory, "helper")["batches"][-1]
+        shown += reminder in batch["text"]
+    assert shown == checkpoints.MAX_NOTICE_REPEATS
+    assert checkpoints.activity(directory, "helper")["notice_repeats"] == {
+        "1:0:pull request ended": checkpoints.MAX_NOTICE_REPEATS
+    }
 
 
 @pytest.fixture
@@ -171,6 +226,7 @@ def test_a_delivery_composed_from_a_moved_state_is_dropped(
 def test_a_second_message_is_delivered_after_the_first(bridge, polled):
     directory = Path(polled["lanes"]["helper"]).parent
     assert delivery.deliver(bridge.home, directory, "helper") > 0
+    mark(bridge, polled, [checkpoints.activity(directory, "helper")["cursor"]])
     send(bridge, polled, "helper", key="delivery-2")
     assert delivery.deliver(bridge.home, directory, "helper") > 0
     published = delivery.mail_file(directory, "helper")

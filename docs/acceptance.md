@@ -175,30 +175,48 @@ replace. Five are decided from the estate's final state; the two that
 watch a lane over time are decided from the frames, because a lane that
 stalled for an hour and recovered leaves nothing behind at the end.
 
-**Every backlog issue reported.** Each seeded issue must end at `ready`,
-`blocked` or `bounced`, and anything other than `ready` must carry a
-reason. This proves the loop closes without an operator: lanes pick up
-work, finish it or say why they cannot, and nothing is left silently
-claimed.
+**Every backlog issue reported.** Each seeded issue must end at `ready`
+or `blocked`, and a `blocked` ending must carry a reason: the remaining
+work the lane filed with the report, read from the same record in the
+lane's durable report log.
+This proves the loop closes without an operator: lanes pick up work,
+finish it or say why they cannot, and nothing is left silently claimed.
 
 **Problems holds only operator rows.** Every row the problems view still
 shows at the end must name the operator as the actor and must carry the
 command that clears it. A row with no command, or one that waits on a
 lane, is a situation the service noticed and could not route.
 
-**No worktree outlived its claim.** A worktree whose issue already
-reported ready or merged must be gone. Stranded worktrees were the
-reclamation gap the audit found, and they accumulate silently across a
+**No worktree outlived its claim.** The product keeps one worktree per
+lane and none per issue, so a lane that holds no undelivered claim when
+the run ends must leave its worktree clean. A claim already reported
+ready or verified does not keep the worktree. Uncommitted or untracked changes there, or
+a worktree Git cannot read, are work no claim owns. Stranded work was the
+reclamation gap the audit found, and it accumulates silently across a
 long run.
 
 **Service log is clean.** The run fails on any `BrokenPipeError` and on
 any hook lock expiry in `server.log`. Both are faults the operator never
-sees at the time and both cost a lane its turn.
+sees at the time and both cost a lane its turn. The service rewrites its
+log in place at its bound and moves the oldest lines to `server.log.1`,
+so the verdict reads both files and counts every entry stamped at or
+after the run's start, not the bytes past an offset. `server.log.1` is
+bounded too, so when the oldest stamped line in both files is later than
+the run's start, the log no longer covers the run and the condition
+fails as unreadable.
 
-**No lane idled on an open claim.** No frame may show a lane reading as
-stalled while it holds a claim. A lane idle with work it owns is the
-trust breach the audit opened this milestone on: the issue is not being
-worked, no peer can take it, and the status line says somebody owns it.
+**No lane idled on an open claim.** Delivered claims are skipped. No
+frame may show a lane reading as stalled while it holds an undelivered
+claim, and no frame may show such a claim whose `last_event_seconds` is
+past the default `claim_idle_after` of 3,600 seconds. That reading is
+the age of the claim's own last generation start or report, the same
+one the service's idle-claim rule uses. It grows whether the holder is
+idle, woken and not working, or dead, so it needs no process reading.
+The stalled reading needs unanswered mail, so the age is what catches a
+lane idle on an empty inbox or a claim whose holder died. A lane idle
+with work it owns is the trust breach the audit opened this milestone on:
+the issue is not being worked, no peer can take it, and the status line
+says somebody owns it.
 
 **No lease outlived its holder.** No frame may show a lane holding a
 reservation past its deadline while no session process of its own is
@@ -304,30 +322,20 @@ the time it was taken. A frame that
 failed to sample records an `error` rather than aborting the run, so a
 single bad frame never loses a day.
 
-Attach the report to the release it validates:
+A release does not require this run; attaching the report to a release is
+optional:
 
 ```sh
 gh release upload v<version> <workspace>/acceptance/report.md
 ```
 
-A minor or major release also reads the run's numbers from
-`docs/acceptance/X.Y.Z.json`. `record` writes that file from the finished
-verdict, with a link to the uploaded report:
-
-```sh
-uv run --locked python -m scripts.acceptance record \
-  --home <home> --workspace <workspace> --version <version> \
-  --run <report-url>
-```
-
-The record holds the lane count, the issues the lanes claimed, how many of
-those reported ready, the idle lane-minutes the lanes' event logs measure
-over the period, and the claim-minutes nothing accounted for. A claim's
-minute is accounted for when its owner reads as active or the problems
-view names the owner or a service or store fault, the same rule the
-fault-injection suite applies. The release refuses the record unless every
-claim reported ready, so a run with a blocked issue cannot validate a
-release.
+`verdict.json` records the measured numbers. The verdict measures the lane
+count, the issues the lanes claimed, how many of those reported ready, the
+idle lane-minutes the lanes' event logs measure over the period, and the
+claim-minutes nothing accounted for. A claim's minute is accounted for when
+its owner reads as active or the problems view names the owner or a service
+or store fault, the same rule the fault-injection suite applies. Records
+under `docs/acceptance/` from earlier releases stay as history.
 
 Keep the frames with the report when a condition failed. The report says
 which condition failed; only the frames say when it started failing.

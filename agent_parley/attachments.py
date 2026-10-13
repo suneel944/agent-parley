@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from agent_parley.state import BridgeError, write_json, write_text
@@ -125,7 +126,8 @@ def used(directory: Path, writer: str) -> int:
         writer: Participant whose attachments are counted.
 
     Returns:
-        Total recorded size of that lane's attachments in bytes.
+        Total recorded size of that lane's attachments in bytes; a released
+        attachment holds none.
     """
     total = 0
     for path in folder(directory).glob("*.json"):
@@ -133,9 +135,40 @@ def used(directory: Path, writer: str) -> int:
             meta = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if meta.get("writer") == writer:
+        if meta.get("writer") == writer and not meta.get("released"):
             total += int(meta.get("bytes", 0))
     return total
+
+
+def release(directory: Path, reference: str, writer: str) -> int:
+    """Frees one settled attachment of a writer from its allowance.
+
+    The body is deleted and the metadata stays marked released, so a later
+    read names why the body is gone instead of reporting it unknown. The
+    record keeps its bounded first slice.
+
+    Args:
+        directory: Private state directory for the common repository.
+        reference: Attachment reference to release.
+        writer: Participant that must have written it.
+
+    Returns:
+        Bytes freed; zero when the attachment is absent, already released
+        or written by someone else.
+    """
+    if not isinstance(reference, str) or not REFERENCE.match(reference):
+        return 0
+    home = folder(directory)
+    meta_path = _path(home, reference, "json")
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return 0
+    if meta.get("writer") != writer or meta.get("released"):
+        return 0
+    _path(home, reference, "md").unlink(missing_ok=True)
+    write_json(meta_path, {**meta, "released": True})
+    return int(meta.get("bytes", 0))
 
 
 def keep(
@@ -145,13 +178,16 @@ def keep(
     text: str,
     writer: str,
     readers: list[str],
+    settled: Iterable[str] = (),
 ) -> str:
     """Stores one body whole beside the record that refers to it.
 
     A handoff payload such as a diff is kept in full rather than clipped,
     because the record refers to it instead of carrying it. The caller decides
     whether a body is worth keeping; this function only bounds it against the
-    attachment cap and the writer's allowance.
+    attachment cap and the writer's allowance. Messages are never pruned, so
+    a full allowance is freed by releasing the writer's settled attachments,
+    oldest first, only as far as the new body needs.
 
     Args:
         directory: Private state directory for the common repository.
@@ -160,13 +196,15 @@ def keep(
         text: Full body to retain.
         writer: Participant that wrote the body.
         readers: Participants allowed to read it.
+        settled: References of the writer's attachments every reader has
+            finished with, oldest first; they may be released to make room.
 
     Returns:
         The reference the record refers to the stored body by.
 
     Raises:
         BridgeError: If the body exceeds the attachment cap or the writer's
-            total attachment allowance.
+            total attachment allowance after releasing settled attachments.
     """
     size = len(text.encode())
     if size > MAX_ATTACHMENT_BYTES:
@@ -174,10 +212,17 @@ def keep(
             f"{kind} body is {size} bytes; an attachment is capped at "
             f"{MAX_ATTACHMENT_BYTES} bytes."
         )
-    if used(directory, writer) + size > MAX_LANE_BYTES:
+    held = used(directory, writer)
+    for ref in settled:
+        if held + size <= MAX_LANE_BYTES:
+            break
+        held -= release(directory, ref, writer)
+    if held + size > MAX_LANE_BYTES:
         raise BridgeError(
             f"{writer} holds its {MAX_LANE_BYTES}-byte attachment "
-            "allowance; wait for older records to be pruned."
+            "allowance in bodies its readers have not finished with; "
+            "send a shorter body, or wait until its older long messages "
+            "are read and its older reports are pruned."
         )
     ref = reference(kind, identifier)
     home = folder(directory)
@@ -204,6 +249,7 @@ def spill(
     cap: int,
     writer: str,
     readers: list[str],
+    settled: Iterable[str] = (),
 ) -> tuple[str, str]:
     """Stores a body above its cap as an attachment and bounds the record.
 
@@ -220,6 +266,8 @@ def spill(
         cap: Record cap in UTF-8 bytes.
         writer: Participant that wrote the body.
         readers: Participants the record is addressed to.
+        settled: The writer's releasable attachments, oldest first; see
+            `keep`.
 
     Returns:
         The body the record stores and the reference, which is empty when
@@ -231,7 +279,7 @@ def spill(
     """
     if len(text.encode()) <= cap:
         return text, ""
-    ref = keep(directory, kind, identifier, text, writer, readers)
+    ref = keep(directory, kind, identifier, text, writer, readers, settled)
     return bounded(kind, identifier, text, cap), ref
 
 
@@ -255,14 +303,24 @@ def body(directory: Path, reference: str, name: str) -> str:
     home = folder(directory)
     try:
         meta = json.loads(_path(home, ref, "json").read_text())
-        text = _path(home, ref, "md").read_text()
     except (OSError, ValueError):
         raise BridgeError(
             f"No attachment {ref} is readable by {name}."
         ) from None
     if name != meta.get("writer") and name not in meta.get("readers", []):
         raise BridgeError(f"No attachment {ref} is readable by {name}.")
-    return text
+    if meta.get("released"):
+        raise BridgeError(
+            f"Attachment {ref} was released after every recipient read it "
+            "to free its writer's allowance; the record keeps its first "
+            "slice."
+        )
+    try:
+        return _path(home, ref, "md").read_text()
+    except OSError:
+        raise BridgeError(
+            f"No attachment {ref} is readable by {name}."
+        ) from None
 
 
 def page(directory: Path, reference: str, name: str, offset: int = 0) -> dict:
@@ -306,6 +364,64 @@ def remove(directory: Path, reference: str) -> None:
     home = folder(directory)
     for suffix in ("md", "json"):
         _path(home, reference, suffix).unlink(missing_ok=True)
+
+
+def retarget(text: str, reference: str) -> str:
+    """Points the marker a bounded record ends with at another reference.
+
+    Args:
+        text: Stored body of a record.
+        reference: Reference the marker names from now on.
+
+    Returns:
+        The body with its marker renamed, or the body unchanged when it
+        carries no marker.
+    """
+    stripped = text.rstrip()
+    found = MARKER.search(stripped)
+    if not found:
+        return text
+    size = int(found.group(2))
+    return stripped[: found.start()] + marker(validate(reference), size)
+
+
+def renumber(directory: Path, moves: list[tuple[str, str]]) -> None:
+    """Re-keys attachments whose records were given new identifiers.
+
+    Every moved file is first parked under a hidden name, so one move never
+    lands on a file another move is about to vacate. A destination that is
+    still occupied afterwards belongs to a record outside the moves and is
+    refused rather than overwritten.
+
+    Args:
+        directory: Private state directory for the common repository.
+        moves: Pairs of the reference a record had and the one it now has.
+
+    Raises:
+        BridgeError: If a destination already holds an attachment.
+    """
+    home = folder(directory)
+    parked = []
+    for old, new in moves:
+        for suffix in ("md", "json"):
+            source = _path(home, validate(old), suffix)
+            if source.exists():
+                hidden = home / f".renumber-{old}.{suffix}"
+                source.rename(hidden)
+                parked.append((hidden, _path(home, validate(new), suffix)))
+    for hidden, target in parked:
+        if target.exists():
+            raise BridgeError(
+                f"Attachment {target.stem} already exists; the import would "
+                "overwrite it."
+            )
+        if target.suffix == ".json":
+            meta = json.loads(hidden.read_text())
+            meta["reference"] = target.stem
+            write_json(target, meta)
+            hidden.unlink()
+        else:
+            hidden.rename(target)
 
 
 def _path(home: Path, reference: str, suffix: str) -> Path:

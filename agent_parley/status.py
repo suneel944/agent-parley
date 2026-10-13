@@ -9,6 +9,7 @@ time.
 from __future__ import annotations
 
 import contextlib
+import shlex
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,9 +25,11 @@ if TYPE_CHECKING:
 
 DORMANT_SECONDS = 86400.0
 ENDED_STATES = ("stopped", "dead", "reclaimed")
+OPEN_REPORTS = ("blocked", "partial")
 ATTENTION_LINES = 8
 FORGE_ISSUES = "forge-issues.json"
 FORGE_TTL = 300.0
+FORGE_STALE = 2 * FORGE_TTL
 FORGE_RETRY = 60.0
 FORGE_TIMEOUT = 5
 FORGE_LIMIT = 1000
@@ -41,7 +44,7 @@ def reading(
         issues: Issue number to its title, or None when never read.
         limit: Most issues the reading asked the forge for.
         age: Seconds since the reading was taken.
-        fresh: Whether the reading is within `FORGE_TTL`.
+        fresh: Whether the reading is within `FORGE_STALE`.
         reason: Why the reading is not fresh, empty when it is.
 
     Returns:
@@ -88,6 +91,31 @@ def forge_note(known: dict) -> str:
     return ""
 
 
+def landed_line(integration: dict) -> str:
+    """States in one line which issues landed in the integration base.
+
+    Args:
+        integration: The ``integration`` reading of one status project.
+
+    Returns:
+        Empty when nothing landed there. Otherwise the base, each landed
+        issue with its pull request, and that the issues wait only for the
+        crossing pull request.
+    """
+    if not integration.get("landed"):
+        return ""
+    listed = ", ".join(
+        f"#{item['issue']} (PR #{item['pull_request']})"
+        if item["pull_request"]
+        else f"#{item['issue']}"
+        for item in integration["landed"]
+    )
+    return (
+        f"Landed in {integration['base']}: {listed}; each waits only for "
+        "the crossing pull request to the default branch."
+    )
+
+
 def lane_state(record: dict) -> str:
     """Names the state one lane is in for the compact status view.
 
@@ -106,6 +134,112 @@ def lane_state(record: dict) -> str:
     if condition := record.get("condition"):
         return str(condition["state"])
     return str(record["availability"]["state"])
+
+
+def folded(record: dict, after: float) -> bool:
+    """Tells whether a dead lane has left nothing the default views need.
+
+    A lane is folded out of the default `status` and `problems` views once
+    its session is dead, it owns no claim, no process of it answers, and its
+    newest report and activity are both older than the retention interval.
+    Nothing in such a lane can change until an operator acts on it, so it
+    is counted on one line instead of listed; `--all` lists it again.
+
+    Args:
+        record: One lane record from the status reading.
+        after: Retention interval in seconds, the project's `fold_after`.
+
+    Returns:
+        True when the lane qualifies; False for any lane still holding a
+        claim, still running, active inside the interval, or whose report
+        and activity ages are both unknown.
+    """
+    availability = record.get("availability") or {}
+    if (
+        record.get("lane_state") != "dead"
+        or record.get("claims")
+        or availability.get("process_alive")
+    ):
+        return False
+    ages = [
+        value
+        for value in (
+            record.get("report_age_seconds"),
+            availability.get("age_seconds"),
+        )
+        if value is not None
+    ]
+    return bool(ages) and min(ages) > after
+
+
+def fold_line(count: int, after: float, noun: str) -> str:
+    """Words the one line that stands for the rows a default view hides.
+
+    Args:
+        count: How many rows were hidden.
+        after: Retention interval in seconds that hid them.
+        noun: What one hidden row is, such as ``dead lane``; an ``s`` is
+            added for any count but one.
+
+    Returns:
+        The summary line naming the count, the interval and `--all`.
+    """
+    from agent_parley import tables
+
+    plural = "" if count == 1 else "s"
+    return (
+        f"{count} {noun}{plural} older than {tables.age(after)} hidden; "
+        "--all shows them"
+    )
+
+
+def task_line(record: dict, fallback: str) -> str:
+    """Describes the work one lane is on for its status task line.
+
+    The lane's last report is its own account of its work, but a report
+    about an issue the lane has since released describes finished work, not
+    current work. Such a report keeps its text, labelled with its issue and
+    age, and open claims the lane has not reported on since claiming are
+    named ahead of it, so a closed issue's summary never reads as the lane's
+    current task. A blocked or partial report on a held issue that mail
+    citing the issue has followed is labelled with its age and that mail's
+    count, because the mail may say its remaining work is done.
+
+    Args:
+        record: One lane record from the status reading, carrying its
+            claims, report summary, report issue, report age and the count
+            of newer mail on a held open report.
+        fallback: Registered or mailed task shown when no report exists.
+
+    Returns:
+        The task line, at most 240 characters.
+    """
+    from agent_parley.tables import age
+
+    summary = record["summary"]
+    issue = record["report_issue"]
+    if summary and record["report_held"]:
+        newer = record["report_newer_mail"]
+        if not newer:
+            return summary[:240]
+        reported = age(record["report_age_seconds"] or 0)
+        plural = "" if newer == 1 else "s"
+        return (
+            f"#{issue} (reported {reported} ago, {newer} newer "
+            f"message{plural} on it): {summary}"
+        )[:240]
+    silent = ", ".join(
+        f"#{claim['issue']}"
+        for claim in record["claims"]
+        if not claim["ended"] and not claim["reported_since_claim"]
+    )
+    if summary and issue is not None:
+        reported = age(record["report_age_seconds"] or 0)
+        text = f"#{issue} (not held, reported {reported} ago): {summary}"
+    else:
+        text = summary or fallback
+    note = f"no report on held {silent}" if silent else ""
+    return "; ".join(part for part in (note, text) if part)[:240]
 
 
 def stopped_seconds(record: dict) -> float | None:
@@ -160,9 +294,11 @@ def pull_request(readings: list[dict], issue: str, branch: str) -> dict | None:
         branch: Branch assigned to the lane that owns the claim.
 
     Returns:
-        The number, URL, check verdict and merge state of the newest pull
-        request that names the issue as one it closes, else of the one whose
-        head is the lane's branch, or None when the cache holds neither.
+        The number, URL, check verdict, merge state, seconds since its head
+        was first seen pending and whether that head was reported stalled,
+        of the newest pull request that names the issue as one it closes,
+        else of the one whose head is the lane's branch, or None when the
+        cache holds neither.
     """
     ordered = sorted(
         readings, key=lambda item: int(item.get("number") or 0), reverse=True
@@ -181,21 +317,29 @@ def pull_request(readings: list[dict], issue: str, branch: str) -> dict | None:
         "url": str(found.get("url") or ""),
         "checks": str(found.get("checks") or ""),
         "mergeable": str(found.get("mergeable") or ""),
+        "pending_seconds": since(float(found.get("pending_since") or 0)),
+        "stalled": bool(found.get("stalled_at")),
     }
 
 
-def attention(claim: dict, owner: str) -> list[str]:
+def attention(
+    claim: dict, owner: str, root: str = "", peer: bool = True
+) -> list[str]:
     """States what an open claim needs and the command that resolves it.
 
     Args:
         claim: One open claim from a lane record of the status snapshot.
         owner: Participant holding the claim.
+        root: Canonical project key the operator's commands name.
+        peer: Whether a live lane besides the owner exists to take an
+            orphaned claim; without one the operator's command is named.
 
     Returns:
         One line for a claim whose owner the supervisor marked orphaned and
         one for a claim past its deadline, each naming the single command
         that resolves it; nothing for a claim that needs no action.
     """
+    from agent_parley import supervision
     from agent_parley.tables import age
 
     number = claim["issue"]
@@ -203,8 +347,8 @@ def attention(claim: dict, owner: str) -> list[str]:
     if claim.get("orphaned"):
         lines.append(
             f"#{number} orphaned from {owner} "
-            f"({claim.get('orphan_reason') or 'no reason'}); a peer lane runs "
-            f"agent-parley issue claim {number} --take-orphaned"
+            f"({claim.get('orphan_reason') or 'no reason'}); "
+            + supervision.orphan_remedy(str(number), root, peer)
         )
     if claim.get("overdue"):
         lines.append(
@@ -217,6 +361,83 @@ def attention(claim: dict, owner: str) -> list[str]:
 def since(instant: float) -> int | None:
     """Reports whole seconds since a Unix time, or None when it is unset."""
     return max(int(time.time() - instant), 0) if instant else None
+
+
+def moved_after(claim: dict, known: dict) -> bool:
+    """Reports whether a claim progressed after the forge reading was taken.
+
+    A number missing from the cached open-issue reading is evidence that
+    the issue closed only when the reading is newer than the claim. A lane
+    that opens an issue and claims it inside the poll interval is otherwise
+    told to resolve work it picked up minutes ago, as
+    `supervision.end_closed_issues` already guards for unowned issues.
+
+    Args:
+        claim: One claim record from the status reading.
+        known: Answer of `StatusMixin.forge_issues`.
+
+    Returns:
+        True when the claim's last progress is more recent than the reading.
+    """
+    touched = claim.get("last_event_seconds")
+    age = known.get("age_seconds")
+    return touched is not None and age is not None and touched < age
+
+
+def reported_since(record: dict) -> bool:
+    """Reports whether a claim's holder reported on it since claiming it.
+
+    Args:
+        record: Published ledger record for one issue.
+
+    Returns:
+        True when the claim's recorded report progress is at or after the
+        start of its current ownership generation. Progress carried over
+        from an earlier generation does not count.
+    """
+    from agent_parley import issues, lifecycle
+
+    progress = lifecycle.state(record).get("progress")
+    if not isinstance(progress, dict):
+        return False
+    return float(progress.get("at", 0) or 0) >= issues.claimed_since(record)
+
+
+def registered_root(home: Path, path: Path) -> str:
+    """Names the registered project a directory belongs to, reading only.
+
+    The directory matches a project when it sits inside the project's root
+    or inside one of its lane worktrees. Only the manifests under ``home``
+    are read, so the answer never runs git and never creates state. It
+    imports what it reads directly rather than through `cli`, so the bare
+    start screen can call it without loading the command surface.
+
+    Args:
+        home: Private state directory.
+        path: Directory to place, usually the working directory.
+
+    Returns:
+        The recorded root of the first matching project, or an empty string
+        when the directory belongs to none.
+    """
+    import json
+
+    from agent_parley import roster
+
+    here = path.resolve()
+    for manifest in sorted((home / "projects").glob("*/project.json")):
+        data = roster.normalize(json.loads(manifest.read_text()))
+        places = [
+            data["root"],
+            *(item["lane"] for item in data["participants"].values()),
+        ]
+        if any(
+            here.is_relative_to(Path(place).resolve())
+            for place in places
+            if place
+        ):
+            return data["root"]
+    return ""
 
 
 class StatusMixin(BridgeCore):
@@ -248,12 +469,29 @@ class StatusMixin(BridgeCore):
             state needs. A store behind this build is
             not consistent: every process running this code queries columns it
             does not have, so reporting it as compatible would describe a
-            healthy system while every lane is denied. The report also names
+            healthy system while every lane is denied. A registered project
+            whose root checkout no longer exists is not consistent either,
+            and the `projects` component names each such root. The report
+            also names
             the kernel release, the WSL generation or ``none``, and whether
             ``pidfd_open`` is available, so a platform gap is read here
-            before a lane is started.
+            before a lane is started. The ``notify`` component says whether
+            outbound and inbound notification are active; notification that
+            is off is consistent, and one configured but unable to send is
+            not. The `approvals` component names each lane
+            `supervision.opt_in_missing` reports as a setup gap; it is the
+            operator's choice, so it leaves the set consistent.
         """
-        from agent_parley.cli import json, process, protocol, store
+        from agent_parley.cli import (
+            inbound_status,
+            json,
+            notification_line,
+            notify,
+            process,
+            protocol,
+            store,
+            supervision,
+        )
 
         components = [
             {
@@ -292,12 +530,15 @@ class StatusMixin(BridgeCore):
                 "compatible": state in store.SCHEMA_USABLE,
             }
         )
+        manifests = [
+            json.loads(path.read_text())
+            for path in (self.home / "projects").glob("*/project.json")
+        ]
         served = self.health()
         serving = served.get("status") or protocol.STOPPED
         stale = serving == protocol.STALE
         stopped = serving == protocol.STOPPED and any(
-            json.loads(path.read_text()).get("participants")
-            for path in (self.home / "projects").glob("*/project.json")
+            manifest.get("participants") for manifest in manifests
         )
         remedy = protocol.RELAUNCH if stale else ""
         components.append(
@@ -308,6 +549,67 @@ class StatusMixin(BridgeCore):
                 "state": protocol.OK if serving == "ready" else serving,
                 "remedy": protocol.START if stopped else remedy,
                 "compatible": not stale and not stopped,
+            }
+        )
+        gone = sorted(
+            str(manifest["root"])
+            for manifest in manifests
+            if manifest.get("root") and not Path(manifest["root"]).exists()
+        )
+        components.append(
+            {
+                "component": "projects",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": protocol.ROOT_GONE if gone else protocol.OK,
+                "remedy": (
+                    protocol.RESTORE_ROOT
+                    + "; ".join(
+                        protocol.FORGET_ROOT.format(root=shlex.quote(root))
+                        for root in gone
+                    )
+                    if gone
+                    else ""
+                ),
+                "compatible": not gone,
+            }
+        )
+        outbound = notify.reported(notify.environment(self.home))
+        received = inbound_status(self.home)
+        components.append(
+            {
+                "component": "notify",
+                "version": ", ".join(outbound["transports"]),
+                "protocol": protocol.PROTOCOL,
+                "state": notification_line(outbound, received).removeprefix(
+                    "Notify: "
+                ),
+                "remedy": outbound["fault"] or received["fault"],
+                "compatible": not (
+                    (outbound["enabled"] and outbound["fault"])
+                    or received["fault"]
+                ),
+            }
+        )
+        unapproved = sorted(
+            f"{manifest['root']} {name}"
+            for manifest in manifests
+            if manifest.get("root")
+            for name in manifest.get("participants") or {}
+            if supervision.opt_in_missing(self.home, manifest, name)
+        )
+        components.append(
+            {
+                "component": "approvals",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": protocol.SETUP_GAP if unapproved else protocol.OK,
+                "remedy": (
+                    supervision.OPT_IN_REMEDY + ": " + ", ".join(unapproved)
+                    if unapproved
+                    else ""
+                ),
+                "compatible": True,
             }
         )
         return {
@@ -485,6 +787,7 @@ class StatusMixin(BridgeCore):
             "usage": usage,
             "schedules": schedules,
             "schedules_error": failure,
+            "pull_request_record": cached,
             "pull_requests": [
                 reading
                 for reading in (
@@ -531,12 +834,20 @@ class StatusMixin(BridgeCore):
             so the activity file cannot report a condition the record does
             not hold; only a lane with no record yet is read from the file.
             `current_task` is the lane's own last report or registered task,
-            never the operator's last prompt, and each claim carries its
+            never the operator's last prompt, built by `task_line`, with
+            `report_issue` naming the issue that report was about and
+            `report_held` whether the lane still holds it and
+            `report_newer_mail` how many messages citing a held issue
+            followed a blocked or partial report on it; each claim
+            carries whether it was reported on since claiming, and its
             recorded title, whether it ended on the forge, the seconds since
-            it last progressed and its cached pull request.
+            it last progressed and its cached pull request. `self_wait` names
+            an unexpired self-declared wait and its next-check time, which the
+            session text also names in place of a bare idle label.
         """
         import sqlite3
 
+        from agent_parley import lifecycle
         from agent_parley.cli import (
             activity,
             budgets,
@@ -570,11 +881,26 @@ class StatusMixin(BridgeCore):
         participant = data["participants"][agent]
         name = participant["display"]
         state = activity(directory, agent)
+        told = supervision.base_advance_told(state, list(advanced))
         observed = supervision.presence(
             directory, agent, configuration["inactive_after"]
         )
         branch = lane_branch(Path(participant["lane"]))
         reported_at = state.get("reported_at")
+        latest = metrics.latest_report(directory, agent) or {}
+        report_issue = (
+            int(latest["issue"])
+            if latest.get("issue") not in (None, "")
+            and latest.get("summary") == state.get("summary")
+            else None
+        )
+        open_issue = (
+            report_issue
+            if state.get("outcome") in OPEN_REPORTS
+            and (ledger["issues"].get(str(report_issue)) or {}).get("owner")
+            == agent
+            else None
+        )
         stalled = supervision.stall(
             self.home,
             directory,
@@ -583,19 +909,48 @@ class StatusMixin(BridgeCore):
             configuration["stalled_after"],
         )
         idle = metrics.idle_intervals(directory, agent)
+        declared_wait = supervision.published_wait(directory, agent)
+        active_wait = (
+            declared_wait
+            if declared_wait and float(declared_wait["until"]) > time.time()
+            else None
+        )
         try:
             with store.reading(self.home, frame["db"]) as db:
                 condition = lanes.read(db, data["root"], agent)
                 accounts = lanes.read_accounts(db, data["root"])
                 wake = lanes.read_wake(db, data["root"], agent)
+                newer = (
+                    store.issue_mail(
+                        db, data["root"], name, open_issue, reported_at
+                    )
+                    if open_issue is not None and reported_at
+                    else 0
+                )
         except (sqlite3.Error, BridgeError, OSError, ValueError):
-            condition, accounts, wake = None, {}, {}
+            condition, accounts, wake, newer = None, {}, {}, 0
+        provenance = lanes.provenance(
+            condition, supervision.hook_gaps(self.home, participant)
+        )
         if condition:
             observed = supervision.recorded_presence(condition, observed)
             observed["evidence"] = condition["evidence"]
             age = observed["age_seconds"]
-            liveness = lanes.describe(condition) + (
-                f"; event {age}s ago" if age is not None else ""
+            inferred = lanes.inference(provenance)
+            cause = supervision.provider_error(directory, agent) or (
+                f"waiting on {active_wait['reason']}, next check "
+                f"{views.timestamp(active_wait['until'])}"
+                if active_wait
+                else ""
+            )
+            liveness = (
+                lanes.describe(
+                    {**condition, "cause": cause}
+                    if cause and condition["state"] == lanes.IDLE
+                    else condition
+                )
+                + (f"; event {age}s ago" if age is not None else "")
+                + (f"; {inferred}" if inferred else "")
             )
         else:
             liveness = participant_liveness(
@@ -604,6 +959,9 @@ class StatusMixin(BridgeCore):
         budget = budgets.report(
             self.home, directory, data, agent, frame["usage"]
         )
+        from agent_parley import blueprints
+
+        runs = blueprints.for_lane(directory, agent)
         record = {
             "participant": agent,
             "identity": name,
@@ -611,6 +969,7 @@ class StatusMixin(BridgeCore):
             "credential": participant["credential"],
             "session": liveness,
             "condition": lanes.view(condition),
+            "provenance": provenance,
             "accounting": (
                 lanes.summary(accounts[agent]) if agent in accounts else None
             ),
@@ -631,6 +990,11 @@ class StatusMixin(BridgeCore):
                 state["dialog"] if isinstance(state.get("dialog"), dict) else {}
             ),
             "foreign_session": checkpoints.foreign_reading(state),
+            "wake_log": (
+                str(directory / f"{agent}-wake.log")
+                if state.get("attached") is False
+                else ""
+            ),
             "retired_at": views.timestamp(participant.get("retired")),
             "retired_age_seconds": (
                 int(time.time() - float(participant["retired"]))
@@ -649,18 +1013,25 @@ class StatusMixin(BridgeCore):
             ),
             "injected_bytes": state.get("injected_bytes", 0),
             "injections": state.get("injections", 0),
+            "injected_per_hour": checkpoints.hourly_rate(state),
             "claims": [
                 {
                     "issue": int(number),
                     "title": record.get("title") or "",
                     "ended": issues.ended(record),
                     "last_event_seconds": since(issues.last_progress(record)),
+                    "ready_seconds": (
+                        since(lifecycle.state(record).get("updated_at") or 0)
+                        if lifecycle.state(record)["state"] == lifecycle.READY
+                        else None
+                    ),
                     "pull_request": pull_request(
                         frame.get("pull_requests") or [],
                         number,
                         participant["branch"],
                     ),
                     "delivered": issues.delivered(record),
+                    "reported_since_claim": reported_since(record),
                     **deadline_state(record),
                     "deadline_at": views.timestamp(
                         deadline_state(record)["deadline"]
@@ -685,6 +1056,11 @@ class StatusMixin(BridgeCore):
                     "convergence": convergence.current(
                         accounts, number, record.get("claim_id")
                     ),
+                    **(
+                        {"blueprint": blueprints.line(number, runs[number])}
+                        if number in runs
+                        else {}
+                    ),
                 }
                 for number, record in sorted(
                     ledger["issues"].items(), key=lambda i: int(i[0])
@@ -701,8 +1077,20 @@ class StatusMixin(BridgeCore):
                 "silent_seconds": stalled["silent_seconds"],
                 "marker": supervision.stall_marker(stalled),
             },
+            "self_wait": {
+                "reason": active_wait["reason"] if active_wait else "",
+                "until": (
+                    views.timestamp(active_wait["until"])
+                    if active_wait
+                    else None
+                ),
+            },
             "operator_edits": list(edited),
             "base_advance_paths": list(advanced),
+            "base_advance": supervision.base_advance_marker(
+                list(advanced), told
+            ),
+            "base_advance_told_at": views.timestamp(told),
             "idle_seconds": idle["seconds"],
             "idle_complete": idle["complete"],
             "budget": {
@@ -721,10 +1109,13 @@ class StatusMixin(BridgeCore):
             ),
             "wake": None,
             "mail": None,
-            "current_task": str(
-                state.get("summary") or state.get("task") or ""
-            )[:240],
+            "report_issue": report_issue,
+            "report_newer_mail": newer,
         }
+        record["report_held"] = report_issue is not None and any(
+            claim["issue"] == report_issue for claim in record["claims"]
+        )
+        record["current_task"] = task_line(record, str(state.get("task") or ""))
         record["lane_state"] = lane_state(record)
         if wake:
             next_at = wake.get("next_at")
@@ -753,12 +1144,9 @@ class StatusMixin(BridgeCore):
         except (sqlite3.Error, BridgeError, OSError) as exc:
             record["mail"] = {"error": str(exc)}
             return record
-        record["current_task"] = str(
-            state.get("summary")
-            or mail["reported_task"]
-            or state.get("task")
-            or ""
-        )[:240]
+        record["current_task"] = task_line(
+            record, str(mail["reported_task"] or state.get("task") or "")
+        )
         record["mail"] = {
             "pending_operator_items": scheduled,
             "unread": mail["unread"],
@@ -808,17 +1196,21 @@ class StatusMixin(BridgeCore):
         Returns:
             Server readiness and the state the service reports itself in, the
             private state directory, whether inbound status queries were asked
-            for and the configuration fault that stops them, and one record
+            for and the configuration fault that stops them, the outbound
+            transports and the fault that stops them, and one record
             per registered project holding its issue ledger and its lanes. A
             service that reports itself stale is not ready, and the state
             names why. A project the supervisor retired because its root is
             gone is left out; one whose root is missing or whose lanes all
             stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
+        from agent_parley import pool
         from agent_parley.cli import (
             inbound_status,
             issues,
             json,
+            metrics,
+            notify,
             plan,
             reported_ready,
             roster,
@@ -860,6 +1252,7 @@ class StatusMixin(BridgeCore):
                         "root_missing": not Path(data["root"]).is_dir(),
                         "dormant": dormant(data["root"], participants),
                         "reclaim": supervision.reclaim_summary(path.parent),
+                        "spares": pool.reading(path.parent, data),
                         "accounting": self._project_accounting(
                             db, data["root"]
                         ),
@@ -874,22 +1267,72 @@ class StatusMixin(BridgeCore):
                             path.parent
                         ),
                         "supervision_poll": supervision.last_poll(path.parent),
+                        "fold_after": context["configuration"]["fold_after"],
+                        "pull_request_outcomes": (
+                            metrics.pull_request_outcomes(
+                                context.get("pull_request_record"),
+                                context["ledger"],
+                                time.time() - metrics.OUTCOME_WINDOW,
+                            )
+                        ),
+                        **self._integration(path.parent, data, context),
                     }
                 )
         return {
             "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
-            "inbound": inbound_status(),
+            "inbound": inbound_status(self.home),
+            "outbound": notify.reported(notify.environment(self.home)),
             "projects": projects,
         }
 
+    def _integration(self, directory: Path, data: dict, context: dict) -> dict:
+        """Reads the work landed in the project's integration base.
+
+        Args:
+            directory: Private state directory of the project.
+            data: Normalized project manifest.
+            context: Project reading from `_project_context`.
+
+        Returns:
+            Empty when no integration base is recorded. Otherwise
+            ``integration`` holding the base, the issues landed there that
+            the forge has not closed, the issues still claimed, whether
+            the forge's open issues were read whole as ``catalog``, and
+            when the newest claim ended as ``settled_at``.
+        """
+        from agent_parley.cli import issues
+
+        base = data.get("integration_base") or ""
+        if not base:
+            return {}
+        known = self.forge_issues(directory, data["root"])
+        ledger = context["ledger"]
+        return {
+            "integration": {
+                "base": base,
+                "landed": issues.landed(
+                    ledger, base, known["issues"] if known["complete"] else None
+                ),
+                "catalog": bool(known["complete"]),
+                "settled_at": issues.settled_at(ledger),
+                "held": sorted(
+                    (
+                        int(number)
+                        for number, record in ledger["issues"].items()
+                        if record.get("owner")
+                    ),
+                ),
+            }
+        }
+
     def _health(self, report: dict) -> None:
-        """Prints the server, code, store, inbound and state directory lines.
+        """Prints the server, code, store, notify and state directory lines.
 
         Args:
             report: Reading produced by `status_snapshot`.
         """
-        from agent_parley.cli import protocol, store
+        from agent_parley.cli import notification_line, protocol, store
 
         ready = "ready" if report["server"]["ready"] else "not ready"
         print(f"Server: {ready}")
@@ -898,8 +1341,8 @@ class StatusMixin(BridgeCore):
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             print(f"Store: {schema}; {repair}")
-        if refusal := (report.get("inbound") or {}).get("fault"):
-            print(f"Inbound: {refusal}")
+        if "outbound" in report:
+            print(notification_line(report["outbound"], report["inbound"]))
         print(f"State: {report['state_directory']}")
 
     def project_at(self, path: Path) -> str:
@@ -916,22 +1359,7 @@ class StatusMixin(BridgeCore):
             The recorded root of the first matching project, or an empty
             string when the directory belongs to none.
         """
-        from agent_parley.cli import json, roster
-
-        here = path.resolve()
-        for manifest in sorted((self.home / "projects").glob("*/project.json")):
-            data = roster.normalize(json.loads(manifest.read_text()))
-            places = [
-                data["root"],
-                *(item["lane"] for item in data["participants"].values()),
-            ]
-            if any(
-                here.is_relative_to(Path(place).resolve())
-                for place in places
-                if place
-            ):
-                return data["root"]
-        return ""
+        return registered_root(self.home, path)
 
     def board(
         self,
@@ -948,14 +1376,16 @@ class StatusMixin(BridgeCore):
         registration names, and a short list of orphaned or overdue claims
         with the command that resolves each. Claims whose work already ended
         on the forge are summarized on one line unless `every_claim` asks
-        for their rows. Dormant projects are left out unless `every_project`
+        for their rows, and so are the lanes `folded` past the project's
+        `fold_after`. Dormant projects are left out unless `every_project`
         asks for them, or the selection names that project.
 
         Args:
             selection: Filters the operator asked for; its project filter
                 scopes the view to one project.
             width: Columns the tables may use, or None for whole lines.
-            every_claim: Also list claims whose work ended on the forge.
+            every_claim: Also list claims whose work ended on the forge and
+                lanes folded out as long dead.
             every_project: Also list dormant projects, after the others.
 
         Returns:
@@ -992,14 +1422,14 @@ class StatusMixin(BridgeCore):
         return reported_lanes({"projects": shown})
 
     def forge_issues(self, directory: Path, root: str) -> dict:
-        """Reads the forge's open issues through a short-lived cache.
+        """Reads the forge's open issues from the supervisor's cache.
 
         The open-work view hides claims on closed issues and shows titles,
-        and only the forge knows either. One bounded `forge` call reads every
-        open issue and is kept in `FORGE_ISSUES` for `FORGE_TTL` seconds. A
-        failed call is retried no sooner than `FORGE_RETRY` seconds later, so
-        a forge that is down costs one timeout per retry window rather than
-        one per reading, and the last good cache answers meanwhile.
+        and only the forge knows either. `status` stays read-only, so it
+        never calls the forge: the service's poll keeps `FORGE_ISSUES`
+        current through `supervision.refresh_forge_issues`, and this reads
+        that file alone. A reading older than `FORGE_STALE` seconds is
+        reported stale, with a recorded failed read named as the cause.
 
         Args:
             directory: Private state directory of the project.
@@ -1009,14 +1439,12 @@ class StatusMixin(BridgeCore):
             ``issues`` as issue number to its title, or None when no reading
             was ever cached; ``complete`` when that reading held every open
             issue; ``age_seconds`` of the reading; ``fresh`` when it is
-            within `FORGE_TTL`; and ``reason`` naming why it is not.
+            within `FORGE_STALE`; and ``reason`` naming why it is not.
         """
         from agent_parley.cli import forge, json
-        from agent_parley.state import write_json
 
-        path = directory / FORGE_ISSUES
         try:
-            cached = json.loads(path.read_text())
+            cached = json.loads((directory / FORGE_ISSUES).read_text())
         except (OSError, ValueError):
             cached = {}
         if not isinstance(cached, dict):
@@ -1026,8 +1454,7 @@ class StatusMixin(BridgeCore):
         issues = stored if isinstance(stored, dict) else None
         read_at = float(cached.get("read_at") or 0)
         limit = int(cached.get("limit") or FORGE_LIMIT)
-        reason = "forge unreachable"
-        if issues is not None and now - read_at < FORGE_TTL:
+        if issues is not None and now - read_at < FORGE_STALE:
             return reading(issues, limit, now - read_at, True, "")
         try:
             manifest = json.loads((directory / "project.json").read_text())
@@ -1035,27 +1462,8 @@ class StatusMixin(BridgeCore):
             manifest = {}
         if forge.select(Path(root), manifest) != "github":
             return reading(issues, limit, now - read_at, False, "no GitHub")
-        if now - float(cached.get("failed_at") or 0) >= FORGE_RETRY:
-            catalog = forge.open_issue_catalog(
-                Path(root), FORGE_LIMIT, FORGE_TIMEOUT
-            )
-            if catalog is not None:
-                issues = {
-                    number: {"title": str(item.get("title") or "")}
-                    for number, item in catalog.items()
-                }
-                with contextlib.suppress(OSError):
-                    write_json(
-                        path,
-                        {
-                            "read_at": now,
-                            "limit": FORGE_LIMIT,
-                            "issues": issues,
-                        },
-                    )
-                return reading(issues, FORGE_LIMIT, 0.0, True, "")
-            with contextlib.suppress(OSError):
-                write_json(path, {**cached, "failed_at": now})
+        failed = float(cached.get("failed_at") or 0) > read_at
+        reason = "forge unreachable" if failed else "service not refreshing"
         return reading(issues, limit, now - read_at, False, reason)
 
     def _board_project(
@@ -1066,8 +1474,10 @@ class StatusMixin(BridgeCore):
         Args:
             project: One project record from the status reading.
             width: Columns the tables may use, or None for whole lines.
-            every_claim: Also list claims whose work ended on the forge.
+            every_claim: Also list claims whose work ended on the forge and
+                lanes folded out as long dead.
         """
+        from agent_parley import metrics, supervision
         from agent_parley.cli import supervision_failure, tables
 
         dormancy = " (dormant)" if project["dormant"] else ""
@@ -1081,20 +1491,35 @@ class StatusMixin(BridgeCore):
         work: list[tuple[int, tuple[str, ...]]] = []
         lanes: list[tuple[str, ...]] = []
         notes: list[str] = []
+        runs: list[str] = []
         ended: list[int] = []
+        gone = 0
+        after = project.get("fold_after") or supervision.DEFAULTS["fold_after"]
+        states = {
+            record["participant"]: record["lane_state"]
+            for record in project["participants"]
+        }
         for record in project["participants"]:
+            if not every_claim and folded(record, after):
+                gone += 1
+                continue
             owner = record["participant"]
+            peer = supervision.live_peer(states, owner)
             live = 0
             for claim in record["claims"]:
                 entry = (opened or {}).get(str(claim["issue"])) or {}
                 closed = claim["ended"] or (
-                    opened is not None and str(claim["issue"]) not in opened
+                    opened is not None
+                    and str(claim["issue"]) not in opened
+                    and not moved_after(claim, known)
                 )
                 if closed:
                     ended.append(claim["issue"])
                 else:
                     live += 1
-                    notes.extend(attention(claim, owner))
+                    notes.extend(attention(claim, owner, project["root"], peer))
+                    if claim.get("blueprint"):
+                        runs.append(f"Blueprint {claim['blueprint']}")
                 if every_claim or not closed:
                     shown = {
                         **claim,
@@ -1120,6 +1545,15 @@ class StatusMixin(BridgeCore):
             print(text)
         for text in tables.lane_table(lanes, width):
             print(text)
+        if gone:
+            print(fold_line(gone, after, "dead lane"))
+        for text in runs:
+            print(text)
+        if outcome := metrics.outcome_line(
+            project.get("pull_request_outcomes") or {},
+            tables.age(metrics.OUTCOME_WINDOW),
+        ):
+            print(outcome)
         if ended:
             listed = " ".join(f"#{number}" for number in sorted(ended)[:10])
             more = f" and {len(ended) - 10} more" if len(ended) > 10 else ""
@@ -1156,12 +1590,14 @@ class StatusMixin(BridgeCore):
             The number of lanes reported, so a caller can gate on a filter
             having matched at least one lane.
         """
+        from agent_parley import pool
         from agent_parley.cli import (
             Selection,
             describe,
             json,
             lane_detail,
             lanes,
+            metrics,
             narrow,
             pending_offers,
             reclaim,
@@ -1196,8 +1632,17 @@ class StatusMixin(BridgeCore):
             if isinstance(polled.get("at"), (int, float)):
                 print(supervision_liveness(polled))
             print(describe(snapshot(path.parent)))
+            if line := landed_line(project.get("integration") or {}):
+                print(line)
+            if outcome := metrics.outcome_line(
+                project.get("pull_request_outcomes") or {},
+                tables.age(metrics.OUTCOME_WINDOW),
+            ):
+                print(outcome)
             if measured := reclaim.summary_line(project.get("reclaim") or {}):
                 print(measured)
+            if spares := pool.summary_line(project.get("spares") or {}):
+                print(spares)
             if accounted := project.get("accounting"):
                 print(f"Lanes: {lanes.describe_account(accounted)}")
             if groups := project.get("ready_groups") or []:
@@ -1219,4 +1664,8 @@ class StatusMixin(BridgeCore):
             ]
             for row in tables.status_table(rows, width):
                 print(row)
+            for record in reported:
+                for claim in record["claims"]:
+                    if claim.get("blueprint"):
+                        print(f"Blueprint {claim['blueprint']}")
         return matched

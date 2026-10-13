@@ -75,6 +75,32 @@ def test_a_scripted_sequence_yields_both_numbers_and_their_causes(home):
     assert events[-1]["evidence"] == lanes.describe_account(last)
 
 
+def test_accounting_rows_do_not_evict_lane_transitions(home, monkeypatch):
+    monkeypatch.setattr(lanes, "MAX_EVENTS", 4)
+    with store.connect(home, write=True) as db:
+        lanes.transition(db, ROOT, "a", lanes.WORKING, now=0.0)
+        lanes.transition(db, ROOT, "a", lanes.IDLE, now=10.0)
+        lanes.transition(db, ROOT, "b", lanes.IDLE, now=0.0)
+        for step in range(12):
+            lanes.account(
+                db,
+                ROOT,
+                "b",
+                lanes.read(db, ROOT, "b"),
+                has_work=True,
+                owns=False,
+                now=60.0 * step,
+            )
+        kept = lanes.history(db, ROOT)
+    kinds = [event["kind"] for event in kept]
+    assert kinds.count("accounting") == 4
+    assert [
+        (event["lane"], event["target"])
+        for event in kept
+        if event["kind"] == "transition"
+    ] == [("a", lanes.WORKING), ("a", lanes.IDLE), ("b", lanes.IDLE)]
+
+
 def test_an_owned_claim_on_an_idle_lane_is_unaccountable_time(home):
     totals, _ = script(
         home,
@@ -180,7 +206,7 @@ def test_top_shows_the_accounting_of_each_lane(bridge, paired):
     view = dashboard.collect(bridge.home, False, {})
     rows = {row["participant"]: row for row in view["projects"][0]["rows"]}
     unaccountable = rows["claude"]["accounting"]["unaccountable_minutes"]
-    lines = dashboard.render(view)
+    lines = dashboard.render(view, columns=("ALL",))
     header = next(line for line in lines if "PARTICIPANT" in line)
     claude = next(line for line in lines if line.startswith("claude"))
     assert "UNUSED" in header

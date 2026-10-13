@@ -24,6 +24,7 @@ from agent_parley import (
     metrics,
     protocol,
     recommend,
+    refusal,
     retries,
     roster,
     store,
@@ -41,6 +42,7 @@ WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
 SLOW_DECISION = DECISION_SECONDS / 2
 DELIVERY_SECONDS = 0.25
+RECEIPT_SECONDS = 0.5
 TEMPORARY_SECONDS = 60.0
 UNDECIDED_LIMIT = 1
 REFUSAL_SECONDS = 5.0
@@ -369,9 +371,9 @@ TOOLS = [
     ),
     _tool(
         store.RETIRE,
-        "Retire this lane when nothing is left: releases your claims, "
-        "handoffs and keys, then ends your credential. Only the operator "
-        "re-admits you.",
+        "Retire when nothing is left: releases claims, handoffs and keys. "
+        "Refused over ready or operator-blocked work. Re-admit: agent-parley "
+        "participant add.",
         {},
         [],
     ),
@@ -416,7 +418,7 @@ class Server(ThreadingHTTPServer):
         self.stopping = threading.Event()
         self.counting = threading.Lock()
         self.deciding: dict[tuple[str, str], int] = {}
-        self.recovering: dict[tuple[str, str], list[dict]] = {}
+        self.recovering: dict[tuple[str, str], dict | None] = {}
         self.repeats: dict[
             tuple[str, tuple[str, str]], tuple[float, int, str]
         ] = {}
@@ -530,10 +532,16 @@ class Server(ThreadingHTTPServer):
         request: socket.socket | tuple[bytes, socket.socket],
         client_address: tuple,
     ) -> None:
-        """Rejects overload rather than creating unbounded worker threads."""
+        """Rejects overload rather than creating unbounded worker threads.
+
+        The refusal is recorded before the connection is closed, so the log
+        entry exists by the time the client observes the close.
+        """
         if not self.slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            self.refuse()
+            try:
+                self.refuse()
+            finally:
+                self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
@@ -582,31 +590,37 @@ class Server(ThreadingHTTPServer):
     def recover(self, lane: tuple[str, str], owed: dict) -> None:
         """Queues a recovery checkpoint to run after its hook was answered.
 
-        One thread per lane works its queue in arrival order, so the lane's
-        checkpoints stay ordered and a burst of events never starts more
-        than one Git capture for the same worktree at once. Every request is
-        kept, because a later one may carry no gate evidence and would lose
-        the passing command an earlier one recorded.
+        One thread per lane runs the lane's captures, so a burst of events
+        never starts more than one Git capture for the same worktree at
+        once. At most one request waits behind the running capture: a newer
+        request replaces it through `checkpoints.merge_recovery`, which
+        keeps the most recent gate evidence of the requests it replaces. A
+        burst therefore costs the running capture and one more, rather than
+        one capture per event holding the lane's locks for minutes.
 
         Args:
             lane: Project key and participant name the request is for.
             owed: The ``recovery`` request `checkpoints.serve` returned.
         """
         with self.counting:
-            queued = self.recovering.get(lane)
-            if queued is not None:
-                queued.append(owed)
+            if lane in self.recovering:
+                waiting = self.recovering[lane]
+                self.recovering[lane] = (
+                    owed
+                    if waiting is None
+                    else checkpoints.merge_recovery(waiting, owed)
+                )
                 return
-            self.recovering[lane] = []
+            self.recovering[lane] = None
         threading.Thread(
             target=self._recovering, args=(lane, owed), daemon=True
         ).start()
 
     def _recovering(self, lane: tuple[str, str], owed: dict) -> None:
-        """Runs one lane's queued recovery checkpoints until none are left.
+        """Runs one lane's recovery checkpoints until none is waiting.
 
         Args:
-            lane: Project key and participant name the queue belongs to.
+            lane: Project key and participant name the requests belong to.
             owed: First request to run.
         """
         while True:
@@ -616,6 +630,7 @@ class Server(ThreadingHTTPServer):
                     owed["participant"],
                     owed["payload"],
                     checkpoints.SETTLE_SECONDS,
+                    owed.get("evidence"),
                 )
             except Exception as exc:
                 self.coalesce(
@@ -625,11 +640,12 @@ class Server(ThreadingHTTPServer):
                     f"event captures again: {type(exc).__name__}",
                 )
             with self.counting:
-                queued = self.recovering.get(lane) or []
-                if not queued:
+                waiting = self.recovering.get(lane)
+                if waiting is None:
                     self.recovering.pop(lane, None)
                     return
-                owed = queued.pop(0)
+                self.recovering[lane] = None
+                owed = waiting
 
     def coalesce(self, event: str, lane: tuple[str, str], detail: str) -> None:
         """Records a per-lane repeat at most once per `REPEAT_SECONDS`.
@@ -984,23 +1000,60 @@ class Handler(BaseHTTPRequestHandler):
                 self._raw_hook(served)
             else:
                 self._reply(200, served)
-            if delivery:
+            received = self._received()
+            if delivery and received:
                 self._delivered(path, request["participant"], delivery)
+            elif delivery:
+                log(
+                    self.server.home,
+                    "undelivered",
+                    f"{self.path} {request['participant']} reply was not "
+                    "confirmed by the client; the next event repeats it",
+                )
         finally:
             if owed:
                 self.server.recover(lane, owed)
 
-    def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
-        """Marks a written reply's coordination as delivered to the lane.
+    def _received(self) -> bool:
+        """Waits for the client to confirm it read the whole reply.
 
-        The whole reply is written before this runs, and the connection
-        closes after it, so the client reads its end of stream only once the
-        lane's state says what it was given, as the in-process path does.
+        Writing a reply succeeds into the kernel's buffer even when the
+        client already stopped waiting for it and decided in-process, so a
+        written reply proves nothing about what the lane was given. A
+        client that announces `hook.RECEIPT_HEADER` sends `hook.RECEIPT`
+        once it read the reply to its declared length, and only that byte
+        arriving within `RECEIPT_SECONDS` counts as receipt. A client that
+        gave up has exited or is deciding in-process and never sends it.
+
+        A client that does not announce the header predates the receipt,
+        as a hook client written before an upgrade and not yet rewritten
+        by a lane launch does, and is treated as having read what was
+        written so its lane keeps the delivery it had.
+
+        Returns:
+            Whether the client holds the reply.
+        """
+        if self.headers.get(hook.RECEIPT_HEADER) != hook.RECEIPT:
+            return True
+        try:
+            self.request.settimeout(RECEIPT_SECONDS)
+            return self.rfile.read(1) == hook.RECEIPT.encode()
+        except OSError:
+            return False
+
+    def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
+        """Marks a confirmed reply's coordination as delivered to the lane.
+
+        The whole reply is written and its receipt confirmed before this
+        runs, and the connection closes after it, so the client reads its
+        end of stream only once the lane's state says what it was given,
+        as the in-process path does.
         The wait for the lane's checkpoint lock is `DELIVERY_SECONDS`, which
         keeps the close inside the client's read timeout. A reply the
-        client stopped reading raised before this point, and a decision the
-        client was answered `hook.DECIDING` for never reaches it, so both
-        leave their coordination to the lane's next event.
+        client stopped reading raised before this point, a reply it never
+        confirmed is not delivered, and a decision the client was answered
+        `hook.DECIDING` for never reaches it, so all three leave their
+        coordination to the lane's next event.
 
         Args:
             directory: Common project state directory of the lane.
@@ -1254,7 +1307,7 @@ class Handler(BaseHTTPRequestHandler):
         except BridgeError as exc:
             return {
                 "isError": True,
-                "content": [{"type": "text", "text": str(exc)}],
+                "content": [{"type": "text", "text": refusal(exc)}],
             }
         except sqlite3.OperationalError as exc:
             retryable = getattr(exc, "sqlite_errorcode", 0) & 0xFF in (

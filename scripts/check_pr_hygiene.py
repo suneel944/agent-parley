@@ -43,7 +43,8 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
     }:
         errors.append("Add a change-type label.")
     linked = [issue for issue in issues if "pull_request" not in issue]
-    if not linked:
+    automated = pr.get("user", {}).get("type") == "Bot"
+    if not linked and not automated:
         errors.append("Reference an existing local issue with Refs #N.")
     milestone = pr.get("milestone")
     if "release" in labels and not milestone:
@@ -56,7 +57,7 @@ def validate(pr: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
             errors.append(
                 f"Match the milestone of linked issue #{issue['number']}."
             )
-    if pr.get("user", {}).get("type") != "Bot":
+    if not automated:
         if not re.fullmatch(
             r"(?:feat|fix|perf|docs|chore|ci|build|refactor|test|revert)"
             r"(?:\([\w.-]+\))?!?: \S.*",

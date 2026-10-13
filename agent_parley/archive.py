@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from agent_parley import attachments, roster, store
 from agent_parley.state import BridgeError, lock
@@ -141,6 +142,39 @@ def _project_locks(directories: list[Path]) -> Iterator[None]:
         yield
 
 
+def _exportable_tables(db: sqlite3.Connection) -> list[str]:
+    """Names every real table an export must scope to the kept projects.
+
+    The list is read from `sqlite_master` rather than a fixed tuple so a
+    table added later is scoped automatically instead of copied whole. A
+    virtual table and the shadow tables SQLite keeps for it are left out:
+    the triggers on its content table already remove its rows when that
+    table's rows are deleted, and it carries no ownership column of its
+    own.
+
+    Args:
+        db: Open connection on the staged copy of the store.
+
+    Returns:
+        Real table names in the order SQLite created them.
+    """
+    rows = db.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY rowid"
+    ).fetchall()
+    virtual = {
+        name
+        for name, sql in rows
+        if sql and sql.upper().startswith("CREATE VIRTUAL TABLE")
+    }
+    return [
+        name
+        for name, _ in rows
+        if name not in virtual
+        and not name.startswith("sqlite_")
+        and not any(name.startswith(f"{owner}_") for owner in virtual)
+    ]
+
+
 def _snapshot(home: Path, destination: Path, roots: set[str]) -> None:
     """Copies the store through the backup interface, scoped to roots."""
     with contextlib.closing(
@@ -156,16 +190,26 @@ def _snapshot(home: Path, destination: Path, roots: set[str]) -> None:
             if row[1] in roots
         ]
         placeholders = ",".join("?" for _ in kept) or "-1"
+        root_marks = ",".join("?" for _ in roots) or "''"
         agents = f"SELECT id FROM agents WHERE project_id IN ({placeholders})"
-        for table in reversed(TABLES):
+        for table in reversed(_exportable_tables(copy)):
             columns = _columns(copy, table)
+            params: list[Any]
             if table == "projects":
-                condition = f"id NOT IN ({placeholders})"
+                condition, params = f"id NOT IN ({placeholders})", kept
             elif "project_id" in columns:
                 condition = f"project_id NOT IN ({placeholders})"
+                params = kept
+            elif "project" in columns:
+                condition = f"project NOT IN ({root_marks})"
+                params = list(roots)
+            elif "agent_id" in columns:
+                condition, params = f"agent_id NOT IN ({agents})", kept
             else:
-                condition = f"agent_id NOT IN ({agents})"
-            copy.execute(f"DELETE FROM {table} WHERE {condition}", kept)
+                raise BridgeError(
+                    f"No export rule scopes table {table!r} by project."
+                )
+            copy.execute(f"DELETE FROM {table} WHERE {condition}", params)
         copy.execute("UPDATE agents SET token_digest=NULL")
         copy.commit()
         copy.execute("VACUUM")
@@ -443,7 +487,6 @@ def import_archive(
             "projects beside it."
         )
     selected = _selected(manifest, project)
-    roots = {entry["root"] for entry in selected}
     (home / PROJECTS).mkdir(parents=True, exist_ok=True, mode=0o700)
     for entry in selected:
         if (home / PROJECTS / entry["key"]).exists():
@@ -466,7 +509,14 @@ def import_archive(
                 target = home / PROJECTS / entry["key"]
                 shutil.move(str(source), str(target))
                 placed.append(target)
-            _merge_store(home, staged, roots)
+            _merge_store(
+                home,
+                staged,
+                {
+                    entry["root"]: home / PROJECTS / entry["key"]
+                    for entry in selected
+                },
+            )
             providers = staged / roster.PROVIDERS
             if providers.exists() and not (home / roster.PROVIDERS).exists():
                 shutil.move(str(providers), str(home / roster.PROVIDERS))
@@ -521,8 +571,16 @@ def _rebind(staged: Path, selected: list[dict]) -> None:
             db.commit()
 
 
-def _merge_store(home: Path, staged: Path, roots: set[str]) -> None:
-    """Copies the selected projects' store rows into the local store."""
+def _merge_store(home: Path, staged: Path, folders: dict[str, Path]) -> None:
+    """Copies the selected projects' store rows into the local store.
+
+    Args:
+        home: Private bridge state root.
+        staged: Directory the archive was extracted into.
+        folders: State directory each imported project was placed in, keyed
+            by the project's canonical root.
+    """
+    roots = set(folders)
     database = staged / STORE_MEMBER
     if not database.exists():
         return
@@ -557,6 +615,44 @@ def _merge_store(home: Path, staged: Path, roots: set[str]) -> None:
                     )
                     if "id" in columns:
                         maps[table][row["id"]] = int(cursor.lastrowid or 0)
+            _rekey(source, target, maps["messages"], folders)
+
+
+def _rekey(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+    renumbered: dict[int, int],
+    folders: dict[str, Path],
+) -> None:
+    """Moves every imported message's attachment to its new identifier.
+
+    An attachment is keyed by the message identifier, which the target store
+    reassigns on import. The marker in the stored body and the attachment
+    files follow that map, so a later send that is given the old identifier
+    cannot overwrite the imported attachment.
+    """
+    owners = {
+        row["id"]: folders[row["human_key"]]
+        for row in source.execute("SELECT id, human_key FROM projects")
+        if row["human_key"] in folders
+    }
+    moves: dict[Path, list[tuple[str, str]]] = {}
+    for old, new in renumbered.items():
+        row = source.execute(
+            "SELECT project_id, body_md FROM messages WHERE id=?", (old,)
+        ).fetchone()
+        was = attachments.reference("message", old)
+        found = attachments.find(row["body_md"])
+        if old == new or not found or found[0] != was:
+            continue
+        now = attachments.reference("message", new)
+        target.execute(
+            "UPDATE messages SET body_md=? WHERE id=?",
+            (attachments.retarget(row["body_md"], now), new),
+        )
+        moves.setdefault(owners[row["project_id"]], []).append((was, now))
+    for directory, pairs in moves.items():
+        attachments.renumber(directory, pairs)
 
 
 def _remapped(

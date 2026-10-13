@@ -101,6 +101,9 @@ def main() -> None:
     page carries the file the OpenAI plugin portal accepts and no maintainer
     builds it by hand. Its builder is imported here rather than at module
     scope because that module imports this one for its archive entries.
+    The install script is another, so the one-command install resolves at
+    ``releases/latest/download/install.sh`` and ``SHA256SUMS`` carries the
+    checksum its verify-first variant checks.
 
     Raises:
         ValueError: If a tag, plugin version, or changelog does not match.
@@ -165,6 +168,9 @@ def main() -> None:
         stdout=subprocess.DEVNULL,
     )
     assets.append(requirements)
+    installer = output / "install.sh"
+    shutil.copyfile(root / "scripts" / "install.sh", installer)
+    assets.append(installer)
     for filename, text in (
         ("CHANGELOG.md", changelog),
         ("RELEASE_NOTES.md", notes),

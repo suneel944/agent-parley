@@ -12,12 +12,15 @@ from pathlib import Path
 import pytest
 
 from agent_parley import (
+    checkpoints,
     cli,
     dialogs,
     issues,
     lanes,
     process,
     roster,
+    server,
+    state,
     store,
     supervision,
     terminal,
@@ -274,6 +277,35 @@ def test_release_reminds_waiter_without_transferring_work(bridge, paired):
     assert after["issues"]["1"]["handoff_prompt"]["responded_at"]
 
 
+def test_withheld_completion_note_answers_the_release_reminder(bridge, paired):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    bridge.issue(lane, "claim", "1")
+    bridge.issue(lane, "release", "1")
+    supervision.reminders(lane.parent, roster.read(lane.parent), {"1"})
+    prompt = issues.snapshot(lane.parent)["issues"]["1"]["handoff_prompt"]
+    assert prompt["waiting"] == []
+    sent = store.call(
+        bridge.home,
+        actors["claude"],
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Merged #1 into main",
+            "body_md": "Released #1 after the merge.",
+            "idempotency_key": "done",
+        },
+    )
+    assert sent["withheld"] == ["codex"]
+    supervision.observe_responses(
+        bridge.home, lane.parent, roster.read(lane.parent)
+    )
+    record = issues.snapshot(lane.parent)["issues"]["1"]
+    assert record["owner"] is None
+    assert record["handoff_prompt"]["responded_at"]
+    assert not mailbox(bridge.home, paired["root"], "codex")["unread"]
+
+
 def test_closed_pr_reminds_holder_and_preserves_claim(
     bridge, paired, monkeypatch
 ):
@@ -292,6 +324,88 @@ def test_closed_pr_reminds_holder_and_preserves_claim(
     record = issues.snapshot(lane.parent)["issues"]["1"]
     assert record["owner"] == "claude"
     assert record["handoff_prompt"]["trigger"] == "pull request ended"
+
+
+def test_a_completion_message_sent_before_the_poll_saw_the_close_counts(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    bridge.issue(lane, "claim", "1")
+    claimed_at = issues.snapshot(lane.parent)["issues"]["1"]["history"][-1][
+        "at"
+    ]
+    monkeypatch.setattr(
+        supervision.forge,
+        "issue_completion",
+        lambda *args: {
+            "state": "MERGED",
+            "closed_at": claimed_at,
+            "pull_request": 2,
+            "url": "https://example.invalid/pull/2",
+            "branch": "",
+            "commit": "abc123",
+        },
+    )
+    store.call(
+        bridge.home,
+        actors["claude"],
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Merged #1",
+            "body_md": "Landed the fix for #1.",
+            "idempotency_key": "done-1",
+        },
+    )
+    supervision.poll(bridge.home, lane.parent)
+    record = issues.snapshot(lane.parent)["issues"]["1"]
+    assert record["handoff_prompt"]["trigger"] == "pull request ended"
+    assert record["handoff_prompt"]["responded_at"]
+    assert record["owner"] == "claude"
+
+
+def test_an_escalated_completion_reminder_stops_waking_the_holder(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    bridge.issue(lane, "claim", "1")
+    supervision.reminders(lane.parent, roster.read(lane.parent), {"1"})
+    write_json(
+        lane.parent / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, lane.parent, "codex")
+    rewake(bridge, paired, lane.parent, "codex", at=0, backlog=[])
+    supervision.wake(
+        bridge.home, lane.parent, paired, "codex", observed, config
+    )
+    assert len(calls) == 1
+    ledger = issues.snapshot(lane.parent)
+    record = ledger["issues"]["1"]
+    record["unresolved_completion"] = {
+        "claim_id": record["claim_id"],
+        "holder": "codex",
+        "prompt": record["handoff_prompt"]["id"],
+    }
+    ledger["revision"] += 1
+    write_json(lane.parent / "issues.json", ledger)
+    rewake(bridge, paired, lane.parent, "codex", at=0)
+    supervision.wake(
+        bridge.home, lane.parent, paired, "codex", observed, config
+    )
+    assert len(calls) == 1
 
 
 def test_live_idle_wakes_back_off_without_acknowledging(
@@ -551,6 +665,165 @@ def test_a_lane_parked_on_an_operator_dialog_is_never_woken(
         )
 
 
+def test_a_lane_blocked_past_the_bound_escalates_once(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "waiting for approval: Bash",
+            "dialog": {"name": "tool-permission"},
+            "event": "PreToolUse",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: pytest.fail("woke a dialog")
+    )
+    sent = []
+    monkeypatch.setattr(
+        supervision.notify,
+        "deliver",
+        lambda directory, name, event, fields: sent.append(
+            (name, event, fields)
+        ),
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, directory, "codex")
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 60,
+        attempts=1,
+        result="resume requested (launcher 1)",
+    )
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    assert not sent
+    assert not supervision.wake_record(
+        bridge.home, paired["root"], "codex"
+    ).get("escalated_at")
+
+    since = time.time() - supervision.BLOCKED_ESCALATE_AFTER - 1
+    with store.connect(bridge.home) as db:
+        db.execute(
+            "UPDATE lane_states SET since=? WHERE project=? AND lane=?",
+            (since, paired["root"], "codex"),
+        )
+    for _ in range(supervision.WORK_WAKE_ATTEMPTS + 1):
+        supervision.wake(
+            bridge.home, directory, paired, "codex", observed, config
+        )
+
+    record = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert record["attempts"] == 1
+    assert record["escalated_at"]
+    assert record["blocked"] == "blocked: approval"
+    assert sent
+    assert {(name, event) for name, event, _ in sent} == {
+        ("codex", supervision.notify.Event.LANE_BLOCKED)
+    }
+    assert {fields["since"] for _, _, fields in sent} == {str(since)}
+    assert "blocked: approval" in sent[0][2]["detail"]
+
+
+@pytest.mark.parametrize("state", [lanes.WORKING, lanes.IDLE])
+def test_a_lane_that_leaves_blocked_clears_its_recorded_block(
+    bridge, paired, monkeypatch, state
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, paired["root"], "codex", lanes.BLOCKED, cause="approval"
+        )
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 60,
+        attempts=1,
+        result="resume requested (launcher 1)",
+        blocked="blocked: approval",
+        escalated_at=time.time() - 30,
+        exhausted_at=time.time() - 30,
+    )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(db, paired["root"], "codex", state)
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: pytest.fail("woke the lane")
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    record = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert record["blocked"] == ""
+    assert not record.get("escalated_at")
+    assert not record.get("exhausted_at")
+    assert record["attempts"] == 1
+
+
+def test_a_lane_still_blocked_keeps_its_recorded_block(bridge, paired):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, paired["root"], "codex", lanes.BLOCKED, cause="approval"
+        )
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=time.time() - 60,
+        attempts=1,
+        result="resume requested (launcher 1)",
+        blocked="blocked: approval",
+        escalated_at=1.0,
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    record = supervision.wake_record(bridge.home, paired["root"], "codex")
+    assert record["blocked"] == "blocked: approval"
+    assert record["escalated_at"] == 1.0
+
+
+def test_a_lane_blocked_notifies_once_per_block(bridge, monkeypatch):
+    monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "telegram")
+    monkeypatch.setenv("AGENT_PARLEY_TELEGRAM_TOKEN", "token")
+    monkeypatch.setenv("AGENT_PARLEY_TELEGRAM_CHAT", "chat")
+    calls = []
+    monkeypatch.setattr(
+        supervision.notify,
+        "send",
+        lambda config, subject, body: (
+            calls.append(subject) or [{"transport": "telegram", "ok": True}]
+        ),
+    )
+    directory = bridge.home / "project"
+    directory.mkdir()
+    fields = {"since": "1.0", "detail": "blocked: approval for 1900s"}
+
+    for _ in range(3):
+        supervision.notify.deliver(
+            directory, "codex", supervision.notify.Event.LANE_BLOCKED, fields
+        )
+        supervision.notify.drain()
+
+    assert len(calls) == 1
+    assert "still blocked" in calls[0]
+
+
 def test_an_unrecorded_lane_parked_on_a_dialog_is_never_woken(
     bridge, paired, monkeypatch
 ):
@@ -726,6 +999,77 @@ def test_a_wake_blocked_by_exhausted_capacity_is_retried_at_the_reset(
     assert retried["result"] == "accepted"
 
 
+def test_a_declared_wait_defers_a_wake_until_its_next_check(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    message = send(bridge, actors["claude"], "codex")
+    until = time.time() + 900
+    supervision.record_wait(
+        directory, "codex", "3 background jobs", until, 3600
+    )
+    calls = []
+    monkeypatch.setattr(
+        terminal, "request", lambda *args: calls.append(args) or "accepted"
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, directory, "codex")
+    path = directory / "codex-wake.json"
+    rewake(
+        bridge,
+        paired,
+        directory,
+        "codex",
+        at=0,
+        backlog=[str(message["id"])],
+        attempts=1,
+        result="manual attention required",
+    )
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    parked = json.loads(path.read_text())
+    assert not calls
+    assert parked["attempts"] == 1
+    assert parked["next_at"] == until
+    assert "waiting on 3 background jobs" in parked["blocked"]
+
+    supervision.record_wait(
+        directory, "codex", "3 background jobs", time.time() - 1, 3600
+    )
+
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+    retried = json.loads(path.read_text())
+    assert calls
+    assert retried["attempts"] == 2
+    assert retried["result"] == "accepted"
+
+
+def test_a_declared_wait_is_capped_by_its_project_ceiling(tmp_path):
+    now = time.time()
+
+    recorded = supervision.record_wait(
+        tmp_path, "codex", "a long benchmark", now + 7200, 600
+    )
+
+    assert recorded["until"] <= time.time() + 600
+    assert recorded["until"] < now + 7200
+    read_back = supervision.published_wait(tmp_path, "codex")
+    assert read_back["reason"] == "a long benchmark"
+    assert read_back["until"] == recorded["until"]
+
+
 def test_status_reports_the_next_wake_or_the_exhausted_budget(
     bridge, paired, capsys
 ):
@@ -823,6 +1167,279 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
     assert record["result"] == "resume requested (launcher 4321)"
 
 
+@pytest.mark.parametrize("opted", [False, True])
+def test_a_claude_resume_without_the_approval_opt_in_is_withheld(
+    bridge, paired, monkeypatch, opted
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    native = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    native_ticks = process.start_ticks(native.pid)
+    native.kill()
+    native.wait(timeout=5)
+    write_json(
+        directory / "claude-activity.json",
+        {
+            "activity": "working",
+            "session_id": "manual-session",
+            "session_pid": native.pid,
+            "session_ticks": native_ticks,
+        },
+    )
+    send(bridge, actors["codex"], "claude")
+
+    class Child:
+        pid = 4321
+
+    launched = []
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append(command) or Child(),
+    )
+    monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
+    manifest = {
+        **paired,
+        "supervision": {**(paired.get("supervision") or {})},
+    }
+    if opted:
+        manifest["supervision"]["approve_bridge_tools"] = True
+    assert supervision.opt_in_missing(bridge.home, manifest, "claude") is (
+        not opted
+    )
+    supervision.wake(
+        bridge.home,
+        directory,
+        manifest,
+        "claude",
+        sampled(
+            bridge, paired, directory, "claude", 300, session="manual-session"
+        ),
+        supervision.DEFAULTS,
+    )
+    record = json.loads((directory / "claude-wake.json").read_text())
+    if opted:
+        assert launched and "--resume" in launched[0]
+    else:
+        assert not launched
+        assert record["result"] == supervision.OPT_IN_MISSING
+        assert record["attempts"] == 0
+        assert not record["exhausted_at"]
+
+
+def test_operator_stop_holds_until_the_next_launch(
+    bridge, repo, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    path = directory / "codex-activity.json"
+    write_json(
+        path,
+        {
+            "activity": "stopped",
+            "session_id": "12345678-abcd-1234-abcd-123456789abc",
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+    bridge.stop(repo, "codex")
+    assert json.loads(path.read_text())["operator_stopped"] is True
+
+    class Child:
+        pid = 4321
+
+    launched = []
+    popen = supervision.subprocess.Popen
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append(command) or Child(),
+    )
+    monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
+    observed = sampled(bridge, paired, directory, "codex", 300)
+    supervision.wake(
+        bridge.home, directory, paired, "codex", observed, supervision.DEFAULTS
+    )
+    assert launched == []
+
+    monkeypatch.setattr(supervision.subprocess, "Popen", popen)
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def identity(*args):
+        return {"registration_token": "test-only"}
+
+    monkeypatch.setattr(bridge, "identity", identity)
+    from agent_parley import cli
+
+    original = cli.shutil.which
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: "/bin/true" if name == "codex" else original(name),
+    )
+    monkeypatch.setattr(terminal, "run", lambda *args, **kwargs: 0)
+    assert bridge.launch("codex", repo, terminal.PROMPT, resume=True) == 0
+    assert "operator_stopped" not in json.loads(path.read_text())
+
+
+def test_stopping_a_live_session_with_backlog_is_not_resumed_by_a_wake(
+    bridge, repo, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    path = directory / "codex-activity.json"
+    send(bridge, actors["claude"], "codex")
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"]
+    )
+    try:
+        write_json(
+            path,
+            {
+                "activity": "idle",
+                "session_id": "12345678-abcd-1234-abcd-123456789abc",
+                "session_pid": child.pid,
+                "session_ticks": process.start_ticks(child.pid),
+                "updated": time.time(),
+            },
+        )
+        assert "ended from the base checkout" in bridge.stop(repo, "codex")
+        assert child.wait(10) is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(10)
+    stopped = json.loads(path.read_text())
+    assert stopped["operator_stopped"] is True
+    assert stopped["session_id"]
+
+    class Child:
+        pid = 4321
+
+    launched = []
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append(command) or Child(),
+    )
+    monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
+    observed = sampled(
+        bridge, paired, directory, "codex", 300, stopped["session_id"]
+    )
+    supervision.wake(
+        bridge.home, directory, paired, "codex", observed, supervision.DEFAULTS
+    )
+    assert launched == []
+    stopped.pop("operator_stopped")
+    write_json(path, stopped)
+    supervision.wake(
+        bridge.home, directory, paired, "codex", observed, supervision.DEFAULTS
+    )
+    assert launched and "--resume" in launched[0]
+
+
+@pytest.mark.parametrize(
+    "answer,result,attempts",
+    [
+        ("accepted", "accepted", 1),
+        ("unavailable", supervision.SESSION_HELD, 0),
+    ],
+)
+def test_a_held_session_lock_is_asked_over_its_socket_never_resumed(
+    bridge, paired, monkeypatch, answer, result, attempts
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    write_json(
+        directory / "codex-activity.json",
+        {"activity": "stopped", "session_id": "live-session"},
+    )
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("resumed a held session"),
+    )
+    asked = []
+    monkeypatch.setattr(
+        terminal,
+        "request",
+        lambda directory, name: asked.append(name) or answer,
+    )
+    with state.lock(directory / "codex.session.lock"):
+        assert supervision.session_held(directory, "codex")
+        supervision.wake(
+            bridge.home,
+            directory,
+            paired,
+            "codex",
+            {"process_alive": False},
+            supervision.DEFAULTS,
+        )
+    assert not supervision.session_held(directory, "codex")
+    assert asked == ["codex"]
+    record = json.loads((directory / "codex-wake.json").read_text())
+    assert record["result"] == result
+    assert record["attempts"] == attempts
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="only Linux reports a process's working directory",
+)
+def test_a_client_in_the_lane_worktree_withholds_the_dead_verdict(
+    bridge, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    command = roster.provider(
+        bridge.home, paired["participants"]["codex"]["provider"]
+    )["command"]
+    gone = subprocess.Popen([sys.executable, "-c", ""])
+    gone.wait(10)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": gone.pid,
+            "session_ticks": "1",
+            "activity": "stopped",
+            "updated": time.time() - 7200,
+        },
+    )
+    assert supervision.rebind_sessions(bridge.home, directory, paired) == []
+    sampled(bridge, paired, directory, "codex", 300)
+    assert supervision.dead_reason(bridge.home, directory, paired, "codex", 0)
+    client = subprocess.Popen(
+        ["bash", "-c", f"exec -a {command} sleep 120"], cwd=lane
+    )
+    try:
+        deadline = time.monotonic() + 10
+        cmdline = Path(f"/proc/{client.pid}/cmdline")
+        while not cmdline.read_bytes().startswith(command.encode()):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+
+        assert supervision.rebind_sessions(bridge.home, directory, paired) == [
+            "codex"
+        ]
+
+        published = checkpoints.activity(directory, "codex")
+        assert published["session_pid"] == client.pid
+        assert published["session_id"] == "s1"
+        sampled(bridge, paired, directory, "codex", 300)
+        recorded = supervision.condition(bridge.home, paired["root"], "codex")
+        assert recorded["state"] == lanes.STARTING
+        assert not supervision.dead_reason(
+            bridge.home, directory, paired, "codex", 0
+        )
+    finally:
+        client.kill()
+        client.wait(10)
+
+
 def test_manual_session_without_process_identity_requires_attention(
     bridge, paired, monkeypatch
 ):
@@ -896,7 +1513,7 @@ def test_global_wake_opt_out_wins_over_project(bridge, paired, monkeypatch):
 
 @pytest.mark.parametrize("provider", ["claude", "codex", "gemini"])
 def test_stopped_resume_keeps_native_interactive_permissions(
-    bridge, repo, tmp_path, monkeypatch, provider
+    bridge, repo, tmp_path, monkeypatch, capsys, provider
 ):
     manifest = bridge.add_participant(repo, provider, provider)
     directory = Path(manifest["lanes"][provider]).parent
@@ -928,6 +1545,8 @@ def test_stopped_resume_keeps_native_interactive_permissions(
         lambda command, *args, **kwargs: captured.append(command) or 0,
     )
     assert bridge.launch(provider, repo, terminal.PROMPT, resume=True) == 0
+    warned = "no bridge tool approval is recorded" in capsys.readouterr().err
+    assert warned is (provider == "claude")
     assert "12345678-abcd-1234-abcd-123456789abc" in captured[0]
     assert "exec" not in captured[0] and "--print" not in captured[0]
     assert not any(
@@ -1281,3 +1900,91 @@ def test_bare_stops_escalate_and_a_commit_resets_the_budget(
     empty_commit(lane)
     record = woken()
     assert record["attempts"] == 1 and record["exhausted_at"] is None
+
+
+def test_a_spent_budget_asks_the_operator_about_orphaned_claims(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "1")
+    with state.lock(directory / "issues.lock"):
+        ledger = issues.snapshot(directory)
+        ledger["issues"]["1"]["orphan"] = {"id": "x", "owner": "codex"}
+        write_json(directory / "issues.json", ledger)
+    idle_lane(directory, "codex", 1000)
+    send(bridge, actors["claude"], "codex")
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    sent = []
+    monkeypatch.setattr(
+        supervision.notify,
+        "deliver",
+        lambda directory, agent, event, fields: sent.append(
+            (agent, event, dict(fields))
+        ),
+    )
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = supervision.presence(directory, "codex", 1)
+    for _ in range(supervision.WORK_WAKE_ATTEMPTS):
+        supervision.wake(
+            bridge.home, directory, paired, "codex", observed, config
+        )
+        record = rewake(bridge, paired, directory, "codex", at=0)
+    assert record["exhausted_at"] and not sent
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+    agent, event, fields = sent[0]
+    assert (agent, event) == ("codex", supervision.notify.Event.ORPHAN_DECISION)
+    assert fields["issue"] == "#1"
+    assert fields["since"] == int(record["exhausted_at"])
+    assert "--take-orphaned" in fields["detail"]
+    assert fields["detail"].endswith(
+        "returns its claims and reservations once it has been dead for "
+        "the orphan ceiling."
+    )
+    assert issues.snapshot(directory)["issues"]["1"]["owner"] == "codex"
+
+
+def test_a_recovery_burst_queues_one_capture_with_merged_evidence(
+    bridge, monkeypatch
+):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def capture(directory, agent, payload, timeout, evidence=None):
+        calls.append((payload, evidence))
+        started.set()
+        release.wait(20)
+        return True
+
+    monkeypatch.setattr(checkpoints, "recover", capture)
+    lane = ("project", "codex")
+    passing = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"cmd": "make check"},
+        "tool_response": {"exit_code": 0},
+    }
+
+    def owed(payload):
+        return {
+            "directory": str(bridge.home),
+            "participant": "codex",
+            "payload": payload,
+        }
+
+    with server.Server(bridge.home, bridge.config) as instance:
+        instance.recover(lane, owed({"step": 0}))
+        assert started.wait(20)
+        instance.recover(lane, owed(passing))
+        for step in range(1, 4):
+            instance.recover(lane, owed({"step": step}))
+        release.set()
+        deadline = time.monotonic() + 20
+        while lane in instance.recovering:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+
+    assert [payload for payload, _ in calls] == [{"step": 0}, {"step": 3}]
+    assert [evidence for _, evidence in calls] == [None, passing]

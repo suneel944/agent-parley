@@ -112,7 +112,62 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "tokens",
         "Tokens the native client counted, never billed spend.",
     ),
+    (
+        "agent_parley_lane_pull_requests_opened_total",
+        "counter",
+        "pull_requests_opened",
+        "Pull requests first seen open in the outcome window.",
+    ),
+    (
+        "agent_parley_lane_pull_requests_merged_total",
+        "counter",
+        "pull_requests_merged",
+        "Pull requests a claim resolution recorded as merged.",
+    ),
+    (
+        "agent_parley_lane_pull_requests_closed_total",
+        "counter",
+        "pull_requests_closed",
+        "Pull requests that left the open list without a recorded merge.",
+    ),
+    (
+        "agent_parley_lane_first_pass_ratio",
+        "gauge",
+        "first_pass_rate",
+        "Share of merged pull requests with a known CI round count that "
+        "merged after one round and no requested change.",
+    ),
+    (
+        "agent_parley_lane_ci_rounds_unknown",
+        "gauge",
+        "ci_rounds_unknown",
+        "Merged pull requests in the outcome window with no CI round count.",
+    ),
+    (
+        "agent_parley_lane_ci_rounds_median",
+        "gauge",
+        "ci_rounds_median",
+        "Median CI rounds over merged pull requests with a known count.",
+    ),
+    (
+        "agent_parley_lane_claim_to_merge_seconds_median",
+        "gauge",
+        "claim_to_merge_seconds",
+        "Median seconds from a claim to the merge of its pull request.",
+    ),
 )
+
+NO_OUTCOMES: dict[str, int | float] = {
+    "pull_requests_opened": 0,
+    "pull_requests_merged": 0,
+    "pull_requests_closed": 0,
+    "first_pass": 0,
+    "first_pass_known": 0,
+    "first_pass_rate": 0.0,
+    "ci_rounds_unknown": 0,
+    "ci_rounds_median": 0.0,
+    "claim_to_merge_seconds": 0.0,
+}
 
 DENIAL_CAUSES = "agent_parley_lane_hook_denials_by_cause_total"
 
@@ -146,6 +201,12 @@ PROJECT_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "counter",
         "denials",
         "Denials recorded across the project's reported lanes.",
+    ),
+    (
+        "agent_parley_project_pull_requests_excluded",
+        "gauge",
+        "pull_requests_excluded",
+        "Pull requests in the outcome window that no lane owns.",
     ),
 )
 
@@ -261,15 +322,24 @@ def handoff(value: dict | None) -> dict | None:
 
 
 def request(value: dict | None) -> dict | None:
-    """Reports one operator request that the issue's owner has not answered."""
+    """Reports one takeover or operator request the owner has not answered.
+
+    Past its deadline the request is not granted by this reading alone; the
+    supervisor's grace window still decides that. The deadline only makes an
+    unanswered request read as overdue, the same way an unanswered offer does.
+    """
     if not value:
         return None
+    waiting = issues_state.offer_state(value)
     return {
         "offer_id": value["id"],
         "to": value["to"],
         "source": value.get("source") or issues_state.OPERATOR,
         "reason": value.get("reason", ""),
         "created_at": timestamp(value.get("created")),
+        "deadline_at": timestamp(waiting["deadline"]),
+        "overdue": waiting["overdue"],
+        "overdue_seconds": waiting["overdue_seconds"],
     }
 
 
@@ -522,15 +592,16 @@ def participant_detail(record: dict, participant: dict) -> dict:
 
     Returns:
         Every field the status reading carries for that lane, with the
-        worktree, the advisory limits and the wake setting the manifest
-        records. No credential value is reported; a profile name is not a
-        credential.
+        worktree, the advisory limits, the wake setting and the last launch
+        timing the manifest records. No credential value is reported; a
+        profile name is not a credential.
     """
     return {
         **record,
         "worktree": participant["lane"],
         "budget_limits": participant.get("budget") or {},
         "wake_enabled": participant.get("wake", True),
+        "launch_timing": participant.get("launch") or {},
     }
 
 
@@ -589,6 +660,7 @@ def _row(row: dict) -> dict:
         "stall": row["stall"],
         "operator_edits": list(row["operator_edits"]),
         "base_advance_paths": list(row["base_advance_paths"]),
+        "base_advance_told_at": timestamp(row["base_advance_told_at"]),
         "last_event_at": timestamp(row["last_event_ts"] or None),
         "branch": row["branch"],
         "drift": row["drift"],
@@ -606,6 +678,7 @@ def _row(row: dict) -> dict:
         "queued_requests": row["queued"],
         "queued_by": list(row["queued_by"]),
         "injected_bytes": row["injected_bytes"],
+        "injected_bytes_per_hour": row.get("injected_per_hour", 0),
         "hook_events": row["hook_events"],
         "denials": row["denials"],
         "denied_by": [dict(item) for item in row.get("denied_by") or []],
@@ -620,6 +693,9 @@ def _row(row: dict) -> dict:
         "unfit_reason": row["unfit"] or None,
         "work_offer": row["offer_kind"] or None,
         "work_dispatch": dict(row.get("work_dispatch") or {}),
+        "pull_requests": {
+            key: row.get(key, value) for key, value in NO_OUTCOMES.items()
+        },
         "prompt": row["prompt"],
     }
 
@@ -707,7 +783,9 @@ def families(view: dict) -> list[dict]:
     """Reports the exported counters and gauges of one live snapshot.
 
     Every lane series is labelled by project, participant and provider, and
-    every project series by project alone. Denials are also counted by the
+    every project series by project alone; a project series the project
+    itself carries, such as its excluded pull requests, is read from the
+    project rather than summed over its rows. Denials are also counted by the
     reason class and the tool that drew them. A field that states nothing could
     be read, such as tokens on an unreadable session record, contributes no
     sample rather than a zero, so a reader never mistakes an unread value for
@@ -773,7 +851,11 @@ def families(view: dict) -> list[dict]:
                 "samples": [
                     {
                         "labels": {"project": project["root"]},
-                        "value": _total(project["rows"], key),
+                        "value": (
+                            float(project[key] or 0)
+                            if key in project
+                            else _total(project["rows"], key)
+                        ),
                     }
                     for project in view["projects"]
                 ],

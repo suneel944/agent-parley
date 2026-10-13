@@ -1,5 +1,6 @@
 """Checks durable, bounded recovery of an integration its gate never passed."""
 
+import fcntl
 import json
 import shlex
 import subprocess
@@ -257,7 +258,7 @@ def test_repeated_failure_exhausts_into_one_escalation(
     rows = problems._integration_rows(directory, str(repo), time.time())
     assert len(rows) == 1
     assert "--renew-recovery" in rows[0]["command"]
-    with pytest.raises(BridgeError, match="from the base checkout"):
+    with pytest.raises(BridgeError, match="in the base checkout"):
         bridge.merge(failed["lane"], "claude", renew=True)
 
     lane = failed["lane"]
@@ -407,7 +408,7 @@ def test_the_operator_path_clears_only_on_a_passing_gate(
     bridge, repo, paired, gated, failed
 ):
     directory = bridge.project(repo)[1]
-    with pytest.raises(BridgeError, match="from the base checkout"):
+    with pytest.raises(BridgeError, match="in the base checkout"):
         bridge.verify_recovery(failed["lane"])
     with pytest.raises(BridgeError, match="record stands"):
         bridge.verify_recovery(repo)
@@ -445,6 +446,39 @@ def test_a_busy_issue_ledger_never_masks_the_failure(
     assert execution(bridge, repo, "42")["state"] == lifecycle.READY
 
 
+def test_a_busy_ledger_at_completion_keeps_the_record_for_a_retry(
+    bridge, repo, paired, gated, monkeypatch
+):
+    ready(bridge, paired, "claude", "42", {"work.txt": "good\n"})
+    directory = bridge.project(repo)[1]
+    real = lifecycle.complete
+
+    def contended(*args):
+        with (directory / "issues.lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            return real(*args)
+
+    monkeypatch.setattr(lifecycle, "complete", contended)
+    with pytest.raises(BridgeError, match="could not be recorded complete"):
+        bridge.merge(repo, "claude")
+    monkeypatch.setattr(lifecycle, "complete", real)
+
+    merged = git(repo, "rev-parse", "HEAD")
+    held = merges.integration_record(directory)
+    assert held["result"] == merged
+    assert "not recorded complete" in held["detail"]
+    assert execution(bridge, repo, "42")["state"] == lifecycle.READY
+
+    report = bridge.merge(repo, "claude")
+
+    assert f"Recovery verified {merged[:12]}" in report
+    assert git(repo, "rev-parse", "HEAD") == merged
+    state = execution(bridge, repo, "42")
+    assert state["state"] == lifecycle.COMPLETE
+    assert state["integrated_commit"] == merged
+    assert merges.integration_record(directory) is None
+
+
 def test_a_merge_timeout_before_any_change_burns_no_attempt(
     bridge, repo, paired, gated, failed, monkeypatch
 ):
@@ -462,6 +496,26 @@ def test_a_merge_timeout_before_any_change_burns_no_attempt(
     assert after["attempt"] == before["attempt"] == 1
     assert after["kind"] == merges.GATE_FAILED
     assert after["result"] == before["result"]
+
+
+def test_a_gate_timeout_after_the_merge_is_recorded_unverified(
+    bridge, repo, paired, monkeypatch
+):
+    hang = (
+        "import pathlib, time; "
+        "pathlib.Path('slow.txt').exists() and time.sleep(30)"
+    )
+    bridge.verification(repo, shlex.join([sys.executable, "-c", hang]))
+    ready(bridge, paired, "claude", "42", {"slow.txt": "slow\n"})
+    monkeypatch.setattr("agent_parley.worktrees.VERIFY_TIMEOUT", 1)
+
+    with pytest.raises(BridgeError, match="timed out"):
+        bridge.merge(repo, "claude")
+
+    held = merges.integration_record(bridge.project(repo)[1])
+    assert held["kind"] == merges.GATE_FAILED
+    assert held["result"] == git(repo, "rev-parse", "HEAD")
+    assert execution(bridge, repo, "42")["state"] == lifecycle.RECOVERY
 
 
 def test_a_first_merge_timeout_leaves_no_record(

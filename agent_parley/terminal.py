@@ -12,25 +12,34 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
 import termios
 import time
 import tty
 from pathlib import Path
+from typing import NamedTuple
 
 from agent_parley import dialogs
 from agent_parley.state import BridgeError, lock
 
 PROMPT = "Review pending coordination messages and handoff reminders."
+ROTATING = "busy:rotating"
 MAX_WORK_PROMPT = 2_000
 SUBMIT_DELAY = 0.2
+ESCAPE_TIMEOUT = 0.5
+ERASE = frozenset({0x08, 0x7F})
 ANSWERING = re.compile(rb"[\r\n0-9]")
 DETACHED_ROWS = 24
 DETACHED_COLUMNS = 80
 STRING_SEQUENCES = frozenset({ord("]"), ord("P"), ord("X"), ord("^"), ord("_")})
+PASTE_START = b"\x1b[200~"
+PASTE_END = b"\x1b[201~"
+PASTE_MARKER = re.compile(rb"(\x1b\[20[01]~)")
 LOG_LIMIT = 1 << 20
 TITLE_LIMIT = 96
 TITLE_CARRY = 4096
 EXEC_FAILED = 127
+SOCKET_GRACE = 60
 DRAIN_READS = 64
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 TITLE_SAVE = b"\x1b[22;0t"
@@ -85,6 +94,23 @@ def _work_bindings(ledger: dict, numbers: list[str]) -> list[dict]:
     return bindings
 
 
+def _noted(text: str, record: dict) -> str:
+    """Leads a selected prompt with its recorded headless-prompt note.
+
+    Args:
+        text: Prompt text chosen before the note.
+        record: Published wake-work record the note was read from.
+
+    Returns:
+        The note followed by `text`, bounded by `MAX_WORK_PROMPT`, or
+        `text` alone, truncated the same way, when no note was recorded.
+    """
+    note = str(record.get("note") or "")
+    if not note:
+        return text[:MAX_WORK_PROMPT]
+    return f"{note} {text}"[:MAX_WORK_PROMPT]
+
+
 def selected_prompt(
     directory: Path, name: str, home: Path | None = None
 ) -> str | None:
@@ -94,6 +120,9 @@ def selected_prompt(
     context does not cross the control socket, and a malformed or obsolete
     publication refuses delivery. A missing selection is the ordinary
     coordination prompt used by launchers outside the supervisor wake path.
+    A selection recorded with a note from a prior headless-prompt stop
+    leads the prompt with that note, naming the command and saying the
+    permission it needed was never granted.
 
     Args:
         directory: Private project state directory.
@@ -129,7 +158,9 @@ def selected_prompt(
     if offer is None:
         try:
             return (
-                PROMPT if _wake_flags(directory, name, home) == flags else None
+                _noted(PROMPT, record)
+                if _wake_flags(directory, name, home) == flags
+                else None
             )
         except (BridgeError, OSError, ValueError):
             return None
@@ -152,14 +183,15 @@ def selected_prompt(
     identifier = str(offer.get("id", ""))
     detail = str(offer.get("text", ""))
     if not identifier or not detail:
-        return PROMPT
+        return _noted(PROMPT, record)
     issues = ", ".join(f"#{number}" for number in offer.get("issues", [])[:5])
     heading = f"Act on work offer {identifier}"
     if issues:
         heading += f" for {issues}"
-    return (f"{heading}. {detail} Delivery does not claim or complete work.")[
-        :MAX_WORK_PROMPT
-    ]
+    return _noted(
+        f"{heading}. {detail} Delivery does not claim or complete work.",
+        record,
+    )
 
 
 def sweep_sockets(home: Path) -> list[str]:
@@ -171,7 +203,10 @@ def sweep_sockets(home: Path) -> list[str]:
     the kernel answers for a path no process listens on. A listening
     launcher accepts the probe, reads an empty request and answers it as
     unavailable, so probing wakes nobody; any other failure leaves the file
-    in place.
+    in place. A launcher binds its socket before it listens, and a socket in
+    that gap refuses connections too, so a refused socket younger than
+    SOCKET_GRACE seconds is kept; a crashed launcher's file is left for a
+    later sweep instead of racing a live launcher's startup.
 
     Args:
         home: Private bridge state root holding the wake sockets.
@@ -186,6 +221,12 @@ def sweep_sockets(home: Path) -> list[str]:
             try:
                 probe.connect(str(path))
             except ConnectionRefusedError:
+                try:
+                    age = time.time() - path.stat().st_mtime
+                except OSError:
+                    continue
+                if age < SOCKET_GRACE:
+                    continue
                 path.unlink(missing_ok=True)
                 removed.append(path.name)
             except OSError:
@@ -286,32 +327,72 @@ def operator_input(entered: bytes, control: bytes = b"") -> tuple[bytes, bytes]:
     return bytes(operator), b""
 
 
-def pending(entered: bytes, previous: bool) -> bool:
-    """Decides whether the operator holds a partially entered line.
+class Draft(NamedTuple):
+    """Describes the operator's unsubmitted composer draft.
+
+    Attributes:
+        characters: Characters typed without submitting them; zero means no
+            pending draft.
+        pasting: Whether a bracketed paste is still open.
+        escaped: Whether the last operator byte was ESC or a backslash, so a
+            following carriage return inserts a newline instead of
+            submitting.
+    """
+
+    characters: int = 0
+    pasting: bool = False
+    escaped: bool = False
+
+
+def draft(entered: bytes, previous: Draft) -> Draft:
+    """Follows the operator's partially entered composer draft.
 
     Terminal control traffic shares the operator's input descriptor. Complete
     recognized control sequences are removed, but bytes after them and unknown
-    escape-prefixed input are still inspected. Line submission, interruption
-    and line clearing reset the state in byte order, so later text in the same
-    read can establish a new pending line.
+    escape-prefixed input are still inspected. Only a bare carriage return
+    submits: native composers insert a newline into the draft for line feed
+    (Ctrl-J), ESC followed by carriage return (Option- or Alt-Enter), a
+    backslash followed by carriage return, and any line break inside a
+    bracketed paste, so those count as draft characters. Submission,
+    interruption and line clearing reset the count in byte order, so later
+    text in the same read can establish a new draft. Backspace and delete
+    erase one character, so a line typed and then erased reads as empty.
+    Other control bytes and UTF-8 continuation bytes add no character; a
+    control byte that edits the line in a way the count cannot follow leaves
+    it pending. An incomplete control suffix is left to the caller, which
+    carries it into the next read.
 
     Args:
-        entered: Bytes read from the operator's terminal in one call.
-        previous: Pending state before this read.
+        entered: Raw bytes read from the operator's terminal, prefixed by any
+            control suffix carried from the previous read.
+        previous: Draft state before this read.
 
     Returns:
-        True while the operator has typed text without submitting it.
+        The draft state after this read.
     """
-    entered, control = operator_input(entered)
-    if control:
-        return True
-    result = previous
-    for value in entered:
-        if value in (0x03, 0x0A, 0x0D, 0x15):
-            result = False
-        else:
-            result = True
-    return result
+    characters, pasting, escaped = previous
+    for part in PASTE_MARKER.split(entered):
+        if part in (PASTE_START, PASTE_END):
+            pasting = part == PASTE_START
+            escaped = False
+            continue
+        for value in operator_input(part)[0]:
+            printable = value == 0x09 or (
+                value >= 0x20 and not 0x80 <= value <= 0xBF
+            )
+            if pasting:
+                if printable or value in (0x0A, 0x0D):
+                    characters += 1
+            elif value == 0x0D and not escaped:
+                characters = 0
+            elif value in (0x03, 0x15):
+                characters = 0
+            elif value in ERASE:
+                characters = max(0, characters - 1)
+            elif printable or value in (0x0A, 0x0D):
+                characters += 1
+            escaped = not pasting and value in (0x1B, 0x5C)
+    return Draft(characters, pasting, escaped)
 
 
 def detached_terminal_replies(
@@ -564,9 +645,14 @@ def lane_summary(start: Path) -> str:
     """Summarizes the lane containing a directory for a native status line.
 
     A lane worktree sits directly under its project's private state
-    directory, named for its participant, so the nearest ancestor whose
-    parent holds a manifest naming it is the lane. The summary is the same
-    line `compose_title` gives the tab, without a client title.
+    directory, named for its participant or, when it began as a spare,
+    recorded as that participant's lane, so the nearest ancestor whose
+    parent holds a manifest naming it is the lane. A repository checked
+    out inside the lane may carry its own unrelated `project.json` files
+    (an Nx workspace, for instance), so a manifest that does not name the
+    candidate folder is skipped rather than treated as proof there is no
+    enclosing lane. The summary is the same line `compose_title` gives
+    the tab, without a client title.
 
     Args:
         start: Working directory of the native client.
@@ -578,12 +664,22 @@ def lane_summary(start: Path) -> str:
         manifest = _read_json(lane.parent / "project.json")
         if manifest is None:
             continue
-        if lane.name not in (manifest.get("participants") or {}):
-            return ""
+        participants = manifest.get("participants") or {}
+        name = next(
+            (
+                key
+                for key, entry in participants.items()
+                if isinstance(entry, dict)
+                and str(entry.get("lane") or "") == str(lane)
+            ),
+            lane.name if lane.name in participants else "",
+        )
+        if not name:
+            continue
         return compose_title(
             lane_title(
-                lane.name,
-                _read_json(lane.parent / f"{lane.name}-activity.json"),
+                name,
+                _read_json(lane.parent / f"{name}-activity.json"),
                 _read_json(lane.parent / "issues.json"),
                 False,
             ),
@@ -622,6 +718,48 @@ def _relay(data: bytes, bounded: bool) -> None:
         os.write(1, data)
 
 
+def call(command: list[str], lane: Path, env: dict[str, str]) -> int:
+    """Runs the native CLI without a terminal and forwards stop signals.
+
+    A lane launched without a terminal records the launcher as its session
+    process, so `participant stop` signals the launcher. The launcher passes
+    each `STOP_SIGNALS` signal on to the client, as `run` does, and keeps
+    waiting until the client exits, so a stop never leaves the client running
+    orphaned in the lane worktree. A signal that arrives before the client
+    has started is held and delivered as soon as the client exists.
+
+    Args:
+        command: Native CLI command line.
+        lane: Lane worktree the client runs in.
+        env: Environment for the client.
+
+    Returns:
+        The client's exit code, negative when a signal ended it.
+    """
+    stopping: list[int] = []
+    child: subprocess.Popen[bytes] | None = None
+
+    def stop(signum: int, frame: object = None) -> None:
+        """Records a termination request and passes it to the client."""
+        stopping.append(signum)
+        if child is not None:
+            child.send_signal(signum)
+
+    previous_stops = {
+        number: signal.getsignal(number) for number in STOP_SIGNALS
+    }
+    for number in STOP_SIGNALS:
+        signal.signal(number, stop)
+    try:
+        child = subprocess.Popen(command, cwd=lane, env=env)
+        if stopping:
+            child.send_signal(stopping[0])
+        return child.wait()
+    finally:
+        for number, handler in previous_stops.items():
+            signal.signal(number, handler)
+
+
 def run(
     command: list[str],
     lane: Path,
@@ -632,6 +770,7 @@ def run(
     inactive_after: float = 300,
     home: Path | None = None,
     titles: bool = True,
+    rotate: bool = False,
 ) -> int:
     """Runs the native CLI with its own controlling terminal and permissions.
 
@@ -666,6 +805,14 @@ def run(
     client. A client that cannot be started exits the forked child with
     status 127 and never unwinds the launcher's own stack.
 
+    With ``rotate``, a detached launcher whose lane recorded a rotation
+    point, a ready or blocked report since the session began, answers an
+    admitted wake with `ROTATING` and ends the session the way ``SIGTERM``
+    does instead of typing the prompt. The service then resumes the
+    stopped lane on its ordinary wake path, and that resume starts a fresh
+    native session. An attached launcher never ends its operator's session
+    this way; it rotates on its next resume.
+
     An attached launcher owns the tab title: the lane name, its state and
     its claim progress lead, and the client's own title follows as a suffix.
     The title is refreshed when the lane's activity record, the issue ledger
@@ -682,6 +829,8 @@ def run(
         inactive_after: Seconds without a new checkpoint before one retry.
         home: Private bridge state root for admission-time wake validation.
         titles: Whether an attached launcher sets the lane tab title.
+        rotate: Whether a detached launcher ends an idle session at a
+            rotation point instead of typing an admitted wake.
 
     Returns:
         Native process exit status.
@@ -743,6 +892,7 @@ def run(
                 bounded=bounded,
                 inactive_after=inactive_after,
                 home=home,
+                rotate=rotate,
             )
             path.unlink(missing_ok=True)
             if status is None:
@@ -773,8 +923,13 @@ def _session(
     bounded: bool,
     inactive_after: float,
     home: Path | None,
+    rotate: bool = False,
 ) -> int | None:
     """Relays one native session until the client exits or is stopped.
+
+    A control prefix the operator leaves incomplete for `ESCAPE_TIMEOUT`
+    seconds resolves as a keypress, as terminal programs resolve a lone Esc,
+    so it adds no text and stops refusing wakes as pending input.
 
     Args:
         pid: Native client process.
@@ -791,6 +946,8 @@ def _session(
         bounded: Whether standard output is a wake log to keep bounded.
         inactive_after: Seconds without a new checkpoint before one retry.
         home: Private bridge state root for admission-time wake validation.
+        rotate: Whether a detached session at a rotation point ends on an
+            admitted wake instead of receiving it.
 
     Returns:
         The client's wait status when it was reaped here, else None.
@@ -806,8 +963,9 @@ def _session(
     signal.signal(signal.SIGWINCH, resize)
     if attached:
         resize()
-    pending_input = False
+    pending_input = Draft()
     pending_control = b""
+    control_at = 0.0
     detached_control = b""
     title_control = b""
     child_title = ""
@@ -865,6 +1023,8 @@ def _session(
             waiting = 1.0
             if submit_at:
                 waiting = max(0.0, submit_at - time.monotonic())
+            if pending_control:
+                waiting = min(waiting, ESCAPE_TIMEOUT)
             ready, _, _ = select.select(descriptors, [], [], waiting)
             if submit_at and time.monotonic() >= submit_at:
                 submit_at = 0.0
@@ -874,13 +1034,20 @@ def _session(
                 entered = os.read(0, 4096)
                 if not entered:
                     break
+                carried = pending_control
                 operator, pending_control = operator_input(
                     entered, pending_control
                 )
-                pending_input = pending(operator, pending_input)
+                control_at = time.monotonic()
+                pending_input = draft(carried + entered, pending_input)
                 os.write(master, entered)
-                if watch.holding and ANSWERING.search(entered):
+                if watch.holding and ANSWERING.search(operator):
                     watch.answered()
+            if (
+                pending_control
+                and time.monotonic() - control_at >= ESCAPE_TIMEOUT
+            ):
+                pending_control = b""
             if master in ready:
                 try:
                     output = os.read(master, 65536)
@@ -900,7 +1067,7 @@ def _session(
             answer = watch.advance(
                 screen,
                 time.monotonic(),
-                bool(pending_input or pending_control),
+                bool(pending_input.characters or pending_control),
             )
             if answer:
                 with contextlib.suppress(OSError):
@@ -931,7 +1098,7 @@ def _session(
                             time.monotonic() - output_at if output_at else None,
                         ):
                             result = "busy:turn"
-                        elif pending_input or pending_control:
+                        elif pending_input.characters or pending_control:
                             result = "busy:input"
                         elif checkpoint != wake_checkpoint:
                             accepted = True
@@ -950,6 +1117,13 @@ def _session(
                             prompt = selected_prompt(lane.parent, name, home)
                             if prompt is None:
                                 result = "busy:stale"
+                            elif (
+                                rotate
+                                and not attached
+                                and state.get("rotation")
+                            ):
+                                result = ROTATING
+                                stopping.append(signal.SIGTERM)
                             else:
                                 result = "unavailable"
                                 os.write(master, prompt.encode())
@@ -974,6 +1148,7 @@ def _session(
                     forward(output)
                 break
     finally:
+        watch.close()
         if titling:
             _relay(TITLE_RESTORE, False)
         if saved is not None:

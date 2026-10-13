@@ -181,8 +181,9 @@ def test_an_issue_closed_from_a_non_lane_branch_is_observed_complete(
     assert ended["1"]["pull_request"] == 1328
     assert ended["1"]["commit"] == "abcdef1234567"
     supervision.poll(bridge.home, claimed.parent)
-    assert prompt(claimed)["trigger"] == "pull request ended"
-    assert issues.snapshot(claimed.parent)["issues"]["1"]["owner"] == "claude"
+    ended_record = issues.snapshot(claimed.parent)["issues"]["1"]
+    assert ended_record["owner"] is None
+    assert ended_record["resolution"]["actor"] == "supervisor"
 
 
 def test_an_issue_closed_before_the_claim_is_not_observed_complete(
@@ -291,6 +292,24 @@ def test_the_issue_reading_names_its_closing_pull_request(
     assert forge.issue_completion(tmp_path, "1216") is None
 
 
+@pytest.mark.parametrize("pull", [None, "", "null", "{}", "not json"])
+def test_an_unreadable_closing_pull_request_gives_no_reading(
+    monkeypatch, tmp_path, pull
+):
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    issue = {
+        "state": "CLOSED",
+        "closedAt": "2026-09-20T00:00:00Z",
+        "closedByPullRequestsReferences": [{"number": 1328}],
+    }
+
+    def run(args, timeout):
+        return json.dumps(issue) if args[1] == "issue" else pull
+
+    monkeypatch.setattr(forge, "_run", run)
+    assert forge.issue_completion(tmp_path, "1216") is None
+
+
 def test_a_hand_closed_issue_finds_its_pull_request_on_the_timeline(
     monkeypatch, tmp_path
 ):
@@ -348,6 +367,58 @@ def test_a_hand_closed_issue_finds_its_pull_request_on_the_timeline(
     reading = forge.issue_completion(tmp_path, "1216")
     assert reading["state"] == "CLOSED"
     assert reading["pull_request"] == 0
+
+
+def test_a_closing_reference_past_the_first_timeline_page_is_found(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    closing = {
+        "event": "cross-referenced",
+        "source": {
+            "issue": {
+                "number": 1328,
+                "body": "Closes #1216",
+                "pull_request": {"merged_at": "2026-09-19T00:00:00Z"},
+                "repository": {"full_name": "owner/name"},
+            }
+        },
+    }
+    full = [{"event": "labeled"}] * forge.TIMELINE_PAGE
+    pages = {"1": full, "2": [closing]}
+    requested = []
+
+    def run(args, timeout):
+        if args[1] == "issue":
+            return json.dumps(
+                {
+                    "state": "CLOSED",
+                    "closedAt": "2026-09-20T00:00:00Z",
+                    "closedByPullRequestsReferences": [],
+                }
+            )
+        if args[1] == "api":
+            page = args[2].rsplit("page=", 1)[1]
+            requested.append(page)
+            return json.dumps(pages.get(page, full))
+        return json.dumps(
+            {
+                "state": "MERGED",
+                "number": 1328,
+                "url": "https://example.invalid/pull/1328",
+                "headRefName": "fix/1216-replay",
+                "mergeCommit": {"oid": "abcdef1234567"},
+            }
+        )
+
+    monkeypatch.setattr(forge, "_run", run)
+    reading = forge.issue_completion(tmp_path, "1216")
+    assert requested == ["1", "2"]
+    assert reading["state"] == "MERGED"
+    pages["2"] = full
+    requested.clear()
+    forge.issue_completion(tmp_path, "1216")
+    assert len(requested) == forge.TIMELINE_PAGES
 
 
 def test_a_ready_report_on_an_observed_complete_claim_asks_for_completion(

@@ -5,11 +5,48 @@ from __future__ import annotations
 import importlib.util
 import sys
 
-__version__ = "0.12.0"
+__version__ = "0.18.2"
 
 
 class BridgeError(Exception):
-    """An actionable operational failure."""
+    """An actionable operational failure.
+
+    A refusal names what was refused and why in its message, and the exact
+    command that resolves it in ``next_command``. The command stays out of
+    the message so the text and the ``--json`` error document keep their
+    shape; `refusal` joins the two for a reader.
+
+    Attributes:
+        next_command: The one command to run next, or empty when no single
+            command resolves the failure.
+    """
+
+    def __init__(self, *args: object, next_command: str = "") -> None:
+        """Records the failure message and the command that resolves it.
+
+        Args:
+            *args: Exception arguments; the first is the message.
+            next_command: The one command to run next, or empty.
+        """
+        super().__init__(*args)
+        self.next_command = next_command
+
+
+def refusal(exc: BaseException) -> str:
+    """Words a failure in the shared refusal shape a user reads.
+
+    The first line is the message: what was refused and why. A failure that
+    names a resolving command adds a ``next:`` line carrying it, so every
+    refusal ends on the command that fixes it.
+
+    Args:
+        exc: The failure to word.
+
+    Returns:
+        The message, followed by a ``next:`` line when the failure has one.
+    """
+    command = getattr(exc, "next_command", "")
+    return f"{exc}\nnext: {command}" if command else str(exc)
 
 
 def _defer_cli() -> None:

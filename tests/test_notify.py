@@ -1,5 +1,6 @@
 """Checks outbound notification selection, formatting and delivery."""
 
+import io
 import json
 import smtplib
 import sys
@@ -252,7 +253,8 @@ def test_the_same_situation_notifies_once(tmp_path, fake):
         offer_context(offer="def456"),
     )
     notify.drain()
-    assert len(fake) == 2
+    bodies = "\n".join(body for _, body in fake)
+    assert bodies.count("\ndecision: ") == 2
     marker = json.loads((tmp_path / "codex-notify.json").read_text())
     assert set(marker) == {"handoff_offered"}
 
@@ -281,6 +283,40 @@ def test_a_refused_send_records_one_event_and_moves_on(tmp_path, refusing):
         "notification_failed"
     ]
     assert "the bot token is rejected" in recorded[0]["cause"]
+
+
+def test_a_refused_send_is_sent_again_on_the_next_observation(
+    tmp_path, refusing
+):
+    for _ in range(2):
+        assert notify.deliver(
+            tmp_path, "codex", notify.Event.RUN_FINISHED, {"session": "s1"}
+        )
+        notify.drain()
+    assert not (tmp_path / "codex-notify.json").exists()
+
+
+def test_a_send_abandoned_by_an_exiting_process_is_not_marked(
+    tmp_path, monkeypatch
+):
+    started = []
+    monkeypatch.setitem(
+        notify.TRANSPORTS,
+        "fake",
+        lambda config, subject, body: started.append(subject),
+    )
+    monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "fake")
+    monkeypatch.setattr(notify, "_SENDING", set())
+    monkeypatch.setattr(notify, "_THREADS", [])
+    monkeypatch.setattr(notify.threading.Thread, "start", lambda self: None)
+    assert notify.deliver(
+        tmp_path, "codex", notify.Event.RUN_FINISHED, {"session": "s1"}
+    )
+    assert not notify.deliver(
+        tmp_path, "codex", notify.Event.RUN_FINISHED, {"session": "s1"}
+    )
+    assert not (tmp_path / "codex-notify.json").exists()
+    assert started == []
 
 
 def test_the_test_message_reports_each_transport(tmp_path, fake):
@@ -346,14 +382,17 @@ def test_an_idle_lane_past_the_grace_period_notifies_once(
         )
         == []
     )
+    notify.drain()
+    assert len(fake) == 1
+    assert "A lane is idle with no claim" in fake[0][0]
+    assert "idle 900s with no claim" in fake[0][1]
     write_json(directory / "codex-activity.json", {"updated": 2000.0})
     assert supervision.announce_idle(
         directory, manifest, ["codex"], {"codex": 900}, 600
     ) == ["codex"]
     notify.drain()
     assert len(fake) == 2
-    assert "A lane is idle with no claim" in fake[0][0]
-    assert "idle 900s with no claim" in fake[0][1]
+    assert "A lane is idle with no claim" in fake[1][0]
 
 
 def test_a_broken_transport_leaves_the_sweep_running(tmp_path, monkeypatch):
@@ -404,3 +443,118 @@ def test_a_lane_without_transports_skips_the_notifier(tmp_path, monkeypatch):
         == ""
     )
     assert not Path(tmp_path / "codex-notify.json").exists()
+
+
+@pytest.fixture
+def unset(monkeypatch):
+    """Clears every stored notification variable from the environment."""
+    for key in notify.STORED_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_stored_settings_are_owner_only_and_merge_by_key(tmp_path, unset):
+    notify.store(tmp_path, {"AGENT_PARLEY_TELEGRAM_TOKEN": "t0ken"})
+    path = notify.store(tmp_path, {"AGENT_PARLEY_TELEGRAM_CHAT": "42"})
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert notify.stored(tmp_path) == {
+        "AGENT_PARLEY_TELEGRAM_TOKEN": "t0ken",
+        "AGENT_PARLEY_TELEGRAM_CHAT": "42",
+    }
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_SMTP_HOST"):
+        notify.store(tmp_path, {"AGENT_PARLEY_SMTP_HOST": "mail"})
+
+
+def test_the_environment_overrides_the_stored_settings(
+    tmp_path, unset, monkeypatch
+):
+    notify.store(
+        tmp_path,
+        {"AGENT_PARLEY_NOTIFY": "telegram", "AGENT_PARLEY_TELEGRAM_CHAT": "1"},
+    )
+    monkeypatch.setenv("AGENT_PARLEY_TELEGRAM_CHAT", "2")
+    values = notify.environment(tmp_path)
+    assert values["AGENT_PARLEY_NOTIFY"] == "telegram"
+    assert values["AGENT_PARLEY_TELEGRAM_CHAT"] == "2"
+    assert notify.enabled(tmp_path)
+    assert not notify.enabled()
+    assert "AGENT_PARLEY_NOTIFY" not in notify.environment()
+
+
+def test_a_service_with_no_environment_sends_on_stored_settings(
+    tmp_path, fake, monkeypatch
+):
+    monkeypatch.delenv("AGENT_PARLEY_NOTIFY")
+    directory = tmp_path / "projects" / "demo"
+    directory.mkdir(parents=True)
+    notify.store(tmp_path, {"AGENT_PARLEY_NOTIFY": "fake"})
+    manifest = {"root": "demo", "participants": {}}
+    checkpoints.announce(
+        directory,
+        "codex",
+        manifest,
+        {"provider": "codex"},
+        {"hook_event_name": "SessionEnd", "session_id": "s1"},
+        checkpoints.Reason.OBSERVED,
+    )
+    notify.drain()
+    assert len(fake) == 1
+
+
+def test_setup_reads_the_token_from_stdin_and_never_prints_it(
+    tmp_path, unset, monkeypatch, capsys
+):
+    home = tmp_path / "agent_parley_home"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("s3cret-token\n"))
+    assert not invoke(monkeypatch, "notify", "setup", "--chat", "42")
+    printed = capsys.readouterr().out
+    assert "s3cret-token" not in printed
+    assert "Notify: outbound on (telegram); inbound off" in printed
+    stored = notify.stored(home)
+    assert stored["AGENT_PARLEY_TELEGRAM_TOKEN"] == "s3cret-token"
+    assert stored["AGENT_PARLEY_TELEGRAM_CHAT"] == "42"
+    assert (home / notify.STORED_NAME).stat().st_mode & 0o077 == 0
+
+
+def test_setup_refuses_a_short_passcode_and_stores_nothing(
+    tmp_path, unset, monkeypatch
+):
+    home = tmp_path / "agent_parley_home"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("token\nshort\n"))
+    with pytest.raises(BridgeError, match="passcode"):
+        cli.secret_settings("42", True)
+    assert notify.stored(home) == {}
+
+
+def test_the_notify_line_says_why_each_direction_is_off(unset):
+    off = notify.reported({})
+    assert not off["enabled"]
+    line = cli.notification_line(off, {"enabled": False, "fault": ""})
+    assert "outbound off: No notification transport is configured" in line
+    assert "inbound off: AGENT_PARLEY_INBOUND is not set" in line
+    half = notify.reported({"AGENT_PARLEY_NOTIFY": "telegram"})
+    assert "AGENT_PARLEY_TELEGRAM_TOKEN" in half["fault"]
+    whole = notify.reported(
+        {
+            "AGENT_PARLEY_NOTIFY": "telegram",
+            "AGENT_PARLEY_TELEGRAM_TOKEN": "t",
+            "AGENT_PARLEY_TELEGRAM_CHAT": "1",
+        }
+    )
+    assert cli.notification_line(whole, {"enabled": True, "fault": ""}) == (
+        "Notify: outbound on (telegram); inbound on"
+    )
+
+
+def test_the_inbound_reader_counts_only_after_the_latest_start(tmp_path):
+    from agent_parley import inbound
+
+    log = tmp_path / "server.log"
+    assert not inbound.polling(tmp_path)
+    log.write_text(
+        "2026-09-29T10:00:00+0000 bound 127.0.0.1:1\n"
+        f"2026-09-29T10:00:01+0000 inbound {inbound.POLLING}\n"
+    )
+    assert inbound.polling(tmp_path)
+    with log.open("a") as stream:
+        stream.write("2026-09-29T11:00:00+0000 bound 127.0.0.1:1\n")
+    assert not inbound.polling(tmp_path)

@@ -74,6 +74,7 @@ SIGNATURE_CHARS = 200
 REPORT_CHARS = 1200
 REPORT_LINES = 4
 REPORT_WIDTH = 100
+COMMAND_CHARS = 300
 OPTION_LABEL = 60
 ESCALATE_AFTER = 30.0
 REPEAT_LIMIT = 2
@@ -92,8 +93,17 @@ ASK = "ask"
 FREE_TEXT = "type something"
 SHELL_TITLE = "Bash command"
 BRIDGE_ANSWER = "Yes"
+SHELL_NOTICE = "This command requires approval"
 SHELL_OPERATORS = re.compile(r"[;&|<>$`\\]")
+DECISION_KIND = "native_dialog"
+TERMINAL_ONLY = "terminal-only: answer it in the lane's terminal"
+WIDENING = re.compile(
+    r"auto mode|don.t ask again|always|allow all|for this session|bypass",
+    re.IGNORECASE,
+)
+REFUSING = re.compile(r"no\b", re.IGNORECASE)
 BOX = re.compile(r"[─-╿]")
+ROW_BREAKS = re.compile(r"\r\n|[\r\n]|\x1b\[[0-9;]*[ABEFHdf]")
 
 ESCAPES = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
@@ -226,6 +236,27 @@ def flatten(data: bytes) -> str:
     """
     text = ESCAPES.sub(" ", data.decode("utf-8", "replace"))
     return " ".join(CONTROL.sub(" ", text).split())
+
+
+def rows(data: bytes) -> list[str]:
+    """Renders a pseudo-terminal byte stream as the rows it draws.
+
+    A line feed, a carriage return and every escape that moves the cursor to
+    another row or to an absolute position end a row, so a command drawn on
+    two rows stays two rows however the client paints them. Box drawing is
+    blanked like any other border.
+
+    Args:
+        data: Bytes read from the client's pseudo-terminal.
+
+    Returns:
+        Each non-blank row in drawing order, whitespace collapsed to one
+        space.
+    """
+    text = ROW_BREAKS.sub("\n", data.decode("utf-8", "replace"))
+    text = BOX.sub(" ", CONTROL.sub(" ", ESCAPES.sub(" ", text)))
+    drawn = (" ".join(line.split()) for line in text.split("\n"))
+    return [line for line in drawn if line]
 
 
 def _picker_start(region: str, end: int) -> int:
@@ -635,7 +666,7 @@ def _opted_in(manifest: dict, name: str, key: str) -> bool:
     return chosen is True
 
 
-def bridge_shell(screen: str, text: str) -> bool:
+def bridge_shell(screen: str, text: str, data: bytes) -> bool:
     """Reports whether a shell permission prompt asks for this bridge's CLI.
 
     The protocol prompt orders every lane to run `protocol.cli_command`
@@ -643,11 +674,16 @@ def bridge_shell(screen: str, text: str) -> bool:
     parks on the first such command. Only a prompt titled as a shell command
     whose command begins with that exact interpreter and module, and whose
     remainder carries no shell operator that could chain a second command,
-    qualifies. Any other screen escalates as before.
+    qualifies. A newline chains commands too, and the flattened screen
+    cannot show one, so the drawn rows must hold the command on one row
+    followed by at most the description row and the client's approval
+    notice. A long command the client wraps onto a second row therefore
+    escalates as well. Any other screen escalates as before.
 
     Args:
         screen: Flattened screen text.
         text: Part of the screen that draws the prompt's question and options.
+        data: Terminal bytes the screen was flattened from.
 
     Returns:
         True when the prompt asks to run this bridge's CLI and nothing else.
@@ -661,7 +697,63 @@ def bridge_shell(screen: str, text: str) -> bool:
     command = protocol.cli_command() + " "
     if not shown.startswith(command):
         return False
-    return SHELL_OPERATORS.search(shown[len(command) :]) is None
+    if SHELL_OPERATORS.search(shown[len(command) :]) is not None:
+        return False
+    body = _shell_rows(data)
+    return 1 <= len(body) <= 2 and body[0].startswith(command)
+
+
+def _shell_rows(data: bytes) -> list[str]:
+    """Reads the rows a shell prompt draws between its title and question.
+
+    Args:
+        data: Terminal bytes that draw the prompt.
+
+    Returns:
+        The rows after the last shell title and before the prompt's question,
+        without a closing approval notice, or no rows when no title is drawn.
+    """
+    drawn = rows(data)
+    titles = [at for at, row in enumerate(drawn) if SHELL_TITLE in row]
+    if not titles:
+        return []
+    first = drawn[titles[-1]]
+    rest = first[first.rfind(SHELL_TITLE) + len(SHELL_TITLE) :].strip()
+    body = [rest] if rest else []
+    question = BY_NAME[PERMISSION].pattern
+    for row in drawn[titles[-1] + 1 :]:
+        if question.search(row):
+            break
+        body.append(row)
+    if body[-1:] == [SHELL_NOTICE]:
+        body.pop()
+    return body
+
+
+def requested_command(screen: str, text: str, data: bytes) -> str:
+    """Reads what a permission prompt asks to run from the rows above it.
+
+    The question and its options say only that something waits for
+    approval; the operator answering from a notice, and a later wake of a
+    lane whose session ended at the prompt, need the command itself. A
+    shell prompt's command rows are read as `_shell_rows` reads them, and
+    any other prompt yields the text drawn above its question.
+
+    Args:
+        screen: Flattened screen text.
+        text: Part of the screen that draws the prompt's question and options.
+        data: Terminal bytes the screen was flattened from.
+
+    Returns:
+        The command or tool description, at most `COMMAND_CHARS` characters
+        from its end, or an empty string when nothing is drawn above it.
+    """
+    shown = " ".join(_shell_rows(data))
+    if not shown:
+        region = screen[-REGION_CHARS:]
+        head = region[: max(0, len(region) - len(text))]
+        shown = " ".join(BOX.sub(" ", head).split())
+    return shown[-COMMAND_CHARS:]
 
 
 def standing_reply(manifest: dict, name: str) -> str:
@@ -755,6 +847,7 @@ class Watch:
         self._answered_at = 0.0
         self._answered_tail = b""
         self._repeats: dict[str, int] = {}
+        self._decision = ""
 
     def _opted_in(self) -> bool:
         """Reads whether this lane's operator allows this bridge's own tools.
@@ -835,6 +928,7 @@ class Watch:
         found = locate(screen)
         signature = self._describe(screen, found)
         if signature != self._signature:
+            self._retire()
             self._signature = signature
             self._since = now
             self._resolved = False
@@ -844,6 +938,10 @@ class Watch:
         if not signature:
             self._release()
             return b""
+        if self._resolved and self._decision:
+            pressed = self._carry(found, held)
+            if pressed:
+                return pressed
         if self._resolved and not self._approvable(screen, found):
             return b""
         return self._act(screen, found, now, held)
@@ -861,7 +959,7 @@ class Watch:
             and found is not None
             and found.dialog.name == PERMISSION
             and not self._answers.get(PERMISSION)
-            and bridge_shell(screen, found.text)
+            and bridge_shell(screen, found.text, self._tail)
             and self._opted_in()
         )
 
@@ -903,11 +1001,15 @@ class Watch:
                 ],
             }
         else:
+            if dialog.name == PERMISSION:
+                detail = {
+                    "command": requested_command(screen, found.text, self._tail)
+                }
             answer = self._answers.get(dialog.name, "")
             if (
                 not answer
                 and dialog.name == PERMISSION
-                and bridge_shell(screen, found.text)
+                and bridge_shell(screen, found.text, self._tail)
                 and self._opted_in()
             ):
                 answer = BRIDGE_ANSWER
@@ -976,7 +1078,12 @@ class Watch:
         """Parks the lane on a screen no configured answer covers.
 
         A question carries its own text and option lines into the record and
-        the notice, so the operator can answer from the notice alone.
+        the notice, so the operator can answer from the notice alone; a
+        permission prompt leads with the command it asks to run, from
+        `requested_command`, for the same reason. A recognized dialog that
+        offers options is also recorded as a decision
+        offering those options, so the operator can answer it from the chat;
+        a prompt this watcher cannot read is named as terminal-only instead.
         """
         extra = dict(detail or {})
         if not self._publish(
@@ -986,7 +1093,149 @@ class Watch:
         shown = " ".join(report(screen))
         if extra.get("options"):
             shown = " | ".join((label, *extra["options"]))
-        self._notify(label, shown)
+        if extra.get("command"):
+            shown = f"{extra['command']} | {shown}"
+        if dialog is None:
+            shown = f"{TERMINAL_ONLY} | {shown}"
+        self._notify(label, shown, self._ask(dialog, label, screen, shown))
+
+    def _ask(
+        self, dialog: Dialog | None, label: str, text: str, shown: str
+    ) -> str:
+        """Records the decision a recognized dialog puts to the operator.
+
+        The options are the labels the client draws, so an answer names the
+        same choice a keypress at the terminal would. An option that widens a
+        permission, such as switching to auto mode or not asking again, takes
+        the same confirming answer an irreversible one does, and a refusing
+        option is the recommendation for a permission or trust prompt. The
+        free-text option of a question picker is not offered, because text
+        from the chat is never typed into a lane. The decision is keyed by the
+        screen and the instant it was first drawn, so a later drawing of an
+        identical dialog asks afresh rather than taking an old answer.
+
+        Args:
+            dialog: The recognized dialog, or None for an unreadable prompt.
+            label: What the operator is asked.
+            text: Screen text drawing the dialog and its options.
+            shown: What the notice shows of the screen.
+
+        Returns:
+            The decision identifier, or an empty string when the dialog offers
+            no options to answer with or the record could not be written.
+        """
+        self._decision = ""
+        if dialog is None or dialog.action == EXHAUSTED:
+            return ""
+        offered = [
+            option
+            for option in options(text).values()
+            if not _comparable(option).startswith(FREE_TEXT)
+        ]
+        if not offered:
+            return ""
+        refusing = [option for option in offered if REFUSING.match(option)]
+        widening: list[str] = []
+        if dialog.name == PERMISSION:
+            widening = [item for item in offered if WIDENING.search(item)]
+        from agent_parley import decisions, roster
+
+        project = ""
+        with contextlib.suppress(BridgeError, OSError, ValueError, KeyError):
+            project = str(roster.read(self._directory).get("root", ""))
+        key = hashlib.sha256(
+            f"{self._signature}\x00{self._since}".encode()
+        ).hexdigest()[:16]
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            record = decisions.open_or_refresh(
+                self._directory,
+                project=project,
+                lane=self._name,
+                kind=DECISION_KIND,
+                key=key,
+                question=label,
+                options=offered,
+                recommended=(
+                    refusing[0] if refusing and dialog.action == ANSWER else ""
+                ),
+                detail=shown,
+                confirm=widening,
+            )
+            self._decision = str(record["id"])
+        return self._decision
+
+    def _carry(self, found: Frame | None, held: bool) -> bytes:
+        """Presses the option the operator chose for the dialog on screen.
+
+        The screen was re-read on this pass and still compares equal to the
+        one the decision was opened for, which is what a changed screen would
+        not. The answer is claimed under the decision lock before its keys
+        are returned, so it is pressed at most once. An answer the screen no
+        longer offers is never pressed: the decision is retired as stale and
+        the lane stays parked on the dialog.
+
+        Args:
+            found: The dialog the screen still draws.
+            held: Whether the operator is holding a partially entered line.
+
+        Returns:
+            The keystrokes for the chosen option, or empty bytes.
+        """
+        if found is None or held:
+            return b""
+        from agent_parley import decisions
+
+        record: dict = {}
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            record = decisions.get(self._directory, self._decision)
+        if record.get("state") != decisions.ANSWERED:
+            return b""
+        answer = str(record.get("answer", ""))
+        pressed = keys(found.text, answer)
+        if not pressed:
+            self._retire()
+            return b""
+        carried = False
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            carried = decisions.applied(self._directory, self._decision)
+        if not carried:
+            return b""
+        self._decision = ""
+        self._publish(
+            found.dialog,
+            found.text,
+            {
+                "label": found.dialog.label,
+                "answer": answer,
+                "keys": pressed.decode().strip(),
+                "answered_by": str(record.get("answered_by", "")),
+            },
+        )
+        self.answered()
+        return pressed
+
+    def close(self) -> None:
+        """Retires the open decision when the launcher stops relaying.
+
+        Once the launcher exits, no screen is left to press an answer on, so
+        a later answer is refused instead of being recorded and never
+        carried out.
+        """
+        self._retire()
+
+    def _retire(self) -> None:
+        """Marks the decision for a screen that is gone as stale.
+
+        A later answer to it is refused, and one already given is never
+        pressed on whatever dialog replaced it.
+        """
+        if not self._decision:
+            return
+        from agent_parley import decisions
+
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            decisions.stale(self._directory, self._decision)
+        self._decision = ""
 
     def _evidence(self, name: str, reset: float | None) -> str:
         """Identifies one screen situation for a durable observation."""
@@ -1081,16 +1330,23 @@ class Watch:
                 evidence="dialog released",
             )
 
-    def _notify(self, label: str, detail: str) -> None:
-        """Sends the operator one message carrying what the screen shows."""
+    def _notify(self, label: str, detail: str, decision: str = "") -> None:
+        """Sends the operator one message carrying what the screen shows.
+
+        A decision already recorded for the dialog is named, so the message
+        offers the dialog's own options rather than a generic one.
+        """
         from agent_parley import notify
 
+        fields = {"dialog": label, "detail": detail}
+        if decision:
+            fields["decision"] = decision
         with contextlib.suppress(BridgeError, OSError, ValueError):
             notify.deliver(
                 self._directory,
                 self._name,
                 notify.Event.NATIVE_DIALOG,
-                {"dialog": label, "detail": detail},
+                fields,
             )
 
 

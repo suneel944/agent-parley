@@ -4,7 +4,8 @@
 lane filed, but neither lets an operator sit on one participant and see its
 coordination activity as it happens. This module tails the records that
 already exist: the issue ledger, the per-lane report log, the store's mail,
-reservations and served calls, and the lane's hook event log. Each poll reads
+reservations and served calls, the lane's hook event log, and its blueprint
+runs' current node and nodes passed. Each poll reads
 the same substrates the snapshot commands read, keeps a cursor over what it
 has already printed, and prints only what is new.
 
@@ -35,7 +36,7 @@ from pathlib import Path
 from agent_parley import checkpoints, history, store, views
 from agent_parley.state import BridgeError
 
-KINDS = (*history.KINDS, "call", "denied", "session")
+KINDS = (*history.KINDS, "call", "denied", "session", "blueprint")
 BACKLOG = 20
 INTERVAL = 0.5
 HORIZON = 300.0
@@ -191,6 +192,34 @@ def _hooks(directory: Path, name: str, since: float) -> list:
     return entries
 
 
+def _blueprints(directory: Path, name: str) -> list:
+    """Reads the current node and nodes passed of the lane's blueprint runs.
+
+    A run's record changes as it moves, so its key carries the node, status
+    and nodes passed: each step prints once, and a lane without a run
+    prints nothing new.
+    """
+    from agent_parley import blueprints
+
+    entries = []
+    for number, run in blueprints.for_lane(directory, name).items():
+        key = json.dumps(
+            [number, run["node"], run["status"], run["passed"]],
+            sort_keys=True,
+        )
+        entries.append(
+            _entry(
+                "blueprint",
+                float(run.get("updated") or run.get("started") or 0),
+                name,
+                f"blueprint {blueprints.line(number, run)}",
+                f"blueprint:{key}",
+                issue=int(number),
+            )
+        )
+    return entries
+
+
 def collect(
     home: Path,
     directory: Path,
@@ -217,6 +246,7 @@ def collect(
         *_history(home, directory, manifest, name),
         *_store(home, manifest, name),
         *_hooks(directory, name, since),
+        *_blueprints(directory, name),
     ]
     selected = [
         record

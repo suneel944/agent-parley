@@ -138,6 +138,80 @@ def test_rejects_a_listing_without_capabilities(tmp_path):
     ]
 
 
+def test_rejects_a_category_the_portal_does_not_list(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root, lambda interface: interface.update(category="Coding")
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.category must be one of the portal's categories"
+    ]
+
+
+def test_rejects_a_listing_that_names_another_assistant(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root,
+        lambda interface: interface.update(
+            longDescription="Runs beside ChatGPT and Gemini."
+        ),
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex listing names another AI assistant: chatgpt, gemini"
+    ]
+
+
+def test_archive_keywords_come_from_the_codex_manifest(tmp_path):
+    bundle = codex_bundle.build(ROOT, tmp_path)
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read(".claude-plugin/plugin.json"))
+    codex = json.loads(
+        (
+            ROOT / codex_bundle.PLUGIN_DIRECTORY / ".codex-plugin/plugin.json"
+        ).read_text()
+    )
+    assert manifest["keywords"] == codex["keywords"]
+
+
+def test_rejects_a_listing_without_policy_urls(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root, lambda interface: interface.pop("privacyPolicyURL")
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.privacyPolicyURL must be an https URL"
+    ]
+
+
+def test_archive_packs_the_listing_skill(tmp_path):
+    bundle = codex_bundle.build(ROOT, tmp_path)
+    listing = ROOT / codex_bundle.PLUGIN_DIRECTORY / codex_bundle.LISTING_SKILLS
+    with zipfile.ZipFile(bundle) as archive:
+        skill = archive.read("skills/coordinate/SKILL.md")
+    assert skill == (listing / "coordinate" / "SKILL.md").read_bytes()
+    for text in ("verify set", "participant merge", "pre-approved"):
+        assert text not in skill.decode()
+
+
+def test_rejects_a_listing_skill_that_drifts(tmp_path):
+    root = copy_repository(tmp_path)
+    skill = (
+        root
+        / codex_bundle.PLUGIN_DIRECTORY
+        / codex_bundle.LISTING_SKILLS
+        / "coordinate"
+        / "SKILL.md"
+    )
+    skill.write_text(skill.read_text().replace("Inspect", "Read", 1))
+    assert codex_bundle.manifest_errors(root) == [
+        "listing skill coordinate frontmatter differs"
+    ]
+    skill.unlink()
+    assert codex_bundle.manifest_errors(root) == [
+        "listing skill coordinate is missing or has no repository skill"
+    ]
+
+
 def test_rejects_interface_block_in_claude_manifest(tmp_path):
     root = copy_repository(tmp_path)
     path = root / codex_bundle.PLUGIN_DIRECTORY / ".claude-plugin/plugin.json"

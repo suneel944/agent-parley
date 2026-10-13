@@ -30,6 +30,7 @@ import contextlib
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 from agent_parley.state import BridgeError, lock
@@ -47,6 +48,7 @@ CAPACITY = "capacity"
 PROMPT = "prompt"
 APPROVAL = "approval"
 CAUSES = frozenset({DIALOG, CAPACITY, PROMPT, APPROVAL})
+PROVIDER_ERROR = "provider error"
 TRANSITIONS: dict[str, frozenset[str]] = {
     "": frozenset({STARTING, WORKING, IDLE, BLOCKED, STOPPED, DEAD}),
     STARTING: frozenset({STARTING, WORKING, IDLE, BLOCKED, STOPPED, DEAD}),
@@ -71,6 +73,8 @@ HOOK_STATES = {
     "Stop": IDLE,
     "SessionEnd": STOPPED,
 }
+INFERENCES = {"dialog": "dialog watcher", "liveness": "liveness"}
+"""Evidence sources that infer a lane state, with the name views print."""
 MAX_EVIDENCE = 200
 MAX_EVENTS = 2000
 SPOOL = "lane-evidence.jsonl"
@@ -131,6 +135,22 @@ ACCOUNT_FIELDS = (
     "owns",
     "accounted",
 )
+EXTRAS = "-wt"
+
+
+def extras(lane: Path | str) -> Path:
+    """Names the one directory a lane keeps its extra worktrees in.
+
+    The lane hook and the reclaim sweep both read it, so it lives with the
+    lane record, which the hook already loads, rather than in the sweep.
+
+    Args:
+        lane: The lane's own worktree.
+
+    Returns:
+        The `<lane>-wt` directory beside the lane, in the same parent.
+    """
+    return Path(f"{lane}{EXTRAS}")
 
 
 def ensure(db: sqlite3.Connection) -> None:
@@ -209,16 +229,23 @@ def _event(
     detail: str = "",
     now: float,
 ) -> None:
-    """Appends one lane event and bounds the project's retained history."""
+    """Appends one lane event and bounds the project's retained history.
+
+    `accounting` events and every other kind are bounded separately, each
+    to `MAX_EVENTS` per project, so accounting rows written on every poll
+    never evict the transitions an operator reads as lane history.
+    """
     db.execute(
         "INSERT INTO lane_events(project,lane,kind,source,target,cause,"
         "evidence,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)",
         (root, lane, kind, source, target, cause, evidence, detail, now),
     )
+    metered = int(kind == "accounting")
     db.execute(
-        "DELETE FROM lane_events WHERE project=? AND id<=(SELECT id FROM "
-        "lane_events WHERE project=? ORDER BY id DESC LIMIT 1 OFFSET ?)",
-        (root, root, MAX_EVENTS),
+        "DELETE FROM lane_events WHERE project=? AND (kind='accounting')=? "
+        "AND id<=(SELECT id FROM lane_events WHERE project=? "
+        "AND (kind='accounting')=? ORDER BY id DESC LIMIT 1 OFFSET ?)",
+        (root, metered, root, metered, MAX_EVENTS),
     )
 
 
@@ -480,13 +507,16 @@ def sample(
     *,
     dead_after: float,
     now: float | None = None,
+    read_at: float | None = None,
 ) -> dict | None:
     """Applies one liveness sample and ages a stopped lane into `dead`.
 
     A lane is dead once it has been stopped for `dead_after` seconds, or once
     the evidence the sample was derived from is that old, so a lane that was
     already long gone when this record was first written is not given a
-    second grace period.
+    second grace period. A reading taken before the lane's last transition
+    moves nothing, because the transition, such as a launch recording
+    `starting` while the poll waited for the store, is newer evidence.
 
     Args:
         db: Open write transaction on the coordination store.
@@ -495,6 +525,8 @@ def sample(
         observed: Presence reading taken by the supervision poll.
         dead_after: Seconds a stopped lane waits before it reads as dead.
         now: Unix time of the sample, or None for the current time.
+        read_at: Unix time the reading was taken, or None when it was taken
+            inside this transaction.
 
     Returns:
         The lane's record once the sample is applied, or None when the lane
@@ -502,7 +534,12 @@ def sample(
     """
     moment = time.time() if now is None else now
     record = read(db, root, lane)
-    move = from_liveness(record, observed)
+    stale = (
+        read_at is not None
+        and record is not None
+        and float(record["since"]) > read_at
+    )
+    move = None if stale else from_liveness(record, observed)
     if move is not None:
         state, cause = move
         record = transition(
@@ -775,6 +812,7 @@ def account(
     *,
     has_work: bool,
     owns: bool,
+    idle_cause: str = "",
     now: float | None = None,
 ) -> dict | None:
     """Adds the time since the last poll to a lane's idle and claim totals.
@@ -782,7 +820,11 @@ def account(
     Idle time is time the lane spent `idle`, `blocked`, `stopped` or `dead`
     while claimable or owned work existed. Unaccountable time is time the
     lane owned a claim while it was not `working`. Each total is kept per
-    state and cause, so the largest one can be named. The span since the
+    state and cause, so the largest one can be named. An idle lane records
+    no cause of its own, so the caller can name one it read elsewhere, such
+    as `PROVIDER_ERROR` for a turn that ended on a retryable provider
+    failure, and the gap is charged under `idle: provider error`. The span
+    since the
     last poll is split where the lane last changed state: the part before
     is charged to the state and work the last poll saw, the rest to the
     current ones. A span longer than `ACCOUNT_GAP`, a stopped service,
@@ -796,6 +838,7 @@ def account(
         record: The lane's current state record, or None.
         has_work: Whether claimable or owned work exists for the lane.
         owns: Whether the lane owns an open claim.
+        idle_cause: Cause an idle lane's gap is charged under, or empty.
         now: Unix time of the poll, or None for the current time.
 
     Returns:
@@ -807,6 +850,8 @@ def account(
     ensure(db)
     previous = read_accounts(db, root).get(lane)
     current = label(record)
+    if idle_cause and current == IDLE:
+        current = f"{IDLE}: {idle_cause}"
     totals: dict = {
         "observed": 0.0,
         "idle": 0.0,
@@ -1061,3 +1106,71 @@ def describe(record: dict, now: float | None = None) -> str:
         else (record["state"])
     )
     return f"{named} {held}"
+
+
+def provenance(
+    record: dict | None, unavailable: Iterable[str] = ()
+) -> dict | None:
+    """Names what put a lane in its recorded state and the hook it lacked.
+
+    Every observation reaches a record with its source as the evidence
+    prefix: `apply` writes the hook event, `dialog` for the terminal
+    watcher or `launch` for a launch deadline, and `sample` writes
+    `liveness`. A state the watcher or the liveness sample set is inferred,
+    because no hook of the native client confirmed it. The gap is the hook
+    events that would have confirmed that state when the lane's adapter
+    raises none of them, so a gap is only named where the client truly has
+    no hook for it, never for a state no hook of any client reports.
+
+    Args:
+        record: Lane state record as `read` returns it, or None.
+        unavailable: Hook events the lane's adapter cannot raise, as
+            `roster.unavailable_hooks` names them.
+
+    Returns:
+        The `source` (`hook`, a name in `INFERENCES`, or `supervision`),
+        whether the state is `inferred`, and the `gap` of hook events behind
+        an inferred state, or None when the lane has no record.
+    """
+    if record is None:
+        return None
+    prefix = str(record["evidence"]).partition(": ")[0]
+    inferred = prefix in INFERENCES
+    confirming = [
+        event
+        for event, state in HOOK_STATES.items()
+        if state == record["state"]
+        and (state != BLOCKED or record["cause"] == APPROVAL)
+    ]
+    missing = set(unavailable)
+    return {
+        "source": (
+            "hook"
+            if prefix in HOOK_STATES
+            else INFERENCES.get(prefix, "supervision")
+        ),
+        "inferred": inferred,
+        "gap": (
+            confirming
+            if inferred and confirming and missing.issuperset(confirming)
+            else []
+        ),
+    }
+
+
+def inference(seen: dict | None) -> str:
+    """Words an inferred lane state for the operator views.
+
+    Args:
+        seen: Provenance as `provenance` returns it, or None.
+
+    Returns:
+        Text such as ``inferred by dialog watcher, no PermissionRequest
+        hook``, or an empty string for a hook-confirmed or unrecorded state.
+    """
+    if not seen or not seen["inferred"]:
+        return ""
+    note = f"inferred by {seen['source']}"
+    if seen["gap"]:
+        note += f", no {'/'.join(seen['gap'])} hook"
+    return note

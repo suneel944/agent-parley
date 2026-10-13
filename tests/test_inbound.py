@@ -1,10 +1,12 @@
-"""Checks the read-only inbound status reader and its passcode gate."""
+"""Checks the inbound status reader, decision answers and the passcode gate."""
 
+import json
 import threading
+from pathlib import Path
 
 import pytest
 
-from agent_parley import inbound, notify
+from agent_parley import decisions, inbound, notify, store
 
 PASSCODE = "correct-horse-battery"
 CONFIG = {
@@ -261,7 +263,174 @@ def test_status_reports_the_inbound_configuration_fault(
     monkeypatch.delenv("AGENT_PARLEY_INBOUND_PASSCODE", raising=False)
     bridge.status()
     printed = capsys.readouterr().out
-    assert "Inbound: AGENT_PARLEY_INBOUND_PASSCODE must be set" in printed
+    assert "inbound off: AGENT_PARLEY_INBOUND_PASSCODE must be set" in printed
     monkeypatch.delenv("AGENT_PARLEY_INBOUND")
     bridge.status()
-    assert "Inbound:" not in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "inbound off: AGENT_PARLEY_INBOUND is not set" in printed
+
+
+@pytest.fixture
+def mail(monkeypatch):
+    """Records the supervisor mail an answer hands to its lane."""
+    spoken: list[dict] = []
+
+    def speak(home, root, name, subject, body, key, **options):
+        spoken.append(
+            {"name": name, "subject": subject, "body": body, "key": key}
+        )
+        return {"id": len(spoken)}
+
+    monkeypatch.setattr(store, "speak", speak)
+    return spoken
+
+
+def waiting(paired, reversibility=decisions.REVERSIBLE):
+    """Opens one decision for the codex lane under the bridge's state."""
+    return decisions.open_or_refresh(
+        Path(paired["lanes"]["codex"]).parent,
+        project="/repo",
+        lane="codex",
+        kind="handoff_offered",
+        key="s1",
+        question="A handoff offer is waiting",
+        options=("accept", "decline"),
+        reversibility=reversibility,
+    )
+
+
+def tapping(name, index, chat=42, confirmed=False, markup=None):
+    """Builds the callback query one button tap produces."""
+    return {
+        "update_id": 9,
+        "callback_query": {
+            "id": "q1",
+            "from": {"id": 5},
+            "data": decisions.callback(name, index, confirmed=confirmed),
+            "message": {
+                "message_id": 11,
+                "chat": {"id": chat},
+                "text": "Agent Parley: 1 decision is waiting",
+                "reply_markup": markup or {"inline_keyboard": []},
+            },
+        },
+    }
+
+
+def test_a_tap_answers_the_decision_and_hands_it_to_the_lane(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired)
+    other = [{"text": "go", "callback_data": "d:other:0"}]
+    markup = decisions.keyboard([record])
+    markup["inline_keyboard"].append(other)
+    verdict = inbound.serve(
+        bridge.home, CONFIG, gate, tapping(record["id"], 1, markup=markup)
+    )
+    assert verdict == inbound.ACCEPTED
+    stored = decisions.find(bridge.home, record["id"])[1]
+    assert stored["state"] == decisions.ANSWERED
+    assert stored["answer"] == "decline"
+    assert stored["answered_by"] == "telegram:5"
+    methods = [method for method, _ in calls]
+    assert methods == ["editMessageText", "answerCallbackQuery"]
+    edited = calls[0][1]
+    assert "answered decline by telegram:5" in edited["text"]
+    assert json.loads(edited["reply_markup"]) == {"inline_keyboard": [other]}
+    assert mail[0]["name"] == "codex"
+    assert mail[0]["key"] == f"decision:{record['id']}"
+    assert "decline" in mail[0]["subject"]
+
+
+def test_a_second_tap_is_refused_with_who_answered_first(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired)
+    inbound.serve(bridge.home, CONFIG, gate, tapping(record["id"], 0))
+    calls.clear()
+    verdict = inbound.serve(bridge.home, CONFIG, gate, tapping(record["id"], 1))
+    assert verdict == inbound.REFUSED
+    assert calls[-1][0] == "answerCallbackQuery"
+    assert "already answered accept" in calls[-1][1]["text"]
+    assert len(mail) == 1
+
+
+def test_a_tap_from_another_chat_or_an_unknown_decision_is_dropped(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired)
+    assert (
+        inbound.serve(bridge.home, CONFIG, gate, tapping(record["id"], 0, 99))
+        == inbound.DROPPED
+    )
+    assert calls == []
+    verdict = inbound.serve(bridge.home, CONFIG, gate, tapping("nope", 0))
+    assert verdict == inbound.REFUSED
+    assert "No decision nope" in calls[-1][1]["text"]
+    stored = decisions.find(bridge.home, record["id"])[1]
+    assert stored["state"] == decisions.OPEN
+
+
+def test_an_irreversible_option_waits_for_the_confirming_tap(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired, decisions.IRREVERSIBLE)
+    first = inbound.serve(bridge.home, CONFIG, gate, tapping(record["id"], 0))
+    assert first == inbound.ACCEPTED
+    stored = decisions.find(bridge.home, record["id"])[1]
+    assert stored["state"] == decisions.OPEN
+    button = json.loads(calls[0][1]["reply_markup"])["inline_keyboard"][0][0]
+    assert button["callback_data"] == decisions.callback(
+        record["id"], 0, confirmed=True
+    )
+    assert mail == []
+    inbound.serve(
+        bridge.home, CONFIG, gate, tapping(record["id"], 0, confirmed=True)
+    )
+    assert decisions.find(bridge.home, record["id"])[1]["answer"] == "accept"
+    assert len(mail) == 1
+
+
+def test_a_typed_answer_carries_its_note_quoted_to_the_lane(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired)
+    text = f"{PASSCODE} decide {record['id']} accept take it after lunch"
+    verdict = inbound.serve(bridge.home, CONFIG, gate, message(text))
+    assert verdict == inbound.ACCEPTED
+    assert replies(calls)[-1].startswith(f"Decision {record['id']} answered")
+    stored = decisions.find(bridge.home, record["id"])[1]
+    assert stored["note"] == "take it after lunch"
+    assert "> take it after lunch" in mail[0]["body"]
+    assert "not an instruction" in mail[0]["body"]
+
+
+def test_a_reply_to_a_one_decision_digest_answers_it(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired)
+    update = message(f"{PASSCODE} decline not today")
+    update["message"]["reply_to_message"] = {
+        "text": decisions.compose([record])[1]
+    }
+    inbound.serve(bridge.home, CONFIG, gate, update)
+    stored = decisions.find(bridge.home, record["id"])[1]
+    assert stored["answer"] == "decline"
+    assert stored["note"] == "not today"
+
+
+def test_a_malformed_or_closed_typed_answer_is_refused_in_the_reply(
+    bridge, paired, gate, calls, mail
+):
+    record = waiting(paired)
+    inbound.serve(bridge.home, CONFIG, gate, message(f"{PASSCODE} decide x"))
+    assert replies(calls)[-1] == inbound.DECIDE_USAGE
+    decisions.close(Path(paired["lanes"]["codex"]).parent, record["id"])
+    inbound.serve(
+        bridge.home,
+        CONFIG,
+        gate,
+        message(f"{PASSCODE} decide {record['id']} accept"),
+    )
+    assert "already closed" in replies(calls)[-1]
+    assert mail == []

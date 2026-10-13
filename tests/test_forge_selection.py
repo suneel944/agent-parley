@@ -90,8 +90,25 @@ def test_the_null_forge_keeps_numbers_bare_and_calls_nothing(repo, monkeypatch):
     assert forge.issue_pull_request_paths(repo, "42") == []
     assert forge.branch_completion(repo, "parley/x/lane-1") is None
     assert forge.assign(repo, "42") is False
+    assert forge.assigned(repo, "42") is False
     assert forge.unassign(repo, "42") is False
     assert forge.comment(repo, "42", "Lane account") is False
+
+
+def test_github_reads_whether_the_signed_in_account_holds_an_issue(
+    repo, monkeypatch
+):
+    replies = {"api": "operator\n", "issue": '{"assignees": []}'}
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    monkeypatch.setattr(forge, "_run", lambda args, timeout: replies[args[1]])
+    assert forge.assigned(repo, "568") is False
+    replies["issue"] = '{"assignees": [{"login": "operator"}]}'
+    assert forge.assigned(repo, "568") is True
+    replies["issue"] = "not json"
+    assert forge.assigned(repo, "568") is False
+    replies["api"] = None
+    assert forge.assigned(repo, "568") is False
 
 
 def test_beads_speaks_through_bd_and_absorbs_failure(

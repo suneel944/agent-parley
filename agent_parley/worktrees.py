@@ -93,7 +93,8 @@ def preserve_pending(root: Path) -> str | None:
     if git(root, "status", "--porcelain"):
         raise BridgeError(
             f"The checkout at {root} still holds changes that Git cannot "
-            "stash. Commit or preserve them first; worktrees start at HEAD."
+            "stash. Commit or preserve them first; worktrees start at HEAD.",
+            next_command=f"git -C {shlex.quote(str(root))} status --short",
         )
     entry = git(root, "rev-parse", "refs/stash")
     return (
@@ -124,6 +125,24 @@ def drift(name: str, participant: dict, actual: str) -> str:
     )
 
 
+def commit_all(lane: Path) -> str:
+    """Builds the command that commits every pending change in a lane.
+
+    A lane branch is private to its participant, so a work-in-progress
+    commit there keeps the changes on the branch the lane already owns.
+    Untracked files are staged too, because a commit of tracked files alone
+    leaves the checkout dirty and the refusal would repeat.
+
+    Args:
+        lane: Worktree holding the pending changes.
+
+    Returns:
+        A shell command line that stages and commits everything pending.
+    """
+    quoted = shlex.quote(str(lane))
+    return f"git -C {quoted} add -A && git -C {quoted} commit -m wip"
+
+
 def verify_base(
     root: Path, command: list[str], integrated: bool = False
 ) -> None:
@@ -145,10 +164,17 @@ def verify_base(
             and is unverified. Nothing is ever reset or reverted either way.
 
     Raises:
-        BridgeError: If the command cannot run, or if it exits non-zero.
-        subprocess.TimeoutExpired: If verification exceeds its timeout.
+        BridgeError: If the command cannot run, if it exits non-zero, or if
+            it exceeds its timeout. A timeout is a failed gate like any
+            other, so every caller records it the same way.
     """
     quoted = shlex.join(command)
+    outcome = (
+        "The merge commits already recorded stand and are unverified; "
+        "nothing was reset or reverted."
+        if integrated
+        else "Nothing was merged."
+    )
     try:
         result = subprocess.run(
             command,
@@ -163,18 +189,88 @@ def verify_base(
             f"not run: {exc}. Correct it with `agent-parley verify set`, then "
             "rerun; merge never skips verification."
         ) from None
+    except subprocess.TimeoutExpired:
+        raise BridgeError(
+            f"Verification timed out in the base checkout at {root}: "
+            f"`{quoted}` ran past {VERIFY_TIMEOUT} seconds. Make it finish "
+            "within the limit and rerun; merge never skips verification. "
+            f"{outcome}"
+        ) from None
     if not result.returncode:
         return
-    outcome = (
-        "The merge commits already recorded stand and are unverified; "
-        "nothing was reset or reverted."
-        if integrated
-        else "Nothing was merged."
-    )
     raise BridgeError(
         f"Verification failed in the base checkout at {root}: `{quoted}` "
         f"exited {result.returncode}. Fix it and rerun; merge never skips "
         f"verification. {outcome} See the command output above."
+    )
+
+
+def preparation(worktree: float, init: float) -> dict:
+    """Records how long one lane's preparation took before its launch.
+
+    The record is kept on the lane's roster entry with ``start`` unset. The
+    launch that follows completes it, which is how that launch tells a lane
+    it prepared itself from one an earlier run left behind.
+
+    Args:
+        worktree: Seconds spent creating the worktree and its branch.
+        init: Seconds spent running the project's ``init`` command.
+
+    Returns:
+        The partial launch timing, in seconds rounded to milliseconds.
+    """
+    return {
+        "worktree": round(worktree, 3),
+        "init": round(init, 3),
+        "start": None,
+    }
+
+
+def launched(prepared: object, total: float) -> dict:
+    """Completes a lane's launch timing at the moment its CLI starts.
+
+    Args:
+        prepared: Timing recorded on the roster entry, if any. Only one that
+            no launch has completed yet counts toward this launch; a lane an
+            earlier run prepared cost this run neither step.
+        total: Seconds from the start of ``run`` to the native CLI's start.
+
+    Returns:
+        The worktree, ``init`` and CLI start shares, their total, and the
+        wall-clock time the CLI started. The CLI start share is everything
+        else ``run`` did first: registration, the service and the native
+        configuration.
+    """
+    fresh = prepared if isinstance(prepared, dict) else {}
+    if fresh.get("start") is not None:
+        fresh = {}
+    worktree = float(fresh.get("worktree") or 0.0)
+    init = float(fresh.get("init") or 0.0)
+    return {
+        "worktree": worktree,
+        "init": init,
+        "start": round(max(total - worktree - init, 0.0), 3),
+        "total": round(total, 3),
+        "at": time.time(),
+    }
+
+
+def launch_line(timing: object) -> str:
+    """Describes a lane's last launch timing for ``participant show``.
+
+    Args:
+        timing: Launch timing from the lane's roster entry, if any.
+
+    Returns:
+        One line splitting the time to CLI start, or an empty string when no
+        launch has completed a timing yet.
+    """
+    if not isinstance(timing, dict) or timing.get("total") is None:
+        return ""
+    return (
+        f"Last launch: {timing['total']:.2f}s to CLI start (worktree "
+        f"{timing['worktree']:.2f}s, init {timing['init']:.2f}s, CLI start "
+        f"{timing['start']:.2f}s)"
     )
 
 

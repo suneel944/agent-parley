@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 
 from agent_parley.policy import has_attribution
-from scripts import codex_bundle, release_publish
+from scripts import check_mcp_manifests, codex_bundle, release_publish
 
 TOLERATED_WARNINGS = frozenset({"protocol"})
 
@@ -354,6 +354,7 @@ def main() -> None:
         if json.loads(path.read_text())["version"] != metadata["version"]:
             errors.append(f"{client} plugin version differs from package")
     errors.extend(codex_bundle.manifest_errors(root))
+    errors.extend(check_mcp_manifests.manifest_errors(root))
     errors.extend(plugin_validation_errors(root))
     marketplace = json.loads(
         (root / ".claude-plugin/marketplace.json").read_text()

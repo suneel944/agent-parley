@@ -26,27 +26,48 @@ commits, so no work leaves with the row.
 Lanes also make worktrees of their own, for pull requests and sub-tasks, and
 Git registers each against the project repository. Those are read from
 `git worktree list` and attributed to a lane by path, when they sit inside a
-lane or the project state directory, or by branch, when their branch is
-named after a lane. A worktree no lane accounts for is the operator's and is
-never touched. An attributed one is removed when it is clean, carries no
-commit that neither the base checkout nor its upstream has, and either the
-base already holds its head, its lane retired, or it has been untouched past
-the inactivity threshold. Uncommitted changes and unpushed commits keep it
-unless the operator forces the removal, and a forced removal first writes a
-recovery checkpoint holding both.
+lane or its `<lane>-wt` directory, or directly inside the project state
+directory or a project directory of the state root the product used before
+its rename, or by branch, when
+their branch is named after a lane. Git records no creator, so a worktree
+no lane accounts for is assessed by the same rule wherever it sits; one any
+process works inside is kept. A
+worktree is removed when it is clean, holds no file Git ignores,
+carries no commit that neither the base checkout nor its upstream has, and
+either the base already holds its head, its lane retired, or it has been
+untouched past the inactivity threshold. Uncommitted changes and unpushed
+commits keep it unless the operator forces the removal, and a forced
+removal first writes a recovery checkpoint holding both; an ignored file
+keeps it regardless, because no force can recover what was never tracked.
+Regenerable tool output alone, such as a virtual environment, bytecode and
+tool caches or package build metadata, keeps nothing: a rerun recreates it.
+
+A lane-made worktree outside its lane's `<lane>-wt` directory is first moved
+there with `git worktree move`, which never deletes, so the sweep can read it
+by path, and every other one outside the lanes is moved into the project's
+`strays` directory the same way; one Git refuses to move is assessed in
+place. A worktree moved underneath the product, by that sweep or by the
+operator, is found again by branch, so a move never reads as a loss.
 """
 
 import os
+import shlex
 import sqlite3
 import subprocess
+import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from agent_parley import forge, issues, store
+from agent_parley import forge, issues, pool, retirement, store
+from agent_parley.lanes import extras
 from agent_parley.state import BridgeError, LockBusy, lock
 
 GIT_SECONDS = 5
+RELOCATE_AFTER = 3600
 MAX_REPORTED_PATHS = 10
+RENAMED_HOMES = {"agent-parley": "agent-bridge"}
+RETIRED_FILES = ("-work.json", "-wake-work.json", "-mcp.json", "-wake.log")
+WAKE_LOG_RETENTION = 2 * 24 * 3600
 
 MERGED = "its pull request merged"
 STOPPED = (
@@ -65,7 +86,6 @@ STALE = (
     "it has been untouched past the inactivity threshold and its commits "
     "are all on its upstream"
 )
-FOREIGN = "no lane made it"
 GONE = "its branch is gone from its upstream"
 OUTSIDE = "its worktree is outside the project state directory"
 UNREGISTERED = "the base checkout does not register its worktree"
@@ -74,16 +94,53 @@ SESSION = "a session is running in it"
 IDLE = "an idle session is still running in it"
 CLAIMED = "it still holds a claim"
 UNCOMMITTED = "it holds uncommitted changes"
+IGNORED = "it holds files Git does not track elsewhere"
 UNMERGED = "its branch holds commits the base checkout does not have"
 UNUSED = "its branch never left the commit its lane was created from"
 UNPUSHED = "its branch holds commits its upstream does not have"
+ABSORBED = (
+    "its unpushed commits already landed in the base checkout through "
+    "another branch"
+)
 PULL_OPEN = "its pull request is still open"
 PUBLISHED = "its upstream still carries its branch"
 PULL_CLOSED = "its pull request was closed without merging"
 UNLANDED = "nothing shows its branch landed"
-REMOVABLE = frozenset(
-    {MERGED, GONE, STOPPED, VANISHED, MISSING, CONTAINED, ABANDONED, STALE}
+MOVED = "its worktree moved to another path Git registers"
+STRAYED = "it sits outside its lane and the lane's -wt directory"
+ADRIFT = "no lane made it and it sits outside the project's strays directory"
+FOREIGN = (
+    "no lane made it and it sits outside the repository, the state "
+    "directory and temporary directories"
 )
+REFUSED = "Git refused to move it"
+FRESH = "it changed within the relocation grace period"
+NESTED = "another registered worktree sits inside it"
+STRAYS = "strays"
+TEMPORARY = ("/tmp", "/var/tmp", "/dev/shm")
+REMOVABLE = frozenset(
+    {
+        MERGED,
+        GONE,
+        STOPPED,
+        VANISHED,
+        MISSING,
+        CONTAINED,
+        ABANDONED,
+        STALE,
+        ABSORBED,
+    }
+)
+REGENERABLE = frozenset(
+    {
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
+)
+BUNDLED = frozenset({ABSORBED})
 FORCEABLE = frozenset({UNCOMMITTED, UNPUSHED, RECENT})
 
 
@@ -266,6 +323,36 @@ def _busy(directory: Path, name: str) -> bool:
         return True
 
 
+def _occupied(path: Path) -> bool:
+    """Reports whether any process works inside a worktree.
+
+    Moving a directory out from under a process strands its shell or
+    session, whoever started it, so every process whose working directory
+    is the worktree or lies inside it counts. Linux exposes that through
+    `/proc`; a host without it, such as macOS, reports none, and only the
+    owning lane's session lock guards the move there.
+
+    Args:
+        path: Worktree about to be moved.
+
+    Returns:
+        Whether a readable process has its working directory inside it.
+    """
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+    target = path.resolve()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(entry / "cwd")).is_relative_to(target):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def assess(
     directory: Path,
     manifest: dict,
@@ -284,7 +371,9 @@ def assess(
     severity. Containment comes first, because a path the project does not
     own is never touched whatever its contents say. A lane whose worktree
     is gone is decided next, on held work alone, because Git has nothing
-    left to read in it. Registration follows, then held work, then
+    left to read in it; but one whose branch Git registers at another
+    existing path was moved, not lost, and is kept with the command that
+    moves it back. Registration follows, then held work, then
     uncommitted files, then commits the base checkout or the upstream does
     not carry, then a branch that never left the commit its lane was created
     from, which is reclaimed only once the lane has stopped and stayed
@@ -346,6 +435,12 @@ def assess(
         return {**row, **_outcome(OUTSIDE)}
     blocker = SESSION if busy else CLAIMED if claimed else held
     if not lane.exists():
+        if moved := relocated(root, lane, branch):
+            return {
+                **row,
+                **_outcome(MOVED, [moved]),
+                "remedy": moved_remedy(lane, moved),
+            }
         return {**row, **_outcome(blocker or VANISHED)}
     if registered is None:
         return {**row, **_outcome(UNREADABLE)}
@@ -383,6 +478,33 @@ def _changed(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+def _used(path: Path) -> float:
+    """Reads when a worktree was last in use, as far as the disk records.
+
+    A session working from the base checkout never keeps its working
+    directory inside the worktree, and editing a file in a subdirectory
+    leaves the worktree directory's own time alone. Git rewrites the
+    worktree's index on status, add and commit, and its HEAD on every
+    commit or checkout, so the latest of the three times marks recent use.
+
+    Args:
+        path: Linked worktree whose `.git` file names its Git directory.
+
+    Returns:
+        The latest modification time of the worktree directory, its index
+        and its HEAD, or the directory's alone when its `.git` file cannot
+        be read.
+    """
+    try:
+        pointer = (path / ".git").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return _changed(path)
+    gitdir = path / pointer.removeprefix("gitdir:").strip()
+    return max(
+        _changed(path), _changed(gitdir / "index"), _changed(gitdir / "HEAD")
+    )
 
 
 def _quiet(directory: Path, name: str, lane: Path, after: float) -> bool:
@@ -505,8 +627,59 @@ def _entries(root: str) -> list[dict] | None:
     return found
 
 
+def relocated(root: str, lane: Path, branch: str) -> str:
+    """Finds where Git now registers a worktree whose recorded path is gone.
+
+    A worktree moved with `git worktree move`, by the sweep or by the
+    operator, keeps its branch and its registration under a new path, so a
+    recorded path that no longer exists is read against the registrations
+    by branch before anything treats it as gone. The main worktree, which
+    Git always lists first, is skipped: a lane worktree cannot be moved
+    onto the base checkout, so that branch match means the operator checked
+    the branch out there after the lane vanished.
+
+    Args:
+        root: Base checkout the worktree is registered with.
+        lane: Recorded worktree path.
+        branch: The branch that worktree has checked out.
+
+    Returns:
+        The existing linked worktree path Git registers that branch at, or
+        an empty string when the recorded path still exists, the branch is
+        empty, or no other existing linked registration carries it.
+    """
+    if not branch or lane.exists():
+        return ""
+    for entry in (_entries(root) or [])[1:]:
+        if entry["branch"] == branch and Path(entry["path"]).exists():
+            return entry["path"]
+    return ""
+
+
+def moved_remedy(lane: Path, moved: str) -> str:
+    """Names the command that returns a moved lane worktree to its place.
+
+    Args:
+        lane: The lane's recorded worktree path.
+        moved: The path Git registers that worktree at now.
+
+    Returns:
+        A sentence naming the move and the `git worktree move` reversing it.
+    """
+    back = shlex.join(["git", "worktree", "move", moved, str(lane)])
+    return (
+        f"its worktree now sits at {moved}; Agent Parley keeps the lane, "
+        f"and `{back}` returns it"
+    )
+
+
 def size(path: Path) -> int:
-    """Totals the bytes of every regular file under a directory.
+    """Totals the bytes of every file under a directory, once per inode.
+
+    Worktrees and clones on one filesystem share Git objects through hard
+    links, so a file reached under several names is counted the first time
+    only. The total is then the space the files take, as `du -sb` reports
+    it, rather than the sum of every name.
 
     Args:
         path: Directory measured; symbolic links are counted, not followed.
@@ -515,18 +688,92 @@ def size(path: Path) -> int:
         The total in bytes, counting only what could be read.
     """
     total = 0
+    seen: set[tuple[int, int]] = set()
     for folder, _, files in os.walk(path, onerror=lambda error: None):
         for file in files:
             try:
-                total += os.lstat(os.path.join(folder, file)).st_size
+                found = os.lstat(os.path.join(folder, file))
             except OSError:
                 continue
+            if found.st_nlink > 1:
+                inode = (found.st_dev, found.st_ino)
+                if inode in seen:
+                    continue
+                seen.add(inode)
+            total += found.st_size
     return total
 
 
 def _within(path: Path, parent: Path) -> bool:
-    """Reports whether a path lies inside, or is, another directory."""
-    return path == parent or parent in path.parents
+    """Reports whether a path lies inside, or is, another directory.
+
+    Both paths are already resolved, so a string prefix answers without
+    building the parent chain of every registered worktree for every lane.
+    """
+    inside = str(path)
+    outside = str(parent)
+    return inside == outside or inside.startswith(outside + os.sep)
+
+
+def owned_roots(directory: Path) -> list[Path]:
+    """Names the directories whose direct children the project itself made.
+
+    The product places every lane and every worktree a lane adds for a
+    sub-task directly inside a project state directory, so only a direct
+    child is the project's. A worktree nested deeper, such as one an
+    operator adds under a directory of their own beside the lanes, is
+    theirs. The project state directory is one such directory. The
+    project directories under the state root the product used before its
+    rename are the others: lanes created then were registered with the
+    same repository from beneath them, and no lane of the current
+    manifest accounts for them any longer. They are only claimed when the
+    current state root carries the product's own default name, so a
+    relocated state root never reaches into a sibling the operator owns.
+    The project's `strays` directory, where `relocations` moves every
+    worktree no lane made, is one too.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        Resolved directories, the project state directory first.
+    """
+    home = directory.parent.parent
+    found = [directory.resolve(), directory.resolve() / STRAYS]
+    if renamed := RENAMED_HOMES.get(home.name):
+        legacy = (home.parent / renamed / "projects").resolve()
+        found.extend(sorted(path for path in legacy.glob("*") if path.is_dir()))
+    return found
+
+
+def _disposable(path: Path, directory: Path, root: str) -> bool:
+    """Reports whether a worktree sits where throwaway checkouts are made.
+
+    Agent Parley and the agents it runs make their scratch worktrees inside
+    the repository, such as under `.claude/worktrees`, under the state
+    root and in temporary directories. A worktree no lane accounts for
+    anywhere else, such as one a system service runs from, belongs to the
+    operator, so a sweep reports it and neither moves nor removes it.
+
+    Args:
+        path: Resolved worktree path.
+        directory: Private project state directory.
+        root: Base checkout of the project repository.
+
+    Returns:
+        Whether the worktree lies inside the repository, the state root,
+        a directory `owned_roots` names or a temporary directory.
+    """
+    places = [
+        Path(root).resolve(),
+        directory.parent.parent.resolve(),
+        *owned_roots(directory),
+        *(
+            Path(folder).resolve()
+            for folder in (*TEMPORARY, tempfile.gettempdir())
+        ),
+    ]
+    return any(_within(path, place) for place in places)
 
 
 def _unpushed(root: str, entry: dict, ahead: list[str]) -> list[str] | None:
@@ -551,6 +798,48 @@ def _unpushed(root: str, entry: dict, ahead: list[str]) -> list[str] | None:
     return _ahead(root, reference, entry["head"])
 
 
+def _absorbed(root: str, head: str) -> bool:
+    """Reports whether the base checkout already holds a head's changes.
+
+    A branch squash-merged or cherry-picked through another branch keeps
+    commits no ref of the base carries, yet merging it into the base
+    changes nothing. Git's own merge is the test: the head is absorbed
+    only when the merge applies cleanly and leaves the base's tree exactly
+    as it is. A conflict, an older Git without `merge-tree --write-tree`
+    and any other failure are all no.
+
+    Args:
+        root: Base checkout whose head is merged into.
+        head: Commit whose changes are looked for.
+
+    Returns:
+        True only when the merge result is the base head's own tree.
+    """
+    merged = _read(root, "merge-tree", "--write-tree", "HEAD", head)
+    if not merged:
+        return False
+    base = _read(root, "rev-parse", "HEAD^{tree}")
+    return bool(base) and merged.splitlines()[0] == base
+
+
+def _regenerable(path: str) -> bool:
+    """Reports whether an ignored path is tool output a rerun recreates.
+
+    Args:
+        path: Worktree-relative path Git ignores.
+
+    Returns:
+        Whether any component of the path is a virtual environment, a
+        Python bytecode or tool cache, or package build metadata. Every
+        other ignored path, such as `.env` or a data directory, may hold
+        content that exists nowhere else.
+    """
+    return any(
+        part in REGENERABLE or part.endswith(".egg-info")
+        for part in PurePosixPath(path).parts
+    )
+
+
 def _stray(
     root: str,
     entry: dict,
@@ -571,7 +860,11 @@ def _stray(
     Returns:
         The condition that decided it and any paths or commits it names.
         Only a condition in `REMOVABLE` allows a removal, and only one in
-        `FORCEABLE` allows a forced one.
+        `FORCEABLE` allows a forced one. A worktree holding files Git
+        ignores is always kept: `git worktree remove` would delete them
+        with the tree, and no force writes a checkpoint of untracked
+        content, so a forced removal could not protect them either. Only
+        regenerable tool output, as `_regenerable` decides, is exempt.
     """
     path = Path(entry["path"])
     if entry["locked"]:
@@ -585,6 +878,12 @@ def _stray(
         return UNREADABLE, []
     if changed:
         return UNCOMMITTED, changed
+    ignored = retirement.ignored_files(str(path))
+    if ignored is None:
+        return UNREADABLE, []
+    kept = [name for name in ignored if not _regenerable(name)]
+    if kept:
+        return IGNORED, kept
     head = entry["head"]
     if not head:
         return UNREADABLE, []
@@ -596,6 +895,9 @@ def _stray(
         if unpushed is None:
             return UNREADABLE, []
         if unpushed:
+            quiet = retired or time.time() - _changed(path) > after
+            if quiet and _absorbed(root, head):
+                return ABSORBED, unpushed
             return UNPUSHED, unpushed
     if retired:
         return ABANDONED, []
@@ -620,11 +922,11 @@ def _owner(
             prefix first; each lane contributes its name and its branch.
 
     Returns:
-        The lane whose worktree contains it, else the lane its branch is
-        named after, else an empty string.
+        The lane whose worktree, or whose `<lane>-wt` directory, contains
+        it, else the lane its branch is named after, else an empty string.
     """
     for lane, name in lanes.items():
-        if _within(path, Path(lane)):
+        if _within(path, Path(lane)) or _within(path, extras(lane)):
             return name
     for prefix, name in prefixes:
         if branch == prefix or branch.startswith((f"{prefix}-", f"{prefix}/")):
@@ -632,18 +934,146 @@ def _owner(
     return ""
 
 
+def _owner_index(
+    manifest: dict,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Builds the lookups `_owner` needs from a project manifest.
+
+    Args:
+        manifest: Project manifest naming the root and participants.
+
+    Returns:
+        Resolved lane worktree path to participant name, and branch prefix
+        to participant name, longest prefix first.
+    """
+    participants = manifest["participants"]
+    lanes = {
+        str(Path(participant["lane"]).resolve()): name
+        for name, participant in participants.items()
+    }
+    prefixes = sorted(
+        {
+            (prefix, name)
+            for name, participant in participants.items()
+            for prefix in (name, participant.get("branch") or name)
+        },
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+    return lanes, prefixes
+
+
+def child_worktrees(directory: Path, manifest: dict, name: str) -> list[Path]:
+    """Lists the worktrees one lane made beyond its own, under the project.
+
+    A lane can run a project's own tooling from its shell and have that
+    tooling add further Git worktrees, for a pull request or a sub-task,
+    directly inside the project state directory beside every lane. Git
+    registers each one against the project repository the same way it
+    registers a lane, so the same attribution `strays` uses names which
+    lane made it: by path, when the worktree sits inside that lane or its
+    `<lane>-wt` directory, or by
+    branch, when its branch is named after that lane. Only worktrees Git
+    already registers are read; nothing here scans the filesystem.
+
+    Args:
+        directory: Private project state directory holding the lanes.
+        manifest: Project manifest naming the root and participants.
+        name: Participant whose own worktrees are listed.
+
+    Returns:
+        Resolved paths Git registers and attributes to this lane, its own
+        lane worktree excluded, empty when Git could not be read.
+    """
+    return children_by_lane(manifest).get(name, [])
+
+
+def children_by_lane(manifest: dict) -> dict[str, list[Path]]:
+    """Attributes every registered worktree beyond the lanes in one read.
+
+    `child_worktrees` answers for one lane; a surface that asks for every
+    lane of a project, as `problems` does, would otherwise list the
+    repository's worktrees and attribute each of them once per lane, and
+    a project with hundreds of registrations made that the whole cost of
+    the command. This lists and attributes them once.
+
+    Args:
+        manifest: Project manifest naming the root and participants.
+
+    Returns:
+        Participant name to the resolved worktree paths attributed to it,
+        the base checkout and every lane's own worktree excluded; empty when
+        Git could not be read.
+    """
+    entries = _entries(manifest["root"])
+    if entries is None:
+        return {}
+    lanes, prefixes = _owner_index(manifest)
+    excluded = {str(Path(manifest["root"]).resolve()), *lanes}
+    found: dict[str, list[Path]] = {}
+    for entry in entries:
+        if entry["path"] in excluded:
+            continue
+        path = Path(entry["path"])
+        if owner := _owner(path, entry["branch"], lanes, prefixes):
+            found.setdefault(owner, []).append(path)
+    return found
+
+
+def _lane_made(
+    directory: Path, manifest: dict, entries: list[dict]
+) -> list[dict]:
+    """Drops the registrations no lane made beside its own worktree.
+
+    Args:
+        directory: Private project state directory holding the spares.
+        manifest: Project manifest naming the root and participants.
+        entries: Parsed registrations of the project repository.
+
+    Returns:
+        The entries left once the base checkout, every lane's own worktree,
+        the recorded spares and any worktree on the branch of a lane that
+        has not retired are dropped. The last is a lane worktree an
+        operator moved, which is the lane itself and never a stray.
+    """
+    lanes, _ = _owner_index(manifest)
+    skipped = {
+        str(Path(manifest["root"]).resolve()),
+        *lanes,
+        *(
+            str(Path(spare["path"]).resolve())
+            for spare in pool.spares(directory)
+        ),
+    }
+    branches = {
+        participant["branch"]
+        for participant in manifest["participants"].values()
+        if not participant.get("retired")
+    }
+    return [
+        entry
+        for entry in entries
+        if entry["path"] not in skipped and entry["branch"] not in branches
+    ]
+
+
 def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
     """Assesses the worktrees lanes made beside their own lane worktrees.
 
     Every worktree the project repository registers is read, except the
-    base checkout and the participants' own lanes. Each is attributed to a
-    lane by path or branch; one inside the project state directory belongs
-    to the project even when no single lane accounts for it, and one
-    nothing accounts for is the operator's and is never removed. An
-    attributed worktree is removed only when Git holds no lock on it, no
-    session runs in its lane, it is clean, every commit beyond the base is
-    on its upstream, and the base holds its head, its lane retired, or it
-    has not changed within the inactivity threshold. A registration whose
+    base checkout, the participants' own lanes, wherever an operator moved
+    them, and the recorded spares,
+    which `pool.sweep` assesses by their own rule. Each is attributed to a
+    lane by path or branch. Git records no creator, so one no lane
+    accounts for is assessed by the same rule wherever it sits, as one
+    Git refused to move into the project's `strays` directory is, except
+    one outside the places throwaway checkouts are made, which is kept as
+    `FOREIGN` because the operator owns it. A worktree is removed only
+    when Git holds no lock on it, no session runs in its lane, no process
+    works inside an unattributed one outside `owned_roots`, it is clean,
+    it holds no file Git ignores, every commit beyond the base is on its
+    upstream, and the base holds its head, its lane retired, or it has not
+    changed within the inactivity threshold. A registration whose
     directory is already gone is reclaimed by dropping that registration.
 
     Args:
@@ -666,36 +1096,23 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
     after = supervision.configuration(directory.parent.parent, manifest)[
         "inactive_after"
     ]
-    base = str(Path(manifest["root"]).resolve())
     participants = manifest["participants"]
-    lanes = {
-        str(Path(participant["lane"]).resolve()): name
-        for name, participant in participants.items()
-    }
-    prefixes = sorted(
-        {
-            (prefix, name)
-            for name, participant in participants.items()
-            for prefix in (name, participant.get("branch") or name)
-        },
-        key=lambda pair: len(pair[0]),
-        reverse=True,
-    )
-    state = directory.resolve()
+    lanes, prefixes = _owner_index(manifest)
+    owned = owned_roots(directory)
     rows = []
-    for entry in entries:
-        if entry["path"] == base or entry["path"] in lanes:
-            continue
+    for entry in _lane_made(directory, manifest, entries):
         path = Path(entry["path"])
         owner = _owner(path, entry["branch"], lanes, prefixes)
         paths: list[str]
-        if not owner and not _within(path, state):
+        if not owner and not _disposable(path, directory, manifest["root"]):
             reason, paths = FOREIGN, []
         else:
             reason, paths = _stray(
                 manifest["root"],
                 entry,
-                busy=bool(owner) and _busy(directory, owner),
+                busy=_busy(directory, owner)
+                if owner
+                else path.parent not in owned and _occupied(path),
                 retired=bool(owner)
                 and bool(participants[owner].get("retired")),
                 after=after,
@@ -710,6 +1127,190 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
             row["bytes"] = size(path)
         rows.append(row)
     return rows
+
+
+def _free(folder: Path, name: str, taken: set[Path]) -> Path:
+    """Picks a destination inside a folder that nothing occupies yet.
+
+    Args:
+        folder: Directory the destination is placed in.
+        name: Preferred final path component.
+        taken: Destinations already planned in this pass.
+
+    Returns:
+        `folder/name`, or the first `folder/name-N` from 2 upward that
+        neither exists nor is already planned.
+    """
+    candidate = folder / name
+    number = 2
+    while candidate in taken or candidate.exists() or candidate.is_symlink():
+        candidate = folder / f"{name}-{number}"
+        number += 1
+    return candidate
+
+
+def relocations(directory: Path, manifest: dict) -> list[dict]:
+    """Plans moving every stray worktree into the project state directory.
+
+    Every worktree a lane makes belongs in that lane's `<lane>-wt`
+    directory, where `strays` attributes it by path and can reclaim it once
+    its work lands. One a lane made elsewhere, in the operator's home, beside
+    the repository or in a temporary directory, is attributed by its branch
+    and planned into `<lane>-wt/<name>`. Git records no creator, so one no
+    lane accounts for that sits where throwaway checkouts are made, inside
+    the repository, including its `.claude/worktrees`, the state root or a
+    temporary directory, is planned into the project's `strays` directory,
+    which `strays` treats as the project's own. One anywhere else, such as
+    a worktree a system service runs from, is reported as `FOREIGN` and
+    never moved. A taken name gets a numeric
+    suffix. A move never deletes anything: Git renames the directory,
+    so uncommitted edits, unpushed commits and ignored files travel with it.
+    The base checkout, the lanes themselves, spares, a worktree already
+    inside a lane, its `-wt` directory or the `strays` directory, and one
+    whose directory is gone are not planned at all. One whose directory
+    holds another registered worktree is planned but refused, because the
+    move would carry the nested one away from its registration and a later
+    sweep would drop that registration as gone. A locked worktree, one
+    whose lane runs a session, one any process works inside and one whose
+    directory, index or HEAD changed within `RELOCATE_AFTER` seconds are
+    planned but refused, the last because a session working from the base
+    checkout edits it without ever entering it.
+
+    Args:
+        directory: Private project state directory holding the lanes.
+        manifest: Project manifest naming the root and participants.
+
+    Returns:
+        One row per worktree naming its path, its branch, its lane, the
+        destination, whether it may be moved and the condition that
+        decided it; empty when Git could not list the worktrees.
+    """
+    entries = _entries(manifest["root"])
+    if entries is None:
+        return []
+    lanes, prefixes = _owner_index(manifest)
+    homes = {name: Path(lane) for lane, name in lanes.items()}
+    unclaimed = directory.resolve() / STRAYS
+    registered = [Path(entry["path"]) for entry in entries]
+    taken: set[Path] = set()
+    rows = []
+    for entry in _lane_made(directory, manifest, entries):
+        path = Path(entry["path"])
+        if not path.exists():
+            continue
+        owner = _owner(path, entry["branch"], lanes, prefixes)
+        if owner:
+            lane = homes[owner]
+            if _within(path, lane) or _within(path, extras(lane)):
+                continue
+            folder, outside = extras(lane), STRAYED
+        elif _within(path, unclaimed):
+            continue
+        else:
+            folder, outside = unclaimed, ADRIFT
+        destination = _free(folder, path.name, taken)
+        taken.add(destination)
+        if not owner and not _disposable(path, directory, manifest["root"]):
+            reason = FOREIGN
+        elif any(
+            other != path and _within(other, path) for other in registered
+        ):
+            reason = NESTED
+        elif entry["locked"]:
+            reason = LOCKED
+        elif (owner and _busy(directory, owner)) or _occupied(path):
+            reason = SESSION
+        elif time.time() - _used(path) < RELOCATE_AFTER:
+            reason = FRESH
+        elif _within(destination, path):
+            reason = REFUSED
+        else:
+            reason = outside
+        rows.append(
+            {
+                "worktree": entry["path"],
+                "branch": entry["branch"],
+                "participant": owner,
+                "destination": str(destination),
+                "relocate": reason == outside,
+                "reason": reason,
+            }
+        )
+    return rows
+
+
+def relocate(root: str, row: dict) -> dict:
+    """Moves one planned worktree through Git's own refusals.
+
+    `git worktree move` without force refuses a locked worktree, a
+    destination that exists and a move across filesystems, so a change
+    made between the plan and the move leaves the worktree in place.
+
+    Args:
+        root: Base checkout the worktree is registered with.
+        row: One plan `relocations` produced.
+
+    Returns:
+        The row with whether Git moved it. A move Git refused, or a
+        destination directory that could not be created, is reported as
+        `REFUSED` and moves nothing.
+    """
+    if not row["relocate"]:
+        return row
+    destination = Path(row["destination"])
+    refused = {**row, "relocate": False, "reason": REFUSED, "moved": False}
+    if destination.exists() or destination.is_symlink():
+        return refused
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return refused
+    moved = _read(root, "worktree", "move", row["worktree"], str(destination))
+    if moved is None:
+        return refused
+    return {**row, "moved": True}
+
+
+def prune(directory: Path, manifest: dict, now: float) -> list[str]:
+    """Deletes lane files nothing reads any more, and old wake logs.
+
+    A retired lane is never offered work, woken or launched until an
+    operator re-admits it, and a re-admitted lane writes these files anew,
+    so its published work, its wake prompt, its client configuration, which
+    carries a registration token, and its wake log only take space. The
+    lane's identity, activity, events, reports and capacity stay: they are
+    the history an archive exports, and capacity is read for every lane
+    sharing the same account. Lock files stay too, because unlinking a lock
+    another process holds would let a third take it. A lane whose session
+    still holds its session lock keeps everything.
+
+    A wake log records the relaunches the supervisor spawned and is only
+    ever appended to, so one untouched for `WAKE_LOG_RETENTION` seconds is
+    deleted whoever wrote it, including lanes no longer in the manifest.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Project manifest naming the participants.
+        now: Unix time the wake log retention is measured against.
+
+    Returns:
+        The names of the files deleted, sorted.
+    """
+    doomed: set[Path] = set()
+    for name, participant in manifest["participants"].items():
+        if participant.get("retired") and not _busy(directory, name):
+            doomed.update(directory / f"{name}{end}" for end in RETIRED_FILES)
+    for log in directory.glob("*-wake.log"):
+        if now - _changed(log) > WAKE_LOG_RETENTION:
+            doomed.add(log)
+    removed = []
+    for path in sorted(doomed):
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path.name)
+    return removed
 
 
 def forceable(row: dict) -> bool:
@@ -729,7 +1330,10 @@ def remove(
     A forced removal of a worktree kept for its uncommitted changes, its
     unpushed commits or a recent change first writes a recovery checkpoint
     holding all of them, and removes nothing when that checkpoint fails.
-    Branches are left in place.
+    A worktree whose unpushed commits already landed through another
+    branch is bundled the same way before its ordinary removal, so the
+    commits no ref of the base carries survive it too. Branches are left
+    in place.
 
     Args:
         root: Base checkout the worktree is registered with.
@@ -739,10 +1343,18 @@ def remove(
 
     Returns:
         The row with whether Git removed it, and the checkpoint written
-        before a forced removal.
+        before a forced or bundled removal.
     """
     from agent_parley import recovery
 
+    if row["reclaim"] and row["reason"] in BUNDLED:
+        try:
+            saved = recovery.preserve(directory, Path(row["worktree"]))
+        except (BridgeError, OSError):
+            return {**row, "removed": False}
+        removed = _read(root, "worktree", "remove", row["worktree"])
+        gone = removed is not None
+        return {**row, "removed": gone, "checkpoint": saved["id"]}
     if row["reclaim"]:
         removed = _read(root, "worktree", "remove", row["worktree"])
         return {**row, "removed": removed is not None}
@@ -791,10 +1403,25 @@ def lines(rows: list[dict]) -> list[str]:
 
     Returns:
         A line per lane or worktree naming what happened or what held it,
-        with the paths a refusal reported and the size when it was measured.
+        with the paths a refusal reported and the size when it was measured,
+        and a line per planned move naming its destination or what held it.
     """
     rendered = []
     for row in rows:
+        label = row["participant"]
+        if "worktree" in row:
+            label = f"worktree {row['worktree']}"
+            if row["participant"]:
+                label += f" of {row['participant']}"
+        if "destination" in row:
+            if row.get("moved"):
+                verb = f"moved to {row['destination']}"
+            elif row["relocate"]:
+                verb = f"to move to {row['destination']}"
+            else:
+                verb = "left in place"
+            rendered.append(f"{label}: {verb} ({row['reason']})")
+            continue
         if row.get("removed"):
             verb = "reclaimed"
         elif row["reclaim"]:
@@ -805,13 +1432,10 @@ def lines(rows: list[dict]) -> list[str]:
         if "bytes" in row:
             detail += f"; {row['bytes'] / 1_000_000:.1f} MB"
         if "checkpoint" in row:
-            detail += f"; forced after checkpoint {row['checkpoint']}"
+            bundled = row["reason"] in BUNDLED
+            action = "bundled to" if bundled else "forced after"
+            detail += f"; {action} checkpoint {row['checkpoint']}"
         if row.get("remedy"):
             detail += f"; {row['remedy']}"
-        label = row["participant"]
-        if "worktree" in row:
-            label = f"worktree {row['worktree']}"
-            if row["participant"]:
-                label += f" of {row['participant']}"
         rendered.append(f"{label}: {verb} ({row['reason']}){detail}")
     return rendered

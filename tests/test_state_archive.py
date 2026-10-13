@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import archive, roster, store
+from agent_parley import archive, lanes, roster, store
 from agent_parley.cli import Bridge, main
 from agent_parley.state import BridgeError, write_json
 
@@ -283,6 +283,39 @@ def test_project_scopes_the_export(bridge, repo, tmp_path):
         bridge.home / "projects" / "ffff" / "project.json",
         {"root": "/elsewhere", "base": "main", "participants": {}},
     )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.ensure(db)
+        other = db.execute(
+            "SELECT id FROM projects WHERE human_key='/elsewhere'"
+        ).fetchone()[0]
+        agent = db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND name='codex'",
+            (other,),
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO reservation_refusals(project_id,agent_id,holder,"
+            "path_pattern,refused_ts) VALUES (?,?,'claude','vault/keys',1.0)",
+            (other, agent),
+        )
+        db.execute(
+            "INSERT INTO lane_states(project,lane,state,since,updated) "
+            "VALUES ('/elsewhere','codex','idle',1.0,1.0)"
+        )
+        db.execute(
+            "INSERT INTO lane_events(project,lane,kind,source,target,ts) "
+            "VALUES ('/elsewhere','codex','wake','test','codex',1.0)"
+        )
+        db.execute(
+            "INSERT INTO lane_accounts(project,lane,observed,idle,"
+            "unaccountable,idle_causes,unaccountable_causes,state,has_work,"
+            "owns,accounted) VALUES "
+            "('/elsewhere','codex',1.0,0.0,0.0,'','','idle',0,0,1.0)"
+        )
+        db.execute(
+            "INSERT INTO lane_wakes(project,lane,at,attempts,backlog,"
+            "superseded,result,activity,blocked) VALUES "
+            "('/elsewhere','codex',1.0,1,'',0,'sent','idle','')"
+        )
     output = tmp_path / "one.tar.gz"
     manifest = archive.export(bridge.home, output, directory)
     assert [entry["root"] for entry in manifest["projects"]] == [root]
@@ -299,7 +332,84 @@ def test_project_scopes_the_export(bridge, repo, tmp_path):
             row[0] for row in db.execute("SELECT human_key FROM projects")
         ] == [root]
         assert db.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 1
+        for leaked in (
+            "reservation_refusals",
+            "lane_states",
+            "lane_events",
+            "lane_accounts",
+            "lane_wakes",
+        ):
+            count = db.execute(f"SELECT COUNT(*) FROM {leaked}").fetchone()
+            assert count[0] == 0, leaked
     with pytest.raises(BridgeError, match="already exists"):
         archive.export(bridge.home, output, directory)
     with pytest.raises(BridgeError, match="no project rooted"):
         archive.import_archive(tmp_path / "empty", output, "/elsewhere")
+
+
+def test_an_imported_attachment_follows_its_renumbered_message(
+    bridge, repo, tmp_path
+):
+    directory = registered(bridge, repo)
+    root = str(bridge.project(repo)[0])
+    bridge.add_participant(repo, "codex", "codex")
+    store.register(bridge.home, root, "codex")
+    token = json.loads((directory / "claude-identity.json").read_text())[
+        "registration_token"
+    ]
+    body = "original evidence\n" * 400
+    sent = store.call(
+        bridge.home,
+        store.authenticate(bridge.home, token),
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Big",
+            "body_md": body,
+            "idempotency_key": "big-1",
+        },
+    )
+    assert sent["attachment"] == f"message-{sent['id']}"
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("DELETE FROM messages WHERE id<?", (sent["id"],))
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    archive.import_archive(home, output)
+    with store.connect(home) as db:
+        stored = db.execute("SELECT id, body_md FROM messages").fetchall()
+    assert [row[0] for row in stored] == [1]
+    assert stored[0][1].endswith(
+        f"[attachment message-1: {len(body.encode())} bytes]"
+    )
+    folder = home / "projects" / directory.name / "attachments"
+    assert (folder / "message-1.md").read_text() == body
+    meta = json.loads((folder / "message-1.json").read_text())
+    assert meta["reference"] == "message-1"
+    assert not (folder / f"message-{sent['id']}.md").exists()
+    assert not list(folder.glob(".renumber-*"))
+
+    stale = directory / "attachments" / "message-1.md"
+    stale.write_text("unrelated\n")
+    clash = tmp_path / "clash.tar.gz"
+    archive.export(bridge.home, clash)
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    with pytest.raises(BridgeError, match="overwrite"):
+        archive.import_archive(other, clash)
+    assert not (other / "projects" / directory.name).exists()
+
+
+def test_an_unscoped_table_fails_the_export_instead_of_leaking(
+    bridge, repo, tmp_path
+):
+    registered(bridge, repo)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("CREATE TABLE stray (id INTEGER PRIMARY KEY, note TEXT)")
+        db.execute("INSERT INTO stray(note) VALUES ('unscoped')")
+    output = tmp_path / "stray.tar.gz"
+    with pytest.raises(BridgeError, match="No export rule"):
+        archive.export(bridge.home, output)
+    assert not output.exists()

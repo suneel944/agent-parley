@@ -350,8 +350,9 @@ def pull_cell(claim: dict) -> str:
 
     Returns:
         ``ended`` with any observed branch state for a claim whose work ended
-        on the forge, the cached open pull request's number, check verdict
-        and any conflict, or ``-`` when none is cached.
+        on the forge, the cached open pull request's number, check verdict,
+        how long a pending head has waited, any stall and any conflict, or
+        ``-`` when none is cached.
     """
     if claim.get("ended"):
         state = str(claim.get("branch_state") or "").lower()
@@ -360,6 +361,10 @@ def pull_cell(claim: dict) -> str:
     if not pull:
         return "-"
     cell = f"#{pull['number']} CI {pull['checks'] or 'unknown'}"
+    if pull["checks"] == "pending" and pull.get("pending_seconds") is not None:
+        cell += f" {age(pull['pending_seconds'])}"
+    if pull.get("stalled"):
+        cell += ", stalled"
     if pull.get("mergeable") == "CONFLICTING":
         cell += ", conflicting"
     return cell

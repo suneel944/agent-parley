@@ -114,6 +114,27 @@ def test_a_repeated_acknowledgement_keeps_the_first_timestamp(
         )
 
 
+def test_a_repeated_send_to_a_since_retired_lane_returns_the_first(
+    bridge, repo, paired
+):
+    sender = actor(bridge, paired["root"], "claude")
+    actor(bridge, paired["root"], "codex")
+    arguments = {
+        "to": ["codex"],
+        "subject": "Ready for review",
+        "body_md": "The branch is pushed.",
+        "idempotency_key": "note",
+    }
+    delivered = store.call(bridge.home, sender, "send_message", arguments)
+    assert store.revoke(bridge.home, paired["root"], "codex") == 1
+    replayed = store.call(bridge.home, sender, "send_message", arguments)
+    assert replayed["id"] == delivered["id"]
+    assert replayed["duplicate"] is True
+    fresh = {**arguments, "idempotency_key": "other"}
+    with pytest.raises(BridgeError, match="cannot receive mail"):
+        store.call(bridge.home, sender, "send_message", fresh)
+
+
 def test_a_retained_key_is_bounded_per_participant(bridge, repo, paired):
     holder = actor(bridge, paired["root"], "claude")
     for number in range(store.retries.RETAINED_CALLS + 2):

@@ -153,6 +153,51 @@ def test_a_replay_merges_and_completes_nothing_again(bridge, repo, ready):
     ]
 
 
+def test_a_lane_holding_two_claims_integrates_its_ready_one(
+    bridge, repo, ready
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    bridge.issue(ready["lane"], "claim", "43")
+
+    unattended.integrate(bridge, repo, "codex")
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert issues.snapshot(directory)["issues"]["43"]["owner"] == "codex"
+    assert execution(directory, "43")["state"] != lifecycle.COMPLETE
+
+
+def test_an_operator_merge_takes_the_only_ready_claim(bridge, repo, ready):
+    directory = ready["directory"]
+    bridge.issue(ready["lane"], "claim", "43")
+
+    bridge.merge(repo, "codex")
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert execution(directory, "43")["state"] != lifecycle.COMPLETE
+
+
+def test_two_ready_claims_need_an_explicit_issue(bridge, repo, ready):
+    directory = ready["directory"]
+    bridge.issue(ready["lane"], "claim", "43")
+    commit(ready["lane"], "second.txt")
+    bridge.report(
+        ready["lane"], "ready", "Second", "", "make check: ok", issue="43"
+    )
+
+    with pytest.raises(BridgeError, match="#42, #43 are ready"):
+        bridge.merge(repo, "codex")
+    assert not (repo / "feature.txt").exists()
+
+    bridge.merge(repo, "codex", issue="43")
+
+    assert (repo / "second.txt").exists()
+    assert execution(directory, "43")["state"] == lifecycle.COMPLETE
+    assert execution(directory)["state"] == lifecycle.READY
+
+
 def test_an_old_integration_never_stands_in_for_a_new_claim(
     bridge, repo, ready
 ):
@@ -186,8 +231,11 @@ def test_a_claim_changed_after_evaluation_merges_nothing(
     def then_supersede(*arguments):
         outcome = evaluate(*arguments)
         monkeypatch.setattr(
-            "agent_parley.cli.exact_claim",
-            lambda directory, name: {"issue": 42, "claim_id": "superseded"},
+            "agent_parley.cli.merge_claim",
+            lambda directory, name, issue="": {
+                "issue": 42,
+                "claim_id": "superseded",
+            },
         )
         return outcome
 
@@ -272,8 +320,11 @@ def test_a_changed_claim_generation_is_refused(
 ):
     authorize(bridge, repo, ready)
     monkeypatch.setattr(
-        "agent_parley.cli.exact_claim",
-        lambda directory, name: {"issue": 42, "claim_id": "superseded"},
+        "agent_parley.cli.merge_claim",
+        lambda directory, name, issue="": {
+            "issue": 42,
+            "claim_id": "superseded",
+        },
     )
 
     with pytest.raises(BridgeError, match="changed claim generation"):
@@ -509,7 +560,7 @@ def test_the_command_line_sets_shows_and_clears_the_policy(
     assert f"into {ready['target']} for issues #9, #42" in shown
     assert "#9, #42" in run("unattended", "show", "--repo", str(repo))
     assert "Integrated unattended" in run(
-        "unattended", "run", "codex", "--repo", str(repo)
+        "unattended", "run", "codex", "--issue", "42", "--repo", str(repo)
     )
     assert "operator-only" in run("unattended", "set", "--repo", str(repo))
     assert roster.read(ready["directory"])["integration"] == {}

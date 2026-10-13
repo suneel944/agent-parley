@@ -45,6 +45,48 @@ def session_busy(name: str) -> str:
     return f"{name} has a running session; stop that terminal first."
 
 
+def launch_busy(directory: Path, name: str) -> str:
+    """Builds the refusal a launch reports while the lane's lock is held.
+
+    A launch fails at once on a held session lock, so the message is all an
+    operator gets. The service can resume a lane from a detached process that
+    no terminal shows, and that session may sit in a native dialog for hours,
+    so a bare retry never succeeds. When the recorded launcher is still that
+    same live process, the refusal names it, the client, when it started and
+    what it last reported, with the command that ends it. Otherwise the lock
+    belongs to a short operation such as a merge, retire or restart, and
+    retrying is the right advice.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The message reported when the lane's session lock is held.
+    """
+    state = activity(directory, name)
+    launcher = state.get("launcher_pid")
+    if not process.alive(launcher, state.get("launcher_ticks")):
+        return (
+            f"Another operation on {name} (a merge, retire or restart) holds "
+            f"{name}.session.lock; retry when it finishes."
+        )
+    started = state.get("session_started")
+    since = (
+        time.strftime(" since %Y-%m-%d %H:%M UTC", time.gmtime(started))
+        if isinstance(started, (int, float))
+        else ""
+    )
+    doing = state.get("activity") or state.get("event") or "no activity"
+    return (
+        f"{name} already has a running session (launcher {launcher}, client "
+        f"{state.get('session_pid', 'unknown')}{since}; last activity: "
+        f"{doing}). It may have been resumed by the service with no terminal "
+        f"attached, so retrying will not help. End it with `agent-parley "
+        f"participant stop {name}`, then run {name} again."
+    )
+
+
 def attributed_commits(root: Path, base: str, branch: str) -> list[str]:
     """Lists the commits a lane would integrate that claim assistant authorship.
 
@@ -548,9 +590,10 @@ def outside_prerequisites(
 
     A selection narrows what a run attempts; it never lifts a recorded
     dependency. Every issue a selected lane holds is read for the issues it
-    waits on, and each one that no selected lane holds is named here. The
-    ledger records no completion, so a prerequisite nobody holds is reported
-    as released rather than as finished work.
+    waits on, and each one that no selected lane holds is named here. A
+    prerequisite whose execution is verified complete reads as completed;
+    one that nobody holds without that completion reads as released, which
+    tells the operator somebody dropped it rather than finished it.
 
     Args:
         state: Published issue ledger.
@@ -569,12 +612,14 @@ def outside_prerequisites(
     }
     lines = []
     for issue in sorted(waited, key=int):
-        owner = state["issues"].get(issue, {}).get("owner", "")
-        satisfied = (
-            f"held by {owner}, so it is not satisfied here"
-            if owner
-            else "released, so no lane still holds it"
-        )
+        record = state["issues"].get(issue, {})
+        owner = record.get("owner", "")
+        if owner:
+            satisfied = f"held by {owner}, so it is not satisfied here"
+        elif lifecycle.state(record)["state"] == lifecycle.COMPLETE:
+            satisfied = "completed, so it is satisfied"
+        else:
+            satisfied = "released, so no lane still holds it"
         lines.append(
             f"#{issue} is a prerequisite outside this selection, {satisfied}."
         )

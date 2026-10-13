@@ -13,6 +13,7 @@ moved method reads. This module never imports `cli` at import time, because
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,8 @@ from agent_parley import BridgeError
 
 if TYPE_CHECKING:
     from agent_parley import process
+
+TIMING_LOCK_SECONDS = 5
 
 
 class BridgeCore:
@@ -41,7 +44,8 @@ class BridgeCore:
         self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.home.stat().st_mode & 0o077:
             raise BridgeError(
-                f"State directory must be private: chmod 700 {self.home}"
+                f"State directory must be private: chmod 700 {self.home}",
+                next_command=f"chmod 700 {shlex.quote(str(self.home))}",
             )
         path = self.home / "config.json"
         if not path.exists():
@@ -166,14 +170,16 @@ class BridgeCore:
                     raise BridgeError(
                         "A service from an older installation is running. "
                         "Stop it with the command that started it before "
-                        "upgrading; existing sessions are preserved."
+                        "upgrading; existing sessions are preserved.",
+                        next_command=f"kill {int(record['pid'])}",
                     )
             running = self.server_process()
             if running:
                 if not self.ready():
                     raise BridgeError(
                         "Server is running but unhealthy. "
-                        f"Inspect {self.home}/server.log"
+                        f"Inspect {self.home}/server.log",
+                        next_command="agent-parley down",
                     )
                 store.initialize(self.home)
                 return
@@ -231,7 +237,9 @@ class BridgeCore:
             write_json(published, failed)
             raise BridgeError(
                 "Coordination server failed to start. "
-                f"Inspect {self.home}/server.log"
+                f"Inspect {self.home}/server.log",
+                next_command="tail -n 50 "
+                + shlex.quote(str(self.home / "server.log")),
             )
 
     def down(self) -> None:
@@ -263,12 +271,28 @@ class BridgeCore:
 
         Returns:
             Main worktree and shared state directory paths.
+
+        Raises:
+            BridgeError: If ``repo`` is not inside a Git checkout, naming
+                ``--repo`` instead of repeating Git's own refusal, or if the
+                repository is bare.
         """
         from agent_parley.cli import git, hashlib
 
-        common = Path(
-            git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        )
+        try:
+            common = Path(
+                git(
+                    repo,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+            )
+        except BridgeError as error:
+            raise BridgeError(
+                "not inside a Git repository; pass --repo PATH or run from "
+                "the checkout"
+            ) from error
         if git(repo, "rev-parse", "--is-bare-repository") == "true":
             raise BridgeError(
                 "Use a non-bare repository with an initial commit."
@@ -326,8 +350,10 @@ class BridgeCore:
         would report an unavailable worktree as a drifted one.
 
         Raises:
-            BridgeError: If a checked lane left its assigned branch, or no
-                manifest exists and creation is not allowed.
+            BridgeError: If a checked lane left its assigned branch, Git
+                registers its worktree at another path, which names the
+                command that moves it back, or no manifest exists and
+                creation is not allowed.
         """
         from agent_parley.cli import (
             drift,
@@ -336,6 +362,7 @@ class BridgeCore:
             json,
             lane_branch,
             preserve_pending,
+            reclaim,
             roster,
             write_json,
         )
@@ -353,9 +380,19 @@ class BridgeCore:
                 participant = participants[name]
                 if roster.retired(participant):
                     continue
-                actual = lane_branch(Path(participant["lane"]))
+                lane = Path(participant["lane"])
+                actual = lane_branch(lane)
                 if actual != participant["branch"]:
-                    raise BridgeError(drift(name, participant, actual))
+                    if moved := reclaim.relocated(
+                        data["root"], lane, participant["branch"]
+                    ):
+                        raise BridgeError(
+                            f"{name}: {reclaim.moved_remedy(lane, moved)}."
+                        )
+                    raise BridgeError(
+                        drift(name, participant, actual),
+                        next_command=f"agent-parley participant restore {name}",
+                    )
             return data
         if not preserve:
             return roster.read(directory)
@@ -406,6 +443,7 @@ class BridgeCore:
             git,
             initialize_lane,
             lock,
+            preparation,
             roster,
             write_json,
         )
@@ -460,8 +498,22 @@ class BridgeCore:
                     f"Existing lane directory for {name}; preserve or remove "
                     f"the worktree at {lane} before adding this participant."
                 )
-            git(root, "worktree", "add", "-b", branch, str(lane), data["base"])
-            if data.get("initialize"):
+            started = time.monotonic()
+            spare = self._spare(root, directory, data, branch)
+            if spare is not None:
+                lane = spare
+            else:
+                git(
+                    root,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(lane),
+                    data["base"],
+                )
+            created = time.monotonic()
+            if spare is None and data.get("initialize"):
                 initialize_lane(lane, data["initialize"], root)
             participants[name] = {
                 "provider": provider,
@@ -470,6 +522,9 @@ class BridgeCore:
                 "branch": branch,
                 "credential": credential,
                 "scheme": "lane",
+                "launch": preparation(
+                    created - started, time.monotonic() - created
+                ),
             }
             try:
                 write_json(directory / "project.json", data)
@@ -480,6 +535,49 @@ class BridgeCore:
                 )
                 raise
             return roster.expand(data)
+
+    def _spare(
+        self, root: Path, directory: Path, data: dict, branch: str
+    ) -> Path | None:
+        """Takes a prepared spare worktree for a new lane, if one is ready.
+
+        Only a project that records a pool hands out spares. The spare's
+        branch is renamed to the lane branch the lane would otherwise have
+        been created on, so the lane starts on the current base under the
+        project's branch prefix exactly as a fresh one does. A spare whose
+        branch cannot be renamed is removed and the lane is created the
+        ordinary way. Every new lane of a pooled project then starts a
+        detached fill, so the pool regains what was taken without the
+        launch waiting for it.
+
+        Args:
+            root: Common repository root.
+            directory: Private state directory for the repository.
+            data: Manifest being updated, under the held setup lock.
+            branch: Lane branch the new lane is assigned.
+
+        Returns:
+            The spare's worktree, now on the lane branch, or None when the
+            project keeps no pool or none of its spares is usable.
+        """
+        from agent_parley import pool
+        from agent_parley.cli import git
+        from agent_parley.state import LockBusy
+
+        if not data.get("pool"):
+            return None
+        try:
+            spare = pool.take(root, directory, data)
+        except LockBusy:
+            spare = None
+        if spare is not None:
+            try:
+                git(root, "branch", "-m", spare["branch"], branch)
+            except BridgeError:
+                pool.discard(root, spare)
+                spare = None
+        pool.replenish(self.home, root, directory)
+        return None if spare is None else Path(spare["path"])
 
     def _readmit(
         self, root: Path, directory: Path, data: dict, name: str
@@ -503,6 +601,7 @@ class BridgeCore:
             git,
             has_branch,
             initialize_lane,
+            preparation,
             write_json,
         )
 
@@ -510,6 +609,7 @@ class BridgeCore:
         lane = Path(participant["lane"])
         branch = participant["branch"]
         if not lane.exists():
+            started = time.monotonic()
             git(root, "worktree", "prune")
             if has_branch(root, branch):
                 git(root, "worktree", "add", str(lane), branch)
@@ -523,10 +623,42 @@ class BridgeCore:
                     str(lane),
                     data["base"],
                 )
+            created = time.monotonic()
             if data.get("initialize"):
                 initialize_lane(lane, data["initialize"], root)
+            participant["launch"] = preparation(
+                created - started, time.monotonic() - created
+            )
         participant.pop("retired", None)
         write_json(directory / "project.json", data)
+
+    def record_launch(self, directory: Path, name: str, timing: dict) -> None:
+        """Keeps a lane's launch timing on its roster entry.
+
+        The timing is a measurement, never a reason to refuse a launch, so a
+        setup lock another lane holds past a short wait leaves the previous
+        timing in place rather than failing this one.
+
+        Args:
+            directory: Private state directory for the repository.
+            name: Participant that owns the lane.
+            timing: Launch timing to record in place of the previous one.
+        """
+        import contextlib
+
+        from agent_parley.cli import lock, roster, write_json
+        from agent_parley.state import LockBusy
+
+        with (
+            contextlib.suppress(LockBusy),
+            lock(directory / "setup.lock", timeout=TIMING_LOCK_SECONDS),
+        ):
+            data = roster.read(directory)
+            participant = data["participants"].get(name)
+            if participant is None:
+                return
+            participant["launch"] = timing
+            write_json(directory / "project.json", data)
 
     def _lane(self, repo: Path, name: str) -> tuple[Path, dict, dict]:
         """Resolves one participant's state directory and manifest entry."""
@@ -538,7 +670,8 @@ class BridgeCore:
         if participant is None:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         return directory, data, participant
 

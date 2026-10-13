@@ -10,7 +10,9 @@ forecasts a collision with one.
 Nothing here claims anything. The result is a shortlist with the reason for
 each entry, and taking one of them stays an explicit, separate call, so a
 recommendation never moves ownership and two lanes reading the same ledger
-still race for the claim rather than for the advice.
+still race for the claim rather than for the advice. To keep that race rare,
+an issue the supervisor already named as another lane's next work ranks
+below the issues nobody was pointed at.
 """
 
 import re
@@ -138,6 +140,8 @@ def _reasons(record: dict, known: bool, provider: str) -> list[str]:
             else f"declares provider {record['provider']}, "
             f"not this lane's {provider or 'own'}"
         )
+    if record.get("named_to"):
+        said.insert(1, f"already named as {record['named_to']}'s next work")
     return said[:MAX_REASONS]
 
 
@@ -148,11 +152,15 @@ def rank(
     declared: dict[str, str],
     provider: str,
     limit: int = MAX_SHORTLIST,
+    named: dict[str, str] | None = None,
 ) -> list[dict]:
     """Orders the issues a lane could take next, worst obstacle last.
 
     The order is a total one over the ledger's own contents, so the same
-    store state always produces the same shortlist. An issue a peer already
+    store state always produces the same shortlist. An issue the supervisor
+    already named as another lane's next work sinks below every issue no
+    lane was pointed at, so lanes reading the same ledger spread out instead
+    of racing for one claim. An issue a peer already
     reserves the paths of sinks below one nobody contends, a declared
     provider this lane does not run sinks below a matching or silent one, a
     forecast collision sinks below a clean path, and what remains is decided
@@ -168,13 +176,16 @@ def rank(
         declared: Provider each issue declares, where the forge says so.
         provider: Provider driving the reading lane.
         limit: Most entries to return.
+        named: Issue number to the other lane the supervisor's published
+            work names it to, as its next lead or first pull pick.
 
     Returns:
         One record per candidate carrying its number, recorded title, plan
         group, the issues it unblocks, the provider it declares, the peer
-        reservations and forecast collisions found for it, and the reasons
-        for its position.
+        reservations and forecast collisions found for it, the lane it is
+        named to, and the reasons for its position.
     """
+    named = named or {}
     waiting = issues.waiters(state)
     placed = _grouped(groups)
     started = _underway(groups, state)
@@ -191,11 +202,13 @@ def rank(
             "provider": declared.get(number, ""),
             "overlaps": risk.get("overlaps", []),
             "collisions": risk.get("collisions", []),
+            "named_to": named.get(number, ""),
         }
         record["reasons"] = _reasons(record, number in risks, provider)
         ranked.append(record)
     ranked.sort(
         key=lambda record: (
+            bool(record["named_to"]),
             bool(record["overlaps"]),
             bool(record["provider"]) and record["provider"] != provider,
             bool(record["collisions"]),
@@ -215,8 +228,13 @@ def shortlist(
     held: dict[str, list[str]],
     overlap: Callable[[str, str], bool],
     limit: int = MAX_SHORTLIST,
+    named: dict[str, str] | None = None,
 ) -> dict:
     """Reads the ledger, the plan and the forge, and ranks what is free.
+
+    Open forge issues the ledger has never recorded are candidates too,
+    read from the supervisor's cache through `issues.with_forge`, so a
+    freshly opened issue is offered before anybody claims it.
 
     The forge reading is best effort and bounded: the paths an issue's
     earlier pull requests touched are read for the first ``MAX_LOOKUPS``
@@ -238,6 +256,8 @@ def shortlist(
             own identity already excluded.
         overlap: The store's reservation overlap rule.
         limit: Most entries to return.
+        named: Issue number to the other lane whose published work names
+            it, which ranks it below every issue no lane was pointed at.
 
     Returns:
         The provider considered, whether the forge answered with any paths,
@@ -245,7 +265,7 @@ def shortlist(
     """
     from agent_parley import plan
 
-    state = issues.snapshot(directory)
+    state = issues.with_forge(directory, issues.snapshot(directory))
     free = issues.unclaimed(state)
     paths = {
         number: forge.issue_pull_request_paths(repo, number)
@@ -267,6 +287,7 @@ def shortlist(
             forge.issue_providers(repo) if free else {},
             provider,
             limit,
+            named,
         ),
     }
 
@@ -410,15 +431,21 @@ def render(result: dict) -> str:
     """Formats a shortlist as one line per candidate, best first.
 
     Returns:
-        The ranked issues with their reasons, or a single line stating that
-        the ledger records nothing free to take.
+        The ranked issues with their reasons and the instruction to claim
+        before exploring, or a single line stating that the ledger records
+        nothing free to take.
     """
     if not result["candidates"]:
         return "No unclaimed, unblocked issue is recorded."
-    return "\n".join(
+    lines = [
         f"#{record['issue']}"
         + (f" {record['title']}" if record["title"] else "")
         + ": "
         + "; ".join(record["reasons"])
         for record in result["candidates"]
+    ]
+    lines.append(
+        "Claim one with agent-parley issue claim before exploring or "
+        "editing; a peer may be reading the same list."
     )
+    return "\n".join(lines)

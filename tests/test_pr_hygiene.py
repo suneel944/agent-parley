@@ -71,6 +71,20 @@ def test_bot_bodies_preserved_but_metadata_still_required():
     assert validate(pr, [{"number": 7}])
 
 
+def test_bot_pull_requests_need_owner_and_label_but_no_local_issue():
+    pr = metadata()
+    pr.update(user={"type": "Bot"}, body="Bumps setup-uv from 10.1 to 10.2.")
+    assert validate(pr, []) == []
+    pr["labels"] = []
+    assert validate(pr, []) == ["Add a change-type label."]
+    human = metadata()
+    human["body"] = "## Problem and result\n## Verification\n"
+    human["body"] += "## Compatibility and risks\n"
+    assert validate(human, []) == [
+        "Reference an existing local issue with Refs #N."
+    ]
+
+
 def test_human_pr_requires_template_sections():
     pr = metadata()
     pr["body"] = "Refs #7"

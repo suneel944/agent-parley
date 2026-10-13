@@ -110,6 +110,25 @@ def test_a_reported_outcome_and_a_drifted_branch_select_lanes(
     ) == ["codex"]
 
 
+def test_a_retired_lane_is_never_selected(bridge, repo, paired):
+    store.initialize(bridge.home)
+    token = store.register(bridge.home, paired["root"], "codex")[
+        "registration_token"
+    ]
+    lane = store.authenticate(bridge.home, token)
+    store.call(bridge.home, lane, store.RETIRE, {})
+    directory, data = state(bridge, repo)
+    assert roster.retired(data["participants"]["codex"])
+
+    assert cli.matching_lanes(
+        bridge.home, directory, data, selector(all=True)
+    ) == ["claude"]
+    assert (
+        cli.matching_lanes(bridge.home, directory, data, selector(drifted=True))
+        == []
+    )
+
+
 def test_an_idle_selector_matches_no_freshly_started_lane(bridge, repo, paired):
     directory, data = state(bridge, repo)
 

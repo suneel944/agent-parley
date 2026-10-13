@@ -267,6 +267,19 @@ def test_a_tool_call_still_running_counts_as_work(bridge, paired):
     assert supervision.tool_silence(directory, "claude") < WINDOW
 
 
+def test_a_long_running_tool_call_under_the_timeout_is_not_silent(
+    bridge, paired
+):
+    directory = overdue(bridge, paired)
+    events(directory, "claude", ("PreToolUse", WINDOW + 150))
+    assert supervision.tool_silence(directory, "claude") == 0.0
+    observed = supervision.presence(directory, "claude", WINDOW)
+    assert not supervision.holder_silent(directory, "claude", observed, WINDOW)
+    kept = step(bridge, directory, paired)
+    assert kept["owner"] == "claude"
+    assert "overdue_recovery" not in kept
+
+
 def test_issue_list_names_a_claim_without_a_deadline(bridge, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import statistics
 import time
 import uuid
 from pathlib import Path
@@ -42,6 +43,8 @@ MAX_REPORT_LOG_BYTES = MAX_LOG_BYTES
 MAX_REPORT_BYTES = 4096
 MAX_WAITS = 64
 VERDICTS = ("pass", "fail")
+OUTCOME_WINDOW = 7 * 86400.0
+CLAIM_STARTS = frozenset({"claim", "accept", "take"})
 
 
 def report_path(directory: Path, name: str) -> Path:
@@ -282,6 +285,26 @@ def latest_review(
     return None
 
 
+def latest_report(directory: Path, name: str) -> dict | None:
+    """Reads the newest report one lane filed, with the issue it named.
+
+    A lane's activity file keeps the latest report's text but not the issue
+    it was about, so status could not tell a report on current work from one
+    on an issue the lane has since released. The durable log records both.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The newest report record, or None when the lane retains none.
+    """
+    for record in reversed(report_records(directory, name)):
+        if record.get("kind") == "report":
+            return record
+    return None
+
+
 def idle_intervals(
     directory: Path,
     name: str,
@@ -295,7 +318,10 @@ def idle_intervals(
     ``Stop`` or ``SessionEnd`` checkpoint, and closes at the lane's next
     recorded activity. The interval still open at the time of the reading is
     reported as open, and only counted while the recorded session process is
-    alive, because a stopped lane is not idle: it is stopped.
+    alive, because a stopped lane is not idle: it is stopped. Records the
+    service writes on the lane's behalf, such as a wake request, and hook
+    calls from another session are not the lane's activity, so they neither
+    close an interval nor open one.
 
     Args:
         directory: Private state directory for the common repository.
@@ -319,9 +345,11 @@ def idle_intervals(
             entries = checkpoints.read_events(directory, name, since)
         except BridgeError:
             return {"intervals": [], "seconds": 0, "complete": False}
+    unobserved = {reason.value for reason in checkpoints.UNOBSERVED}
     stamps = sorted(
         (float(entry.get("ts", 0) or 0), str(entry.get("event", "")))
         for entry in entries
+        if entry.get("reason_class") not in unobserved
     )
     intervals: list[dict] = []
     opened: float | None = None
@@ -530,4 +558,240 @@ def pending(reported: list[dict]) -> list[dict]:
         (wait for wait in reported if not wait["complete"]),
         key=lambda wait: wait["seconds"],
         reverse=True,
+    )
+
+
+def ci_rounds(reading: dict | None) -> int | None:
+    """Reads the CI round count stored on one pull request reading.
+
+    Supervision owns counting the rounds and stores them as `rounds`, one
+    per finished head commit; this is the one place outcome metrics read
+    the stored count, so a change to how it is stored changes only this
+    function.
+
+    Args:
+        reading: One pull request reading from the pull request record, open
+            or archived, or None when supervision never recorded it.
+
+    Returns:
+        The stored count of CI rounds, or None when none is recorded.
+    """
+    value = (reading or {}).get("rounds")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _merges(ledger: dict, since: float) -> dict[str, dict]:
+    """Lists the pull requests a claim's resolution recorded as merged.
+
+    Args:
+        ledger: Published issue ledger.
+        since: Unix time the window starts.
+
+    Returns:
+        One entry per pull request number merged inside the window: the
+        lane that held the claim and the seconds from the claim to the
+        merge, or None where the history names no claim before it.
+    """
+    merged: dict[str, dict] = {}
+    for record in ledger.get("issues", {}).values():
+        started = 0.0
+        for entry in record.get("history") or []:
+            if entry.get("action") in CLAIM_STARTS:
+                started = float(entry.get("at") or 0)
+                continue
+            evidence = entry.get("evidence") or {}
+            if (
+                entry.get("action") != "resolve"
+                or entry.get("outcome") != "complete"
+                or evidence.get("state") != "MERGED"
+                or not evidence.get("pull_request")
+                or not entry.get("holder")
+            ):
+                continue
+            at = float(evidence.get("closed_at") or entry.get("at") or 0)
+            if at < since:
+                continue
+            merged[str(int(evidence["pull_request"]))] = {
+                "lane": str(entry["holder"]),
+                "seconds": at - started if started else None,
+            }
+    return merged
+
+
+def _first_pass(reading: dict, rounds: int) -> bool:
+    """Reports whether a merged pull request passed on its first attempt."""
+    return rounds == 1 and not any(
+        review.get("state") == "CHANGES_REQUESTED"
+        for review in reading.get("reviews") or []
+        if isinstance(review, dict)
+    )
+
+
+def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
+    """Measures each lane's pull request outcomes inside a window.
+
+    The readings come from what supervision already keeps: the pull request
+    record, holding every open pull request and an archive of those that
+    left the open list, and the ledger, whose claim resolutions name the
+    pull request that merged. A pull request is opened when supervision
+    first saw it, merged when a resolution names it, and closed unmerged
+    when it left the open list without one. One whose reading names no lane
+    and no claim names either is excluded and counted as such.
+
+    Args:
+        record: Parsed pull request record, or anything else when it could
+            not be read, which reports nothing.
+        ledger: Published issue ledger.
+        since: Unix time the window starts.
+
+    Returns:
+        ``lanes`` mapping each participant with an outcome to its counts,
+        first-pass rate over merged pull requests with a known CI round
+        count, the count without one, the median CI rounds and the median
+        claim-to-merge seconds, with zero for a median over nothing; and
+        ``excluded``, the pull requests no lane owns.
+    """
+    stored = record if isinstance(record, dict) else {}
+    opened = stored.get("pull_requests")
+    archived = stored.get("history")
+    current = [
+        item
+        for item in (opened.values() if isinstance(opened, dict) else [])
+        if isinstance(item, dict)
+    ]
+    gone = [
+        item
+        for item in (archived if isinstance(archived, list) else [])
+        if isinstance(item, dict)
+    ]
+    readings = {str(item.get("number")): item for item in [*gone, *current]}
+    merged = _merges(ledger, since)
+    every = _merges(ledger, 0.0)
+    tallies: dict[str, dict] = {}
+    excluded: set[str] = set()
+    counted: set[str] = set()
+
+    def tally(name: str) -> dict:
+        """Returns the running counts of one lane."""
+        return tallies.setdefault(
+            name,
+            {
+                "opened": 0,
+                "merged": 0,
+                "closed": 0,
+                "first": 0,
+                "rounds": [],
+                "unknown": 0,
+                "seconds": [],
+            },
+        )
+
+    for item in [*gone, *current]:
+        number = str(item.get("number"))
+        if (
+            not item.get("opened_at")
+            or float(item["opened_at"]) < since
+            or number in counted
+        ):
+            continue
+        counted.add(number)
+        owner = item.get("lane") or every.get(number, {}).get("lane")
+        if owner:
+            tally(str(owner))["opened"] += 1
+        else:
+            excluded.add(number)
+    for number, item in readings.items():
+        if (
+            number in every
+            or not item.get("gone_at")
+            or float(item["gone_at"]) < since
+        ):
+            continue
+        if item.get("lane"):
+            tally(str(item["lane"]))["closed"] += 1
+        else:
+            excluded.add(number)
+    for number, merge in merged.items():
+        counts = tally(merge["lane"])
+        counts["merged"] += 1
+        if merge["seconds"] is not None:
+            counts["seconds"].append(merge["seconds"])
+        reading = readings.get(number)
+        rounds = ci_rounds(reading)
+        if reading is None or rounds is None:
+            counts["unknown"] += 1
+            continue
+        counts["rounds"].append(rounds)
+        counts["first"] += int(_first_pass(reading, rounds))
+    return {
+        "lanes": {
+            name: {
+                "pull_requests_opened": counts["opened"],
+                "pull_requests_merged": counts["merged"],
+                "pull_requests_closed": counts["closed"],
+                "first_pass": counts["first"],
+                "first_pass_known": len(counts["rounds"]),
+                "first_pass_rate": (
+                    counts["first"] / len(counts["rounds"])
+                    if counts["rounds"]
+                    else 0.0
+                ),
+                "ci_rounds_unknown": counts["unknown"],
+                "ci_rounds_median": (
+                    float(statistics.median(counts["rounds"]))
+                    if counts["rounds"]
+                    else 0.0
+                ),
+                "claim_to_merge_seconds": (
+                    float(statistics.median(counts["seconds"]))
+                    if counts["seconds"]
+                    else 0.0
+                ),
+            }
+            for name, counts in tallies.items()
+        },
+        "excluded": len(excluded),
+    }
+
+
+def outcome_line(outcomes: dict, window: str) -> str:
+    """Summarizes a project's pull request outcomes on one line.
+
+    Args:
+        outcomes: Reading from `pull_request_outcomes`.
+        window: The window the reading covers, already formatted.
+
+    Returns:
+        The opened, merged and closed counts, the first-pass share over
+        merged pull requests with a known CI round count and the unowned
+        count, or an empty string when the window holds no pull request.
+    """
+    lanes = outcomes.get("lanes") or {}
+
+    def total(key: str) -> int:
+        """Sums one count over the lanes."""
+        return sum(int(counts.get(key) or 0) for counts in lanes.values())
+
+    excluded = int(outcomes.get("excluded") or 0)
+    counted = [
+        total(key)
+        for key in (
+            "pull_requests_opened",
+            "pull_requests_merged",
+            "pull_requests_closed",
+        )
+    ]
+    if not any(counted) and not excluded:
+        return ""
+    known = total("first_pass_known")
+    unknown = total("ci_rounds_unknown")
+    return (
+        f"Pull requests (last {window}): "
+        f"{counted[0]} opened, {counted[1]} merged, "
+        f"{counted[2]} closed unmerged, first pass "
+        f"{total('first_pass')}/{known}"
+        + (f" ({unknown} without CI rounds)" if unknown else "")
+        + (f", {excluded} unowned excluded" if excluded else "")
     )

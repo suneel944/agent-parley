@@ -6,6 +6,11 @@ command contract of its own. The lane therefore receives a private copy of
 that directory, selected with ``OPENCODE_CONFIG_DIR`` for one launch only,
 holding the user's configuration plus the lane's MCP server and one plugin
 that runs the configured hook command for each supported native event.
+
+The service marks coordination text delivered on every event, but only
+``chat.message`` and ``tool.execute.after`` can carry text into the session.
+The plugin therefore holds context returned to any other event and adds it,
+per session, to the next message or tool result.
 """
 
 import json
@@ -50,19 +55,33 @@ function decide(payload) {
 }
 
 export const AgentParley = async ({ client, directory }) => {
+  const pending = new Map();
   const payload = (name, sessionID, fields) => ({
     hook_event_name: name,
     session_id: sessionID,
     cwd: directory,
     ...fields,
   });
+  const hold = (sessionID, reply) => {
+    if (reply.context) {
+      const held = pending.get(sessionID) || [];
+      pending.set(sessionID, [...held, reply.context]);
+    }
+    return reply;
+  };
+  const take = (sessionID) => {
+    const held = pending.get(sessionID) || [];
+    pending.delete(sessionID);
+    return held.join("\\n\\n");
+  };
   return {
     event: async ({ event }) => {
       if (event.type === "session.created") {
-        decide(payload("session.created", event.properties.info.id, {}));
+        const id = event.properties.info.id;
+        hold(id, decide(payload("session.created", id, {})));
       } else if (event.type === "session.idle") {
         const id = event.properties.sessionID;
-        const reply = decide(payload("session.idle", id, {}));
+        const reply = hold(id, decide(payload("session.idle", id, {})));
         if (reply.decision === "block" && reply.reason) {
           await client.session.prompt({
             path: { id },
@@ -72,36 +91,53 @@ export const AgentParley = async ({ client, directory }) => {
       }
     },
     "chat.message": async (input, output) => {
-      const reply = decide(payload("chat.message", input.sessionID, {}));
-      if (reply.context) {
-        output.parts.push({ type: "text", text: reply.context });
+      const id = input.sessionID;
+      hold(id, decide(payload("chat.message", id, {})));
+      const context = take(id);
+      if (context) {
+        output.parts.push({ type: "text", text: context });
       }
     },
     "tool.execute.before": async (input, output) => {
-      const reply = decide(
-        payload("tool.execute.before", input.sessionID, {
-          tool_name: input.tool,
-          tool_input: output.args,
-        }),
+      const reply = hold(
+        input.sessionID,
+        decide(
+          payload("tool.execute.before", input.sessionID, {
+            tool_name: input.tool,
+            tool_input: output.args,
+          }),
+        ),
       );
       if (reply.decision === "deny") {
         throw new Error(reply.reason || "Agent Parley refused this call");
       }
     },
     "tool.execute.after": async (input, output) => {
-      decide(
-        payload("tool.execute.after", input.sessionID, {
-          tool_name: input.tool,
-          tool_response: output.output,
-        }),
+      hold(
+        input.sessionID,
+        decide(
+          payload("tool.execute.after", input.sessionID, {
+            tool_name: input.tool,
+            tool_response: output.output,
+          }),
+        ),
       );
+      const context = take(input.sessionID);
+      if (context) {
+        output.output = [output.output, context]
+          .filter((part) => part)
+          .join("\\n\\n");
+      }
     },
     "permission.ask": async (input) => {
-      decide(
-        payload("permission.ask", input.sessionID, {
-          tool_name: input.type,
-          tool_input: input.metadata,
-        }),
+      hold(
+        input.sessionID,
+        decide(
+          payload("permission.ask", input.sessionID, {
+            tool_name: input.type,
+            tool_input: input.metadata,
+          }),
+        ),
       );
     },
   };

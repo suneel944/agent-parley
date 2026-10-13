@@ -193,10 +193,44 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         "codex plugin",
         "store",
         "service",
+        "projects",
+        "notify",
+        "approvals",
     }
+    [approvals] = [
+        entry
+        for entry in reported["components"]
+        if entry["component"] == "approvals"
+    ]
+    assert approvals["state"] == protocol.SETUP_GAP
+    assert approvals["remedy"].endswith(f"{paired['root']} claude")
     text = protocol.render(reported)
     assert "Consistent." in text
+    assert f"approvals: {approvals['remedy']}" in text
     assert str(bridge.home) not in text
+
+
+def test_doctor_names_a_project_whose_root_is_gone(
+    bridge, repo, paired, answering, tmp_path
+):
+    store.initialize(bridge.home)
+    gone = tmp_path / "parley-probe-gone"
+    directory = bridge.home / "projects" / "0000000000000000"
+    directory.mkdir(parents=True)
+    (directory / "project.json").write_text(json.dumps({"root": str(gone)}))
+
+    reported = bridge.doctor()
+
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["projects"]["state"] == protocol.ROOT_GONE
+    assert named["projects"]["compatible"] is False
+    assert (
+        f"agent-parley gc --project {gone} --apply"
+        in named["projects"]["remedy"]
+    )
+    assert str(repo) not in named["projects"]["remedy"]
+    assert reported["consistent"] is False
+    assert str(gone) in protocol.render(reported)
 
 
 def store_schema(bridge, schema):

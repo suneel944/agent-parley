@@ -9,12 +9,16 @@ the repository owner can carry out.
 Repository installation does not imply public directory approval. The Codex
 listing went live on 2026-09-14 at
 `https://chatgpt.com/plugins/plugins_6aa7c91c25008191ad715f14756e5deb`, and
-the submission archive has been attached to every release from v0.6.0 through
-v0.12.0; each new version still needs a manual portal upload, because neither
+the submission archive is attached to every release from v0.6.0 onward; each
+new version still needs a manual portal upload, because neither
 catalog offers a publishing API. The Claude submission was made on 2026-09-14
-and was still awaiting review on 2026-09-26; a code search of
-`anthropics/claude-plugins-official` for `agent-parley` returned no match on
-that date.
+through the Console form and was still awaiting review on 2026-09-26; a code
+search of `anthropics/claude-plugins-official` for `agent-parley` returned no
+match on that date. The directory has since retired that form, and its
+pre-submission checklist blocks a plugin folder without a README, which the
+folder lacked until `plugins/agent-parley/README.md` was added for 0.14.0. The
+listing therefore needs a fresh submission through the developer portal once
+that README is on `main`.
 
 The developer lists that compare orchestrators are a separate surface from
 both catalogs, and nothing in this repository can file an entry there. On
@@ -41,8 +45,8 @@ this listing would describe.
 ### Claude plugin directory
 
 Submissions go through the
-[Console form](https://platform.claude.com/plugins/submit) or the
-[claude.ai form](https://claude.ai/admin-settings/directory/submissions/plugins/new).
+[developer portal](https://claude.ai/directory/manage). The earlier Console
+form is no longer supported, and a submission made there is not reviewed.
 The directory surfaces in Claude Code as the `claude-plugins-official`
 marketplace. [Anthropic's submission guide](https://claude.com/docs/plugins/submit)
 is authoritative for the process, and
@@ -54,11 +58,18 @@ closed-source plugins are not accepted, and the manifest must pass
 `claude plugin validate`. Identifying metadata belongs on the manifest: name,
 display name, version, description, author, homepage, repository, license and
 keywords. The repository must carry a license and a way to report problems.
+The
+[pre-submission checklist](https://claude.com/docs/plugins/pre-submission-checklist)
+also requires a README of at least 40 words, not counting code blocks, inside
+the submitted plugin folder, and treats a missing one as blocking.
+`plugins/agent-parley/README.md` meets it: it describes the `coordinate`
+skill, the separately installed command line tool, what the plugin runs and
+transmits in line with `docs/privacy.md`, and where to find the privacy
+policy, terms and issue tracker. The submission names that plugin folder, not
+the repository root, because the root is a marketplace.
 
-Submitting is account-bound and role-gated. The Console form requires a
-Developer, Admin or Owner role on a Console organization, which is the route
-for an individual author. The claude.ai form requires a Team or Enterprise
-organization with directory management access.
+Submitting is account-bound and happens under the owner's signed-in account
+on the developer portal.
 
 Once a listing is published, pushes to the repository are mirrored
 automatically and rescreened. Updates do not need a new submission.
@@ -92,17 +103,28 @@ and `composerIcon` pointing to square images inside the archive, and the
 in `.codex-plugin/plugin.json` and `make codex-bundle` merges them into the
 archived copy. The archive lands at
 `dist/agent-parley-VERSION-codex-skills.zip` and contains only the merged
-manifest, `skills/` and `assets/`. `scripts/check_policy.py` fails the gate if
-either manifest drifts from the shape its directory reads.
+manifest, `skills/` and `assets/`; the plugin-folder README stays out,
+because the portal renders the listing from the manifest rather than from a
+README. The archived `skills/` comes from `.codex-plugin/listing-skills`, not
+from the repository skills: the portal scans each skill and flagged the full
+`coordinate` skill as a security risk once it carried operator, integration,
+permission and credential guidance. The listing skill keeps the same name and
+description and covers status, claims, handoffs, reports and mail only.
+The manifest also declares the website, privacy policy and terms of service
+URLs the listing shows. `scripts/check_policy.py` fails the gate if
+either manifest drifts from the shape its directory reads, if a listing URL
+is not https, or if a listing skill's frontmatter differs from its repository
+skill's.
 
 That archive is a release asset. `make release-artifacts` builds it into
 `dist/release` beside the wheel, the source tarball and the plugin archive,
 records its hash in `SHA256SUMS`, and `scripts/release_publish.py` requires it
 by name, so a release missing it fails instead of publishing. A portal upload
 therefore starts from a released artifact rather than a local build. Releases
-v0.6.0 through v0.9.1 carry the same archive, uploaded by hand after the fact.
-Neither catalog exposes a publishing API, so each new
-version still needs a manual upload through the portal. Claude mirrors pushes
+from v0.10.0 onward carry it automatically; v0.6.0 through v0.9.1 carry the
+same archive, uploaded by hand after the fact. Neither catalog exposes a
+publishing API, so each new version still needs a manual upload through the
+portal. Claude mirrors pushes
 once a listing is live; Codex does not.
 
 Both forms change over time. Re-read them at submission time and treat the
@@ -130,7 +152,8 @@ confirm the stated expectation before opening either form.
   `gh release view vVERSION --json assets`
 - Neither manifest passes `claude plugin validate --strict`; the single
   `protocol` warning is expected and the gate runs without `--strict`.
-  `uv run --locked python scripts/check_policy.py`
+  `claude plugin validate --strict plugins/agent-parley` and
+  `claude plugin validate --strict .`
 - The `coordinate` skill carries YAML frontmatter with `name` and
   `description`.
   `head -5 plugins/agent-parley/skills/coordinate/SKILL.md`
@@ -201,13 +224,22 @@ and the Claude marketplace entry describe isolated worktrees, advisory
 reservations and explicit handoffs in a full paragraph. The Claude manifest
 declares `displayName`, `license` and `keywords`; the marketplace entry adds
 `category`, `author`, `homepage` and `repository`. The Codex manifest keeps
-its listing copy in `interface`, and that copy names no specific model. The
+its listing copy in `interface` and its own `keywords`. The OpenAI portal
+rejects a listing whose name or description references another AI assistant,
+model or platform, so the archived manifest takes the Codex keywords rather
+than the Claude ones, which name the supported agent command line tools. The
+bundle check fails when the archived manifest or a listing skill names an
+assistant, and the listing skill's launch example uses an `AGENT`
+placeholder. The
 marketplace is named `agent-parley`, so the documented install command is
 `agent-parley@agent-parley`.
 
 Both catalogs ask for public URLs that match the publisher identity. Use:
 
-- Website and homepage: `https://github.com/suneel944/agent-parley#readme`
+- Website: `https://suneel944.github.io/agent-parley/`, the `Homepage` in
+  `pyproject.toml` and the `websiteUrl` in `server.json`
+- Plugin homepage and repository: `https://github.com/suneel944/agent-parley`,
+  as `plugin.json` and `.claude-plugin/marketplace.json` declare
 - Support: `https://github.com/suneel944/agent-parley/issues`
 - Privacy policy:
   `https://github.com/suneel944/agent-parley/blob/main/docs/privacy.md`
@@ -242,9 +274,18 @@ skill needs: it reads coordination state in a conversation and writes claims,
 reservations and handoffs. `interface.defaultPrompt` carries three starter
 prompts. The directory keeps at most three and truncates any entry past 128
 characters, and the bundle check fails rather than letting either happen
-silently. Each prompt states a situation, naming the peers and the work in
-hand, because a bare command reads as documentation rather than a reason to
-install.
+silently. Each prompt states a situation, naming the work in hand and the
+peer involved, because a bare command reads as documentation rather than a
+reason to install. The prompts call the peer "the other agent" because the
+listing runs inside Codex, where "Codex" would name the user's own session.
+
+`interface.category` is `Developer Tools`. The portal could not confirm
+`Productivity` for a tool that coordinates coding agents, and the bundle check
+rejects any value outside the portal's supported list. The portal's guide asks
+`longDescription` to cover tasks, intended users and limitations, so the text
+has one paragraph for each after an opening sentence that states the purpose.
+It does not mention MCP, because the archive is skills-only and carries no
+server. `interface.supportURL` points at the issue tracker.
 
 Each prompt also ends in changed state rather than an answer, and covers one
 moment that a single agent cannot reach: splitting a milestone across lanes
@@ -270,11 +311,15 @@ accounts and to a legal identity that an agent does not hold.
   publisher. Verification proves control of an identity or a domain and cannot
   be delegated.
 - **Signing in and submitting.** Both forms are account-bound and role-gated.
-  The Claude directory needs a Developer, Admin or Owner role on a Console
-  organization, or a Team or Enterprise organization on claude.ai with
-  directory management access; Codex needs Apps Management write access.
-  Submitting requires the owner's authenticated session, and the submission
-  becomes a statement made by that account.
+  The Claude directory takes submissions through the developer portal at
+  `https://claude.ai/directory/manage`; Codex needs Apps Management write
+  access. Submitting requires the owner's authenticated session, and the
+  submission becomes a statement made by that account.
+- **Retiring the stale Claude submission.** The 2026-09-14 submission went
+  through the retired Console form. Withdraw it at
+  `https://platform.claude.com/plugins/submissions`, or ask
+  `directory@anthropic.com` to move it, before resubmitting through the
+  developer portal.
 - **Accepting catalog terms.** Each catalog attaches distribution terms to the
   listing. Only the owner can agree to them.
 - **Publishing the policy and listing URLs.** The owner chooses which pages
@@ -348,8 +393,9 @@ executable installed.
   remaining"`, and stays paused while the offer is pending. The recipient
   reads the current offer identifier from `agent-parley issue list` and runs
   `agent-parley issue accept NUMBER --offer-id ID`. An identifier from a
-  cancelled or replaced offer is rejected rather than accepted. The handoff
-  transfers neither file reservations nor message acknowledgement.
+  cancelled or replaced offer is rejected rather than accepted. Accepting
+  moves the advisory file reservations the offer carried from the offering
+  lane to the recipient; message acknowledgement does not transfer.
 
 ### 5. Reporting an outcome without claiming verification
 

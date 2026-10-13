@@ -1,6 +1,10 @@
 """Checks release-note extraction and the published release asset set."""
 
+import re
+import shutil
+import subprocess
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -78,3 +82,29 @@ def test_release_without_the_codex_archive_fails(release_bundle):
     archive.unlink()
     with pytest.raises(ValueError):
         verify_assets(directory, version)
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
+def test_package_description_shows_the_video_as_a_still_frame(tmp_path):
+    subprocess.run(
+        ["uv", "build", "--wheel", "--quiet", "--out-dir", str(tmp_path)],
+        cwd=ROOT,
+        check=True,
+    )
+    (wheel,) = tmp_path.glob("*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        (name,) = [
+            n for n in archive.namelist() if n.endswith(".dist-info/METADATA")
+        ]
+        metadata = archive.read(name).decode()
+    description = metadata.split("\n\n", 1)[1]
+    readme = (ROOT / "README.md").read_text()
+    assert "https://github.com/user-attachments/" in readme
+    assert "user-attachments" not in description
+    assert re.search(
+        r'<a href="https://github\.com/suneel944/agent-parley#readme">'
+        r'<img src="https://cdn\.jsdelivr\.net/gh/suneel944/agent-parley@v[\d.]+'
+        r'/docs/assets/launch\.webp"',
+        description,
+    )
+    assert (ROOT / "docs/assets/launch.webp").is_file()

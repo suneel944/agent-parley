@@ -11,6 +11,7 @@ from agent_parley import (
     checkpoints,
     cli,
     dashboard,
+    delivery,
     issues,
     lifecycle,
     roster,
@@ -250,6 +251,67 @@ def test_an_offer_records_and_reports_its_deadline(bridge, repo, paired):
     assert accepted["attempts"] == 0
 
 
+def test_a_takeover_request_records_and_reports_its_deadline(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    bridge.issue(paired["lanes"]["claude"], "claim", "42")
+    bridge.issue(
+        paired["lanes"]["codex"],
+        "request",
+        "42",
+        summary="claude is idle",
+        within=60,
+    )
+    record = ledger(directory)["42"]
+    assert record["request"]["deadline"] is not None
+    record["request"]["deadline"] = time.time() - 120
+    assert issues.offer_state(record["request"])["overdue_seconds"] >= 120
+
+
+def test_a_takeover_request_inherits_the_project_default(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    bridge.budgets(repo, {"request": 1800})
+    bridge.issue(paired["lanes"]["claude"], "claim", "42")
+    bridge.issue(
+        paired["lanes"]["codex"], "request", "42", summary="claude is idle"
+    )
+    record = ledger(directory)["42"]
+    assert record["request"]["deadline"] is not None
+
+
+def test_an_overdue_peer_offer_is_cancelled_back_to_its_lane(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "42")
+    bridge.issue(
+        lane, "offer", "42", to="codex", summary="commit, checks", within=60
+    )
+    state = issues.snapshot(directory)
+    state["issues"]["42"]["offer"]["deadline"] = time.time() - 120
+    state["revision"] += 1
+    write_json(directory / "issues.json", state)
+    supervision.expire_offers(directory, paired)
+    record = ledger(directory)["42"]
+    assert record["offer"] is None
+    assert record["owner"] == "claude"
+
+
+def test_a_live_peer_offer_is_left_alone(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "42")
+    bridge.issue(
+        lane, "offer", "42", to="codex", summary="commit, checks", within=60
+    )
+    supervision.expire_offers(directory, paired)
+    record = ledger(directory)["42"]
+    assert record["offer"] is not None
+    assert record["owner"] == "claude"
+
+
 def test_an_acknowledgement_deadline_is_recorded_and_reported(
     bridge, repo, paired
 ):
@@ -285,6 +347,31 @@ def test_the_runtime_records_one_notice_per_breach(bridge, repo, paired):
     revision = issues.snapshot(directory)["revision"]
     supervision.deadline_notices(directory, paired)
     assert issues.snapshot(directory)["revision"] == revision
+
+
+def test_a_released_claim_stops_delivering_its_deadline_notice(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "42", within=60)
+    age_claim(directory, "42", 300)
+    supervision.deadline_notices(directory, paired)
+    held = issues.snapshot(directory)
+    assert "overdue" in "\n".join(
+        delivery._notices("claude", held, None, [], {})
+    )
+    bridge.issue(lane, "release", "42")
+    state = issues.snapshot(directory)
+    assert state["issues"]["42"]["deadline_notice"]["holder"] == "claude"
+    state["revision"] += 1
+    write_json(directory / "issues.json", state)
+    stale = issues.snapshot(directory)
+    assert "overdue" not in "\n".join(
+        delivery._notices("claude", stale, None, [], {})
+    )
+    supervision.deadline_notices(directory, paired)
+    assert "deadline_notice" not in ledger(directory)["42"]
 
 
 def test_a_request_without_a_window_takes_the_configured_default(
@@ -326,6 +413,23 @@ def test_a_missed_deadline_returns_to_the_sender_with_its_reason(
     assert outstanding(bridge, paired, "codex") == []
     supervision.poll(bridge.home, directory)
     assert len(returned(bridge, "claude")) == 1
+
+
+def test_a_resent_request_after_retirement_stays_a_duplicate(
+    bridge, repo, paired
+):
+    actor = registered(bridge, paired, "claude")
+    registered(bridge, paired, "codex")
+    request = request_ack(bridge, actor, ["codex"], "resent", within=60)
+    assert request_ack(bridge, actor, ["codex"], "resent", within=60)[
+        "duplicate"
+    ]
+    assert store.retire_acknowledgement(
+        bridge.home, paired["root"], request["id"]
+    )
+    again = request_ack(bridge, actor, ["codex"], "resent", within=60)
+    assert again["duplicate"] and again["id"] == request["id"]
+    assert outstanding(bridge, paired, "codex") == []
 
 
 def test_an_acknowledged_request_never_returns_to_its_sender(
@@ -485,6 +589,8 @@ def test_defaults_are_validated_and_reported_as_json(
         roster.deadlines({"attempts": 0})
     with pytest.raises(BridgeError, match="claim deadline"):
         roster.deadlines({"claim": 0})
+    with pytest.raises(BridgeError, match="request deadline"):
+        roster.deadlines({"request": 0})
     with pytest.raises(BridgeError, match="Deadline defaults accept only"):
         roster.deadlines({"unknown": 1})
     bridge.budgets(repo, {"claim": 3600})

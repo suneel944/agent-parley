@@ -104,3 +104,23 @@ def test_an_empty_command_removes_the_setting(bridge, repo, command):
     bridge.setup(repo)
     bridge.initialization(repo, "true")
     assert "no lane initialization" in bridge.initialization(repo, command)
+
+
+def test_a_lane_cannot_change_the_initialization_command(
+    bridge, repo, monkeypatch
+):
+    bridge.setup(repo)
+    bridge.initialization(repo, "true")
+    manifest = bridge.add_participant(repo, "claude", "claude")
+    lane = Path(manifest["lanes"]["claude"])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.initialization(lane, "touch planted")
+    monkeypatch.chdir(lane)
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.initialization(repo, "")
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.initialization(repo, "touch planted")
+    assert "runs `true`" in bridge.initialization(lane)
+    assert roster.read(lane.parent)["initialize"] == ["true"]

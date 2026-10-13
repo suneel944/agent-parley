@@ -1,6 +1,7 @@
 """Checks the JSON error document the CLI prints for runtime failures."""
 
 import json
+import sqlite3
 import subprocess
 import sys
 
@@ -16,6 +17,17 @@ FAILURES = (
         subprocess.TimeoutExpired(["gh", "api"], 5),
         "timeout",
         "Command '['gh', 'api']' timed out after 5 seconds",
+    ),
+    (
+        sqlite3.OperationalError("database is locked"),
+        "store",
+        "database is locked",
+    ),
+    (
+        KeyError("claude-9"),
+        "missing",
+        "No record 'claude-9' any more; another command changed the "
+        "project while this one ran. Rerun it.",
     ),
 )
 
@@ -77,6 +89,17 @@ def test_partial_output_is_followed_by_its_own_error_line(
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == '{"schema": "partial"'
     assert json.loads(lines[-1])["error"]["message"] == "stopped midway"
+
+
+def test_pause_refuses_a_lane_retired_before_the_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli.Bridge, "_lane", lambda self, repo, name: (tmp_path, None, None)
+    )
+    monkeypatch.setattr(
+        cli.roster, "read", lambda directory: {"participants": {}}
+    )
+    with pytest.raises(BridgeError, match="claude-9 was retired"):
+        cli.Bridge(tmp_path).pause(tmp_path, "claude-9")
 
 
 def test_argument_errors_keep_the_argparse_contract(monkeypatch, capsys):

@@ -5,17 +5,21 @@ text. Every frame holds one real command line and the bytes that command
 wrote to a pseudo-terminal of fixed size, so the wrapping, the table widths
 and the refusal text are the ones an operator sees.
 
-What the run exercises, in order: a coordination server, a registered
-repository, two lanes on different providers, a lane launch each, a claim, an
-advisory path reservation, the collision a second lane meets on the same
-pattern, the queued request it files instead, a handoff offer and its
-acceptance, the dashboard, and a native hook refusing a branch switch.
+The run is told in nine chapters, each opened by a title card: parallel
+lanes on two providers, a work order every lane reads, claims and advisory
+reservations with the collision a second lane meets, guardrails in the native
+hooks, a handoff offer and its acceptance, a plan revision, a run budget,
+unattended integration, and the operator dashboard. A closing card names the
+install command.
 
-The native CLIs are stubs. The recorder writes ``claude`` and ``codex``
-executables that run ``exec sleep 900`` onto the front of ``PATH``, so the
-lane processes are real, the coordination path is real, and only the model
-session is a stand-in. Lanes are launched one at a time because two
-simultaneous launches race for the same server lock.
+The story and the stub-lane harness live in the package, in
+`agent_parley.demo_scenario` and `agent_parley.demo`, so ``agent-parley
+demo`` runs a short cut of the same chapters and cannot drift from this
+recording. The native CLIs are stubs. The harness writes ``claude`` and
+``codex`` executables that run ``exec sleep 900`` onto the front of
+``PATH``, so the lane processes are real, the coordination path is real, and
+only the model session is a stand-in. Lanes are launched one at a time
+because two simultaneous launches race for the same server lock.
 
 Reservations have no command-line verb; they are MCP tools. Those steps call
 the same tool dispatch the served transport calls, through
@@ -31,49 +35,75 @@ Nothing from the recording machine survives into the asset. The temporary
 state directory, the demo repository and the operator's home are rewritten
 to a ``/home/dev`` shape before a frame is drawn.
 
-Regenerate with ``make demo``, or::
+Regenerate with ``make demo-stub``, or::
 
     uv run --locked python scripts/record_demo.py
 
-The result is written to ``docs/assets/demo.svg`` and committed. It is
-referenced from ``README.md`` through a pinned jsdelivr URL, because the
-README is also the PyPI long description and relative image paths do not
-resolve there.
+The result is written to ``docs/assets/demo.svg``, the full nine-chapter
+walkthrough; ``--short`` writes the short cut to
+``docs/assets/demo-short.svg`` instead, and ``--video`` writes the launch
+video's frames to ``docs/video/frames.js``. ``scripts/record_live.py``
+(``make demo``) records real clients instead and needs model quota. The
+README shows the launch video, not these SVGs.
+
+``--video`` records the short tour and writes no SVG. It keeps the steps
+named in ``VIDEO``, each after its chapter card, and writes their text,
+colours and hold times to ``docs/video/frames.js`` for the launch video
+composition beside it. The composition reads only that file for terminal
+text, so the video uses the same captured frames and timing as the SVG.
 """
 
-import contextlib
 import dataclasses
-import fcntl
 import json
-import os
-import pty
-import re
-import select
-import socket
-import struct
-import subprocess
 import sys
 import tempfile
-import termios
+import textwrap
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
-COLUMNS = 132
-ROWS = 30
-FRAME_LINES = 24
-SECONDS_PER_FRAME = 4.5
+from agent_parley.demo import (
+    COLUMNS,
+    FRAME_LINES,
+    Card,
+    Recorder,
+    Step,
+    environment,
+    fixtures,
+    git,
+)
+from agent_parley.demo_scenario import record, tour
+
+SHORT = (
+    "ada claims #41 from inside its lane.",
+    "grace asks for the same paths: a named collision.",
+    "grace accepts; only then does ownership move.",
+    "The dashboard: state, issues, mail, leases, denials.",
+)
+VIDEO = (
+    "ada runs on claude, in a worktree of its own.",
+    "grace runs on codex, right beside it.",
+    "Two providers, two lanes, one shared view.",
+    "ada claims #41 from inside its lane.",
+    "ada reserves the refund module.",
+    "grace asks for the same paths: a named collision.",
+    "So grace queues behind ada instead of waiting blind.",
+    "ada offers #41 to grace with a summary.",
+    "grace accepts; only then does ownership move.",
+    "The dashboard: state, issues, mail, leases, denials.",
+)
+TYPE_RATE = 0.028
+TYPE_LIMIT = 1.6
+FADE = 0.35
+CAPTION = 48.0
+SANS = "system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
 CHARACTER = 7.81
 LINE = 18.0
 MARGIN = 18.0
 HEADER = 30.0
-DEFAULT_PORT = 8876
-ISSUE = "41"
-PATTERN = "src/payments/**"
 DEMO_HOME = "/home/dev"
 DEMO_REPOSITORY = "/home/dev/payments-api"
 DEMO_STATE = "/home/dev/.local/state/agent-parley"
-ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[=>]|\x1b\][^\x07]*\x07")
-OFFER_ID = re.compile(r'"id": "([0-9a-f]{16,})"')
 BACKGROUND = "#0d1117"
 BAR = "#161b22"
 MUTED = "#8b949e"
@@ -92,123 +122,9 @@ EMPHASIS = (
     "project ",
     "agent-parley top",
     "projects ",
+    "Lanes:",
+    "Mail:",
 )
-
-
-@dataclasses.dataclass(frozen=True)
-class Step:
-    """One recorded frame.
-
-    Attributes:
-        prompt: The leading marker drawn before the command, ``$`` for a
-            shell command and the lane name for a tool call.
-        command: The command line or tool call as it was issued.
-        output: The lines the step wrote, already stripped of escapes.
-    """
-
-    prompt: str
-    command: str
-    output: tuple[str, ...]
-
-
-def free_port() -> int:
-    """Reserves a loopback port the demo server can bind.
-
-    Returns:
-        The documented default port when nothing holds it, so the frames
-        read like a first run, and otherwise any free port, so a recording
-        never collides with an operator's own server.
-    """
-    for candidate in (DEFAULT_PORT, 0):
-        with socket.socket() as probe:
-            try:
-                probe.bind(("127.0.0.1", candidate))
-            except OSError:
-                continue
-            return int(probe.getsockname()[1])
-    raise RuntimeError("no loopback port was available")
-
-
-def git(*arguments: str, cwd: Path | None = None) -> None:
-    """Runs one Git command for the demo fixtures.
-
-    Args:
-        *arguments: Arguments after the program name.
-        cwd: Directory to run in, or None for the process directory.
-
-    Raises:
-        RuntimeError: If Git reported a failure.
-    """
-    done = subprocess.run(
-        ["git", *arguments],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if done.returncode:
-        raise RuntimeError(f"git {' '.join(arguments)}: {done.stderr.strip()}")
-
-
-def fixtures(base: Path) -> tuple[Path, Path, Path]:
-    """Builds the temporary state directory, stub CLIs and demo repository.
-
-    Args:
-        base: Directory every artefact of this run is created under.
-
-    Returns:
-        The coordination home, the stub executable directory and the demo
-        repository root.
-    """
-    home = base / "state"
-    binaries = base / "bin"
-    repository = base / "payments-api"
-    for path in (home, binaries, repository / "src" / "payments"):
-        path.mkdir(parents=True)
-    home.chmod(0o700)
-    for tool in ("claude", "codex"):
-        stub = binaries / tool
-        stub.write_text("#!/usr/bin/env bash\nexec sleep 900\n")
-        stub.chmod(0o755)
-    module = repository / "src" / "payments" / "refund.py"
-    module.write_text('"""Refund path the lanes negotiate over."""\n')
-    git("init", "-q", "-b", "main", str(repository))
-    git("add", "--all", cwd=repository)
-    git(
-        "-c",
-        "user.name=dev",
-        "-c",
-        "user.email=dev@example.com",
-        "commit",
-        "-qm",
-        "Add the refund path",
-        cwd=repository,
-    )
-    return home, binaries, repository
-
-
-def environment(home: Path, binaries: Path, base: Path) -> dict[str, str]:
-    """Builds the environment every recorded command runs under.
-
-    Args:
-        home: Coordination state directory for this run.
-        binaries: Directory holding the stub native CLIs.
-        base: Directory the native configuration homes are created under.
-
-    Returns:
-        A copy of the process environment pinned to the temporary state,
-        the stub executables and a free loopback port.
-    """
-    values = dict(os.environ)
-    values["PATH"] = f"{binaries}{os.pathsep}{values['PATH']}"
-    values["AGENT_PARLEY_HOME"] = str(home)
-    values["AGENT_PARLEY_PORT"] = str(free_port())
-    values["CLAUDE_CONFIG_DIR"] = str(base / "native" / "claude")
-    values["CODEX_HOME"] = str(base / "native" / "codex")
-    values["COLUMNS"] = str(COLUMNS)
-    values["LINES"] = str(ROWS)
-    values["NO_COLOR"] = "1"
-    return values
 
 
 def lower_stall_windows(directory: Path) -> None:
@@ -219,7 +135,12 @@ def lower_stall_windows(directory: Path) -> None:
     generator that waited that long to show a genuine idle label would
     make ``make demo screenshots`` impractical, so this rewrites the
     project's own manifest, the legitimate place that setting lives,
-    rather than faking the label. ``inactive_after`` is left at its
+    rather than faking the label. ``interval`` drops to two seconds for
+    the same reason: lane records and published fitness move only on a
+    supervision poll, and a poll taken before the later lanes launched
+    would otherwise stand for the default thirty seconds. Call this before
+    the first launch, since the poll a launch triggers schedules the next
+    one from the interval it reads. ``inactive_after`` is left at its
     default: it also governs whether a launched session still reads as
     running, and lowering it would misreport every quiet lane as stopped.
 
@@ -232,393 +153,35 @@ def lower_stall_windows(directory: Path) -> None:
     manifest["supervision"] = {
         **manifest.get("supervision", {}),
         "stalled_after": 2,
+        "interval": 2,
     }
     path.write_text(json.dumps(manifest))
 
 
-def terminal() -> tuple[int, int]:
-    """Opens a pseudo-terminal sized like the recorded frame.
+def verdict(step: Step) -> Step:
+    """Reads a recorded hook decision the way the agent receives it.
 
-    Returns:
-        The controlling and child file descriptors; the caller closes the
-        child once the subprocess owns it.
-    """
-    controller, child = pty.openpty()
-    size = struct.pack("HHHH", ROWS, COLUMNS, 0, 0)
-    fcntl.ioctl(child, termios.TIOCSWINSZ, size)
-    return controller, child
-
-
-def drain(controller: int, deadline: float) -> str:
-    """Reads a pseudo-terminal until it closes or the deadline passes.
+    The hook writes a JSON document for the native client. A screenshot
+    shows the decision and the reason the agent is told, wrapped to the
+    frame, instead of the envelope around them.
 
     Args:
-        controller: Controlling file descriptor of the pseudo-terminal.
-        deadline: Monotonic time to stop reading at.
+        step: Step recorded by ``Recorder.hook``.
 
     Returns:
-        Everything the child wrote, decoded and with escapes removed.
+        The same step with its output replaced by the decision and reason.
     """
-    chunks: list[bytes] = []
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if not select.select([controller], [], [], remaining)[0]:
-            break
-        try:
-            data = os.read(controller, 65536)
-        except OSError:
-            break
-        if not data:
-            break
-        chunks.append(data)
-    return clean(b"".join(chunks).decode("utf-8", "replace"))
-
-
-def clean(text: str) -> str:
-    """Removes terminal escapes and carriage returns from captured bytes.
-
-    Args:
-        text: Raw pseudo-terminal output.
-
-    Returns:
-        The same output as plain lines.
-    """
-    return ANSI.sub("", text).replace("\r\n", "\n").replace("\r", "")
-
-
-class Recorder:
-    """Drives the demo and collects one frame per step.
-
-    Attributes:
-        home: Coordination state directory for this run.
-        repository: Demo repository root.
-        env: Environment every recorded command runs under.
-        steps: Frames captured so far, in order.
-        lanes: Lane worktrees keyed by participant name.
-        sessions: Launched lane processes, kept alive for the whole run.
-        attached: Controlling terminals of those launches; closing one
-            hangs up its lane, which would read as a stopped session in the
-            dashboard, so they stay open until the recording ends.
-    """
-
-    def __init__(self, home: Path, repository: Path, env: dict[str, str]):
-        """Stores the run's directories and prepares empty frame state.
-
-        Args:
-            home: Coordination state directory for this run.
-            repository: Demo repository root.
-            env: Environment every recorded command runs under.
-        """
-        self.home = home
-        self.repository = repository
-        self.env = env
-        self.steps: list[Step] = []
-        self.lanes: dict[str, Path] = {}
-        self.sessions: list[subprocess.Popen[bytes]] = []
-        self.attached: list[int] = []
-
-    def parley(self, *arguments: str) -> list[str]:
-        """Builds the argument vector that runs the installed command.
-
-        Args:
-            *arguments: Arguments after the program name.
-
-        Returns:
-            The interpreter invocation of the package entry point, which is
-            the installed ``agent-parley`` command without a launcher on
-            PATH.
-        """
-        return [sys.executable, "-m", "agent_parley", *arguments]
-
-    def run(
-        self, *arguments: str, cwd: Path | None = None, timeout: float = 90.0
-    ) -> str:
-        """Records one ``agent-parley`` command and its terminal output.
-
-        Args:
-            *arguments: Arguments after the program name.
-            cwd: Directory to run in, defaulting to the demo repository.
-            timeout: Seconds to wait for the command to finish.
-
-        Returns:
-            The captured output, so a later step can read an identifier out
-            of it.
-        """
-        controller, child = terminal()
-        process = subprocess.Popen(
-            self.parley(*arguments),
-            cwd=cwd or self.repository,
-            env=self.env,
-            stdin=child,
-            stdout=child,
-            stderr=child,
-        )
-        os.close(child)
-        output = drain(controller, time.monotonic() + timeout)
-        os.close(controller)
-        process.wait(timeout=timeout)
-        self.steps.append(
-            Step("$", " ".join(("agent-parley", *arguments)), lines(output))
-        )
-        return output
-
-    def shell(self, *arguments: str, cwd: Path) -> str:
-        """Records one plain shell command run inside a lane worktree.
-
-        Args:
-            *arguments: The command and its arguments.
-            cwd: Directory to run in.
-
-        Returns:
-            The captured output.
-        """
-        controller, child = terminal()
-        process = subprocess.Popen(
-            list(arguments),
-            cwd=cwd,
-            env=self.env,
-            stdin=child,
-            stdout=child,
-            stderr=child,
-        )
-        os.close(child)
-        output = drain(controller, time.monotonic() + 30.0)
-        os.close(controller)
-        process.wait(timeout=30.0)
-        self.steps.append(Step("$", " ".join(arguments), lines(output)))
-        return output
-
-    def launch(self, name: str) -> None:
-        """Records one lane launch and keeps that lane's session alive.
-
-        Args:
-            name: Participant to launch.
-
-        Raises:
-            RuntimeError: If the launch printed no worktree path.
-        """
-        controller, child = terminal()
-        process = subprocess.Popen(
-            self.parley("run", name, "--repo", str(self.repository)),
-            cwd=self.repository,
-            env=self.env,
-            stdin=child,
-            stdout=child,
-            stderr=child,
-        )
-        os.close(child)
-        self.sessions.append(process)
-        self.attached.append(controller)
-        output = drain(controller, time.monotonic() + 8.0)
-        captured = lines(output)
-        if not captured or ": " not in captured[0]:
-            raise RuntimeError(f"run {name} printed no worktree: {output!r}")
-        self.lanes[name] = Path(captured[0].split(": ", 1)[1].strip())
-        self.steps.append(Step("$", f"agent-parley run {name}", captured))
-
-    def tool(self, name: str, tool: str, arguments: dict) -> dict:
-        """Records one MCP tool call made with a lane's own credential.
-
-        Args:
-            name: Participant making the call.
-            tool: Tool name as the served transport exposes it.
-            arguments: Tool arguments.
-
-        Returns:
-            The tool result, so a later step can read it.
-
-        Raises:
-            RuntimeError: If the lane's credential was refused.
-        """
-        from agent_parley import store
-
-        directory = next(iter(self.lanes.values())).parent
-        identity = directory / f"{name}-identity.json"
-        token = json.loads(identity.read_text())["registration_token"]
-        actor = store.authenticate(self.home, token)
-        if actor is None:
-            raise RuntimeError(f"{name} was not registered")
-        result = store.call(self.home, actor, tool, arguments)
-        rendered = json.dumps(arguments, separators=(", ", ": "))
-        self.steps.append(
-            Step(
-                name,
-                f"{tool} {rendered}",
-                lines(json.dumps(result, indent=2)),
-            )
-        )
-        return result
-
-    def event(self, name: str, payload: dict) -> str:
-        """Serves one native hook event the way a launched client does.
-
-        Args:
-            name: Participant whose session raised the event.
-            payload: The event body the native client writes on standard
-                input.
-
-        Returns:
-            The decision document the hook wrote, with escapes removed.
-        """
-        lane = self.lanes[name]
-        done = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "agent_parley.hook",
-                "--home",
-                str(self.home),
-                "--directory",
-                str(lane.parent),
-                "--agent",
-                name,
-            ],
-            cwd=lane,
-            env=self.env,
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return clean(done.stdout + done.stderr)
-
-    def session(self, name: str) -> None:
-        """Serves the session-start event a launched client raises.
-
-        The stub native CLI raises no events of its own, so the recorder
-        serves the one a real session would, which is what moves the lane
-        out of its starting state and delivers its briefing.
-
-        Args:
-            name: Participant whose session started.
-        """
-        self.event(
-            name,
-            {
-                "hook_event_name": "SessionStart",
-                "session_id": f"demo-{name}",
-                "source": "startup",
-                "cwd": str(self.lanes[name]),
-            },
-        )
-
-    def hook(self, name: str, command: str) -> None:
-        """Records the native hook's decision on one tool call.
-
-        Args:
-            name: Participant whose session raised the event.
-            command: Shell command the native client asked to run.
-        """
-        decision = self.event(
-            name,
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": f"demo-{name}",
-                "cwd": str(self.lanes[name]),
-                "tool_name": "Bash",
-                "tool_input": {"command": command},
-            },
-        )
-        self.steps.append(
-            Step(
-                name,
-                f"PreToolUse Bash: {command}",
-                lines(json.dumps(json.loads(decision), indent=2)),
-            )
-        )
-
-    def close(self) -> None:
-        """Stops the lane sessions and the coordination server."""
-        for process in self.sessions:
-            with contextlib.suppress(OSError):
-                process.terminate()
-        for process in self.sessions:
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=10)
-        for descriptor in self.attached:
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
-        subprocess.run(
-            self.parley("down"),
-            cwd=self.repository,
-            env=self.env,
-            capture_output=True,
-            check=False,
-        )
-
-
-def lines(text: str) -> tuple[str, ...]:
-    """Splits captured output into frame lines without trailing blanks.
-
-    Args:
-        text: Captured output.
-
-    Returns:
-        The lines of that output, right-stripped, wrapped at the frame
-        width the way the terminal wraps, and without trailing blank
-        lines. Output captured from a pseudo-terminal is already wrapped;
-        a tool result rendered as a document is not.
-    """
-    rows: list[str] = []
-    for row in text.split("\n"):
-        stripped = row.rstrip()
-        if not stripped:
-            rows.append(stripped)
-        while stripped:
-            rows.append(stripped[:COLUMNS])
-            stripped = stripped[COLUMNS:]
-    while rows and not rows[-1]:
-        rows.pop()
-    return tuple(rows)
-
-
-def record(recorder: Recorder) -> None:
-    """Drives every coordination feature the recording shows.
-
-    Args:
-        recorder: Recorder collecting the frames.
-
-    Raises:
-        RuntimeError: If the handoff offer carried no identifier.
-    """
-    root = str(recorder.repository)
-    recorder.run("up")
-    recorder.run("setup", root)
-    recorder.run("forge", "set", "null", "--repo", root)
-    recorder.run("participant", "add", "ada", "--provider", "claude")
-    recorder.run("participant", "add", "grace", "--provider", "codex")
-    recorder.launch("ada")
-    recorder.launch("grace")
-    recorder.session("ada")
-    recorder.session("grace")
-    ada = recorder.lanes["ada"]
-    grace = recorder.lanes["grace"]
-    recorder.run("status")
-    recorder.run("issue", "claim", ISSUE, cwd=ada)
-    recorder.tool("ada", "file_reservation_paths", {"paths": [PATTERN]})
-    recorder.tool("grace", "file_reservation_paths", {"paths": [PATTERN]})
-    recorder.tool("grace", "request_reservation", {"paths": [PATTERN]})
-    offered = recorder.run(
-        "issue",
-        "offer",
-        ISSUE,
-        "--to",
-        "grace",
-        "--summary",
-        "Refund path reserved; tests green.",
-        cwd=ada,
+    text = "".join(step.output).strip()
+    output = (json.loads(text) if text else {}).get("hookSpecificOutput", {})
+    decision = output.get("permissionDecision", "allow")
+    reason = output.get("permissionDecisionReason", "")
+    wrapped = textwrap.wrap(
+        reason,
+        COLUMNS - 12,
+        initial_indent=f"{decision:<7}",
+        subsequent_indent=" " * 7,
     )
-    found = OFFER_ID.search(offered)
-    if found is None:
-        raise RuntimeError(f"no offer identifier in {offered!r}")
-    recorder.run(
-        "issue", "accept", ISSUE, "--offer-id", found.group(1), cwd=grace
-    )
-    recorder.run("issue", "list", cwd=grace)
-    recorder.run("top", "--once")
-    recorder.hook("ada", "git checkout -b hotfix/refund")
+    return dataclasses.replace(step, output=tuple(wrapped or [decision]))
 
 
 def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
@@ -651,34 +214,40 @@ def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
     recorder.run("forge", "set", "null", "--repo", root)
     recorder.run("participant", "add", "claude-1", "--provider", "claude")
     recorder.run("participant", "add", "codex-1", "--provider", "codex")
-    recorder.run("participant", "add", "kimi-1", "--provider", "kimi")
+    recorder.run("participant", "add", "claude-2", "--provider", "claude")
+    manifest = next((recorder.home / "projects").glob("*/project.json"))
+    lower_stall_windows(manifest.parent)
     recorder.launch("claude-1")
     recorder.launch("codex-1")
+    recorder.launch("claude-2")
     recorder.session("claude-1")
+    recorder.session("claude-2")
     claude_lane = recorder.lanes["claude-1"]
     codex_lane = recorder.lanes["codex-1"]
-    lower_stall_windows(claude_lane.parent)
-    recorder.env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:0"
-    recorder.env["ANTHROPIC_AUTH_TOKEN"] = "screenshot-fixture"
-    recorder.launch("kimi-1")
-    recorder.session("kimi-1")
-    dormant_process = recorder.sessions[-1]
-    dormant_process.terminate()
-    dormant_process.wait(timeout=10.0)
+    docs_lane = recorder.lanes["claude-2"]
     recorder.run("issue", "claim", "17", cwd=codex_lane)
     recorder.run("issue", "claim", "42", cwd=claude_lane)
+    recorder.run("issue", "claim", "58", cwd=docs_lane)
+    recorder.prompt("claude-1", "Fix refund rounding for partial captures")
+    recorder.prompt("codex-1", "Rename the shared money helper")
+    recorder.prompt("claude-2", "Document the refund API for merchants")
+    recorder.tool(
+        "claude-2",
+        "file_reservation_paths",
+        {"paths": ["docs/refunds.md"], "reason": "refund API guide"},
+    )
     recorder.tool(
         "claude-1",
         "file_reservation_paths",
         {"paths": [path], "exclusive": True, "reason": "refund rounding fix"},
     )
-    reserved = recorder.steps[-1]
+    reserved = recorder.latest()
     recorder.tool(
         "codex-1",
         "file_reservation_paths",
         {"paths": [path], "exclusive": True, "reason": "shared helper rename"},
     )
-    conflicted = recorder.steps[-1]
+    conflicted = recorder.latest()
     recorder.run("issue", "block", "42", "--on", "17", cwd=claude_lane)
     recorder.run(
         "issue",
@@ -691,7 +260,7 @@ def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
         cwd=claude_lane,
     )
     recorder.run("issue", "list", cwd=claude_lane)
-    issue_list = recorder.steps[-1]
+    issue_list = recorder.latest()
     recorder.tool(
         "claude-1",
         "send_message",
@@ -706,19 +275,24 @@ def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
             "ack_required": True,
         },
     )
-    sent = recorder.steps[-1]
+    sent = recorder.latest()
     recorder.tool("codex-1", "fetch_inbox", {"limit": 5})
-    fetched = recorder.steps[-1]
+    fetched = recorder.latest()
     git("switch", "-c", "refund-spike", cwd=codex_lane)
     recorder.hook("codex-1", "cat src/payments/refund.py")
-    drifted = recorder.steps[-1]
+    drifted = recorder.latest()
     recorder.hook("claude-1", "git switch -c hotfix")
-    blocked = recorder.steps[-1]
-    time.sleep(3.0)
-    recorder.run("top", "--once")
-    top = recorder.steps[-1]
+    blocked = recorder.latest()
+    time.sleep(5.0)
+    recorder.run(
+        "top",
+        "--once",
+        "--columns",
+        "PARTICIPANT,STATE,ISSUES,MAIL,LEASES,DENIALS,IDLE,TASK",
+    )
+    top = recorder.latest()
     recorder.run("status")
-    status = recorder.steps[-1]
+    status = recorder.latest()
 
     return {
         "screenshot-top.svg": [top],
@@ -726,14 +300,12 @@ def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
         "screenshot-issues.svg": [issue_list],
         "screenshot-hooks.svg": [
             annotate("# a branch switch attempted inside an assigned lane"),
-            annotate(""),
-            blocked,
+            verdict(blocked),
             annotate(""),
             annotate(
-                "# the same lane after any bypass leaves it on another branch"
+                "# a lane left on another branch is stopped at its next call"
             ),
-            annotate(""),
-            drifted,
+            verdict(drifted),
         ],
         "screenshot-coordination.svg": [
             annotate("# the agent reserves the file it is about to change"),
@@ -758,7 +330,9 @@ def screenshot_scenario(recorder: Recorder) -> dict[str, list[Step]]:
     }
 
 
-def rewritten(steps: list[Step], places: dict[str, str]) -> list[Step]:
+def rewritten(
+    steps: Sequence[Step | Card], places: dict[str, str]
+) -> list[Step | Card]:
     """Replaces recording paths with a stable demo shape.
 
     Args:
@@ -785,7 +359,13 @@ def rewritten(steps: list[Step], places: dict[str, str]) -> list[Step]:
         return text
 
     return [
-        Step(step.prompt, fix(step.command), tuple(fix(x) for x in step.output))
+        dataclasses.replace(
+            step,
+            command=fix(step.command),
+            output=tuple(fix(x) for x in step.output),
+        )
+        if isinstance(step, Step)
+        else step
         for step in steps
     ]
 
@@ -801,11 +381,11 @@ def colour(text: str) -> str:
         header or table heading reads as a heading, everything else reads
         as body text.
     """
+    if any(text.lstrip().startswith(word) for word in EMPHASIS):
+        return HEADING
     lowered = text.lower()
     if any(word in lowered for word in REFUSED):
         return REFUSAL
-    if any(text.lstrip().startswith(word) for word in EMPHASIS):
-        return HEADING
     return BODY
 
 
@@ -828,15 +408,16 @@ def frame(step: Step) -> tuple[str, ...]:
         step: The captured step.
 
     Returns:
-        Every output line when the step fits, and otherwise its first and
-        last lines with one marker naming how many lines between them the
-        frame does not show. Nothing is rewritten: a clipped frame states
-        that it is clipped.
+        Every output line when the step fits its limit, and otherwise its
+        first and last lines with one marker naming how many lines between
+        them the frame does not show. Nothing is rewritten: a clipped frame
+        states that it is clipped.
     """
-    if len(step.output) <= FRAME_LINES:
+    limit = min(step.limit, FRAME_LINES)
+    if len(step.output) <= limit:
         return step.output
-    head = (FRAME_LINES - 1) * 2 // 3
-    tail = FRAME_LINES - 1 - head
+    head = (limit - 1) * 2 // 3
+    tail = limit - 1 - head
     elided = len(step.output) - head - tail
     return (
         *step.output[:head],
@@ -845,94 +426,416 @@ def frame(step: Step) -> tuple[str, ...]:
     )
 
 
-def schedule(index: int, count: int, total: float) -> str:
-    """Builds the animation that shows one frame in its turn.
-
-    The timing is SMIL rather than CSS keyframes because an SVG served as
-    an image animates through its own timeline in every renderer that
-    animates at all, and because a headless browser can be asked what that
-    timeline shows at a given second, which makes the result checkable.
+def typing_seconds(step: Step) -> float:
+    """Returns how long a step's command takes to type out.
 
     Args:
-        index: Position of the frame in the recording.
-        count: Number of frames in the recording.
+        step: The captured step.
+
+    Returns:
+        Seconds proportional to the command's length, capped so a long
+        tool call does not stall the recording.
+    """
+    return min(len(step.command) * TYPE_RATE, TYPE_LIMIT)
+
+
+def hold_seconds(item: "Step | Card") -> float:
+    """Returns how long one item stays on screen.
+
+    Args:
+        item: A captured step or a title card.
+
+    Returns:
+        A card's own duration, or for a step the typing time plus a reading
+        time that grows with the lines and the caption it shows.
+    """
+    if isinstance(item, Card):
+        return item.seconds
+    reading = 2.4 + 0.1 * len(frame(item)) + 0.03 * len(item.caption)
+    return typing_seconds(item) + min(max(reading, 3.0), 7.5)
+
+
+def cut(
+    items: Sequence[Step | Card], captions: Sequence[str]
+) -> list[Step | Card]:
+    """Selects the steps a cut shows, each chapter kept with its card.
+
+    Args:
+        items: Every card and step a recording captured, in order.
+        captions: Captions of the steps the cut shows, in recording order.
+
+    Returns:
+        The chosen steps in recording order. The card that opened a chapter
+        comes before the first chosen step of that chapter; a chapter with
+        no chosen step loses its card.
+
+    Raises:
+        RuntimeError: If the recording lost or reordered one of the
+            captions.
+    """
+    chosen: list[Step | Card] = []
+    card: Card | None = None
+    for item in items:
+        if isinstance(item, Card):
+            card = item
+        elif item.caption in captions:
+            if card is not None:
+                chosen.append(card)
+                card = None
+            chosen.append(item)
+    found = [item.caption for item in chosen if isinstance(item, Step)]
+    if found != list(captions):
+        raise RuntimeError(f"cut captions changed: {found}")
+    return chosen
+
+
+def timeline(items: Sequence[Step | Card]) -> dict[str, object]:
+    """Lays a cut on the recording's timing model for the video.
+
+    The video composition in ``docs/video`` draws exactly what this returns,
+    so a frame there holds the same clipped rows, colours and hold times as
+    the animated SVG.
+
+    Args:
+        items: Cards and steps of the cut, in order.
+
+    Returns:
+        The frame size in columns and rows, the cut's length in seconds and
+        one entry per item with its start second and hold time. A card
+        entry carries its kicker, title and lines; a step entry carries its
+        typing time, prompt, command, caption and each row `frame` shows,
+        paired with the colour `colour` gives it.
+    """
+    start = 0.0
+    entries: list[dict[str, object]] = []
+    for item in items:
+        seconds = hold_seconds(item)
+        entry: dict[str, object] = {
+            "start": round(start, 3),
+            "seconds": round(seconds, 3),
+        }
+        if isinstance(item, Card):
+            entry |= {
+                "kind": "card",
+                "kicker": item.kicker,
+                "title": item.title,
+                "lines": list(item.lines),
+            }
+        else:
+            entry |= {
+                "kind": "step",
+                "typing": round(typing_seconds(item), 3),
+                "prompt": item.prompt,
+                "command": item.command,
+                "caption": item.caption,
+                "rows": [[row, colour(row)] for row in frame(item)],
+            }
+        entries.append(entry)
+        start += seconds
+    return {
+        "columns": COLUMNS,
+        "rows": FRAME_LINES,
+        "seconds": round(start, 3),
+        "items": entries,
+    }
+
+
+def keytimes(moments: list[float], total: float) -> str:
+    """Formats absolute moments as SMIL key times over one loop.
+
+    Args:
+        moments: Seconds from the start of the loop, non-decreasing, the
+            first zero and the last the loop length.
         total: Length of one loop in seconds.
 
     Returns:
-        One ``animate`` element holding the frame's opacity at zero until
-        its turn, at one for its turn, and at zero afterwards.
+        The ``keyTimes`` attribute value.
     """
-    start = round(index / count, 6)
-    end = round((index + 1) / count, 6)
-    values = "1;0" if index == 0 else "0;1;0"
-    times = f"0;{end}" if index == 0 else f"0;{start};{end}"
+    return ";".join(f"{min(max(x / total, 0.0), 1.0):.6f}" for x in moments)
+
+
+def animate(
+    attribute: str, values: list[str], moments: list[float], total: float
+) -> str:
+    """Builds one looping SMIL animation on the shared recording timeline.
+
+    Every animation in the file shares one duration and repeats forever, so
+    they stay in step on every loop without referencing each other. The
+    timing is SMIL rather than CSS keyframes because an SVG served as an
+    image animates through its own timeline in every renderer that animates
+    at all, and because a headless browser can be asked what that timeline
+    shows at a given second, which makes the result checkable.
+
+    Args:
+        attribute: Attribute the animation drives.
+        values: One value per moment.
+        moments: Seconds from the start of the loop, starting at zero and
+            ending at the loop length.
+        total: Length of one loop in seconds.
+
+    Returns:
+        One ``animate`` element.
+    """
     return (
-        '<animate attributeName="opacity" calcMode="discrete" '
-        f'values="{values}" keyTimes="{times}" dur="{total}s" '
+        f'<animate attributeName="{attribute}" values="{";".join(values)}" '
+        f'keyTimes="{keytimes(moments, total)}" dur="{total}s" '
         'repeatCount="indefinite"/>'
     )
 
 
-def render(steps: list[Step], destination: Path) -> None:
-    """Writes the frames as one animated SVG.
+def visibility(start: float, end: float, total: float) -> str:
+    """Builds the opacity animation that fades one item in and out.
 
     Args:
-        steps: Frames to draw, in order.
-        destination: File to write.
+        start: Second the item appears.
+        end: Second the item has gone.
+        total: Length of one loop in seconds.
+
+    Returns:
+        One ``animate`` element; the first item starts visible, so a
+        renderer that ignores animation still shows the opening card.
     """
-    widest = max(
-        max(
-            [len(step.prompt) + 1 + len(step.command)]
-            + [len(row) for row in frame(step)]
+    if start <= 0:
+        return animate(
+            "opacity", ["1", "1", "0", "0"], [0, end - FADE, end, total], total
         )
-        for step in steps
+    if end >= total:
+        return animate(
+            "opacity",
+            ["0", "0", "1", "1"],
+            [0, start, start + FADE, total],
+            total,
+        )
+    return animate(
+        "opacity",
+        ["0", "0", "1", "1", "0", "0"],
+        [0, start, start + FADE, end - FADE, end, total],
+        total,
     )
-    columns = min(widest, COLUMNS)
-    width = round(columns * CHARACTER + MARGIN * 2)
-    rows = max(len(frame(step)) for step in steps)
-    height = round(HEADER + MARGIN * 2 + LINE * (rows + 1))
-    total = round(len(steps) * SECONDS_PER_FRAME, 2)
+
+
+def definitions(width: int) -> str:
+    """Returns the gradients shared by every card and the progress bar.
+
+    Args:
+        width: Canvas width in pixels.
+
+    Returns:
+        One ``defs`` element.
+    """
+    return (
+        "<defs>"
+        '<radialGradient id="backdrop" cx="50%" cy="38%" r="75%">'
+        '<stop offset="0" stop-color="#1b2a4a"/>'
+        '<stop offset="0.55" stop-color="#0d1117"/>'
+        '<stop offset="1" stop-color="#010409"/></radialGradient>'
+        f'<linearGradient id="accent" x1="0" x2="{width}" y1="0" y2="0" '
+        'gradientUnits="userSpaceOnUse">'
+        '<stop offset="0.2" stop-color="#79c0ff"/>'
+        '<stop offset="0.5" stop-color="#d2a8ff"/>'
+        '<stop offset="0.8" stop-color="#7ee787"/></linearGradient>'
+        "</defs>"
+    )
+
+
+def draw_card(
+    card: Card, width: int, height: int, start: float, total: float
+) -> list[str]:
+    """Draws one title card as a full-canvas group.
+
+    Args:
+        card: The card to draw.
+        width: Canvas width in pixels.
+        height: Canvas height in pixels.
+        start: Second the card appears.
+        total: Length of one loop in seconds.
+
+    Returns:
+        The SVG elements of the card, without the enclosing group.
+    """
+    middle = width / 2
+    top = height / 2 - 26 - len(card.lines) * 13
+    rise = animate(
+        "transform",
+        ["0 14", "0 14", "0 0", "0 0"],
+        [0, start, start + 0.8, total],
+        total,
+    ).replace("<animate ", '<animateTransform type="translate" ')
+    parts = [
+        f'<rect width="{width}" height="{height}" rx="10" '
+        'fill="url(#backdrop)"/>',
+        f"<g>{rise}",
+        f'<text x="{middle}" y="{top}" text-anchor="middle" '
+        f'fill="{HEADING}" font-family="{SANS}" font-size="14" '
+        f'letter-spacing="4" font-weight="600">{escape(card.kicker)}</text>',
+        f'<text x="{middle}" y="{top + 56}" text-anchor="middle" '
+        f'fill="url(#accent)" font-family="{SANS}" font-size="44" '
+        f'font-weight="800">{escape(card.title)}</text>',
+    ]
+    for number, line in enumerate(card.lines):
+        parts.append(
+            f'<text x="{middle}" y="{top + 104 + number * 28}" '
+            f'text-anchor="middle" fill="{BODY}" font-family="{SANS}" '
+            f'font-size="18">{escape(line)}</text>'
+        )
+    parts.append("</g>")
+    return parts
+
+
+def draw_step(
+    step: Step,
+    chapter: str,
+    width: int,
+    start: float,
+    total: float,
+) -> list[str]:
+    """Draws one terminal frame with its typed command and caption.
+
+    The command is revealed left to right behind a cursor, and the output
+    fades in once it is typed, so the frame reads as a command being run.
+    Nothing in the terminal area is written by hand: the command and every
+    output line are the captured ones.
+
+    Args:
+        step: The captured step.
+        chapter: Chapter name drawn in the title bar.
+        width: Canvas width in pixels.
+        start: Second the frame appears.
+        total: Length of one loop in seconds.
+
+    Returns:
+        The SVG elements of the frame, without the enclosing group.
+    """
+    typed = start + FADE + typing_seconds(step)
+    baseline = HEADER + MARGIN + LINE
+    origin = MARGIN + (len(step.prompt) + 1) * CHARACTER
+    span = min(len(step.command) * CHARACTER, width - origin - MARGIN)
+    marker = PROMPT if step.prompt == "$" else TOOL
+    clip = f"type{round(start * 1000)}"
+    parts = [
+        f'<text x="{width / 2}" y="19" text-anchor="middle" fill="{MUTED}" '
+        f'font-family="{SANS}" font-size="12">{escape(chapter)}</text>',
+        f'<clipPath id="{clip}"><rect x="{origin}" y="{baseline - 14}" '
+        f'height="{LINE}" width="0">'
+        + animate(
+            "width",
+            ["0", "0", f"{span:.1f}", f"{span:.1f}"],
+            [0, start + FADE, typed, total],
+            total,
+        )
+        + "</rect></clipPath>",
+        f'<text x="{MARGIN}" y="{baseline}" xml:space="preserve" '
+        f'fill="{marker}">{escape(step.prompt)}</text>',
+        f'<text x="{origin}" y="{baseline}" xml:space="preserve" '
+        f'fill="{COMMAND}" clip-path="url(#{clip})">'
+        f"{escape(step.command)}</text>",
+        f'<rect y="{baseline - 12}" width="8" height="15" fill="{COMMAND}">'
+        + animate(
+            "x",
+            [f"{origin:.1f}", f"{origin:.1f}", f"{origin + span:.1f}"]
+            + [f"{origin + span:.1f}"],
+            [0, start + FADE, typed, total],
+            total,
+        )
+        + animate(
+            "opacity",
+            ["1", "1", "0", "0"],
+            [0, typed + 0.2, typed + 0.2, total],
+            total,
+        )
+        + "</rect>",
+        "<g>"
+        + animate(
+            "opacity",
+            ["0", "0", "1", "1"],
+            [0, typed + 0.15, typed + 0.45, total],
+            total,
+        ),
+    ]
+    for number, row in enumerate(frame(step), start=1):
+        parts.append(
+            f'<text x="{MARGIN}" y="{baseline + number * LINE}" '
+            f'xml:space="preserve" fill="{colour(row)}">'
+            f"{escape(row)}</text>"
+        )
+    parts.append("</g>")
+    if step.caption:
+        band = HEADER + MARGIN * 2 + LINE * (FRAME_LINES + 1)
+        parts.append(
+            f'<rect x="{MARGIN}" y="{band + 12}" width="4" height="24" '
+            f'rx="2" fill="url(#accent)"/>'
+            f'<text x="{MARGIN + 16}" y="{band + 29}" fill="{COMMAND}" '
+            f'font-family="{SANS}" font-size="16">'
+            f"{escape(step.caption)}</text>"
+        )
+    return parts
+
+
+def render(items: list["Step | Card"], destination: Path) -> float:
+    """Writes the recording as one animated SVG.
+
+    Each item is a group whose opacity fades in and out on one shared
+    timeline. Cards fill the canvas; steps draw the terminal window, a
+    typed command, the captured output and a caption band. A progress bar
+    runs along the bottom edge with a tick at every chapter.
+
+    Args:
+        items: Title cards and captured steps, in order.
+        destination: File to write.
+
+    Returns:
+        Length of one loop in seconds.
+    """
+    width = round(COLUMNS * CHARACTER + MARGIN * 2)
+    band = HEADER + MARGIN * 2 + LINE * (FRAME_LINES + 1)
+    height = round(band + CAPTION)
+    durations = [hold_seconds(item) for item in items]
+    total = round(sum(durations), 2)
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
         f'height="{height}" viewBox="0 0 {width} {height}" '
         'font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, '
         '\'Liberation Mono\', monospace" font-size="13">',
-    ]
-    parts.append(
-        f'<rect width="{width}" height="{height}" rx="10" fill="{BACKGROUND}"/>'
-    )
-    parts.append(f'<rect width="{width}" height="30" rx="10" fill="{BAR}"/>')
-    parts.append(f'<rect y="20" width="{width}" height="10" fill="{BAR}"/>')
-    parts.append(
+        definitions(width),
+        f'<rect width="{width}" height="{height}" rx="10" '
+        f'fill="{BACKGROUND}"/>',
+        f'<rect width="{width}" height="30" rx="10" fill="{BAR}"/>',
+        f'<rect y="20" width="{width}" height="10" fill="{BAR}"/>',
         '<circle cx="18" cy="15" r="5.5" fill="#ff5f57"/>'
         '<circle cx="36" cy="15" r="5.5" fill="#febc2e"/>'
-        '<circle cx="54" cy="15" r="5.5" fill="#28c840"/>'
-    )
-    for index, step in enumerate(steps):
-        opacity = "1" if index == 0 else "0"
+        '<circle cx="54" cy="15" r="5.5" fill="#28c840"/>',
+        f'<rect y="{band}" width="{width}" height="{CAPTION}" fill="{BAR}"/>',
+        f'<rect y="{band}" width="{width}" height="1" fill="#30363d"/>',
+    ]
+    start = 0.0
+    chapter = ""
+    ticks = []
+    for item, seconds in zip(items, durations, strict=True):
+        end = start + seconds
+        opacity = "1" if start <= 0 else "0"
         parts.append(f'<g opacity="{opacity}">')
-        parts.append(schedule(index, len(steps), total))
-        title = escape(f"{step.prompt} {step.command}"[:columns])
-        parts.append(
-            f'<text x="{width / 2}" y="19" text-anchor="middle" '
-            f'fill="{MUTED}" font-size="12">{title}</text>'
-        )
-        marker = PROMPT if step.prompt == "$" else TOOL
-        baseline = HEADER + MARGIN + LINE
-        parts.append(
-            f'<text x="{MARGIN}" y="{baseline}" xml:space="preserve">'
-            f'<tspan fill="{marker}">{escape(step.prompt)} </tspan>'
-            f'<tspan fill="{COMMAND}">{escape(step.command)}</tspan></text>'
-        )
-        for number, row in enumerate(frame(step), start=1):
-            parts.append(
-                f'<text x="{MARGIN}" y="{baseline + number * LINE}" '
-                f'xml:space="preserve" fill="{colour(row)}">'
-                f"{escape(row)}</text>"
-            )
+        parts.append(visibility(start, end, total))
+        if isinstance(item, Card):
+            chapter = f"{item.kicker.title()} · {item.title}"
+            ticks.append(start)
+            parts.extend(draw_card(item, width, height, start, total))
+        else:
+            parts.extend(draw_step(item, chapter, width, start, total))
         parts.append("</g>")
+        start = end
+    for moment in ticks[1:]:
+        parts.append(
+            f'<rect x="{moment / total * width:.1f}" y="{height - 4}" '
+            'width="2" height="4" fill="#30363d"/>'
+        )
+    parts.append(
+        f'<rect y="{height - 3}" height="3" width="0" fill="url(#accent)">'
+        f'<animate attributeName="width" values="0;{width}" dur="{total}s" '
+        'repeatCount="indefinite"/></rect>'
+    )
     parts.append("</svg>")
     destination.write_text("\n".join(parts) + "\n")
+    return total
 
 
 def annotate(text: str) -> Step:
@@ -1048,7 +951,11 @@ def screenshots(destination: Path) -> int:
             str(Path.home()): DEMO_HOME,
         }
         for name, steps in blocks.items():
-            rewrite = rewritten(steps, places)
+            rewrite = [
+                step
+                for step in rewritten(steps, places)
+                if isinstance(step, Step)
+            ]
             render_static(rewrite, destination / name, titles[name])
             print(f"wrote {destination / name}")
     return 0
@@ -1057,20 +964,30 @@ def screenshots(destination: Path) -> int:
 def main() -> int:
     """Records the demo and writes the asset.
 
-    Run with ``--screenshots`` to record the static screenshots instead.
+    Run with ``--screenshots`` to record the static screenshots instead, or
+    with ``--short`` to record the README's first-screen cut: the `tour`
+    steps whose captions `SHORT` names, written to ``demo-short.svg``. With
+    ``--video`` the `tour` steps whose captions `VIDEO` names, and their
+    chapter cards, are laid out by `timeline` and written to
+    ``docs/video/frames.js`` for the launch video composition.
 
     Returns:
         Zero when the recording and the asset were written.
+
+    Raises:
+        RuntimeError: If the short cut lost one of its captions.
     """
     destination = Path(__file__).resolve().parent.parent / "docs" / "assets"
     if "--screenshots" in sys.argv[1:]:
         return screenshots(destination)
+    short = "--short" in sys.argv[1:]
+    video = "--video" in sys.argv[1:]
     with tempfile.TemporaryDirectory(prefix="agent-parley-demo-") as path:
         base = Path(path)
         home, binaries, repository = fixtures(base)
         recorder = Recorder(home, repository, environment(home, binaries, base))
         try:
-            record(recorder)
+            (tour if short or video else record)(recorder)
         finally:
             recorder.close()
         places = {
@@ -1080,8 +997,29 @@ def main() -> int:
             str(Path.home()): DEMO_HOME,
         }
         steps = rewritten(recorder.steps, places)
-    render(steps, destination / "demo.svg")
-    print(f"{len(steps)} frames written to {destination / 'demo.svg'}")
+    if video:
+        kept = cut(steps, VIDEO)
+        document = timeline(kept)
+        script = destination.parent / "video" / "frames.js"
+        script.write_text(
+            f"window.PARLEY_CUT = {json.dumps(document, indent=1)};\n"
+        )
+        seconds = document["seconds"]
+        print(f"{len(kept)} frames, {seconds}s, written to {script}")
+        return 0
+    name = "demo.svg"
+    if short:
+        name = "demo-short.svg"
+        chosen = [
+            step
+            for step in steps
+            if isinstance(step, Step) and step.caption in SHORT
+        ]
+        if [step.caption for step in chosen] != list(SHORT):
+            raise RuntimeError(f"short cut captions changed: {chosen}")
+        steps = list(chosen)
+    total = render(steps, destination / name)
+    print(f"{len(steps)} frames, {total:.0f}s, written to {destination / name}")
     return 0
 
 

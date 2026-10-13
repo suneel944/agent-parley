@@ -315,3 +315,57 @@ def test_a_record_only_call_past_an_expiring_offer_is_still_denied(
         },
     )
     assert "permissionDecision" not in answered.get("hookSpecificOutput", {})
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f'P="{protocol.cli_command()}"; $P issue accept 7 --offer-id o1',
+        "P=python3; cd /lane && $P -m agent_parley.cli issue list",
+        f"cd /lane && {protocol.cli_command()} issue list",
+        f"{protocol.cli_command()} issue list | grep 7",
+        f"{protocol.cli_command()} issue list > /tmp/issues.txt 2>&1",
+        f"{protocol.cli_command()} issue list; gh issue view 7",
+        f"{protocol.cli_command()} status; {protocol.cli_command()} status",
+        "$P -m agent_parley.cli issue accept 7 --offer-id o1",
+        f"X=1 {protocol.cli_command()} status",
+    ],
+)
+def test_a_cli_call_the_pre_approval_cannot_match_is_refused(tmp_path, command):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    reason, text = checkpoints.hazard(payload, tmp_path, "codex", {}, {})
+
+    assert reason == checkpoints.Reason.CHAINED_CLI
+    assert "alone" in text
+    assert protocol.cli_command() in text
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"{protocol.cli_command()} issue accept 7 --offer-id o1",
+        "agent-parley status",
+        'agent-parley say codex "parser -> lexer, see <notes>"',
+        "cd /lane && make check",
+        "git log | grep agent_parley.cli",
+    ],
+)
+def test_a_plain_cli_call_and_other_shell_are_not_refused(tmp_path, command):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+
+    assert checkpoints.hazard(payload, tmp_path, "codex", {}, {}) is None
+
+
+def test_a_record_only_chained_cli_call_is_denied(bridge, paired, lanes):
+    command = protocol.cli_command()
+
+    denied = record_only(
+        bridge,
+        lanes,
+        tool_name="Bash",
+        tool_input={"command": f"{command} status; {command} issue list"},
+    )["hookSpecificOutput"]
+
+    assert denied["permissionDecision"] == "deny"
+    assert "alone" in denied["permissionDecisionReason"]

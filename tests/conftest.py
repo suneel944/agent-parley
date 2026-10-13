@@ -15,10 +15,16 @@ def native_config_homes(tmp_path, monkeypatch):
     The command line falls back to ``AGENT_PARLEY_HOME`` when a test drives
     ``cli.main()`` without ``--home``, so that variable is pinned as well;
     otherwise such a test reads the developer's live store and fails
-    whenever that store is behind the checked-out code.
+    whenever that store is behind the checked-out code. A lane's own
+    ``AGENT_PARLEY_TOKEN`` is removed, so a suite run from inside a lane
+    still drives operator-only commands as the operator. ``FORCE_COLOR`` is
+    removed because it makes help text carry colour codes, so a developer
+    shell that exports it would fail every test that reads plain help.
     """
     for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_PARLEY_HOME"):
         monkeypatch.setenv(variable, str(tmp_path / variable.lower()))
+    monkeypatch.delenv("AGENT_PARLEY_TOKEN", raising=False)
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
 
 
 @pytest.fixture

@@ -1,11 +1,12 @@
 """Checks the operator's issue assign path from offer to acceptance."""
 
 import sys
+import time
 
 import pytest
 
-from agent_parley import cli, issues, store
-from agent_parley.state import BridgeError
+from agent_parley import cli, issues, lifecycle, store
+from agent_parley.state import BridgeError, lock, write_json
 
 
 def run(bridge, monkeypatch, capsys, *arguments):
@@ -119,6 +120,18 @@ def test_a_second_offer_on_the_same_issue_is_refused(bridge, repo, paired):
         bridge.issue_assign(repo, "42", "claude")
 
 
+def test_a_claim_is_refused_while_an_offer_is_pending(bridge, repo, paired):
+    result = bridge.issue_assign(repo, "42", "codex", reason="Parser work")
+    with pytest.raises(BridgeError, match="offered to codex"):
+        bridge.issue(paired["lanes"]["claude"], "claim", "42")
+    with pytest.raises(BridgeError, match="issue accept 42 --offer-id"):
+        bridge.issue(paired["lanes"]["codex"], "claim", "42")
+    record = ledger(bridge, repo)["42"]
+    assert record["owner"] is None
+    assert record["offer"]["id"] == result["offer_id"]
+    assert record["offer"]["reason"] == "Parser work"
+
+
 def test_a_held_issue_records_a_request_its_owner_is_mailed(
     bridge, repo, paired
 ):
@@ -156,6 +169,33 @@ def test_the_owner_authorizes_the_request_before_the_offer_exists(
         offer_id=authorized["offer"]["id"],
     )
     assert accepted["owner"] == "codex"
+
+
+def test_ended_on_forge_does_not_survive_an_accepted_operator_offer(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    claimed = held(bridge, paired, "claude")
+    with lock(directory / "issues.lock", timeout=1):
+        state = issues.snapshot(directory)
+        record = state["issues"]["42"]
+        record["owner"] = None
+        record["ended_on_forge"] = {
+            "at": time.time(),
+            "claim_id": claimed["claim_id"],
+        }
+        write_json(directory / "issues.json", state)
+    result = bridge.issue_assign(repo, "42", "codex", reason="Resume")
+    assert ledger(bridge, repo)["42"]["ended_on_forge"]
+    accepted = bridge.issue(
+        paired["lanes"]["codex"], "accept", "42", offer_id=result["offer_id"]
+    )
+    assert "ended_on_forge" not in accepted
+    assert (
+        accepted["history"][-1]["cleared"]["ended_on_forge"]["claim_id"]
+        == (claimed["claim_id"])
+    )
+    assert lifecycle.actionable(issues.snapshot(directory), "codex") == ["42"]
 
 
 def test_only_the_owner_answers_an_operator_request(bridge, repo, paired):

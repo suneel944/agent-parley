@@ -29,11 +29,13 @@ from agent_parley import (
     dashboard,
     evidence,
     forge,
+    issues,
     metrics,
     process,
     records,
     roster,
     store,
+    supervision,
 )
 from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
@@ -55,7 +57,8 @@ from agent_parley.cli import (
     main,
     write_json,
 )
-from agent_parley.issues import MAX_BLOCKERS, describe
+from agent_parley.issues import MAX_BLOCKERS, describe, merge_claim
+from agent_parley.merges import launch_busy
 from agent_parley.process import start_ticks
 from agent_parley.server import TOOLS
 from scripts.check_pr_hygiene import issue_numbers, validate
@@ -189,7 +192,8 @@ def test_checkpoint_waits_for_a_short_activity_update(
 
 def test_public_state_directory_rejected(tmp_path):
     public = tmp_path / "public"
-    public.mkdir(mode=0o755)
+    public.mkdir()
+    public.chmod(0o755)
     with pytest.raises(BridgeError, match="private"):
         Bridge(public)
 
@@ -273,20 +277,36 @@ def test_ps_reader_reports_a_live_process_through_the_real_command():
     assert process.read_ps_field("args=", os.getpid()) != ""
 
 
+def test_ps_reader_prints_one_start_time_whatever_the_caller_timezone(
+    monkeypatch,
+):
+    readings = set()
+    for zone, locale in (("UTC0", "C"), ("IST-5:30", "en_US.UTF-8")):
+        monkeypatch.setenv("TZ", zone)
+        monkeypatch.setenv("LC_ALL", locale)
+        readings.add(process.read_ps_field("lstart=", os.getpid()))
+    assert len(readings) == 1
+    assert "" not in readings
+
+
 def test_process_platform_is_chosen_once_for_the_running_system():
     linux = process.platform_for("linux")
     assert linux.start_ticks is process.linux_start_ticks
     assert linux.foreground_pid is process.linux_foreground_pid
     assert linux.parent_pid is process.linux_parent_pid
     assert linux.running is process.linux_running
+    assert linux.zombie is process.linux_zombie
     assert linux.matches_command is process.linux_matches_command
     assert linux.terminate is process.linux_terminate
     darwin = process.platform_for("darwin")
     assert darwin.running is process.darwin_running
+    assert darwin.zombie.func is process.darwin_zombie
     assert darwin.start_ticks.func is process.darwin_start_ticks
     assert darwin.foreground_pid.func is process.darwin_foreground_pid
     assert darwin.parent_pid.func is process.darwin_parent_pid
     assert darwin.terminate.func is process.darwin_terminate
+    assert darwin.same_start.func is process.darwin_same_start
+    assert linux.same_start is process.linux_same_start
     with pytest.raises(BridgeError, match="Unsupported operating system"):
         process.platform_for("win32")
     assert process.running(os.getpid()) is True
@@ -380,6 +400,46 @@ def test_macos_identity_pins_the_recorded_creation_time(monkeypatch, tmp_path):
     assert process.identify(record, tmp_path / "other") is None
 
 
+def test_macos_identity_accepts_a_creation_time_recorded_in_local_time(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "private state"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    universal = "Thu Sep 10 07:22:33 2026"
+    local = "jeu 10 sep 11:22:33 2026"
+    other = "Wed Sep  9 07:22:33 2026"
+    reader = macos_ps(
+        {child.pid: universal},
+        {child.pid: f"/usr/bin/python3 -m agent_parley.server --home {home}"},
+    )
+    local_reader = macos_ps({child.pid: local}, {})
+    monkeypatch.setattr(
+        process, "PLATFORM", process.darwin_platform(reader, local_reader)
+    )
+    try:
+        assert process.alive(child.pid, universal) is True
+        assert process.alive(child.pid, local) is True
+        assert process.alive(child.pid, other) is False
+        assert process.identify(
+            {"pid": child.pid, "start_ticks": local}, home
+        ) == process.ServerProcess(child.pid, universal)
+        with pytest.raises(BridgeError, match="PID changed"):
+            process.ServerProcess(child.pid, other).stop()
+        assert child.poll() is None
+        process.ServerProcess(child.pid, local).stop()
+        child.wait(timeout=5)
+        assert child.poll() is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
 def test_macos_liveness_separates_a_missing_process_from_a_foreign_one(
     monkeypatch, tmp_path
 ):
@@ -423,6 +483,32 @@ def test_macos_shutdown_signals_only_the_recorded_process(monkeypatch):
             child.wait(timeout=5)
 
 
+def test_a_zombie_session_process_is_not_alive():
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys, time;"
+            "child = subprocess.Popen(['sleep', '60']);"
+            "print(child.pid, flush=True);"
+            "time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert parent.stdout is not None
+        pid = int(parent.stdout.readline())
+        ticks = process.start_ticks(pid)
+        assert process.darwin_zombie(process.read_ps_field, pid) is False
+        process.ServerProcess(pid, ticks).stop()
+        assert process.alive(pid, ticks) is False
+        assert process.darwin_zombie(process.read_ps_field, pid) is True
+    finally:
+        parent.kill()
+        parent.wait(timeout=5)
+
+
 def test_changed_lane_branch_is_rejected_without_resetting(
     bridge, repo, paired
 ):
@@ -441,6 +527,7 @@ def test_changed_lane_branch_is_rejected_without_resetting(
         "git branch -m personal-work",
         "git symbolic-ref HEAD refs/heads/personal-work",
         "gh pr checkout 42",
+        "git fetch -q\ngit checkout -b personal-work",
     ],
 )
 def test_native_hook_blocks_bridge_lane_branch_changes(
@@ -484,6 +571,69 @@ def test_native_hook_blocks_drift_until_exact_restore(bridge, repo, paired):
         None,
         "branch_restore",
     )
+
+
+def test_lane_rebasing_its_own_branch_can_finish_or_abort(bridge, repo, paired):
+    lane = Path(paired["lanes"]["codex"])
+    expected = paired["branches"]["codex"]
+    git(lane, "config", "user.email", "test@example.com")
+    git(lane, "config", "user.name", "Test")
+    git(lane, "switch", "-c", "upstream")
+    (lane / "clash.txt").write_text("upstream\n")
+    git(lane, "add", "clash.txt")
+    git(lane, "commit", "-m", "upstream side")
+    git(lane, "switch", expected)
+    (lane / "clash.txt").write_text("lane\n")
+    git(lane, "add", "clash.txt")
+    git(lane, "commit", "-m", "lane side")
+    rebase = subprocess.run(
+        ["git", "-C", str(lane), "rebase", "upstream"],
+        capture_output=True,
+        check=False,
+    )
+    assert rebase.returncode
+    assert git(lane, "branch", "--show-current") == ""
+    payload = {
+        "cwd": str(lane),
+        "tool_input": {"command": "git rebase --abort"},
+    }
+    assert branch_guard("PreToolUse", payload, lane, expected) == (
+        None,
+        "branch_rebase",
+    )
+    blocked, reason = branch_guard("Stop", payload, lane, expected)
+    assert "git rebase --abort" in blocked["reason"]
+    assert reason == "branch_rebase"
+    assert branch_guard(
+        "Stop", {**payload, "stop_hook_active": True}, lane, expected
+    ) == ({}, "branch_rebase")
+    git(lane, "rebase", "--abort")
+    assert git(lane, "branch", "--show-current") == expected
+    git(lane, "switch", "--detach")
+    denied, reason = branch_guard("PreToolUse", payload, lane, expected)
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert reason == "branch_drift"
+
+
+def test_launch_refusal_names_the_session_holding_the_lane(tmp_path):
+    assert "retry when it finishes" in launch_busy(tmp_path, "claude-3")
+    (tmp_path / "claude-3-activity.json").write_text(
+        json.dumps(
+            {
+                "launcher_pid": os.getpid(),
+                "launcher_ticks": start_ticks(os.getpid()),
+                "session_pid": 4242,
+                "session_started": 0,
+                "activity": "dialog: an unrecognized native prompt",
+            }
+        )
+    )
+    message = launch_busy(tmp_path, "claude-3")
+    assert f"launcher {os.getpid()}, client 4242" in message
+    assert "since 1970-01-01 00:00 UTC" in message
+    assert "dialog: an unrecognized native prompt" in message
+    assert "`agent-parley participant stop claude-3`" in message
+    assert "retry when" not in message
 
 
 @pytest.mark.parametrize("create_first", [False, True])
@@ -1082,6 +1232,23 @@ def test_reports_require_remaining_work_or_verification(bridge, repo, paired):
     assert state["remaining"] == "CLI integration missing"
 
 
+def test_a_waiting_report_declares_a_wait_instead_of_a_claim_phase(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    with pytest.raises(BridgeError, match="seconds"):
+        bridge.report(lane, "waiting", "3 background jobs", "", "")
+
+    bridge.report(lane, "waiting", "3 background jobs", "", "", until=900)
+
+    directory = bridge.project(repo)[1]
+    published = supervision.published_wait(directory, "claude")
+    assert published["reason"] == "3 background jobs"
+    assert published["until"] <= time.time() + 900
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert state["outcome"] == "waiting"
+
+
 def test_liveness_follows_the_session_process_not_the_session_lock(
     bridge, repo, paired, capsys
 ):
@@ -1156,8 +1323,9 @@ def test_top_reports_every_participant_and_writes_no_state(
     }
     dashboard.run(bridge.home, lambda: False, once=True)
     output = capsys.readouterr().out
-    assert "agent-parley top  server: not running" in output
-    assert "denials 0 (0%)" in output
+    assert "agent-parley top - " in output
+    assert "server not running" in output
+    assert "0 denied (0%)" in output
     assert "#77" in output
     assert "Wire the dashboard" in output
     assert "working" in output and "stopped" in output
@@ -1167,28 +1335,38 @@ def test_top_reports_every_participant_and_writes_no_state(
 
 
 def test_top_reports_only_the_selected_providers(bridge, repo, paired, capsys):
-    dashboard.run(bridge.home, lambda: False, once=True, providers=("codex",))
+    dashboard.run(
+        bridge.home,
+        lambda: False,
+        once=True,
+        providers=("codex",),
+        columns=("ALL",),
+    )
     selected = capsys.readouterr().out
     assert "codex/default" in selected
     assert "claude/default" not in selected
-    assert "participants 1" in selected
+    assert "Lanes: 1 total" in selected
     assert "provider codex" in selected
 
     dashboard.run(
-        bridge.home, lambda: False, once=True, providers=("claude", "codex")
+        bridge.home,
+        lambda: False,
+        once=True,
+        providers=("claude", "codex"),
+        columns=("ALL",),
     )
     both = capsys.readouterr().out
     assert "claude/default" in both and "codex/default" in both
-    assert "participants 2" in both
+    assert "Lanes: 2 total" in both
 
     dashboard.run(bridge.home, lambda: False, once=True, providers=("kimi",))
     none = capsys.readouterr().out
     assert "no participants for the selected provider" in none
-    assert "participants 0" in none
+    assert "Lanes: 0 total" in none
 
     dashboard.run(bridge.home, lambda: False, once=True)
     unfiltered = capsys.readouterr().out
-    assert "participants 2" in unfiltered
+    assert "Lanes: 2 total" in unfiltered
     assert "provider " not in unfiltered
 
 
@@ -1212,8 +1390,7 @@ def test_top_marks_a_lease_past_its_time_to_live_as_stale(
     dashboard.run(bridge.home, lambda: False, once=True)
     stale = capsys.readouterr().out
     assert "1!1" in stale
-    assert "past a declared time to live" in stale
-    assert "still held" in stale
+    assert "1 stale" in stale
 
 
 def usage_record(identifier, tokens):
@@ -1298,10 +1475,9 @@ def test_top_reports_tokens_each_native_client_recorded(
     assert rows["codex"]["tokens"] == 2500
 
     dashboard.run(bridge.home, lambda: False, once=True)
-    output = capsys.readouterr().out
-    lines = output.splitlines()
+    lines = capsys.readouterr().out.splitlines()
     assert any(
-        line.startswith("PARTICIPANT") and line.endswith("FIT")
+        line.startswith("PARTICIPANT") and line.endswith("TASK")
         for line in lines
     )
     assert (
@@ -1312,7 +1488,7 @@ def test_top_reports_tokens_each_native_client_recorded(
         next(line for line in lines if line.startswith("codex ")).split()[-3]
         == "2.5k"
     )
-    assert "not billed spend" in output
+    assert "not billed spend" in " ".join(dashboard.keymap())
 
 
 def test_top_leaves_tokens_blank_without_readable_session_records(
@@ -1325,11 +1501,11 @@ def test_top_leaves_tokens_blank_without_readable_session_records(
     dashboard.run(bridge.home, lambda: False, once=True)
     lines = capsys.readouterr().out.splitlines()
     assert any(
-        line.startswith("PARTICIPANT") and line.endswith("FIT")
+        line.startswith("PARTICIPANT") and line.endswith("TASK")
         for line in lines
     )
     row = next(line for line in lines if line.startswith("claude "))
-    assert row.split()[-3:] == ["0", "0s+", "-"]
+    assert row.split()[-3:] == ["0/0", "0s+", "-"]
 
 
 def test_token_reading_survives_a_malformed_session_record(
@@ -1660,7 +1836,33 @@ def test_forge_slug_reads_github_remotes_and_ignores_everything_else(repo):
     assert forge.slug(repo) == "owner/name"
     git(repo, "remote", "set-url", "origin", "https://github.com/owner/name")
     assert forge.slug(repo) == "owner/name"
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "https://user@github.com/owner/name.git",
+    )
+    assert forge.slug(repo) == "owner/name"
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "ssh://git@ssh.github.com:443/owner/name.git",
+    )
+    assert forge.slug(repo) == "owner/name"
+    git(repo, "remote", "set-url", "origin", "https://GitHub.com/owner/name")
+    assert forge.slug(repo) == "owner/name"
     git(repo, "remote", "set-url", "origin", "git@example.com:owner/name.git")
+    assert forge.slug(repo) is None
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "https://user@gitlab.com/owner/name.git",
+    )
     assert forge.slug(repo) is None
 
 
@@ -1760,8 +1962,11 @@ def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
         "agent_parley.cli.forge.issue_title", lambda directory, number: None
     )
     monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: False
+    )
+    monkeypatch.setattr(
         "agent_parley.cli.forge.assign",
-        lambda directory, number: mirrored.append(("assign", number)),
+        lambda directory, number: not mirrored.append(("assign", number)),
     )
     monkeypatch.setattr(
         "agent_parley.cli.forge.unassign",
@@ -1780,6 +1985,40 @@ def test_claim_and_release_mirror_onto_the_forge_after_the_ledger(
     with pytest.raises(AssertionError):
         bridge.issue(claude, "claim", "432")
     assert bridge.issue(repo, "list")["issues"]["432"]["owner"] == "claude"
+
+
+def test_a_release_keeps_an_assignee_the_claim_did_not_add(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    mirrored = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: True
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign",
+        lambda directory, number: not mirrored.append(("assign", number)),
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.unassign",
+        lambda directory, number: mirrored.append(("unassign", number)),
+    )
+    bridge.issue(claude, "claim", "568")
+    bridge.issue(claude, "release", "568")
+    assert mirrored == []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: False
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign",
+        lambda directory, number: mirrored.append(("assign", number)),
+    )
+    bridge.issue(claude, "claim", "568")
+    bridge.issue(claude, "release", "568")
+    assert mirrored == [("assign", "568")]
 
 
 def test_a_report_requires_one_claim_and_comments_on_that_issue(
@@ -1826,8 +2065,8 @@ def test_a_report_requires_one_claim_and_comments_on_that_issue(
     assert "claude" not in posted[0][1]
     assert "make check passed" in posted[0][1]
     assert "neither review nor independent verification" in posted[0][1]
-    with pytest.raises(BridgeError, match="owns multiple issues"):
-        bridge.merge(repo, "claude")
+    directory = bridge.project(repo)[1]
+    assert merge_claim(directory, "claude")["issue"] == 432
 
     bridge.report(
         claude,
@@ -2509,6 +2748,38 @@ def test_retire_removes_a_lane_and_revokes_its_credential(bridge, repo, paired):
     assert event_summary(lane.parent, "codex")["events"] == 0
 
 
+def test_retire_releases_the_lanes_reservations_and_claims(
+    bridge, repo, paired
+):
+    _, directory = bridge.project(repo)
+    data = json.loads((directory / "project.json").read_text())
+    store.initialize(bridge.home)
+    actors = {}
+    for name in ("claude", "codex"):
+        display = data["participants"][name]["display"]
+        token = store.register(bridge.home, data["root"], display)[
+            "registration_token"
+        ]
+        actors[name] = store.authenticate(bridge.home, token)
+    claude, codex = actors["claude"], actors["codex"]
+    held = store.call(
+        bridge.home, claude, "file_reservation_paths", {"paths": ["shared.txt"]}
+    )
+    assert held["granted"]
+    queued = store.call(
+        bridge.home, codex, "request_reservation", {"paths": ["shared.txt"]}
+    )
+    assert not queued.get("granted")
+    issues.change(
+        directory, "claude", "claim", "7", participants={"claude", "codex"}
+    )
+    bridge.retire(repo, "claude")
+    active = store.active_reservations(bridge.home, data["root"])
+    assert claude["name"] not in active
+    assert active[codex["name"]] == ["shared.txt"]
+    assert issues.snapshot(directory)["issues"]["7"]["owner"] is None
+
+
 def test_retire_keeps_a_branch_that_still_holds_commits(bridge, repo, paired):
     lane = Path(paired["lanes"]["codex"])
     branch = paired["branches"]["codex"]
@@ -3072,6 +3343,10 @@ def test_merge_runs_the_repository_verification_command_first(
 
 
 GH_STUB = """#!/bin/sh
+if [ "$1" = "api" ]; then
+  echo operator
+  exit 0
+fi
 if [ "$1" = "issue" ]; then
   cat "$GH_ISSUE"
   exit 0

@@ -2,13 +2,21 @@
 
 import json
 import os
+import shlex
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import issues, lifecycle, process, store, supervision
+from agent_parley import (
+    cli,
+    issues,
+    lifecycle,
+    process,
+    store,
+    supervision,
+)
 from agent_parley.state import BridgeError, lock, write_json
 
 WINDOW = 300
@@ -105,6 +113,16 @@ def test_an_idle_claim_of_a_live_lane_is_offered_and_its_peer_kept(
     notice = woken["8"]["deadline_notice"]
     assert notice["holder"] == "claude"
     assert "has recorded no progress" in notice["text"]
+    taught = notice["text"].split("Record progress with ", 1)[1]
+    program, *arguments = shlex.split(taught.split(", or offer", 1)[0])
+    assert program == "agent-parley"
+    parser, _ = cli.root_parser(arguments[0])
+    parsed = parser.parse_args(arguments)
+    assert (parsed.command, parsed.state, parsed.issue) == (
+        "report",
+        "partial",
+        "8",
+    )
     assert "overdue_recovery" not in woken["7"]
 
     edit(
@@ -127,9 +145,13 @@ def test_an_idle_claim_of_a_live_lane_is_offered_and_its_peer_kept(
 def test_progress_on_the_idle_claim_drops_its_recovery(bridge, paired):
     directory = busy_with_one_idle_claim(bridge, paired)
     assert step(bridge, directory)["8"]["overdue_recovery"]["step"] == "wake"
+    assert issues.deadline_notice(issues.snapshot(directory)["issues"]["8"])
     lifecycle.record_report(
         directory, "claude", "partial", "", "still going", issue="8"
     )
+    reported = issues.snapshot(directory)["issues"]["8"]
+    assert "deadline_notice" in reported
+    assert issues.deadline_notice(reported) == {}
     kept = step(bridge, directory)["8"]
     assert kept["offer"] is None
     assert "overdue_recovery" not in kept
@@ -245,6 +267,160 @@ def test_a_delivered_claim_does_not_count_toward_the_cap(bridge, paired):
     assert bridge.issue(lane, "claim", "9")["owner"] == "claude"
     with pytest.raises(BridgeError, match="max_claims_per_lane is 2"):
         bridge.issue(lane, "claim", "10")
+
+
+def test_a_claim_on_a_closed_issue_does_not_count_toward_the_cap(
+    bridge, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    for number in ("7", "8"):
+        bridge.issue(lane, "claim", number)
+    with pytest.raises(BridgeError, match="max_claims_per_lane is 2"):
+        bridge.issue(lane, "claim", "9")
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        for number in ("7", "8"):
+            ledger["issues"][number]["handoff_prompt"] = {
+                "trigger": issues.ENDED,
+                "holder": "claude",
+                "created": time.time(),
+                "responded_at": time.time(),
+            }
+        write_json(directory / "issues.json", ledger)
+    assert bridge.issue(lane, "claim", "9")["owner"] == "claude"
+    assert bridge.issue(lane, "claim", "10")["owner"] == "claude"
+    with pytest.raises(BridgeError, match="max_claims_per_lane is 2"):
+        bridge.issue(lane, "claim", "11")
+
+
+def test_ready_work_on_a_closed_issue_releases_without_requeueing(
+    bridge, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        record = ledger["issues"]["7"]
+        record["execution"] = {
+            **lifecycle.state(record),
+            "authorized": True,
+            "state": lifecycle.READY,
+            "claim_id": record["claim_id"],
+        }
+        write_json(directory / "issues.json", ledger)
+    with pytest.raises(BridgeError, match="Ready work must remain claimed"):
+        bridge.issue(lane, "release", "7")
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        ledger["issues"]["7"]["handoff_prompt"] = {
+            "trigger": issues.ENDED,
+            "holder": "claude",
+            "created": time.time(),
+            "responded_at": time.time(),
+        }
+        write_json(directory / "issues.json", ledger)
+    released = bridge.issue(lane, "release", "7")
+    assert released["owner"] is None
+    assert released["ended_on_forge"]
+    assert "7" not in lifecycle.actionable(issues.snapshot(directory))
+    assert "7" not in issues.unclaimed(issues.snapshot(directory))
+    reclaimed = bridge.issue(lane, "claim", "7")
+    assert reclaimed["owner"] == "claude"
+    assert "ended_on_forge" not in reclaimed
+
+
+def test_a_release_after_the_forge_closed_the_issue_is_not_claimable(
+    bridge, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        ledger["issues"]["7"]["handoff_prompt"] = {
+            "trigger": issues.ENDED,
+            "holder": "claude",
+            "created": time.time(),
+            "responded_at": time.time(),
+        }
+        write_json(directory / "issues.json", ledger)
+    released = bridge.issue(lane, "release", "7")
+    execution = lifecycle.state(released)
+    assert released["ended_on_forge"]
+    assert execution["next_action"] == "none"
+    assert execution["authorized"] is False
+    assert "7" not in issues.unclaimed(issues.snapshot(directory))
+    reclaimed = bridge.issue(lane, "claim", "7")
+    assert lifecycle.state(reclaimed)["authorized"] is True
+    assert lifecycle.state(reclaimed)["next_action"] == "resume"
+
+
+def test_a_blocker_that_ended_on_the_forge_frees_its_dependents(bridge, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
+    bridge.issue(lane, "claim", "8")
+    lifecycle.record_report(
+        directory,
+        "claude",
+        lifecycle.BLOCKED,
+        "",
+        "needs #7",
+        issue="8",
+        resume_on="7",
+    )
+    assert lifecycle.settle_dependencies(directory) == []
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        ledger["issues"]["7"]["handoff_prompt"] = {
+            "trigger": issues.ENDED,
+            "holder": "claude",
+            "created": time.time(),
+            "responded_at": time.time(),
+        }
+        write_json(directory / "issues.json", ledger)
+    released = bridge.issue(lane, "release", "7")
+    assert released["ended_on_forge"]
+    assert lifecycle.state(released)["state"] != lifecycle.COMPLETE
+    assert "ended on forge" in issues.describe(issues.snapshot(directory))
+
+    assert lifecycle.settle_dependencies(directory) == [("8", "7")]
+    waiting = issues.snapshot(directory)["issues"]["8"]
+    assert waiting["blocked_by"] == []
+    assert lifecycle.state(waiting)["state"] == lifecycle.RUNNING
+    assert "8" in lifecycle.actionable(issues.snapshot(directory), "claude")
+    assert lifecycle.settle_dependencies(directory) == []
+
+
+def test_a_blocker_that_ended_on_the_forge_counts_as_satisfied():
+    authorized = {"authorized": True, "state": lifecycle.QUEUED}
+    ledger = {
+        "issues": {
+            "7": {"execution": dict(authorized), "ended_on_forge": {"at": 1}},
+            "8": {"execution": dict(authorized), "blocked_by": ["7"]},
+            "9": {"execution": dict(authorized)},
+            "10": {"execution": dict(authorized), "blocked_by": ["9"]},
+        }
+    }
+
+    assert lifecycle.dependencies_complete(ledger, ledger["issues"]["8"])
+    assert not lifecycle.dependencies_complete(ledger, ledger["issues"]["10"])
+    assert "8" in lifecycle.actionable(ledger)
+    assert "10" not in lifecycle.actionable(ledger)
+
+
+def test_resolve_without_an_escalation_names_release(bridge, paired):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    bridge.issue(lane, "claim", "7")
+    with pytest.raises(BridgeError, match="issue release 7"):
+        bridge.issue_resolve(lane, "7")
 
 
 def test_a_wake_waits_out_a_brief_setup_lock_holder(bridge, paired):

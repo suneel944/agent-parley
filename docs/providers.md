@@ -31,11 +31,38 @@ that provider.
 | `delivery` | How a lane is told | Which adapters | What it cannot do |
 | --- | --- | --- | --- |
 | `hooks` | a native lifecycle event returns bounded context at a turn boundary | `claude`, `codex`, `copilot`, `gemini`, `opencode` and every preset built on them | nothing further; this is the full path |
-| `polled` | a launcher-owned thread reads the mailbox on an interval and publishes it to `STATE/PROJECT/NAME-delivery.md`, which the lane's prompt tells it to read each turn | any adapter missing `SessionStart`, `UserPromptSubmit`, `PreToolUse` or `Stop`; `amp` today | deny a tool call, hold a turn open, or guarantee the lane reads the file; budget threshold notices are not carried, and a missing required guard still refuses the launch |
+| `polled` | a launcher-owned thread reads the mailbox on an interval and publishes it to `STATE/projects/PROJECT_KEY/NAME-delivery.md`, which the lane's prompt tells it to read each turn | any adapter missing `SessionStart`, `UserPromptSubmit`, `PreToolUse` or `Stop`; `amp` today | deny a tool call, hold a turn open, or guarantee the lane reads the file; budget threshold notices are not carried, and a missing required guard still refuses the launch |
 
 `AGENT_PARLEY_DELIVERY_SECONDS` sets the interval for a polled lane, 20s by
 default. Delivery is recorded in that lane's event log like a served
 checkpoint, so `agent-parley top` reports its delivered context in `CONTEXT`.
+
+### How idle, blocked and prompt states are detected
+
+A lane's state comes from a native hook when its client raises one, and
+otherwise from the launcher's dialog watcher, which reads the lane's own
+terminal, or from the supervision poll's liveness sample of the session
+process. `status`, `top` and `problems` mark a state the watcher or the
+liveness sample set as inferred, for example `blocked: approval 2m; inferred
+by dialog watcher, no PermissionRequest hook`, and name the hook the client
+lacks. `status --json` carries the same reading under each lane's
+`provenance`: its `source`, whether it is `inferred`, and the `gap`.
+
+For an adapter missing `PermissionRequest` or `Stop`, the poll reads the
+dialog the watcher published on every pass while the lane is idle or blocked,
+and records the lane blocked under that dialog's cause, so an approval or
+question prompt still reaches `problems` as a row for the operator.
+
+| Provider | Hooks it cannot raise | Delivery | Idle | Blocked on approval | Other prompts |
+| --- | --- | --- | --- | --- | --- |
+| `claude`, `codex`, `copilot` | none | `hooks` | `Stop` hook | `PermissionRequest` hook | dialog watcher |
+| `gemini` | `PermissionRequest` | `hooks` | `Stop` hook | dialog watcher, read every poll | dialog watcher |
+| `opencode` | `SessionEnd` | `hooks` | `Stop` hook | `PermissionRequest` hook | dialog watcher |
+| `amp` | `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `Stop`, `SessionEnd` | `polled` | liveness sample | dialog watcher, read every poll | dialog watcher |
+
+A hook-delivered lane idle at its prompt receives mail only when something
+makes its client raise a hook, such as a wake the service sends; a polled lane
+reads its delivery file on its own interval.
 
 ## Accounts
 
@@ -167,11 +194,15 @@ agent-parley participant retire claude-2
 agent-parley run claude-2 --provider claude --credentials account-2
 ```
 
-`retire` refuses while a session is running, refuses a lane with uncommitted
-changes, and refuses a lane still holding work it reported ready until that
-work is merged or offered on, so commit or preserve the work first; it never
-discards work. Commits
-the lane made are kept on its branch, and it says so. Messages are preserved.
+`retire` refuses while a session is running, refuses while the lane's
+checkpoint lock is busy, and refuses a lane with uncommitted changes, so commit
+or preserve the work first; it never discards work. Ignored files in the
+worktree are deleted with it only after you confirm them by name, or with
+`--yes`. Commits
+the lane made are kept on its branch, and it says so. It also refuses a lane
+whose ready work still awaits integration. Its issue claims return to the pool,
+its reservations are released and granted to queued peers, and mail it has not
+read or acknowledged is marked superseded. Messages are preserved.
 The replacement lane is a fresh worktree on the next free lane branch, so it
 does not continue the retired branch: merge that branch, or branch from it with
 Git, if the new lane should carry that work.

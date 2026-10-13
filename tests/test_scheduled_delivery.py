@@ -244,3 +244,51 @@ def test_a_migrated_store_reports_the_current_schema(bridge, repo, paired):
     with store.connect(bridge.home) as db:
         version = db.execute("PRAGMA user_version").fetchone()[0]
     assert store.schema_state(version) == store.SCHEMA_CURRENT
+
+
+BERLIN = "CET-1CEST,M3.5.0,M10.5.0/3"
+
+
+def frozen_clock(monkeypatch, instant):
+    """Pins the cli clock to one instant in a zone with daylight saving."""
+    import datetime
+    import types
+
+    from agent_parley import cli
+
+    class Frozen(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return instant.astimezone().replace(tzinfo=None)
+            return instant.astimezone(tz)
+
+    monkeypatch.setenv("TZ", BERLIN)
+    time.tzset()
+    monkeypatch.setattr(
+        cli,
+        "datetime",
+        types.SimpleNamespace(
+            datetime=Frozen, time=datetime.time, timedelta=datetime.timedelta
+        ),
+    )
+    return cli.clock
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs time.tzset")
+def test_a_time_of_day_past_a_daylight_saving_change_keeps_its_wall_time(
+    monkeypatch,
+):
+    import datetime
+
+    utc = datetime.UTC
+    evening = datetime.datetime(2026, 10, 24, 19, 0, tzinfo=utc)
+    try:
+        clock = frozen_clock(monkeypatch, evening)
+        expected = datetime.datetime(2026, 10, 25, 19, 0, tzinfo=utc)
+        assert clock("20:00") == expected.timestamp()
+        today = datetime.datetime(2026, 10, 24, 23, 0, tzinfo=utc)
+        assert clock("23:00+00:00") == today.timestamp()
+    finally:
+        monkeypatch.undo()
+        time.tzset()

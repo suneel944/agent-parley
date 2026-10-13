@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import budgets, cli, dashboard, roster, store
+from agent_parley import budgets, cli, dashboard, records, roster, store
 from agent_parley.checkpoints import checkpoint
 from agent_parley.process import start_ticks
 from agent_parley.state import BridgeError, write_json
@@ -186,6 +186,40 @@ def test_served_calls_are_counted_against_the_call_limit(bridge, repo, paired):
     peer = budgets.standing(bridge.home, directory, data, "codex")
     assert peer["crossed"] == []
     assert budgets.marker(peer) == "budget; calls 0 of 2 (0%)"
+
+
+def test_standing_counts_a_transcript_longer_than_one_read(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    padding = json.dumps({"type": "user", "text": "x" * 100_000})
+    lines = []
+    for index in range(40):
+        lines += [padding, usage_record(f"msg_{index}", 1000)]
+    path = claude_transcript(
+        tmp_path / "claude_config_dir", paired["lanes"]["claude"], lines
+    )
+    assert path.stat().st_size > 3 * records.MAX_READ
+    bridge.budget(repo, "participant", "claude", {"tokens": 200_000})
+    data = roster.read(directory)
+    reading = budgets.standing(bridge.home, directory, data, "claude")
+    assert reading["used"]["tokens"] == 400_000
+    assert reading["crossed"] == ["tokens"]
+    assert reading["over"] is True
+    read = path.stat().st_size
+    with path.open("a") as handle:
+        handle.write(usage_record("msg_last", 100) + "\n")
+    starts = []
+    advance = records._advance
+
+    def spied(record_path, fold, prior):
+        starts.append(int(prior.get("offset", 0)))
+        return advance(record_path, fold, prior)
+
+    monkeypatch.setattr(records, "_advance", spied)
+    again = budgets.standing(bridge.home, directory, data, "claude")
+    assert again["used"]["tokens"] == 401_000
+    assert starts == [read]
 
 
 def test_session_hours_are_counted_against_the_hour_limit(bridge, repo, paired):

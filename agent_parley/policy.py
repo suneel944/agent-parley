@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import re
 
-ACTOR = r"(?:ai\b|claude\b|codex\b|chatgpt\b|copilot\b|openai\b|anthropic\b)"
+ACTOR = (
+    r"(?:ai\b|claude\b|codex\b|chatgpt\b|copilot\b|openai\b|anthropic\b|"
+    r"gemini\b|\bamp\b)"
+)
 TRAILER = (
     r"co-authored-by|author|authored-by|committer|signed-off-by|"
     r"assisted-by|generated-by|created-by|reviewed-by"

@@ -28,6 +28,23 @@ def _idle(updated: float) -> dict:
     }
 
 
+def _answered(directory: Path, name: str, timeout: float = 10) -> str:
+    """Repeats a wake request until the launcher answers or the timeout.
+
+    `terminal.request` reports unavailable for any socket error, including
+    its one-second receive timeout, so a launcher that is listening but
+    slow on a loaded runner reads the same as one that is gone. The tests
+    here start the launcher themselves, so unavailable is never the
+    expected answer and only means the launcher has not answered yet.
+    """
+    deadline = time.monotonic() + timeout
+    answer = terminal.request(directory, name)
+    while answer == "unavailable" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        answer = terminal.request(directory, name)
+    return answer
+
+
 def test_control_socket_names_fit_valid_long_participants():
     directory = Path(
         "/home/operator/.local/state/agent-parley/projects/0123456789abcdef"
@@ -44,7 +61,6 @@ def test_control_socket_names_fit_valid_long_participants():
         (b"\x1b[12;1R", False, False),
         (b"\x1b[I", False, False),
         (b"\x1b[A", True, True),
-        (b"\x1b", False, True),
         (b"\x1b[12;1Rtyped", False, True),
         (b"\x1bP>|tmux 3.4\x1b\\", False, False),
         (b"\x1bP>|tmux 3.4\x1b\\", True, True),
@@ -58,12 +74,51 @@ def test_control_socket_names_fit_valid_long_participants():
         (b"\x03", True, False),
         (b"abc\x15", True, False),
         (b"abc\x15new", True, True),
+        (b"a\x7f", False, False),
+        (b"ab\x08", False, True),
+        (b"\x7f", True, False),
+        (b"\x7f\x7f", False, False),
+        (b"\x01", False, False),
+        ("é\x7f".encode(), False, False),
     ],
 )
 def test_control_replies_never_hold_the_operator_line(
     entered, previous, expected
 ):
-    assert terminal.pending(entered, previous) is expected
+    state = terminal.draft(entered, terminal.Draft(int(previous)))
+    assert bool(state.characters) is expected
+
+
+@pytest.mark.parametrize(
+    "entered",
+    [
+        b"\x1b[200~fix the bug\n\x1b[201~",
+        b"\x1b[200~fix the bug\r\x1b[201~",
+        b"draft line\x1b\r",
+        b"draft line\\\r",
+        b"draft line\n",
+        b"draft line",
+        b"\n",
+    ],
+)
+def test_a_multi_line_draft_reads_as_pending_input(entered):
+    assert terminal.draft(entered, terminal.Draft()).characters
+
+
+def test_a_newline_inside_a_paste_split_across_reads_stays_pending():
+    state = terminal.draft(b"\x1b[200~first line", terminal.Draft())
+    assert state.pasting
+    state = terminal.draft(b"\rsecond line\r\x1b[201~", state)
+    assert state.characters
+    assert not state.pasting
+    assert not terminal.draft(b"\r", state).characters
+
+
+def test_a_backslash_then_enter_in_separate_reads_stays_pending():
+    state = terminal.draft(b"draft line\\", terminal.Draft())
+    state = terminal.draft(b"\r", state)
+    assert state.characters
+    assert not terminal.draft(b"more\r", state).characters
 
 
 def test_control_sequences_split_across_reads_keep_later_operator_text():
@@ -73,7 +128,7 @@ def test_control_sequences_split_across_reads_keep_later_operator_text():
     operator, control = terminal.operator_input(b"1Rtyped", control)
     assert operator == b"typed"
     assert control == b""
-    assert terminal.pending(operator, False)
+    assert terminal.draft(b"\x1b[12;1Rtyped", terminal.Draft()).characters
 
 
 def test_a_version_report_split_across_reads_holds_no_operator_line():
@@ -83,7 +138,8 @@ def test_a_version_report_split_across_reads_holds_no_operator_line():
     operator, control = terminal.operator_input(b" 3.4\x1b\\", control)
     assert operator == b""
     assert control == b""
-    assert terminal.pending(b"\x1bP>|tmux 3.4\x1b\\", False) is False
+    state = terminal.draft(b"\x1bP>|tmux 3.4\x1b\\", terminal.Draft())
+    assert state.characters == 0
 
 
 def test_detached_terminal_replies_cover_native_startup_probes():
@@ -183,13 +239,93 @@ def test_attached_launcher_admits_a_wake_after_a_cursor_report():
             assert b"READY" in _read_until(master, b"READY")
             os.write(master, b"\x1b[12;1R")
             time.sleep(0.5)
-            assert terminal.request(directory, "lane") == "accepted"
+            assert _answered(directory, "lane") == "accepted"
             received = _read_until(master, b"RECEIVED:")
             assert terminal.PROMPT.encode() in received.split(b"RECEIVED:")[1]
             os.write(master, b"typed")
             time.sleep(0.5)
             write_json(directory / "lane-activity.json", _idle(2))
             assert terminal.request(directory, "lane") == "busy:input"
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize(
+    "entered",
+    [
+        b"\x1b[200~fix the bug\n\x1b[201~",
+        b"draft line\x1b\r",
+        b"draft line\\\r",
+        b"draft line\n",
+    ],
+)
+def test_attached_launcher_refuses_a_wake_into_a_multi_line_draft(entered):
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        write_json(directory / "lane-activity.json", _idle(1))
+        script = (
+            "import sys\nprint('READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('RECEIVED:' + line.rstrip(), flush=True)\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=True))"
+        )
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvp(
+                sys.executable,
+                [sys.executable, "-c", harness, str(lane), script],
+            )
+        try:
+            assert b"READY" in _read_until(master, b"READY")
+            os.write(master, entered)
+            time.sleep(0.5)
+            assert terminal.request(directory, "lane") == "busy:input"
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize("entered", [b"\x1b", b"x\x7f"])
+def test_attached_launcher_admits_a_wake_after_a_lone_esc_or_erased_line(
+    entered,
+):
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        lane = directory / "lane"
+        lane.mkdir()
+        write_json(directory / "lane-activity.json", _idle(1))
+        script = (
+            "import sys\nprint('READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('RECEIVED:' + line.rstrip(), flush=True)\n"
+        )
+        harness = (
+            "import os, sys\nfrom pathlib import Path\n"
+            "from agent_parley.terminal import run\n"
+            "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
+            "Path(sys.argv[1]), dict(os.environ), 'lane', attached=True))"
+        )
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvp(
+                sys.executable,
+                [sys.executable, "-c", harness, str(lane), script],
+            )
+        try:
+            assert b"READY" in _read_until(master, b"READY")
+            os.write(master, entered)
+            time.sleep(terminal.ESCAPE_TIMEOUT + 0.5)
+            assert _answered(directory, "lane") == "accepted"
+            received = _read_until(master, b"RECEIVED:")
+            assert terminal.PROMPT.encode() in received.split(b"RECEIVED:")[1]
         finally:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
@@ -323,7 +459,7 @@ def test_latched_checkpoint_admits_one_retry_then_requires_attention():
             "from agent_parley.terminal import run\n"
             "raise SystemExit(run([sys.executable, '-c', sys.argv[2]], "
             "Path(sys.argv[1]), dict(os.environ), 'lane', attached=False, "
-            "inactive_after=0.05))"
+            "inactive_after=1.0))"
         )
         child = subprocess.Popen(
             [sys.executable, "-c", harness, str(lane), script],
@@ -337,10 +473,10 @@ def test_latched_checkpoint_admits_one_retry_then_requires_attention():
             assert b"READY" in child.stdout.readline()
             assert terminal.request(directory, "lane") == "accepted"
             assert terminal.request(directory, "lane") == "busy:repeat"
-            time.sleep(0.1)
+            time.sleep(1.2)
             assert terminal.request(directory, "lane") == "accepted"
             assert terminal.request(directory, "lane") == "busy:repeat"
-            time.sleep(0.1)
+            time.sleep(1.2)
             assert (
                 terminal.request(directory, "lane")
                 == "manual attention required"
@@ -776,3 +912,62 @@ def test_the_status_line_command_prints_the_lane_summary():
             check=True,
         )
         assert outside.stdout == ""
+
+
+def test_stopping_a_launcher_without_a_terminal_ends_its_client(tmp_path):
+    """Stops the launcher the way `participant stop` does; no client remains.
+
+    A lane launched without a terminal records the launcher as its session
+    process. Signalling that recorded process must also end the native client
+    the launcher started, or the client keeps running orphaned (#844).
+    """
+    marker = tmp_path / "client.pid"
+    client = (
+        "import os, sys, time\n"
+        "path = sys.argv[1]\n"
+        "with open(path + '.tmp', 'w') as handle:\n"
+        "    handle.write(str(os.getpid()))\n"
+        "os.replace(path + '.tmp', path)\n"
+        "time.sleep(60)\n"
+    )
+    launcher = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from agent_parley import terminal\n"
+        "command = [sys.executable, '-c', sys.argv[1], sys.argv[2]]\n"
+        "terminal.call(command, Path(sys.argv[3]), {})\n"
+    )
+    source = str(Path(terminal.__file__).parents[1])
+    started = subprocess.Popen(
+        [sys.executable, "-c", launcher, client, str(marker), str(tmp_path)],
+        stdin=subprocess.DEVNULL,
+        env=dict(os.environ, PYTHONPATH=source),
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        client_pid = int(marker.read_text())
+        client_ticks = process.start_ticks(client_pid)
+        process.ServerProcess(
+            started.pid, process.start_ticks(started.pid)
+        ).stop()
+        assert started.wait(timeout=20) == 0
+        assert not process.alive(client_pid, client_ticks)
+    finally:
+        started.kill()
+        started.wait()
+
+
+def test_the_lane_summary_skips_a_repository_project_json():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        deep = directory / "lane" / "sub" / "deep"
+        deep.mkdir(parents=True)
+        write_json(directory / "project.json", {"participants": {"lane": {}}})
+        write_json(directory / "lane" / "sub" / "project.json", {"name": "lib"})
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        assert terminal.lane_summary(deep) != ""

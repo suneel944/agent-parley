@@ -38,6 +38,12 @@ UNAVAILABLE_HOOKS: dict[str, tuple[str, ...]] = {
 }
 REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
 DELIVERY_HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+WATCHED_HOOKS = ("PermissionRequest", "Stop")
+"""Events whose absence leaves a lane's blocked or idle state to the watcher.
+
+An adapter missing any of these has the supervision poll read its dialog
+watcher every poll, because no hook will report the prompt or the turn end.
+"""
 HOOK_DELIVERY = "hooks"
 POLLED_DELIVERY = "polled"
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,38}")
@@ -47,6 +53,8 @@ SCHEMES = ("participant", "lane")
 VARIABLE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 SECRET_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL")
 OPERATOR = "operator"
+LANE_TOKEN = "AGENT_PARLEY_TOKEN"
+"""Environment variable a launched lane and its children carry."""
 RESERVED = frozenset(
     {
         "bridge",
@@ -61,6 +69,7 @@ RESERVED = frozenset(
 )
 LEGACY_DISPLAY = {"claude": "GreenCastle", "codex": "BlueLake"}
 MAX_PARTICIPANTS = 32
+MAX_POOL = 8
 MAX_VERIFY_ARGUMENTS = 64
 MAX_STANDING_REPLY = 500
 MAX_UNATTENDED_ISSUES = 100
@@ -190,6 +199,71 @@ def branch_prefix(value: str) -> str:
     return value
 
 
+def branch_name(value: object) -> bool:
+    """Reports whether a value is one usable Git branch name.
+
+    Args:
+        value: Candidate branch name.
+
+    Returns:
+        Whether the value matches `TARGET_BRANCH` and holds no `..`, no
+        repeated slash and no trailing slash, dot or `.lock`.
+    """
+    return (
+        isinstance(value, str)
+        and bool(TARGET_BRANCH.fullmatch(value))
+        and ".." not in value
+        and "//" not in value
+        and not value.endswith(("/", ".", ".lock"))
+    )
+
+
+def integration_base(value: object) -> str:
+    """Validates the branch a milestone's pull requests merge into.
+
+    Work merged into this branch counts as landed for the claim it closes,
+    though the forge leaves its issue open until the branch crosses to the
+    default branch. An empty value records no integration base.
+
+    Args:
+        value: Candidate branch name, or an empty string.
+
+    Returns:
+        The accepted branch name, empty when none is recorded.
+
+    Raises:
+        BridgeError: If the value is neither empty nor one Git branch name.
+    """
+    if value == "":
+        return ""
+    if not branch_name(value):
+        raise BridgeError(
+            "The integration base must be one Git branch name, such as "
+            "integration/1.0.0, or an empty string to remove it."
+        )
+    return str(value)
+
+
+def pool_size(value: object) -> int:
+    """Validates the number of spare worktrees a project keeps prepared.
+
+    Args:
+        value: Candidate pool size.
+
+    Returns:
+        The accepted size; zero keeps no spares.
+
+    Raises:
+        BridgeError: If the value is not a whole number from zero to
+            `MAX_POOL`.
+    """
+    if type(value) is not int or not 0 <= value <= MAX_POOL:
+        raise BridgeError(
+            f"The pool size must be a whole number from 0 to {MAX_POOL}."
+        )
+    return value
+
+
 def next_lane_branch(manifest: dict, key: str, taken: set[str]) -> str:
     """Derives the next neutral branch name for a new lane.
 
@@ -303,7 +377,7 @@ def verify_command(
     return parsed
 
 
-DEADLINE_FIELDS = ("claim", "offer", "ack")
+DEADLINE_FIELDS = ("claim", "offer", "request", "ack", "wait")
 MAX_DEADLINE = 86400 * 30
 MAX_ATTEMPTS = 1000
 
@@ -311,11 +385,17 @@ MAX_ATTEMPTS = 1000
 def deadlines(value: dict) -> dict:
     """Validates the deadline and attempt-budget defaults of one project.
 
-    A default is inherited by a claim, an offer or an acknowledgement that
-    passes no explicit window, so lanes carry a budget without repeating a
-    flag. A deadline makes an overdue claim, offer or acknowledgement say
-    so; only the supervisor's overdue transition, which acts when the holder
-    has stopped working, moves an overdue claim.
+    A default is inherited by a claim, an offer, a takeover request or an
+    acknowledgement that passes no explicit window, so lanes carry a budget
+    without repeating a flag. A deadline makes an overdue claim, offer,
+    request or acknowledgement say so; only the supervisor's overdue
+    transition, which acts when the holder has stopped working, moves an
+    overdue claim. A peer offer past its deadline is cancelled back to the
+    lane that made it; a peer request past its deadline is never granted by
+    this alone, it only becomes visible as a decision its holder or the
+    operator still owes. The `wait` field bounds how far into the future a
+    lane's self-declared wait may set its own next-check time, so a lane
+    cannot suppress stall detection indefinitely.
 
     Args:
         value: Defaults recorded in the project manifest.
@@ -430,6 +510,32 @@ def merged_budget(current: dict, changes: dict) -> dict:
 
 MAX_RESOURCES = 64
 RESOURCE = re.compile(r"[a-z][a-z0-9_-]{0,15}:[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+MERGE_RESOURCE = re.compile(r"merge:[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+
+
+def resource_name(pattern: str) -> bool:
+    """Reports whether a string is a well-formed named-resource key.
+
+    Every scheme but ``merge`` names an opaque token, the same shape as a
+    declared resource: no slash, so it is never mistaken for a path. A
+    ``merge:`` resource names a Git branch that may itself carry slashes,
+    such as ``merge:integration/0.15.0``, so its name is validated the same
+    way the unattended integration policy validates its target branch.
+
+    Args:
+        pattern: Candidate reservation key or declared resource name.
+
+    Returns:
+        Whether the key is well-formed for its scheme.
+    """
+    if MERGE_RESOURCE.fullmatch(pattern):
+        branch = pattern.split(":", 1)[1]
+        return (
+            ".." not in branch
+            and "//" not in branch
+            and not branch.endswith(("/", ".", ".lock"))
+        )
+    return bool(RESOURCE.fullmatch(pattern))
 
 
 def resources(declared: list) -> list[str]:
@@ -437,7 +543,8 @@ def resources(declared: list) -> list[str]:
 
     A declaration is a convenience, not a security boundary: it catches a
     mistyped resource before two lanes reserve different spellings of the same
-    thing. A project that declares nothing accepts every well-formed name.
+    thing. A project that declares nothing accepts every well-formed name,
+    including a ``merge:<branch>`` naming a shared branch's turn order.
 
     Args:
         declared: Resource names such as ``port:5432`` or ``db:local``.
@@ -453,12 +560,30 @@ def resources(declared: list) -> list[str]:
             f"A project declares at most {MAX_RESOURCES} named resources."
         )
     for name in declared:
-        if not isinstance(name, str) or not RESOURCE.fullmatch(name):
+        if not isinstance(name, str) or not resource_name(name):
             raise BridgeError(
                 f"{name!r} is not a named resource; write a scheme and a "
                 "name, such as port:5432 or suite:integration."
             )
     return sorted(set(declared))
+
+
+def retired_reason(name: str) -> str:
+    """Names what a retired lane's session can still do and who readmits it.
+
+    Args:
+        name: Participant that retired.
+
+    Returns:
+        One notice: coordination is gone, local tools still run, and the
+        operator's re-admit command.
+    """
+    return (
+        f"{name} retired from this project. Coordination is gone: native "
+        "tools run without it and the agent-parley MCP tools refuse. Only "
+        f"the operator re-admits the lane, with `agent-parley participant "
+        f"add {name}` in the base checkout."
+    )
 
 
 PAUSED_REASON = (
@@ -720,7 +845,8 @@ def provider(home: Path, name: str) -> dict:
     if entry is None:
         raise BridgeError(
             f"Unknown provider {name!r}. Run `agent-parley provider list` or "
-            "define it with `agent-parley provider add`."
+            "define it with `agent-parley provider add`.",
+            next_command="agent-parley provider list",
         )
     return entry
 
@@ -824,7 +950,8 @@ def credential(home: Path, name: str) -> dict:
     if entry is None:
         raise BridgeError(
             f"Unknown credential profile {name!r}. Define it with "
-            "`agent-parley credentials add`."
+            "`agent-parley credentials add`.",
+            next_command=f"agent-parley credentials add {shlex.quote(name)}",
         )
     return entry
 
@@ -1028,13 +1155,43 @@ def normalize(manifest: dict) -> dict:
         ),
         "verify": list(manifest.get("verify") or []),
         "initialize": list(manifest.get("initialize") or []),
+        **(
+            {"pool": pool_size(manifest["pool"])}
+            if manifest.get("pool")
+            else {}
+        ),
         "resources": resources(list(manifest.get("resources") or [])),
         "deadlines": deadlines(dict(manifest.get("deadlines") or {})),
         "budget": budget(dict(manifest.get("budget") or {})),
+        **(
+            {"run_budget": budget(dict(manifest["run_budget"]))}
+            if manifest.get("run_budget")
+            else {}
+        ),
         "forge": forge_choice(manifest.get("forge")),
         "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "integration": manifest.get("integration", {}),
+        **(
+            {"integration_base": integration_base(manifest["integration_base"])}
+            if manifest.get("integration_base")
+            else {}
+        ),
+        **(
+            {"timeouts": manifest["timeouts"]}
+            if manifest.get("timeouts")
+            else {}
+        ),
+        **(
+            {"blueprints": dict(manifest["blueprints"])}
+            if manifest.get("blueprints")
+            else {}
+        ),
+        **(
+            {"blueprint_defaults": dict(manifest["blueprint_defaults"])}
+            if manifest.get("blueprint_defaults")
+            else {}
+        ),
         "supervision": project,
         "participants": participants,
     }
@@ -1255,13 +1412,7 @@ def integration_policy(value: object) -> dict:
             invalid + "`unattended` must name exactly `target` and `issues`."
         )
     target = unattended["target"]
-    if (
-        not isinstance(target, str)
-        or not TARGET_BRANCH.fullmatch(target)
-        or ".." in target
-        or "//" in target
-        or target.endswith(("/", ".", ".lock"))
-    ):
+    if not branch_name(target):
         raise BridgeError(invalid + "`target` must be one Git branch name.")
     numbers = unattended["issues"]
     if (
@@ -1317,7 +1468,8 @@ def read(directory: Path) -> dict:
     if not path.exists():
         raise BridgeError(
             "This repository has no bridge project yet; run agent-parley run "
-            "or agent-parley setup first."
+            "or agent-parley setup first.",
+            next_command="agent-parley setup .",
         )
     return normalize(json.loads(path.read_text()))
 
@@ -1339,7 +1491,8 @@ def resolve(manifest: dict, lane: Path) -> str:
         if Path(participant["lane"]) == lane:
             return name
     raise BridgeError(
-        "Run this from an assigned agent worktree, not the main checkout."
+        "Run this from an assigned agent worktree, not the main checkout.",
+        next_command="agent-parley participant list",
     )
 
 
@@ -1363,6 +1516,25 @@ def caller_lane(manifest: dict) -> str | None:
         if here == lane or lane in here.parents:
             return name
     return None
+
+
+def from_lane(manifest: dict) -> bool:
+    """Reports whether a lane runs the command, by directory or credential.
+
+    Operator-only commands refuse when this is true. The working directory
+    alone misses a lane that changes directory to the base checkout, but a
+    launched lane carries `LANE_TOKEN` and every process it starts inherits
+    it. Like the directory check, this is the command-line boundary between
+    the operator and the lanes, not an operating-system one.
+
+    Args:
+        manifest: Manifest using the participant roster layout.
+
+    Returns:
+        True when the working directory is inside a lane or the environment
+        holds a lane's coordination credential.
+    """
+    return caller_lane(manifest) is not None or bool(os.environ.get(LANE_TOKEN))
 
 
 def describe(manifest: dict) -> str:

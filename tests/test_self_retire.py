@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ from agent_parley import (
     terminal,
 )
 from agent_parley.process import start_ticks
-from agent_parley.state import BridgeError, write_json
+from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
 
 @pytest.fixture(autouse=True)
@@ -119,6 +120,29 @@ def test_a_dirty_worktree_is_kept_and_its_changes_reported(
 
     assert result["worktree"] == retirement.KEPT
     assert result["dirty"] == ["notes.md", "shared.txt"]
+    assert result["dirty_count"] == 2
+    assert worktree.exists()
+
+
+def test_a_retire_result_stays_within_budget_and_counts_every_path(
+    bridge, repo, paired
+):
+    lane = actor(bridge, paired["root"], "claude")
+    worktree = Path(paired["lanes"]["claude"])
+    (worktree / "untracked").mkdir()
+    for index in range(400):
+        (worktree / "untracked" / f"generated-file-{index:04d}.txt").touch()
+
+    result = retire(bridge, lane)
+
+    assert result["worktree"] == retirement.KEPT
+    assert result["dirty_count"] == 400
+    assert 0 < len(result["dirty"]) < 400
+    assert result["dirty"] == sorted(result["dirty"])
+    assert (
+        len(json.dumps(result, ensure_ascii=False).encode())
+        <= store.MAX_RESULT_BYTES
+    )
     assert worktree.exists()
 
 
@@ -288,7 +312,8 @@ def test_a_retired_lane_reports_only_the_worktree_it_kept(bridge, repo, paired):
 
     assert [row["condition"] for row in found] == [problems.DIRTY]
     assert found[0]["command"] == (
-        f"agent-parley participant add claude --repo {paired['root']}"
+        "agent-parley participant add claude --repo "
+        f"{shlex.quote(paired['root'])}"
     )
 
 
@@ -350,7 +375,7 @@ def test_a_lane_holding_ready_work_is_refused_before_releasing_any(
     bridge.issue(lane, "claim", "5")
     bridge.report(lane, "ready", "Done.", "", "make check", issue="5")
     for _ in range(2):
-        with pytest.raises(BridgeError, match=r"ready work \(#5\)"):
+        with pytest.raises(BridgeError, match=r"operator-blocked work \(#5\)"):
             retirement.withdraw(directory, "claude")
     ledger = issues.snapshot(directory)["issues"]
     assert [ledger[number]["owner"] for number in ("4", "5")] == [
@@ -358,3 +383,55 @@ def test_a_lane_holding_ready_work_is_refused_before_releasing_any(
         "claude",
     ]
     assert not roster.retired(entry(directory, "claude"))
+
+
+def test_a_lane_blocked_on_an_operator_action_is_refused(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(lane, "claim", "4")
+    bridge.issue(lane, "claim", "5")
+    bridge.report(
+        lane, "blocked", "Waiting.", "operator rotates the key", "", issue="5"
+    )
+    with pytest.raises(BridgeError, match=r"\(#5\).*issue release"):
+        retirement.withdraw(directory, "claude")
+    ledger = issues.snapshot(directory)["issues"]
+    assert [ledger[number]["owner"] for number in ("4", "5")] == [
+        "claude",
+        "claude",
+    ]
+    assert not roster.retired(entry(directory, "claude"))
+
+
+def test_a_lane_blocked_on_another_issue_retires(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    lane = paired["lanes"]["claude"]
+    bridge.issue(paired["lanes"]["codex"], "claim", "4")
+    bridge.issue(lane, "claim", "5")
+    bridge.report(
+        lane, "blocked", "Waiting.", "needs #4", "", issue="5", resume_on="4"
+    )
+    assert retirement.withdraw(directory, "claude")["released"] == ["5"]
+
+
+def test_a_held_lane_lock_refuses_the_retirement_and_changes_nothing(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(retirement, "LOCK_SECONDS", 0.05)
+    directory = bridge.project(repo)[1]
+    worktree = Path(paired["lanes"]["claude"])
+    identity = directory / "claude-identity.json"
+    write_json(identity, {})
+    bridge.issue(str(worktree), "claim", "4")
+
+    with lock(directory / "claude-checkpoint.lock"):
+        with pytest.raises(LockBusy, match="nothing was retired"):
+            retirement.withdraw(directory, "claude")
+
+    assert worktree.exists()
+    assert identity.exists()
+    assert not roster.retired(entry(directory, "claude"))
+    assert issues.snapshot(directory)["issues"]["4"]["owner"] == "claude"
+    result = retirement.withdraw(directory, "claude")
+    assert result["worktree"] == retirement.PRUNED
+    assert not identity.exists()

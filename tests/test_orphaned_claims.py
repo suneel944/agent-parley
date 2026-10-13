@@ -17,16 +17,19 @@ from agent_parley import (
     cli,
     dashboard,
     issues,
+    lanes,
     lifecycle,
+    notify,
     process,
     recovery,
     roster,
     store,
     supervision,
     tables,
+    terminal,
 )
 from agent_parley.cli import git
-from agent_parley.state import BridgeError, write_json
+from agent_parley.state import BridgeError, LockBusy, lock, write_json
 
 STALLED = supervision.DEFAULTS["stalled_after"]
 
@@ -115,6 +118,41 @@ def inbox(bridge, paired, name):
     ]
 
 
+@pytest.mark.parametrize("peer", [True, False])
+def test_mail_pending_lists_the_orphan_decision_without_a_transport(
+    bridge, repo, paired, monkeypatch, peer
+):
+    monkeypatch.delenv("AGENT_PARLEY_NOTIFY", raising=False)
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    if peer:
+        running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    assert not notify.enabled(bridge.home)
+    assert issues.snapshot(directory)["issues"]["42"]["orphan"]
+
+    listed = bridge.mail(repo, "pending")
+
+    assert listed["pending"] == []
+    assert listed["orphans"] == [
+        {
+            "participant": "claude",
+            "detail": listed["orphans"][0]["detail"],
+            "decision": supervision.orphan_remedy("42", paired["root"], peer),
+        }
+    ]
+    assert listed["orphans"][0]["detail"].startswith("claims #42 orphaned")
+    shown = [
+        row["command"]
+        for row in bridge.problems()
+        if row["condition"] == "orphaned claims"
+    ]
+    assert shown == [listed["orphans"][0]["decision"]]
+
+
 def test_a_killed_lane_is_orphaned_announced_and_taken_by_a_peer(
     bridge, repo, paired
 ):
@@ -169,6 +207,40 @@ def test_a_killed_lane_is_orphaned_announced_and_taken_by_a_peer(
     }
 
 
+def test_a_failed_capture_still_orphans_and_the_claim_can_be_taken(
+    bridge, repo, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    reserve(bridge, actors["claude"], "src/app.py")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+
+    def locked(*args, **kwargs):
+        raise BridgeError("index.lock exists")
+
+    monkeypatch.setattr(recovery, "capture", locked)
+    supervision.poll(bridge.home, directory)
+
+    orphan = issues.snapshot(directory)["issues"]["42"]["orphan"]
+    assert orphan["owner"] == "claude"
+    assert orphan["capture_failed"] == "index.lock exists"
+    assert "no recovery checkpoint was captured" in orphan["reason"]
+    assert inbox(bridge, paired, "codex")[0][0] == (
+        "Orphaned claims held by claude"
+    )
+
+    taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
+
+    assert taken["owner"] == "codex"
+    assert taken["taken"]["from"] == "claude"
+    assert "recovery" not in taken
+    assert taken["reservations_moved"] == ["src/app.py"]
+
+
 def test_a_native_exit_retains_the_generation_needed_for_recovery(
     bridge, repo, paired, monkeypatch
 ):
@@ -207,7 +279,7 @@ def test_a_native_exit_retains_the_generation_needed_for_recovery(
     monkeypatch.setattr(bridge, "up", lambda: None)
     monkeypatch.setattr(bridge, "identity", identity)
     monkeypatch.setattr(cli.shutil, "which", lambda command: sys.executable)
-    monkeypatch.setattr(cli.subprocess, "call", exit_native)
+    monkeypatch.setattr(cli.terminal, "call", exit_native)
     monkeypatch.setattr(
         cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: False)
     )
@@ -226,6 +298,44 @@ def test_a_native_exit_retains_the_generation_needed_for_recovery(
     taken = bridge.issue(peer, "claim", "42", take_orphaned=True)
     assert taken["owner"] == "codex"
     assert taken["taken"]["from"] == "claude"
+
+
+def test_a_takeover_run_from_a_subdirectory_restores_the_whole_worktree(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    for folder in ("src", "tests"):
+        (lane / folder).mkdir()
+        (lane / folder / "staged.txt").write_text(f"{folder} staged\n")
+        git(lane, "add", f"{folder}/staged.txt")
+        (lane / folder / "staged.txt").write_text(f"{folder} unstaged\n")
+    recovery.capture(
+        directory,
+        roster.read(directory),
+        "claude",
+        {"hook_event_name": "PostToolUse", "tool_name": "Bash"},
+    )
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    (peer / "src").mkdir()
+
+    supervision.poll(bridge.home, directory)
+    taken = bridge.issue(peer / "src", "claim", "42", take_orphaned=True)
+
+    for folder in ("src", "tests"):
+        assert (peer / folder / "staged.txt").read_text() == (
+            f"{folder} unstaged\n"
+        )
+    assert git(peer, "diff", "--cached", "--name-only").splitlines() == [
+        "src/staged.txt",
+        "tests/staged.txt",
+    ]
+    with pytest.raises(BridgeError, match="worktree root"):
+        recovery.restore(directory, peer / "src", taken)
 
 
 def test_takeover_restores_committed_staged_unstaged_and_untracked_work(
@@ -405,6 +515,83 @@ def test_capture_does_not_reuse_gate_evidence_for_changed_content(
     assert saved["last_verified_step"] == "PostToolUse: Bash"
 
 
+def test_recovery_capture_leaves_the_checkpoint_lock_free(
+    bridge, repo, paired, monkeypatch
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    (lane / "draft.txt").write_text("unsaved\n")
+    activity = directory / "claude-activity.json"
+    write_json(activity, {"session_id": "s1"})
+    observed = []
+    original = recovery._publish_bundle
+
+    def probed(*args):
+        with lock(directory / "claude-checkpoint.lock"):
+            observed.append("checkpoint free")
+        with pytest.raises(LockBusy):
+            with lock(directory / "claude-capture.lock"):
+                pass
+        return original(*args)
+
+    monkeypatch.setattr(recovery, "_publish_bundle", probed)
+    event = {"hook_event_name": "Stop", "session_id": "s1"}
+
+    assert checkpoints.recover(directory, "claude", event) is True
+
+    assert observed == ["checkpoint free"]
+    state = json.loads(activity.read_text())
+    assert len(state["recovery_checkpoints"]) == 1
+    assert "recovery_error" not in state
+
+
+def test_a_capture_reclaims_a_ref_orphaned_by_a_killed_capture(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    manifest = roster.read(directory)
+    head = git(lane, "rev-parse", "HEAD")
+    scope = recovery._lane_scope(lane)
+    stray = f"refs/agent-parley-recovery/{scope}/leftover"
+    git(lane, "update-ref", stray, head)
+
+    saved = recovery.capture(directory, manifest, "claude")
+
+    assert len(saved) == 1
+    remaining = git(
+        lane,
+        "for-each-ref",
+        "--format=%(refname)",
+        f"refs/agent-parley-recovery/{scope}/",
+    )
+    assert remaining == ""
+
+
+def test_a_capture_never_deletes_a_sibling_lanes_in_flight_ref(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    bridge.issue(peer, "claim", "43")
+    manifest = roster.read(directory)
+    peer_head = git(peer, "rev-parse", "HEAD")
+    peer_scope = recovery._lane_scope(peer)
+    in_flight = (
+        f"refs/agent-parley-recovery/{peer_scope}/issue-43-still-publishing"
+    )
+    git(peer, "update-ref", in_flight, peer_head)
+
+    saved = recovery.capture(directory, manifest, "claude")
+
+    assert len(saved) == 1
+    assert git(lane, "rev-parse", "--verify", in_flight) == peer_head
+
+
 def test_an_unchanged_tree_is_captured_once(bridge, repo, paired, monkeypatch):
     lane = Path(paired["lanes"]["claude"])
     directory = lane.parent
@@ -452,6 +639,40 @@ def test_an_unchanged_tree_is_captured_once(bridge, repo, paired, monkeypatch):
     assert len(published) == 2
     assert third["worktree_commit"] != first["worktree_commit"]
     assert third["gate"] == {}
+
+
+def test_a_merged_recovery_records_the_gate_of_the_event_it_replaced(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    (lane / "draft.txt").write_text("gated\n")
+    passing = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"cmd": "make check"},
+        "tool_response": {"exit_code": 0},
+    }
+    later = {"hook_event_name": "PostToolUse", "tool_name": "Read"}
+    request = {"directory": str(directory), "participant": "claude"}
+    owed = checkpoints.merge_recovery(
+        {**request, "payload": passing}, {**request, "payload": later}
+    )
+
+    assert owed["payload"] == later
+    assert owed["evidence"] == passing
+    saved = recovery.capture(
+        directory,
+        roster.read(directory),
+        "claude",
+        owed["payload"],
+        owed["evidence"],
+    )[0]
+
+    assert saved["last_verified_step"] == "PostToolUse: Read"
+    assert saved["gate"]["command"] == "make check"
+    assert saved["gate"]["exit_code"] == 0
 
 
 @pytest.mark.parametrize("boundary", ["head", "index", "worktree"])
@@ -653,6 +874,109 @@ def test_a_fenced_session_still_takes_a_prompt_as_context(bridge, repo, paired):
     assert "cannot resume edits" in details["additionalContext"]
 
 
+def fenced(bridge, paired):
+    """Moves claude's claim to codex so claude's session is fenced."""
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    bridge.issue(peer, "claim", "42", take_orphaned=True)
+    return actors, lane, directory
+
+
+def test_a_fenced_session_is_allowed_to_end_its_turn(bridge, repo, paired):
+    _, lane, directory = fenced(bridge, paired)
+    for active in (False, True):
+        payload = {
+            "session_id": "claude-session",
+            "hook_event_name": "Stop",
+            "cwd": str(lane),
+            "stop_hook_active": active,
+        }
+        output = checkpoints.checkpoint(
+            bridge.home, directory, "claude", payload
+        )
+        assert output.get("decision") != "block"
+        assert "cannot resume edits" in output["systemMessage"]
+
+
+def test_wake_never_resumes_a_fenced_session(bridge, repo, paired, monkeypatch):
+    actors, _, directory = fenced(bridge, paired)
+    store.call(
+        bridge.home,
+        actors["codex"],
+        "send_message",
+        {
+            "to": ["claude"],
+            "subject": "Review",
+            "body_md": "Review the result",
+            "idempotency_key": "fenced",
+            "ack_required": True,
+        },
+    )
+    launched = []
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append(command),
+    )
+    monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
+    observed = supervision.presence(directory, "claude", 300)
+    with store.connect(bridge.home, write=True) as db:
+        record = lanes.sample(
+            db,
+            paired["root"],
+            "claude",
+            observed,
+            dead_after=STALLED,
+        )
+        lanes.transition(
+            db,
+            paired["root"],
+            "claude",
+            record["state"],
+            session="claude-session",
+        )
+    assert observed["process_alive"] is False
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "claude",
+        observed,
+        supervision.DEFAULTS,
+    )
+    assert not launched
+    wake = json.loads((directory / "claude-wake.json").read_text())
+    assert wake["result"] == supervision.WAKE_ATTENTION
+
+
+def test_run_refuses_to_resume_a_fenced_session(
+    bridge, repo, paired, monkeypatch
+):
+    fenced(bridge, paired)
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    original = cli.shutil.which
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: "/bin/true" if name == "claude" else original(name),
+    )
+    captured = []
+    monkeypatch.setattr(
+        terminal,
+        "run",
+        lambda command, *args, **kwargs: captured.append(command) or 0,
+    )
+    with pytest.raises(BridgeError, match="takeover and cannot resume"):
+        bridge.launch("claude", repo, terminal.PROMPT, resume=True)
+    assert not captured
+
+
 def test_explicit_approval_quiesces_session_observation_after_reclaim(
     bridge, repo, paired
 ):
@@ -832,6 +1156,64 @@ def test_quiesce_resumes_after_the_exact_process_stops(
         transitions = list((directory / "recovery").glob("*-quiesce.json"))
         assert json.loads(transitions[0].read_text())["phase"] == "complete"
         assert recovery.approval(directory, "42", record["claim_id"]) is None
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_quiesce_refuses_a_capture_without_the_issue(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    session_id = "moved-capacity-session"
+    try:
+        write_json(
+            directory / "claude-activity.json",
+            {
+                "activity": "working",
+                "updated": time.time(),
+                "session_id": session_id,
+                "session_pid": child.pid,
+                "session_ticks": process.start_ticks(child.pid),
+            },
+        )
+        write_json(
+            directory / "capacity-candidates.json",
+            {
+                "version": 1,
+                "candidates": [
+                    {
+                        "issue": "42",
+                        "owner": "claude",
+                        "reason": "provider capacity exhausted",
+                        "reset_at": None,
+                        "source": "provider-status",
+                        "session_id": session_id,
+                        "observation_id": "moved-observation",
+                    }
+                ],
+            },
+        )
+        manifest = roster.read(directory)
+        bridge.authorize_recovery(repo, "42", "recover after provider refusal")
+        monkeypatch.setattr(recovery, "capture", lambda *args: [])
+
+        with pytest.raises(BridgeError, match="Issue #42 has no capture"):
+            recovery.quiesce_authorized(directory, manifest)
+
+        transitions = list((directory / "recovery").glob("*-quiesce.json"))
+        assert json.loads(transitions[0].read_text())["phase"] == "stopped"
+        assert "orphan" not in issues.snapshot(directory)["issues"]["42"]
     finally:
         if child.poll() is None:
             child.kill()
@@ -1265,6 +1647,24 @@ def test_the_notice_is_recorded_once_for_one_orphaning(bridge, repo, paired):
 
     assert issues.snapshot(directory)["revision"] == revision
     assert len(inbox(bridge, paired, "codex")) == 1
+
+
+def test_the_notice_skips_lanes_that_cannot_take_the_work(bridge, repo, paired):
+    registered(bridge, paired)
+    bridge.add_participant(repo, "spare", "codex")
+    store.register(bridge.home, paired["root"], "spare")
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    killed(directory, "claude", STALLED + 100)
+    killed(directory, "spare", STALLED + 100)
+    running(directory, "codex")
+
+    supervision.poll(bridge.home, directory)
+
+    assert issues.snapshot(directory)["issues"]["42"]["orphan"]
+    assert len(inbox(bridge, paired, "codex")) == 1
+    assert not inbox(bridge, paired, "spare")
 
 
 def test_a_live_owner_is_never_taken_from(bridge, repo, paired):

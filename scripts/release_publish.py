@@ -3,7 +3,6 @@
 import datetime
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -31,15 +30,6 @@ CHANGELOG_SECTIONS = (
     ("perf", "Performance"),
 )
 ACCEPTANCE_SUITE = "tests/test_fault_acceptance.py"
-ACCEPTANCE_RECORDS = "docs/acceptance"
-ACCEPTANCE_MEASURES = (
-    "lanes",
-    "claims",
-    "claims_completed",
-    "idle_lane_minutes",
-    "unaccountable_claim_minutes",
-)
-ACCEPTANCE_COUNTS = ("lanes", "claims", "claims_completed")
 RELEASE_KINDS = ("major", "minor", "patch")
 MEASURED = "measured"
 RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?(!?):")
@@ -82,6 +72,7 @@ def asset_names(version: str) -> set[str]:
         f"agent-parley-plugins-{version}.zip",
         f"agent-parley-{version}-codex-skills.zip",
         "requirements.txt",
+        "install.sh",
         "CHANGELOG.md",
         "RELEASE_NOTES.md",
     }
@@ -410,13 +401,12 @@ def release_candidate(root: Path, requested: str = "") -> tuple[str, int, int]:
     the count is measured from. The proposal then looks ahead for a version
     that is genuinely free.
 
-    A maintainer can name the kind instead. That request exists for the case
-    measurement cannot see: a published package repaired by a change outside
-    the package, such as the README the index renders, or a repair that landed
-    as a plain fix and must ship before a tenth issue. The requested kind
-    replaces the markers and the count, and nothing else: the version must
-    still be free, and the tree must still hold at least one commit past the
-    approved release, so a request never republishes an unchanged tree.
+    A maintainer can name the kind instead. That request exists for a package
+    repair that landed as a plain fix and must ship before a tenth issue. The
+    requested kind replaces the markers and the count, and nothing else: the
+    version must still be free, and the tree must still hold at least one
+    commit past the approved release. The candidate phase then still requires
+    a package change, so a documentation-only tree never ships as a version.
 
     Args:
         root: Checkout containing the version manifest and release history.
@@ -520,56 +510,6 @@ def run_acceptance_suite(root: Path) -> str:
     return lines[-1] if lines else f"pytest exited {result.returncode}"
 
 
-def acceptance_record_error(root: Path, version: str) -> str:
-    """Validates the live acceptance record a minor or major release needs.
-
-    Every measurement must be a finite, non-negative number, and lane and
-    claim counts must be integers. JSON decoding admits NaN, infinity and
-    overflowed literals, so those are named as invalid rather than letting
-    comparisons against them pass the record.
-
-    Args:
-        root: Checkout holding the acceptance records.
-        version: Version the release would publish.
-
-    Returns:
-        An empty string for a valid record, otherwise what is missing or
-        wrong in it.
-    """
-    path = f"{ACCEPTANCE_RECORDS}/{version}.json"
-    try:
-        record = json.loads((root / path).read_text())
-    except FileNotFoundError:
-        return f"no live acceptance record {path}"
-    except (OSError, ValueError) as exc:
-        return f"live acceptance record {path} is unreadable: {exc}"
-    if not isinstance(record, dict):
-        return f"live acceptance record {path} is not an object"
-    if record.get("version") != version:
-        return f"live acceptance record {path} names another version"
-    if not str(record.get("run", "")).strip():
-        return f"live acceptance record {path} names no run"
-    missing = [
-        name
-        for name in ACCEPTANCE_MEASURES
-        if isinstance(record.get(name), bool)
-        or not isinstance(record.get(name), (int, float))
-        or (name in ACCEPTANCE_COUNTS and isinstance(record[name], float))
-        or (isinstance(record[name], float) and not math.isfinite(record[name]))
-        or record[name] < 0
-    ]
-    if missing:
-        return f"live acceptance record {path} lacks measured " + ", ".join(
-            missing
-        )
-    if record["claims"] <= 0 or record["claims_completed"] != record["claims"]:
-        return (
-            f"live acceptance record {path} completed "
-            f"{record['claims_completed']} of {record['claims']} claims"
-        )
-    return ""
-
-
 def acceptance_errors(
     root: Path,
     approved: str,
@@ -580,9 +520,9 @@ def acceptance_errors(
 
     A patch release needs none: it repairs a published version rather than
     claiming new behaviour. A minor or major release claims new unattended
-    behaviour, so it needs both the fault-injection suite passing on the
-    release commit and a live acceptance record for the version with the
-    numbers that run measured.
+    behaviour, so it needs the fault-injection suite passing on the release
+    commit. A live unattended run is not required; the operator may still
+    run one by hand with ``scripts/acceptance.py``.
 
     Args:
         root: Checkout of the release commit.
@@ -602,8 +542,6 @@ def acceptance_errors(
             f"fault-injection acceptance suite {ACCEPTANCE_SUITE} did not "
             f"pass on the release commit: {failure}"
         )
-    if failure := acceptance_record_error(root, version):
-        errors.append(failure)
     return errors
 
 
@@ -788,6 +726,10 @@ def bump(root: Path, baseline: str, approved: str, version: str) -> None:
     marketplace = json.loads(path.read_text())
     marketplace["plugins"][0]["version"] = version
     path.write_text(json.dumps(marketplace, indent=2) + "\n")
+    path = root / "server.json"
+    server = json.loads(path.read_text())
+    server["version"] = version
+    path.write_text(json.dumps(server, indent=2) + "\n")
     (root / MANIFEST_PATH).write_text(
         json.dumps({".": version}, indent=2) + "\n"
     )
@@ -995,7 +937,7 @@ def main() -> None:
         if requested == MEASURED:
             requested = ""
         version, issues, features = release_candidate(root, requested)
-        changed = bool(requested) or has_package_changes(root)
+        changed = has_package_changes(root)
         eligible = bool(version) and changed
         emit("eligible", str(eligible).lower())
         emit("version", version)
@@ -1009,6 +951,11 @@ def main() -> None:
             print(
                 f"{measured}; a {requested} release was requested but main "
                 "holds no commit past the approved release."
+            )
+        elif requested and not changed:
+            print(
+                f"{measured}; a {requested} release was requested but the "
+                "package is unchanged since the approved release."
             )
         elif requested:
             print(

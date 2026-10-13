@@ -102,6 +102,8 @@ def test_the_branch_prefix_is_configurable_per_project(bridge, repo):
         "git commit -m " + json.dumps(CREDIT),
         "git commit --amend --message=" + json.dumps(CREDIT),
         "git commit -m 'fix: repair the parser' -m " + json.dumps(TRAILER),
+        "git commit -m fix --trailer " + json.dumps(TRAILER),
+        "git commit -m fix --trailer=" + json.dumps(TRAILER),
         "git merge --no-ff -m " + json.dumps(CREDIT) + " other",
         "git tag -a v1 -m " + json.dumps(CREDIT),
         "gh pr create --title " + json.dumps(CREDIT) + " --body ok",
@@ -142,6 +144,34 @@ def test_a_command_publishing_attribution_is_denied(
 def test_ordinary_work_is_not_refused(bridge, repo, paired, command):
     lane = Path(paired["lanes"]["claude"])
     assert attributed_command(payload(lane, command), lane) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git commit -F {path}",
+        "git commit --file={path}",
+        "git merge --no-ff -F {path} other",
+        "git tag -a v1 -F {path}",
+        "gh pr create --title fix --body-file {path}",
+        "gh pr create --title fix -F {path}",
+    ],
+)
+def test_a_message_file_carrying_attribution_is_refused(
+    bridge, repo, paired, tmp_path, command
+):
+    lane = Path(paired["lanes"]["claude"])
+    message = tmp_path / "message.txt"
+    message.write_text("fix: repair the parser\n\n" + TRAILER + "\n")
+    found = attributed_command(
+        payload(lane, command.format(path=message)), lane
+    )
+    assert found is not None and found[1] == "assistant_trailer"
+    message.write_text("fix: repair the parser\n")
+    assert (
+        attributed_command(payload(lane, command.format(path=message)), lane)
+        is None
+    )
 
 
 def test_a_command_in_another_checkout_is_not_this_lane_s_to_refuse(
@@ -193,6 +223,8 @@ def test_the_issue_comment_names_no_participant_or_provider():
             "generated_pull_request",
         ),
         (chr(0x1F916) + " shipped", "robot_signature"),
+        ("Co-Authored-By:" + " Gemini <g@example.com>", "assistant_trailer"),
+        ("Generated" + " with Amp", "assistant_credit"),
     ],
 )
 def test_each_refusal_names_its_rule(text, rule):
@@ -206,6 +238,7 @@ def test_each_refusal_names_its_rule(text, rule):
         "fix: repair the codex adapter",
         "Co-Authored-By: Example Maintainer <human@example.com>",
         "Run Claude Code and Codex in separate worktrees.",
+        "Signed-off-by: Champ Example <champ@example.com>",
     ],
 )
 def test_ordinary_text_breaks_no_rule(text):

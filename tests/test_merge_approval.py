@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import approvals, dashboard, history, metrics, roster
+from agent_parley import (
+    approvals,
+    dashboard,
+    history,
+    lifecycle,
+    merges,
+    metrics,
+    roster,
+)
 from agent_parley.checkpoints import branch_head
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
@@ -92,12 +100,39 @@ def test_a_lane_naming_the_base_checkout_cannot_approve_itself(
         bridge.merge(repo, "codex")
 
 
+def test_a_lane_in_the_base_checkout_with_its_token_cannot_approve_itself(
+    bridge, repo, paired, awaiting, monkeypatch
+):
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.approve(repo, "codex")
+    monkeypatch.delenv("AGENT_PARLEY_TOKEN")
+    with pytest.raises(BridgeError, match="approve codex"):
+        bridge.merge(repo, "codex")
+
+
 def test_a_lane_naming_the_base_checkout_cannot_approve_recovery(
     bridge, repo, paired, monkeypatch
 ):
     monkeypatch.chdir(paired["lanes"]["codex"])
     with pytest.raises(BridgeError, match="base checkout"):
         bridge.authorize_recovery(repo, "42", "usage limit")
+
+
+def test_a_lane_token_in_the_base_checkout_cannot_decide(
+    bridge, repo, paired, awaiting, monkeypatch
+):
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.approve(repo, "codex")
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.authorize_recovery(repo, "42", "usage limit")
+    with pytest.raises(BridgeError, match="assigned agent worktree"):
+        bridge.issue(repo, "unblock", "42", on="17")
+    monkeypatch.delenv("AGENT_PARLEY_TOKEN")
+    with pytest.raises(BridgeError, match="approve codex"):
+        bridge.merge(repo, "codex")
 
 
 def test_a_lane_naming_the_base_checkout_cannot_unblock_as_operator(
@@ -214,7 +249,7 @@ def test_approval_state_is_visible_in_status_and_the_live_view(
     )
     view = dashboard.collect(bridge.home, False, {})
     assert view["totals"]["awaiting_approval"] == 1
-    assert any("awaiting approval 1" in line for line in dashboard.render(view))
+    assert any("1 awaiting approval" in line for line in dashboard.render(view))
 
     bridge.approve(repo, "codex")
     lanes = {
@@ -248,3 +283,51 @@ def test_the_requirement_is_reported_and_validated(bridge, repo, paired):
         (Path(paired["lanes"]["codex"]).parent / "project.json").read_text()
     )
     assert stored["approval"] == ["merge"]
+
+
+def test_a_lane_cannot_clear_the_approval_or_verification_gate(
+    bridge, repo, paired, monkeypatch
+):
+    bridge.approval_policy(repo, ["merge"])
+    bridge.verification(repo, "make check")
+    lane = Path(paired["lanes"]["codex"])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.approval_policy(lane, [])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.verification(lane, "true")
+    monkeypatch.chdir(lane)
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.approval_policy(repo, [])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.verification(repo, "true")
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.approval_policy(repo, [])
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.verification(repo, "")
+    assert "participant merge" in bridge.approval_policy(lane)
+    assert "make check" in bridge.verification(lane)
+    stored = roster.read(lane.parent)
+    assert stored["approval"] == ["merge"]
+    assert stored["verify"] == ["make", "check"]
+
+
+def test_a_completed_prerequisite_reads_as_completed_not_released():
+    state = {
+        "issues": {
+            "10": {"owner": None, "execution": {"state": lifecycle.COMPLETE}},
+            "11": {"owner": None},
+            "12": {"owner": "codex"},
+            "20": {"owner": "claude", "blocked_by": ["10", "11", "12"]},
+        }
+    }
+
+    assert merges.outside_prerequisites(state, {"claude": ["20"]}) == [
+        "#10 is a prerequisite outside this selection, completed, so it is "
+        "satisfied.",
+        "#11 is a prerequisite outside this selection, released, so no lane "
+        "still holds it.",
+        "#12 is a prerequisite outside this selection, held by codex, so it "
+        "is not satisfied here.",
+    ]

@@ -201,7 +201,8 @@ class MailMixin(BridgeCore):
 
         Returns:
             One thread page, the matching messages, the most recent messages,
-            one message, the pending items, or the outcome of a cancellation.
+            one message, the pending items with the orphan decisions waiting
+            on the operator, or the outcome of a cancellation.
 
         Raises:
             BridgeError: If the lane, the named participant or its registered
@@ -212,7 +213,10 @@ class MailMixin(BridgeCore):
         _, directory = self.project(repo)
         data = roster.read(directory)
         if action == "pending":
-            return {"pending": store.schedules(self.home, data["root"])}
+            return {
+                "pending": store.schedules(self.home, data["root"]),
+                "orphans": self.orphan_decisions(data["root"]),
+            }
         if action == "cancel":
             return store.cancel_schedule(self.home, data["root"], identifier)
         if participant:
@@ -247,6 +251,35 @@ class MailMixin(BridgeCore):
         return store.search_messages(
             self.home, data["root"], name, query, limit
         )
+
+    def orphan_decisions(self, root: str) -> list[dict]:
+        """Lists the orphan decisions waiting on the operator for a project.
+
+        The supervisor sends its orphan decision through notification
+        transports, which may be off, so a decision listed only there could
+        never reach the operator. These entries are the `problems` rows for
+        orphaned claims, read from the ledger, so `mail pending` and
+        `problems` name the same remedy with or without a transport.
+
+        Args:
+            root: Canonical project key the rows are matched on.
+
+        Returns:
+            One entry per lane holding orphaned claims, naming the lane, the
+            claims and the decision: a live peer's take command, or the
+            operator's commands when no live lane can take them.
+        """
+        from agent_parley.cli import Bridge, problems
+
+        return [
+            {
+                "participant": row["participant"],
+                "detail": row["detail"],
+                "decision": row["command"],
+            }
+            for row in Bridge(self.home).problems()
+            if row["project"] == root and row["condition"] == problems.ORPHANED
+        ]
 
     def decide(
         self, repo: Path, text: str, subject: str = "", key: str = ""

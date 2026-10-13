@@ -284,10 +284,11 @@ def test_a_crashed_approval_keeps_its_note_or_stays_open(
         raise RuntimeError("killed")
 
     finish = plan._accept
+    settle = plan._settle
     monkeypatch.setattr(plan, "_settle", crash)
     with pytest.raises(RuntimeError):
         bridge.plan_revision(repo, "approve", record["id"], reason="ok")
-    monkeypatch.undo()
+    monkeypatch.setattr(plan, "_settle", settle)
     listing = bridge.plan_revision(repo, "proposals")
     [still] = listing["proposals"]
     assert still["status"] == "pending"
@@ -313,10 +314,11 @@ def test_a_crash_before_the_ledger_write_withdraws_the_proposal(
     def crash(*_args):
         raise RuntimeError("killed before the ledger write")
 
+    settle = plan._settle
     monkeypatch.setattr(plan, "_settle", crash)
     with pytest.raises(RuntimeError):
         proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
-    monkeypatch.undo()
+    monkeypatch.setattr(plan, "_settle", settle)
     with pytest.raises(BridgeError, match="No revision proposal"):
         bridge.plan_revision(repo, "reject", "0000000000000000")
     listing = bridge.plan_revision(repo, "proposals")

@@ -5,6 +5,7 @@ description: >-
   and explicit handoffs.
 url: https://suneel944.github.io
 baseurl: /agent-parley
+image: /docs/assets/agent-parley.png
 theme: jekyll-theme-primer
 plugins:
   - jekyll-sitemap
@@ -23,6 +24,7 @@ exclude:
   - CHANGELOG.md
   - AGENTS.md
   - CLAUDE.md
+  - docs/video
 defaults:
   - scope:
       path: README.md
@@ -64,7 +66,7 @@ defaults:
     values:
       title: Operations
       description: >-
-        Install, upgrade and operate Agent Parley on Linux and macOS: daily
+        Install, upgrade and operate Agent Parley on Linux, macOS and WSL2: daily
         use, providers, accounts, recovery and plugins.
   - scope:
       path: docs/providers.md
@@ -93,7 +95,8 @@ defaults:
       title: Unattended acceptance run
       description: >-
         How a day of real parallel coding agent lanes is run without an
-        operator and turned into the evidence a minor release needs.
+        operator and turned into optional evidence about real-client
+        behaviour.
   - scope:
       path: docs/catalog-submission.md
     values:
@@ -102,12 +105,19 @@ defaults:
         Plugin directory submission material for the Agent Parley plugin
         bundle and how to verify each requirement.
   - scope:
+      path: docs/mcp-directories.md
+    values:
+      title: MCP directory listings
+      description: >-
+        MCP directory manifests for the Agent Parley coordination server,
+        how each is validated, and the owner-only submission steps.
+  - scope:
       path: docs/0.11.0-validation.md
     values:
       title: 0.11.0 work-loop validation
       description: >-
-        Release acceptance protocol for the autonomous work loop, run with
-        native Claude and Codex terminals.
+        Historical 0.11.0 acceptance record for the autonomous work loop, run
+        with native Claude and Codex terminals.
   - scope:
       path: docs/windows-port.md
     values:

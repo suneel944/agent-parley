@@ -15,6 +15,7 @@ must not fail on a client's private file format.
 from __future__ import annotations
 
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -57,6 +58,12 @@ THROTTLED = re.compile(
     r"overloaded"
     r"|\b(?:api|http|status)\b[\W_]{0,3}(?:error|code)?[\W_]{0,3}"
     r"(?:429|5\d\d)\b",
+    re.IGNORECASE,
+)
+TRANSPORT = re.compile(
+    r"server error|mid-response|network error|request timed out"
+    r"|connection (?:error|reset|refused|closed)"
+    r"|stream (?:error|disconnected|closed)",
     re.IGNORECASE,
 )
 RESET_CLOCK = re.compile(
@@ -113,10 +120,27 @@ def _config_home(home: Path, entry: dict, profile: str | None) -> Path | None:
     return Path(selected).expanduser() if selected else None
 
 
+def _claude_sources(config: Path, lane: Path) -> list[Path]:
+    """Lists every Claude transcript recorded for one lane."""
+    directory = config / "projects" / UNSAFE.sub("-", str(lane))
+    return sorted(directory.glob("*.jsonl"))
+
+
 def _claude_records(config: Path, lane: Path) -> Path | None:
     """Finds the newest Claude transcript recorded for one lane."""
-    directory = config / "projects" / UNSAFE.sub("-", str(lane))
-    return _newest(directory.glob("*.jsonl"))
+    return _newest(_claude_sources(config, lane))
+
+
+@functools.lru_cache(maxsize=1024)
+def _codex_cwd(path: Path, inode: int) -> str:
+    """Remembers the working directory a rollout's first record names.
+
+    A rollout's first record is written once, so the answer for one path and
+    inode never changes and each rollout is opened for it only once. An empty
+    answer from a half-written first record is cached too, so callers reread
+    the rollout uncached through ``_codex_lane`` when this returns empty.
+    """
+    return _codex_lane(path)
 
 
 def _codex_lane(path: Path) -> str:
@@ -134,8 +158,13 @@ def _codex_lane(path: Path) -> str:
     return str(source.get("cwd", ""))
 
 
-def _codex_records(config: Path, lane: Path) -> Path | None:
-    """Finds a recent Codex rollout whose own record names this lane."""
+def _codex_sources(config: Path, lane: Path) -> list[Path]:
+    """Lists the recent Codex rollouts whose own record names this lane.
+
+    Only rollouts from the last ``CODEX_DAYS`` days, and among them the
+    ``CODEX_CANDIDATES`` most recently modified, are considered, newest
+    first.
+    """
     root = config / "sessions"
     today = datetime.date.today()
     candidates: list[Path] = []
@@ -144,13 +173,20 @@ def _codex_records(config: Path, lane: Path) -> Path | None:
         directory = root / f"{day:%Y}" / f"{day:%m}" / f"{day:%d}"
         candidates.extend(directory.glob("rollout-*.jsonl"))
     ordered = sorted(candidates, key=_mtime, reverse=True)
+    found = []
     for path in ordered[:CODEX_CANDIDATES]:
         try:
-            if _codex_lane(path) == str(lane):
-                return path
+            cwd = _codex_cwd(path, path.stat().st_ino) or _codex_lane(path)
+            if cwd == str(lane):
+                found.append(path)
         except OSError:
             continue
-    return None
+    return found
+
+
+def _codex_records(config: Path, lane: Path) -> Path | None:
+    """Finds a recent Codex rollout whose own record names this lane."""
+    return next(iter(_codex_sources(config, lane)), None)
 
 
 def _fold_claude(record: dict, reading: dict) -> None:
@@ -166,6 +202,7 @@ def _fold_claude(record: dict, reading: dict) -> None:
         if identifier in reading["seen"]:
             return
         reading["seen"].add(identifier)
+        reading["last"] = identifier
     for name in CLAUDE_FIELDS:
         value = usage.get(name)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -190,6 +227,10 @@ def _fold_codex(record: dict, reading: dict) -> None:
 ADAPTERS: dict[str, tuple[Finder, Fold]] = {
     "claude": (_claude_records, _fold_claude),
     "codex": (_codex_records, _fold_codex),
+}
+SOURCES: dict[str, Callable[[Path, Path], list[Path]]] = {
+    "claude": _claude_sources,
+    "codex": _codex_sources,
 }
 
 
@@ -219,7 +260,11 @@ def _capacity_state(text: str) -> str | None:
     which is retryable. An overload report and a bare status report such as
     ``API Error: 529`` or ``HTTP 429`` are read last, and a status number
     counts only next to an explicit API, HTTP or status label, so ordinary
-    error prose that merely mentions a number is no evidence.
+    error prose that merely mentions a number is no evidence. A transport
+    failure, such as a server error mid-response or a dropped stream, is read
+    last as retryable: the request never finished, so the same request can be
+    sent again, while a rejected request such as ``400 Bad Request`` names no
+    such failure and stays unclassified.
 
     Args:
         text: Provider-authored refusal text from one error envelope.
@@ -234,7 +279,7 @@ def _capacity_state(text: str) -> str | None:
         return "retryable"
     if WEAK_EXHAUSTION.search(text):
         return "exhausted"
-    if THROTTLED.search(text):
+    if THROTTLED.search(text) or TRANSPORT.search(text):
         return "retryable"
     return None
 
@@ -359,8 +404,10 @@ def _codex_capacity(record: dict) -> dict | None:
     """Reads one validated Codex capacity observation.
 
     Codex wraps each rollout record in a payload naming its own kind, so the
-    reader matches refusal text only on an error. Token-count events carry
-    structured rate limits and prove a successful request.
+    reader matches refusal text only on an error. A stream error whose text
+    names no capacity state is still retryable, because Codex writes it only
+    when the response stream broke before the request finished. Token-count
+    events carry structured rate limits and prove a successful request.
 
     Args:
         record: One parsed rollout record.
@@ -377,7 +424,10 @@ def _codex_capacity(record: dict) -> dict | None:
         return None
     kind = str(payload.get("type", ""))
     if kind in ("error", "stream_error"):
-        return _text_capacity(str(payload.get("message", "")), at)
+        observation = _text_capacity(str(payload.get("message", "")), at)
+        if observation is None and kind == "stream_error":
+            return {"state": "retryable", "observed_at": at}
+        return observation
     if kind != "token_count":
         return None
     info = payload.get("info")
@@ -559,6 +609,12 @@ def _advance(path: Path, fold: Fold, reading: dict) -> dict:
     that grew by more than the budget catches up over later refreshes. A
     replaced or truncated file starts a new reading.
 
+    A line longer than ``MAX_READ`` holds no newline in a full chunk, so the
+    offset moves past that whole chunk rather than stalling on it forever.
+    The next reading then starts inside the oversized line; its remaining
+    fragment is not a JSON object and is skipped like any unparsable line,
+    and folding resumes from the following newline.
+
     Every adapter folds only records carrying a usage object, whose key ends
     in ``USAGE_MARK``, so a line without those bytes is skipped unparsed.
     Most transcript lines are prompts and tool output with no usage at all.
@@ -591,6 +647,8 @@ def _advance(path: Path, fold: Fold, reading: dict) -> dict:
         chunk = handle.read(MAX_READ)
     end = chunk.rfind(b"\n")
     if end < 0:
+        if len(chunk) == MAX_READ:
+            reading["offset"] += len(chunk)
         return reading
     reading["offset"] += end + 1
     for line in chunk[:end].split(b"\n"):
@@ -605,7 +663,9 @@ def _advance(path: Path, fold: Fold, reading: dict) -> dict:
     return reading
 
 
-def reported_tokens(home: Path, participant: dict, cache: dict) -> int | None:
+def reported_tokens(
+    home: Path, participant: dict, cache: dict, whole: bool = False
+) -> int | None:
     """Reports the tokens a lane's own native client recorded for itself.
 
     The value is read from the client's session records under the config home
@@ -620,6 +680,9 @@ def reported_tokens(home: Path, participant: dict, cache: dict) -> int | None:
         participant: Manifest entry naming the lane, provider and account.
         cache: Caller-owned mapping of lane to its previous reading, which
             keeps a live refresh reading only newly appended records.
+        whole: Read on past ``MAX_READ`` until the record's size when this
+            call began, so a caller comparing the count with a limit sees
+            every recorded token now rather than over later refreshes.
 
     Returns:
         The reported token count, or None when this lane has no readable
@@ -636,8 +699,132 @@ def reported_tokens(home: Path, participant: dict, cache: dict) -> int | None:
         if path is None:
             cache.pop(key, None)
             return None
+        size = path.stat().st_size
         reading = _advance(path, fold, cache.get(key, {}))
+        while whole and reading["offset"] < size:
+            before = reading["offset"]
+            reading = _advance(path, fold, reading)
+            if reading["offset"] <= before:
+                break
     except (BridgeError, KeyError, OSError, ValueError):
         return None
     cache[key] = reading
     return int(reading["tokens"])
+
+
+def child_activity(
+    home: Path, participant: dict, paths: Iterable[Path]
+) -> tuple[int, float | None]:
+    """Counts native sessions recorded under worktrees a lane made itself.
+
+    A lane's own worktree is read by `reported_tokens`; this reads the
+    worktrees Git registers beyond it, so a session a lane started through
+    its own shell, in a worktree it added for a pull request or a
+    sub-task, is still attributed to it. The same provider session layout
+    is read for each worktree: a Claude project directory named after the
+    worktree path, or a recent Codex rollout whose own record names it.
+
+    Args:
+        home: Private bridge state root.
+        participant: Manifest entry naming the lane, provider and account.
+        paths: Worktrees Git registers and attributes to this lane, its own
+            lane worktree excluded.
+
+    Returns:
+        How many session records were found across those worktrees, and the
+        most recent modification time among them, or None when none were
+        found or the provider publishes no session layout.
+    """
+    try:
+        entry = roster.provider(home, str(participant.get("provider", "")))
+        sources = SOURCES[str(entry.get("adapter", ""))]
+        config = _config_home(home, entry, participant.get("credential"))
+    except (BridgeError, KeyError, ValueError):
+        return 0, None
+    if config is None:
+        return 0, None
+    count = 0
+    latest: float | None = None
+    for path in paths:
+        try:
+            found = sources(config, path)
+        except OSError:
+            continue
+        for record_path in found:
+            count += 1
+            stamp = _mtime(record_path)
+            if stamp > 0 and (latest is None or stamp > latest):
+                latest = stamp
+    return count, latest
+
+
+def lane_sources(
+    home: Path, participant: dict, known: dict, since: float
+) -> list[dict] | None:
+    """Advances every session record a lane's own native client wrote.
+
+    Unlike ``reported_tokens``, which follows only the newest record, this
+    reads each record the lane's client kept, resuming where the caller's
+    durable reading of it stopped, so records that ended between two
+    readings, or were written while nobody was reading, are still counted.
+    Each record is advanced by at most ``MAX_READ`` bytes per call.
+
+    Args:
+        home: Private bridge state root.
+        participant: Manifest entry naming the lane, provider and account.
+        known: Previous reading per ``path:inode`` key, each carrying the
+            byte ``offset``, the ``tokens`` read so far and the ``last``
+            message identifier folded.
+        since: A record absent from ``known`` and last modified before this
+            instant is taken as already consumed, so history from before the
+            caller began counting is skipped rather than read.
+
+    Returns:
+        One reading per record with its ``key``, ``offset``, ``tokens`` and
+        ``last``, or None when this lane has no readable session records.
+    """
+    try:
+        entry = roster.provider(home, str(participant.get("provider", "")))
+        adapter = str(entry.get("adapter", ""))
+        fold = ADAPTERS[adapter][1]
+        config = _config_home(home, entry, participant.get("credential"))
+        if config is None:
+            return None
+        paths = SOURCES[adapter](config, Path(str(participant.get("lane", ""))))
+    except (BridgeError, KeyError, OSError, ValueError):
+        return None
+    readings = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            key = f"{path}:{stat.st_ino}"
+            prior = known.get(key)
+            base = {"path": str(path), "inode": stat.st_ino, "seen": set()}
+            if prior is not None:
+                last = str(prior.get("last", ""))
+                reading = _advance(
+                    path,
+                    fold,
+                    {
+                        **base,
+                        "offset": int(prior["offset"]),
+                        "tokens": int(prior["tokens"]),
+                        "seen": {last} if last else set(),
+                        "last": last,
+                    },
+                )
+            elif stat.st_mtime < since:
+                reading = {**base, "offset": stat.st_size, "tokens": 0}
+            else:
+                reading = _advance(path, fold, {})
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+        readings.append(
+            {
+                "key": key,
+                "offset": int(reading["offset"]),
+                "tokens": int(reading["tokens"]),
+                "last": str(reading.get("last", "")),
+            }
+        )
+    return readings or None

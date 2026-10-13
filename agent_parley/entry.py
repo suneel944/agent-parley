@@ -4,8 +4,9 @@ Every `agent-parley` process pays this module's import before the subcommand
 is known, so it imports nothing but `sys` and reaches the command surface
 only once the invocation is known to need it. The version flags answer from
 the compatibility contract alone, which is the cheapest module on the
-launcher's side, and every other invocation falls through to the full parser
-with its arguments untouched.
+launcher's side. A bare invocation prints the start-here screen from `start`,
+which reads state without the command surface, and every other invocation
+falls through to the full parser with its arguments untouched.
 
 The fall-through is deliberately total: anything beyond a bare version flag,
 including a version flag mixed with other arguments, is handed to the command
@@ -48,6 +49,10 @@ def main() -> int:
     if sys.platform == "win32":
         print(WINDOWS_REFUSAL, file=sys.stderr)
         return 2
+    if not arguments:
+        from agent_parley import start
+
+        return start.show()
     from agent_parley import cli
 
     return cli.main()
