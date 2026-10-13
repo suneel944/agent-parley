@@ -4,6 +4,7 @@ import socket
 
 import pytest
 
+from agent_parley import forge
 from agent_parley.cli import Bridge, git
 from agent_parley.state import write_json
 
@@ -48,6 +49,9 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
     Git reads only ``git_config`` and no system file, so a developer's
     signing, hooks or default branch never reach the suite, and Git starts
     no detached maintenance inside a worktree a test is about to move.
+
+    Each test starts with no recorded forge failure, so a refusal one test
+    records never puts a later test's poll into the forge backoff.
     """
     for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_PARLEY_HOME"):
         monkeypatch.setenv(variable, str(tmp_path / variable.lower()))
@@ -58,6 +62,7 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
     for variable in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
         monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setattr(forge, "_failure", {})
 
 
 @pytest.fixture

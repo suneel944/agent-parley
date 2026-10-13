@@ -120,6 +120,39 @@ def test_open_forge_issues_the_ledger_never_saw_are_free_candidates(
     assert not (tmp_path / "issues.json").exists()
 
 
+def test_a_forge_issue_held_by_someone_else_or_not_ready_is_not_offered(
+    tmp_path,
+):
+    ledger = {"revision": 1, "issues": {}}
+    write_json(
+        tmp_path / FORGE_ISSUES,
+        {
+            "read_at": time.time(),
+            "login": "operator",
+            "issues": {
+                "50": {"title": "Theirs", "assignees": ["teammate"]},
+                "51": {"title": "Blocked", "labels": ["blocked"]},
+                "52": {"title": "Mine", "assignees": ["operator"]},
+                "53": {"title": "Free", "labels": ["bug"], "assignees": []},
+                "54": {"title": "Old shape"},
+            },
+        },
+    )
+    pool = issues.with_forge(tmp_path, ledger)
+    assert issues.unclaimed(pool) == ["52", "53", "54"]
+    assert issues.forge_assignees(tmp_path, "50") == ["teammate"]
+    assert issues.forge_assignees(tmp_path, "52") == []
+    write_json(
+        tmp_path / FORGE_ISSUES,
+        {
+            **json.loads((tmp_path / FORGE_ISSUES).read_text()),
+            "skip_labels": ["bug"],
+        },
+    )
+    pool = issues.with_forge(tmp_path, ledger)
+    assert issues.unclaimed(pool) == ["51", "52", "54"]
+
+
 def test_a_stale_or_missing_forge_cache_adds_nothing(tmp_path):
     ledger = {"revision": 1, "issues": {}}
     assert issues.with_forge(tmp_path, ledger) is ledger
