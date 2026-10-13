@@ -1,5 +1,6 @@
 """Checks the Copilot hook wire contract through the configured command."""
 
+import io
 import json
 import os
 import shlex
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, copilot, roster, store
+from agent_parley import cli, copilot, hook, roster, store
 from agent_parley.cli import COPILOT_EVENTS, main
 from agent_parley.state import BridgeError
 
@@ -62,16 +63,26 @@ def lane(bridge, repo, monkeypatch, tmp_path):
     }
 
 
-def fire(lane, event, payload):
-    """Runs one configured hook command exactly as Copilot would run it."""
-    result = subprocess.run(
+def run_hook(lane, event, payload, session="helper"):
+    """Runs one configured hook in a session the launcher named."""
+    env = {**os.environ}
+    env.pop("AGENT_PARLEY_PARTICIPANT", None)
+    if session is not None:
+        env["AGENT_PARLEY_PARTICIPANT"] = session
+    return subprocess.run(
         shlex.split(lane["commands"][event]),
         input=json.dumps({"hook_event_name": event, **payload}),
         capture_output=True,
         text=True,
         check=False,
         cwd=lane["lane"],
+        env=env,
     )
+
+
+def fire(lane, event, payload):
+    """Runs one configured hook command exactly as Copilot would run it."""
+    result = run_hook(lane, event, payload)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -229,23 +240,121 @@ def test_a_relaunch_adds_no_duplicate_hooks_and_retire_removes_them(
     assert bridge.launch("helper", repo, "Coordinate", "copilot", "work") == 0
     after = json.loads(settings_path.read_text())
     assert after["hooks"] == before["hooks"]
-    assert bridge.launch("second", repo, "Coordinate", "copilot", "work") == 0
+    foreign = {
+        **after["hooks"]["PreToolUse"][1],
+        "bash": after["hooks"]["PreToolUse"][1]["bash"].replace(
+            "--participant helper", "--participant second"
+        ),
+    }
+    after["hooks"]["PreToolUse"].append(foreign)
+    settings_path.write_text(json.dumps(after))
     bridge.retire(repo, "helper")
     settings = json.loads(settings_path.read_text())
-    assert settings["hooks"]["PreToolUse"][0]["bash"] == "operator-policy"
-    assert all(
-        "--participant second" in entry["bash"]
-        for entry in settings["hooks"]["PreToolUse"][1:]
-    )
+    assert settings["hooks"]["PreToolUse"] == [
+        {"type": "command", "bash": "operator-policy", "timeoutSec": 1},
+        foreign,
+    ]
     servers = json.loads((account / "mcp-config.json").read_text())
     assert "agent_parley" in servers["mcpServers"]
-    bridge.retire(repo, "second")
+    copilot.release_copilot(
+        bridge.home, {"provider": "copilot", "credential": "work"}, "second"
+    )
     settings = json.loads(settings_path.read_text())
     assert settings["hooks"]["PreToolUse"] == [
         {"type": "command", "bash": "operator-policy", "timeoutSec": 1}
     ]
     servers = json.loads((account / "mcp-config.json").read_text())
     assert "agent_parley" not in servers["mcpServers"]
+
+
+def test_a_second_copilot_lane_on_one_profile_is_refused_naming_the_first(
+    lane, bridge, repo, tmp_path
+):
+    with pytest.raises(BridgeError, match="hooks of helper") as refusal:
+        bridge.launch("second", repo, "Coordinate", "copilot", "work")
+    assert "credentials add" in str(refusal.value)
+    settings = json.loads(
+        (tmp_path / "copilot-account" / "settings.json").read_text()
+    )
+    assert "--participant second" not in json.dumps(settings)
+    assert bridge.launch("helper", repo, "Coordinate", "copilot", "work") == 0
+
+
+@pytest.mark.parametrize("session", ["alpha", None])
+def test_a_hook_for_another_participant_prints_nothing_and_succeeds(
+    lane, session
+):
+    result = run_hook(
+        lane,
+        "PreToolUse",
+        {
+            "session_id": "session-x",
+            "cwd": "/elsewhere",
+            "tool_name": "shell",
+            "tool_input": {"command": "git switch main"},
+        },
+        session=session,
+    )
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_the_in_process_hook_ignores_another_participants_session(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("AGENT_PARLEY_PARTICIPANT", "alpha")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hook", "--participant", "beta", "--adapter", "copilot"],
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    assert hook.main() == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_a_relaunch_drops_hooks_a_vanished_lane_left_in_the_profile(
+    lane, bridge, repo, tmp_path
+):
+    settings_path = tmp_path / "copilot-account" / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    entry = settings["hooks"]["PreToolUse"][0]
+    settings["hooks"]["PreToolUse"].append(
+        {
+            **entry,
+            "bash": entry["bash"].replace(
+                "--participant helper", "--participant gone"
+            ),
+        }
+    )
+    settings_path.write_text(json.dumps(settings))
+    assert bridge.launch("helper", repo, "Coordinate", "copilot", "work") == 0
+    settings = json.loads(settings_path.read_text())
+    assert "--participant gone" not in json.dumps(settings)
+    assert settings["hooks"]["PreToolUse"] == [entry]
+
+
+def test_retiring_a_lane_whose_provider_needs_an_unset_variable_unhooks_it(
+    lane, bridge, repo, tmp_path, monkeypatch
+):
+    roster.define_provider(
+        bridge.home,
+        "vendor",
+        "copilot",
+        "copilot",
+        "COPILOT_HOME",
+        [],
+        ["VENDOR_TOKEN"],
+    )
+    other = tmp_path / "vendor-account"
+    roster.define_credential(bridge.home, "vendor-work", str(other), [], [])
+    monkeypatch.setenv("VENDOR_TOKEN", "exported")
+    assert bridge.launch("vendored", repo, "Go", "vendor", "vendor-work") == 0
+    assert "--participant vendored" in (other / "settings.json").read_text()
+    monkeypatch.delenv("VENDOR_TOKEN")
+    bridge.retire(repo, "vendored")
+    settings = (other / "settings.json").read_text()
+    assert "--participant vendored" not in settings
 
 
 def test_a_copilot_lane_stays_interactive_on_launch_and_on_resume(

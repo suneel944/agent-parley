@@ -464,7 +464,8 @@ reported.
                 retirement removes the worktree under the same lock, or
                 ``issue`` is not an issue number or its claim is refused,
                 or a blueprint is named without ``issue``, from a lane, or
-                is unknown.
+                is unknown, or a ``copilot`` lane's profile already runs
+                another live lane's hooks.
         """
         from agent_parley.cli import (
             COPILOT_EVENTS,
@@ -490,6 +491,8 @@ reported.
             terminal,
             write_json,
         )
+        from agent_parley.copilot import occupants
+        from agent_parley.hook import PARTICIPANT_ENV
 
         began = time.monotonic()
         number = parse_issue(issue) if issue else ""
@@ -609,6 +612,7 @@ reported.
                 **account,
                 "AGENT_PARLEY_TOKEN": identity["registration_token"],
                 "AGENT_PARLEY_HOME": str(self.home),
+                PARTICIPANT_ENV: agent,
             }
             if entry["adapter"] == "claude":
                 config = lane.parent / f"{agent}-mcp.json"
@@ -719,6 +723,19 @@ reported.
                         "DIR`, sign in to it once, and launch with "
                         "--credentials NAME."
                     )
+                sharing = occupants(
+                    self.home, Path(config_home), lane.parent, agent
+                )
+                if sharing:
+                    raise BridgeError(
+                        f"Copilot profile {participant['credential']!r} "
+                        f"already runs the hooks of {', '.join(sharing)}, "
+                        "and Copilot runs every hook in a profile for every "
+                        "session on it, so each lane would decide the "
+                        "other's tool calls. Define a second profile with "
+                        "`agent-parley credentials add NAME --config-home "
+                        "DIR` and launch this lane with --credentials NAME."
+                    )
                 configure_copilot(
                     Path(config_home),
                     {
@@ -742,6 +759,7 @@ reported.
                         for event, groups in hooks.items()
                         if event in COPILOT_EVENTS
                     },
+                    agent,
                 )
                 command = [
                     executable,
