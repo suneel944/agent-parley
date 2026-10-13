@@ -69,6 +69,11 @@ RESTORE_ROOT = (
     "it, or remove the project's state once the service retired its "
     "lanes: "
 )
+DAMAGED = "damaged"
+RECOVER_DECISIONS = (
+    "A damaged decisions record was kept aside; recover the decisions it "
+    "holds, then delete it: "
+)
 FORGET_ROOT = "agent-parley gc --project {root} --apply"
 
 

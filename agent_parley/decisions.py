@@ -25,6 +25,7 @@ stay in `notify`.
 
 import hashlib
 import json
+import os
 import secrets
 import time
 from collections.abc import Mapping, Sequence
@@ -71,8 +72,11 @@ def identifier(project: str, lane: str, kind: str, key: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
-def _read(directory: Path) -> dict[str, dict]:
-    """Reads every decision record of one project.
+def _peek(directory: Path) -> dict[str, dict]:
+    """Reads every decision record of one project without changing it.
+
+    Readers that write nothing tolerate damage: the file stays in place for
+    the next writer to set aside.
 
     Args:
         directory: Private project state directory.
@@ -86,6 +90,63 @@ def _read(directory: Path) -> dict[str, dict]:
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _read(directory: Path) -> dict[str, dict]:
+    """Reads the records a writer is about to replace, keeping damage aside.
+
+    A writer replaces the whole file, so reading undecodable records as
+    empty would silently drop every open decision. A file that does not
+    decode to a mapping is instead moved to `decisions.json.corrupt-<unix
+    time>`, never over an earlier copy, one supervision note names the
+    copy, and the writer continues from no records. `doctor` reports every
+    such copy until the operator removes it. Call this under `LOCK_NAME`.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        Records keyed by identifier, or an empty mapping when none is stored
+        or the stored file was set aside.
+
+    Raises:
+        OSError: The file exists but cannot be read or set aside, so it is
+            left in place rather than overwritten.
+    """
+    path = directory / RECORD_NAME
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        value = None
+    if isinstance(value, dict):
+        return value
+    stamp = int(time.time())
+    while (kept := path.with_name(f"{RECORD_NAME}.corrupt-{stamp}")).exists():
+        stamp += 1
+    os.replace(path, kept)
+    from agent_parley import issues
+
+    issues.note_supervision_error(
+        directory, f"Damaged decisions record kept as {kept}"
+    )
+    return {}
+
+
+def damaged(home: Path) -> list[str]:
+    """Lists the damaged decision records kept aside in every project.
+
+    Args:
+        home: Bridge home directory.
+
+    Returns:
+        Sorted paths of every `decisions.json.corrupt-*` copy.
+    """
+    return sorted(
+        str(path)
+        for path in (home / "projects").glob(f"*/{RECORD_NAME}.corrupt-*")
+    )
 
 
 def _write(directory: Path, records: dict[str, dict]) -> None:
@@ -238,7 +299,7 @@ def get(directory: Path, name: str) -> dict:
     Returns:
         The record, or an empty mapping when no decision has the identifier.
     """
-    return dict(_read(directory).get(name) or {})
+    return dict(_peek(directory).get(name) or {})
 
 
 def find(home: Path, name: str) -> tuple[Path, dict]:
@@ -279,7 +340,7 @@ def list_open(directory: Path, now: float = 0.0) -> list[dict]:
     return sorted(
         (
             dict(record)
-            for record in _read(directory).values()
+            for record in _peek(directory).values()
             if record.get("state") == OPEN
             and record.get("expires", stamp) >= stamp
         ),
