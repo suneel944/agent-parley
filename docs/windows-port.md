@@ -93,6 +93,7 @@ reservations built on top of them stay advisory.
 | `agent_parley/demo.py:380` | Demo starts a stub lane on a fresh pseudo-terminal in its own session. |
 | `agent_parley/demo.py:539` | Demo runs a hook call (`subprocess.run`). |
 | `agent_parley/demo.py:696` | Demo stops its sandbox service (`subprocess.run`). |
+| `agent_parley/pool.py:354` | Pool starts a spare session. Added after `4119237`; the line is against 0.18.2. |
 
 `start_new_session` is POSIX-only; on Windows `subprocess` ignores it, and the
 child stays in the parent's console and process group.
@@ -114,7 +115,7 @@ child stays in the parent's console and process group.
 | `agent_parley/state.py:73-76`, `agent_parley/recovery.py:363-366` | `os.replace`, then `os.open(dir, O_RDONLY \| O_DIRECTORY)` and `fsync` of the directory. `os.O_DIRECTORY` does not exist on Windows, and `os.replace` fails while another process holds the target open. |
 | `agent_parley/recovery.py:74-75`, `agent_parley/store.py:389`, `agent_parley/roster.py:954`, `agent_parley/opencode.py:216`, `agent_parley/terminal.py:756` | `0o600` and `0o700` modes for private state. Windows ignores all bits except read-only; privacy would come from the profile directory ACL. |
 | `agent_parley/archive.py:314`, `:325`, `:553` | Modes stored inside archive members; harmless on Windows. |
-| `agent_parley/hook.py:57`, `:163-221` | The native hook command is a generated `#!/usr/bin/env bash` client made executable with `os.chmod(..., 0o755)`. Windows has no Bash by default, and `claude` and `codex` run hook commands through different shells there. |
+| `agent_parley/hook.py:57`, `:163-221` | The native hook command is a generated `#!/usr/bin/env bash` client made executable with `os.chmod(..., 0o755)`. Windows has no Bash by default, and the six adapters (`claude`, `codex`, `gemini`, `copilot`, `opencode` and `amp`) share this client and run hook commands through different shells there. |
 | `agent_parley/gemini.py:46-50` | System settings path chooses `darwin` or `/etc/gemini-cli/settings.json`; Windows uses `%ProgramData%`. |
 
 ### CI
@@ -142,7 +143,7 @@ of the same calls but is private and undocumented, so it is not relied on.
 | Process identity | `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE)` then `GetProcessTimes` creation time as start ticks. The open handle pins the process object, so it gives the same race freedom as a pidfd. Parent through `CreateToolhelp32Snapshot`. Boot identity from `time.time()` minus `GetTickCount64()`, rounded. Command-line match has no documented user-mode call; match on executable path (`QueryFullProcessImageNameW`) plus the recorded creation time instead. | A `windows_platform()` returning the existing `process.Platform` tuple, selected in `platform_for()` by `win32`. | M-L | Medium: `foreground_pid` has no equivalent (no terminal process groups), so hook-to-session identity must come from the parent walk alone. |
 | Termination | `os.kill(pid, signal.CTRL_BREAK_EVENT)` to a child started with `CREATE_NEW_PROCESS_GROUP`, `WaitForSingleObject` on the handle with the existing timeouts, then `TerminateProcess`. | `Platform.terminate`. | M | Medium: `CTRL_BREAK_EVENT` reaches only processes sharing a console; detached children need `CREATE_NEW_CONSOLE` with a hidden window, or they can only be terminated hard. |
 | Signals | `SIGINT` and `SIGBREAK` through `signal.signal`; `SetConsoleCtrlHandler` through `ctypes` for `CTRL_CLOSE_EVENT`, `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` as the `SIGHUP` analog. | `server.SIGNALS` and `terminal.STOP_SIGNALS` become per-platform tuples; handlers unchanged. | S-M | Medium: a close event allows only a few seconds before the process is killed, so cleanup must stay short. |
-| Detaching | `creationflags=CREATE_NEW_PROCESS_GROUP \| DETACHED_PROCESS` (or `CREATE_NO_WINDOW`) in place of `start_new_session=True`. | The six `start_new_session` sites; one shared helper. | S | Low. |
+| Detaching | `creationflags=CREATE_NEW_PROCESS_GROUP \| DETACHED_PROCESS` (or `CREATE_NO_WINDOW`) in place of `start_new_session=True`. | The seven `start_new_session` sites; one shared helper. | S | Low. |
 | Wake IPC | Loopback TCP bound to `127.0.0.1:0` with the port and a random token written to the existing socket-path file, reusing the mail server's token pattern. Named pipes are the alternative but need `ctypes` overlapped I/O. | `terminal.socket_path()`, `request()`, `sweep_sockets()` and the listener in `run()`. | M | Medium: a TCP wake channel needs authentication that the `0o600` socket file gave for free. |
 | Port probe | `SO_EXCLUSIVEADDRUSE` instead of `SO_REUSEADDR` on Windows, and `allow_reuse_address = False` on the service. | `BridgeCore.up()` in `core.py`, `server.Server`. | S | High if missed: two services could bind one port. |
 | Hook client | Ship the hook as a Python entry point (`python -m agent_parley.hook`) or a `.cmd` wrapper; keep the Bash client on POSIX for its start-up cost. | `hook.write_client()` and the hook registration in `launch.py`. | M | Medium: hook start-up latency on every native tool call; must be measured. |
@@ -204,8 +205,10 @@ minor release, when the sample meets the rule.
 
 Result against the rule below: native Windows is 1.0% of installs with a
 recorded system, under the 10% trigger, and the sample is too small. Do not
-start the port; keep WSL2 as the Windows path and measure again at the next
-minor release.
+start the port; keep WSL2 as the Windows path. This measurement belongs to
+`4119237` (2026-10-02); releases 0.16.0 through 0.18.x shipped without a
+new one, so it is overdue and the decision stands on the 2026-09-26 sample
+until it is repeated.
 
 Decision rule, applied over at least 30 days and at least 500 downloads with
 a recorded system:
@@ -234,7 +237,7 @@ Titles only; none are created until the decision rule is met.
 4. feat: replace `start_new_session` with Windows creation flags at every detached start
 5. fix: detect an occupied service port on Windows with `SO_EXCLUSIVEADDRUSE`
 6. feat: carry lane wake requests over authenticated loopback TCP on Windows
-7. feat: ship a Windows hook client for `claude` and `codex`
+7. feat: ship a Windows hook client for all six adapters: `claude`, `codex`, `gemini`, `copilot`, `opencode` and `amp`
 8. feat: map service and launcher stop signals to Windows console control events
 9. feat: launch native clients through ConPTY on Windows
 10. feat: read `watch` and `top` keys through `msvcrt` on Windows
