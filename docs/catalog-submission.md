@@ -11,14 +11,13 @@ listing went live on 2026-09-14 at
 `https://chatgpt.com/plugins/plugins_6aa7c91c25008191ad715f14756e5deb`, and
 the submission archive is attached to every release from v0.6.0 onward; each
 new version still needs a manual portal upload, because neither
-catalog offers a publishing API. The Claude submission was made on 2026-09-14
-through the Console form and was still awaiting review on 2026-09-26; a code
-search of `anthropics/claude-plugins-official` for `agent-parley` returned no
-match on that date. The directory has since retired that form, and its
-pre-submission checklist blocks a plugin folder without a README, which the
-folder lacked until `plugins/agent-parley/README.md` was added for 0.14.0. The
-listing therefore needs a fresh submission through the developer portal once
-that README is on `main`.
+catalog offers a publishing API. The Claude directory submission is pending:
+it was made on 2026-09-14 through the Console form, and no listing has been
+published since. On 2026-10-13 the official Claude plugin `marketplace.json`
+had no `parley` entry. The directory has since retired that form, and its
+pre-submission checklist blocks a plugin folder without a README; that
+README, `plugins/agent-parley/README.md`, has been on `main` since 0.14.0.
+The next owner step is a fresh submission through the developer portal.
 
 The developer lists that compare orchestrators are a separate surface from
 both catalogs, and nothing in this repository can file an entry there. On
@@ -245,8 +244,13 @@ Both catalogs ask for public URLs that match the publisher identity. Use:
   `https://github.com/suneel944/agent-parley/blob/main/docs/privacy.md`
 - Terms: `https://github.com/suneel944/agent-parley/blob/main/docs/terms.md`
 
-`docs/privacy.md` states that nothing leaves the machine. That claim rests on
-the coordination server binding `127.0.0.1` only, on the client disabling
+`docs/privacy.md` states: "Coordination itself stays on your machine unless
+you turn on the notifications described below." It also states that some
+commands and the supervision service "deliberately reach the Git host you
+already use, through the native `gh` and `git` clients under your own
+sign-in", and that "Notifications are off unless `AGENT_PARLEY_NOTIFY` names
+`telegram`, `email`, `webhook` or a mix." The local part of that claim rests
+on the coordination server binding `127.0.0.1` only, on the client disabling
 proxy handling for its loopback requests, and on the package declaring no
 runtime dependencies. If any of those three change, the policy must change
 with them in the same commit.

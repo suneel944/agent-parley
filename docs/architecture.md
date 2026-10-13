@@ -953,6 +953,77 @@ reservations continue to resolve.
 
 ## Persistence and concurrency
 
+### State layout
+
+All coordination state lives under one private state root: `--home`, else
+`AGENT_PARLEY_HOME`, else `~/.local/state/agent-parley` (`cli.py` parser,
+`start.DEFAULT_HOME`). `core.BridgeCore` creates it with mode `0700` and refuses a
+root that grants any group or other permission. Each project gets
+`projects/<key>/`, where `<key>` is the first 16 hexadecimal characters of the
+SHA-256 of the resolved Git common directory (`git rev-parse
+--git-common-dir`), so every linked worktree of one repository shares one
+project directory. Nothing is written into the target repository.
+
+Files at the state root, grouped by the module that owns them:
+
+| Module | Files |
+| --- | --- |
+| `core` | `config.json` under `config.lock`; `server.json` (the running service's record) under `server.lock`; `server.log` |
+| `server` | `server.log`, rotated to `server.log.1` |
+| `store` | `bridge.sqlite3` (`store.DATABASE`) with its SQLite WAL companions, under `store.lock`; a legacy `mail.sqlite3` is imported once into a new store |
+| `roster` | `providers.json`, `credentials.json`, under `registry.lock` |
+| `notify` | `notify.json` (stored notification settings) under `notify.lock` |
+| `inbound` | `inbound-gate.json` (inbound passcode failures and lockouts) |
+| `supervision`, `terminal` | `supervision.json` (global supervision settings, including the wake opt-out) |
+| `terminal` | `wake-<digest>.sock`, one control socket per project lane |
+
+Files in `projects/<key>/`, grouped the same way:
+
+| Module | Files |
+| --- | --- |
+| `core` | `project.json` (participant manifest); `setup.lock` |
+| `issues` | `issues.json` under `issues.lock`; `supervision-error.json` |
+| `plan` | `plan.json` under `plan.lock` |
+| `decisions` | `decisions.json` under `decisions.lock` |
+| `budgets` | `run-budget.json` under `run-budget.lock` |
+| `convergence` | `convergence.json` under `convergence.lock` |
+| `claims` | `forge-assigned.json` under `forge-assigned.json.lock` |
+| `status` | `forge-issues.json` (forge issue cache) |
+| `blueprints` | `blueprint-runs.json` under `blueprint-runs.json.lock`; `blueprint-<issue>.lock` per running blueprint |
+| `merges`, `integration`, `unattended` | `integration.json`; `merge.lock` |
+| `forecast` | `cochanges.json` (co-change cache) |
+| `lanes` | `lane-evidence.jsonl`, drained through `lane-evidence.draining.jsonl`, under `lane-evidence.lock` |
+| `pool` | `spares.json` under `pool.lock`; `pool.log` |
+| `supervision` | `boot.json`, `capacity-candidates.json` under `capacity-candidates.lock`, `git-readings.json`, `key-holds.json` under `key-holds.lock`, `pull-requests.json`, `reclaim.json`, `root-missing.json`, `root-returned.json`, `supervision-poll.json` |
+| `attachments` | `attachments/` |
+| `recovery` | `recovery/` (mode `0700`): capture records `<id>.json`, Git bundles `<id>.bundle`, their `-approval.json` and `-quiesce.json` records, and `issue-<n>-refusal.json` |
+
+Per-lane files sit in the same project directory, prefixed with the lane
+name:
+
+| Module | Files |
+| --- | --- |
+| `checkpoints` | `<lane>-identity.json` and `<lane>-activity.json` under `<lane>-checkpoint.lock`; `<lane>-events.jsonl`, rotated to `<lane>-events.1.jsonl`, under `<lane>-events.lock` |
+| `launch` | `<lane>-mcp.json` |
+| `gemini`, `amp`, `opencode` | `<lane>-gemini-settings.json`; `<lane>-amp-settings.json`, derived from Amp's `settings.json`; `<lane>-opencode/opencode.json` |
+| `supervision` | `<lane>-work.json` under `<lane>-work.lock`; `<lane>-wake.json` under `<lane>-wake.lock`; `<lane>-wake-work.json`; `<lane>-wake.log`; `<lane>-wait.json`; `<lane>-capacity.json` under `<lane>-capacity.lock`; `<lane>-session-process.json` |
+| `notify` | `<lane>-notify.json` under `<lane>-notify.lock` |
+| `metrics` | `<lane>-reports.jsonl` (`metrics.REPORTS`, the lane's report log) under `<lane>-reports.lock` |
+| `reports` | `<lane>-report.lock` |
+| `delivery` | `<lane>-delivery.md` |
+| `recovery` | `<lane>-capture.lock` |
+| `cli` | `<lane>-integration.lock` |
+
+Retiring a lane deletes its identity, activity, MCP, event and provider
+settings files and its `<lane>-opencode/` folder; `reclaim.RETIRED_FILES`
+names the work, wake-work, MCP and wake-log files reclaim removes. Two files
+live outside the state root: `<lane>.session.lock` beside the lane worktree,
+and `agent-parley-config.lock` in the native Copilot configuration directory
+while `copilot` edits its `mcp-config.json` and `settings.json`. An export
+archive carries its own `manifest.json` (`archive.MANIFEST`).
+
+### Concurrency
+
 Mail uses SQLite WAL with indexed inbox and held-lease queries. Each write
 acquires an immediate transaction, validates and mutates, then commits once.
 Connections close after every operation. A writer waits up to five seconds for
