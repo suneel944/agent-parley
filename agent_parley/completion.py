@@ -320,8 +320,9 @@ def _bash(
     an option in ``takes`` consumes, descends the command tree while the
     words name subcommands, and counts the positionals after that. The count
     selects the positional slot to complete; a word starting with ``-``
-    completes the command's flags instead. Table keys start with the program
-    name, because Bash rejects the empty key the root path would need.
+    completes the command's flags instead. The command and slot tables are
+    ``case`` lookups rather than associative arrays, because macOS ships
+    Bash 3.2, which has none.
 
     Args:
         entries: Result of `tree`.
@@ -336,30 +337,33 @@ def _bash(
     """
     name = f"_{program.replace('-', '_')}"
     table = "\n".join(
-        f'    ["{f"{program} {path}".strip()}"]='
-        f'"{" ".join([*children, *flags])}"'
+        f'    "{f"{program} {path}".strip()}") '
+        f'node="{" ".join([*children, *flags])}";;'
         for path, children, flags in entries
     )
     slot_table = "\n".join(
-        f'    ["{f"{program} {key}".replace(" #", "#")}"]="{slot}"'
+        f'    "{f"{program} {key}".replace(" #", "#")}") slot="{slot}";;'
         for key, slot in sorted(slots.items())
     )
     cases = "\n".join(
         f"        {option}) _kind={kind};;"
         for option, kind in sorted(values.items())
     )
-    return f"""{name}_tree() {{
-  declare -gA {name.upper()}_TREE=(
+    return f"""{name}_node() {{
+  case "$1" in
 {table}
-  )
-  declare -gA {name.upper()}_SLOTS=(
+    *) return 1;;
+  esac
+}}
+{name}_slot() {{
+  slot=""
+  case "$1" in
 {slot_table}
-  )
-  {name.upper()}_TAKES=" {" ".join(takes)} "
+  esac
 }}
 {name}() {{
-  local cur prev key probe word opts slot _kind i n skip
-  {name}_tree
+  local cur prev key probe word node slot _kind i n skip takes
+  takes=" {" ".join(takes)} "
   cur="${{COMP_WORDS[COMP_CWORD]}}"
   prev="${{COMP_WORDS[COMP_CWORD-1]}}"
   _kind=""
@@ -382,11 +386,11 @@ def _bash(
     case "$word" in
       --*=*) continue;;
       -*)
-        case "${{{name.upper()}_TAKES}}" in *" $word "*) skip=1;; esac
+        case "$takes" in *" $word "*) skip=1;; esac
         continue;;
     esac
     probe="$key $word"
-    if [ "$n" = 0 ] && [ -n "${{{name.upper()}_TREE[$probe]+x}}" ]; then
+    if [ "$n" = 0 ] && {name}_node "$probe"; then
       key="$probe"
     else
       n=$((n+1))
@@ -399,7 +403,7 @@ def _bash(
   case "$cur" in
     -*) ;;
     *)
-      slot="${{{name.upper()}_SLOTS[$key#$n]-}}"
+      {name}_slot "$key#$n"
       case "$slot" in
         @*)
           COMPREPLY=( $(compgen -W "$({program} {mode} "${{slot#@}}")" \\
@@ -410,8 +414,8 @@ def _bash(
           return;;
       esac;;
   esac
-  opts="${{{name.upper()}_TREE[$key]}}"
-  COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+  {name}_node "$key"
+  COMPREPLY=( $(compgen -W "$node" -- "$cur") )
 }}
 complete -F {name} {program}
 """
