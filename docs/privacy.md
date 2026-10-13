@@ -6,7 +6,7 @@ policy describes what the software stores, where it stores it, and what it
 transmits. It applies to the published package, to the Claude plugin and to
 the Codex plugin, which share one coordination runtime.
 
-Last updated 2026-09-29.
+Last updated 2026-10-13.
 
 ## What the software transmits
 
@@ -32,7 +32,11 @@ it unassigns it, and a report that turns ready posts its summary and evidence
 as a comment on the issue it is bound to. `issue next`, `issue match` and
 `issue resolve` read open issues, their labels and the pull requests that
 close them, and the supervision service and `gc` read whether a lane's branch
-or issue has landed. A repository carrying a Beads ledger in `.beads/` uses
+or issue has landed. `run --issue N` reads that issue's title, body, its latest
+three comments and the titles of up to five linked issues. The supervision
+service reads a lane's pull request checks, reviews, inline review comments and
+the logs of failed jobs, and re-runs a cancelled job unless `rerun_cancelled`
+is off. A repository carrying a Beads ledger in `.beads/` uses
 the `beads` forge instead: the same title lookups, assignments and comments go
 through the `bd` client in place of `gh`. Agent Parley stores no forge token
 and adds no flag that bypasses a repository rule, and when no `gh` client, no
@@ -44,7 +48,10 @@ or both. Then a change that moves ownership or holds a lane, such as a handoff
 offer, a permission prompt, a native dialog or an idle lane, is sent to the
 Telegram Bot API with `AGENT_PARLEY_TELEGRAM_TOKEN` and
 `AGENT_PARLEY_TELEGRAM_CHAT`, or to the SMTP server named by
-`AGENT_PARLEY_SMTP_HOST` and its companion variables. A message names the
+`AGENT_PARLEY_SMTP_HOST` and its companion variables.
+`AGENT_PARLEY_TELEGRAM_API` replaces the Telegram Bot API address,
+`https://api.telegram.org` by default, so messages go to the host it names. A
+message names the
 repository, the lane, its provider, the event, the issue or offer, and the
 dialog text involved, capped at 1,536 bytes. With `AGENT_PARLEY_INBOUND` set
 to `telegram` and an `AGENT_PARLEY_INBOUND_PASSCODE`, the service long-polls
@@ -136,8 +143,11 @@ Logs are bounded automatically:
   longer the issue's current one: released, taken again or closed.
 - An issue record keeps its newest 50 history entries, plus its latest claim,
   take and complete markers.
+- The store keeps the newest 200 settled operator decisions, and an open
+  decision expires after one day.
+- Retry records keep the newest 500 calls of each participant.
 
-Everything else, messages and decisions included, persists until you delete
+Everything else, messages included, persists until you delete
 it. To remove the private state of one project whose root checkout is gone,
 once the service has retired its lanes and none of its sessions runs:
 
