@@ -226,3 +226,63 @@ def test_history_reads_and_reports_as_json(
 def test_an_unknown_participant_is_refused(bridge, repo, paired):
     with pytest.raises(BridgeError, match="not a participant"):
         bridge.history(repo, "participant", "absent")
+
+
+def test_a_read_finds_no_store_and_creates_none(bridge):
+    database = bridge.home / store.DATABASE
+    database.unlink(missing_ok=True)
+    with pytest.raises(BridgeError, match="agent-parley up"):
+        with store.connect(bridge.home):
+            pass
+    assert not database.exists()
+
+
+def test_status_then_history_on_a_fresh_project_leaves_no_store(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    database = bridge.home / store.DATABASE
+    database.unlink(missing_ok=True)
+    monkeypatch.chdir(repo)
+    run(monkeypatch, capsys, "--home", str(bridge.home), "status")
+    printed = run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "history",
+        "issue",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    printed += run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "issue",
+        "show",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    assert "sqlite" not in printed.lower()
+    assert not database.exists()
+
+
+def test_history_reads_an_empty_store_file_as_absent(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    (bridge.home / store.DATABASE).write_bytes(b"")
+    printed = run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "issue",
+        "show",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    assert "file_reservations" not in printed

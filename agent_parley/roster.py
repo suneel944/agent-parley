@@ -1666,7 +1666,7 @@ def token_lane(home: Path, manifest: dict) -> str | None:
         return None
     try:
         actor = store.authenticate(home, token)
-    except sqlite3.Error:
+    except (sqlite3.Error, BridgeError):
         actor = None
     if actor and actor["project"] == manifest["root"]:
         for name, participant in manifest["participants"].items():

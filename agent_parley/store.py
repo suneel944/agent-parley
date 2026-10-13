@@ -242,6 +242,24 @@ def missing() -> BridgeError:
     return BridgeError(MISSING, next_command="agent-parley up")
 
 
+def present(home: Path) -> bool:
+    """Reports whether a store with content exists to be read.
+
+    A zero-byte file, such as the one a read left behind before 0.19.0,
+    declares no tables, so it is read as no store at all.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        True when the store file exists and is not empty.
+    """
+    try:
+        return (home / DATABASE).stat().st_size > 0
+    except FileNotFoundError:
+        return False
+
+
 @contextlib.contextmanager
 def connect(
     home: Path, *, write: bool = False, timeout: float = BUSY_TIMEOUT
@@ -266,7 +284,17 @@ def connect(
 
     A transaction that rolls back also runs every removal registered in its
     ``undo`` list, so no file written for it outlives it.
+
+    A read never creates the store. SQLite creates a missing database file on
+    open, and an empty file left by a read made later readers query tables
+    that were never created.
+
+    Raises:
+        BridgeError: If a read finds no store or an empty file, naming
+            ``agent-parley up``.
     """
+    if not write and not present(home):
+        raise missing()
     db = sqlite3.connect(
         home / DATABASE, timeout=0 if write else timeout, factory=Transaction
     )
@@ -5535,7 +5563,7 @@ def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
         and still reported as stale elsewhere, but the paths it names no
         longer read as reserved for the purpose of naming a collision.
     """
-    if not (home / DATABASE).exists():
+    if not present(home):
         return {}
     held: dict[str, list[str]] = {}
     with connect(home) as db:
