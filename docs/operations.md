@@ -514,7 +514,8 @@ condition, that count, its age and what clears it:
 | `checks refused` | A required check the forge never started blocks one or more open pull requests. One row per check name and forge conclusion names every pull request it blocks. | Resolve it at the forge (billing, spending limit or manual approval), then re-run once. |
 | `session outliving its claim` | The lane holds no claim, yet a native session in a worktree the lane made showed activity in the last 60 seconds. | `agent-parley status NAME`; Agent Parley never stops such a session. |
 | `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
-| `root missing` | The project root checkout is gone. Once it has been gone an interval, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
+| `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
+| `root returned` | The project root came back after lanes retired for its absence. The row names those lanes until each is re-admitted. | `agent-parley participant add NAME --repo ROOT` for each lane named |
 | `escalated plan revision` | A lane's plan revision touched an edge already revised back and forth under the current plan version, so it was escalated instead of applied. One row per escalated proposal, on the proposing lane, among the retained proposals. | `agent-parley plan approve ID` or `agent-parley plan reject ID --reason TEXT` |
 | `plan revisions pending` | Plan revisions outside the operator's envelope wait for a decision. One row per project counts them and ages from the oldest. | `agent-parley plan proposals`, then approve or reject each |
 | `orphaned claims` | The lane's session process is gone and the supervisor marked claims it holds orphaned, and the lane is not yet `ready to retire`. The row is derived from the ledger, so it shows whether or not a notification transport is configured. | `agent-parley issue claim N --take-orphaned` from a live peer lane; with no live lane besides the holder, start one with `agent-parley run NAME` and have it take the claim, or `agent-parley issue release N`. |
@@ -1995,7 +1996,8 @@ The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `stalled_after` (600 seconds),
 `start_deadline` (30 seconds),
 `completion_reminders` (3 reminders, 1 to 100), `orphan_retire_after`
-(3600 seconds), `claim_idle_after` (3600 seconds), `takeover_grace`
+(3600 seconds), `root_gone_after` (3600 seconds),
+`claim_idle_after` (3600 seconds), `takeover_grace`
 (300 seconds), `max_claims_per_lane` (2 claims, 1 to 100),
 `convergence_repeats` (3 failures, 1 to 100), `convergence_after`
 (14400 seconds), `prompts`, `wake`,
@@ -2822,13 +2824,20 @@ the same account, so a live peer's observations would otherwise rewrite the
 dead lane's work file on every poll.
 
 When the project root itself disappears, the first poll records
-`root-missing.json` in the project state directory. One interval later every
-lane still registered is captured for recovery, retired and has its
-reservations revoked. The marker names, per lane, the claims released and the
-checkpoint each one left, and the state directory for the operator to remove.
-A lane whose session is still live is kept, and `agent-parley problems` names
-it under `root missing` until its session ends. The project then leaves
-`status`, `top` and `metrics`; a root that returns clears the marker on the next poll. When the service starts, it
+`root-missing.json` in the project state directory. Once the root has been
+gone `root_gone_after` (an hour by default), every lane still registered is
+captured for recovery, retired and has its reservations revoked; a rename and
+rename back, a re-clone or a remount inside that window touches nothing. A
+root whose parent directory cannot be listed, such as one on an unmounted
+volume, is marked `unreachable` and never retires a lane. The marker names,
+per lane, the claims released and the checkpoint each one left, and the state
+directory for the operator to remove. A lane whose session is still live is
+kept, and `agent-parley problems` names it under `root missing` until its
+session ends. The project then leaves `status`, `top` and `metrics`. A root
+that returns clears the marker on the next poll; when lanes had retired, the
+marker moves to `root-returned.json` with `returned_at`, and
+`agent-parley problems` lists them under `root returned` with each re-admit
+command until every one is re-admitted. When the service starts, it
 removes every wake socket in its home that no launcher is listening on.
 
 ## Other agent CLIs

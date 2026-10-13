@@ -1526,7 +1526,7 @@ def test_the_sweep_logs_what_it_moved_and_removed_for_later_reading(
     assert not json.loads(publication.read_text())["relocations"]
 
 
-def test_a_missing_project_root_is_retired_within_one_interval(
+def test_a_missing_project_root_is_retired_once_gone_long_enough(
     bridge, repo, paired
 ):
     store.initialize(bridge.home)
@@ -1539,7 +1539,7 @@ def test_a_missing_project_root_is_retired_within_one_interval(
     first = supervision.root_retired(directory)
     marker = directory / supervision.ROOT_PUBLICATION
     recorded = json.loads(marker.read_text())
-    recorded["since"] -= supervision.DEFAULTS["interval"]
+    recorded["since"] -= supervision.DEFAULTS["root_gone_after"]
     marker.write_text(json.dumps(recorded))
     supervision.poll(bridge.home, directory)
 
@@ -1703,7 +1703,7 @@ def test_a_missing_root_never_retires_a_live_lane(bridge, repo, paired):
     supervision.poll(bridge.home, directory)
     marker = directory / supervision.ROOT_PUBLICATION
     recorded = json.loads(marker.read_text())
-    recorded["since"] -= supervision.DEFAULTS["interval"]
+    recorded["since"] -= supervision.DEFAULTS["root_gone_after"]
     marker.write_text(json.dumps(recorded))
     supervision.poll(bridge.home, directory)
 
@@ -1731,7 +1731,7 @@ def test_a_missing_root_never_retires_an_unreadable_lane(bridge, repo, paired):
     supervision.poll(bridge.home, directory)
     marker = directory / supervision.ROOT_PUBLICATION
     recorded = json.loads(marker.read_text())
-    recorded["since"] -= supervision.DEFAULTS["interval"]
+    recorded["since"] -= supervision.DEFAULTS["root_gone_after"]
     marker.write_text(json.dumps(recorded))
     supervision.poll(bridge.home, directory)
 
@@ -1741,6 +1741,114 @@ def test_a_missing_root_never_retires_an_unreadable_lane(bridge, repo, paired):
     assert issues.snapshot(directory)["issues"]["1"]["owner"] == "claude"
     published = json.loads(marker.read_text())
     assert published["live"] == ["claude"]
+
+
+def backdate(directory, seconds):
+    """Moves the recorded start of a root's absence `seconds` earlier."""
+    marker = directory / supervision.ROOT_PUBLICATION
+    recorded = json.loads(marker.read_text())
+    recorded["since"] -= seconds
+    marker.write_text(json.dumps(recorded))
+
+
+def test_a_root_gone_past_one_interval_and_back_retires_nothing(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    bridge.issue(Path(paired["lanes"]["claude"]), "claim", "1")
+    away = repo.with_name("moved away")
+    repo.rename(away)
+
+    supervision.poll(bridge.home, directory)
+    backdate(directory, supervision.DEFAULTS["interval"] + 30)
+    supervision.poll(bridge.home, directory)
+    away.rename(repo)
+    supervision.poll(bridge.home, directory)
+
+    participants = roster.read(directory)["participants"]
+    assert not any(roster.retired(entry) for entry in participants.values())
+    assert issues.snapshot(directory)["issues"]["1"]["owner"] == "claude"
+    assert not (directory / supervision.ROOT_PUBLICATION).exists()
+    assert not (directory / supervision.ROOT_RETURNED).exists()
+
+
+def test_a_root_whose_parent_cannot_be_listed_never_retires(
+    bridge, repo, paired, tmp_path
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    bridge.issue(Path(paired["lanes"]["claude"]), "claim", "1")
+    manifest = directory / "project.json"
+    data = json.loads(manifest.read_text())
+    data["root"] = str(tmp_path / "unmounted volume" / "project")
+    manifest.write_text(json.dumps(data))
+
+    supervision.poll(bridge.home, directory)
+    backdate(directory, supervision.DEFAULTS["root_gone_after"] + 1)
+    supervision.poll(bridge.home, directory)
+
+    published = json.loads(
+        (directory / supervision.ROOT_PUBLICATION).read_text()
+    )
+    assert published["unreachable"] is True
+    assert not published["retired"]
+    participants = roster.read(directory)["participants"]
+    assert not any(roster.retired(entry) for entry in participants.values())
+    assert issues.snapshot(directory)["issues"]["1"]["owner"] == "claude"
+
+
+def test_a_returned_root_keeps_the_record_of_the_lanes_it_retired(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    bridge.issue(Path(paired["lanes"]["claude"]), "claim", "1")
+    away = repo.with_name("moved away")
+    repo.rename(away)
+
+    supervision.poll(bridge.home, directory)
+    backdate(directory, supervision.DEFAULTS["root_gone_after"])
+    supervision.poll(bridge.home, directory)
+    away.rename(repo)
+    supervision.poll(bridge.home, directory)
+
+    assert not (directory / supervision.ROOT_PUBLICATION).exists()
+    kept = json.loads((directory / supervision.ROOT_RETURNED).read_text())
+    assert kept["returned_at"] >= kept["since"]
+    assert {lane["participant"] for lane in kept["lanes"]} == {
+        "claude",
+        "codex",
+    }
+    [row] = [
+        row
+        for row in bridge.problems()
+        if row["condition"] == problems.ROOT_RETURNED
+    ]
+    assert row["count"] == 2
+    assert "agent-parley participant add claude --repo " in row["command"]
+    assert "agent-parley participant add codex --repo " in row["command"]
+
+
+def test_a_returned_root_record_clears_once_its_lanes_are_readmitted(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    kept = directory / supervision.ROOT_RETURNED
+    kept.write_text(
+        json.dumps(
+            {
+                "since": time.time() - 7200,
+                "returned_at": time.time(),
+                "lanes": [{"participant": "claude", "released": []}],
+            }
+        )
+    )
+
+    supervision.poll(bridge.home, directory)
+
+    assert not kept.exists()
 
 
 def test_service_start_removes_wake_sockets_nobody_listens_on():
@@ -1824,7 +1932,7 @@ def gone_root(bridge, repo, paired, interval=True):
     if interval:
         marker = directory / supervision.ROOT_PUBLICATION
         recorded = json.loads(marker.read_text())
-        recorded["since"] -= supervision.DEFAULTS["interval"]
+        recorded["since"] -= supervision.DEFAULTS["root_gone_after"]
         marker.write_text(json.dumps(recorded))
         supervision.poll(bridge.home, directory)
     return directory, saved
