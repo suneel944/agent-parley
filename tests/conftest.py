@@ -7,9 +7,33 @@ import pytest
 from agent_parley.cli import Bridge, git
 from agent_parley.state import write_json
 
+GIT_SETTINGS = {
+    "user.name": "Bridge Test",
+    "user.email": "test@example.com",
+    "commit.gpgsign": "false",
+    "tag.gpgsign": "false",
+    "init.defaultBranch": "main",
+    "maintenance.auto": "false",
+    "gc.auto": "0",
+}
+
+
+@pytest.fixture(scope="session")
+def git_config(tmp_path_factory):
+    """Writes the only global Git configuration the suite reads.
+
+    Each setting goes in the global file rather than in ``GIT_CONFIG_COUNT``
+    so a repository's own configuration and ``git -c`` still override it,
+    as they would on an operator's machine.
+    """
+    path = tmp_path_factory.mktemp("git") / "gitconfig"
+    for key, value in GIT_SETTINGS.items():
+        git(path.parent, "config", "--file", str(path), key, value)
+    return path
+
 
 @pytest.fixture(autouse=True)
-def native_config_homes(tmp_path, monkeypatch):
+def native_config_homes(tmp_path, monkeypatch, git_config):
     """Keeps every state read inside each test's own directory.
 
     The command line falls back to ``AGENT_PARLEY_HOME`` when a test drives
@@ -20,11 +44,20 @@ def native_config_homes(tmp_path, monkeypatch):
     still drives operator-only commands as the operator. ``FORCE_COLOR`` is
     removed because it makes help text carry colour codes, so a developer
     shell that exports it would fail every test that reads plain help.
+
+    Git reads only ``git_config`` and no system file, so a developer's
+    signing, hooks or default branch never reach the suite, and Git starts
+    no detached maintenance inside a worktree a test is about to move.
     """
     for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_PARLEY_HOME"):
         monkeypatch.setenv(variable, str(tmp_path / variable.lower()))
     monkeypatch.delenv("AGENT_PARLEY_TOKEN", raising=False)
     monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+    for variable in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
+        monkeypatch.delenv(variable, raising=False)
 
 
 @pytest.fixture

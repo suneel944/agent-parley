@@ -2281,10 +2281,22 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     metadata = tomllib.loads((project / "pyproject.toml").read_text())
     version = metadata["project"]["version"]
     stem = metadata["project"]["name"].replace("-", "_")
-    wheel = project / "dist" / f"{stem}-{version}-py3-none-any.whl"
-    assert wheel.exists(), "Run make build before the installed-package test."
+    dist = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--no-sources", "--out-dir", str(dist)],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    wheel = dist / f"{stem}-{version}-py3-none-any.whl"
     with zipfile.ZipFile(wheel) as archive:
         assert "agent_parley/__main__.py" in archive.namelist()
+        assert (
+            "agent_parley/plugins/agent-parley/skills/coordinate/SKILL.md"
+            in archive.namelist()
+        )
         for client in ("claude", "codex"):
             manifest = archive.read(
                 f"agent_parley/plugins/agent-parley/"
@@ -2296,7 +2308,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         ).decode()
         assert "Requires-Dist:" not in package_metadata
         assert not any(name.startswith("src/") for name in archive.namelist())
-    with tarfile.open(project / "dist" / f"{stem}-{version}.tar.gz") as archive:
+    with tarfile.open(dist / f"{stem}-{version}.tar.gz") as archive:
         root = f"{stem}-{version}"
         for client in ("codex", "claude"):
             manifest_path = (
