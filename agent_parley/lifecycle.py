@@ -222,6 +222,13 @@ def released(record: dict, closed: bool = False) -> dict:
     the next claim builds a fresh record without the mark, so a reopened
     issue can still be taken.
 
+    A claim blocked on a recorded external condition keeps that condition
+    when it is released: the work stays ``blocked`` with no owner and no
+    claim generation, so neither a work offer nor `issue next` presents it
+    as unblocked to the next lane, which would only rediscover the same
+    unmet condition. A lane or operator that knows the condition is met
+    lifts it by claiming the issue, which starts a fresh generation.
+
     Args:
         record: Mutable issue ledger record.
         closed: Whether the claim's issue closed on the forge inside the
@@ -239,7 +246,21 @@ def released(record: dict, closed: bool = False) -> dict:
             "Ready work must remain claimed until verified integration "
             "completes."
         )
-    if execution["state"] != COMPLETE:
+    condition = execution.get("resume_when") or {}
+    if (
+        not closed
+        and execution["state"] == BLOCKED
+        and isinstance(condition, dict)
+        and condition.get("kind") == "external"
+    ):
+        execution.update(
+            claim_id=None,
+            next_action=_next_action(execution),
+            updated_at=time.time(),
+            commit="",
+            gate=None,
+        )
+    elif execution["state"] != COMPLETE:
         execution.update(
             state=QUEUED,
             claim_id=None,

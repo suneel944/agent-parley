@@ -2378,6 +2378,26 @@ def named_leads(directory: Path, manifest: dict, name: str) -> dict[str, str]:
     return named
 
 
+def own_lead(directory: Path, name: str) -> str:
+    """Names the issue a lane's own published work points it at.
+
+    `named_leads` leaves the reading lane's lead out, and `issue next` and
+    the `next_issues` tool rank it first, so a lane claims the work it was
+    pointed at rather than a lower-numbered free issue its peers already
+    steer around.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lead of the lane's published offer, or an empty string.
+    """
+    offer = published_work(directory, name).get("offer")
+    lead = offer.get("lead") if isinstance(offer, dict) else None
+    return lead if isinstance(lead, str) else ""
+
+
 def _first_untaken(available: list[str], taken: set[str]) -> list[str]:
     """Moves the first issue no earlier lane was pointed at to the front.
 
@@ -2578,6 +2598,34 @@ def _idle_leads(
             else None
         ),
     }
+
+
+def _only_waits(ledger: dict, held: list[str], leads: dict | None) -> bool:
+    """Reports whether a lane can only wait on operator-gated claims.
+
+    A lane whose every held claim is blocked on an operator action, and for
+    which no next work was found, has nothing to act on: the claims stay
+    with the lane that recorded them, retire would be refused, and the wake
+    text can only say to end the turn. Such a continue record is never
+    delivered as a wake, since each delivery bills a turn that changes
+    nothing. Ready work is not counted, because its text still asks the
+    lane to open the pull request it may not have opened yet.
+
+    Args:
+        ledger: Current issue ledger.
+        held: Every issue the lane holds.
+        leads: Next work from `_idle_leads`, or None.
+
+    Returns:
+        Whether the lane can only wait for an operator to change its work.
+    """
+    leads = leads or {}
+    if leads.get("mail") or leads.get("next") or leads.get("stalled"):
+        return False
+    return bool(held) and all(
+        lifecycle.operator_blocked(ledger["issues"].get(number) or {})
+        for number in held
+    )
 
 
 def _continue_text(
@@ -2843,7 +2891,11 @@ def _work_offer(
     Returns:
         The actionable offer, or None when no work is currently eligible.
         A pull offer with unclaimed work, and a continue offer naming next
-        work, also carry that issue as ``lead``, which `named_leads` reads.
+        work to a lane that reads as fit, also carry that issue as
+        ``lead``, which `named_leads` reads and `work` marks as taken. A
+        lane that cannot take a turn may still be told about the candidate,
+        but never reserves it, so a fit lane later in the sweep is pointed
+        at the best work rather than the second best.
     """
     held = owned.get(name, [])
     continuation = lifecycle.actionable(ledger, name)
@@ -2905,7 +2957,12 @@ def _work_offer(
             "text": _continue_text(ledger, continuation, held, leads),
             "progress": _work_progress(ledger, selected),
         }
-        if not continuation and leads and leads.get("next"):
+        if (
+            not continuation
+            and results[name]["fit"]
+            and leads
+            and leads.get("next")
+        ):
             offer["lead"] = leads["next"]
     elif results[name]["fit"] and not held and (available or busy):
         selected = available[:5]
@@ -8148,6 +8205,12 @@ def _work_backlog(
     backoff, so one delivered wake the lane did not act on never silences
     the next claim it could make.
 
+    A continue record whose lane holds only work blocked on an operator
+    action, and has no next work, is never delivered, not even once: the
+    lane can only end the turn, so each wake would bill a turn that
+    changes nothing, and `_only_waits` explains why ready work differs. A
+    change to that work publishes a new record, which is judged again.
+
     The offer is derived again the way `work` derived it: the leads the
     lanes before this one in name order publish are the issues taken
     earlier in that sweep, so an unchanged sweep reproduces the same offer.
@@ -8190,6 +8253,15 @@ def _work_backlog(
         peer: idle_seconds(directory, peer) for peer in manifest["participants"]
     }
     free = lifecycle.actionable(pool)
+    leads = _idle_leads(
+        home,
+        directory,
+        manifest,
+        name,
+        pool,
+        config["claim_idle_after"],
+        taken,
+    )
     current = _work_offer(
         name,
         results,
@@ -8208,20 +8280,18 @@ def _work_backlog(
             ledger,
             config,
         ),
-        _idle_leads(
-            home,
-            directory,
-            manifest,
-            name,
-            pool,
-            config["claim_idle_after"],
-            taken,
-        ),
+        leads,
     )
     if not current or (
         current.get("id"),
         current.get("progress"),
     ) != (offer.get("id"), offer.get("progress")):
+        return None
+    if (
+        current["kind"] == "continue"
+        and leads is not None
+        and _only_waits(pool, owned.get(name, []), leads)
+    ):
         return None
     if (
         current["kind"] == "continue"

@@ -333,3 +333,91 @@ def test_issue_next_demotes_the_lead_another_lane_was_named(
     assert supervision.named_leads(
         directory, json.loads((directory / "project.json").read_text()), "x"
     ) == {"43": "codex", "44": "claude"}
+
+
+def test_a_fit_lane_after_an_unfit_one_is_pointed_at_the_best_work(
+    bridge, repo, paired, monkeypatch
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    store.initialize(bridge.home)
+    for name in ("claude", "codex"):
+        store.register(bridge.home, paired["root"], name)
+        alive(directory, name)
+    measured = supervision.fit
+
+    def session_down(home, directory, manifest, name, *args):
+        """Reads claude's session as not running and leaves codex fit."""
+        result = measured(home, directory, manifest, name, *args)
+        if name != "claude":
+            return result
+        checks = {**result["checks"], "session": False}
+        return {**result, "fit": False, "checks": checks}
+
+    monkeypatch.setattr(supervision, "fit", session_down)
+    write_json(
+        directory / "issues.json",
+        {"revision": 1, "issues": {"1": ready("claude"), "2": ready("codex")}},
+    )
+    cached(directory, {"7": "Seven", "8": "Eight"})
+    swept(bridge, directory)
+    unfit = offer_for(directory, "claude")
+    assert supervision.published_work(directory, "claude")["fit"] is False
+    assert unfit["kind"] == "continue" and "lead" not in unfit
+    assert offer_for(directory, "codex")["lead"] == "7"
+
+
+def test_a_lane_that_can_only_wait_on_an_operator_is_never_woken(
+    bridge, repo, paired
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    store.initialize(bridge.home)
+    store.register(bridge.home, paired["root"], "claude")
+    alive(directory, "claude")
+    blocked = ready("claude")
+    blocked["execution"] = {
+        **blocked["execution"],
+        "state": "blocked",
+        "resume_when": {"kind": "external", "detail": "100 trades"},
+    }
+    write_json(
+        directory / "issues.json", {"revision": 1, "issues": {"1": blocked}}
+    )
+    manifest, config = swept(bridge, directory)
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "continue"
+    assert "End the turn" in offer["text"]
+    record = supervision.published_work(directory, "claude")
+    assert not record["dispatch"].get("delivered")
+    assert (
+        supervision._work_backlog(
+            bridge.home, directory, manifest, "claude", config, record
+        )
+        is None
+    )
+
+
+def test_next_issues_and_issue_next_rank_published_leads_alike(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    cached(directory, {"2": "Two", "3": "Three", "4": "Four"})
+    write_json(
+        directory / "codex-work.json",
+        {"offer": {"kind": "pull", "issues": ["2"], "lead": "2"}},
+    )
+    write_json(
+        directory / "claude-work.json",
+        {"offer": {"kind": "pull", "issues": ["3"], "lead": "3"}},
+    )
+    store.initialize(bridge.home)
+    token = store.register(bridge.home, paired["root"], "claude")
+    actor = store.authenticate(bridge.home, token["registration_token"])
+    served = store.call(bridge.home, actor, "next_issues", {})
+    command = bridge.issue_next(lane)
+    order = [record["issue"] for record in served["candidates"]]
+    assert order == ["3", "4", "2"]
+    assert order == [record["issue"] for record in command["candidates"]]
+    first, *_, last = served["candidates"]
+    assert "named as this lane's next work" in first["reasons"]
+    assert "already named as codex's next work" in last["reasons"]

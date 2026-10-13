@@ -654,14 +654,19 @@ def holders(state: dict) -> dict[str, list[str]]:
     return owned
 
 
-def waiters(state: dict) -> dict[str, list[str]]:
-    """Maps each blocking issue to the owned issues recorded as waiting on it.
+def waiters(state: dict, *, owned_only: bool = True) -> dict[str, list[str]]:
+    """Maps each blocking issue to the issues recorded as waiting on it.
 
-    Only owned issues are counted, because finishing a blocker matters when a
-    lane is actually held up by it and an unowned waiter is nobody's wait.
+    By default only owned issues are counted, because a lane is held up by
+    an owned waiter and an unowned waiter is nobody's wait. A lane can never
+    claim a waiter while its blocker is open, though, so the waiters of a
+    plan's open blocker are always unowned; ranking reads every authorized,
+    unfinished waiter so the plan's critical path still orders the work.
 
     Args:
         state: Published issue ledger.
+        owned_only: Whether to count owned waiters only, or every
+            authorized waiter that is not yet complete.
 
     Returns:
         Blocker number to the issue numbers waiting on it, ordered
@@ -670,7 +675,13 @@ def waiters(state: dict) -> dict[str, list[str]]:
     waiting: dict[str, list[str]] = {}
     issues = state.get("issues", {})
     for number in sorted(issues, key=int):
-        if not issues[number].get("owner"):
+        record = issues[number]
+        if owned_only and not record.get("owner"):
+            continue
+        execution = lifecycle.state(record)
+        if not execution["authorized"] or (
+            execution["state"] == lifecycle.COMPLETE
+        ):
             continue
         for blocker in issues[number].get("blocked_by", []):
             waiting.setdefault(blocker, []).append(number)
@@ -688,9 +699,16 @@ def unclaimed(state: dict) -> list[str]:
     ``lifecycle.actionable`` leaves it out, so finished work is never offered
     as the next thing to claim; claiming it again clears the mark.
 
-    The order puts first the issues that other owned issues wait on, because
-    finishing one of those releases a peer, and falls back to the issue number
-    so the same ledger always produces the same list.
+    A released claim that kept its recorded external blocker stays
+    ``blocked`` with no owner, as `lifecycle.released` leaves it, and is
+    left out until a lane claims it on purpose, so a gated issue is not
+    offered to lane after lane that each rediscover the same condition.
+
+    The order puts first the issues the most authorized, unfinished work
+    waits on, planned or owned, because finishing one of those moves the
+    plan's critical path; then the issues more owned work waits on, because
+    finishing one of those releases a peer; and falls back to the issue
+    number so the same ledger always produces the same list.
 
     Args:
         state: Published issue ledger.
@@ -699,6 +717,7 @@ def unclaimed(state: dict) -> list[str]:
         Issue numbers a lane could claim, most unblocking first.
     """
     issues = state.get("issues", {})
+    planned = waiters(state, owned_only=False)
     waiting = waiters(state)
     return sorted(
         (
@@ -709,9 +728,14 @@ def unclaimed(state: dict) -> list[str]:
             and not record.get("blocked_by")
             and not record.get("ended_on_forge")
             and lifecycle.state(record)["authorized"]
-            and lifecycle.state(record)["state"] != lifecycle.COMPLETE
+            and lifecycle.state(record)["state"]
+            not in (lifecycle.COMPLETE, lifecycle.BLOCKED)
         ),
-        key=lambda number: (-len(waiting.get(number, [])), int(number)),
+        key=lambda number: (
+            -len(planned.get(number, [])),
+            -len(waiting.get(number, [])),
+            int(number),
+        ),
     )
 
 

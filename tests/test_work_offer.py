@@ -1731,6 +1731,7 @@ def test_selected_wake_prompt_names_current_work_and_issues(tmp_path):
             "bindings": bindings,
             "offer": {
                 "id": "offer-123",
+                "kind": "continue",
                 "issues": ["42"],
                 "text": "Work offer. Claim one yourself.",
             },
@@ -1740,7 +1741,11 @@ def test_selected_wake_prompt_names_current_work_and_issues(tmp_path):
     prompt = terminal.selected_prompt(tmp_path, "codex")
 
     assert prompt is not None
-    assert "offer-123" in prompt
+    assert prompt.startswith(
+        "Dispatcher continue record offer-123 (not a handoff offer: "
+        "nothing to accept, decline or search for) for #42."
+    )
+    assert "Act on work offer" not in prompt
     assert "#42" in prompt
     assert "Claim one yourself" in prompt
 
@@ -1979,6 +1984,31 @@ def test_a_lane_blocked_on_an_operator_action_is_not_told_to_retire():
     assert "retire MCP tool" not in text
     assert "blocked on an operator action" in text
     assert "retire would be refused" in text
+
+
+def test_an_unfit_lane_is_told_of_next_work_but_never_reserves_it():
+    ledger = {
+        "issues": {
+            "7": held("running", blocked_by=["9"]),
+            "9": {"owner": "zed", "execution": {"state": "running"}},
+        }
+    }
+    leads = {"mail": [], "next": "8", "stalled": None}
+    unfit = supervision._work_offer(
+        "claude",
+        {"claude": {"fit": False, "checks": {"session": False}}},
+        {"claude": 0},
+        issues.holders(ledger),
+        [],
+        ledger,
+        600,
+        [],
+        leads,
+    )
+    assert unfit["kind"] == "continue"
+    assert "claim #8" in unfit["text"]
+    assert "lead" not in unfit
+    assert waiting_offer(ledger, leads)["lead"] == "8"
 
 
 def test_a_waiting_lane_answers_peer_mail_before_new_work():

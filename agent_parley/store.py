@@ -3220,6 +3220,12 @@ def _recommended(home: Path, actor: dict, args: dict) -> dict:
     reserves nothing, so a lane still takes the issue it chooses through the
     explicit claim and still races a peer that chose the same one.
 
+    The ranking reads the same published leads `issue next` reads: an issue
+    a peer's published work names ranks last and the lead this lane's own
+    publication names ranks first, so lanes in session spread out the same
+    way lanes reading the command do. The supervisor module is imported
+    lazily so the hook path that imports this module never pays for it.
+
     Args:
         home: Private bridge state root.
         actor: Authenticated project and lane.
@@ -3243,8 +3249,22 @@ def _recommended(home: Path, actor: dict, args: dict) -> dict:
         1,
         recommend.MAX_SHORTLIST,
     )
+    from agent_parley import supervision
+
     held = active_reservations(home, root)
     held.pop(actor["name"], None)
+    try:
+        manifest = roster.read(directory)
+    except (BridgeError, OSError, ValueError):
+        manifest = {"participants": {}}
+    key = next(
+        (
+            name
+            for name, entry in manifest["participants"].items()
+            if entry.get("display") == actor["name"]
+        ),
+        "",
+    )
     return recommend.shortlist(
         directory,
         root,
@@ -3253,6 +3273,8 @@ def _recommended(home: Path, actor: dict, args: dict) -> dict:
         held,
         overlapping,
         limit,
+        supervision.named_leads(directory, manifest, key),
+        supervision.own_lead(directory, key) if key else "",
     )
 
 
