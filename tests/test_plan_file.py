@@ -55,7 +55,10 @@ def test_a_second_apply_adds_nothing_further(bridge, repo, paired):
     path = written(repo.parent, PLAN)
     bridge.work_plan(repo, "apply", path)
     again = bridge.work_plan(repo, "apply", path)
-    assert again["added"] == []
+    assert again["replayed"]
+    assert bridge.work_plan(repo, "show")["versions"] == 1
+    edited = bridge.work_plan(repo, "apply", written(repo.parent, PLAN + "\n"))
+    assert edited["added"] == []
     assert bridge.work_plan(repo, "show")["versions"] == 2
 
 

@@ -29,6 +29,8 @@ BARE = """
 "43" = ["17"]
 """
 
+EDITED = ENVELOPED + "# edited\n"
+
 
 def applied(bridge, repo, text=ENVELOPED, name="plan.toml"):
     """Applies one plan file and returns the version a proposal names."""
@@ -166,7 +168,7 @@ def test_a_stale_base_version_is_refused(bridge, repo, paired):
 def test_a_proposal_left_behind_by_a_new_apply_is_stale(bridge, repo, paired):
     base = applied(bridge, repo)
     record = proposed(bridge, paired["lanes"]["claude"], base, add=["42:60"])
-    applied(bridge, repo, name="again.toml")
+    applied(bridge, repo, EDITED, name="again.toml")
     [left] = bridge.plan_revision(repo, "proposals")["proposals"]
     assert left["current"] is False
     assert left["status"] == "stale"
@@ -183,7 +185,7 @@ def test_proposals_left_behind_never_hold_open_places(
     lane = paired["lanes"]["claude"]
     monkeypatch.setattr(plan, "MAX_PENDING", 1)
     proposed(bridge, lane, base, add=["43:42"])
-    base = applied(bridge, repo, BARE, name="again.toml")
+    base = applied(bridge, repo, BARE + "# edited\n", name="again.toml")
     assert proposed(bridge, lane, base, add=["43:42"])["status"] == "pending"
 
 
@@ -260,7 +262,7 @@ def test_an_apply_finishes_a_crashed_proposal_before_staling(
     with pytest.raises(RuntimeError):
         proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
     monkeypatch.setattr(plan, "_accept", finish)
-    fresh = applied(bridge, repo)
+    fresh = applied(bridge, repo, EDITED)
     assert fresh == base + 2
     with pytest.raises(BridgeError, match="No revision proposal"):
         bridge.plan_revision(repo, "reject", "0000000000000000")
@@ -405,7 +407,7 @@ def test_contradictory_revisions_escalate(bridge, repo, paired):
         "#43 waits on #42 was already revised 2 times under this plan version"
     )
     assert ledger(bridge, repo)["43"]["blocked_by"] == ["17"]
-    applied(bridge, repo, name="again.toml")
+    applied(bridge, repo, EDITED, name="again.toml")
     fresh = bridge.plan_revision(repo, "proposals")
     assert fresh["automatic"] == 0
     assert (
@@ -511,7 +513,7 @@ def test_the_command_line_proposes_lists_and_approves(
         "plan", "approve", filed["id"], "--repo", str(repo)
     )
     stale = proposed(bridge, lane, base + 1, add=["43:60"])
-    applied(bridge, repo, name="again.toml")
+    applied(bridge, repo, EDITED, name="again.toml")
     assert f"{stale['id']} stale" in run(
         "plan", "proposals", "--repo", str(repo)
     )
@@ -658,3 +660,64 @@ def test_a_replay_after_retention_drops_the_record_changes_nothing(
     assert again["status"] == "accepted"
     assert bridge.plan_revision(repo, "proposals")["revision"] == base + 1
     assert ledger(bridge, repo)["43"]["blocked_by"] == ["17", "42"]
+
+
+def test_a_reapply_never_restores_an_edge_a_revision_removed(
+    bridge, repo, paired
+):
+    base = applied(bridge, repo)
+    lane = paired["lanes"]["claude"]
+    record = proposed(bridge, lane, base, remove=["44:43"])
+    assert record["status"] == "accepted"
+    path = repo.parent / "plan.toml"
+    reported = bridge.work_plan(repo, "diff", path)
+    assert reported["revoked"] == [("44", "43", record["id"])]
+    assert (
+        f"revoked: #44 waits on #43 was removed by proposal {record['id']}"
+        in plan.render_diff(reported)
+    )
+    with pytest.raises(
+        BridgeError, match=f"#44 waits on #43 \\(proposal {record['id']}\\)"
+    ):
+        bridge.work_plan(repo, "apply", path)
+    assert ledger(bridge, repo)["44"]["blocked_by"] == ["42"]
+    assert bridge.plan_revision(repo, "proposals")["revision"] == base + 1
+    forced = bridge.work_plan(repo, "apply", path, force=True)
+    assert forced["added"] == [("44", "43")]
+    assert ledger(bridge, repo)["44"]["blocked_by"] == ["42", "43"]
+    assert bridge.work_plan(repo, "diff", path)["revoked"] == []
+
+
+def test_reapplying_an_unchanged_plan_keeps_proposals_and_budget(
+    bridge, repo, paired, capsys, monkeypatch
+):
+    base = applied(bridge, repo)
+    lane = paired["lanes"]["claude"]
+    assert proposed(bridge, lane, base, add=["43:42"])["status"] == "accepted"
+    held = proposed(bridge, lane, base + 1, add=["42:60"])
+    assert held["status"] == "pending"
+    directory = bridge.project(repo)[1]
+    before = issues.snapshot(directory)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "plan",
+            "apply",
+            str(repo.parent / "plan.toml"),
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() == 0
+    assert "already applied; nothing changed" in capsys.readouterr().out
+    assert issues.snapshot(directory) == before
+    listing = bridge.plan_revision(repo, "proposals")
+    assert listing["revision"] == base + 1
+    assert listing["automatic"] == 1
+    [left] = [item for item in listing["proposals"] if item["id"] == held["id"]]
+    assert left["status"] == "pending"
+    assert plan.recorded(directory)["flips"] == {"43:42": 1}

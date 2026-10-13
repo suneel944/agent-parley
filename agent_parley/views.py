@@ -417,6 +417,10 @@ def plan_diff(reported: dict) -> dict:
             {"issue": issue, "waits_on": blocker}
             for issue, blocker in reported["unlisted"]
         ],
+        "revoked": [
+            {"issue": issue, "waits_on": blocker, "proposal": proposal}
+            for issue, blocker, proposal in reported["revoked"]
+        ],
     }
 
 

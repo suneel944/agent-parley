@@ -4586,6 +4586,12 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             )
         if action != "apply":
             command.add_argument("--json", action="store_true", help=JSON_HELP)
+        else:
+            command.add_argument(
+                "--force",
+                action="store_true",
+                help="Restore edges accepted revisions removed.",
+            )
     revising = {
         "propose": "File a revision that adds or removes plan edges.",
         "approve": "Approve and apply one open revision as operator.",
@@ -5988,9 +5994,17 @@ def main() -> int:
                 return 1
         elif args.command == "plan":
             applied = bridge.work_plan(
-                args.repo.resolve(), args.action, getattr(args, "path", None)
+                args.repo.resolve(),
+                args.action,
+                getattr(args, "path", None),
+                force=getattr(args, "force", False),
             )
-            if args.action == "apply":
+            if args.action == "apply" and applied.get("replayed"):
+                print(
+                    f"Plan {applied['name']} is already applied; "
+                    "nothing changed."
+                )
+            elif args.action == "apply":
                 print(
                     f"Applied plan {applied['name']} "
                     f"({applied['digest'][:12]}): "
