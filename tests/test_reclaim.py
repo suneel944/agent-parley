@@ -1851,6 +1851,75 @@ def test_a_returned_root_record_clears_once_its_lanes_are_readmitted(
     assert not kept.exists()
 
 
+def test_a_returned_root_row_names_only_lanes_still_retired(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    retirement.mark(directory, "codex", time.time())
+    (directory / supervision.ROOT_RETURNED).write_text(
+        json.dumps(
+            {
+                "since": time.time() - 7200,
+                "returned_at": time.time(),
+                "lanes": [
+                    {"participant": "claude", "released": []},
+                    {"participant": "codex", "released": []},
+                ],
+            }
+        )
+    )
+
+    [row] = [
+        row
+        for row in bridge.problems()
+        if row["condition"] == problems.ROOT_RETURNED
+    ]
+
+    assert row["count"] == 1
+    assert "agent-parley participant add codex --repo " in row["command"]
+    assert "participant add claude" not in row["command"]
+    assert "claude" not in row["detail"]
+
+
+def test_a_second_root_return_keeps_lanes_retired_by_the_first(
+    bridge, repo, paired
+):
+    store.initialize(bridge.home)
+    directory = bridge.project(repo, create=False)[1]
+    retirement.mark(directory, "claude", time.time())
+    retirement.mark(directory, "codex", time.time())
+    kept = directory / supervision.ROOT_RETURNED
+    kept.write_text(
+        json.dumps(
+            {
+                "since": time.time() - 7200,
+                "returned_at": time.time() - 3600,
+                "lanes": [
+                    {"participant": "claude", "released": ["1"]},
+                    {"participant": "codex", "released": ["2"]},
+                ],
+            }
+        )
+    )
+    (directory / supervision.ROOT_PUBLICATION).write_text(
+        json.dumps(
+            {
+                "since": time.time() - 600,
+                "lanes": [{"participant": "codex", "released": []}],
+            }
+        )
+    )
+
+    supervision.root_returned(directory, roster.read(directory))
+
+    recorded = json.loads(kept.read_text())
+    assert recorded["lanes"] == [
+        {"participant": "codex", "released": []},
+        {"participant": "claude", "released": ["1"]},
+    ]
+
+
 def test_service_start_removes_wake_sockets_nobody_listens_on():
     with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
         home = Path(temporary)

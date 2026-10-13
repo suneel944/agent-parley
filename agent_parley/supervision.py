@@ -7376,10 +7376,12 @@ def root_returned(directory: Path, manifest: dict) -> None:
     A root that reappears after `missing_root` retired lanes leaves those
     lanes retired and their claims released. Deleting the publication then
     would hide why, so it moves to `ROOT_RETURNED` with the time the root
-    returned, and `problems` names each lane with its re-admit command. The
-    record is removed once every lane it names has been re-admitted, or when
-    the operator deletes the file. A publication that retired nothing is
-    simply removed.
+    returned, and `problems` names each lane with its re-admit command. A
+    second return merges its lanes into a record already kept, deduplicated
+    by participant, so lanes still retired from an earlier loss stay named.
+    The record is removed once every lane it names has been re-admitted, or
+    when the operator deletes the file. A publication that retired nothing
+    is simply removed.
 
     Args:
         directory: Private project state directory.
@@ -7392,7 +7394,26 @@ def root_returned(directory: Path, manifest: dict) -> None:
     except (OSError, ValueError):
         recorded = None
     if isinstance(recorded, dict) and recorded.get("lanes"):
-        write_json(kept, {**recorded, "returned_at": time.time()})
+        try:
+            earlier = json.loads(kept.read_text())
+        except (OSError, ValueError):
+            earlier = None
+        lanes = list(recorded["lanes"])
+        named = {
+            str(lane.get("participant"))
+            for lane in lanes
+            if isinstance(lane, dict)
+        }
+        if isinstance(earlier, dict):
+            lanes.extend(
+                lane
+                for lane in earlier.get("lanes") or []
+                if isinstance(lane, dict)
+                and str(lane.get("participant")) not in named
+            )
+        write_json(
+            kept, {**recorded, "lanes": lanes, "returned_at": time.time()}
+        )
     path.unlink(missing_ok=True)
     try:
         returned = json.loads(kept.read_text())
