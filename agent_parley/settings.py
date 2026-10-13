@@ -350,14 +350,19 @@ class SettingsMixin(BridgeCore):
             An account of the configured prefix and the names it produces.
 
         Raises:
-            BridgeError: If the repository has no project yet, or the prefix
-                is not a usable Git ref path component.
+            BridgeError: If the repository has no project yet, the prefix
+                is not a usable Git ref path component, or a change comes
+                from a lane or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if prefix is not None:
+            unattended.operator_only(
+                repo, root, data, "The lane branch prefix is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["branch_prefix"] = roster.branch_prefix(prefix)
@@ -440,14 +445,17 @@ class SettingsMixin(BridgeCore):
             An account of the forge in use and what it can do.
 
         Raises:
-            BridgeError: If the repository has no project yet, or the name is
-                not a known forge.
+            BridgeError: If the repository has no project yet, the name is
+                not a known forge, or a change comes from a lane or a process
+                holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import forge, lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if name is not None:
+            unattended.operator_only(repo, root, data, "The forge is set")
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["forge"] = roster.forge_choice(name)
@@ -483,14 +491,19 @@ class SettingsMixin(BridgeCore):
             An account of the declared resources.
 
         Raises:
-            BridgeError: If the repository has no project yet, or a name is
-                not a scheme and a name such as ``port:5432``.
+            BridgeError: If the repository has no project yet, a name is
+                not a scheme and a name such as ``port:5432``, or a change
+                comes from a lane or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, shlex, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if declared is not None:
+            unattended.operator_only(
+                repo, root, data, "The declared resources are set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["resources"] = roster.resources(shlex.split(declared))
@@ -525,14 +538,19 @@ class SettingsMixin(BridgeCore):
             An account of the recorded defaults.
 
         Raises:
-            BridgeError: If the repository has no project yet, or a default is
-                not a usable window or budget.
+            BridgeError: If the repository has no project yet, a default is
+                not a usable window or budget, or a change comes from a lane
+                or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if defaults is not None:
+            unattended.operator_only(
+                repo, root, data, "The deadline defaults are set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 merged = {
@@ -592,10 +610,13 @@ class SettingsMixin(BridgeCore):
             its consumption against the limits that apply.
 
         Raises:
-            BridgeError: If the record does not exist or a limit is unusable.
+            BridgeError: If the record does not exist, a limit is unusable,
+                or a participant or project change comes from a lane or a
+                process holding a lane's token.
         """
         import sqlite3
 
+        from agent_parley import unattended
         from agent_parley.cli import budgets, lock, roster, store, write_json
 
         if scope == "provider":
@@ -605,8 +626,11 @@ class SettingsMixin(BridgeCore):
                 roster.provider(self.home, name).get("budget") or {}
             )
             return f"provider {name} " + self._budget_account(recorded)
-        _, directory = self.project(repo, create=False)
+        root, directory = self.project(repo, create=False)
         if changes is not None:
+            unattended.operator_only(
+                repo, root, roster.read(directory), "A budget is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 if scope == "project":
@@ -665,13 +689,18 @@ class SettingsMixin(BridgeCore):
             An account of the enforced limits and the run's standing.
 
         Raises:
-            BridgeError: If the repository has no project or a limit is
-                unusable.
+            BridgeError: If the repository has no project, a limit is
+                unusable, or a change comes from a lane or a process holding
+                a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import budgets, lock, roster, write_json
 
-        _, directory = self.project(repo, create=False)
+        root, directory = self.project(repo, create=False)
         if changes is not None:
+            unattended.operator_only(
+                repo, root, roster.read(directory), "A run budget is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 before = dict(data.get("run_budget") or {})

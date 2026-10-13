@@ -1537,6 +1537,48 @@ def from_lane(manifest: dict) -> bool:
     return caller_lane(manifest) is not None or bool(os.environ.get(LANE_TOKEN))
 
 
+def token_lane(home: Path, manifest: dict) -> str | None:
+    """Returns the participant whose coordination credential the caller holds.
+
+    The working directory names a lane only while the lane stays inside its
+    worktree. A launched lane carries `LANE_TOKEN` wherever it runs, so a
+    lane-attributed command resolves the credential too and refuses to act
+    for a peer whose worktree it names as ``--repo``. Like `from_lane`, this
+    is the command-line boundary, not an operating-system one.
+
+    Args:
+        home: Private bridge state root holding the coordination store.
+        manifest: Manifest using the participant roster layout.
+
+    Returns:
+        The participant the credential was issued to, or None when the
+        environment holds no credential.
+
+    Raises:
+        BridgeError: If the environment holds a credential that names no
+            participant of this project.
+    """
+    import sqlite3
+
+    from agent_parley import store
+
+    token = os.environ.get(LANE_TOKEN)
+    if not token:
+        return None
+    try:
+        actor = store.authenticate(home, token)
+    except sqlite3.Error:
+        actor = None
+    if actor and actor["project"] == manifest["root"]:
+        for name, participant in manifest["participants"].items():
+            if participant.get("display") == actor["name"]:
+                return name
+    raise BridgeError(
+        f"The {LANE_TOKEN} in this environment names no participant of "
+        f"{manifest['root']}; a lane acts only as itself."
+    )
+
+
 def describe(manifest: dict) -> str:
     """Formats the roster for operators and for peer discovery."""
     lines = []
