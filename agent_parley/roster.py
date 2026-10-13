@@ -877,29 +877,122 @@ def define_provider(
     Raises:
         BridgeError: If the adapter, command, or variables are invalid.
     """
+    return _define(
+        home,
+        PROVIDERS,
+        name,
+        validated_provider(
+            name,
+            {
+                "adapter": adapter,
+                "command": command,
+                "home_env": home_env,
+                "env": overrides(env),
+                "require_env": require_env,
+            },
+        ),
+    )
+
+
+def validated_provider(name: str, entry: object) -> dict:
+    """Checks one provider definition the way `provider add` checks it.
+
+    Shared by `define_provider` and by state import, so a definition read
+    from an archive passes the same bounds as one an operator typed.
+
+    Args:
+        name: Provider name.
+        entry: Candidate definition with adapter, command, home_env, env,
+            require_env and an optional budget.
+
+    Returns:
+        The definition holding only the recognised fields.
+
+    Raises:
+        BridgeError: If any field is malformed, names an unsupported adapter
+            or records a credential value.
+    """
     identifier(name, "Provider name")
+    if not isinstance(entry, dict):
+        raise BridgeError(f"Provider {name!r} is not a definition object.")
+    adapter = entry.get("adapter")
     if adapter not in ADAPTERS:
         raise BridgeError(
             "Agent Parley supplies MCP configuration and lifecycle hooks "
             "through one native configuration contract per CLI; adapter "
             f"must be one of: {', '.join(ADAPTERS)}."
         )
-    if not command.strip() or "\x00" in command or len(command) > 240:
+    command = entry.get("command")
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or "\x00" in command
+        or len(command) > 240
+    ):
         raise BridgeError("Provider command must be an executable name.")
+    home_env = entry.get("home_env", "")
+    if not isinstance(home_env, str):
+        raise BridgeError("Provider home_env must be a variable name.")
     if home_env:
         variables([home_env])
-    return _define(
-        home,
-        PROVIDERS,
-        name,
-        {
-            "adapter": adapter,
-            "command": command,
-            "home_env": home_env,
-            "env": overrides(env),
-            "require_env": variables(require_env),
-        },
-    )
+    env = entry.get("env", {})
+    require_env = entry.get("require_env", [])
+    if not isinstance(env, dict) or not all(
+        isinstance(value, str) for value in env.values()
+    ):
+        raise BridgeError("Provider env must map names to string values.")
+    if not isinstance(require_env, list):
+        raise BridgeError("Provider require_env must be a list of names.")
+    result = {
+        "adapter": adapter,
+        "command": command,
+        "home_env": home_env,
+        "env": overrides([f"{key}={env[key]}" for key in variables(list(env))]),
+        "require_env": variables(require_env),
+    }
+    if "budget" in entry:
+        result["budget"] = budget(entry["budget"])
+    return result
+
+
+def adopt_providers(home: Path, entries: dict) -> dict[str, list]:
+    """Adds provider definitions carried in from elsewhere, entry by entry.
+
+    A name that is a built-in preset or already defined here is skipped, so
+    an import never replaces a launch contract the operator relies on. Every
+    other entry passes `validated_provider` or is refused with its reason.
+
+    Args:
+        home: Private bridge state root.
+        entries: Provider definitions by name, as another registry stored
+            them.
+
+    Returns:
+        ``added`` and ``skipped`` provider names, and ``refused`` records
+        naming each rejected provider and why.
+    """
+    result: dict[str, list] = {"added": [], "skipped": [], "refused": []}
+    with lock(home / "registry.lock"):
+        path = home / PROVIDERS
+        stored: dict = (
+            json.loads(path.read_text())
+            if path.exists()
+            else {"version": 1, "entries": {}}
+        )
+        local = stored.setdefault("entries", {})
+        for name, entry in entries.items():
+            if name in PRESETS or name in local:
+                result["skipped"].append(name)
+                continue
+            try:
+                local[name] = validated_provider(name, entry)
+            except BridgeError as exc:
+                result["refused"].append({"name": name, "reason": str(exc)})
+                continue
+            result["added"].append(name)
+        if result["added"]:
+            write_json(path, stored)
+    return result
 
 
 def provider_budget(home: Path, name: str, changes: dict) -> dict:

@@ -475,6 +475,16 @@ class ReportsMixin(BridgeCore):
                 f"{entry['lane'] or 'no path recorded'}; recreate the "
                 "worktree before launching it."
             )
+        providers = result["providers"]
+        if providers["added"]:
+            lines.append("Providers added: " + ", ".join(providers["added"]))
+        if providers["skipped"]:
+            lines.append(
+                "Providers kept as defined here: "
+                + ", ".join(providers["skipped"])
+            )
+        for entry in providers["refused"]:
+            lines.append(f"Provider {entry['name']} refused: {entry['reason']}")
         return "\n".join(lines)
 
     def history(
