@@ -124,6 +124,12 @@ def selected_prompt(
     leads the prompt with that note, naming the command and saying the
     permission it needed was never granted.
 
+    The prompt names the record by its kind and states that it is not a
+    handoff offer. Its identifier is a digest of the dispatcher's own
+    publication, which no `issue accept --offer-id`, inbox or message
+    search knows, so a lane told to act on an "offer" spent its turn
+    looking for a handoff that never existed.
+
     Args:
         directory: Private project state directory.
         name: Participant owning the terminal socket.
@@ -185,7 +191,11 @@ def selected_prompt(
     if not identifier or not detail:
         return _noted(PROMPT, record)
     issues = ", ".join(f"#{number}" for number in offer.get("issues", [])[:5])
-    heading = f"Act on work offer {identifier}"
+    kind = str(offer.get("kind") or "work")
+    heading = (
+        f"Dispatcher {kind} record {identifier} (not a handoff offer: "
+        "nothing to accept, decline or search for)"
+    )
     if issues:
         heading += f" for {issues}"
     return _noted(

@@ -116,9 +116,13 @@ def _reasons(record: dict, known: bool, provider: str) -> list[str]:
     """States, in ranking order, why an issue sits where it sits."""
     said = ["no recorded dependency blocks it"]
     if record["unblocks"]:
-        said.append(
-            "unblocks " + ", ".join(f"#{n}" for n in record["unblocks"])
-        )
+        owned = [n for n in record["unblocks"] if n not in record["planned"]]
+        listed = [f"#{n}" for n in owned]
+        if record["planned"]:
+            listed.append(
+                ", ".join(f"#{n}" for n in record["planned"]) + " (planned)"
+            )
+        said.append("unblocks " + ", ".join(listed))
     if record["group"]:
         said.append(
             f"plan group {record['group']} is already under way"
@@ -142,6 +146,8 @@ def _reasons(record: dict, known: bool, provider: str) -> list[str]:
         )
     if record.get("named_to"):
         said.insert(1, f"already named as {record['named_to']}'s next work")
+    if record.get("own"):
+        said.insert(1, "named as this lane's next work")
     return said[:MAX_REASONS]
 
 
@@ -153,19 +159,23 @@ def rank(
     provider: str,
     limit: int = MAX_SHORTLIST,
     named: dict[str, str] | None = None,
+    own: str = "",
 ) -> list[dict]:
     """Orders the issues a lane could take next, worst obstacle last.
 
     The order is a total one over the ledger's own contents, so the same
-    store state always produces the same shortlist. An issue the supervisor
-    already named as another lane's next work sinks below every issue no
-    lane was pointed at, so lanes reading the same ledger spread out instead
-    of racing for one claim. An issue a peer already
+    store state always produces the same shortlist. The issue the supervisor
+    named as this lane's own next work ranks first, so the lane claims what
+    it was pointed at rather than a lower-numbered free issue. An issue the
+    supervisor already named as another lane's next work sinks below every
+    issue no lane was pointed at, so lanes reading the same ledger spread
+    out instead of racing for one claim. An issue a peer already
     reserves the paths of sinks below one nobody contends, a declared
     provider this lane does not run sinks below a matching or silent one, a
     forecast collision sinks below a clean path, and what remains is decided
-    by a plan group already under way, then by how many owned issues the
-    issue unblocks, then by the issue number.
+    by a plan group already under way, then by how much authorized,
+    unfinished work, planned or owned, waits on the issue, then by how many
+    owned issues wait on it, then by the issue number.
 
     Args:
         state: Published issue ledger.
@@ -178,42 +188,51 @@ def rank(
         limit: Most entries to return.
         named: Issue number to the other lane the supervisor's published
             work names it to, as its next lead or first pull pick.
+        own: Issue the supervisor's published work names as the reading
+            lane's own next lead, or empty when it names none.
 
     Returns:
         One record per candidate carrying its number, recorded title, plan
-        group, the issues it unblocks, the provider it declares, the peer
-        reservations and forecast collisions found for it, the lane it is
-        named to, and the reasons for its position.
+        group, the issues it unblocks and which of those are planned rather
+        than owned, the provider it declares, the peer reservations and
+        forecast collisions found for it, the lane it is named to, whether
+        it is this lane's own lead, and the reasons for its position.
     """
     named = named or {}
-    waiting = issues.waiters(state)
+    waiting = issues.waiters(state, owned_only=False)
+    owned = issues.waiters(state)
     placed = _grouped(groups)
     started = _underway(groups, state)
     ranked = []
     for number in issues.unclaimed(state):
         risk = risks.get(number) or {}
         group = placed.get(number, "")
+        unblocks = waiting.get(number, [])
         record = {
             "issue": number,
             "title": state["issues"][number].get("title") or "",
             "group": group,
             "group_underway": group in started,
-            "unblocks": waiting.get(number, []),
+            "unblocks": unblocks,
+            "planned": [n for n in unblocks if n not in owned.get(number, [])],
             "provider": declared.get(number, ""),
             "overlaps": risk.get("overlaps", []),
             "collisions": risk.get("collisions", []),
-            "named_to": named.get(number, ""),
+            "named_to": "" if number == own else named.get(number, ""),
+            "own": number == own,
         }
         record["reasons"] = _reasons(record, number in risks, provider)
         ranked.append(record)
     ranked.sort(
         key=lambda record: (
+            not record["own"],
             bool(record["named_to"]),
             bool(record["overlaps"]),
             bool(record["provider"]) and record["provider"] != provider,
             bool(record["collisions"]),
             not record["group_underway"],
             -len(record["unblocks"]),
+            len(record["planned"]),
             int(record["issue"]),
         )
     )
@@ -229,6 +248,7 @@ def shortlist(
     overlap: Callable[[str, str], bool],
     limit: int = MAX_SHORTLIST,
     named: dict[str, str] | None = None,
+    own: str = "",
 ) -> dict:
     """Reads the ledger, the plan and the forge, and ranks what is free.
 
@@ -258,6 +278,8 @@ def shortlist(
         limit: Most entries to return.
         named: Issue number to the other lane whose published work names
             it, which ranks it below every issue no lane was pointed at.
+        own: Issue the reading lane's own published work names as its
+            lead, which ranks first.
 
     Returns:
         The provider considered, whether the forge answered with any paths,
@@ -288,6 +310,7 @@ def shortlist(
             provider,
             limit,
             named,
+            own,
         ),
     }
 

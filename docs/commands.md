@@ -78,7 +78,7 @@ on standard output and export to a file.
 | `issue claim NUMBER` | Claim an available issue from this lane. `--within 6h` on `claim`, `offer` or `accept` records a deadline; past it the record reads overdue, and ownership never moves on a deadline. |
 | `issue claim NUMBER --take-orphaned` | Take an issue whose owner reads as orphaned, recording the previous owner and the reason and moving the reservations that owner held for this claim to the taking lane; reservations for its other claims stay with it. |
 | `issue request NUMBER` | Ask the holder of an owned issue to hand it to this lane; `--summary` says why, and `--within 30m` records a deadline; past it the request reads overdue and shows in `problems`, but is granted only by the project's `takeover_grace`. The holder answers with `issue accept` or `issue decline`, and a holder that neither answers nor records progress within `takeover_grace` has the request granted as an offer to this lane. |
-| `issue release NUMBER` | Release ownership without closing the GitHub issue. |
+| `issue release NUMBER` | Release ownership without closing the GitHub issue. A claim blocked on a recorded external condition keeps that condition: the issue stays blocked with no owner and is not offered as free work until a lane or the operator claims it again. |
 | `issue offer NUMBER --to NAME --summary TEXT` | Pause work and offer ownership explicitly; `--remaining ITEM`, repeatable, lists the work still to do, and `--when-released N` records it until that issue is released. |
 | `issue accept NUMBER --offer-id ID` | Accept the current offer addressed to this lane; the offered reservations move with the issue. |
 | `issue decline NUMBER --offer-id ID` | Decline the current offer addressed to this lane. |

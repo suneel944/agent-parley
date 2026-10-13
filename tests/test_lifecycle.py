@@ -120,6 +120,71 @@ def test_release_requeues_partial_work_but_never_recycles_completion(tmp_path):
         claim(tmp_path, "8")
 
 
+def test_a_released_external_blocker_stays_out_of_dispatch_until_claimed(
+    tmp_path,
+):
+    claim(tmp_path, "8")
+    claim(tmp_path, "9")
+    lifecycle.record_report(
+        tmp_path, "codex", "blocked", "", "needs 100 paper trades", issue="8"
+    )
+    for number in ("8", "9"):
+        issues.change(
+            tmp_path, "codex", "release", number, participants={"codex"}
+        )
+    ledger = issues.snapshot(tmp_path)
+    execution = ledger["issues"]["8"]["execution"]
+    assert ledger["issues"]["8"]["owner"] is None
+    assert execution["state"] == lifecycle.BLOCKED
+    assert execution["resume_when"] == {
+        "kind": "external",
+        "detail": "needs 100 paper trades",
+    }
+    assert execution["next_action"] == "wait for external"
+    assert lifecycle.actionable(ledger) == ["9"]
+    assert issues.unclaimed(ledger) == ["9"]
+
+    claim(tmp_path, "8", agent="claude")
+    lifted = issues.snapshot(tmp_path)["issues"]["8"]["execution"]
+    assert lifted["state"] == lifecycle.RUNNING
+    assert lifted["resume_when"] == ""
+
+
+@pytest.mark.parametrize("condition", ["external", "", None])
+def test_a_released_legacy_operator_blocker_keeps_its_block(condition):
+    record = {
+        "owner": "codex",
+        "execution": {
+            "authorized": True,
+            "state": lifecycle.BLOCKED,
+            "claim_id": "c1",
+            "blocker": "needs approval",
+            "resume_when": condition,
+        },
+    }
+    assert lifecycle.operator_blocked(record)
+    execution = lifecycle.released(record)
+    assert execution["state"] == lifecycle.BLOCKED
+    assert execution["blocker"] == "needs approval"
+    assert execution["claim_id"] is None
+
+
+def test_a_released_issue_blocker_returns_to_the_queue():
+    record = {
+        "owner": "codex",
+        "execution": {
+            "authorized": True,
+            "state": lifecycle.BLOCKED,
+            "claim_id": "c1",
+            "blocker": "waits on #7",
+            "resume_when": {"kind": "issue", "issue": "7"},
+        },
+    }
+    execution = lifecycle.released(record)
+    assert execution["state"] == lifecycle.QUEUED
+    assert execution["resume_when"] == ""
+
+
 def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
     current = claim(tmp_path, "9")
     lifecycle.record_report(

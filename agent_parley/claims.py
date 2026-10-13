@@ -557,7 +557,8 @@ class ClaimsMixin(ReportsMixin):
         and still races any peer that chose the same one. To make that race
         rare, an issue another lane's published work names as its next lead
         or first pull pick, through `supervision.named_leads`, ranks below
-        the issues no lane was pointed at.
+        the issues no lane was pointed at, and the lead this lane's own
+        publication names, through `supervision.own_lead`, ranks first.
 
         Args:
             repo: Assigned worktree, which names the lane doing the reading.
@@ -596,6 +597,7 @@ class ClaimsMixin(ReportsMixin):
                 store.overlapping,
                 limit,
                 supervision.named_leads(directory, data, agent),
+                supervision.own_lead(directory, agent),
             ),
         }
 

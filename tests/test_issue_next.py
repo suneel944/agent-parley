@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import forge, recommend, store
+from agent_parley import forge, issues, recommend, store
 from agent_parley.state import BridgeError
 
 PLAN = """
@@ -232,6 +232,53 @@ def test_a_released_claim_that_ended_on_the_forge_is_not_next_work():
     }
     ranked = recommend.rank(ended, {}, {}, {}, "claude")
     assert [record["issue"] for record in ranked] == ["43", "44"]
+
+
+PLANNED = {
+    "revision": 1,
+    "issues": {
+        number: {
+            "owner": None,
+            "offer": None,
+            "blocked_by": blockers,
+            "execution": {"authorized": True},
+        }
+        for number, blockers in (
+            ("5", []),
+            ("10", []),
+            ("20", ["10"]),
+            ("30", ["10"]),
+            ("40", ["10"]),
+        )
+    },
+}
+
+
+def test_a_blocker_of_planned_work_ranks_above_an_isolated_issue():
+    assert issues.unclaimed(PLANNED) == ["10", "5"]
+    assert issues.waiters(PLANNED) == {}
+    ranked = recommend.rank(PLANNED, {}, {}, {}, "claude")
+    assert [record["issue"] for record in ranked] == ["10", "5"]
+    assert ranked[0]["planned"] == ["20", "30", "40"]
+    assert "unblocks #20, #30, #40 (planned)" in ranked[0]["reasons"]
+    assert ranked[1]["reasons"] == ["no recorded dependency blocks it"]
+
+
+def test_default_waiters_count_every_owned_waiter():
+    ledger = {
+        "issues": {
+            "10": {"owner": None, "blocked_by": []},
+            "20": {"owner": "codex", "blocked_by": ["10"]},
+            "30": {
+                "owner": "claude",
+                "blocked_by": ["10"],
+                "execution": {"authorized": True, "state": "complete"},
+            },
+            "40": {"owner": None, "blocked_by": ["10"]},
+        }
+    }
+    assert issues.waiters(ledger) == {"10": ["20", "30"]}
+    assert issues.waiters(ledger, owned_only=False) == {"10": ["20"]}
 
 
 def test_nothing_free_reads_as_nothing_free():
