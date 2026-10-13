@@ -48,7 +48,8 @@ class Found(NamedTuple):
         problems: The rows `agent-parley problems` would list, most urgent
             first; read only for a registered project with a running
             service.
-        notify: Whether an outbound notification transport is configured.
+        notify: Whether an outbound notification transport is configured
+            with every setting it needs to send.
         lanes: How many lanes the project has registered.
         unborn: Whether the checkout's branch has no commit yet, so no
             lane can start from it.
@@ -154,8 +155,8 @@ def attention(home: Path, root: str) -> tuple[tuple[dict, ...], bool, int]:
 
     Returns:
         The problem rows, most urgent first, whether an outbound
-        notification transport is configured, and how many lanes the
-        project has registered.
+        notification transport is configured and able to send, and how
+        many lanes the project has registered.
     """
     from agent_parley import notify
     from agent_parley.cli import Bridge, problems
@@ -176,7 +177,8 @@ def attention(home: Path, root: str) -> tuple[tuple[dict, ...], bool, int]:
         for project in report["projects"]
         if project["root"] == root
     )
-    configured = bool(notify.reported(notify.environment(home))["transports"])
+    outbound = notify.reported(notify.environment(home))
+    configured = bool(outbound["transports"]) and not outbound["fault"]
     return rows, configured, lanes
 
 

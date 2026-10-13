@@ -151,6 +151,9 @@ def test_running_service_and_registered_project_offer_the_dashboard(
     codex_plugin()
     running(bridge, monkeypatch)
     monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "email")
+    monkeypatch.setenv("AGENT_PARLEY_SMTP_HOST", "smtp.example.com")
+    monkeypatch.setenv("AGENT_PARLEY_SMTP_FROM", "bridge@example.com")
+    monkeypatch.setenv("AGENT_PARLEY_SMTP_TO", "owner@example.com")
     printed = screen(capsys, bridge.home, repo)
     (bridge.home / "server.json").unlink()
     assert "Project   registered" in printed
@@ -198,6 +201,27 @@ def test_notify_off_with_lanes_offers_its_setup(
         printed
     )
     assert "Needs you" not in printed
+
+
+def test_notify_missing_email_settings_keeps_its_setup_hint(
+    path, bridge, repo, paired, monkeypatch, capsys
+):
+    path("codex")
+    codex_plugin()
+    running(bridge, monkeypatch)
+    monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "email")
+    for name in (
+        "AGENT_PARLEY_SMTP_HOST",
+        "AGENT_PARLEY_SMTP_FROM",
+        "AGENT_PARLEY_SMTP_TO",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    printed = screen(capsys, bridge.home, repo)
+    (bridge.home / "server.json").unlink()
+    assert "  Notify    off\n" in printed
+    assert "agent-parley notify setup  Get told when a lane needs you." in (
+        printed
+    )
 
 
 def snapshot(root):

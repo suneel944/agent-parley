@@ -185,7 +185,8 @@ Once the project is registered and its service runs, the screen also reads
 what `agent-parley problems` would list. A line such as
 `Needs you 2 problems: …` gives the count and the two most urgent rows, and
 `agent-parley problems` then leads the next commands. With lanes but no
-outbound notification transport, a `Notify    off` line appears and
+outbound notification transport, or one missing a setting it needs to send,
+a `Notify    off` line appears and
 `agent-parley notify setup` joins the next commands. A project with nothing
 pending shows neither line.
 

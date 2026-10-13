@@ -681,6 +681,31 @@ def test_status_names_a_missing_webhook_url():
     assert usable["fault"] == ""
 
 
+def test_status_names_each_missing_email_setting():
+    complete = {
+        "AGENT_PARLEY_NOTIFY": "email",
+        "AGENT_PARLEY_SMTP_HOST": "smtp.example.com",
+        "AGENT_PARLEY_SMTP_FROM": "bridge@example.com",
+        "AGENT_PARLEY_SMTP_TO": "owner@example.com",
+    }
+    assert notify.reported(complete)["fault"] == ""
+    for name in (
+        "AGENT_PARLEY_SMTP_HOST",
+        "AGENT_PARLEY_SMTP_FROM",
+        "AGENT_PARLEY_SMTP_TO",
+    ):
+        values = {key: value for key, value in complete.items() if key != name}
+        report = notify.reported(values)
+        assert report["transports"] == ["email"]
+        assert report["fault"] == f"Email needs {name}."
+    bare = notify.reported({"AGENT_PARLEY_NOTIFY": "email,webhook"})
+    assert bare["fault"].startswith(
+        "Email needs AGENT_PARLEY_SMTP_HOST, AGENT_PARLEY_SMTP_FROM and "
+        "AGENT_PARLEY_SMTP_TO.; "
+    )
+    assert "AGENT_PARLEY_WEBHOOK_URL" in bare["fault"]
+
+
 def test_setup_adds_the_webhook_and_keeps_telegram(
     tmp_path, unset, monkeypatch, capsys
 ):
