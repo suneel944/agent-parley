@@ -2595,11 +2595,17 @@ recommended, whether acting on it can be undone, and an expiry a day out that
 each repeat observation extends; one situation holds exactly one open decision.
 The operator problems `problems` reports, such as a dirty worktree, an
 unresolved completion or a second session, open decisions as well, and a
-decision closes when its problem clears. Delivery is durable: a decision is
-marked sent only after every transport accepted it, and a refused or abandoned
-send is retried on the next supervision poll with a backoff that doubles from
-30 seconds to an hour, so a hook that exits before its send finishes still
-reaches the operator. Decisions due together go out as one digest; on Telegram
+decision closes when its problem clears. Delivery is durable: a decision
+records each transport that accepted it and is marked sent only after every
+transport did, and a refused or abandoned send is retried on the next
+supervision poll with a backoff that doubles from 30 seconds to an hour, so a
+hook that exits before its send finishes still reaches the operator. A retry
+goes only to the transports that have not accepted the decision yet, so a
+healthy Telegram bot does not repeat a decision while SMTP keeps failing.
+Retries stop after eight failed attempts, and one `notification_failed` event
+on the lane, or a supervision note for a decision with no lane, records that
+the decision was given up. Decisions due together go out as one digest; on
+Telegram
 it carries one row of buttons per decision, and every transport shows the text
 reply each takes. Decisions are recorded only while notifications are on, and
 a record holds no credential. A `decisions.json` that no longer decodes is

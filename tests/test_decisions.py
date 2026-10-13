@@ -141,6 +141,72 @@ def test_a_refused_digest_is_retried_with_a_growing_backoff(
     assert stored["retry_at"] == 131.0 + 2 * decisions.BACKOFF_FIRST
 
 
+def test_a_failing_transport_never_makes_a_healthy_one_resend(
+    tmp_path, monkeypatch
+):
+    calls = {"good": 0, "flaky": 0}
+    broken = {"flaky": True}
+
+    def good(config, subject, body):
+        calls["good"] += 1
+
+    def flaky(config, subject, body):
+        calls["flaky"] += 1
+        if broken["flaky"]:
+            raise OSError("smtp refused")
+
+    monkeypatch.setitem(notify.TRANSPORTS, "good", good)
+    monkeypatch.setitem(notify.TRANSPORTS, "flaky", flaky)
+    config = {"transports": ["good", "flaky"]}
+    record = opened(tmp_path, now=100.0)
+    for tick in range(4):
+        decisions.flush(tmp_path, config, now=100.0 + tick * 900.0)
+    stored = decisions.get(tmp_path, record["id"])
+    assert calls == {"good": 1, "flaky": 4}
+    assert stored["sent"] == 0.0
+    assert set(stored["delivered"]) == {"good"}
+    assert "flaky: OSError: smtp refused" in stored["error"]
+    broken["flaky"] = False
+    report = decisions.flush(tmp_path, config, now=10000.0)
+    assert report["sent"] == [record["id"]]
+    assert calls == {"good": 1, "flaky": 5}
+    assert decisions.get(tmp_path, record["id"])["sent"] == 10000.0
+    decisions.flush(tmp_path, config, now=20000.0)
+    assert calls == {"good": 1, "flaky": 5}
+
+
+def test_a_transport_failing_for_good_stops_at_the_attempt_cap(
+    tmp_path, monkeypatch
+):
+    calls = {"good": 0, "broken": 0}
+
+    def good(config, subject, body):
+        calls["good"] += 1
+
+    def refuse(config, subject, body):
+        calls["broken"] += 1
+        raise OSError("smtp refused")
+
+    monkeypatch.setitem(notify.TRANSPORTS, "good", good)
+    monkeypatch.setitem(notify.TRANSPORTS, "broken", refuse)
+    config = {"transports": ["good", "broken"]}
+    record = opened(tmp_path, now=100.0)
+    for tick in range(48):
+        decisions.flush(tmp_path, config, now=100.0 + tick * 900.0)
+    assert calls == {"good": 1, "broken": decisions.MAX_ATTEMPTS}
+    stored = decisions.get(tmp_path, record["id"])
+    assert stored["attempts"] == decisions.MAX_ATTEMPTS
+    assert stored["state"] == decisions.OPEN
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "codex-events.jsonl").read_text().splitlines()
+    ]
+    assert [event["reason_class"] for event in events] == [
+        "notification_failed"
+    ]
+    assert "broken: OSError: smtp refused" in events[0]["cause"]
+
+
 def test_a_decision_leased_by_one_sender_is_not_sent_by_another(tmp_path):
     opened(tmp_path, now=100.0)
     assert decisions._lease(tmp_path, 100.0)
