@@ -573,7 +573,21 @@ reported.
             for event in roster.REQUIRED_HOOKS
             if event in roster.unavailable_hooks(entry["adapter"])
         ]
-        if missing:
+        degraded = (
+            roster.delivery_path(entry["adapter"]) == roster.POLLED_DELIVERY
+            and bool(missing)
+            and not set(missing) & set(roster.POLLED_REQUIRED_HOOKS)
+        )
+        if degraded:
+            print(
+                roster.DEGRADED_WARNING.format(
+                    name=agent,
+                    adapter=entry["adapter"],
+                    missing=", ".join(missing),
+                ),
+                file=sys.stderr,
+            )
+        elif missing:
             raise BridgeError(
                 f"The {entry['adapter']!r} adapter cannot deliver "
                 f"{', '.join(missing)}, so its lanes would run without the "
@@ -885,6 +899,7 @@ reported.
                     attached=sys.stdin.isatty(),
                     client=entry["adapter"],
                     client_version=client_version,
+                    degraded=degraded,
                 )
                 previous.pop("last_prompt", None)
                 previous.pop("operator_stopped", None)
