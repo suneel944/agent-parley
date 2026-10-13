@@ -51,11 +51,22 @@ uv run --locked agent-parley credentials add claude-p2 \
 service the way a lane's launcher would, writes each lane's launch command
 to `acceptance/plan.json`, takes one frame, and exits non-zero naming each
 reading the service did not answer. It starts no lane and spends no model
-quota, so run it before every period:
+quota, so run it before every period. Run every command below in the same
+shell as the two exports above; `rehearse`, `run` and `verdict` read the
+home from `AGENT_PARLEY_HOME` unless `--home` names it, and the lanes reach
+the run's service only through `AGENT_PARLEY_PORT`:
 
 ```sh
 uv run --locked python -m scripts.acceptance rehearse
 ```
+
+Each `rehearse` and each `run` seeds a new throwaway project at
+`~/.local/state/parley-acceptance/run-<timestamp>` unless `--workspace`
+names a directory, and refuses a directory that already holds a
+repository. A rehearsal therefore checks a project of its own, not the one
+the run will use, and leaves that project behind; it prints that path when
+every reading was answered. Pass `--workspace` to `run` to choose its
+directory up front, which is the path `verdict` needs later.
 
 The run occupies its terminal for the whole period. Start it detached and
 read its log, which lives beside the run rather than in `/tmp`:
@@ -63,11 +74,12 @@ read its log, which lives beside the run rather than in `/tmp`:
 ```sh
 setsid nohup uv run --locked python -m scripts.acceptance run \
   --hours 24 --trust \
+  --workspace ~/.local/state/parley-acceptance/run-period \
   > ~/.local/state/parley-acceptance/run.log 2>&1 &
 ```
 
-`--trust` is what lets the lanes start at all; it is described under what
-the estate is given below.
+`--trust` lets the lanes start without an answer to the native directory
+trust dialog; it is described under what the estate is given below.
 
 Everything the run produces lands in `acceptance/` inside the throwaway
 project: `launch/<lane>.log` per launcher, `launched.json` with each
@@ -75,10 +87,20 @@ launcher's process identifier, `frames.jsonl` with one sample per
 interval, and `report.md` plus `verdict.json` when the period ends. The
 process exits zero only when every condition passed.
 
-`python -m scripts.acceptance verdict --workspace <path>` re-decides a
-finished run from the state that is already on disk. It starts nothing and
-launches nobody, so it is the safe way to re-read a run whose report was
-lost or whose conditions were changed after the fact.
+`verdict` re-decides a finished run from the state that is already on
+disk. It starts nothing and launches nobody, so it is the safe way to
+re-read a run whose report was lost or whose conditions were changed after
+the fact:
+
+```sh
+uv run --locked python -m scripts.acceptance verdict \
+  --workspace ~/.local/state/parley-acceptance/run-period
+```
+
+`--workspace` is required for `verdict` and must name the run's directory,
+the one holding its `acceptance/` records. Without it, or with a path that
+holds no run, `verdict` refuses with exit status 2 and names the command
+that lists the run directories.
 
 ## What the run builds
 
@@ -147,13 +169,17 @@ command they claim with.
 
 `--trust` records the throwaway project and each lane worktree in the
 native clients' own trust records: `hasTrustDialogAccepted` for `claude` in
-`~/.claude.json`, and a `[projects."<path>"] trust_level = "trusted"` entry
-for `codex` in `~/.codex/config.toml`. Without it every lane parks on the
-client's directory trust screen at startup, which the launcher can neither
-name nor answer, and the estate spends the whole period at `not started; no
-native hook`. That gap is issue #383; until it closes, an unattended run
-needs the flag, and the flag writes nothing but the directories of a
-project the run itself seeded. Leave it off to watch the gap instead.
+`.claude.json`, and a `[projects."<path>"] trust_level = "trusted"` entry
+for `codex` in `config.toml`. Each record is written in the configuration
+home of the lane's credential profile, so the two `claude-p2` lanes are
+trusted in `~/.claude-p2/.claude.json`; a lane without a profile uses `~`
+for `claude` and `~/.codex` for `codex`. Without the flag every lane stops
+on the `directory-trust` dialog at startup. The launcher names that dialog
+in the lane's activity and in `status`, and answers it only when
+`supervision.dialogs` or the participant's own `dialogs` maps
+`directory-trust` to an option; with no answer recorded the lanes stay
+parked and the period measures nothing. The flag writes nothing but the
+directories of a project the run itself seeded.
 
 ## The observation rule
 
@@ -237,10 +263,12 @@ A native client draws a blocking dialog on its own terminal, runs no hook
 while it waits, and keeps its process alive. Nothing about that screen
 reaches the coordination substrate on its own, so the launcher's
 pseudo-terminal watcher in `agent_parley/dialogs.py` is the only
-observation available. Three screens are recorded from live clients:
-`usage-limit`, `hook-review` and `tool-permission`.
+observation available. Five screens are recognized: `usage-limit`,
+`question`, `hook-review`, `directory-trust` and `tool-permission`. Four
+are proved here from live clients: `usage-limit`, `hook-review`,
+`directory-trust` and `tool-permission`.
 
-The unattended period cannot be trusted to produce all three, so each is
+The unattended period cannot be trusted to produce them, so each is
 triggered deliberately against a live client in a separate short session
 against the same throwaway project, and the evidence is recorded with the
 run. Use one lane at a time and note the client version, because the
@@ -258,6 +286,11 @@ same record and the record should name the tool.
 writes into the lane worktree, and start the client again. The client
 draws its `Hooks need review` screen before it reads any prompt, which is
 the startup case a resumed lane hits after any settings change.
+
+**`directory-trust`.** Start a lane without `--trust` on a worktree the
+client has never opened. The client asks whether to trust the directory
+before it reads any prompt, and the lane must record the `dialog` entry
+for `directory-trust`.
 
 **`usage-limit`.** This one cannot be forced by the harness. Run a lane on
 a credential profile whose weekly capacity is already spent, or take the

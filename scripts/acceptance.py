@@ -40,7 +40,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from agent_parley import metrics, problems, server, supervision
+from agent_parley import (
+    BridgeError,
+    metrics,
+    problems,
+    refusal,
+    server,
+    supervision,
+)
 
 BACKLOG = 20
 HOURS = 24.0
@@ -315,9 +322,11 @@ def trust(home: Path, repo: Path, lanes: list[str]) -> list[str]:
         The directories recorded as trusted, so the report can say which
         ones the run was given.
 
-    Both native clients open a fresh directory with a trust screen, and a
-    launcher cannot name or answer that screen. Eight lanes on eight new
-    worktrees therefore park at startup and never fire a hook. The
+    Both native clients open a fresh directory with a trust screen. The
+    launcher names it as the ``directory-trust`` dialog but answers it
+    only when the manifest records an answer, so eight lanes on eight new
+    worktrees would otherwise park at startup and never fire a hook.
+    Recording trust keeps the period independent of a dialog answer. The
     decision itself stays the operator's: this writes only the
     directories of a project the run seeded, into each client's own trust
     record, and only when the operator asked for it on the command line.
@@ -1163,6 +1172,38 @@ def report(decided: dict, repo: Path, hours: float) -> str:
     return "\n".join(lines) + "\n"
 
 
+def finished(workspace: str) -> Path:
+    """Resolves the directory of an earlier run that ``verdict`` re-decides.
+
+    A fresh run directory is invented only for a command that seeds one;
+    ``verdict`` reads records that must already exist, so it needs the
+    operator to name them.
+
+    Args:
+        workspace: The ``--workspace`` value, empty when it was omitted.
+
+    Returns:
+        The run directory, which holds the run's ``acceptance/`` records.
+
+    Raises:
+        BridgeError: No workspace was named, or the named path holds no
+            run records. The next command lists the run directories.
+    """
+    listing = f"ls -d {ROOT}/run-*"
+    if not workspace:
+        raise BridgeError(
+            "verdict needs --workspace naming an earlier run directory",
+            next_command=listing,
+        )
+    repo = Path(workspace).expanduser()
+    if not (repo / "acceptance").is_dir():
+        raise BridgeError(
+            f"{repo} holds no acceptance run records",
+            next_command=listing,
+        )
+    return repo
+
+
 def main(argv: list[str] | None = None) -> int:
     """Runs one acceptance run end to end.
 
@@ -1170,28 +1211,79 @@ def main(argv: list[str] | None = None) -> int:
         argv: Command line arguments, taken from the process when None.
 
     Returns:
-        Zero when the run passed every condition, one when it did not.
+        Zero when the run passed every condition, one when it did not, and
+        two when ``verdict`` was refused because it names no earlier run.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("run", "verdict", "rehearse"))
-    parser.add_argument("--home", default=os.environ.get("AGENT_PARLEY_HOME"))
-    parser.add_argument("--workspace", default="")
     parser.add_argument(
-        "--cli", default=str(Path(sys.executable).with_name("agent-parley"))
+        "command",
+        choices=("run", "verdict", "rehearse"),
+        help="run a period, re-decide a finished run, or rehearse one",
     )
-    parser.add_argument("--hours", type=float, default=HOURS)
-    parser.add_argument("--interval", type=float, default=INTERVAL)
-    parser.add_argument("--issues", type=int, default=BACKLOG)
-    parser.add_argument("--lane", action="append", default=[])
-    parser.add_argument("--trust", action="store_true")
+    parser.add_argument(
+        "--home",
+        default=os.environ.get("AGENT_PARLEY_HOME"),
+        help="private state home of the run; default AGENT_PARLEY_HOME",
+    )
+    parser.add_argument(
+        "--workspace",
+        default="",
+        help=(
+            f"run directory; run and rehearse default to a new "
+            f"{ROOT}/run-<timestamp>, verdict requires it"
+        ),
+    )
+    parser.add_argument(
+        "--cli",
+        default=str(Path(sys.executable).with_name("agent-parley")),
+        help="agent-parley executable; default beside this interpreter",
+    )
+    parser.add_argument(
+        "--hours",
+        type=float,
+        default=HOURS,
+        help=f"length of the unattended period; default {HOURS:g}",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=INTERVAL,
+        help=f"seconds between frames; default {INTERVAL:g}",
+    )
+    parser.add_argument(
+        "--issues",
+        type=int,
+        default=BACKLOG,
+        help=f"backlog tasks seeded; default {BACKLOG}",
+    )
+    parser.add_argument(
+        "--lane",
+        action="append",
+        default=[],
+        metavar="NAME:PROVIDER[:PROFILE]",
+        help="one lane, repeatable; default the eight standard lanes",
+    )
+    parser.add_argument(
+        "--trust",
+        action="store_true",
+        help="record the seeded directories in the clients' trust records",
+    )
     arguments = parser.parse_args(argv)
     if not arguments.home:
         parser.error("--home or AGENT_PARLEY_HOME is required")
     home = Path(arguments.home).expanduser()
     lanes = arguments.lane or list(LANES)
-    repo = Path(
-        arguments.workspace or ROOT / f"run-{time.strftime('%Y%m%d-%H%M%S')}"
-    ).expanduser()
+    if arguments.command == "verdict":
+        try:
+            repo = finished(arguments.workspace)
+        except BridgeError as exc:
+            sys.stderr.write(f"acceptance.py: {refusal(exc)}\n")
+            return 2
+    else:
+        repo = Path(
+            arguments.workspace
+            or ROOT / f"run-{time.strftime('%Y%m%d-%H%M%S')}"
+        ).expanduser()
     frames = repo / "acceptance" / "frames.jsonl"
     if arguments.command == "rehearse":
         workspace(repo, arguments.issues)
