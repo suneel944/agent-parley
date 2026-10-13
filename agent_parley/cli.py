@@ -3099,7 +3099,9 @@ class Bridge(
         rows = reclaim.relocations(directory, manifest)
         if not apply:
             return rows
-        return [reclaim.relocate(manifest["root"], row) for row in rows]
+        return [
+            reclaim.relocate(manifest["root"], directory, row) for row in rows
+        ]
 
 
 COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -4528,6 +4530,29 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "each worktree's size on disk; the default."
         ),
     )
+    sweeping.add_argument(
+        "--preserved",
+        action="store_true",
+        help=(
+            "List the recovery checkpoints written before a sweep removed "
+            "or rebuilt a worktree, with each one's source path and age."
+        ),
+    )
+    sweeping.add_argument(
+        "--restore",
+        default="",
+        metavar="ID",
+        help=(
+            "Recreate the worktree a preserved checkpoint holds, its "
+            "branch head and staged and unstaged changes, at --to PATH."
+        ),
+    )
+    collecting.add_argument(
+        "--to",
+        type=Path,
+        metavar="PATH",
+        help="With --restore, the path the worktree is recreated at.",
+    )
     collecting.add_argument(
         "--force",
         action="store_true",
@@ -5925,6 +5950,41 @@ def main() -> int:
                 parser.error("--force needs --apply.")
             if args.yes and not args.project:
                 parser.error("--yes needs --project.")
+            if bool(args.restore) != bool(args.to):
+                parser.error("--restore and --to need each other.")
+            if args.preserved or args.restore:
+                from agent_parley import recovery
+
+                _, directory = bridge.project(args.repo.resolve(), create=False)
+                if args.restore:
+                    restored = recovery.restore_preserved(
+                        directory,
+                        Path(roster.read(directory)["root"]),
+                        args.restore,
+                        args.to.absolute(),
+                    )
+                    print(
+                        views.render("gc", {"restored": restored})
+                        if args.json
+                        else f"Restored {args.restore} to "
+                        f"{restored['restored_to']}"
+                    )
+                    return 0
+                kept = recovery.preserved(directory)
+                listed = []
+                for saved in kept:
+                    age = time.time() - float(saved.get("captured_at") or 0)
+                    listed.append(
+                        f"{saved['id']}: {saved.get('source_worktree')} "
+                        f"({saved.get('branch') or 'detached'}), "
+                        f"{age / 3600:.1f} hours old"
+                    )
+                print(
+                    views.render("gc", {"preserved": kept})
+                    if args.json
+                    else "\n".join(listed) or "No preserved worktree."
+                )
+                return 0
             if args.project:
                 if args.force:
                     parser.error("--force does not apply to --project.")

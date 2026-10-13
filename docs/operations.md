@@ -2724,15 +2724,25 @@ lane runs a session or any process works inside, one
 whose directory, Git index or HEAD changed within the last hour, reported as
 `it changed within the relocation grace period` because a session working
 from the base checkout edits it without entering it, and one Git refuses to
-move, such as a move across filesystems, stay in place and
+move stay in place and
 are reported; one Git refused is then assessed in place by the same rule.
+Git cannot rename a worktree across filesystems, such as out of a `tmpfs`
+`/tmp`, so one on another filesystem than its destination is reported as
+`it sits on another filesystem than its destination` and rebuilt instead:
+a recovery checkpoint of it is written first, and only then is it
+force-removed and added again at the destination with its branch head and
+staged, unstaged and untracked changes. A checkpoint that fails removes
+nothing; one holding ignored files other than regenerable tool output stays
+in place with reason `it holds files Git does not track elsewhere`; a rebuild
+that fails after the removal names the checkpoint and its restore command.
 The base checkout, the lanes themselves and spares are never moved. The
 moves are published under `relocations` in `reclaim.json`; `agent-parley gc`
 lists them as `to move to` without `--apply`, performs them with it, and
 `--json` carries them as `relocations`. `reclaim.json` describes only the
 latest sweep, so the service also writes one `reclaim` line to `server.log`
-for every worktree a sweep moved, every move Git refused and every lane or
-worktree it removed. The log's rotation into `server.log.1` keeps that record
+for every worktree a sweep moved, every lane or worktree it removed, and
+every refused move the previous sweep did not already report for the same
+worktree and reason. The log's rotation into `server.log.1` keeps that record
 after later sweeps find nothing left to do.
 
 A worktree moved underneath Agent Parley, by the sweep or by the operator,
@@ -2768,6 +2778,16 @@ checkout through another branch`, and it is removed with an ordinary
 `git worktree remove` only after a recovery checkpoint bundle of it is
 written, so its commits stay recoverable. A checkpoint that fails removes
 nothing, and its branch is kept.
+
+Every removal that wrote a checkpoint prints the command that puts the
+worktree back. `agent-parley gc --preserved` lists each preserved worktree
+with its checkpoint id, source path, branch and age, and `agent-parley gc
+--restore ID --to PATH` recreates it at `PATH`, which must not exist: on its
+branch when the branch still points at the saved head, on a new branch of
+that name when it is gone, and detached otherwise, with its staged, unstaged
+and untracked changes. Preserved checkpoints are kept for
+`PRESERVED_RETENTION`, 30 days, after their capture; the sweep then deletes
+them.
 
 `agent-parley gc`, `gc --dry-run` and its alias `agent-parley reclaim`
 without `--apply` add each worktree's size on disk.
