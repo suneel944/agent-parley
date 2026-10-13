@@ -1000,8 +1000,8 @@ and recorded as exhausted, so unknown prior use never reads as none.
 
 **Resume and reset.** Raising, removing or clearing a limit is an operator
 action. `budget enforce` and `budget resume` refuse to run when
-`AGENT_PARLEY_TOKEN` is set, as it is in a launched lane's environment, and no
-MCP tool changes the run budget. A lane's hook also denies a shell command that
+`AGENT_PARLEY_TOKEN` is set, as it is in a launched lane's environment, or
+when run from inside a lane worktree, and no MCP tool changes the run budget. A lane's hook also denies a shell command that
 runs `agent-parley budget enforce` or `budget resume`, so unsetting the
 variable in the same command does not slip past. Nothing here is enforcement:
 both refusals only prevent accidental use from a lane, are not an authority

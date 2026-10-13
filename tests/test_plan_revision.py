@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from agent_parley import cli, issues, lifecycle, plan, state
+from agent_parley import cli, issues, lifecycle, plan, state, store
 from agent_parley.state import BridgeError
 
 ENVELOPED = """
@@ -617,6 +617,30 @@ def test_a_lane_cannot_propose_from_a_peer_worktree(
     assert ledger(bridge, repo)["43"]["blocked_by"] == ["17"]
     record = proposed(bridge, paired["lanes"]["codex"], base, add=["43:42"])
     assert record["by"] == "codex"
+
+
+def test_a_lane_token_cannot_propose_from_a_peer_worktree_anywhere(
+    bridge, repo, paired, monkeypatch, tmp_path
+):
+    base = applied(bridge, repo)
+    store.initialize(bridge.home)
+    display = paired["participants"]["claude"]["display"]
+    token = store.register(bridge.home, paired["root"], display)[
+        "registration_token"
+    ]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", token)
+    with pytest.raises(BridgeError, match="claude cannot propose from codex"):
+        proposed(bridge, paired["lanes"]["codex"], base, add=["43:42"])
+    assert ledger(bridge, repo)["43"]["blocked_by"] == ["17"]
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "unknown-token")
+    with pytest.raises(BridgeError, match="names no participant"):
+        proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", token)
+    record = proposed(bridge, paired["lanes"]["claude"], base, add=["43:42"])
+    assert record["by"] == "claude"
 
 
 def test_a_replay_after_retention_drops_the_record_changes_nothing(
