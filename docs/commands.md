@@ -201,8 +201,12 @@ without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 The commands that change something print their outcome the same way with
 `--json`: `up`, `down`, `setup`, `run`, `say`, `decide`, `mail send`,
 `mail cancel`, `approve`, `reject`, `report review`, `problems ack`,
-`plan propose`, `plan approve`, `plan reject`,
-`notify test` and `gc`. `top --json` prints one frame and exits;
+`plan propose`, `plan approve`, `plan reject`, `issue resolve`,
+`issue recover`, `provider add`, `credentials add`,
+`notify test` and `gc`. Without `--json`, `setup`, `issue resolve`,
+`issue recover`, `provider add` and `credentials add` print a short
+confirmation, with the next command where one applies; `--json` is the stable
+machine form. `top --json` prints one frame and exits;
 `metrics --json` prints the same values as its Prometheus text.
 The document carries the identifiers the table abbreviates — offer, message and
 thread IDs — with every time in RFC 3339, and no credential value. A pending

@@ -654,6 +654,138 @@ def credential_detail(name: str, entry: dict) -> dict:
     return shown
 
 
+def setup_text(manifest: dict) -> str:
+    """Confirms a registered project in two lines a reader can act on.
+
+    Args:
+        manifest: Project manifest ``setup`` created or verified.
+
+    Returns:
+        The common root, the abbreviated base commit and the selected forge,
+        then the command that starts the first lane.
+    """
+    return (
+        f"Registered {manifest['root']} at {manifest['base'][:12]}. "
+        f"Forge: {manifest.get('forge') or 'none'}.\n"
+        "Next: agent-parley run claude"
+    )
+
+
+def _settings(entry: dict) -> list[str]:
+    """Names the environment a definition sets and requires, never values."""
+    shown = []
+    if names := sorted(entry.get("env") or {}):
+        shown.append(f"sets {', '.join(names)}")
+    if required := list(entry.get("require_env") or []):
+        shown.append(f"requires {', '.join(required)}")
+    return shown
+
+
+def credential_text(name: str, entry: dict) -> str:
+    """Confirms one defined account profile without printing its values.
+
+    Args:
+        name: Profile name used by ``run --credentials``.
+        entry: Stored profile.
+
+    Returns:
+        One sentence naming the config home and the environment variables
+        the profile sets and requires, then the command that launches with
+        it.
+    """
+    parts = [f"config home {entry['home']}"] if entry.get("home") else []
+    parts += _settings(entry)
+    detail = f" ({'; '.join(parts)})" if parts else ""
+    return (
+        f"Defined credential profile {name}{detail}.\n"
+        f"Next: agent-parley run claude --credentials {name}"
+    )
+
+
+def provider_text(name: str, entry: dict) -> str:
+    """Confirms one defined provider in a sentence and a next command.
+
+    Args:
+        name: Provider name used by ``run --provider``.
+        entry: Stored provider definition.
+
+    Returns:
+        The adapter and executable the provider launches, the environment
+        variables it sets and requires, then the command that prints it.
+    """
+    parts = [f"{entry['adapter']} adapter", f"runs {entry['command']}"]
+    parts += _settings(entry)
+    return (
+        f"Defined provider {name} ({'; '.join(parts)}).\n"
+        f"Next: agent-parley provider show {name}"
+    )
+
+
+def resolution(result: dict) -> dict:
+    """Reports an operator resolution with its observation time in RFC 3339.
+
+    Args:
+        result: Outcome ``issue resolve`` returned.
+
+    Returns:
+        The same fields, with the forge evidence's ``observed_at`` rendered
+        the way every other document renders a time.
+    """
+    evidence = dict(result.get("evidence") or {})
+    if "observed_at" in evidence:
+        evidence["observed_at"] = timestamp(evidence["observed_at"])
+    return {**result, "evidence": evidence}
+
+
+def resolution_text(result: dict) -> str:
+    """Says what ``issue resolve`` ended, on which forge evidence.
+
+    Args:
+        result: Outcome ``issue resolve`` returned.
+
+    Returns:
+        One sentence naming the issue, the outcome recorded, the former
+        holder and the pull request state, then the command that shows it.
+    """
+    evidence = result.get("evidence") or {}
+    ended = (
+        "returned to the queue"
+        if result["outcome"] == "release"
+        else "recorded complete"
+    )
+    return (
+        f"Resolved issue #{result['issue']}: {ended}, ending "
+        f"{result['holder']}'s claim on {evidence.get('branch', '')} "
+        f"({str(evidence.get('state', '')).lower()}).\n"
+        f"Next: agent-parley issue show {result['issue']}"
+    )
+
+
+def recovery(approval: dict) -> dict:
+    """Reports a recovery approval with its approval time in RFC 3339."""
+    return {
+        **approval,
+        "authorized_at": timestamp(approval.get("authorized_at")),
+    }
+
+
+def recovery_text(approval: dict) -> str:
+    """Says which live claim ``issue recover`` approved stopping.
+
+    Args:
+        approval: Approval ``issue recover`` recorded.
+
+    Returns:
+        One sentence naming the issue and its owner, and that the approval
+        alone moves nothing until a matching capacity observation arrives.
+    """
+    return (
+        f"Recovery approved for issue #{approval['issue']}: "
+        f"{approval['owner']}'s claim stops once a matching capacity "
+        "observation is published; nothing has moved yet."
+    )
+
+
 def _count(value: object) -> int | None:
     """Reports a mail count, or None where the mailbox could not be read."""
     return value if isinstance(value, int) else None

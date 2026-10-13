@@ -1780,7 +1780,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `plan`, `plan_diff`, `plan_proposals`, `plan_revision`, `approval`, `verify`, `init`, `pool`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show` or `error`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `plan`, `plan_diff`, `plan_proposals`, `plan_revision`, `approval`, `verify`, `init`, `pool`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show`, `issue_resolve`, `issue_recover` or `error`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -1813,7 +1813,16 @@ carries the same reading as each project's `spares`.
 `config_home`, `env` as `NAME=<redacted>` entries and `require_env`: no
 recorded value is printed. A profile that sets none of the three also reports
 `account` as `selects no account`. `problems ack --json` reports the message `id` and
-the `participants` the acknowledgement was recorded for.
+the `participants` the acknowledgement was recorded for. `provider add --json`
+and `credentials add --json` report the whole `providers` or `credentials`
+registry the definition joined. `issue resolve --json` reports `issue`,
+`outcome` (`complete` or `release`), the former `holder`, the resulting
+`owner` and execution `state`, and the forge `evidence` it acted on.
+`issue recover --json` reports the approval `id`, `issue`, `claim_id`, `owner`,
+the live session it is bound to as `session_id`, `session_pid` and
+`session_ticks`, `reason`, `authorized_by` and `authorized_at`. Without `--json`
+these commands, and `setup`, print a short confirmation, with the next
+command where one applies; `--json` is the stable machine form.
 
 `issue next --json` reports the reading lane as `participant`, its `provider`,
 `forge_paths` stating whether the forge answered with any paths at all, and

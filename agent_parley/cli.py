@@ -4519,6 +4519,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         required=True,
         help="Operator rationale persisted with this exact claim approval.",
     )
+    recovering.add_argument("--json", action="store_true", help=JSON_HELP)
     resolving = actions.add_parser(
         "resolve",
         help=(
@@ -4545,6 +4546,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "because nothing was integrated."
         ),
     )
+    resolving.add_argument("--json", action="store_true", help=JSON_HELP)
     choosing = actions.add_parser(
         "next",
         help=(
@@ -5787,6 +5789,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         metavar="NAME",
         help="Variable the launching shell must export; repeatable.",
     )
+    defining.add_argument("--json", action="store_true", help=JSON_HELP)
     capping = definitions.add_parser(
         "budget",
         help=(
@@ -5841,6 +5844,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         metavar="NAME",
         help="Variable the launching shell must export; repeatable.",
     )
+    profile.add_argument("--json", action="store_true", help=JSON_HELP)
     parser.epilog = command_help(commands)
 
 
@@ -6206,7 +6210,7 @@ def main() -> int:
             print(
                 views.render("setup", registered)
                 if args.json
-                else json.dumps(registered, indent=2)
+                else views.setup_text(registered)
             )
         elif args.command == "run":
             status = bridge.launch(
@@ -6346,12 +6350,20 @@ def main() -> int:
                 reason=args.reason,
                 release=args.release,
             )
-            print(json.dumps(ended, indent=2))
+            print(
+                views.render("issue_resolve", views.resolution(ended))
+                if args.json
+                else views.resolution_text(ended)
+            )
         elif args.command == "issue" and args.action == "recover":
             approved = bridge.authorize_recovery(
                 args.repo.resolve(), args.number, args.reason
             )
-            print(json.dumps(approved, indent=2))
+            print(
+                views.render("issue_recover", views.recovery(approved))
+                if args.json
+                else views.recovery_text(approved)
+            )
         elif args.command == "issue":
             result = bridge.issue(
                 args.repo.resolve(),
@@ -7060,6 +7072,8 @@ def main() -> int:
                     },
                 )
                 if getattr(args, "json", False)
+                else views.provider_text(args.name, defined[args.name])
+                if args.action == "add"
                 else json.dumps(defined, indent=2)
             )
         elif args.command == "credentials":
@@ -7090,6 +7104,10 @@ def main() -> int:
                     },
                 )
                 if getattr(args, "json", False)
+                else views.credential_text(
+                    args.name, roster.credential(bridge.home, args.name)
+                )
+                if args.action == "add"
                 else json.dumps(registered, indent=2)
             )
         else:
