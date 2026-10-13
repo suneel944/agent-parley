@@ -676,13 +676,15 @@ def waiters(state: dict, *, owned_only: bool = True) -> dict[str, list[str]]:
     issues = state.get("issues", {})
     for number in sorted(issues, key=int):
         record = issues[number]
-        if owned_only and not record.get("owner"):
-            continue
-        execution = lifecycle.state(record)
-        if not execution["authorized"] or (
-            execution["state"] == lifecycle.COMPLETE
-        ):
-            continue
+        if owned_only:
+            if not record.get("owner"):
+                continue
+        else:
+            execution = lifecycle.state(record)
+            if not execution["authorized"] or (
+                execution["state"] == lifecycle.COMPLETE
+            ):
+                continue
         for blocker in issues[number].get("blocked_by", []):
             waiting.setdefault(blocker, []).append(number)
     return waiting

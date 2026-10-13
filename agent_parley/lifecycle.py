@@ -223,7 +223,9 @@ def released(record: dict, closed: bool = False) -> dict:
     issue can still be taken.
 
     A claim blocked on a recorded external condition keeps that condition
-    when it is released: the work stays ``blocked`` with no owner and no
+    when it is released. `operator_blocked` decides which claims qualify,
+    so an older record with a string condition or no condition counts as
+    external here too. The work stays ``blocked`` with no owner and no
     claim generation, so neither a work offer nor `issue next` presents it
     as unblocked to the next lane, which would only rediscover the same
     unmet condition. A lane or operator that knows the condition is met
@@ -246,13 +248,7 @@ def released(record: dict, closed: bool = False) -> dict:
             "Ready work must remain claimed until verified integration "
             "completes."
         )
-    condition = execution.get("resume_when") or {}
-    if (
-        not closed
-        and execution["state"] == BLOCKED
-        and isinstance(condition, dict)
-        and condition.get("kind") == "external"
-    ):
+    if not closed and operator_blocked(record):
         execution.update(
             claim_id=None,
             next_action=_next_action(execution),

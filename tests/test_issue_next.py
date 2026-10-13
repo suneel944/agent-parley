@@ -264,6 +264,23 @@ def test_a_blocker_of_planned_work_ranks_above_an_isolated_issue():
     assert ranked[1]["reasons"] == ["no recorded dependency blocks it"]
 
 
+def test_default_waiters_count_every_owned_waiter():
+    ledger = {
+        "issues": {
+            "10": {"owner": None, "blocked_by": []},
+            "20": {"owner": "codex", "blocked_by": ["10"]},
+            "30": {
+                "owner": "claude",
+                "blocked_by": ["10"],
+                "execution": {"authorized": True, "state": "complete"},
+            },
+            "40": {"owner": None, "blocked_by": ["10"]},
+        }
+    }
+    assert issues.waiters(ledger) == {"10": ["20", "30"]}
+    assert issues.waiters(ledger, owned_only=False) == {"10": ["20"]}
+
+
 def test_nothing_free_reads_as_nothing_free():
     empty = {"provider": "claude", "forge_paths": False, "candidates": []}
     assert recommend.render(empty) == (
