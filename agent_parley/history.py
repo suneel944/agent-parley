@@ -183,7 +183,7 @@ def _report_records(directory: Path, manifest: dict) -> list[dict]:
 
 def _store_records(home: Path, manifest: dict) -> list[dict]:
     """Reads reservations and mail for one project, correlated where known."""
-    if not (home / store.DATABASE).exists():
+    if not store.present(home):
         return []
     lanes = {
         participant["display"]: name

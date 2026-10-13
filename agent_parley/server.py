@@ -806,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ("/mcp/", HOOK_PATH):
             try:
                 actor = store.authenticate(self.server.home, token)
-            except sqlite3.Error:
+            except (sqlite3.Error, BridgeError):
                 self._reply(503)
                 return None
             if actor:
