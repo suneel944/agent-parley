@@ -312,27 +312,57 @@ def locate(screen: str) -> Frame | None:
     notice draws no options, so it must carry the client's own notice marker
     instead, which quoted text in a code block or a log does not.
 
+    A command, its description or scrollback above a prompt can carry the
+    words of another dialog, so the recognized text of an answerable dialog
+    must be the question drawn right above its own option list: option 1
+    follows it with no other question line between. When several dialogs
+    qualify, the one drawn nearest the footer is the one on screen, and
+    `DIALOGS` order breaks only a tie.
+
     Args:
         screen: Flattened screen text.
 
     Returns:
-        The first policy entry drawn in the dialog region, with the text that
+        The policy entry drawn last in the dialog region, with the text that
         draws it, or None.
     """
     region = screen[-REGION_CHARS:]
+    best: Frame | None = None
+    best_start = -1
     for dialog in DIALOGS:
-        found = dialog.pattern.search(region)
-        if found is None:
-            continue
-        if not dialog.framed:
-            return Frame(dialog, region[found.start() :])
-        start = found.start()
-        if dialog.name == QUESTION:
-            start = _picker_start(region, start)
-        text = region[start:]
-        if len(options(text)) >= 2 and FOOTER.search(text[-FOOTER_CHARS:]):
-            return Frame(dialog, text)
-    return None
+        for found in dialog.pattern.finditer(region):
+            if not dialog.framed:
+                return Frame(dialog, region[found.start() :])
+            start = found.start()
+            if dialog.name == QUESTION:
+                start = _picker_start(region, start)
+            elif not _heads_options(region, found.end()):
+                continue
+            text = region[start:]
+            if (
+                start > best_start
+                and len(options(text)) >= 2
+                and FOOTER.search(text[-FOOTER_CHARS:])
+            ):
+                best, best_start = Frame(dialog, text), start
+    return best
+
+
+def _heads_options(region: str, end: int) -> bool:
+    """Reports whether recognized text is the question over an option list.
+
+    Args:
+        region: Dialog region of the screen.
+        end: Offset where the recognized text ends.
+
+    Returns:
+        True when the next option drawn after the text is option 1 and no
+        other question line sits between them.
+    """
+    first = OPTION.search(region, end)
+    if first is None or first.group(1) != "1":
+        return False
+    return QUESTION_LINE.search(region, end, first.start()) is None
 
 
 def match(screen: str) -> Dialog | None:
@@ -413,16 +443,21 @@ def _comparable(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
-def keys(screen: str, answer: str) -> bytes:
+def keys(screen: str, answer: str, *, allow_widening: bool = False) -> bytes:
     """Returns the keystrokes that choose an offered option by its text.
 
     The configured answer names option text rather than a position, because
     the clients reorder and add options between versions. An exact label wins
-    over a longer label the answer only begins.
+    over a longer label the answer only begins. A label that widens a
+    permission is chosen only by its exact text, because a client that drops
+    the plain label or draws the widening one first would otherwise turn a
+    configured `Yes` into "don't ask again".
 
     Args:
         screen: Flattened screen text.
         answer: Option text the operator configured for this dialog.
+        allow_widening: Whether a widening label may also match by prefix,
+            for an answer the operator already confirmed on that label.
 
     Returns:
         The option's digit and a carriage return, which is what an operator
@@ -436,6 +471,8 @@ def keys(screen: str, answer: str) -> bytes:
         if _comparable(label) == wanted:
             return f"{number}\r".encode()
     for number, label in offered.items():
+        if not allow_widening and WIDENING.search(label):
+            continue
         if _comparable(label).startswith(wanted):
             return f"{number}\r".encode()
     return b""
@@ -737,7 +774,8 @@ def requested_command(screen: str, text: str, data: bytes) -> str:
     approval; the operator answering from a notice, and a later wake of a
     lane whose session ended at the prompt, need the command itself. A
     shell prompt's command rows are read as `_shell_rows` reads them, and
-    any other prompt yields the text drawn above its question.
+    any other prompt yields the text drawn above its question since the
+    footer of any dialog drawn before it.
 
     Args:
         screen: Flattened screen text.
@@ -752,6 +790,9 @@ def requested_command(screen: str, text: str, data: bytes) -> str:
     if not shown:
         region = screen[-REGION_CHARS:]
         head = region[: max(0, len(region) - len(text))]
+        footers = list(FOOTER.finditer(head))
+        if footers:
+            head = head[footers[-1].end() :]
         shown = " ".join(BOX.sub(" ", head).split())
     return shown[-COMMAND_CHARS:]
 
@@ -964,10 +1005,24 @@ class Watch:
         )
 
     def _describe(self, screen: str, found: Frame | None) -> str:
-        """Names the screen so a redraw of it compares equal to itself."""
+        """Names the screen so a redraw of it compares equal to itself.
+
+        A dialog is named by its question and options, and a permission
+        prompt also by the command it asks to run, so a prompt for another
+        command that offers the same options is a different screen: the
+        decision opened for the first is retired rather than pressed on it.
+        """
         if found is not None:
+            command = ""
+            if found.dialog.name == PERMISSION:
+                command = requested_command(screen, found.text, self._tail)
             return "\x00".join(
-                (found.dialog.name, *options(found.text).values())
+                (
+                    found.dialog.name,
+                    question(found.text),
+                    command,
+                    *options(found.text).values(),
+                )
             )
         if prompted(screen):
             return "prompt\x00" + screen[-SIGNATURE_CHARS:]
@@ -1191,7 +1246,7 @@ class Watch:
         if record.get("state") != decisions.ANSWERED:
             return b""
         answer = str(record.get("answer", ""))
-        pressed = keys(found.text, answer)
+        pressed = keys(found.text, answer, allow_widening=True)
         if not pressed:
             self._retire()
             return b""

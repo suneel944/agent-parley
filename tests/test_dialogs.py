@@ -623,7 +623,8 @@ def test_a_mouse_or_cursor_report_does_not_answer_a_held_dialog(report):
             os.waitpid(pid, 0)
 
 
-def test_an_operator_digit_still_answers_a_held_dialog():
+@pytest.mark.parametrize("key", [b"1", b"\x1b", b"\x03"])
+def test_an_operator_digit_esc_or_interrupt_releases_a_held_dialog(key):
     with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
         directory = Path(temporary)
         (directory / "lane").mkdir()
@@ -638,7 +639,7 @@ def test_an_operator_digit_still_answers_a_held_dialog():
             os.write(master, b"\x1b[I")
             marked(master, b"DRAWN")
             assert published(directory)["dialog"]["name"] == "hook-review"
-            os.write(master, b"1")
+            os.write(master, key)
             deadline = time.monotonic() + 10
             state = {}
             while time.monotonic() < deadline:
@@ -1244,3 +1245,95 @@ def test_an_unreadable_prompt_is_named_terminal_only(tmp_path, delivered):
     [fields] = delivered
     assert "decision" not in fields
     assert fields["detail"].startswith(dialogs.TERMINAL_ONLY)
+
+
+MISE_TRUST = (
+    "\x1b[2J ╭──────────╮\r\n│ Bash command │\r\n│   mise trust .\r\n"
+    "│   Trust the mise config so tools in this directory load?\r\n│\r\n"
+    "│ Do you want to proceed?\r\n│ ❯ 1. Yes\r\n│   2. Yes, and don't ask "
+    "again for mise trust commands in /home/operator/lane\r\n│   3. No\r\n"
+    "Esc to cancel · Tab to amend"
+)
+
+
+@pytest.mark.parametrize(
+    ("screen", "command"),
+    [
+        (MISE_TRUST, "mise trust ."),
+        (
+            "● Should the launcher trust a lane directory it did not create?"
+            "\r\n" + _shell_prompt("rm -rf build"),
+            "rm -rf build",
+        ),
+        (_shell_prompt("echo hooks need review"), "echo hooks need review"),
+    ],
+)
+def test_dialog_wording_around_a_permission_prompt_is_not_that_dialog(
+    tmp_path, delivered, screen, command
+):
+    """Never presses a trust or hook answer on a tool permission prompt."""
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    answers = {"directory-trust": "Yes", "hook-review": "Trust all"}
+    watch = dialogs.Watch(tmp_path, "lane", answers, bridge=False)
+    found = dialogs.match(dialogs.flatten(screen.encode()))
+    assert found is not None
+    assert found.name == dialogs.PERMISSION
+    assert watch.advance(screen.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    record = json.loads((tmp_path / "lane-activity.json").read_text())
+    record = record["dialog"]
+    assert record["name"] == dialogs.PERMISSION
+    assert dialogs.lane_cause(record) == lanes.APPROVAL
+    assert record["command"].startswith(command)
+    [decision] = decisions.list_open(tmp_path)
+    [widening] = decision["confirm"]
+    assert widening.startswith("Yes, and don't ask again")
+
+
+def test_a_decision_is_never_pressed_on_another_commands_prompt(
+    tmp_path, delivered
+):
+    """Retires an answer for one command when another command is drawn."""
+    prompt = " Do you want to proceed? ❯ 1. Yes 2. No Esc to cancel "
+    first = "  ls build " + prompt
+    second = "  rm -rf ~/.ssh " + prompt
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(first.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    assert "ls build" in record["detail"]
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    assert watch.advance(second.encode(), 1.0) == b""
+    assert watch.advance(b"", 1.5) == b""
+    assert decisions.get(tmp_path, record["id"])["state"] == decisions.STALE
+    [fresh] = decisions.list_open(tmp_path)
+    assert "rm -rf ~/.ssh" in fresh["detail"]
+    assert "ls build" not in fresh["detail"]
+
+
+DRIFTED_PERMISSION = (
+    "  make test  Do you want to proceed? ❯ 1. Yes, and don't ask again for "
+    "make commands 2. No Esc to cancel "
+)
+
+
+def test_a_configured_answer_never_widens_a_permission_by_prefix(
+    tmp_path, delivered
+):
+    """Escalates when the only option the answer begins widens it."""
+    reordered = dialogs.flatten(
+        DRIFTED_PERMISSION.replace("2. No", "2. Yes, allow once 3. No").encode()
+    )
+    assert dialogs.keys(reordered, "Yes") == b"2\r"
+    screen = dialogs.flatten(DRIFTED_PERMISSION.encode())
+    assert dialogs.keys(screen, "Yes") == b""
+    assert dialogs.keys(screen, "Yes", allow_widening=True) == b"1\r"
+    exact = "Yes, and don't ask again for make commands"
+    assert dialogs.keys(screen, exact) == b"1\r"
+    watch = dialogs.Watch(tmp_path, "lane", {"tool-permission": "Yes"})
+    assert watch.advance(DRIFTED_PERMISSION.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    [record] = decisions.list_open(tmp_path)
+    assert record["options"][0].startswith("Yes, and don't ask again")
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
