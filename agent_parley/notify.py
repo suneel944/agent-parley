@@ -259,20 +259,36 @@ def reported(values: Mapping[str, str]) -> dict:
     except BridgeError as exc:
         return {"enabled": True, "transports": [], "fault": str(exc)}
     telegram = config["telegram"]
-    fault = ""
+    faults = []
     if "telegram" in config["transports"] and not (
         telegram["token"] and telegram["chat"]
     ):
-        fault = (
+        faults.append(
             "Telegram needs AGENT_PARLEY_TELEGRAM_TOKEN and "
             "AGENT_PARLEY_TELEGRAM_CHAT; run `agent-parley notify setup`."
         )
-    if not fault and "webhook" in config["transports"]:
-        fault = webhook_fault(config["webhook"]["url"])
+    if "email" in config["transports"]:
+        mail = config["email"]
+        missing = [
+            name
+            for name, value in (
+                ("AGENT_PARLEY_SMTP_HOST", mail["host"]),
+                ("AGENT_PARLEY_SMTP_FROM", mail["sender"]),
+                ("AGENT_PARLEY_SMTP_TO", mail["recipients"]),
+            )
+            if not value
+        ]
+        if missing:
+            names = missing[-1]
+            if len(missing) > 1:
+                names = ", ".join(missing[:-1]) + " and " + names
+            faults.append(f"Email needs {names}.")
+    if "webhook" in config["transports"]:
+        faults.append(webhook_fault(config["webhook"]["url"]))
     return {
         "enabled": True,
         "transports": config["transports"],
-        "fault": fault,
+        "fault": "; ".join(fault for fault in faults if fault),
     }
 
 
