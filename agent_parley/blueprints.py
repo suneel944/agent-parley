@@ -38,6 +38,12 @@ launched lane inherits minus its coordination token, plus
 verification gate stay the only way into the base, and a blueprint cannot
 remove that gate. Progress is recorded per claim in the project's coordination
 directory, and a claim with no run recorded behaves exactly as before.
+
+The package ships starter blueprints under `TEMPLATES`, listed by
+`blueprint templates` and recorded with `blueprint set NAME --template T`.
+Their ``run`` nodes hold the `VERIFY` placeholder, filled from ``--verify``
+or the project's verification command, and the result passes through the
+same `parse` limits as a hand-written file.
 """
 
 from __future__ import annotations
@@ -45,9 +51,11 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
 import threading
 import time
+from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -78,6 +86,15 @@ MAX_RETRIES = 20
 MAX_TEXT = 4000
 MAX_VISITS = 200
 """Node visits one run may make, which ends a cycle of passing nodes."""
+
+TEMPLATES = "blueprint_templates"
+"""Package folder holding the starter blueprints, one JSON file each."""
+
+VERIFY = "{verify}"
+"""Template ``run`` command token replaced by the verification command."""
+
+STOP_GRACE = 5
+"""Seconds a timed-out node's process group gets between SIGTERM and kill."""
 
 TAIL_LINES = 40
 TAIL_CHARS = 2000
@@ -216,21 +233,110 @@ def _node(entry: object) -> dict:
     return node
 
 
-def define(bridge: Bridge, repo: Path, name: str, path: Path | None) -> str:
+def templates() -> dict[str, dict]:
+    """Reads the starter blueprints shipped in the package.
+
+    Returns:
+        Each template's name mapped to its document: a one-line
+        ``description`` and the ``nodes``, whose ``run`` commands may hold
+        the `VERIFY` placeholder.
+    """
+    folder = resources.files("agent_parley") / TEMPLATES
+    return {
+        entry.name.removesuffix(".json"): json.loads(entry.read_text())
+        for entry in sorted(folder.iterdir(), key=lambda entry: entry.name)
+        if entry.name.endswith(".json")
+    }
+
+
+def catalog(as_json: bool = False) -> str:
+    """Lists the shipped starter blueprints.
+
+    Args:
+        as_json: Whether to return a JSON list instead of text lines.
+
+    Returns:
+        One ``name: description`` line per template, or a JSON list of
+        objects with ``name`` and ``description``.
+    """
+    rows = [
+        {"name": key, "description": document["description"]}
+        for key, document in templates().items()
+    ]
+    if as_json:
+        return json.dumps(rows, indent=2)
+    return "\n".join(f"{row['name']}: {row['description']}" for row in rows)
+
+
+def filled(template: str, verify: list[str]) -> str:
+    """Renders a starter blueprint with the verification command filled in.
+
+    Args:
+        template: Shipped template name.
+        verify: Verification command tokens that replace the `VERIFY`
+            placeholder in ``run`` commands.
+
+    Returns:
+        Blueprint text for `parse`.
+
+    Raises:
+        BridgeError: If the template is unknown, or it runs the
+            verification command and none is given.
+    """
+    shipped = templates()
+    if template not in shipped:
+        raise BridgeError(
+            f"No blueprint template named {template!r}; run agent-parley "
+            "blueprint templates."
+        )
+    nodes = shipped[template]["nodes"]
+    for node in nodes:
+        if node["kind"] != "run" or VERIFY not in node["command"]:
+            continue
+        if not verify:
+            raise BridgeError(
+                f"Template {template} runs the verification command; "
+                "pass --verify CMD or record one with agent-parley "
+                "verify set CMD."
+            )
+        node["command"] = [
+            token
+            for part in node["command"]
+            for token in (verify if part == VERIFY else [part])
+        ]
+    return json.dumps({"nodes": nodes})
+
+
+def define(
+    bridge: Bridge,
+    repo: Path,
+    name: str,
+    path: Path | None,
+    template: str | None = None,
+    verify: str | None = None,
+) -> str:
     """Records, replaces or removes one named blueprint.
+
+    A blueprint recorded from a starter template remembers the template's
+    name, which `describe` shows; recording from a file clears it.
 
     Args:
         bridge: Coordination runtime owning the project state.
         repo: Any checkout of the target repository, outside every lane.
         name: Blueprint name.
-        path: Blueprint file to record, or None to remove the blueprint.
+        path: Blueprint file to record, or None to record ``template`` or,
+            without one, to remove the blueprint.
+        template: Shipped starter blueprint to record instead of a file.
+        verify: Command line filling the template's verification step; the
+            project's recorded verification command when omitted.
 
     Returns:
         An account of the change.
 
     Raises:
         BridgeError: If the command runs from a lane, the file cannot be
-            read, or the blueprint is invalid or unknown.
+            read, the template is unknown or lacks a verification command,
+            or the blueprint is invalid or unknown.
     """
     root, directory = bridge.project(repo, create=False)
     data = roster.read(directory)
@@ -239,6 +345,10 @@ def define(bridge: Bridge, repo: Path, name: str, path: Path | None) -> str:
         raise BridgeError(
             "Blueprint names use 1-64 letters, digits and hyphens."
         )
+    if path is not None and template is not None:
+        raise BridgeError("Record a blueprint from a FILE or a --template.")
+    if verify is not None and template is None:
+        raise BridgeError("--verify fills a --template only.")
     nodes = None
     if path is not None:
         try:
@@ -246,8 +356,20 @@ def define(bridge: Bridge, repo: Path, name: str, path: Path | None) -> str:
         except OSError as exc:
             raise BridgeError(f"Cannot read blueprint {path}: {exc}.") from None
         nodes = parse(text)
+    elif template is not None:
+        command = (
+            data["verify"]
+            if verify is None
+            else roster.verify_command(verify, "--verify")
+        )
+        nodes = parse(filled(template, command))
     with lock(directory / "setup.lock"):
         data = roster.read(directory)
+        sources = dict(data.get("blueprint_templates") or {})
+        sources.pop(name, None)
+        if template is not None:
+            sources[name] = template
+        data["blueprint_templates"] = sources
         stored = dict(data.get("blueprints") or {})
         labels = sorted(
             label
@@ -319,7 +441,9 @@ def describe(bridge: Bridge, repo: Path, name: str | None = None) -> str:
             f"No blueprint named {name!r}; run agent-parley blueprint list."
         )
     nodes = stored[name]
-    lines = [f"Blueprint {name}:"]
+    template = (data.get("blueprint_templates") or {}).get(name)
+    origin = f" (from template {template})" if template else ""
+    lines = [f"Blueprint {name}{origin}:"]
     for index, node in enumerate(nodes):
         following = node.get("next") or (
             nodes[index + 1]["name"] if index + 1 < len(nodes) else DONE
@@ -816,6 +940,11 @@ def _execute(
 ) -> bool:
     """Runs one deterministic node in the lane's worktree without a shell.
 
+    The command leads a session of its own, so a node past its timeout
+    stops as a whole process tree: gates are mostly wrappers such as
+    ``make check`` whose real work runs in grandchildren, and a survivor
+    would race the retry in the same worktree.
+
     Args:
         command: Argument tokens to run.
         lane: Worktree the command runs in.
@@ -833,27 +962,65 @@ def _execute(
     }
     environment["AGENT_PARLEY_BASE"] = str(root)
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=lane,
             env=environment,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
     except OSError as exc:
         run["output"] = f"`{shlex.join(command)}` could not run: {exc}"
         return False
+    try:
+        output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        run["output"] = f"`{shlex.join(command)}` ran past {timeout:g} seconds."
+        lines = _stop(process).splitlines()[-TAIL_LINES:]
+        run["output"] = (
+            f"`{shlex.join(command)}` ran past {timeout:g} seconds"
+            + (":\n" + "\n".join(lines)[-TAIL_CHARS:] if lines else ".")
+        )
         return False
-    lines = (result.stdout + result.stderr).splitlines()[-TAIL_LINES:]
+    lines = output.splitlines()[-TAIL_LINES:]
     run["output"] = (
-        f"`{shlex.join(command)}` exited {result.returncode}:\n"
+        f"`{shlex.join(command)}` exited {process.returncode}:\n"
         + "\n".join(lines)[-TAIL_CHARS:]
     )
-    return not result.returncode
+    return not process.returncode
+
+
+def _stop(process: subprocess.Popen[str]) -> str:
+    """Stops a timed-out node's whole process group and collects its output.
+
+    The group gets SIGTERM, then SIGKILL after `STOP_GRACE` seconds, so the
+    run records the failure or retries only once no descendant is left. A
+    host without process groups kills the direct child only.
+
+    Args:
+        process: Node command started as the leader of its own session.
+
+    Returns:
+        The output the group wrote before it stopped.
+    """
+    if not hasattr(os, "killpg"):
+        process.kill()
+        return process.communicate()[0] or ""
+    for signal_number, grace in (
+        (signal.SIGTERM, STOP_GRACE),
+        (signal.SIGKILL, None),
+    ):
+        try:
+            os.killpg(process.pid, signal_number)
+        except ProcessLookupError:
+            break
+        try:
+            return process.communicate(timeout=grace)[0] or ""
+        except subprocess.TimeoutExpired:
+            continue
+    return process.communicate()[0] or ""
 
 
 def _agent(

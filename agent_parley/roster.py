@@ -1285,6 +1285,11 @@ def normalize(manifest: dict) -> dict:
             if manifest.get("blueprint_defaults")
             else {}
         ),
+        **(
+            {"blueprint_templates": dict(manifest["blueprint_templates"])}
+            if manifest.get("blueprint_templates")
+            else {}
+        ),
         "supervision": project,
         "participants": participants,
     }

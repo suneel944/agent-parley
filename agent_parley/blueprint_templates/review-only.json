@@ -1,0 +1,15 @@
+{
+  "description": "Review the pull request linked to the issue and report.",
+  "nodes": [
+    {
+      "name": "review",
+      "kind": "agent",
+      "prompt": "Review the pull request linked to the claimed issue: read the diff and the issue, run what you need to check it, and change nothing. File a ready report whose summary lists your findings, or a blocked report naming what stops the review."
+    },
+    {
+      "name": "done",
+      "kind": "report",
+      "message": "Review reported."
+    }
+  ]
+}

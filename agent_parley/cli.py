@@ -5136,11 +5136,31 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "show", help="Show one blueprint node by node, or list them all."
     )
     blueprint_show.add_argument("name", nargs="?", metavar="NAME")
+    blueprint_templates = blueprint_actions.add_parser(
+        "templates", help="List the starter blueprints shipped with the tool."
+    )
+    blueprint_templates.add_argument(
+        "--json", action="store_true", help=JSON_HELP
+    )
     blueprint_set = blueprint_actions.add_parser(
-        "set", help="Record a blueprint from a JSON file. Base checkout only."
+        "set",
+        help="Record a blueprint from a JSON file or a starter template. "
+        "Base checkout only.",
     )
     blueprint_set.add_argument("name", metavar="NAME")
-    blueprint_set.add_argument("file", type=Path, metavar="FILE")
+    blueprint_source = blueprint_set.add_mutually_exclusive_group(required=True)
+    blueprint_source.add_argument("file", type=Path, nargs="?", metavar="FILE")
+    blueprint_source.add_argument(
+        "--template",
+        metavar="TEMPLATE",
+        help="Starter blueprint to record; see blueprint templates.",
+    )
+    blueprint_set.add_argument(
+        "--verify",
+        metavar="CMD",
+        help="Command the template's verify steps run; the project's "
+        "verification command when omitted.",
+    )
     blueprint_remove = blueprint_actions.add_parser(
         "remove", help="Remove a recorded blueprint. Base checkout only."
     )
@@ -6500,10 +6520,17 @@ def main() -> int:
         elif args.command == "blueprint":
             from agent_parley import blueprints
 
-            repository = args.repo.resolve()
-            if args.action == "set":
+            repository = getattr(args, "repo", Path.cwd()).resolve()
+            if args.action == "templates":
+                account = blueprints.catalog(args.json)
+            elif args.action == "set":
                 account = blueprints.define(
-                    bridge, repository, args.name, args.file
+                    bridge,
+                    repository,
+                    args.name,
+                    args.file,
+                    args.template,
+                    args.verify,
                 )
             elif args.action == "remove":
                 account = blueprints.define(bridge, repository, args.name, None)

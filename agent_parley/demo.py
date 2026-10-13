@@ -20,8 +20,10 @@ Every child is started in a session of its own, so a Ctrl-C at the terminal
 reaches only the demo and never interrupts a command half way through. The
 demo then waits for the command in flight, stops the service and the lanes,
 removes the sandbox and, where ``/proc`` is available, ends any process still
-working inside it. Cleanup runs with interrupts ignored, on success, on
-``q``, on Ctrl-C and on an exception alike.
+working inside it. SIGTERM and SIGHUP, as from ``timeout``, ``kill`` or a
+closed terminal, stop the demo the same way and exit 143 and 129. Cleanup
+runs with interrupts ignored, on success, on ``q``, on Ctrl-C, on those
+signals and on an exception alike.
 
 The sandbox is created under ``/tmp`` when that directory exists, because the
 per-user temporary directory on macOS is long enough to push a lane's control
@@ -848,6 +850,40 @@ def narrator(stream: TextIO) -> Callable[[Step | Card], None]:
     return say
 
 
+STOPS = (signal.SIGTERM, signal.SIGHUP)
+"""Termination signals the demo stops on as it does on Ctrl-C."""
+
+
+class Stopped(KeyboardInterrupt):
+    """A termination signal routed through the demo's interrupt path.
+
+    Attributes:
+        number: Signal that stopped the demo.
+    """
+
+    def __init__(self, number: int) -> None:
+        """Records the signal.
+
+        Args:
+            number: Signal that stopped the demo.
+        """
+        super().__init__(number)
+        self.number = number
+
+
+def _stopped(number: int, frame: object) -> None:
+    """Raises `Stopped` so a termination signal unwinds like Ctrl-C.
+
+    Args:
+        number: Signal received.
+        frame: Interrupted stack frame, unused.
+
+    Raises:
+        Stopped: Always.
+    """
+    raise Stopped(number)
+
+
 def sandbox_directory() -> Path:
     """Creates the private sandbox directory.
 
@@ -871,9 +907,11 @@ def main(
         story: Chapters to run.
 
     Returns:
-        Zero when the story finished, 130 when it was interrupted.
+        Zero when the story finished, 130 when it was interrupted, and 128
+        plus the signal number when SIGTERM or SIGHUP stopped it.
     """
     out = sys.stdout if stream is None else stream
+    handlers = {number: signal.signal(number, _stopped) for number in STOPS}
     base = sandbox_directory().resolve()
     recorder: Recorder | None = None
     status = 0
@@ -895,11 +933,14 @@ def main(
                 narrator(out),
             )
             story(recorder)
-    except KeyboardInterrupt:
-        status = 130
-        print("\nStopped.", file=out, flush=True)
+    except KeyboardInterrupt as exc:
+        status = 128 + exc.number if isinstance(exc, Stopped) else 130
+        with contextlib.suppress(OSError):
+            print("\nStopped.", file=out, flush=True)
     finally:
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for number in STOPS:
+            signal.signal(number, signal.SIG_IGN)
         try:
             if recorder is not None:
                 recorder.close()
@@ -907,6 +948,8 @@ def main(
             shutil.rmtree(base, ignore_errors=True)
         finally:
             signal.signal(signal.SIGINT, previous)
+            for number, handler in handlers.items():
+                signal.signal(number, handler)
     if status == 0:
         print(
             f"\nDone in {time.monotonic() - started:.0f}s; the sandbox is "
@@ -916,5 +959,6 @@ def main(
             flush=True,
         )
     else:
-        print("The sandbox is removed.", file=out, flush=True)
+        with contextlib.suppress(OSError):
+            print("The sandbox is removed.", file=out, flush=True)
     return status

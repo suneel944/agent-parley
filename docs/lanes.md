@@ -419,7 +419,23 @@ ordered list of required steps, so formatting, focused tests or a push happen
 in order instead of whenever the model remembers them. The harness runs the
 deterministic steps itself, with no model call, and hands the lane only the
 steps that need judgment. Blueprints live in coordination state, not in the
-repository:
+repository. The quickest start is a shipped template:
+
+```sh
+agent-parley blueprint templates                     # pr-loop, test-first, review-only
+agent-parley blueprint set feature --template pr-loop --verify "make check"
+agent-parley run codex --issue 42 --blueprint feature
+```
+
+`pr-loop` has the lane implement the issue, runs the verify command (back to
+the lane on failure), pushes, opens the pull request and waits for CI, handing
+red checks back to the lane. `test-first` asks for a failing test, runs the
+verify command expecting it to fail, then asks for the fix and verifies it.
+`review-only` asks the lane to review the linked pull request and report.
+`--verify` fills each template's verify step; without it the project's
+`verify set` command does, and a template that runs one is refused when
+neither exists. The result is validated like a file, and `blueprint show`
+names the template it came from. To write one by hand:
 
 ```json
 {
@@ -457,7 +473,10 @@ Node kinds:
 - `run` runs `command`, a string split like `verify set` or a list of
   arguments, in the lane's worktree as an argument list, never through a
   shell, within `timeout` seconds (default and ceiling 1800). It keeps the
-  last 40 lines of output. `AGENT_PARLEY_BASE` names the base checkout.
+  last 40 lines of output. `AGENT_PARLEY_BASE` names the base checkout. The
+  command runs in a session of its own; past its timeout the whole process
+  group gets SIGTERM, then SIGKILL 5 seconds later, before the node fails or
+  retries, so no grandchild of a wrapper such as `make` keeps running.
 - `push` runs `git push --set-upstream origin HEAD` the same way.
 - `agent` writes `prompt` into the lane's inbox, with the last failing step's
   output attached, and waits. The next `blueprint advance` after the lane
