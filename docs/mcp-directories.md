@@ -57,8 +57,9 @@ schemas are not vendored; both were fetched on 2026-09-30 from:
 - `https://glama.ai/mcp/schemas/server.json`.
 
 A release raises the `server.json` version with every other marker:
-`python3 -m scripts.release_publish bump` writes it, and the policy gate
-compares it with `pyproject.toml`.
+`RELEASE_VERSION=X.Y.Z python3 -m scripts.release_publish bump` writes it,
+and the policy gate compares it with `pyproject.toml`. The release workflow
+sets `RELEASE_VERSION`; a local run must set it by hand.
 
 ## Official MCP registry
 

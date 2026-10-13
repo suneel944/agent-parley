@@ -185,6 +185,21 @@ attached `run` titles its terminal tab with the lane name, its state and its
 claim progress, and `agent-parley title` prints the same line for a native
 status line.
 
+### Waiting on something
+
+A lane told to wait on a peer, a CI run or an operator decision reports it
+instead of going quiet or reporting blocked:
+
+```sh
+agent-parley report --state waiting --until 3600 --summary "waiting on the CI run"
+```
+
+The lane keeps its session. `status` and `top` show it as waiting on that
+reason with its next-check time, and the supervisor does not wake it until
+then, capped by the project's `deadlines.wait` ceiling. A blocked report is for
+a lane that cannot continue: it ends the lane's work on the claim and the next
+resume starts a fresh session.
+
 ## Integrating one lane
 
 When a lane's work is ready, integrate it from the base checkout:
@@ -342,7 +357,7 @@ envelope and escalation rules are in
 ## One command for many lanes
 
 With eight lanes, ending the day should not be eight commands. `say`,
-`participant stop`, `participant pause`, `participant resume`,
+`mail send`, `participant stop`, `participant pause`, `participant resume`,
 `participant merge`, `participant pr` and `issue assign` take a lane selector in
 place of the positional name:
 
@@ -357,7 +372,11 @@ agent-parley participant pr --drifted
 `--all` selects every lane and the other filters narrow it, so they combine.
 Each filter reads the same lane facts `status` reports: the provider driving a
 lane, the lane's own latest reported outcome, whether its checkout sits on the
-branch it was assigned, and whether the lane reads as `idle` rather than active.
+branch it was assigned, whether supervision reads the lane as stalled, and
+whether it is over a limit. `--idle` keeps only the lanes supervision reads as
+stalled: live, owing an answer and serving no calls for longer than
+`stalled_after`. `--over-budget` keeps only the lanes over any of their advisory
+token, call or hour limits.
 A positional name and a selector together are refused.
 
 Every bulk run prints the lanes it matched and what will happen to each, then

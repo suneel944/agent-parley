@@ -41,8 +41,8 @@ separate: `decide` records a decision while `decision` reads them back, and
 one lane's event stream.
 
 `--repo` is the repository selector everywhere, `status` and `top` included.
-Both still accept `--project` for one release; it is undocumented in their
-help and will be removed.
+Both still accept `--project` as a hidden alias of `--repo`; it is
+undocumented in their help.
 
 `top` is the dashboard: every lane at once, redrawn, or one frame with
 `--once` or `--json`. `watch NAME` is the event stream: one lane's
@@ -66,7 +66,7 @@ on standard output and export to a file.
 | `top` | The dashboard of live lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it; `--no-operator-edits` skips reading a base checkout that is always dirty for operator edits on reserved paths; `--all` also shows stopped lanes holding nothing and projects whose root is gone, which the header otherwise only counts. |
 | `title` | Print the current lane's name, state and claim progress for a native status line; prints nothing outside a lane. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it; `--provider` narrows the lanes and `--since` bounds the enforcement history counted. |
-| `report` | Record `--state`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--issue` binds the report to one owned issue, `--resume-on N` resumes a blocked report once that issue completes, `--until SECONDS` sets the seconds until the lane's next check and is required with `--state waiting`, capped by the project's wait deadline, and `--idempotency-key` makes a retry safe. |
+| `report` | Record `--state partial|blocked|ready|waiting`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--issue` binds the report to one owned issue, `--resume-on N` resumes a blocked report once that issue completes, `--until SECONDS` sets the seconds until the lane's next check and is required with `--state waiting`, capped by the project's wait deadline, and `--idempotency-key` makes a retry safe. |
 | `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
 | `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
 | `say NAME TEXT` | Send as `operator`; `--subject` sets the inbox subject line, `--ack` requests acknowledgement, `--within 15m` records a deadline for it that only reads overdue, and `--key` controls deduplication. |
@@ -137,7 +137,7 @@ on standard output and export to a file.
 | `resources show` | Show the named resources lanes may reserve. |
 | `resources set NAMES` | Declare them; an empty string accepts any well-formed name. |
 | `deadlines show` | Show this project's deadline and attempt defaults. |
-| `deadlines set` | Set `--claim`, `--offer`, `--request`, `--ack` windows and `--attempts`. |
+| `deadlines set` | Set `--claim`, `--offer`, `--request`, `--ack` and `--wait` windows and `--attempts`; `--wait` is the ceiling on the `--until` of a waiting report. |
 | `budget show` | Show the advisory token, call and hour limits every lane of this project inherits. |
 | `budget set` | Set `--tokens`, `--calls` and `--hours` project defaults; a budget informs and does not gate. |
 | `budget enforce` | Show or set the opt-in run budget: aggregate `--tokens`, `--calls` and `--hours` across every lane; `0` removes one. Once used up, no wake, dispatch, retry or launch starts. A usage limit, not a billing cap. For the operator; refused from a lane's environment by accident guard, not enforcement. |
@@ -194,7 +194,7 @@ without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 `history participant`, `history claim`, `plan diff`, `plan show`,
 `plan proposals`,
 `approval show`, `verify show`, `init show`, `branch show`, `forge show`,
-`deadlines show`, `budget show`, `resources show`, `state show`,
+`deadlines show`, `budget show`, `resources show`, `pool show`, `state show`,
 `provider list`, `provider show`, `credentials list` and `credentials show`.
 The commands that change something print their outcome the same way with
 `--json`: `up`, `down`, `setup`, `run`, `say`, `decide`, `mail send`,

@@ -1,5 +1,6 @@
 """Checks the Codex directory archive and the manifest shape it depends on."""
 
+import argparse
 import json
 import shutil
 import zipfile
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_parley import cli
 from scripts import codex_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -191,6 +193,30 @@ def test_archive_packs_the_listing_skill(tmp_path):
     assert skill == (listing / "coordinate" / "SKILL.md").read_bytes()
     for text in ("verify set", "participant merge", "pre-approved"):
         assert text not in skill.decode()
+
+
+def test_both_skills_teach_every_report_state():
+    """Fails when a `report --state` choice is missing from either skill."""
+    parser, _ = cli.root_parser(None)
+    commands = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    state = next(
+        action
+        for action in commands.choices["report"]._actions
+        if "--state" in action.option_strings
+    )
+    plugin = ROOT / codex_bundle.PLUGIN_DIRECTORY
+    skills = (
+        plugin / "skills/coordinate/SKILL.md",
+        plugin / codex_bundle.LISTING_SKILLS / "coordinate/SKILL.md",
+    )
+    for path in skills:
+        text = path.read_text()
+        missing = [name for name in state.choices if name not in text]
+        assert missing == [], str(path)
 
 
 def test_rejects_a_listing_skill_that_drifts(tmp_path):

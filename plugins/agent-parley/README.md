@@ -26,11 +26,13 @@ connects it to the local coordination server.
 
 ## What the plugin runs and sends
 
-The plugin contains one skill document and its icons. It runs only the
+The plugin contains the `coordinate` skill, a copy of it for the Codex
+directory listing, its two manifests and its icons. It runs only the
 `agent-parley` executable and adds no hooks, servers or binaries of its own.
 
 The coordination server binds the loopback interface, `127.0.0.1`, and the
-skill reaches it over that address with proxy handling disabled. The runtime
+`agent-parley` executable the skill runs reaches it over a direct socket to
+that address, never through an HTTP proxy. The runtime
 uses only the Python standard library and declares no third-party
 dependencies. There is no analytics, no crash reporting and no account, and
 Agent Parley does not read or forward the credentials of the agents it

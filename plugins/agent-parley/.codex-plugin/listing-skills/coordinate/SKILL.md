@@ -60,9 +60,10 @@ sessions from a tool call.
 
 ## Report outcomes
 
-Record outcomes with `agent-parley report --state partial|blocked|ready
---summary "result"`. Partial and blocked reports require `--remaining`; a
-ready report requires `--evidence`. Reports are claims made by the
+Record outcomes with `agent-parley report --state
+partial|blocked|ready|waiting --summary "result"`. Partial and blocked reports
+require `--remaining`; a ready report requires `--evidence`; a waiting report
+requires `--until SECONDS`, the time until your next check. Reports are claims made by the
 participant, not independent verification. To record a check of a peer's
 work, run `agent-parley report review ID --verdict pass|fail --evidence "what
 you checked"`.

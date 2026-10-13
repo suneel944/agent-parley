@@ -121,16 +121,30 @@ their reach. The branch guard allows a `git checkout` that only restores
 files. Like the branch guard, this is a guard on the agent's own tool calls,
 not an authority boundary.
 
-Pending mail and notices ride on the call as context and never refuse it. Only
-three hazards deny a tool call: a shell call that runs Agent Parley's CLI
-together with a variable, `cd`, `;`, `&&`, a pipe or a redirect
-(`chained_cli`, whose text asks for the command alone, the only form the
-launch pre-approves), a write to a path that overlaps an exclusive
-reservation a peer holds (`reserved_path`, whose text says reservations are
-advisory), and an offer to this lane that expires unanswered within 120
-seconds (`offer_expiring`, which names the accept and decline commands).
-Otherwise a call that only reads, and Agent Parley's own commands, are never
-refused for coordination.
+Pending mail and notices ride on the call as context and never refuse it. These
+causes deny a tool call:
+
+- `chained_cli`: a shell call that runs Agent Parley's CLI together with a
+  variable, `cd`, `;`, `&&`, a pipe or a redirect. The text asks for the
+  command alone, the only form the launch pre-approves.
+- `reserved_path`: a write to a path that overlaps an exclusive reservation a
+  peer holds. The text says reservations are advisory.
+- `offer_expiring`: an offer to this lane that expires unanswered within 120
+  seconds. The text names the accept and decline commands.
+- `worktree_refused`: a `git worktree add` whose target resolves outside the
+  lane's `<lane>-wt/` directory.
+- `branch_switch`: a command that would switch the lane off its assigned
+  branch.
+- `attribution_refused`: a command whose message carries assistant
+  attribution the repository policy forbids.
+- `budget_refused`: a lane running `agent-parley budget enforce` or `resume`,
+  which is the operator's decision.
+- `filing_overlap`: a `gh issue create` that overlaps a peer's files or live
+  claim, refused once.
+- `paused`: any tool call from a lane the operator has paused.
+
+Every other hazard is a notice. Otherwise a call that only reads, and Agent
+Parley's own commands, are never refused for coordination.
 
 Overlap is shown before the work, not found as a merge conflict after it.
 A write to a file a peer reserves, even shared, or that a peer's open pull
@@ -159,6 +173,12 @@ gives a project defaults to inherit. The claim default also applies to a claim
 that was made before the default existed. Past its deadline a claim reads `overdue`
 with the seconds over, `top` marks the issue `#42!`, and a lane that reports
 `blocked` on work it still holds spends one attempt of the recorded budget.
+
+A holder that waits on a peer, a CI run or an operator decision files
+`agent-parley report --state waiting --until SECONDS --summary "what it waits
+on"`. `status` and `top` show the lane as waiting on that reason with its
+next-check time, and the supervisor defers waking it until then, capped by the
+project's `deadlines.wait` ceiling.
 
 An overdue claim whose holder is still working on it stays owned. Two cases get
 a terminating transition. The first is an overdue claim whose holder is
