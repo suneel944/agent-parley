@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import copilot, roster, store
+from agent_parley import cli, copilot, roster, store
 from agent_parley.cli import COPILOT_EVENTS, main
 from agent_parley.state import BridgeError
 
@@ -246,3 +246,33 @@ def test_a_relaunch_adds_no_duplicate_hooks_and_retire_removes_them(
     ]
     servers = json.loads((account / "mcp-config.json").read_text())
     assert "agent_parley" not in servers["mcpServers"]
+
+
+def test_a_copilot_lane_stays_interactive_on_launch_and_on_resume(
+    lane, bridge, repo, tmp_path, monkeypatch
+):
+    capture = tmp_path / "capture.json"
+    assert json.loads(capture.read_text())["argv"][0] == "-i"
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-5", "cwd": str(lane["lane"])},
+    )
+    monkeypatch.setattr(
+        cli.terminal,
+        "run",
+        lambda command, lane, env, agent, **_: subprocess.call(
+            command, cwd=lane, env=env
+        ),
+    )
+    assert (
+        bridge.launch(
+            "helper", repo, "Continue", "copilot", "work", resume=True
+        )
+        == 0
+    )
+    assert json.loads(capture.read_text())["argv"][:3] == [
+        "--resume",
+        "session-5",
+        "-i",
+    ]

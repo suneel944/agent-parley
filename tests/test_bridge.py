@@ -2668,7 +2668,7 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     )
     captured = json.loads((tmp_path / "capture.json").read_text())
     assert captured["home"] == str(account)
-    assert captured["argv"][0] == "-p"
+    assert captured["argv"][0] == "-i"
     assert "Work on issue 42" in captured["argv"][1]
     assert not [flag for flag in captured["argv"] if flag.startswith("--al")]
 

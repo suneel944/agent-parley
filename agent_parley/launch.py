@@ -745,7 +745,7 @@ reported.
                 )
                 command = [
                     executable,
-                    "-p",
+                    "-i",
                     prompt + "\nUser task:\n" + task,
                 ]
             else:
