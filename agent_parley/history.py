@@ -45,6 +45,9 @@ HANDOFF_ACTIONS = frozenset(
     }
 )
 MAX_RECORDS = 500
+_ENDING_ACTIONS = frozenset(
+    {"claim", "accept", "take", "release", "complete", "resolve"}
+)
 
 
 def _provider(manifest: dict, participant: str | None) -> str:
@@ -99,10 +102,13 @@ def holdings(directory: Path, number: str) -> list[dict]:
     Returns:
         One record per generation, naming the participant, the claim
         identifier, when the generation started, when it ended, and how long
-        it was held. A take of an orphaned claim ends the generation it took
-        from and starts its own, because that ownership moved without the
-        previous holder recording a release. A generation that is still held
-        reports no end and the seconds so far.
+        it was held. A claim, accept or take ends the generation before it
+        and starts its own, because ownership moved without the previous
+        holder recording a release; a release, complete or resolve ends the
+        open generation. When capped history no longer names the record's
+        current owner, a generation for that owner is added from the start
+        of the current claim, so the answer always names the live holder. A
+        generation that is still held reports no end and the seconds so far.
     """
     record = issues.snapshot(directory)["issues"].get(number)
     if not record:
@@ -111,20 +117,35 @@ def holdings(directory: Path, number: str) -> list[dict]:
     for entry in record.get("history", []):
         action = str(entry.get("action", ""))
         at = float(entry.get("at", 0) or 0)
+        if action in _ENDING_ACTIONS and held and held[-1]["ended"] is None:
+            held[-1].update(ended=at, seconds=int(at - held[-1]["started"]))
         if action in ("claim", "accept", "take"):
-            if action == "take" and held and held[-1]["ended"] is None:
-                held[-1].update(ended=at, seconds=int(at - held[-1]["started"]))
             held.append(
                 {
-                    "participant": entry.get("actor"),
+                    "participant": entry.get("owner") or entry.get("actor"),
                     "claim_id": entry.get("claim_id"),
                     "started": at,
                     "ended": None,
                     "seconds": 0,
                 }
             )
-        elif action == "release" and held and held[-1]["ended"] is None:
-            held[-1].update(ended=at, seconds=int(at - held[-1]["started"]))
+    owner = record.get("owner")
+    current = held[-1] if held and held[-1]["ended"] is None else None
+    if owner and (current is None or current["participant"] != owner):
+        started = issues.claimed_since(record)
+        if current is not None:
+            current.update(
+                ended=started, seconds=int(started - current["started"])
+            )
+        held.append(
+            {
+                "participant": owner,
+                "claim_id": record.get("claim_id"),
+                "started": started,
+                "ended": None,
+                "seconds": 0,
+            }
+        )
     stamp = time.time()
     for generation in held:
         if generation["ended"] is None:

@@ -26,7 +26,7 @@ ACTIVE = (QUEUED, RUNNING, RECOVERY)
 STATES = (*ACTIVE, BLOCKED, READY, COMPLETE)
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
 MAX_HISTORY = 50
-_MARKER_ACTIONS = ("claim", "take", "complete")
+_MARKER_ACTIONS = ("claim", "accept", "take", "complete")
 
 
 def append_history(record: dict, entry: dict, cap: int = MAX_HISTORY) -> None:
@@ -35,10 +35,10 @@ def append_history(record: dict, entry: dict, cap: int = MAX_HISTORY) -> None:
     A lane that claims and releases the same issue hundreds of times would
     otherwise grow this list without limit, and every idempotent retry then
     copies the whole growing list again. Retention keeps the most recent
-    `cap` entries, plus the latest claim, take and complete marker when an
-    older one would otherwise fall outside that window, so a capped history
-    still answers when the current claim began and when the issue last
-    completed.
+    `cap` entries, plus the latest claim, accept, take and complete marker
+    when an older one would otherwise fall outside that window, so a capped
+    history still answers when the current claim began, who it moved to and
+    when the issue last completed.
 
     Args:
         record: Issue record whose history is being extended.
