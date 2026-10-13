@@ -954,7 +954,7 @@ def main(
         print(
             f"\nDone in {time.monotonic() - started:.0f}s; the sandbox is "
             "removed. Try it on your repository: agent-parley setup . && "
-            "agent-parley run <lane>",
+            "agent-parley run claude",
             file=out,
             flush=True,
         )

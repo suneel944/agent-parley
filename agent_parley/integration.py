@@ -76,7 +76,8 @@ class IntegrationMixin(MailMixin):
                 if participant is None:
                     raise BridgeError(
                         f"{name} is not a participant in this project; "
-                        "run agent-parley participant list."
+                        "run agent-parley participant list.",
+                        next_command="agent-parley participant list",
                     )
             if renew:
                 self._from_base(repo, root, data, "Recovery attempts are")
@@ -607,7 +608,8 @@ class IntegrationMixin(MailMixin):
             if participant is None:
                 raise BridgeError(
                     f"{name} is not a participant in this project; "
-                    "run agent-parley participant list."
+                    "run agent-parley participant list.",
+                    next_command="agent-parley participant list",
                 )
             session = lane_session(directory, name)
         report = merge_preview(
@@ -1017,7 +1019,8 @@ class IntegrationMixin(MailMixin):
         if name not in data["participants"]:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         if decision == approvals.REJECTED and not reason.strip():
             raise BridgeError(

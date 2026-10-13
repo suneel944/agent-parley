@@ -531,7 +531,8 @@ def integrate(bridge: Bridge, repo: Path, name: str, issue: str = "") -> str:
     if name not in data["participants"]:
         raise BridgeError(
             f"{name} is not a participant in this project; "
-            "run agent-parley participant list."
+            "run agent-parley participant list.",
+            next_command="agent-parley participant list",
         )
     operator_only(repo, root, data, "Unattended integration runs")
     with lock(directory / "merge.lock", MERGE_BUSY):

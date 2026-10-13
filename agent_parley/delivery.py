@@ -282,7 +282,10 @@ def deliver(home: Path, directory: Path, agent: str) -> int:
     manifest = roster.read(directory)
     participant = manifest["participants"].get(agent)
     if participant is None:
-        raise BridgeError(f"{agent} is not a participant in this project.")
+        raise BridgeError(
+            f"{agent} is not a participant in this project.",
+            next_command="agent-parley participant list",
+        )
     if participant.get("paused", False):
         return 0
     identity = json.loads((directory / f"{agent}-identity.json").read_text())

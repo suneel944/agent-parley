@@ -1811,7 +1811,8 @@ carries the same reading as each project's `spares`.
 `manifest`. `provider show --json` reports the definition beside its
 `provider` name, and `credentials show --json` reports `credential`,
 `config_home`, `env` as `NAME=<redacted>` entries and `require_env`: no
-recorded value is printed. `problems ack --json` reports the message `id` and
+recorded value is printed. A profile that sets none of the three also reports
+`account` as `selects no account`. `problems ack --json` reports the message `id` and
 the `participants` the acknowledgement was recorded for.
 
 `issue next --json` reports the reading lane as `participant`, its `provider`,

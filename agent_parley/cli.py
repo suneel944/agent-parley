@@ -2222,7 +2222,8 @@ class Bridge(
             if participant is None:
                 raise BridgeError(
                     f"{name} is not a participant in this project; "
-                    "run agent-parley participant list."
+                    "run agent-parley participant list.",
+                    next_command="agent-parley participant list",
                 )
             lane = Path(participant["lane"])
             branch = participant["branch"]
@@ -7063,6 +7064,8 @@ def main() -> int:
             )
         elif args.command == "credentials":
             if args.action == "add":
+                if not (args.config_home or args.env or args.require_env):
+                    parser.error(roster.EMPTY_CREDENTIAL)
                 roster.define_credential(
                     bridge.home,
                     args.name,

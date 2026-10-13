@@ -239,7 +239,10 @@ def mark(directory: Path, name: str, at: float) -> None:
         manifest = roster.read(directory)
         participant = manifest["participants"].get(name)
         if participant is None:
-            raise BridgeError(f"{name} is not a participant in this project.")
+            raise BridgeError(
+                f"{name} is not a participant in this project.",
+                next_command="agent-parley participant list",
+            )
         participant["retired"] = float(at)
         write_json(directory / "project.json", manifest)
 
@@ -279,7 +282,10 @@ def withdraw(directory: Path, name: str) -> dict:
         manifest = roster.read(directory)
         participant = manifest["participants"].get(name)
         if participant is None:
-            raise BridgeError(f"{name} is not a participant in this project.")
+            raise BridgeError(
+                f"{name} is not a participant in this project.",
+                next_command="agent-parley participant list",
+            )
         if roster.retired(participant):
             return {
                 "participant": name,

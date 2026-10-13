@@ -167,7 +167,8 @@ class SettingsMixin(BridgeCore):
         }
         if participant and participant not in data["participants"]:
             raise BridgeError(
-                f"{participant} is not a participant in this project."
+                f"{participant} is not a participant in this project.",
+                next_command="agent-parley participant list",
             )
         if changes:
             unattended.operator_only(
@@ -642,7 +643,8 @@ class SettingsMixin(BridgeCore):
                     if participant is None:
                         raise BridgeError(
                             f"{name} is not a participant in this project; "
-                            "run agent-parley participant list."
+                            "run agent-parley participant list.",
+                            next_command="agent-parley participant list",
                         )
                     participant["budget"] = roster.merged_budget(
                         participant.get("budget") or {}, changes
@@ -654,7 +656,8 @@ class SettingsMixin(BridgeCore):
         if name not in data["participants"]:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         try:
             usage = store.usage(self.home, data["root"])

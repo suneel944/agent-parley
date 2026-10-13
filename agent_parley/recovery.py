@@ -483,7 +483,10 @@ def _capture(
 
     participant = manifest["participants"].get(agent)
     if not participant:
-        raise BridgeError(f"{agent} is not a participant in this project.")
+        raise BridgeError(
+            f"{agent} is not a participant in this project.",
+            next_command="agent-parley participant list",
+        )
     lane = Path(participant["lane"])
     _reclaim_temporary_refs(lane)
     ledger = issues.snapshot(directory)

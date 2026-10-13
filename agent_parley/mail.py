@@ -84,7 +84,8 @@ class MailMixin(BridgeCore):
         if participant is None:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         subject = subject or "Operator message"
         identity = participant["display"]
@@ -223,12 +224,13 @@ class MailMixin(BridgeCore):
             if participant not in data["participants"]:
                 raise BridgeError(
                     f"{participant} is not a participant in this project; "
-                    "run agent-parley participant list."
+                    "run agent-parley participant list.",
+                    next_command="agent-parley participant list",
                 )
             agent = participant
         else:
             lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-            agent = roster.resolve(data, lane)
+            agent = roster.resolve(data, lane, mail_reader=True)
         name = data["participants"][agent]["display"]
         if action == "thread":
             return store.read_thread(

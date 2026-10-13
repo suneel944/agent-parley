@@ -3890,8 +3890,11 @@ def test_mail_commands_read_the_lane_participants_own_thread_and_search(
     found = bridge.mail(lane, "search", query="reservation")
     assert [row["id"] for row in found["messages"]] == [sent["id"]]
     assert bridge.mail(lane, "search", query="unrelated")["messages"] == []
-    with pytest.raises(BridgeError, match="assigned agent worktree"):
+    with pytest.raises(BridgeError, match="with --as NAME") as main_checkout:
         bridge.mail(repo, "thread", thread=sent["thread_id"])
+    assert main_checkout.value.next_command == (
+        "agent-parley mail list --as claude"
+    )
     before = mailbox(bridge.home, paired["root"], identities["codex"])["unread"]
     named = bridge.mail(
         repo, "thread", thread=sent["thread_id"], participant="codex"
