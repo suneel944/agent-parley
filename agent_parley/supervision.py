@@ -134,7 +134,7 @@ OPT_IN_REMEDY = (
     "for one lane), or resume the lane in your own terminal"
 )
 OPT_IN_WARNING = (
-    "{name} is a claude lane the coordination service resumes unattended, "
+    "{name} is a {adapter} lane the coordination service resumes unattended, "
     "and no bridge tool approval is recorded for it, so a service resume "
     "would stop at a permission prompt nobody sees; the service reports "
     "that lane instead of resuming it. To opt in, " + OPT_IN_REMEDY + "."
@@ -3391,13 +3391,14 @@ def configuration(home: Path, manifest: dict) -> dict:
 def opt_in_missing(home: Path, manifest: dict, name: str) -> bool:
     """Reports whether a service resume of this lane would stop unseen.
 
-    A resumed `claude` session asks again for permission to use this
-    bridge's own MCP tools, and a resume the service starts has nobody at
-    the keyboard. Only `dialogs.pre_approved` or `dialogs.auto_mode` carries
-    an answer into that session, and both stay the operator's choice. A lane
-    the service would never resume, because its wake loop is off, it
-    retired, its provider needs environment the service cannot supply or
-    its provider is not defined, has no such gap.
+    A resumed session asks again for permission to use this bridge's own
+    MCP tools, and a resume the service starts has nobody at the keyboard.
+    Only `dialogs.pre_approved`, or `dialogs.auto_mode` for a `claude` lane,
+    carries an answer into that session, and both stay the operator's
+    choice. A lane the service would never resume, because its wake loop is
+    off, it retired, its provider needs environment the service cannot
+    supply or its provider is not defined, has no such gap, and neither has
+    an adapter `roster.APPROVAL` gives no way to carry the opt-in.
 
     Args:
         home: Private bridge state root.
@@ -3405,23 +3406,43 @@ def opt_in_missing(home: Path, manifest: dict, name: str) -> bool:
         name: Participant that owns the lane.
 
     Returns:
-        True when the service may resume this `claude` lane and the operator
-        recorded neither opt-in for it.
+        True when the service may resume this lane, its adapter can carry
+        the opt-in and the operator recorded none for it.
+    """
+    return bool(opt_in_adapter(home, manifest, name))
+
+
+def opt_in_adapter(home: Path, manifest: dict, name: str) -> str:
+    """Names the adapter of a lane `opt_in_missing` reports.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest as the roster reports it.
+        name: Participant that owns the lane.
+
+    Returns:
+        The lane's adapter when its opt-in is missing, else an empty string.
     """
     participant = (manifest.get("participants") or {}).get(name) or {}
     if (
         not participant.get("wake", True)
         or roster.retired(participant)
         or dialogs.pre_approved(manifest, name)
-        or dialogs.auto_mode(manifest, name)
         or not configuration(home, manifest)["wake"]
     ):
-        return False
+        return ""
     try:
         entry = roster.provider(home, participant.get("provider", name))
     except BridgeError:
-        return False
-    return entry["adapter"] == "claude" and not entry.get("require_env")
+        return ""
+    adapter = entry["adapter"]
+    if (
+        roster.APPROVAL.get(adapter) is None
+        or entry.get("require_env")
+        or (adapter == "claude" and dialogs.auto_mode(manifest, name))
+    ):
+        return ""
+    return adapter
 
 
 def reminders(

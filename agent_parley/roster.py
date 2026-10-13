@@ -38,6 +38,22 @@ UNAVAILABLE_HOOKS: dict[str, tuple[str, ...]] = {
 }
 REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
 DELIVERY_HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+APPROVAL: dict[str, str | None] = {
+    "claude": "settings",
+    "codex": None,
+    "copilot": "flag",
+    "gemini": "overlay",
+    "opencode": "overlay",
+    "amp": None,
+}
+"""How a launch carries the bridge tool opt-in into each adapter.
+
+``settings`` is the session's permission settings, ``flag`` a command-line
+allow and ``overlay`` the lane-private configuration the launch writes;
+each allows this bridge's own MCP server and nothing else. ``None`` marks
+an adapter with no such setting the launcher uses, so a recorded opt-in
+cannot reach its session and no opt-in gap is reported for it.
+"""
 POLLED_REQUIRED_HOOKS = ("PreToolUse",)
 """Guards a polled-delivery adapter must still raise to launch at all.
 

@@ -344,6 +344,55 @@ def test_a_profile_that_already_ships_the_bridge_plugin_file_is_refused(
         )
 
 
+def test_an_opted_in_overlay_allows_only_the_bridge_tools(
+    bridge, tmp_path, account
+):
+    plain = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(account),
+    )
+    assert "permission" not in json.loads((plain / "opencode.json").read_text())
+    write_json(
+        account / "opencode.json",
+        {"permission": {"bash": "ask", "edit": "deny"}},
+    )
+    trusted = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(account),
+        trusted=True,
+    )
+    settings = json.loads((trusted / "opencode.json").read_text())
+    assert settings["permission"] == {
+        "bash": "ask",
+        "edit": "deny",
+        "agent_parley_*": "allow",
+    }
+    assert json.loads((account / "opencode.json").read_text()) == {
+        "permission": {"bash": "ask", "edit": "deny"}
+    }
+
+
+def test_an_opt_in_over_a_non_object_permission_is_refused(
+    bridge, tmp_path, account
+):
+    write_json(account / "opencode.json", {"permission": "ask"})
+    with pytest.raises(BridgeError, match="permission settings"):
+        opencode.configure(
+            tmp_path,
+            "lane",
+            "http://127.0.0.1/mcp/",
+            bridge.hooks("lane", tmp_path),
+            str(account),
+            trusted=True,
+        )
+
+
 PLUGIN_RUN = """
 const { AgentParley } = await import(process.argv[1]);
 const hooks = await AgentParley({ client: {}, directory: "/lane" });

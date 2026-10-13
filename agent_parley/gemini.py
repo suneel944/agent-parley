@@ -35,6 +35,7 @@ def configure(
     url: str,
     hooks: dict,
     source_path: str | None = None,
+    trusted: bool = False,
 ) -> Path:
     """Copies native system policy into a lane-private settings overlay.
 
@@ -48,6 +49,8 @@ def configure(
         url: Authenticated loopback MCP endpoint.
         hooks: Common checkpoint hook definitions.
         source_path: Native system policy selected by the launch environment.
+        trusted: Whether the operator opted this lane in to pre-approving
+            the bridge's own tools, which marks only its server as trusted.
 
     Returns:
         Path for GEMINI_CLI_SYSTEM_SETTINGS_PATH in this launch only.
@@ -81,6 +84,8 @@ def configure(
         "httpUrl": url,
         "headers": {"Authorization": "Bearer ${AGENT_PARLEY_TOKEN}"},
     }
+    if trusted:
+        servers["agent_parley"]["trust"] = True
     for native, common in EVENTS.items():
         existing = configured.setdefault(native, [])
         if not isinstance(existing, list):

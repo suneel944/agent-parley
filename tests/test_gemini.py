@@ -312,3 +312,24 @@ def test_native_before_tool_can_receive_denial_and_recover_via_mcp():
     assert gemini.response(
         {"decision": "block", "reason": "Restore branch"}
     ) == {"decision": "deny", "reason": "Restore branch"}
+
+
+def test_an_opted_in_gemini_lane_trusts_only_the_bridge_server(
+    lane, bridge, repo, capsys
+):
+    assert "trust" not in lane["settings"]["mcpServers"]["agent_parley"]
+    capsys.readouterr()
+    assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
+    assert "helper is a gemini lane" in capsys.readouterr().err
+    path = lane["directory"] / "project.json"
+    manifest = json.loads(path.read_text())
+    manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    write_json(path, manifest)
+    lane["native"].write_text(
+        json.dumps({"mcpServers": {"docs": {"command": "docs-mcp"}}})
+    )
+    assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
+    assert "is a gemini lane" not in capsys.readouterr().err
+    servers = json.loads(lane["overlay"].read_text())["mcpServers"]
+    assert servers["agent_parley"]["trust"] is True
+    assert servers["docs"] == {"command": "docs-mcp"}

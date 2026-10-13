@@ -6664,9 +6664,13 @@ def main() -> int:
                 added = bridge.add_participant(
                     repository, args.name, args.provider, args.credentials
                 )
-                if supervision.opt_in_missing(bridge.home, added, args.name):
+                if gap := supervision.opt_in_adapter(
+                    bridge.home, added, args.name
+                ):
                     print(
-                        supervision.OPT_IN_WARNING.format(name=args.name),
+                        supervision.OPT_IN_WARNING.format(
+                            name=args.name, adapter=gap
+                        ),
                         file=sys.stderr,
                     )
             elif args.action == "restore":

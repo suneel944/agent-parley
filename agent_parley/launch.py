@@ -520,9 +520,10 @@ reported.
                 next_command="agent-parley budget resume",
             )
         data = self.add_participant(repo, agent, provider, credential)
-        if supervision.opt_in_missing(self.home, data, agent):
+        if gap := supervision.opt_in_adapter(self.home, data, agent):
             print(
-                supervision.OPT_IN_WARNING.format(name=agent), file=sys.stderr
+                supervision.OPT_IN_WARNING.format(name=agent, adapter=gap),
+                file=sys.stderr,
             )
         if number:
             from agent_parley import blueprints
@@ -709,6 +710,7 @@ reported.
                         self.url + "/mcp/",
                         hooks,
                         env.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH"),
+                        trusted=dialogs.pre_approved(data, agent),
                     )
                 )
                 command = [
@@ -724,6 +726,7 @@ reported.
                         self.url + "/mcp/",
                         hooks,
                         env.get("OPENCODE_CONFIG_DIR"),
+                        trusted=dialogs.pre_approved(data, agent),
                     )
                 )
                 command = [
@@ -805,6 +808,8 @@ reported.
                     "-i",
                     prompt + "\nUser task:\n" + task,
                 ]
+                if dialogs.pre_approved(data, agent):
+                    command += ["--allow-tool", "agent_parley"]
             else:
                 command = [
                     executable,
