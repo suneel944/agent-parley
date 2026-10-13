@@ -143,7 +143,8 @@ proposed only when the measured work reaches a release marker and the package
 differs from the approved release. Commit `436c2b5` measures zero under every
 one of those conditions. Removing the proposal pull request therefore removed a
 review step that was never what stopped the incident; the guard that did is
-`python3 -m scripts.release_publish candidate`, which anyone can run locally
+the candidate phase of `scripts.release_publish`, which anyone can run locally
+as `GITHUB_OUTPUT=/dev/null python3 -m scripts.release_publish candidate`
 and which every push to `main` runs before anything else happens.
 
 GitHub and PyPI were checked during recovery. Both retained valid 0.1.1 package
@@ -190,8 +191,14 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    proposed and the step reports the counts it measured. Counting is local and
    repeatable: it reads Git history; selecting an available version
    additionally queries the release services described below.
-   `python3 -m scripts.release_publish candidate` performs those checks and
-   can be run locally at any time. Every push to `main` runs it after the
+   `python3 -m scripts.release_publish candidate` performs those checks. It
+   appends its results to the file `GITHUB_OUTPUT` names and stops with
+   `KeyError: 'GITHUB_OUTPUT'` when that variable is unset, so a local run
+   points it at a scratch file:
+   `GITHUB_OUTPUT=/dev/null python3 -m scripts.release_publish candidate`.
+   An optional `RELEASE_KIND` of `patch`, `minor` or `major` requests that
+   kind instead of the measurement, as a manual Auto version dispatch does;
+   `measured` or an empty value keeps the measurement. Every push to `main` runs it after the
    push lands, and a push that reaches no marker ends there.
 2. The chosen number must be free. Previously consumed versions cannot be
    reused, including a deleted or yanked 0.1.2. A release that lands on an
@@ -206,8 +213,12 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
 3. A minor or major release needs acceptance evidence; a patch release does
    not. `uv run --locked python -m scripts.release_publish evidence` runs the
    fault-injection acceptance suite, `tests/test_fault_acceptance.py`, on the
-   release commit. The suite drives stub clients through a lane killed
-   mid-claim, a service restart, a usage limit dialog, a permission prompt
+   release commit. The phase reads the proposed version from
+   `RELEASE_VERSION`, which Auto version takes from the candidate step, and
+   stops with `KeyError: 'RELEASE_VERSION'` without it; a local run sets it,
+   as in `RELEASE_VERSION=X.Y.Z uv run --locked python -m
+   scripts.release_publish evidence`. The suite drives stub clients through
+   a lane killed mid-claim, a service restart, a usage limit dialog, a permission prompt
    on resume, a full disk under the logs and a dropped `Stop` event, and
    fails unless every claim completes with idle lane-minutes and
    unaccountable claim-minutes under its limits. It also runs in
@@ -223,7 +234,9 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    commits the measurement counted, so the published notes and the decision to
    release describe the same work. The policy gate then runs against the
    raised markers, so a marker the bump forgets fails the run instead of
-   reaching a release.
+   reaching a release. Like `evidence`, the phase reads the target version
+   from `RELEASE_VERSION`, which must be `MAJOR.MINOR.PATCH` and differ from
+   the approved release.
 5. The release application commits `chore(main): release X.Y.Z` to `main`,
    creates the annotated tag `vX.Y.Z` and pushes both. That commit subject is
    the loop guard: `Auto version` skips it, so a release cannot trigger another
@@ -330,7 +343,8 @@ The migration audit of 2026-09-10 ran Release Please 17.6.0 against the
 published curated branch using read-only GitHub requests and the proposed scan
 boundary. It stopped at the mapped release and built zero release proposals.
 That audit is historical: versioning no longer runs Release Please, and the
-equivalent check today is `python3 -m scripts.release_publish candidate`, which
+equivalent check today is
+`GITHUB_OUTPUT=/dev/null python3 -m scripts.release_publish candidate`, which
 counts local Git history and checks version availability when a release marker
 is reached. It does not open pull requests, tag commits, dispatch workflows,
 or upload packages.
