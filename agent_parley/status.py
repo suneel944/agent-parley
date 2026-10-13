@@ -483,7 +483,11 @@ class StatusMixin(BridgeCore):
             is off is consistent, and one configured but unable to send is
             not. The `approvals` component names each lane
             `supervision.opt_in_missing` reports as a setup gap; it is the
-            operator's choice, so it leaves the set consistent.
+            operator's choice, so it leaves the set consistent. The
+            `dialogs` component names each lane `dialogs.drift` reports,
+            a client newer than its recorded dialog matchers or a dialog
+            none of them read, as a matcher drift that also leaves the set
+            consistent, because the lane still escalates what it cannot read.
         """
         from agent_parley.cli import (
             inbound_status,
@@ -612,6 +616,23 @@ class StatusMixin(BridgeCore):
                     if unapproved
                     else ""
                 ),
+                "compatible": True,
+            }
+        )
+        from agent_parley import dialogs
+
+        drifted = [
+            line
+            for path in sorted((self.home / "projects").glob("*/project.json"))
+            for line in dialogs.drift(path.parent, json.loads(path.read_text()))
+        ]
+        components.append(
+            {
+                "component": "dialogs",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": protocol.DRIFT if drifted else protocol.OK,
+                "remedy": "; ".join(drifted),
                 "compatible": True,
             }
         )

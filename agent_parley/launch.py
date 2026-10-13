@@ -440,6 +440,11 @@ reported.
         rotation point, which the service then resumes this way; it is
         withheld for a lane the service would not resume.
 
+        The activity record names the client's adapter as ``client`` and
+        the first line its ``--version`` prints as ``client_version``, so
+        the dialog watcher and ``doctor`` can name the release that drew a
+        dialog; a client that cannot say leaves the version empty.
+
         Args:
             agent: Participant name within the project.
             repo: Target Git repository.
@@ -772,6 +777,9 @@ reported.
                 f"Shared project: {data['root']}",
                 flush=True,
             )
+            from agent_parley import dialogs
+
+            client_version = dialogs.version_of(executable)
             with lock(
                 lane.parent / f"{agent}-checkpoint.lock",
                 timeout=LAUNCH_LOCK_SECONDS,
@@ -837,6 +845,8 @@ reported.
                     launcher_ticks=process.start_ticks(os.getpid()),
                     session_started=time.time(),
                     attached=sys.stdin.isatty(),
+                    client=entry["adapter"],
+                    client_version=client_version,
                 )
                 previous.pop("last_prompt", None)
                 previous.pop("operator_stopped", None)

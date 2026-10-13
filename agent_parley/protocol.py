@@ -64,6 +64,7 @@ STALE = "stale"
 STOPPED = "not running"
 ROOT_GONE = "root gone"
 SETUP_GAP = "setup gap"
+DRIFT = "matcher drift"
 RESTORE_ROOT = (
     "These projects name a root checkout that no longer exists; restore "
     "it, or remove the project's state once the service retired its "
@@ -207,8 +208,8 @@ def render(reported: dict) -> str:
         sees which line to read. No path inside a credential profile and no
         credential is printed. One platform line names the kernel release,
         the WSL generation and whether ``pidfd_open`` is available. A setup
-        gap does not make the set inconsistent, so its remedy follows the
-        verdict on a line of its own.
+        gap or a dialog matcher drift does not make the set inconsistent, so
+        its remedy follows the verdict on a line of its own.
     """
     lines = []
     for component in reported["components"]:
@@ -231,7 +232,7 @@ def render(reported: dict) -> str:
     lines.extend(
         f"{component['component']}: {component['remedy']}"
         for component in reported["components"]
-        if component["state"] == SETUP_GAP
+        if component["state"] in (SETUP_GAP, DRIFT)
     )
     return "\n".join(lines)
 

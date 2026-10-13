@@ -18,7 +18,17 @@ operator named for that lane. Nothing here weakens a native permission decision
 or adds a way around one, and an unnamed dialog is escalated rather than
 answered.
 
-The patterns are recorded from `claude` CLI 2.1.270 and Codex CLI 0.153.4.
+The patterns are recorded from the client versions `RECORDED` names: the
+`claude` CLI's dialogs, and the Codex CLI's trust prompt and its approvals to
+run a command, make edits and grant permissions. The launch records the
+version of the client it starts, every published dialog names it, and
+`doctor` reports a lane whose client is newer than its recorded version or
+whose dialog this module could not read, so a reworded dialog is found
+before a lane is found stuck on it. A screen that draws no recorded words
+but stays silent after the lane's last hook announced a tool call is
+escalated as well, because the client is most likely waiting on an approval
+in wording nobody recorded yet.
+
 Matching runs on a flattened screen with escape sequences removed and
 whitespace collapsed, because both clients redraw and rewrap the same dialog
 continuously and neither emits line breaks between redraws. Only the bottom
@@ -56,6 +66,7 @@ import contextlib
 import datetime
 import hashlib
 import re
+import subprocess
 import textwrap
 import time
 import zoneinfo
@@ -79,6 +90,11 @@ OPTION_LABEL = 60
 ESCALATE_AFTER = 30.0
 REPEAT_LIMIT = 2
 SILENT_AFTER = 5.0
+VERSION_TIMEOUT = 5.0
+RECORDED = {"claude": "2.1.270", "codex": "0.153.4"}
+PENDING_TOOL = "PreToolUse"
+STALLED = "a silent screen after a tool call"
+RELEASE = re.compile(r"\d+(?:\.\d+)+")
 MARKER = "dialog: "
 APPROVAL = "waiting for approval"
 PERMISSION = "tool-permission"
@@ -200,7 +216,12 @@ DIALOGS: tuple[Dialog, ...] = (
     Dialog(
         PERMISSION,
         "native tool permission prompt",
-        re.compile(r"do you want to proceed\?", re.IGNORECASE),
+        re.compile(
+            r"do you want to proceed\?"
+            r"|would you like to (?:run the following command"
+            r"|make the following edits|grant these permissions)\?",
+            re.IGNORECASE,
+        ),
         ANSWER,
     ),
 )
@@ -773,9 +794,10 @@ def requested_command(screen: str, text: str, data: bytes) -> str:
     The question and its options say only that something waits for
     approval; the operator answering from a notice, and a later wake of a
     lane whose session ended at the prompt, need the command itself. A
-    shell prompt's command rows are read as `_shell_rows` reads them, and
-    any other prompt yields the text drawn above its question since the
-    footer of any dialog drawn before it.
+    shell prompt's command rows are read as `_shell_rows` reads them. A
+    Codex approval draws its command between the question and option 1,
+    so that text is read next, and any other prompt yields the text drawn
+    above its question since the footer of any dialog drawn before it.
 
     Args:
         screen: Flattened screen text.
@@ -787,6 +809,11 @@ def requested_command(screen: str, text: str, data: bytes) -> str:
         from its end, or an empty string when nothing is drawn above it.
     """
     shown = " ".join(_shell_rows(data))
+    asked = BY_NAME[PERMISSION].pattern.search(text)
+    first = OPTION.search(text, asked.end()) if asked else None
+    if not shown and asked and first:
+        below = text[asked.end() : first.start()]
+        shown = " ".join(BOX.sub(" ", below).split())
     if not shown:
         region = screen[-REGION_CHARS:]
         head = region[: max(0, len(region) - len(text))]
@@ -889,6 +916,8 @@ class Watch:
         self._answered_tail = b""
         self._repeats: dict[str, int] = {}
         self._decision = ""
+        self._stalled: bool | None = None
+        self._client = ""
 
     def _opted_in(self) -> bool:
         """Reads whether this lane's operator allows this bridge's own tools.
@@ -955,6 +984,7 @@ class Watch:
                 self._resolved = False
                 self._release()
             self._tail = (self._tail + output)[-SCREEN_BYTES:]
+            self._stalled = None
         elif self._answered and self._answered_tail:
             if not self._answered_at:
                 self._answered_at = now
@@ -967,6 +997,13 @@ class Watch:
             return b""
         screen = flatten(self._tail)
         found = locate(screen)
+        if (
+            self._stalled is None
+            and not output
+            and found is None
+            and not prompted(screen)
+        ):
+            self._stalled = self._pending_tool()
         signature = self._describe(screen, found)
         if signature != self._signature:
             self._retire()
@@ -1026,7 +1063,22 @@ class Watch:
             )
         if prompted(screen):
             return "prompt\x00" + screen[-SIGNATURE_CHARS:]
+        if self._stalled:
+            return "stalled\x00" + screen[-SIGNATURE_CHARS:]
         return ""
+
+    def _pending_tool(self) -> bool:
+        """Reports whether the lane's last hook announced an unfinished tool.
+
+        A client that stops on an approval in wording no pattern records
+        draws nothing more after its `PreToolUse` hook, and its next hook
+        would be `PostToolUse`. The check runs once per silence, on the
+        first pass that reads no output, so an idle screen costs one read.
+        """
+        from agent_parley import checkpoints
+
+        state = checkpoints.activity(self._directory, self._name)
+        return state.get("event") == PENDING_TOOL
 
     def _act(
         self, screen: str, found: Frame | None, now: float, held: bool
@@ -1035,7 +1087,10 @@ class Watch:
         if found is None:
             if now - self._since < self._deadline:
                 return b""
-            self._escalate(None, "an unrecognized native prompt", screen)
+            label = "an unrecognized native prompt"
+            if self._signature.startswith("stalled\x00"):
+                label = STALLED
+            self._escalate(None, label, screen)
             return b""
         dialog = found.dialog
         if dialog.action == EXHAUSTED:
@@ -1307,7 +1362,9 @@ class Watch:
         The last observed native checkpoint is left untouched: a dialog is
         evidence that the lane stopped, never fresh activity. A record that
         cannot take the lane's checkpoint lock is not marked handled, so the
-        next pass publishes it again rather than dropping it.
+        next pass publishes it again rather than dropping it. The client
+        version the launch recorded on the activity is copied into the
+        record as `client_version`; a lane launched without one has none.
 
         Returns:
             Whether the record was written.
@@ -1335,6 +1392,9 @@ class Watch:
                         (state.get("dialog") or {}).get("previous", "")
                     )
                 record["previous"] = previous
+                self._client = str(state.get("client_version") or "")
+                if self._client:
+                    record["client_version"] = self._client
                 state["activity"] = MARKER + label
                 state["dialog"] = record
                 write_json(path, state)
@@ -1389,10 +1449,14 @@ class Watch:
         """Sends the operator one message carrying what the screen shows.
 
         A decision already recorded for the dialog is named, so the message
-        offers the dialog's own options rather than a generic one.
+        offers the dialog's own options rather than a generic one, and the
+        client version the launch recorded is named after the screen, so a
+        reader can tell which release drew wording nobody recorded.
         """
         from agent_parley import notify
 
+        if self._client:
+            detail = f"{detail} | drawn by {self._client}"
         fields = {"dialog": label, "detail": detail}
         if decision:
             fields["decision"] = decision
@@ -1426,3 +1490,76 @@ def watcher(directory: Path, name: str) -> Watch:
         answers = configured(manifest, name)
         reply = standing_reply(manifest, name)
     return Watch(directory, name, answers, deadline=ESCALATE_AFTER, reply=reply)
+
+
+def version_of(executable: str) -> str:
+    """Asks a native client which release it is.
+
+    Args:
+        executable: Resolved path of the client the launch starts.
+
+    Returns:
+        The first line the client prints for `--version`, or empty text when
+        it fails, prints nothing or answers slower than `VERSION_TIMEOUT`.
+    """
+    try:
+        done = subprocess.run(
+            [executable, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=VERSION_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if done.returncode != 0:
+        return ""
+    lines = done.stdout.strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _release_of(version: str) -> tuple[int, ...]:
+    """Reads the dotted release number a version line carries."""
+    found = RELEASE.search(version)
+    return tuple(int(part) for part in found[0].split(".")) if found else ()
+
+
+def drift(directory: Path, manifest: dict) -> list[str]:
+    """Names the lanes whose dialogs the recorded matchers may misread.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Project manifest stored in that directory.
+
+    Returns:
+        One line per lane of a client `RECORDED` names whose launch recorded
+        a newer release than the matchers were recorded from, and one per
+        such lane now held on a dialog no matcher read, with the end of its
+        screen so a contributor can record the wording. A lane with no
+        recorded client version reports no release drift.
+    """
+    from agent_parley import checkpoints
+
+    root = str(manifest.get("root", ""))
+    found = []
+    for name in sorted(manifest.get("participants") or {}):
+        state = checkpoints.activity(directory, name)
+        client = str(state.get("client", ""))
+        if client not in RECORDED:
+            continue
+        version = str(state.get("client_version") or "")
+        if _release_of(version) > _release_of(RECORDED[client]):
+            found.append(
+                f"{root} {name}: {client} {version} is newer than the "
+                f"{RECORDED[client]} the dialog matchers were recorded from"
+            )
+        record = state.get("dialog")
+        if isinstance(record, dict) and record.get("name") == "unknown":
+            screen = " ".join(str(line) for line in record.get("screen") or [])
+            found.append(
+                f"{root} {name}: {client} drew an unrecognized prompt: "
+                f"{screen[-REPORT_WIDTH:]}"
+            )
+    return found

@@ -73,6 +73,35 @@ CODEX_TRUST = (
     "No, quit\r\n\r\n  Press enter to continue\r\n"
 )
 
+CODEX_RUN = (
+    "\x1b[2J\x1b[H  Would you like to run the following command?\r\n\r\n"
+    "  $ python3 -P -m agent_parley.cli inbox\r\n\r\n\x1b[1m› 1. Yes, "
+    "proceed (y)\x1b[0m\r\n  2. Yes, and don't ask again for this command "
+    "in this session (a)\r\n  3. No, and tell Codex what to do differently "
+    "(esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n"
+)
+
+CODEX_EDITS = (
+    "\x1b[2J\x1b[H  Would you like to make the following edits?\r\n\r\n"
+    "  README.md (+1 -0)\r\n\r\n\x1b[1m› 1. Yes, proceed (y)\x1b[0m\r\n"
+    "  2. Yes, and don't ask again for these files (a)\r\n  3. No, and "
+    "tell Codex what to do differently (esc)\r\n\r\n  Press enter to "
+    "confirm or esc to cancel\r\n"
+)
+
+CODEX_GRANT = (
+    "\x1b[2J\x1b[H  Would you like to grant these permissions?\r\n\r\n"
+    "  network access\r\n\r\n\x1b[1m› 1. Yes, grant these permissions for "
+    "this turn (y)\x1b[0m\r\n  2. Yes, grant these permissions for this "
+    "session (a)\r\n  3. No, and tell Codex what to do differently (esc)"
+    "\r\n\r\n  Press enter to confirm or esc to cancel\r\n"
+)
+
+OPENCODE_LIKE = (
+    "\x1b[2J\x1b[H  △ Permission required\r\n  $ rm -rf build\r\n"
+    "  Allow once   Allow always   Reject\r\n"
+)
+
 CLAUDE_TRUST = (
     "\x1b[2J\x1b[H╭────╮\r\n│ Do you trust the files in this folder? │\r\n"
     "│ /home/operator/lane │\r\n│ Claude Code may read, write, or execute "
@@ -1337,3 +1366,134 @@ def test_a_configured_answer_never_widens_a_permission_by_prefix(
     assert record["options"][0].startswith("Yes, and don't ask again")
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert state["dialog"]["escalated"] is True
+
+
+@pytest.mark.parametrize(
+    ("capture", "answer", "command"),
+    [
+        (CODEX_RUN, "Yes, proceed", "$ python3 -P -m agent_parley.cli inbox"),
+        (CODEX_EDITS, "Yes, proceed", "README.md (+1 -0)"),
+        (
+            CODEX_GRANT,
+            "Yes, grant these permissions for this turn",
+            "network access",
+        ),
+    ],
+)
+def test_a_codex_approval_is_a_tool_permission_with_its_command(
+    tmp_path, delivered, capture, answer, command
+):
+    """Recognizes the Codex approvals and asks the operator about each."""
+    screen = dialogs.flatten(capture.encode())
+    assert dialogs.match(screen).name == dialogs.PERMISSION
+    assert dialogs.keys(screen, answer) == b"1\r"
+    watch = dialogs.Watch(tmp_path, "lane")
+    assert watch.advance(capture.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    record = json.loads((tmp_path / "lane-activity.json").read_text())
+    record = record["dialog"]
+    assert record["name"] == dialogs.PERMISSION
+    assert record["command"] == command
+    assert dialogs.lane_cause(record) == lanes.APPROVAL
+    [decision] = decisions.list_open(tmp_path)
+    assert len(decision["options"]) == 3
+    assert decision["confirm"] == [decision["options"][1]]
+    assert decision["recommended"].startswith("No, and tell Codex")
+    assert command in decision["detail"]
+
+
+def test_a_configured_answer_is_pressed_on_a_codex_approval(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", {"tool-permission": "Yes, proceed"})
+    assert watch.advance(CODEX_RUN.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b"1\r"
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["answer"] == "Yes, proceed"
+
+
+def test_a_silent_screen_after_a_tool_call_escalates_after_the_deadline(
+    tmp_path, delivered
+):
+    """Escalates wording nobody recorded once a tool call stays unanswered."""
+    write_json(
+        tmp_path / "lane-activity.json",
+        {"activity": "working", "event": "PreToolUse"},
+    )
+    screen = dialogs.flatten(OPENCODE_LIKE.encode())
+    assert dialogs.match(screen) is None
+    assert dialogs.prompted(screen) is False
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    assert watch.advance(OPENCODE_LIKE.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    assert watch.holding is False
+    assert watch.advance(b"", 1.6) == b""
+    assert watch.holding is True
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == dialogs.MARKER + dialogs.STALLED
+    assert state["dialog"]["name"] == "unknown"
+    assert dialogs.lane_cause(state["dialog"]) == lanes.PROMPT
+    [fields] = delivered
+    assert fields["detail"].startswith(dialogs.TERMINAL_ONLY)
+    assert "Allow once" in fields["detail"]
+
+
+def test_a_silent_screen_with_no_pending_tool_call_never_escalates(tmp_path):
+    write_json(
+        tmp_path / "lane-activity.json", {"activity": "idle", "event": "Stop"}
+    )
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    for now in (0.0, 1.0, 40.0, 400.0):
+        output = OPENCODE_LIKE.encode() if now == 0.0 else b""
+        assert watch.advance(output, now) == b""
+    assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert "dialog" not in state
+
+
+def test_a_published_dialog_names_the_client_version_that_drew_it(
+    tmp_path, delivered
+):
+    write_json(
+        tmp_path / "lane-activity.json",
+        {"activity": "working", "client_version": "codex-cli 0.153.4"},
+    )
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(CODEX_RUN.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["client_version"] == "codex-cli 0.153.4"
+    [fields] = delivered
+    assert fields["detail"].endswith("drawn by codex-cli 0.153.4")
+
+
+def test_the_client_version_is_the_first_line_it_prints(tmp_path):
+    client = tmp_path / "client"
+    client.write_text("#!/bin/sh\necho 'codex-cli 0.153.4'\necho more\n")
+    client.chmod(0o755)
+    assert dialogs.version_of(str(client)) == "codex-cli 0.153.4"
+    failing = tmp_path / "failing"
+    failing.write_text("#!/bin/sh\necho 'unknown option'\nexit 2\n")
+    failing.chmod(0o755)
+    assert dialogs.version_of(str(failing)) == ""
+    assert dialogs.version_of(str(tmp_path / "missing")) == ""
+
+
+def test_drift_names_a_newer_client_and_an_unread_dialog(tmp_path):
+    seen = {
+        "newer": {"client": "claude", "client_version": "2.1.295 (Claude)"},
+        "unread": {
+            "client": "codex",
+            "client_version": "codex-cli 0.153.4",
+            "dialog": {"name": "unknown", "screen": ["Allow once  Reject"]},
+        },
+        "current": {"client": "claude", "client_version": "2.1.270"},
+        "untracked": {"client": "gemini", "client_version": "9.0.0"},
+        "unversioned": {"client": "claude"},
+    }
+    for name, state in seen.items():
+        write_json(tmp_path / f"{name}-activity.json", state)
+    manifest = {"root": "/repo", "participants": dict.fromkeys(seen, {})}
+    assert dialogs.drift(tmp_path, manifest) == [
+        "/repo newer: claude 2.1.295 (Claude) is newer than the 2.1.270 the "
+        "dialog matchers were recorded from",
+        "/repo unread: codex drew an unrecognized prompt: Allow once  Reject",
+    ]
