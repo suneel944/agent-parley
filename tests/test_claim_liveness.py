@@ -142,6 +142,37 @@ def test_an_idle_claim_of_a_live_lane_is_offered_and_its_peer_kept(
     assert "overdue_recovery" not in offered["7"]
 
 
+@pytest.mark.parametrize("waiting", [lifecycle.READY, lifecycle.BLOCKED])
+def test_a_waiting_second_claim_keeps_tool_calls_counting_on_the_first(
+    bridge, paired, waiting
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "7")
+    bridge.issue(lane, "claim", "8")
+    for number in ("7", "8"):
+        edit(directory, number, lambda record: aged(record, 2 * IDLE_AFTER))
+    edit(
+        directory,
+        "8",
+        lambda record: record["execution"].update(
+            state=waiting, claim_id=record["claim_id"]
+        ),
+    )
+    live(directory, "claude", 5)
+    events(directory, "claude", ("PostToolUse", 5))
+    live(directory, "codex", 5)
+    events(directory, "codex", ("PostToolUse", 5))
+    assert lifecycle.actionable(issues.snapshot(directory), "claude") == ["7"]
+
+    for _ in range(2):
+        kept = step(bridge, directory)
+        assert kept["7"]["owner"] == "claude"
+        assert kept["7"]["offer"] is None
+        assert "overdue_recovery" not in kept["7"]
+
+
 def test_progress_on_the_idle_claim_drops_its_recovery(bridge, paired):
     directory = busy_with_one_idle_claim(bridge, paired)
     assert step(bridge, directory)["8"]["overdue_recovery"]["step"] == "wake"
