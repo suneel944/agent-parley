@@ -607,8 +607,10 @@ reported.
                     supervision.forget_delivered(lane.parent, agent)
             prompt = self.protocol(agent, data)
             hooks = self.hooks(agent, lane.parent)
+            inherited = dict(os.environ)
+            inherited.pop(entry.get("home_env") or "", None)
             env = {
-                **os.environ,
+                **inherited,
                 **account,
                 "AGENT_PARLEY_TOKEN": identity["registration_token"],
                 "AGENT_PARLEY_HOME": str(self.home),

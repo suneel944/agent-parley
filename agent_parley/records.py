@@ -18,7 +18,6 @@ import datetime
 import functools
 import hashlib
 import json
-import os
 import re
 import zoneinfo
 from collections.abc import Callable, Iterable
@@ -99,6 +98,10 @@ def _newest(paths: Iterable[Path]) -> Path | None:
 def _config_home(home: Path, entry: dict, profile: str | None) -> Path | None:
     """Resolves the config home the lane's own launch selected.
 
+    A default-account lane runs without the caller's config-home variable,
+    so its records sit under the client's default home, never under a
+    directory the reading process happens to export.
+
     Args:
         home: Private bridge state root.
         entry: Provider definition driving the lane.
@@ -113,8 +116,6 @@ def _config_home(home: Path, entry: dict, profile: str | None) -> Path | None:
             the provider cannot apply.
     """
     selected = roster.config_home(home, entry, profile)
-    if not selected:
-        selected = os.environ.get(entry.get("home_env") or "", "")
     if not selected:
         selected = DEFAULT_HOMES.get(str(entry.get("adapter", "")), "")
     return Path(selected).expanduser() if selected else None

@@ -14,7 +14,6 @@ per session, to the next message or tool result.
 """
 
 import json
-import os
 import shlex
 import shutil
 from pathlib import Path
@@ -169,8 +168,9 @@ def configure(
         name: Validated participant name.
         url: Authenticated loopback MCP endpoint.
         hooks: Common checkpoint hook definitions.
-        source_dir: Configuration directory selected by the launch
-            environment; OpenCode's default location when unset.
+        source_dir: Configuration directory selected by the lane's
+            credential profile; OpenCode's default location when unset,
+            whatever the caller's environment exports.
 
     Returns:
         Directory for OPENCODE_CONFIG_DIR in this launch only.
@@ -180,12 +180,7 @@ def configure(
             lane server or plugin, or already holds a plugin file named
             ``agent-parley.js``.
     """
-    source = Path(
-        source_dir
-        or os.environ.get(
-            "OPENCODE_CONFIG_DIR", str(Path.home() / ".config" / "opencode")
-        )
-    )
+    source = Path(source_dir or Path.home() / ".config" / "opencode")
     if (source / "opencode.jsonc").exists() and not (source / CONFIG).exists():
         raise BridgeError(
             f"{source / 'opencode.jsonc'} cannot be carried into a lane "
