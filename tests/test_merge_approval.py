@@ -187,6 +187,7 @@ def test_new_commits_and_changed_policy_each_need_a_new_approval(
     with pytest.raises(BridgeError, match="committed since"):
         bridge.merge(repo, "codex")
 
+    bridge.report(awaiting["lane"], "ready", "Engine extended", "", "13 ok")
     bridge.approve(repo, "codex")
     bridge.verification(repo, "true")
     with pytest.raises(BridgeError, match="verification command"):
@@ -194,6 +195,28 @@ def test_new_commits_and_changed_policy_each_need_a_new_approval(
 
     bridge.approve(repo, "codex")
     assert "Merged" in bridge.merge(repo, "codex")
+
+
+def test_an_approval_binds_the_commit_the_ready_report_described(
+    bridge, repo, paired, awaiting
+):
+    lane = awaiting["lane"]
+    (lane / "unreviewed.txt").write_text("never reported\n")
+    commit(lane, "Unreported work")
+    report = reported(awaiting["directory"], "codex")
+
+    with pytest.raises(BridgeError, match="committed since report") as stale:
+        bridge.approve(repo, "codex")
+    assert report in str(stale.value)
+    with pytest.raises(BridgeError, match="committed since report"):
+        bridge.merge(repo, "codex")
+    assert not (repo / "unreviewed.txt").exists()
+    assert "committed since report" in bridge.preview_merge(repo, "codex")
+
+    bridge.report(lane, "ready", "Engine extended", "", "13 tests passed")
+    bridge.approve(repo, "codex")
+    assert "Merged" in bridge.merge(repo, "codex")
+    assert (repo / "unreviewed.txt").exists()
 
 
 def test_a_further_report_invalidates_the_approval_it_was_given_for(
