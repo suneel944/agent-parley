@@ -50,6 +50,8 @@ class Found(NamedTuple):
             service.
         notify: Whether an outbound notification transport is configured.
         lanes: How many lanes the project has registered.
+        unborn: Whether the checkout's branch has no commit yet, so no
+            lane can start from it.
     """
 
     repository: bool
@@ -60,32 +62,42 @@ class Found(NamedTuple):
     problems: tuple[dict, ...] = ()
     notify: bool = True
     lanes: int = 0
+    unborn: bool = False
 
 
-def checkout(directory: Path) -> tuple[bool, bool | None]:
-    """Says whether a directory is in a Git checkout and whether it is dirty.
+def checkout(directory: Path) -> tuple[bool, bool | None, bool]:
+    """Says whether a directory is in a Git checkout and what state it is in.
 
     Membership is read from a ``.git`` entry in the directory or a parent,
     so a slow or missing Git never makes a plain directory read as a
-    checkout; Git runs only to learn whether a found checkout is dirty.
-    It runs with ``--no-optional-locks`` so the reading never refreshes
-    and rewrites the checkout's index.
+    checkout; Git runs only to learn whether a found checkout is dirty and
+    whether it has a first commit. It runs with ``--no-optional-locks`` so
+    the reading never refreshes and rewrites the checkout's index. The
+    version 2 porcelain branch header names an unborn branch as
+    ``# branch.oid (initial)``, a stable form Git does not translate.
 
     Args:
         directory: Directory to inspect.
 
     Returns:
-        Whether it is a checkout, and whether it has uncommitted changes,
-        None when Git did not answer within `GIT_SECONDS`.
+        Whether it is a checkout; whether it has uncommitted changes, None
+        when Git did not answer within `GIT_SECONDS`; and whether its
+        branch has no commit yet.
     """
     resolved = directory.resolve()
     if not any(
         (place / ".git").exists() for place in (resolved, *resolved.parents)
     ):
-        return False, False
+        return False, False, False
     try:
         finished = subprocess.run(
-            ["git", "--no-optional-locks", "status", "--porcelain"],
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+            ],
             cwd=directory,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -94,12 +106,18 @@ def checkout(directory: Path) -> tuple[bool, bool | None]:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return True, None
+        return True, None, False
     except OSError:
-        return False, False
+        return False, False, False
     if finished.returncode:
-        return False, False
-    return True, bool(finished.stdout.strip())
+        return False, False, False
+    lines = finished.stdout.splitlines()
+    headers = [line for line in lines if line.startswith("# ")]
+    return (
+        True,
+        len(headers) < len(lines),
+        "# branch.oid (initial)" in headers,
+    )
 
 
 def serving(home: Path) -> bool:
@@ -172,7 +190,7 @@ def look(home: Path, directory: Path) -> Found:
     Returns:
         What was found.
     """
-    repository, dirty = checkout(directory)
+    repository, dirty, unborn = checkout(directory)
     try:
         root = registered_root(home, directory) if repository else ""
     except (OSError, ValueError, KeyError, TypeError):
@@ -181,7 +199,9 @@ def look(home: Path, directory: Path) -> Found:
         client.name: plugins.recorded(client.name)
         for client, _ in plugins.detected()
     }
-    found = Found(repository, dirty, bool(root), clis, serving(home))
+    found = Found(
+        repository, dirty, bool(root), clis, serving(home), unborn=unborn
+    )
     if not (root and found.service):
         return found
     import sqlite3
@@ -249,6 +269,10 @@ def advice(found: Found) -> list[tuple[str, str]]:
     )
     if not found.repository:
         steps.append(("cd REPOSITORY", "Move into the Git checkout to share."))
+    elif found.unborn:
+        steps.append(
+            ("git commit", "Make the first commit; lanes start from it.")
+        )
     elif found.dirty:
         steps.append(
             ("git status", "Lanes start from the last commit; commit first.")
@@ -275,6 +299,8 @@ def render(found: Found) -> str:
     """
     if not found.repository:
         repository = "not a Git repository"
+    elif found.unborn:
+        repository = "Git repository, no commits yet"
     elif found.dirty is None:
         repository = "Git repository"
     elif found.dirty:

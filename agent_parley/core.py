@@ -358,8 +358,10 @@ class BridgeCore:
         Raises:
             BridgeError: If a checked lane left its assigned branch, Git
                 registers its worktree at another path, which names the
-                command that moves it back, or no manifest exists and
-                creation is not allowed.
+                command that moves it back, no manifest exists and
+                creation is not allowed, or the repository has no commit
+                yet for lanes to start from, checked before any pending
+                work is stashed.
         """
         from agent_parley.cli import (
             drift,
@@ -402,13 +404,21 @@ class BridgeCore:
             return data
         if not preserve:
             return roster.read(directory)
+        try:
+            base = git(root, "rev-parse", "--verify", "--quiet", "HEAD")
+        except BridgeError:
+            raise BridgeError(
+                "This repository has no commits yet; lanes start from HEAD. "
+                "Make a first commit, then retry.",
+                next_command='git commit --allow-empty -m "Initial commit"',
+            ) from None
         preserved = preserve_pending(root)
         if preserved:
             print(preserved, file=sys.stderr, flush=True)
         data = {
             "version": roster.MANIFEST_VERSION,
             "root": str(root),
-            "base": git(root, "rev-parse", "--verify", "HEAD"),
+            "base": base,
             "verify": [],
             "initialize": [],
             "forge": forge.select(root),

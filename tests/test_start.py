@@ -79,7 +79,26 @@ def test_a_plain_directory_is_not_a_checkout_whatever_git_answers(
     path("git")
     outside = tmp_path / "plain"
     outside.mkdir()
-    assert start.checkout(outside) == (False, False)
+    assert start.checkout(outside) == (False, False, False)
+
+
+def test_repository_without_commits_leads_with_the_first_commit(
+    path, tmp_path, capsys
+):
+    path("claude")
+    claude_plugin()
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    subprocess.run(["git", "init", "-q", str(fresh)], check=True)
+    (fresh / "notes.txt").write_text("draft\n")
+    printed = screen(capsys, tmp_path / "home", fresh)
+    assert "Git repository, no commits yet" in printed
+    assert "clean" not in printed
+    assert "uncommitted changes" not in printed
+    assert printed.index("git commit") < printed.index(
+        "agent-parley run claude"
+    )
+    assert "Make the first commit" in printed
 
 
 def test_dirty_repository_points_at_its_uncommitted_work(

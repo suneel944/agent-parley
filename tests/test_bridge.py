@@ -92,6 +92,19 @@ def test_isolation_identity_and_idempotent_setup(bridge, repo, paired):
     )
 
 
+def test_setup_refuses_a_repository_without_commits(bridge, tmp_path):
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    git(fresh, "init")
+    (fresh / "notes.txt").write_text("draft\n")
+    with pytest.raises(BridgeError, match="no commits yet") as raised:
+        bridge.setup(fresh)
+    assert "fatal" not in str(raised.value)
+    assert raised.value.next_command.startswith("git commit")
+    assert not list(bridge.home.rglob("project.json"))
+    assert (fresh / "notes.txt").read_text() == "draft\n"
+
+
 def test_dirty_source_is_preserved_as_a_stash_entry(bridge, repo, capsys):
     (repo / "shared.txt").write_text("uncommitted work\n")
     (repo / "untracked.txt").write_text("untracked work\n")

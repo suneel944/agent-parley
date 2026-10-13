@@ -157,8 +157,9 @@ completion, upgrades and the supported platforms are in
 ## Run it
 
 Not sure where to start? Run `agent-parley` with no arguments in the
-repository. It reads, and writes nothing: whether this is a Git checkout and
-whether it has uncommitted changes, whether the project is registered, which
+repository. It reads, and writes nothing: whether this is a Git checkout,
+whether it has a first commit and uncommitted changes, whether the project is
+registered, which
 of `claude` and `codex` are on PATH and whether each has the plugin, and
 whether the coordination service is running. It then names the next one to
 three commands for exactly that state, such as `agent-parley plugins install`,
