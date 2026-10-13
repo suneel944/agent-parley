@@ -137,6 +137,21 @@ def test_seeding_refuses_a_directory_that_holds_a_repository(tmp_path):
         acceptance.workspace(tmp_path, 2)
 
 
+@pytest.mark.parametrize("named", [False, True])
+def test_verdict_refuses_a_workspace_that_holds_no_run(tmp_path, capsys, named):
+    argv = ["verdict", "--home", str(tmp_path / "home")]
+    if named:
+        argv += ["--workspace", str(tmp_path / "missing")]
+    assert acceptance.main(argv) == 2
+    captured = capsys.readouterr()
+    message, command = captured.err.splitlines()
+    assert message.startswith("acceptance.py: ")
+    assert ("missing" in message) is named
+    assert command == f"next: ls -d {acceptance.ROOT}/run-*"
+    assert "Traceback" not in captured.err
+    assert not captured.out
+
+
 def test_a_dirty_lane_worktree_with_no_claim_is_stranded(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
