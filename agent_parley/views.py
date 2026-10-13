@@ -830,6 +830,7 @@ def _row(row: dict) -> dict:
         "calls": row["calls"],
         "errors": row["errors"],
         "tokens": row["tokens"],
+        "unmeasured": list(row.get("unmeasured") or []),
         "idle_seconds": row["idle_seconds"],
         "idle_complete": row["idle_complete"],
         "over_budget": row.get("over_budget", False),

@@ -129,6 +129,22 @@ def test_top_prints_one_frame_and_exits(
     assert rows[0]["drift"] is False
 
 
+def test_top_names_the_lanes_whose_tokens_are_unmeasured(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    bridge.add_participant(repo, "gem", "gemini")
+    document = envelope(
+        run(monkeypatch, capsys, "--home", str(bridge.home), "top", "--json"),
+        "top",
+    )
+    rows = document["projects"][0]["participants"]
+    assert {row["participant"]: row["unmeasured"] for row in rows} == {
+        "claude": [],
+        "codex": [],
+        "gem": ["tokens"],
+    }
+
+
 def test_issue_list_reports_offers_with_their_identifiers(
     bridge, repo, paired, monkeypatch, capsys
 ):

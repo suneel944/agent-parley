@@ -233,6 +233,69 @@ SOURCES: dict[str, Callable[[Path, Path], list[Path]]] = {
     "claude": _claude_sources,
     "codex": _codex_sources,
 }
+UNMEASURED_WARNING = (
+    "warning: no token count is read for {lanes}, so a token limit never "
+    "counts their use; only {readers} lanes report tokens."
+)
+
+
+def measures_tokens(home: Path, provider: str) -> bool:
+    """Reports whether a provider's lanes have a token reader at all.
+
+    Args:
+        home: Private bridge state root.
+        provider: Provider name a lane runs.
+
+    Returns:
+        True when the provider is defined and its adapter has a session
+        record reader in ``ADAPTERS``; a provider without one always reports
+        no tokens, so a token limit can never count its lanes.
+    """
+    try:
+        entry = roster.provider(home, provider)
+    except BridgeError:
+        return False
+    return str(entry.get("adapter", "")) in ADAPTERS
+
+
+def unmeasured(
+    home: Path, manifest: dict, names: Iterable[str] | None = None
+) -> list[str]:
+    """Names the active lanes whose tokens no reader can count.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest as the roster reports it.
+        names: Lanes to check; every participant when omitted.
+
+    Returns:
+        Sorted names of active lanes whose provider ``measures_tokens``
+        rejects.
+    """
+    participants = manifest.get("participants") or {}
+    return sorted(
+        name
+        for name in (participants if names is None else names)
+        if name in participants
+        and not roster.retired(participants[name])
+        and not measures_tokens(
+            home, str(participants[name].get("provider", name))
+        )
+    )
+
+
+def unmeasured_warning(lanes: Iterable[str]) -> str:
+    """Formats the warning for lanes or providers no token reader counts.
+
+    Args:
+        lanes: Names of the unmeasured lanes or providers.
+
+    Returns:
+        One warning line naming each of them and the readable adapters.
+    """
+    return UNMEASURED_WARNING.format(
+        lanes=", ".join(lanes), readers=" and ".join(ADAPTERS)
+    )
 
 
 def _stamp(value: object) -> float | None:
