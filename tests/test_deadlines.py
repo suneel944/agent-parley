@@ -161,6 +161,31 @@ def test_a_project_default_is_inherited_without_a_flag(bridge, repo, paired):
     assert "attempt budget 2" in bridge.budgets(repo)
 
 
+@pytest.mark.parametrize("via", ["token", "worktree"])
+@pytest.mark.parametrize(
+    ("setter", "value"),
+    [
+        ("budgets", {"wait": 2592000}),
+        ("tracker", "null"),
+        ("resources", "port:5432"),
+        ("branch_naming", "lanes"),
+    ],
+)
+def test_a_lane_cannot_change_project_settings(
+    bridge, repo, paired, monkeypatch, via, setter, value
+):
+    directory = bridge.project(repo)[1]
+    before = (directory / "project.json").read_text()
+    if via == "token":
+        monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    else:
+        monkeypatch.chdir(paired["lanes"]["claude"])
+    with pytest.raises(BridgeError, match="from an operator shell"):
+        getattr(bridge, setter)(repo, value)
+    assert (directory / "project.json").read_text() == before
+    assert str(repo.resolve()) in getattr(bridge, setter)(repo)
+
+
 def test_an_overdue_claim_is_visible_and_still_owned(bridge, repo, paired):
     directory = bridge.project(repo)[1]
     lane = paired["lanes"]["claude"]

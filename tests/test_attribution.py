@@ -11,6 +11,9 @@ from agent_parley.state import BridgeError, write_json
 
 CREDIT = "Generated" + " with " + "Claude"
 TRAILER = "Co-Authored-By:" + " Codex <bot@example.com>"
+FOOTER = (
+    "Generated" + " with [Claude Code](https://claude" + ".com/claude-code)"
+)
 
 
 def commit(repo, message):
@@ -107,6 +110,21 @@ def test_the_branch_prefix_is_configurable_per_project(bridge, repo):
         "git merge --no-ff -m " + json.dumps(CREDIT) + " other",
         "git tag -a v1 -m " + json.dumps(CREDIT),
         "gh pr create --title " + json.dumps(CREDIT) + " --body ok",
+        "gh pr edit 1 --body " + json.dumps(CREDIT),
+        "gh pr comment 1 --body " + json.dumps(CREDIT),
+        "gh pr merge 1 --squash --body " + json.dumps(CREDIT),
+        "gh pr review 1 --approve -b " + json.dumps(CREDIT),
+        "gh issue create -t t -b " + json.dumps(CREDIT),
+        "gh issue edit 1 --body " + json.dumps(CREDIT),
+        "gh issue comment 1 -b " + json.dumps(CREDIT),
+        "gh release create v1 --notes " + json.dumps(CREDIT),
+        "gh release edit v1 -n " + json.dumps(CREDIT),
+        "git notes add -m " + json.dumps(CREDIT),
+        "git commit -F - <<'M'\nfix: x\n\n" + TRAILER + "\nM",
+        "gh pr create -t fix --body-file - <<M\nsee " + CREDIT + "\nM",
+        "git commit -m \"$(cat <<'EOF'\nfix: it's done\n\n"
+        + CREDIT
+        + '\nEOF\n)"',
     ],
 )
 def test_a_command_publishing_attribution_is_denied(
@@ -139,6 +157,10 @@ def test_a_command_publishing_attribution_is_denied(
         "git status",
         "git commit -m 'docs: explain how claude sessions are launched'",
         "gh pr view 12",
+        "gh issue comment 1 -b 'LGTM'",
+        "git commit -F - <<'M'\nfix: x\nM",
+        "git commit -F - <<'M' && git push\nfix: it's the codex adapter\nM",
+        "gh release create v1 --notes 'Integrates with Claude Code hooks.'",
     ],
 )
 def test_ordinary_work_is_not_refused(bridge, repo, paired, command):
@@ -225,6 +247,11 @@ def test_the_issue_comment_names_no_participant_or_provider():
         (chr(0x1F916) + " shipped", "robot_signature"),
         ("Co-Authored-By:" + " Gemini <g@example.com>", "assistant_trailer"),
         ("Generated" + " with Amp", "assistant_credit"),
+        (FOOTER, "assistant_credit"),
+        (chr(0x1F916) + " " + FOOTER, "assistant_credit"),
+        ("Written" + " by **Codex**", "assistant_credit"),
+        ("Generated" + " with `Claude`", "assistant_credit"),
+        ("See https://claude" + ".ai/code for details", "assistant_link"),
     ],
 )
 def test_each_refusal_names_its_rule(text, rule):
@@ -239,7 +266,24 @@ def test_each_refusal_names_its_rule(text, rule):
         "Co-Authored-By: Example Maintainer <human@example.com>",
         "Run Claude Code and Codex in separate worktrees.",
         "Signed-off-by: Champ Example <champ@example.com>",
+        "The bridge integrates with Claude Code hooks.",
+        "Built with care by the maintainers.",
     ],
 )
 def test_ordinary_text_breaks_no_rule(text):
     assert policy.matched_rule(text) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(git commit -m " + json.dumps(TRAILER) + ")",
+        "env GIT_AUTHOR_NAME=x git commit -m " + json.dumps(TRAILER),
+        "timeout 5 git commit -m " + json.dumps(TRAILER),
+    ],
+)
+def test_a_wrapped_attributed_commit_is_refused(paired, command):
+    lane = Path(paired["lanes"]["claude"])
+    found = attributed_command(payload(lane, command), lane)
+    assert found is not None
+    assert found[0] == TRAILER

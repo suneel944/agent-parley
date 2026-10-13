@@ -104,14 +104,22 @@ while status continues to show the drift.
 
 A lane keeps any extra worktree in its `<lane>-wt/` directory, because Git
 records no creator and the sweep attributes a worktree by where it sits. The
-lane hook, for every provider, denies a `git worktree add` whose target
-resolves outside that directory (`worktree_refused`), and the denial names the
-directory and the same command aimed inside it. The target is read past `git
--C DIR` and options such as `-b`, `-B`, `--detach`, `--lock` and `--reason`,
-and a relative one resolves against the call's working directory. `git
-worktree move`, `remove`, `list` and `prune` pass, and a session outside a
-lane carries no lane hook, so it is never gated. Like the branch guard, this is
-a guard on the agent's own tool calls, not an authority boundary.
+lane hook, for every provider, denies a `git worktree add`, or a `git worktree
+move` whose destination, resolves outside that directory (`worktree_refused`),
+and the denial names the directory and the same command aimed inside it. The
+target is read past `git -C DIR` and options such as `-b`, `-B`, `--detach`,
+`--lock` and `--reason`, and a relative one resolves against the directory an
+earlier `cd` in the same call selects, else the call's working directory. A
+target naming a variable is denied with a request for a literal path. `git
+worktree remove`, `list` and `prune` pass, and a session outside a lane
+carries no lane hook, so it is never gated. Both this gate and the branch
+guard read through subshells, brace groups, compound commands, wrappers such
+as `env`, `timeout`, `nice`, `exec`, `sudo` and `xargs`, `sh -c`, `eval`,
+command substitutions and `git -c alias.NAME=...`; code an interpreter runs,
+such as `python -c` or a script, and aliases in Git configuration are out of
+their reach. The branch guard allows a `git checkout` that only restores
+files. Like the branch guard, this is a guard on the agent's own tool calls,
+not an authority boundary.
 
 Pending mail and notices ride on the call as context and never refuse it. These
 causes deny a tool call:

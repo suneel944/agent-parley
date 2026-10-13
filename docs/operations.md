@@ -1000,8 +1000,8 @@ and recorded as exhausted, so unknown prior use never reads as none.
 
 **Resume and reset.** Raising, removing or clearing a limit is an operator
 action. `budget enforce` and `budget resume` refuse to run when
-`AGENT_PARLEY_TOKEN` is set, as it is in a launched lane's environment, and no
-MCP tool changes the run budget. A lane's hook also denies a shell command that
+`AGENT_PARLEY_TOKEN` is set, as it is in a launched lane's environment, or
+when run from inside a lane worktree, and no MCP tool changes the run budget. A lane's hook also denies a shell command that
 runs `agent-parley budget enforce` or `budget resume`, so unsetting the
 variable in the same command does not slip past. Nothing here is enforcement:
 both refusals only prevent accidental use from a lane, are not an authority
@@ -3069,8 +3069,11 @@ for every provider, with no flag that turns it off:
 
 - **Denied before it lands.** The same hook that refuses a branch switch inside
   an assigned lane denies `git commit`, `git commit --amend`, `git merge`,
-  `git tag -m`, `git revert -m` and `gh pr create` whose message, title or body
-  claims assistant authorship: a co-author trailer naming an assistant,
+  `git tag -m`, `git revert -m`, `git notes add`, `gh pr` `create`, `edit`,
+  `comment`, `merge` and `review`, `gh issue` `create`, `edit` and `comment`,
+  and `gh release` `create` and `edit` whose message, title, body, notes,
+  message file or here-document claims assistant authorship: a co-author
+  trailer naming an assistant,
   "generated", "written", "created", "authored", "assisted" or "powered" by a
   named assistant, a vendor or model name in an authorship position, or a
   generator signature. Each denial names the enumerated rule it broke, lands in
@@ -3090,8 +3093,9 @@ for every provider, with no flag that turns it off:
 
 Detection is textual and deliberately narrow: it matches authorship claims and
 authorship positions, so "fix the codex adapter" is ordinary work while "written
-by" an assistant is refused. A message supplied through a file rather than the
-command line is not visible to the hook; the integration scan still reads the
+by" an assistant is refused. Markdown around the name, as in a linked footer,
+does not hide it. A message the hook cannot read, such as a file written
+earlier in the same command, still reaches the integration scan through the
 commit it produced. Rewriting history you already have is out of scope: a
 pre-existing commit carrying a trailer is reported at merge, never amended for
 you.

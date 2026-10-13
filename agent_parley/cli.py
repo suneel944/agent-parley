@@ -1358,27 +1358,6 @@ def budget_changes(args: argparse.Namespace) -> dict | None:
     return changes
 
 
-def operator_only(action: str) -> None:
-    """Refuses an operator-authority command run from inside a lane.
-
-    Every launched lane carries its registration token in its environment
-    and the operator's own shell does not, so the check stops a lane from
-    raising, removing or clearing its run budget by accident. It is not an
-    authority boundary: a process that drops the variable passes it.
-
-    Args:
-        action: Command named in the refusal.
-
-    Raises:
-        BridgeError: If the environment belongs to a launched lane.
-    """
-    if os.environ.get("AGENT_PARLEY_TOKEN"):
-        raise BridgeError(
-            f"{action} needs operator authority and is refused from a lane; "
-            "run it from the operator's own shell."
-        )
-
-
 def selected(args: argparse.Namespace) -> bool:
     """Reports whether the command line carries any lane selector."""
     return bool(
@@ -6231,21 +6210,16 @@ def main() -> int:
                     )
                 )
             elif args.action == "enforce":
-                changes = budget_changes(args)
-                if changes is not None:
-                    operator_only("budget enforce")
-                print(bridge.enforce(repository, changes))
+                print(bridge.enforce(repository, budget_changes(args)))
             elif args.action == "resume":
-                operator_only("budget resume")
-                _, directory = bridge.project(repository, create=False)
-                print(
-                    budgets.resume(
-                        bridge.home,
-                        directory,
-                        roster.read(directory),
-                        args.reset,
-                    )
+                from agent_parley import unattended
+
+                root, directory = bridge.project(repository, create=False)
+                data = roster.read(directory)
+                unattended.operator_only(
+                    repository, root, data, "A run budget is resumed"
                 )
+                print(budgets.resume(bridge.home, directory, data, args.reset))
             else:
                 print(
                     bridge.budget(

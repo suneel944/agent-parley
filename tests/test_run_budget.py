@@ -473,9 +473,26 @@ def test_only_the_operator_resumes_or_raises_the_run(
         "--repo",
         str(repo),
     )
-    assert "operator authority" in capsys.readouterr().err
+    assert "from an operator shell" in capsys.readouterr().err
     assert budgets.halted(directory, roster.read(directory))
     monkeypatch.delenv("AGENT_PARLEY_TOKEN")
+    before = roster.read(directory)
+    monkeypatch.chdir(paired["lanes"]["claude"])
+    assert main(monkeypatch, bridge, "budget", "resume", "--repo", str(repo))
+    assert main(
+        monkeypatch,
+        bridge,
+        "budget",
+        "enforce",
+        "--calls",
+        "100",
+        "--repo",
+        str(repo),
+    )
+    assert capsys.readouterr().err.count("from an operator shell") == 2
+    assert roster.read(directory) == before
+    assert budgets.halted(directory, before)
+    monkeypatch.chdir(repo)
     assert main(monkeypatch, bridge, "budget", "resume", "--repo", str(repo))
     assert "still at or over" in capsys.readouterr().err
     assert not main(
