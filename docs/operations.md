@@ -1731,7 +1731,11 @@ command that ran out of time, `os` for a file or network failure, `missing`
 for an internal lookup that found nothing, `store` for a failure reading or
 writing coordination state, and `value` for anything else, such as an
 invalid value. `message` is the same text the `agent-parley:` line
-prints on standard error, which still appears; no traceback is printed. The
+prints on standard error, which still appears; no traceback is printed. A
+`missing` document also carries `where`, the `file:line` of the innermost
+frame that raised it, which the message repeats. A state file such as
+`config.json` or a project manifest that lacks a required key is a `bridge`
+refusal naming the file and the key instead. The
 document goes to standard output so `agent-parley ... --json | jq` reads a
 failure the same way it reads a result. A command that already wrote part of
 its output before failing is not rolled back: the error document follows on

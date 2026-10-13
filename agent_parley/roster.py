@@ -1555,7 +1555,7 @@ def read(directory: Path) -> dict:
         Manifest using the participant roster layout.
 
     Raises:
-        BridgeError: If no manifest exists yet.
+        BridgeError: If no manifest exists yet, or it lacks a required key.
     """
     path = directory / "project.json"
     if not path.exists():
@@ -1564,7 +1564,13 @@ def read(directory: Path) -> dict:
             "or agent-parley setup first.",
             next_command="agent-parley setup .",
         )
-    return normalize(json.loads(path.read_text()))
+    try:
+        return normalize(json.loads(path.read_text()))
+    except KeyError as exc:
+        raise BridgeError(
+            f"{path} lacks {exc.args[0]!r}; the project manifest is "
+            "incomplete or corrupt. Restore the key or the file."
+        ) from exc
 
 
 def resolve(manifest: dict, lane: Path) -> str:

@@ -7603,13 +7603,25 @@ def failure(label: str, exc: BaseException) -> str:
         The stage, the exception type and text, and the innermost frame that
         raised it, so a recorded failure can be traced without the log.
     """
-    frames = traceback.extract_tb(exc.__traceback__)
-    where = (
-        f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}"
-        if frames
-        else ""
-    )
+    place = raised_at(exc)
+    where = f" at {place}" if place else ""
     return f"{label}: {type(exc).__name__}: {exc}{where}"
+
+
+def raised_at(exc: BaseException) -> str:
+    """Names the innermost frame that raised one exception.
+
+    Args:
+        exc: Exception to locate.
+
+    Returns:
+        The file name and line number as ``name:line``, or an empty string
+        when the exception carries no traceback.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return ""
+    return f"{Path(frames[-1].filename).name}:{frames[-1].lineno}"
 
 
 def last_poll(directory: Path) -> dict:

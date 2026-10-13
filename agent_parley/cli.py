@@ -6614,9 +6614,11 @@ def main() -> int:
 def _error_message(exc: Exception) -> str:
     """Words one runtime failure as the line the CLI prints.
 
-    A missing key reads as its quoted key alone, so it is named as a record
-    that vanished, which is how one reaches the handler: another process
-    retired or removed it between the command's read and its use.
+    A missing key reads as its quoted key alone. State files name themselves
+    when they lack a required key, so one reaching the handler is either a
+    record another process removed meanwhile or a fault in the code, and the
+    message carries the innermost frame that raised it so a rerun that fails
+    the same way can be traced.
 
     Args:
         exc: Failure the command handler caught.
@@ -6625,9 +6627,11 @@ def _error_message(exc: Exception) -> str:
         The message both the human line and the error document carry.
     """
     if isinstance(exc, KeyError):
+        place = supervision.raised_at(exc)
+        where = f" (at {place})" if place else ""
         return (
-            f"No record {exc.args[0]!r} any more; another command changed "
-            "the project while this one ran. Rerun it."
+            f"No record {exc.args[0]!r}{where}; if another command changed "
+            "the project meanwhile, rerun it, otherwise report this line."
         )
     return str(exc)
 
@@ -6656,7 +6660,8 @@ def _error_document(exc: Exception) -> str:
 
     The document carries the shared snapshot envelope with ``kind`` set to
     ``error``, a stable ``type`` for the exception class and the same
-    ``message`` the human line prints. It fits on one line so it stays a
+    ``message`` the human line prints. A missing key also carries ``where``,
+    the innermost frame that raised it. It fits on one line so it stays a
     separate record after any partial output a command already wrote.
 
     Args:
@@ -6677,10 +6682,11 @@ def _error_document(exc: Exception) -> str:
         kind = "store"
     else:
         kind = "value"
-    message = _error_message(exc)
+    error = {"type": kind, "message": _error_message(exc)}
+    if isinstance(exc, KeyError):
+        error["where"] = supervision.raised_at(exc)
     return json.dumps(
-        views.document("error", {"error": {"type": kind, "message": message}}),
-        ensure_ascii=False,
+        views.document("error", {"error": error}), ensure_ascii=False
     )
 
 
