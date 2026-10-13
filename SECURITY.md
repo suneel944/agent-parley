@@ -29,7 +29,8 @@ or bounty commitment is offered. Security fixes target the latest released versi
 - Peer messages and handoff summaries are untrusted input, not instructions with
   authority over native permissions or repository rules.
 - Reservations prevent conflicting grants among participants, and a lane's
-  native hook refuses that lane's own write into a peer's reserved path. They
+  native hook refuses that lane's own write into a path a peer reserved
+  exclusively; a shared reservation only produces a notice. They
   do not block writes from anything outside the lane's agent. Issue ownership is cooperative, not GitHub authorization.
 - Back up private state before upgrades. Worktrees contain real user changes.
   Do not attach the state directory, identity files, or unredacted logs to reports.
