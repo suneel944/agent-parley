@@ -746,7 +746,10 @@ class IntegrationMixin(MailMixin):
         `participant merge --preview` reports, and each merge then runs
         through the single-lane path, so no lane is integrated on easier terms
         than it would be alone. A group is admitted whole or not at all: one
-        refused member leaves the group unmerged. Execution is still ordered
+        refused member leaves the group unmerged. The whole run is predicted
+        first with `merges.run_conflicts`, each lane onto the lanes before
+        it, and a run any lane would conflict in merges nothing and names
+        the lanes and paths. Execution is still ordered
         rather than atomic, so a merge or gate failure part way through stops
         the run and leaves the earlier merge commits in place; the report then
         names what was integrated, what refused and what was not attempted.
@@ -828,9 +831,33 @@ class IntegrationMixin(MailMixin):
                     + admitted[name]
                     for name in sequence
                 }
+            conflicts = merges.run_conflicts(
+                root,
+                [
+                    (name, data["participants"][name]["branch"])
+                    for name in sequence
+                ],
+            )
             if preview:
                 return self._integration_preview(
-                    root, directory, data, subject, sequence, admitted
+                    root,
+                    directory,
+                    data,
+                    subject,
+                    sequence,
+                    admitted,
+                    conflicts or [],
+                )
+            if conflicts:
+                raise BridgeError(
+                    "\n".join(
+                        [
+                            f"{subject}: nothing merged, because merging "
+                            "the lanes in dependency order "
+                            f"({', '.join(sequence)}) would conflict:",
+                            *(f"- {conflict}" for conflict in conflicts),
+                        ]
+                    )
                 )
             if group and any(refusals.values()):
                 raise BridgeError(group_refusal(group, sequence, refusals))
@@ -889,8 +916,13 @@ class IntegrationMixin(MailMixin):
         subject: str,
         sequence: list[str],
         admitted: dict[str, list[str]],
+        conflicts: Sequence[str] = (),
     ) -> str:
-        """Reports the ordered plan and every candidate's own preview."""
+        """Reports the ordered plan and every candidate's own preview.
+
+        Conflicts predicted for the run as a whole, which a lane's own
+        preview against the base cannot show, are named after the plan.
+        """
         from agent_parley.cli import lane_session, merge_preview
 
         report = [
@@ -899,6 +931,12 @@ class IntegrationMixin(MailMixin):
             + ".",
             "Preview only: nothing is merged and no lane is verified.",
         ]
+        if conflicts:
+            report.append(
+                "Merging them in this order would conflict, so a run "
+                "merges nothing:"
+            )
+            report += [f"- {conflict}" for conflict in conflicts]
         for name in sequence:
             participant = data["participants"][name]
             report.append(f"\n{name}:")

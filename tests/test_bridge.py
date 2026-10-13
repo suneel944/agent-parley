@@ -31,6 +31,7 @@ from agent_parley import (
     evidence,
     forge,
     issues,
+    merges,
     metrics,
     process,
     records,
@@ -3316,9 +3317,43 @@ def test_merge_integrates_a_lane_branch_and_leaves_the_lane_alone(
     )
 
 
-def test_merge_leaves_a_conflict_resolvable_without_discarding(
+def test_a_predicted_conflict_is_refused_before_the_base_is_touched(
     bridge, repo, paired
 ):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    identify(repo)
+    (lane / "shared.txt").write_text("lane version\n")
+    commit(lane, "Lane edit")
+    (repo / "shared.txt").write_text("base version\n")
+    commit(repo, "Base edit")
+    head = git(repo, "rev-parse", "HEAD")
+    git_dir = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+
+    report = bridge.preview_merge(repo, "codex")
+    assert f"- Merging {branch} would conflict in: shared.txt." in report
+    with pytest.raises(BridgeError, match="would conflict in: shared.txt"):
+        bridge.merge(repo, "codex")
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert not (git_dir / "MERGE_HEAD").exists()
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_a_git_without_merge_tree_predicts_nothing(monkeypatch, tmp_path):
+    def usage(arguments, **options):
+        return subprocess.CompletedProcess(arguments, 129, "", "usage")
+
+    monkeypatch.setattr(merges.subprocess, "run", usage)
+    assert merges.predicted_conflicts(tmp_path, "HEAD", "lane") is None
+    assert merges.run_conflicts(tmp_path, [("codex", "lane")]) is None
+
+
+def test_merge_leaves_a_conflict_resolvable_without_discarding(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(merges, "predicted_conflicts", lambda *args: None)
     lane = Path(paired["lanes"]["codex"])
     identify(repo)
     (lane / "shared.txt").write_text("lane version\n")
@@ -3359,7 +3394,7 @@ def test_preview_reports_pending_work_and_leaves_the_base_untouched(
     assert "Lane work" in report
     assert "feature.txt" in report
     assert f"Nothing refuses this merge; it would land on {base}." in report
-    assert "cannot predict conflicts" in report
+    assert "It merges cleanly." in report
     assert "would be refused" not in report
 
     assert git(repo, "rev-parse", "HEAD") == head
@@ -3410,8 +3445,9 @@ def test_preview_gathers_every_blocking_condition_in_one_report(
 
 
 def test_preview_reports_a_merge_in_progress_a_drift_and_a_missing_branch(
-    bridge, repo, paired
+    bridge, repo, paired, monkeypatch
 ):
+    monkeypatch.setattr(merges, "predicted_conflicts", lambda *args: None)
     lane = Path(paired["lanes"]["codex"])
     branch = paired["branches"]["codex"]
     identify(repo)

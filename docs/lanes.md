@@ -223,8 +223,11 @@ agent-parley participant merge claude-2 --preview
 ```
 
 The preview only reads. It changes nothing, and it never takes the lane's
-session lock, so it is safe while that agent is still working. It attempts no
-merge, so it cannot predict conflicts.
+session lock, so it is safe while that agent is still working. On Git 2.38 or
+later it predicts conflicts with `git merge-tree`, which touches no checkout: a
+lane that would conflict is refused with the conflicting paths, and `participant
+merge` refuses it the same way before anything is merged. Older Git cannot
+predict conflicts.
 
 Or send it for review instead:
 
@@ -271,7 +274,10 @@ single-lane path, so nothing is integrated on easier terms than it would be
 alone.
 
 A group is admitted whole or not at all: one refused member leaves the group
-unmerged. Execution is ordered rather than atomic, so a merge or a gate failure
+unmerged. The whole run is predicted first, each lane onto the lanes before it,
+and a run in which any lane would conflict, alone or only in combination, merges
+nothing and names the lanes and paths. Execution is ordered rather than atomic,
+so a merge or a gate failure
 part way through stops the run, leaves the earlier merge commits in place and
 reports what was integrated, what refused and what was not attempted. Nothing is
 reset or reverted.

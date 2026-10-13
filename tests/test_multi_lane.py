@@ -362,6 +362,27 @@ def test_a_selected_merge_integrates_only_the_matched_lanes(
     assert not (repo / "second.txt").exists()
 
 
+def test_lanes_that_conflict_only_together_merge_nothing(bridge, repo, paired):
+    git(repo, "config", "user.name", "Bridge Test")
+    git(repo, "config", "user.email", "test@example.com")
+    worked(bridge, paired, "claude", "42", "shared.txt")
+    worked(bridge, paired, "codex", "43", "shared.txt")
+    head = git(repo, "rev-parse", "HEAD")
+    git_dir = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+
+    preview = bridge.integrate(repo, preview=True)
+    assert "would conflict in: shared.txt" in preview
+    with pytest.raises(BridgeError, match="nothing merged") as refused:
+        bridge.integrate(repo)
+
+    assert "would conflict in: shared.txt" in str(refused.value)
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert not (git_dir / "MERGE_HEAD").exists()
+    assert git(repo, "status", "--porcelain") == ""
+
+
 def test_an_empty_selection_integrates_nothing(bridge, repo, paired):
     git(repo, "config", "user.name", "Bridge Test")
     git(repo, "config", "user.email", "test@example.com")
