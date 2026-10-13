@@ -14,7 +14,19 @@ EVENTS = {
     "AfterTool": "PostToolUse",
     "AfterAgent": "Stop",
     "SessionEnd": "SessionEnd",
+    "Notification": "PermissionRequest",
 }
+TOOL_PERMISSION = "ToolPermission"
+"""Notification type Gemini raises when it shows a tool confirmation.
+
+Only that type is translated to the shared ``PermissionRequest`` event; it
+reports the wait and never answers it. Every other notification keeps its
+native name, which the shared checkpoints record as an ignored event. The
+payload shape follows Gemini's hook reference and has not been confirmed
+in a live trial, so ``roster.UNAVAILABLE_HOOKS`` still lists
+``PermissionRequest`` for this adapter and the dialog watcher stays the
+authoritative reading.
+"""
 
 
 def configure(
@@ -87,12 +99,34 @@ def configure(
 
 
 def payload(value: dict) -> dict:
-    """Translates Gemini events and MCP names for shared checkpoints."""
+    """Translates Gemini events and MCP names for shared checkpoints.
+
+    A ``Notification`` whose ``notification_type`` is ``ToolPermission``
+    becomes ``PermissionRequest``, naming the tool from its ``details``;
+    any other notification is passed on under its native name.
+
+    Args:
+        value: Native Gemini hook input.
+
+    Returns:
+        The event in the shared checkpoint schema.
+    """
     translated = dict(value)
-    translated["hook_event_name"] = EVENTS.get(
-        value.get("hook_event_name", ""), value.get("hook_event_name", "")
-    )
-    tool = value.get("tool_name", "")
+    native = value.get("hook_event_name", "")
+    if native == "Notification":
+        if value.get("notification_type") != TOOL_PERMISSION:
+            return translated
+        details = value.get("details")
+        details = details if isinstance(details, dict) else {}
+        translated["tool_name"] = str(
+            details.get("tool_name")
+            or details.get("toolName")
+            or details.get("name")
+            or ""
+        )
+        translated["tool_input"] = details.get("tool_input", details)
+    translated["hook_event_name"] = EVENTS.get(native, native)
+    tool = translated.get("tool_name", "")
     if tool.startswith("mcp_agent_parley_"):
         translated["tool_name"] = tool.replace(
             "mcp_agent_parley_", "mcp__agent_parley__", 1

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import gemini, roster, store
+from agent_parley import dialogs, gemini, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -163,6 +163,70 @@ def test_a_native_after_agent_without_coordination_ends_the_turn(lane):
         )
         == {}
     )
+
+
+def test_a_tool_permission_notification_records_the_lane_blocked(lane):
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-3", "cwd": str(lane["lane"])},
+    )
+    output = fire(
+        lane,
+        "Notification",
+        {
+            "session_id": "session-3",
+            "cwd": str(lane["lane"]),
+            "notification_type": "ToolPermission",
+            "message": "Allow execution?",
+            "details": {"toolName": "run_shell_command", "command": "ls"},
+        },
+    )
+    assert output == {}
+    state = json.loads((lane["directory"] / "helper-activity.json").read_text())
+    assert state["activity"] == f"{dialogs.APPROVAL}: run_shell_command"
+    assert state["dialog"]["tool"] == "run_shell_command"
+
+
+def test_other_notifications_are_ignored_and_never_decide(lane):
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-4", "cwd": str(lane["lane"])},
+    )
+    output = fire(
+        lane,
+        "Notification",
+        {
+            "session_id": "session-4",
+            "cwd": str(lane["lane"]),
+            "notification_type": "Idle",
+        },
+    )
+    assert output == {}
+    state = json.loads((lane["directory"] / "helper-activity.json").read_text())
+    assert state["activity"] == "working"
+    assert "dialog" not in state
+
+
+def test_a_tool_permission_payload_names_the_shared_tool():
+    assert gemini.payload(
+        {
+            "hook_event_name": "Notification",
+            "notification_type": "ToolPermission",
+            "details": {"toolName": "mcp_agent_parley_send_message"},
+        }
+    ) == {
+        "hook_event_name": "PermissionRequest",
+        "notification_type": "ToolPermission",
+        "details": {"toolName": "mcp_agent_parley_send_message"},
+        "tool_name": "mcp__agent_parley__send_message",
+        "tool_input": {"toolName": "mcp_agent_parley_send_message"},
+    }
+    assert gemini.payload(
+        {"hook_event_name": "Notification", "notification_type": "Idle"}
+    ) == {"hook_event_name": "Notification", "notification_type": "Idle"}
+    assert gemini.response({}) == {}
 
 
 def test_resume_without_a_recorded_session_is_refused(lane, bridge, repo):
