@@ -25,6 +25,7 @@ import json
 import shlex
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agent_parley import (
@@ -964,6 +965,51 @@ def _ack_rows(
     ]
 
 
+def _dirt(project: dict, data: dict) -> dict[str, list[str] | None]:
+    """Reads the uncommitted paths of every worktree a lane row may report.
+
+    Only a retired lane, and a quiet lane with no live session process whose
+    branch has not drifted, report uncommitted work, so only their worktrees
+    are read. The Git reads are read-only and independent, so up to
+    `supervision.GIT_WORKERS` of them run at once, the same bound `status`
+    and `top` use; one read per lane in turn grew `problems` linearly with
+    quiet lanes.
+
+    Args:
+        project: One project of the status reading.
+        data: The project's normalized manifest.
+
+    Returns:
+        Mapping of worktree path to the paths `supervision.dirty_paths`
+        reported, None where Git could not answer.
+    """
+    lanes = sorted(
+        {
+            participant["lane"]
+            for record in project["participants"]
+            for participant in [data["participants"][record["participant"]]]
+            if roster.retired(participant)
+            or (
+                not record["drift"]
+                and record["availability"]["state"] != supervision.ACTIVE
+                and record["availability"]["process_alive"] is not True
+            )
+        }
+    )
+    with ThreadPoolExecutor(max_workers=supervision.GIT_WORKERS) as pool:
+        found = pool.map(supervision.dirty_paths, lanes)
+        return dict(zip(lanes, found, strict=True))
+
+
+def _dirty(
+    lane: str, dirt: dict[str, list[str] | None] | None
+) -> list[str] | None:
+    """Returns a worktree's uncommitted paths, read already or read now."""
+    if dirt is not None and lane in dirt:
+        return dirt[lane]
+    return supervision.dirty_paths(lane)
+
+
 def _lane_rows(
     record: dict,
     participant: dict,
@@ -973,6 +1019,7 @@ def _lane_rows(
     now: float,
     directory: Path | None = None,
     peer: bool = True,
+    dirt: dict[str, list[str] | None] | None = None,
 ) -> list[dict]:
     """Derives the rows one lane record carries, one per cause.
 
@@ -987,6 +1034,8 @@ def _lane_rows(
             key-hold deadline, or None to read no deadline.
         peer: Whether a live lane besides this one exists to take its
             orphaned claims.
+        dirt: Uncommitted paths already read per worktree, as `_dirt`
+            returns them; a worktree missing from it is read here.
 
     Returns:
         Zero or more rows, one per cause the record shows, each carrying how
@@ -1028,7 +1077,7 @@ def _lane_rows(
     repo = f"--repo {shlex.quote(str(root))}"
     rows: list[dict] = []
     if roster.retired(participant):
-        if supervision.dirty_paths(participant["lane"]):
+        if _dirty(participant["lane"], dirt):
             rows.append(
                 _row(
                     DIRTY,
@@ -1221,7 +1270,7 @@ def _lane_rows(
     elif (
         quiet
         and availability["process_alive"] is not True
-        and (changed := supervision.dirty_paths(participant["lane"]))
+        and (changed := _dirty(participant["lane"], dirt))
     ):
         lane = participant["lane"]
         rows.append(
@@ -2166,6 +2215,7 @@ def derive(
             for record in project["participants"]
         }
         children = reclaim.children_by_lane(data)
+        dirt = _dirt(project, data)
         for record in project["participants"]:
             found.extend(
                 _lane_rows(
@@ -2177,6 +2227,7 @@ def derive(
                     stamp,
                     directory,
                     supervision.live_peer(states, record["participant"]),
+                    dirt,
                 )
             )
             aged.extend(

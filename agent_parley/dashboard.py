@@ -4,6 +4,7 @@ import contextlib
 import curses
 import functools
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -744,7 +745,7 @@ def collect(
         }
         rows = [
             _row(home, path.parent, data, agent, context)
-            for agent in sorted(data["participants"])
+            for agent in sorted(data["participants"], key=tables.natural_key)
         ]
         _orphan_remedies(rows, data["root"])
         if providers:
@@ -762,6 +763,7 @@ def collect(
                 ),
             }
         )
+    projects.sort(key=lambda project: project["root"])
     return {
         "running": running,
         "home": str(home),
@@ -1505,7 +1507,13 @@ def render(
 
 
 def _warning() -> int:
-    """Chooses how a warning row is emphasized on this terminal."""
+    """Chooses how a warning row is emphasized on this terminal.
+
+    A non-empty `NO_COLOR` keeps emphasis bold-only, as the no-color.org
+    convention asks, so colour is never set up on such a terminal.
+    """
+    if os.environ.get("NO_COLOR"):
+        return curses.A_BOLD
     with contextlib.suppress(curses.error):
         if curses.has_colors():
             curses.start_color()

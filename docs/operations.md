@@ -1218,7 +1218,8 @@ matched by path or by its trailing directory name.
 
 Branch drift, a stale lease, a rejected call, an overdue issue and a lost
 session process are drawn in colour where the terminal reports colour
-support and in bold where it does not. Each also prints its own `!` or word
+support and in bold where it does not; set `NO_COLOR` to keep emphasis
+bold-only. Each also prints its own `!` or word
 in the table, so a monochrome terminal and a piped capture read the same.
 The legend that explains the columns moved behind `?` and out of every
 frame.

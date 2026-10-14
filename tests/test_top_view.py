@@ -647,3 +647,32 @@ def test_the_a_key_shows_and_hides_what_the_live_view_left_out(monkeypatch):
 def test_the_header_reports_how_long_the_frame_took_to_read():
     view = {**snapshot(("/repo", lanes(1))), "read_seconds": 0.25}
     assert "read 0.25s" in dashboard.render(view)[0]
+
+
+def test_no_color_keeps_warning_rows_bold_without_setting_up_colour(
+    monkeypatch,
+):
+    started = []
+    monkeypatch.setattr(curses, "has_colors", lambda: True)
+    monkeypatch.setattr(curses, "start_color", lambda: started.append(1))
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert dashboard._warning() == curses.A_BOLD
+    assert started == []
+
+
+def test_ages_of_two_days_and_more_read_in_days():
+    assert tables.age(47 * 3600) == "47h"
+    assert tables.age(3 * 86400) == "3d"
+    assert tables.age(30 * 86400) == "30d"
+
+
+def test_numbered_lanes_sort_by_their_number():
+    names = ["codex13", "amp5", "codex7", "amp17", "codex", "amp11"]
+    assert sorted(names, key=tables.natural_key) == [
+        "amp5",
+        "amp11",
+        "amp17",
+        "codex",
+        "codex7",
+        "codex13",
+    ]
