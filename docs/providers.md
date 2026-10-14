@@ -73,7 +73,10 @@ disk, under the config home the lane launched with. No vendor is asked.
   `~/.copilot`). The event carries the session total across resumes, and
   Parley sums its input and output tokens over every model. Copilot CLI
   keeps per-call usage only in its live event stream, so a session that is
-  still running reads 0 until it ends.
+  still running reads 0 until it ends. A token limit therefore cannot stop a
+  running `copilot` lane: setting one warns that the lane reports tokens only
+  at session end, and `budget enforce --tokens` refuses unless
+  `--allow-unmeasured` is given, as it does for `amp`.
 - `gemini` reads `tokens.total` of each `gemini` message in the chat logs
   under `.gemini/tmp/<project>/chats` in `GEMINI_CLI_HOME` (default `~`).
   The project directory comes from `.gemini/projects.json`. A message that
