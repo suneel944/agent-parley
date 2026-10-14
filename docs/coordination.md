@@ -330,7 +330,14 @@ other lanes read, not a filesystem lock.
 A reservation can name something that is not a file — `port:5432`, `db:local`,
 `suite:integration`, `device:android-1` — because a worktree isolates none of
 those; a named resource conflicts on an exact match, and
-`agent-parley resources set` declares which ones exist. A granted reservation
+`agent-parley resources set` declares which ones exist. Path keys compare
+case-sensitively unless the project manifest records `case_insensitive`, which
+a new project takes from Git's `core.ignorecase` (set when the repository is
+cloned or initialized on a case-insensitive file system, such as default macOS).
+Then `README.md` and `readme.md` overlap, `src/` covers `SRC/x.py`, and a write
+through a lane path spelled in another case is still checked against
+reservations; named resources stay exact. A manifest written before the field
+existed keeps exact comparison. A granted reservation
 also carries a `forecast`: the files that changed together with a reserved path
 in at least three of the base checkout's last 500 commits and that a peer holds
 right now, each with the peer and the count, so the lane can renegotiate or

@@ -2055,7 +2055,7 @@ def named_resource(pattern: str) -> bool:
     return bool(separator) and "/" not in scheme
 
 
-def overlapping(pattern: str, other: str) -> bool:
+def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
     """Reports whether two reservation keys can name the same thing.
 
     Named resources overlap only when spelled identically. Paths overlap when
@@ -2067,15 +2067,23 @@ def overlapping(pattern: str, other: str) -> bool:
     ever the text being matched, never a compiled pattern, which gives the
     same answer without one regular expression per dirty path.
 
+    A project on a case-insensitive file system folds case, so two paths
+    that open the same file overlap however each is spelled. Named
+    resources are still compared exactly.
+
     Args:
         pattern: Reservation key or repository-relative path.
         other: Reservation key it is compared against.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         Whether the two keys overlap.
     """
     if named_resource(pattern) or named_resource(other):
         return pattern == other
+    if fold:
+        pattern = pattern.casefold()
+        other = other.casefold()
     pattern_glob = any(c in pattern for c in "*?[")
     other_glob = any(c in other for c in "*?[")
     return (
@@ -2088,7 +2096,9 @@ def overlapping(pattern: str, other: str) -> bool:
     )
 
 
-def overlapping_paths(paths: list[str], patterns: list[str]) -> set[str]:
+def overlapping_paths(
+    paths: list[str], patterns: list[str], *, fold: bool = False
+) -> set[str]:
     """Names the paths that overlap any pattern, as ``overlapping`` judges.
 
     A dirty checkout can list tens of thousands of paths, and one call per
@@ -2099,17 +2109,34 @@ def overlapping_paths(paths: list[str], patterns: list[str]) -> set[str]:
     collides with every globbed path. A named resource overlaps only its own
     spelling, so either side being one is answered by a set lookup; only a
     globbed path checked against a plain pattern uses the pairwise rule.
+    Folding case answers the same question over casefolded paths and
+    reports each match in the spelling the caller gave.
 
     Args:
         paths: Reservation keys or repository-relative paths.
         patterns: Reservation keys each path is compared against.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
-        Every path that ``overlapping(path, pattern)`` reports for some
-        pattern.
+        Every path that ``overlapping(path, pattern, fold=fold)`` reports for
+        some pattern.
     """
     if not patterns:
         return set()
+    if fold:
+        spellings: dict[str, list[str]] = {}
+        for path in paths:
+            key = path if named_resource(path) else path.casefold()
+            spellings.setdefault(key, []).append(path)
+        folded = [
+            pattern if named_resource(pattern) else pattern.casefold()
+            for pattern in patterns
+        ]
+        return {
+            path
+            for key in overlapping_paths(list(spellings), folded)
+            for path in spellings[key]
+        }
     globbed = [
         path for path in paths if "*" in path or "?" in path or "[" in path
     ]
@@ -2369,7 +2396,11 @@ def _reclaim_notice(
 
 
 def _conflicts(
-    db: sqlite3.Connection, actor: dict, paths: list[str], exclusive: bool
+    db: sqlite3.Connection,
+    actor: dict,
+    paths: list[str],
+    exclusive: bool,
+    fold: bool = False,
 ) -> tuple[list[sqlite3.Row], list[dict]]:
     """Names every peer lease that blocks one batch of keys.
 
@@ -2378,6 +2409,7 @@ def _conflicts(
         actor: Authenticated project and lane.
         paths: Normalized keys the batch asks for.
         exclusive: Whether the batch asks exclusively.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         Every live peer lease of this project, and one conflict entry per
@@ -2397,7 +2429,7 @@ def _conflicts(
         for lease in leases:
             other = lease["path_pattern"]
             if (exclusive or lease["exclusive"]) and overlapping(
-                pattern, other
+                pattern, other, fold=fold
             ):
                 conflict = {"path": pattern, "owner": lease["name"]}
                 if lease["reason"]:
@@ -2448,6 +2480,7 @@ def _reserve(
     declared: frozenset[str] | None = None,
     claim: str = "",
     commits: list[list[str]] | None = None,
+    fold: bool = False,
 ) -> dict:
     """Grants all requested leases or none; two globs conservatively overlap.
 
@@ -2490,6 +2523,8 @@ def _reserve(
             history can follow one piece of work. Empty records no claim.
         commits: Files per recent commit of the base checkout, read before
             the transaction opened, or None when no history is available.
+        fold: Whether paths are compared without regard to case, as on a
+            case-insensitive file system.
 
     Returns:
         The granted leases, or the conflicts that granted nothing. A grant
@@ -2504,7 +2539,7 @@ def _reserve(
     """
     paths, ttl, exclusive, reason = _keys(args, declared)
     _reclaim(db, actor["project_id"])
-    leases, conflicts = _conflicts(db, actor, paths, exclusive)
+    leases, conflicts = _conflicts(db, actor, paths, exclusive, fold)
     if conflicts:
         return _refusal(conflicts)
     return _grant(
@@ -2603,6 +2638,7 @@ def _request(
     declared: frozenset[str] | None = None,
     claim: str = "",
     commits: list[list[str]] | None = None,
+    fold: bool = False,
 ) -> dict:
     """Takes the leases that are free and queues a request for the rest.
 
@@ -2629,6 +2665,7 @@ def _request(
             claim.
         commits: Files per recent commit of the base checkout, or None when
             no history is available.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         The granted leases and an empty queue, or the conflicts that granted
@@ -2641,13 +2678,13 @@ def _request(
     """
     paths, ttl, exclusive, reason = _keys(args, declared)
     _reclaim(db, actor["project_id"])
-    leases, conflicts = _conflicts(db, actor, paths, exclusive)
+    leases, conflicts = _conflicts(db, actor, paths, exclusive, fold)
     if not conflicts:
         granted = _grant(
             db, actor, paths, ttl, exclusive, reason, claim, leases, commits
         )
         return {**granted, "queued": []}
-    queued = _queue(db, actor, conflicts, ttl, exclusive, reason, claim)
+    queued = _queue(db, actor, conflicts, ttl, exclusive, reason, claim, fold)
     return _refusal(conflicts, queued)
 
 
@@ -2659,6 +2696,7 @@ def _queue(
     exclusive: bool,
     reason: str,
     claim: str,
+    fold: bool = False,
 ) -> list[dict]:
     """Records this lane's place behind the holders of the blocked keys.
 
@@ -2670,6 +2708,7 @@ def _queue(
         exclusive: Whether the batch was asked for exclusively.
         reason: Declared scope, carried onto the lease a grant writes.
         claim: Claim identifier the lane holds, or empty for none.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         One entry per blocked key, in key order, naming the request, the
@@ -2728,7 +2767,7 @@ def _queue(
             for row in queue
             if row["id"] < waiting["id"]
             and row["agent_id"] != actor["id"]
-            and overlapping(path, row["path_pattern"])
+            and overlapping(path, row["path_pattern"], fold=fold)
         )
         entries.append(
             {
@@ -2771,7 +2810,7 @@ def _cancel_request(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
     return {"cancelled": cancelled}
 
 
-def _release(db: sqlite3.Connection, actor: dict) -> dict:
+def _release(db: sqlite3.Connection, actor: dict, fold: bool = False) -> dict:
     """Releases this lane's leases and grants what a peer queued for them.
 
     The release, the grant and the notice that names it are one transaction,
@@ -2781,6 +2820,7 @@ def _release(db: sqlite3.Connection, actor: dict) -> dict:
     Args:
         db: Open transaction owned by the caller.
         actor: Authenticated project and lane.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         How many leases were released and, as ``granted``, one entry per
@@ -2797,7 +2837,9 @@ def _release(db: sqlite3.Connection, actor: dict) -> dict:
         "WHERE agent_id=? AND released_ts IS NULL",
         (actor["id"],),
     ).rowcount
-    granted = _grant_queued(db, actor, sorted({row[0] for row in held}))
+    granted = _grant_queued(
+        db, actor, sorted({row[0] for row in held}), fold=fold
+    )
     return {"released": released, "granted": granted}
 
 
@@ -2807,6 +2849,7 @@ def _grant_queued(
     released: list[str],
     reclaimed: bool = False,
     reason: str = "",
+    fold: bool = False,
 ) -> list[dict]:
     """Hands each released key to the lane that queued for it first.
 
@@ -2827,6 +2870,7 @@ def _grant_queued(
             says so the taking lane knows the holder never handed over.
         reason: Why the runtime released the keys on the holder's behalf,
             stated in the notice in place of the expiry, or empty.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         One entry per lane granted something, naming that lane, the keys it
@@ -2857,7 +2901,7 @@ def _grant_queued(
     first: dict[str, int] = {}
     for request in queued:
         pattern = request["path_pattern"]
-        if not any(overlapping(pattern, key) for key in released):
+        if not any(overlapping(pattern, key, fold=fold) for key in released):
             continue
         if any(
             owner == request["agent_id"]
@@ -2874,7 +2918,7 @@ def _grant_queued(
         if any(
             owner != request["agent_id"]
             and (request["exclusive"] or exclusive)
-            and overlapping(pattern, key)
+            and overlapping(pattern, key, fold=fold)
             for owner, key, exclusive in held
         ):
             continue
@@ -3414,7 +3458,9 @@ def _dispatch(
     only a state directory can resolve, so it is read here and handed to the
     tool rather than looked up inside the transaction. The co-change history
     a reservation is forecast against is read the same way, before the
-    transaction, so a Git read never holds the store's write lock.
+    transaction, so a Git read never holds the store's write lock. Whether
+    the checkout ignores case is read from the manifest the same way for
+    the tools that compare reservation keys.
 
     A recommendation reads the ledger, the recorded plan and, best effort, the
     forge. It writes nothing and its slowest reading is another process, so it
@@ -3449,9 +3495,13 @@ def _dispatch(
         if tool in ATTACHED
         else None
     )
+    fold = tool in (
+        *RESERVING,
+        "release_file_reservations",
+    ) and case_insensitive(home, str(actor.get("project", "")))
     with connect(home, write=tool not in READ_ONLY) as db:
         result = _serve(
-            db, actor, tool, args, declared, claim, commits, directory
+            db, actor, tool, args, declared, claim, commits, directory, fold
         )
         if tool in RESERVING and result.get("conflicts"):
             _record_refusals(db, actor, result["conflicts"])
@@ -3731,6 +3781,27 @@ def declared_resources(home: Path, root: str) -> frozenset[str] | None:
     except (BridgeError, OSError, ValueError):
         return None
     return frozenset(resources) if resources else None
+
+
+def case_insensitive(home: Path, root: str) -> bool:
+    """Reads whether a project's checkout ignores case in file names.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key recorded in the manifest.
+
+    Returns:
+        Whether the manifest records ``case_insensitive``. An unregistered
+        project or an unreadable manifest reports False, which keeps the
+        exact comparison every project used before the flag existed.
+    """
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        return False
+    try:
+        return roster.case_insensitive(roster.read(directory))
+    except (BridgeError, OSError, ValueError):
+        return False
 
 
 def cochange_history(home: Path, root: str) -> list[list[str]]:
@@ -4032,6 +4103,7 @@ def _serve(
     claim: str = "",
     commits: list[list[str]] | None = None,
     directory: Path | None = None,
+    fold: bool = False,
 ) -> dict:
     """Applies one validated coordination tool to the open transaction.
 
@@ -4059,6 +4131,8 @@ def _serve(
             reservation forecast, or None when none was read.
         directory: Project state directory attachments live under, or None
             when the project has no registered manifest.
+        fold: Whether reservation paths are compared without regard to
+            case, as the manifest records for a case-insensitive checkout.
 
     Returns:
         The tool result.
@@ -4074,14 +4148,16 @@ def _serve(
     key = retries.validate(args.get("idempotency_key"))
     if not key or tool not in RETRIED:
         return _effect(
-            db, actor, tool, args, declared, claim, commits, directory
+            db, actor, tool, args, declared, claim, commits, directory, fold
         )
     fingerprint = retries.digest(
         tool, {name: args.get(name) for name in RETRIED[tool]}
     )
     if recorded := _recorded(db, actor, tool, key):
         return retries.replayed(recorded, tool, key, fingerprint)
-    result = _effect(db, actor, tool, args, declared, claim, commits, directory)
+    result = _effect(
+        db, actor, tool, args, declared, claim, commits, directory, fold
+    )
     _retain(db, actor, tool, key, fingerprint, retries.SERVED, result)
     return result
 
@@ -4095,6 +4171,7 @@ def _effect(
     claim: str,
     commits: list[list[str]] | None = None,
     directory: Path | None = None,
+    fold: bool = False,
 ) -> dict:
     """Performs the effect of one coordination tool without retry bookkeeping.
 
@@ -4111,6 +4188,8 @@ def _effect(
             reservation forecast, or None when none was read.
         directory: Project state directory attachments live under, or None
             when the project has no registered manifest.
+        fold: Whether reservation paths are compared without regard to
+            case, as the manifest records for a case-insensitive checkout.
 
     Returns:
         The tool result.
@@ -4144,13 +4223,13 @@ def _effect(
     if tool == "search_decisions":
         return _decisions(db, actor, args)
     if tool == "file_reservation_paths":
-        return _reserve(db, actor, args, declared, claim, commits)
+        return _reserve(db, actor, args, declared, claim, commits, fold)
     if tool == "request_reservation":
-        return _request(db, actor, args, declared, claim, commits)
+        return _request(db, actor, args, declared, claim, commits, fold)
     if tool == "cancel_reservation_request":
         return _cancel_request(db, actor, args)
     if tool == "release_file_reservations":
-        return _release(db, actor)
+        return _release(db, actor, fold)
     if tool in ("acknowledge_message", "mark_message_read"):
         message = _number(args.get("message_id"), "message_id", 1, 2**63 - 1)
         ack = tool == "acknowledge_message"

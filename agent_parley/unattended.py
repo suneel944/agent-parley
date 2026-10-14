@@ -489,7 +489,9 @@ def _conditions(
             f"with a peer can be ruled out: {exc}"
         )
     held.pop(data["participants"][name]["display"], None)
-    if overlaps := reserved_overlaps(changed, held):
+    if overlaps := reserved_overlaps(
+        changed, held, fold=roster.case_insensitive(data)
+    ):
         return (
             "A peer reservation covers what the work changed: "
             + "; ".join(overlaps[:5])

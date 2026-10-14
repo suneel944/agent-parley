@@ -410,6 +410,12 @@ class BridgeCore:
         worktree to be on the wrong branch of, and reading its pruned lane
         would report an unavailable worktree as a drifted one.
 
+        A new manifest records ``case_insensitive`` when Git reports
+        ``core.ignorecase``, which Git sets from a file-system probe when the
+        repository is cloned or initialized, so reservation keys there are
+        compared without regard to case. A manifest without the field keeps
+        exact comparison.
+
         Raises:
             BridgeError: If a checked lane left its assigned branch, Git
                 registers its worktree at another path, which names the
@@ -471,6 +477,10 @@ class BridgeCore:
         if preserved:
             self.preserved = preserved
             print(preserved, file=sys.stderr, flush=True)
+        try:
+            folded = git(root, "config", "--bool", "core.ignorecase")
+        except BridgeError:
+            folded = "false"
         data = {
             "version": roster.MANIFEST_VERSION,
             "root": str(root),
@@ -478,6 +488,7 @@ class BridgeCore:
             "verify": [],
             "initialize": [],
             "forge": forge.select(root),
+            **({"case_insensitive": True} if folded == "true" else {}),
             "participants": {},
         }
         write_json(path, data)

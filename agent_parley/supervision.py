@@ -1070,7 +1070,11 @@ def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
     collisions: dict[str, list[str]] = {}
     for name, participant in manifest["participants"].items():
         patterns = held.get(participant["display"], [])
-        matched = sorted(store.overlapping_paths(dirty, patterns))
+        matched = sorted(
+            store.overlapping_paths(
+                dirty, patterns, fold=roster.case_insensitive(manifest)
+            )
+        )
         if matched:
             collisions[name] = matched
     return collisions
@@ -1174,7 +1178,9 @@ def base_advances(home: Path, manifest: dict) -> dict[str, list[str]]:
         patterns = held.get(participants[name]["display"], [])
         matched = sorted(
             {path for path in changed if path in held_paths[name]}
-            | store.overlapping_paths(changed, patterns)
+            | store.overlapping_paths(
+                changed, patterns, fold=roster.case_insensitive(manifest)
+            )
         )
         if matched:
             advances[name] = matched
