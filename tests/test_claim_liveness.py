@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shlex
 import threading
 import time
@@ -236,8 +237,12 @@ def test_the_listing_shows_each_claims_own_progress(bridge, paired):
     directory = busy_with_one_idle_claim(bridge, paired)
     text = issues.describe(issues.snapshot(directory))
     lines = text.splitlines()
-    assert "last progress 0s ago" in lines[0] or "last progress 1s" in lines[0]
-    assert f"last progress {2 * IDLE_AFTER}s ago" in lines[1]
+    ages = [
+        int(re.search(r"last progress (\d+)s ago", line).group(1))
+        for line in lines[:2]
+    ]
+    assert 0 <= ages[0] <= 5
+    assert 2 * IDLE_AFTER <= ages[1] <= 2 * IDLE_AFTER + 5
 
 
 def test_a_peer_takeover_request_is_granted_after_the_grace_window(

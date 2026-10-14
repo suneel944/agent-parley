@@ -1200,7 +1200,14 @@ def test_state_show_prints_the_archive_manifest(
     assert document["manifest"]["projects"][0]["root"] == paired["root"]
 
 
+@pytest.mark.filterwarnings("ignore:subprocess \\d+ is still running")
 def test_up_and_down_report_the_service_as_json(bridge, monkeypatch, capsys):
+    """Starts and stops the service in this process.
+
+    `up` leaves the service it started running on purpose and drops its
+    process handle, so the handle warns when collected here; a launcher
+    that exits never sees it.
+    """
     started = envelope(
         run(monkeypatch, capsys, "--home", str(bridge.home), "up", "--json"),
         "up",
