@@ -18,7 +18,11 @@ evidence``.
 
 Each supervision poll runs `sweep` over the project's open decision records.
 `EVENTS` names the table kind each recorded notification kind settles as; a
-record whose kind it does not name is left open. A settled record is answered
+record whose kind it does not name is left open. An orphan decision is one:
+the service cannot carry out any of its options for the operator, so it waits
+until the operator answers or the dead lane's work is returned at the orphan
+ceiling, which retires it. A policy that still names its former
+``orphan_claim`` kind is ignored. A settled record is answered
 with its own recommended option by `ANSWERED_BY` and handed to its lane the
 way any other answer is.
 
@@ -82,12 +86,6 @@ class Kind(NamedTuple):
 
 
 KINDS: dict[str, Kind] = {
-    "orphan_claim": Kind(
-        REVERSIBLE,
-        "reassign",
-        "agent-parley issue assign {issue} {lane}",
-        "reassign a dead lane's orphaned claim",
-    ),
     "merge_default": Kind(
         IRREVERSIBLE, WAIT, "", "merge to the default branch"
     ),
@@ -100,7 +98,6 @@ KINDS: dict[str, Kind] = {
 }
 
 EVENTS: dict[str, str] = {
-    notify.Event.ORPHAN_DECISION: "orphan_claim",
     notify.Event.PERMISSION_PROMPT: "native_permission",
     notify.Event.PERMISSION_DENIED: "native_permission",
     notify.Event.NATIVE_DIALOG: "native_permission",
@@ -374,6 +371,7 @@ def sweep(
             applied = settle(manifest, question, stamp)
             if applied is None:
                 continue
+            applied["option"] = option
             answered = decisions.answer(
                 directory, entry["id"], option, ANSWERED_BY, now=stamp
             )

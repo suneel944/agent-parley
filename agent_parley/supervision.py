@@ -5672,8 +5672,9 @@ def _return_work(
 
     `retirement.abandon` returns its claims and offers, and
     `store.release_dead_holder` releases its reservations to the peers
-    queued for them. A lane whose work cannot be returned is recorded as a
-    supervision error and keeps it.
+    queued for them. The lane's open orphan decision is retired as stale,
+    since the work it asked about has now been returned. A lane whose work
+    cannot be returned is recorded as a supervision error and keeps it.
 
     Args:
         home: Private bridge state root.
@@ -5694,6 +5695,13 @@ def _return_work(
     except (BridgeError, OSError, ValueError) as exc:
         issues.note_supervision_error(directory, f"dead lane {name}: {exc}")
         return
+    with contextlib.suppress(BridgeError, OSError, ValueError):
+        for entry in decisions.list_open(directory):
+            if (
+                entry.get("lane") == name
+                and entry.get("kind") == notify.Event.ORPHAN_DECISION
+            ):
+                decisions.stale(directory, str(entry["id"]))
     try:
         keys = store.release_dead_holder(
             home,

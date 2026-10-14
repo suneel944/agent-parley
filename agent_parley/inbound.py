@@ -734,14 +734,19 @@ def settle(home: Path, directory: Path, record: Mapping[str, object]) -> None:
         directory: Private project state directory holding the decision.
         record: The answered decision.
     """
-    from agent_parley import roster, store
+    from agent_parley import roster, store, timeouts
 
     manifest = roster.read(directory)
     participant = manifest.get("participants", {}).get(record.get("lane"))
     if not isinstance(participant, dict):
         return
+    answerer = (
+        "The service's decision timeout"
+        if record.get("answered_by") == timeouts.ANSWERED_BY
+        else "The operator"
+    )
     body = (
-        f"The operator answered decision {record['id']} "
+        f"{answerer} answered decision {record['id']} "
         f"({record.get('question', '')}): {record['answer']}, "
         f"by {record.get('answered_by', '')}. Take the step this answer "
         "asks for with the matching agent-parley command; nothing was done "

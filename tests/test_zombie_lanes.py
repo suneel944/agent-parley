@@ -4,7 +4,15 @@ import os
 import time
 from pathlib import Path
 
-from agent_parley import issues, lanes, lifecycle, store, supervision
+from agent_parley import (
+    decisions,
+    issues,
+    lanes,
+    lifecycle,
+    notify,
+    store,
+    supervision,
+)
 from agent_parley.state import write_json
 
 CEILING = supervision.DEFAULTS["orphan_retire_after"]
@@ -130,6 +138,33 @@ def test_a_lane_dead_under_the_ceiling_keeps_its_work(bridge, repo, paired):
     reap(bridge, directory)
 
     assert issues.snapshot(directory)["issues"]["7"]["owner"] == "claude"
+
+
+def test_returning_a_dead_lanes_work_closes_its_orphan_decision(
+    bridge, repo, paired
+):
+    actors(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    bridge.issue(Path(paired["lanes"]["claude"]), "claim", "7")
+    event = notify.Event.ORPHAN_DECISION
+    options, reversibility = notify.ANSWERS[event]
+    orphan = decisions.open_or_refresh(
+        directory,
+        project=paired["root"],
+        lane="claude",
+        kind=event.value,
+        key=event.value,
+        question=notify.TITLES[event],
+        options=options,
+        issue="#7",
+        reversibility=reversibility,
+    )
+    died(bridge, paired, "claude", CEILING + 60)
+
+    reap(bridge, directory)
+
+    assert issues.snapshot(directory)["issues"]["7"]["owner"] is None
+    assert decisions.get(directory, orphan["id"])["state"] == decisions.STALE
 
 
 def test_a_never_launched_lane_past_the_ceiling_returns_its_claims(
