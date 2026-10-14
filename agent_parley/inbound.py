@@ -83,6 +83,12 @@ SUPERSEDED = (
 )
 UNREADABLE = "The status reading could not be taken."
 POLLING = "reading status queries from Telegram"
+POLL_FAILED = (
+    "polling Telegram failed ({reason}); retrying every "
+    f"{RETRY_SECONDS:g} seconds"
+)
+RECOVERED = f"polling recovered; {POLLING}"
+REDACTED_TOKEN = "<bot token>"
 LOCKED_DETAIL = (
     f"Inbound status queries are refused for {int(LOCK_SECONDS // 60)} "
     f"minutes after {FAILURE_LIMIT} wrong passcodes."
@@ -504,14 +510,16 @@ def polling(home: Path) -> bool:
     The reader announces itself in the service log once it passes every
     configuration check, and the service announces each start with a
     ``bound`` entry, so the reader is running when its announcement follows
-    the latest start.
+    the latest start. A failed poll logs `POLL_FAILED` and a later success
+    logs `RECOVERED`, which ends with the announcement, so the reader counts
+    as polling only while its latest entry is not a failure.
 
     Args:
         home: Private state root holding the service log.
 
     Returns:
         True when the latest service start was followed by the reader's
-        announcement.
+        announcement and no failure has been logged since its latest one.
     """
     from agent_parley import server
 
@@ -526,8 +534,8 @@ def polling(home: Path) -> bool:
             continue
         if words[1] == "bound":
             running = False
-        elif words[1] == "inbound" and line.endswith(POLLING):
-            running = True
+        elif words[1] == "inbound":
+            running = line.endswith(POLLING)
     return running
 
 
@@ -1068,6 +1076,38 @@ def updates(config: dict, offset: int) -> list[dict]:
     return [item for item in reported_updates if isinstance(item, dict)]
 
 
+def failure(config: dict, exc: Exception) -> str:
+    """Names why one poll failed, without the bot token.
+
+    The exception class is always named. A `BridgeError` adds its message,
+    an HTTP error its status and reason, which is how a second poller (409)
+    and a revoked token (401) are told apart, and any other request error
+    its reason, such as a failed name lookup. The token is part of the
+    request URL, so it is replaced by `REDACTED_TOKEN` wherever it appears.
+
+    Args:
+        config: Resolved notification configuration holding the token.
+        exc: Exception the poll raised.
+
+    Returns:
+        One line describing the failure.
+    """
+    import urllib.error
+
+    if isinstance(exc, BridgeError):
+        detail = str(exc)
+    elif isinstance(exc, urllib.error.HTTPError):
+        detail = f"HTTP {exc.code} {exc.reason}"
+    elif isinstance(exc, urllib.error.URLError):
+        detail = str(exc.reason)
+    else:
+        detail = str(exc)
+    token = str(config.get("telegram", {}).get("token") or "")
+    if token:
+        detail = detail.replace(token, REDACTED_TOKEN)
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
 def run(home: Path, stopped: threading.Event) -> None:
     """Polls for status queries until the local service stops.
 
@@ -1076,7 +1116,10 @@ def run(home: Path, stopped: threading.Event) -> None:
     poller running and is reported by `status` instead. A failed poll is
     retried after a short pause rather than ending the reader, because the
     Bot API is a remote service and a service restart is not an operator's
-    remedy for one dropped connection.
+    remedy for one dropped connection. The service log names each failure
+    through `failure` when its text differs from the last one logged, so an
+    outage writes one line rather than one per retry, and the first poll
+    that succeeds after it logs `RECOVERED`.
 
     Args:
         home: Private state directory the readings are taken from.
@@ -1096,12 +1139,20 @@ def run(home: Path, stopped: threading.Event) -> None:
     )
     server.log(home, "inbound", POLLING)
     offset = 0
+    failing = ""
     while not stopped.is_set():
         try:
             batch = updates(config, offset)
-        except (OSError, ValueError, BridgeError):
+        except (OSError, ValueError, BridgeError) as exc:
+            reason = failure(config, exc)
+            if reason != failing:
+                server.log(home, "inbound", POLL_FAILED.format(reason=reason))
+                failing = reason
             stopped.wait(RETRY_SECONDS)
             continue
+        if failing:
+            server.log(home, "inbound", RECOVERED)
+            failing = ""
         for update in batch:
             offset = max(offset, int(update.get("update_id", 0)) + 1)
             if stopped.is_set():
