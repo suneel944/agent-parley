@@ -398,6 +398,12 @@ def doctor(reported: dict) -> dict:
         the document's own schema identifier. No credential and no profile
         path is included. The platform record names the kernel release, the
         WSL generation or `none`, and whether `pidfd_open` is available.
+        `plugins` lists one record per CLI and config home with its `cli`,
+        its `home` label (`default`, `shell` or a profile name, never a
+        path), the installed `version`, the launcher version it is
+        `expected` to match and its `state`; `server` carries the running
+        service's `version`, empty when none answers, and the `expected`
+        launcher version.
     """
     return {
         "protocol": reported["protocol"],
@@ -405,6 +411,8 @@ def doctor(reported: dict) -> dict:
         "store_schema": reported["schema"],
         "platform": reported["platform"],
         "components": reported["components"],
+        "plugins": reported["plugins"],
+        "server": reported["server"],
         "consistent": reported["consistent"],
     }
 
