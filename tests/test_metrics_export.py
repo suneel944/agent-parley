@@ -54,7 +54,7 @@ def test_exposition_reports_every_lane_and_project_series(
     assert text.endswith("\n")
     assert "# HELP agent_parley_lane_issues_held" in text
     assert "# TYPE agent_parley_lane_issues_held gauge" in text
-    assert "# TYPE agent_parley_lane_hook_events_total counter" in text
+    assert "# TYPE agent_parley_lane_hook_events_window gauge" in text
     held = samples(text, "agent_parley_lane_issues_held")
     labels = (
         f'{{project="{paired["root"]}",participant="claude",provider="claude"}}'
@@ -88,6 +88,39 @@ def test_exposition_names_and_labels_are_well_formed(
         assert family[0].endswith("_total") == (family[1] == "counter")
 
 
+def test_no_windowed_or_retained_family_is_typed_counter():
+    exported = views.families({"projects": []})
+    counters = {
+        family["name"] for family in exported if family["type"] == "counter"
+    }
+    assert counters == {"agent_parley_lane_tokens_total"}
+    for family in exported:
+        if "window" in family["help"] or "Retained" in family["help"]:
+            assert family["type"] == "gauge"
+        if family["type"] == "gauge":
+            assert not family["name"].endswith("_total")
+
+
+def test_a_lane_without_merges_reports_counts_but_no_ratio_or_median():
+    row = {
+        "participant": "claude",
+        "provider_name": "claude",
+        **views.NO_OUTCOMES,
+    }
+    text = views.exposition(snapshot(row))
+    for name in (
+        "agent_parley_lane_first_pass_ratio",
+        "agent_parley_lane_ci_rounds_median",
+        "agent_parley_lane_claim_to_merge_seconds_median",
+    ):
+        assert samples(text, name) == []
+        assert f"# TYPE {name} gauge" in text
+    assert samples(text, "agent_parley_lane_pull_requests_merged_window") == [
+        'agent_parley_lane_pull_requests_merged_window{project="/tmp/project",'
+        'participant="claude",provider="claude"} 0'
+    ]
+
+
 def test_a_label_value_escapes_quotes_backslashes_and_newlines():
     root = 'a\\b"c\nd'
     view = snapshot({"participant": "claude", "provider_name": "x"}, root)
@@ -114,8 +147,8 @@ def test_an_unread_measurement_reports_no_sample():
     assert samples(text, "agent_parley_lane_tokens_total") == []
     assert samples(text, "agent_parley_lane_mail_unread") == []
     assert "# TYPE agent_parley_lane_tokens_total counter" in text
-    assert samples(text, "agent_parley_lane_served_calls_total") == [
-        'agent_parley_lane_served_calls_total{project="/tmp/project",'
+    assert samples(text, "agent_parley_lane_served_calls_retained") == [
+        'agent_parley_lane_served_calls_retained{project="/tmp/project",'
         'participant="claude",provider="claude"} 3'
     ]
 

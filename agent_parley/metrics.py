@@ -650,7 +650,8 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
         ``lanes`` mapping each participant with an outcome to its counts,
         first-pass rate over merged pull requests with a known CI round
         count, the count without one, the median CI rounds and the median
-        claim-to-merge seconds, with zero for a median over nothing; and
+        claim-to-merge seconds, with None for a rate or a median over
+        nothing, so a lane without the data reports no value; and
         ``excluded``, the pull requests no lane owns.
     """
     stored = record if isinstance(record, dict) else {}
@@ -736,18 +737,18 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
                 "first_pass_rate": (
                     counts["first"] / len(counts["rounds"])
                     if counts["rounds"]
-                    else 0.0
+                    else None
                 ),
                 "ci_rounds_unknown": counts["unknown"],
                 "ci_rounds_median": (
                     float(statistics.median(counts["rounds"]))
                     if counts["rounds"]
-                    else 0.0
+                    else None
                 ),
                 "claim_to_merge_seconds": (
                     float(statistics.median(counts["seconds"]))
                     if counts["seconds"]
-                    else 0.0
+                    else None
                 ),
             }
             for name, counts in tallies.items()
