@@ -237,12 +237,12 @@ Then watch the work, and steer a lane without taking over its terminal:
 agent-parley status   # this project's open work: issue, owner, state, PR
 agent-parley top      # every lane live, including what enforcement denied
 agent-parley problems # only what needs you now, oldest first
-agent-parley say claude-2 "Rebase onto main before you open the pull request."
+agent-parley say codex "Rebase onto main before you open the pull request."
 ```
 
 `agent-parley --help` prints the grouped command list; `agent-parley version`
 prints the version and state directory. Single records read through `show`:
-`issue show 42`, `participant show claude-2`, `provider show claude`,
+`issue show 42`, `participant show codex`, `provider show claude`,
 `credentials show work`, and each of those, like `status`, `top` and
 `problems`, accepts `--json`. The mail readers take
 `--as NAME`, so you can open a lane's mail from the main checkout without
@@ -258,8 +258,8 @@ When a lane's work is ready, integrate it from the base checkout, or send it
 for review:
 
 ```sh
-agent-parley participant merge claude-2
-agent-parley participant pr claude-2
+agent-parley participant merge codex
+agent-parley participant pr codex
 ```
 
 With `pull_request.self_service` on in the private project settings (off by
@@ -292,7 +292,7 @@ a recovery checkpoint first.
 A lane that crashed, hung or lost its host comes back with one command:
 
 ```sh
-agent-parley participant restart claude-2
+agent-parley participant restart codex
 ```
 
 A restart is refused while the session is alive and current; one silent past
