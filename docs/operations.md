@@ -3955,6 +3955,50 @@ agent-parley` reports when the installation is not in `~/.local/bin`, and set
 `Environment=AGENT_PARLEY_HOME=...` in the `[Service]` section for a private
 root other than the default.
 
+On macOS a launchd agent does the same. Write
+`~/Library/LaunchAgents/dev.agent-parley.service.plist`, replacing
+`/Users/example` with your home directory. launchd does not expand `~` or
+`$HOME`, and `~/.local/bin` is not on its path, so every path is absolute:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agent-parley.service</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/example/.local/bin/agent-parley</string>
+    <string>up</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+```
+
+Check it, load it into your login session, and unload it with:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/dev.agent-parley.service.plist
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/dev.agent-parley.service.plist
+launchctl bootout "gui/$UID" ~/Library/LaunchAgents/dev.agent-parley.service.plist
+```
+
+`up` returns once the service answers, so launchd sees the job exit and does
+not stop the service on `bootout`. Stop it with `agent-parley down`, as with the
+systemd unit. The agent loads at login, so the service returns after a reboot
+once you sign in. Use the path `which agent-parley` reports when the
+installation is not in `~/.local/bin`.
+
+On WSL2 the systemd recipe above works once systemd is enabled in the
+distribution, with `systemd=true` under `[boot]` in `/etc/wsl.conf` and a
+restart of the distribution with `wsl --shutdown`. Without it the user unit
+never runs. The distribution also stops when its last terminal closes, which
+stops the service with it. In that case nothing restarts the service at boot;
+it starts again with the next `agent-parley run`, or with `agent-parley up`.
+
 Worktrees start at a captured commit and persist. Ignored environment files,
 dependencies and untracked configuration are not copied. Set up each worktree
 as needed. Review each lane's branch, integrate it with `participant merge` or
