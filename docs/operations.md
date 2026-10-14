@@ -32,7 +32,19 @@ sh install.sh
 `agent-parley plugins install` is the plugin step on its own: it adds the
 marketplace and plugin to each of `claude` and `codex` found on PATH, skipping
 what their listings already hold, and `agent-parley plugins status` reports
-that state without writing. The manual steps follow.
+that state without writing. `uv tool upgrade agent-parley` on its own
+replaces the launcher and leaves the plugin behind, because the plugin lives in
+each CLI's own cache. The running service repairs that: once at start and then
+once per poll interval, its supervision thread runs the same install for every
+CLI and config home whose installed plugin version differs from the launcher's,
+at most once per launcher version and home. A home the plugin was never
+installed into is left alone. A failed refresh is logged with the CLI's error
+and retried with a delay doubling from one minute to an hour. Native sessions
+read their plugin at start, so `problems` then lists a `plugin stale` row
+naming the live lanes started before the refresh, with the command that
+relaunches each. Setting `AGENT_PARLEY_PLUGIN_REPAIR=off` in the service's
+environment turns the repair off for an estate that manages its plugins another
+way. The manual steps follow.
 
 Installing needs no clone. `uv tool install agent-parley` takes the published
 distribution from PyPI. `uv tool install git+https://github.com/suneel944/agent-parley`
@@ -534,6 +546,7 @@ condition, that count, its age and what clears it:
 | `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
 | `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
 | `root returned` | The project root came back after lanes retired for its absence. The row names those lanes until each is re-admitted. | `agent-parley participant add NAME --repo ROOT` for each lane named |
+| `plugin stale` | The service refreshed a plugin older than the launcher, and these live lanes started their sessions before the refresh, so they still run the old plugin. A refresh that failed is named with the CLI's error instead; the service retries it. | End each named session, then `agent-parley run NAME --repo ROOT --resume`; for a failed refresh, `agent-parley plugins install` |
 | `escalated plan revision` | A lane's plan revision touched an edge already revised back and forth under the current plan version, so it was escalated instead of applied. One row per escalated proposal, on the proposing lane, among the retained proposals. | `agent-parley plan approve ID` or `agent-parley plan reject ID --reason TEXT` |
 | `plan revisions pending` | Plan revisions outside the operator's envelope wait for a decision. One row per project counts them and ages from the oldest. | `agent-parley plan proposals`, then approve or reject each |
 | `orphaned claims` | The lane's session process is gone and the supervisor marked claims it holds orphaned, and the lane is not yet `ready to retire`. The row is derived from the ledger, so it shows whether or not a notification transport is configured. | `agent-parley issue claim N --take-orphaned` from a live peer lane; with no live lane besides the holder, start one with `agent-parley run NAME` and have it take the claim, or `agent-parley issue release N`. |

@@ -168,6 +168,7 @@ PROBLEM_CONDITIONS = frozenset(
         "waiting on approval",
         "held by a native dialog",
         "crossing ready",
+        "plugin stale",
     }
 )
 
