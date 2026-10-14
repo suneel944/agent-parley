@@ -129,9 +129,11 @@ file system, not under `/mnt/c`.
 To track the default branch instead of the latest release, run
 `uv tool install git+https://github.com/suneel944/agent-parley`.
 
-Then add the plugin to whichever CLI you drive: `agent-parley plugins install`
-does it for each one on PATH, or run the commands yourself. One marketplace
-serves both.
+Then add the plugin to whichever of `claude` and `codex` you drive:
+`agent-parley plugins install` does it for each one on PATH, or run the
+commands yourself. One marketplace serves both. `gemini`, `copilot`,
+`opencode` and `amp` lanes take no plugin; the launcher configures them per
+session.
 
 ```sh
 claude plugin marketplace add suneel944/agent-parley
@@ -164,7 +166,9 @@ of `claude` and `codex` are on PATH and whether each has the plugin, and
 whether the coordination service is running. It then names the next one to
 three commands for exactly that state, such as `agent-parley plugins install`,
 `agent-parley run claude` or `agent-parley top`, or `agent-parley demo` when no
-native CLI is installed.
+native CLI is installed. A checkout with no commits yet puts `git commit`
+first, and one with uncommitted changes puts `git status` first, because lanes
+start from the last commit.
 
 ```text
 Agent Parley coordinates native coding CLIs in one repository.
@@ -202,8 +206,20 @@ agent-parley run codex
 
 That is the whole setup. The first run registers the repository, creates the
 lane's worktree and branch, starts the coordination service and hands you the
-native CLI. Prompt it as you always do. Another account or provider is one more
-terminal. Each tab title names its lane, state and progress, such as
+native CLI.
+
+Lanes start from the last commit. A repository with no commits yet cannot
+start one: `setup` and `run` stop with "This repository has no commits yet"
+and suggest a first commit. If the checkout has uncommitted or untracked
+changes when the project is first registered, they are stashed, not
+discarded, and the command prints the `git stash apply <entry>` line that
+restores them; `run` in a terminal prints it again after the native CLI
+exits. Until the entry is dropped, `agent-parley` in that checkout lists it
+as `Stashed   git stash apply <entry>`. Commit first to carry the changes
+into the lanes.
+
+Prompt the native CLI as you always do. Another account or provider is one
+more terminal. Each tab title names its lane, state and progress, such as
 `[codex] idle with claim #412 - 2/5 done`; the supervision key `titles` turns
 this off, and `agent-parley title` prints the same line for a Claude Code
 status line. `agent-parley run codex --issue 412` claims issue 412 for the lane
@@ -469,7 +485,9 @@ be set and at least 12 characters; inbound status queries are off.
 ## What it does not do
 
 - **No sandbox.** Worktrees and reservations are coordination boundaries, not
-  OS isolation.
+  OS isolation. If you need isolation, a container tool such as
+  [container-use](https://github.com/dagger/container-use) provides it;
+  Agent Parley does not, and does not integrate with one.
 - **No silent merges.** A lane integrates only through `participant merge`, or
   `unattended run` for an issue a recorded `unattended` policy lists.
 - **No approvals on your behalf.** Two opt-ins exist for `claude` lanes:
@@ -486,7 +504,9 @@ be set and at least 12 characters; inbound status queries are off.
 - **`ready` is not done.** A ready report means ready for review, not verified
   completion.
 - **No token-saving claims.** `CONTEXT` counts the bytes coordination injects
-  and `TOKENS` repeats what the lane's client counted; neither is billed spend.
+  and `TOKENS` repeats what a `claude` or `codex` lane's client counted;
+  `gemini`, `copilot`, `opencode` and `amp` lanes report no token count.
+  Neither is billed spend.
 
 ## How it compares
 
@@ -503,6 +523,15 @@ taken from the project's own documentation, linked so you can check it.
 
 None of them documents a searchable decision log shared by every lane, or a
 refusal to let an assistant sign your commits.
+
+Hosted agents and container isolation answer a different question: where one
+agent runs, rather than how several share a repository.
+
+| Project | What its own documentation describes | What Agent Parley records instead |
+| --- | --- | --- |
+| [GitHub Copilot cloud agent](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-coding-agent) | Researches a repository, plans changes and implements them in the background, editing files and running tests in an ephemeral cloud development environment. | Runs the CLIs you already use on your own machine, under their own sign-in, and coordinates several of them on one repository through claims, reservations and handoffs. |
+| [OpenAI Codex cloud](https://developers.openai.com/codex/cloud) | Works through coding tasks in the cloud, from investigating bugs to building features. | The same local, multi-CLI coordination; a `codex` lane is the Codex CLI on your machine, not Codex cloud. |
+| [container-use](https://github.com/dagger/container-use) | Gives each coding agent a fresh container in its own Git branch. | No isolation of its own; it records who owns which issue and path, and does not sandbox what an agent runs. |
 
 Conductor is the smoother macOS app, and a board reads faster at a glance.
 Pick Agent Parley when several agents share one repository and "who owns this,

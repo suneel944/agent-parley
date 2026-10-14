@@ -13,6 +13,7 @@ from agent_parley.state import BridgeError
 VERIFY_TIMEOUT = 1800
 INIT_OUTPUT_LINES = 20
 GIT_SECONDS = 30
+PENDING_MESSAGE = "agent-parley pending work"
 
 
 def git(repo: Path, *args: str) -> str:
@@ -88,7 +89,7 @@ def preserve_pending(root: Path) -> str | None:
         "push",
         "--include-untracked",
         "--message",
-        f"agent-parley pending work {stamp}",
+        f"{PENDING_MESSAGE} {stamp}",
     )
     if git(root, "status", "--porcelain"):
         raise BridgeError(

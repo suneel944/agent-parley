@@ -34,7 +34,12 @@ class BridgeCore:
         home: Resolved private state directory.
         config: Local HTTP port and bearer credential.
         url: Loopback HTTP origin of the mail server.
+        preserved: The notice naming the stash entry registration made of
+            the base checkout's pending changes, empty when nothing was
+            stashed, so `run` can repeat it after the native CLI exits.
     """
+
+    preserved: str = ""
 
     def __init__(self, home: Path) -> None:
         """Loads or initializes private configuration under home."""
@@ -414,6 +419,7 @@ class BridgeCore:
             ) from None
         preserved = preserve_pending(root)
         if preserved:
+            self.preserved = preserved
             print(preserved, file=sys.stderr, flush=True)
         data = {
             "version": roster.MANIFEST_VERSION,

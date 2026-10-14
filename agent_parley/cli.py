@@ -6223,6 +6223,8 @@ def main() -> int:
                 issue=args.issue,
                 blueprint=args.blueprint,
             )
+            if bridge.preserved and sys.stdin.isatty():
+                print(bridge.preserved, file=sys.stderr, flush=True)
             if args.json:
                 print(
                     views.render(
