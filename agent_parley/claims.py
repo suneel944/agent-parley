@@ -587,7 +587,7 @@ class ClaimsMixin(ReportsMixin):
         _, directory = self.project(repo)
         data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = roster.resolve(data, lane)
+        agent = roster.resolve(data, lane, next_reader=True)
         participant = data["participants"][agent]
         forge.select(repo, data)
         try:

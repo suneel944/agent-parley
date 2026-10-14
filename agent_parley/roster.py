@@ -1705,19 +1705,29 @@ def read(directory: Path) -> dict:
         ) from exc
 
 
-def resolve(manifest: dict, lane: Path, mail_reader: bool = False) -> str:
+def resolve(
+    manifest: dict,
+    lane: Path,
+    mail_reader: bool = False,
+    next_reader: bool = False,
+) -> str:
     """Returns the participant that owns a worktree.
 
     The read-only mail verbs accept ``--as NAME``, so their refusal from the
     main checkout tells the operator to name a lane there, ending on a
     ``mail list --as`` for the first active lane, instead of pointing at a
-    participant listing that cannot read anything.
+    participant listing that cannot read anything. Every other verb is
+    refused with the first active lane's worktree named, and with ``run
+    claude`` when no lane is active yet. `issue next` takes ``--repo``, so
+    its refusal ends on that command aimed at the worktree.
 
     Args:
         manifest: Manifest using the participant roster layout.
         lane: Resolved worktree path.
         mail_reader: Whether the caller is a read-only mail verb that reads
             a named lane's mail with ``--as NAME``.
+        next_reader: Whether the caller is `issue next`, which ranks work
+            for the lane its ``--repo`` names.
 
     Returns:
         The owning participant name.
@@ -1728,12 +1738,12 @@ def resolve(manifest: dict, lane: Path, mail_reader: bool = False) -> str:
     for name, participant in manifest["participants"].items():
         if Path(participant["lane"]) == lane:
             return name
+    active = sorted(
+        name
+        for name, participant in manifest["participants"].items()
+        if not retired(participant)
+    )
     if mail_reader:
-        active = sorted(
-            name
-            for name, participant in manifest["participants"].items()
-            if not retired(participant)
-        )
         raise BridgeError(
             "Read a lane's mail from the main checkout with --as NAME, or run "
             "this inside the lane's worktree.",
@@ -1743,9 +1753,21 @@ def resolve(manifest: dict, lane: Path, mail_reader: bool = False) -> str:
                 else "agent-parley run claude"
             ),
         )
+    if not active:
+        raise BridgeError(
+            "Run this from an assigned agent worktree, not the main checkout; "
+            "this project has no active lane yet.",
+            next_command="agent-parley run claude",
+        )
+    worktree = manifest["participants"][active[0]]["lane"]
     raise BridgeError(
-        "Run this from an assigned agent worktree, not the main checkout.",
-        next_command="agent-parley participant list",
+        "Run this from an assigned agent worktree, not the main checkout, "
+        f"such as {active[0]}'s at {worktree}.",
+        next_command=(
+            f"agent-parley issue next --repo {shlex.quote(worktree)}"
+            if next_reader
+            else "agent-parley participant list"
+        ),
     )
 
 
