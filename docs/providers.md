@@ -46,7 +46,7 @@ checkpoint, so `agent-parley top` reports its delivered context in `CONTEXT`.
 | Task handed over | positional, interactive | positional, interactive | `-p` | `--prompt-interactive` | `--prompt` | refused before launch |
 | Resume argument | `--resume ID` | `resume ID` | `--resume ID` | `--resume ID` | `--session ID` | `threads continue ID` |
 | Rotation to a fresh session | yes | yes | yes | yes | yes | n/a |
-| Service-resume opt-ins applied | yes | no | no | no | no | n/a |
+| Service-resume opt-ins applied | yes | yes (0.153.0+) | yes | yes | yes | no |
 | Refused-tool event | `PermissionDenied` | none | none | none | none | none |
 | Blocked-on-approval source | hook | hook | hook | dialog watcher | hook | dialog watcher |
 | Removed by `participant retire` | `-mcp.json` | nothing to remove | the lane's hooks in the profile, and the MCP entry once no lane hook remains | overlay file | overlay directory | overlay file |
