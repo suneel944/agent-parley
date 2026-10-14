@@ -3657,7 +3657,8 @@ states how many units of work the claim still has left.
 state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in
 `server.log`, with the previous window in `server.log.1`; repeated per-lane
 `undecided`, `unanswered` and `unrecovered` entries are coalesced to one per
-minute, and the next entry carries the count it skipped. Set
+minute, and the next entry carries the count it skipped. An `unrecovered`
+entry names the exception type, its text and the line that raised it. Set
 `AGENT_PARLEY_HOME` or pass `--home` for another private root.
 Set `AGENT_PARLEY_PORT` before first initialization to override port 8876.
 

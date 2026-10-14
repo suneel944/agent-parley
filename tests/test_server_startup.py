@@ -81,6 +81,30 @@ def test_a_refusal_burst_writes_one_line_per_lane_per_window(
     assert lines[2].endswith("; 4999 more since the previous entry")
 
 
+def test_an_unrecovered_checkpoint_logs_its_cause(tmp_path, monkeypatch):
+    def full_disk(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server.checkpoints, "recover", full_disk)
+    path = tmp_path / "server.log"
+    lane = ("/work/project", "claude-p2-4")
+    owed = {"directory": "/work/project", "participant": "x", "payload": {}}
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        with path.open("a", encoding="utf-8") as stream:
+            with contextlib.redirect_stdout(stream):
+                instance.recovering[lane] = None
+                instance._recovering(lane, owed)
+    lines = [
+        line
+        for line in path.read_text().splitlines()
+        if " unrecovered " in line
+    ]
+    assert len(lines) == 1
+    assert "OSError: [Errno 28] No space left on device" in lines[0]
+    assert re.search(r" at test_server_startup\.py:\d+$", lines[0])
+    assert lane not in instance.recovering
+
+
 def test_a_stopped_burst_still_writes_its_count(tmp_path, monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
