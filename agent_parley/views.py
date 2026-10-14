@@ -173,6 +173,43 @@ NO_OUTCOMES: dict[str, int | float | None] = {
 
 DENIAL_CAUSES = "agent_parley_lane_hook_denials_by_cause_window"
 
+DEPRECATED_ALIASES: dict[str, str] = {
+    "agent_parley_lane_context_bytes_window": (
+        "agent_parley_lane_context_bytes_total"
+    ),
+    "agent_parley_lane_hook_events_window": (
+        "agent_parley_lane_hook_events_total"
+    ),
+    "agent_parley_lane_hook_denials_window": (
+        "agent_parley_lane_hook_denials_total"
+    ),
+    "agent_parley_lane_served_calls_retained": (
+        "agent_parley_lane_served_calls_total"
+    ),
+    "agent_parley_lane_served_rejections_retained": (
+        "agent_parley_lane_served_rejections_total"
+    ),
+    "agent_parley_lane_pull_requests_opened_window": (
+        "agent_parley_lane_pull_requests_opened_total"
+    ),
+    "agent_parley_lane_pull_requests_merged_window": (
+        "agent_parley_lane_pull_requests_merged_total"
+    ),
+    "agent_parley_lane_pull_requests_closed_window": (
+        "agent_parley_lane_pull_requests_closed_total"
+    ),
+    DENIAL_CAUSES: "agent_parley_lane_hook_denials_by_cause_total",
+    "agent_parley_project_context_bytes_window": (
+        "agent_parley_project_context_bytes_total"
+    ),
+    "agent_parley_project_hook_events_window": (
+        "agent_parley_project_hook_events_total"
+    ),
+    "agent_parley_project_hook_denials_window": (
+        "agent_parley_project_hook_denials_total"
+    ),
+}
+
 PROJECT_METRICS: tuple[tuple[str, str, str, str], ...] = (
     (
         "agent_parley_project_participants",
@@ -992,7 +1029,8 @@ def families(view: dict) -> list[dict]:
     Returns:
         One record per metric family carrying its ``name``, ``type``,
         ``help`` and its ``samples``, each sample carrying its ``labels`` and
-        its ``value``.
+        its ``value``. Each renamed family is followed by its deprecated
+        0.18.x alias, as ``_with_aliases`` describes.
     """
     reported = []
     for name, kind, key, text in LANE_METRICS:
@@ -1056,7 +1094,45 @@ def families(view: dict) -> list[dict]:
                 ],
             }
         )
-    return reported
+    return _with_aliases(reported)
+
+
+def _with_aliases(reported: list[dict]) -> list[dict]:
+    """Adds the deprecated 0.18.x name after each family that replaced one.
+
+    0.19.0 renamed twelve counters to gauges suffixed ``_window`` or
+    ``_retained``. Each old name is exported again, typed ``counter`` as
+    0.18.x typed it, with the same labels and values as its replacement, so a
+    dashboard written against 0.18.x keeps reading data. Removing an alias
+    needs a release marked breaking.
+
+    Args:
+        reported: Families in export order, under their current names.
+
+    Returns:
+        The same families, each replaced one followed by its alias, which
+        carries ``deprecated`` and the ``replacement`` it stands in for.
+    """
+    expanded = []
+    for family in reported:
+        expanded.append(family)
+        alias = DEPRECATED_ALIASES.get(family["name"])
+        if alias is None:
+            continue
+        expanded.append(
+            {
+                "name": alias,
+                "type": "counter",
+                "help": (
+                    f"Deprecated: use {family['name']}; removal needs a "
+                    f"release marked breaking. {family['help']}"
+                ),
+                "samples": family["samples"],
+                "deprecated": True,
+                "replacement": family["name"],
+            }
+        )
+    return expanded
 
 
 def exposition(view: dict) -> str:

@@ -573,6 +573,18 @@ command reads the records `top` reads, holds no lock
 and writes no coordination state, and its `tokens` counter is what the native
 client counted rather than billed spend, exactly as the `TOKENS` column is.
 
+0.19.0 renamed twelve windowed and retained counts from `_total` counters to
+gauges suffixed `_window` or `_retained`. The old 0.18.x names are still
+exported as deprecated aliases with their `counter` type, labels and the same
+values as their replacements, and each `# HELP` line names the replacement;
+`--json` marks them `"deprecated": true` with a `replacement` key. The pull
+request aliases are `agent_parley_lane_pull_requests_opened_total`,
+`agent_parley_lane_pull_requests_merged_total` and
+`agent_parley_lane_pull_requests_closed_total`. Removing the aliases needs a
+release marked breaking.
+[Operations](operations.md#metrics-a-monitoring-stack-can-read) lists every
+alias with its replacement.
+
 ### Web view and scrape endpoint
 
 `top --serve [PORT]` serves the same frame in a browser tab. It binds

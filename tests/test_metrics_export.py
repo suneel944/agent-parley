@@ -89,7 +89,11 @@ def test_exposition_names_and_labels_are_well_formed(
 
 
 def test_no_windowed_or_retained_family_is_typed_counter():
-    exported = views.families({"projects": []})
+    exported = [
+        family
+        for family in views.families({"projects": []})
+        if not family.get("deprecated")
+    ]
     counters = {
         family["name"] for family in exported if family["type"] == "counter"
     }
@@ -99,6 +103,73 @@ def test_no_windowed_or_retained_family_is_typed_counter():
             assert family["type"] == "gauge"
         if family["type"] == "gauge":
             assert not family["name"].endswith("_total")
+
+
+OLD_NAMES = {
+    "agent_parley_lane_context_bytes_total",
+    "agent_parley_lane_hook_events_total",
+    "agent_parley_lane_hook_denials_total",
+    "agent_parley_lane_hook_denials_by_cause_total",
+    "agent_parley_lane_served_calls_total",
+    "agent_parley_lane_served_rejections_total",
+    "agent_parley_lane_pull_requests_opened_total",
+    "agent_parley_lane_pull_requests_merged_total",
+    "agent_parley_lane_pull_requests_closed_total",
+    "agent_parley_project_context_bytes_total",
+    "agent_parley_project_hook_events_total",
+    "agent_parley_project_hook_denials_total",
+}
+
+
+def test_every_0_18_name_is_exported_as_a_deprecated_counter():
+    exported = {
+        family["name"]: family for family in views.families({"projects": []})
+    }
+    for name in OLD_NAMES:
+        alias = exported[name]
+        assert alias["type"] == "counter"
+        assert alias["deprecated"] is True
+        assert alias["replacement"] in exported
+        assert alias["help"].startswith(
+            f"Deprecated: use {alias['replacement']};"
+        )
+        assert "breaking" in alias["help"]
+    deprecated = {
+        name for name, family in exported.items() if family.get("deprecated")
+    }
+    assert deprecated == OLD_NAMES
+
+
+def test_each_alias_reports_the_values_of_its_replacement():
+    row = {
+        "participant": "claude",
+        "provider_name": "claude",
+        **views.NO_OUTCOMES,
+        "injected_bytes": 2048,
+        "hook_events": 9,
+        "denials": 2,
+        "calls": 5,
+        "errors": 1,
+        "pull_requests_opened": 3,
+        "pull_requests_merged": 2,
+        "pull_requests_closed": 1,
+        "denied_by": [{"reason": "policy", "tool": "Bash", "count": 2}],
+    }
+    view = snapshot(row)
+    text = views.exposition(view)
+    for new, old in views.DEPRECATED_ALIASES.items():
+        replaced = samples(text, new)
+        assert replaced
+        assert [line.removeprefix(old) for line in samples(text, old)] == [
+            line.removeprefix(new) for line in replaced
+        ]
+        assert f"# TYPE {old} counter" in text
+    document = views.measurements(view)
+    reported = {family["name"]: family for family in document["metrics"]}
+    for new, old in views.DEPRECATED_ALIASES.items():
+        assert reported[old]["samples"] == reported[new]["samples"]
+        assert reported[old]["replacement"] == new
+        assert "deprecated" not in reported[new]
 
 
 def test_a_lane_without_merges_reports_counts_but_no_ratio_or_median():
@@ -126,9 +197,15 @@ def test_a_label_value_escapes_quotes_backslashes_and_newlines():
     view = snapshot({"participant": "claude", "provider_name": "x"}, root)
     text = views.exposition(view)
     assert 'project="a\\\\b\\"c\\nd"' in text
-    assert len(text.splitlines()) == (len(views.LANE_METRICS) + 1) * 2 + (
-        len(views.PROJECT_METRICS) * 3
-    )
+    project_aliases = [
+        name
+        for name in views.DEPRECATED_ALIASES
+        if name.startswith("agent_parley_project_")
+    ]
+    lane_aliases = len(views.DEPRECATED_ALIASES) - len(project_aliases)
+    lane_families = len(views.LANE_METRICS) + 1 + lane_aliases
+    project_families = len(views.PROJECT_METRICS) + len(project_aliases)
+    assert len(text.splitlines()) == lane_families * 2 + project_families * 3
 
 
 def test_a_description_escapes_backslashes_and_newlines():

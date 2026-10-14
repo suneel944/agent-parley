@@ -2020,6 +2020,29 @@ counter: it is the native session's own running count.
 `tokens` is what the native client counted, not billed spend, exactly as the
 `TOKENS` column is.
 
+The twelve 0.18.x names these gauges replaced are still exported as
+deprecated aliases, so a dashboard or alert rule written against 0.18.x keeps
+reading data. Each alias follows its replacement, keeps its 0.18.x `counter`
+type and labels, carries the same samples as its replacement, and says
+`Deprecated: use <replacement>` in its `# HELP` line; in `--json` it also
+carries `"deprecated": true` and a `replacement` key. Move queries to the new
+names: removing the aliases needs a release marked breaking.
+
+| Deprecated alias | Replacement |
+| --- | --- |
+| `agent_parley_lane_context_bytes_total` | `agent_parley_lane_context_bytes_window` |
+| `agent_parley_lane_hook_events_total` | `agent_parley_lane_hook_events_window` |
+| `agent_parley_lane_hook_denials_total` | `agent_parley_lane_hook_denials_window` |
+| `agent_parley_lane_served_calls_total` | `agent_parley_lane_served_calls_retained` |
+| `agent_parley_lane_served_rejections_total` | `agent_parley_lane_served_rejections_retained` |
+| `agent_parley_lane_pull_requests_opened_total` | `agent_parley_lane_pull_requests_opened_window` |
+| `agent_parley_lane_pull_requests_merged_total` | `agent_parley_lane_pull_requests_merged_window` |
+| `agent_parley_lane_pull_requests_closed_total` | `agent_parley_lane_pull_requests_closed_window` |
+| `agent_parley_lane_hook_denials_by_cause_total` | `agent_parley_lane_hook_denials_by_cause_window` |
+| `agent_parley_project_context_bytes_total` | `agent_parley_project_context_bytes_window` |
+| `agent_parley_project_hook_events_total` | `agent_parley_project_hook_events_window` |
+| `agent_parley_project_hook_denials_total` | `agent_parley_project_hook_denials_window` |
+
 A measurement that could not be read reports no sample rather than a zero:
 an unreadable mailbox or session record leaves `mail_unread`, `mail_pending_ack`
 or `tokens` absent for that lane, while the family still prints its `# HELP`
