@@ -1647,6 +1647,11 @@ from a claim to the pull request that ended it.
 `--provider`, `--issue` and `--since` combine on any listing, and `--json`
 prints one document with a `records` array, consistent with the snapshot
 contract below. `--output PATH` writes that document to a file instead.
+Mail and reservations are read at most 500 rows each, newest first, after the
+lane, claim and `--since` filters apply, so one lane's records are never
+crowded out by other lanes. When that cap leaves older matching rows out, the
+listing ends with `Older records omitted; narrow with --since.` and the JSON
+document carries `"truncated": true`.
 
 **A correlation key follows the work.** Every claim carries its own identifier,
 minted again on each claim and each accepted handoff, so releasing and

@@ -3608,7 +3608,13 @@ def issue_lines(reading: dict) -> str:
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
     reported = reading["history"]
-    lines.append(history.describe(reported["records"], reported["holdings"]))
+    lines.append(
+        history.describe(
+            reported["records"],
+            reported["holdings"],
+            truncated=bool(reported.get("truncated")),
+        )
+    )
     return "\n".join(lines)
 
 
@@ -6169,7 +6175,9 @@ def main() -> int:
                     document
                     if args.json
                     else history.describe(
-                        reported["records"], reported["holdings"]
+                        reported["records"],
+                        reported["holdings"],
+                        truncated=reported["truncated"],
                     )
                 )
         elif args.command == "events":

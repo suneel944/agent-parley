@@ -554,7 +554,8 @@ class ReportsMixin(BridgeCore):
 
         Returns:
             The matching records, with the ownership generations of an issue
-            listing.
+            listing, and whether the row cap omitted older matching mail or
+            reservations.
 
         Raises:
             BridgeError: If the subject is unknown or the project has none.
@@ -579,19 +580,21 @@ class ReportsMixin(BridgeCore):
             participant = value
         elif subject == "claim":
             claim = value
+        reported, truncated = history.query(
+            self.home,
+            directory,
+            data,
+            kinds=kinds,
+            participant=participant,
+            provider=provider,
+            issue=issue,
+            claim=claim,
+            since=since,
+        )
         return {
             "subject": subject or "project",
             "value": value,
             "holdings": held,
-            "records": history.records(
-                self.home,
-                directory,
-                data,
-                kinds=kinds,
-                participant=participant,
-                provider=provider,
-                issue=issue,
-                claim=claim,
-                since=since,
-            ),
+            "records": reported,
+            "truncated": truncated,
         }

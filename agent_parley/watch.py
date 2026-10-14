@@ -290,7 +290,8 @@ def follow(
     floor trails the newest record by a fixed horizon, so a record committed
     with a slightly earlier time than one already printed is still caught,
     and keys older than the floor are forgotten so a long watch does not grow
-    without bound.
+    without bound. Records the backlog leaves out are marked seen without
+    being printed, so a later poll never emits them after newer ones.
 
     Args:
         source: Reads every record at or after a Unix time floor.
@@ -302,10 +303,10 @@ def follow(
         backlog: Records to print first when no floor is given.
     """
     floor = since
-    seen: dict[str, float] = {}
     records = source(floor)
-    if not since:
-        records = records[-backlog:]
+    hidden = 0 if since else max(len(records) - backlog, 0)
+    seen = {record["key"]: record["at"] for record in records[:hidden]}
+    records = records[hidden:]
     while True:
         for record in records:
             if record["key"] in seen:
