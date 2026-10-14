@@ -285,6 +285,7 @@ def reported(values: Mapping[str, str]) -> dict:
             if len(missing) > 1:
                 names = ", ".join(missing[:-1]) + " and " + names
             faults.append(f"Email needs {names}.")
+        faults.append(email_fault(mail))
     if "webhook" in config["transports"]:
         faults.append(webhook_fault(config["webhook"]["url"]))
     return {
@@ -564,8 +565,11 @@ def telegram(config: dict, subject: str, body: str) -> None:
 def email(config: dict, subject: str, body: str) -> None:
     """Sends one message over SMTP with STARTTLS or implicit TLS.
 
-    The SMTP client is imported here rather than at module scope, so a
-    command line that never notifies does not pay for it at startup.
+    Both TLS modes verify the server certificate chain and host name with
+    the system trust store. A login without TLS is refused unless the host
+    is loopback; see `email_fault`. The SMTP client is imported here rather
+    than at module scope, so a command line that never notifies does not
+    pay for it at startup.
 
     Args:
         config: Resolved notification configuration.
@@ -573,11 +577,13 @@ def email(config: dict, subject: str, body: str) -> None:
         body: Plain-text body.
 
     Raises:
-        BridgeError: If the host, sender or recipient list is missing.
+        BridgeError: If the host, sender or recipient list is missing, or
+            the login would travel in the clear to a remote host.
         OSError: If the session cannot be established.
         smtplib.SMTPException: If the server refuses the session or message.
     """
     import smtplib
+    import ssl
 
     values = config["email"]
     if not values["host"]:
@@ -586,22 +592,54 @@ def email(config: dict, subject: str, body: str) -> None:
         raise BridgeError(
             "Email needs AGENT_PARLEY_SMTP_FROM and AGENT_PARLEY_SMTP_TO."
         )
+    fault = email_fault(values)
+    if fault:
+        raise BridgeError(fault)
+    context = ssl.create_default_context()
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = values["sender"]
     message["To"] = ", ".join(values["recipients"])
     message.set_content(body)
     session = (
-        smtplib.SMTP_SSL(values["host"], values["port"], timeout=TIMEOUT)
+        smtplib.SMTP_SSL(
+            values["host"], values["port"], timeout=TIMEOUT, context=context
+        )
         if values["tls"] == "implicit"
         else smtplib.SMTP(values["host"], values["port"], timeout=TIMEOUT)
     )
     with session:
         if values["tls"] == "starttls":
-            session.starttls()
+            session.starttls(context=context)
         if values["user"]:
             session.login(values["user"], values["password"])
         session.send_message(message)
+
+
+def email_fault(values: Mapping[str, object]) -> str:
+    """Names why the SMTP settings would expose the login.
+
+    With ``AGENT_PARLEY_SMTP_TLS=none`` the ``AUTH`` exchange travels
+    unencrypted, so a login is accepted only to a loopback relay, as
+    `webhook_fault` accepts plain HTTP only to one.
+
+    Args:
+        values: The ``email`` section of the resolved configuration.
+
+    Returns:
+        The refusal sentence, or an empty string when the settings are usable.
+    """
+    if (
+        values["tls"] != "none"
+        or not values["user"]
+        or values["host"] in LOOPBACK_HOSTS
+    ):
+        return ""
+    return (
+        "AGENT_PARLEY_SMTP_TLS=none would send the SMTP login in the clear "
+        "to a host other than 127.0.0.1, localhost or ::1; set "
+        "AGENT_PARLEY_SMTP_TLS to starttls or implicit."
+    )
 
 
 def webhook_fault(url: str) -> str:

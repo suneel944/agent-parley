@@ -6,6 +6,7 @@ import http.server
 import io
 import json
 import smtplib
+import ssl
 import sys
 import threading
 import urllib.request
@@ -210,7 +211,9 @@ def test_email_starts_tls_before_it_authenticates(monkeypatch):
         def __exit__(self, *args):
             return False
 
-        def starttls(self):
+        def starttls(self, context=None):
+            assert context.verify_mode == ssl.CERT_REQUIRED
+            assert context.check_hostname
             steps.append("starttls")
 
         def login(self, user, password):
@@ -241,6 +244,71 @@ def test_email_starts_tls_before_it_authenticates(monkeypatch):
         "login bridge",
         "send subject to owner@example.com",
     ]
+
+
+def mail(tls, host="smtp.example.com", user="bridge"):
+    """Builds an email configuration for one TLS mode, host and user."""
+    return {
+        "email": {
+            "host": host,
+            "port": 465,
+            "user": user,
+            "password": "secret",
+            "sender": "bridge@example.com",
+            "recipients": ["owner@example.com"],
+            "tls": tls,
+        }
+    }
+
+
+def test_implicit_tls_verifies_the_server_certificate(monkeypatch):
+    contexts = []
+
+    class Session:
+        def __init__(self, host, port, timeout=0, context=None):
+            contexts.append(context)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def login(self, user, password):
+            pass
+
+        def send_message(self, message):
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", Session)
+    notify.email(mail("implicit"), "subject", "body")
+    assert contexts[0].verify_mode == ssl.CERT_REQUIRED
+    assert contexts[0].check_hostname
+
+
+def test_email_refuses_a_clear_login_to_a_remote_host(monkeypatch):
+    monkeypatch.setattr(smtplib, "SMTP", None)
+    with pytest.raises(BridgeError, match="in the clear"):
+        notify.email(mail("none"), "subject", "body")
+    assert notify.email_fault(mail("none")["email"]).endswith(
+        "set AGENT_PARLEY_SMTP_TLS to starttls or implicit."
+    )
+    assert notify.email_fault(mail("none", host="127.0.0.1")["email"]) == ""
+    assert notify.email_fault(mail("none", user="")["email"]) == ""
+    assert notify.email_fault(mail("starttls")["email"]) == ""
+    report = notify.reported(
+        {
+            "AGENT_PARLEY_NOTIFY": "email",
+            "AGENT_PARLEY_SMTP_HOST": "smtp.example.com",
+            "AGENT_PARLEY_SMTP_FROM": "bridge@example.com",
+            "AGENT_PARLEY_SMTP_TO": "owner@example.com",
+            "AGENT_PARLEY_SMTP_TLS": "none",
+            "AGENT_PARLEY_SMTP_USER": "bridge",
+            "AGENT_PARLEY_SMTP_PASSWORD": "secret",
+        }
+    )
+    assert "AGENT_PARLEY_SMTP_TLS=none" in report["fault"]
+    assert "secret" not in report["fault"]
 
 
 def test_the_same_situation_notifies_once(tmp_path, fake):
