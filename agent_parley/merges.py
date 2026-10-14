@@ -125,6 +125,135 @@ def attributed_commits(root: Path, base: str, branch: str) -> list[str]:
     return refusals
 
 
+def predicted_conflicts(
+    root: Path, base: str, target: str
+) -> tuple[str, list[str]] | None:
+    """Predicts merging one commit onto another without touching a checkout.
+
+    `git merge-tree --write-tree` merges in the object store alone: it
+    writes the resulting tree as an unreferenced object and changes no ref,
+    index or working tree, so the base checkout is never left mid-merge.
+    Git before 2.38 lacks the option and answers with a usage error, and an
+    unrelated history or a timeout gives no prediction either; each returns
+    None so the caller keeps its unpredicted behavior.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        base: Commit the merge would land on.
+        target: Commit or branch the merge would carry.
+
+    Returns:
+        The resulting tree and no paths on a clean merge, an empty tree and
+        the conflicted paths on a conflict, or None when Git cannot predict.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                base,
+                target,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode not in {0, 1} or not lines:
+        return None
+    if result.returncode == 0:
+        return lines[0], []
+    return "", list(dict.fromkeys(line for line in lines[1:] if line))
+
+
+def conflict_refusal(name: str, branch: str, paths: Sequence[str]) -> str:
+    """Builds the refusal for a lane whose merge is predicted to conflict.
+
+    Args:
+        name: Participant that owns the lane.
+        branch: Bridge branch the merge would carry.
+        paths: Paths the predicted merge leaves conflicted.
+
+    Returns:
+        The message naming the lane, its branch and the conflicted paths.
+    """
+    return (
+        f"Merging {branch} would conflict in: {', '.join(paths)}. Rebase "
+        f"{name}'s lane onto the base and resolve them there; nothing was "
+        "merged."
+    )
+
+
+def run_conflicts(
+    root: Path, lanes: Sequence[tuple[str, str]]
+) -> list[str] | None:
+    """Predicts an ordered run, each lane merged onto those before it.
+
+    A lane can merge cleanly onto the base alone and still conflict with
+    a lane merged ahead of it, so every clean prediction becomes an
+    unreferenced commit, with the base and the lane as its parents, that
+    the next lane is predicted against. A conflicting lane is left out of
+    the chain, as a refused lane would be. Only objects are written; no
+    ref, index or working tree changes.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        lanes: Each lane's participant and bridge branch, in merge order.
+
+    Returns:
+        One refusal per lane predicted to conflict, naming its paths, or
+        None when Git cannot predict the run.
+    """
+    base = "HEAD"
+    refusals = []
+    for name, branch in lanes:
+        predicted = predicted_conflicts(root, base, branch)
+        if predicted is None:
+            return None
+        tree, paths = predicted
+        if paths:
+            refusals.append(f"{name}: {conflict_refusal(name, branch, paths)}")
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=agent-parley",
+                    "-c",
+                    "user.email=agent-parley@localhost",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    base,
+                    "-p",
+                    branch,
+                    "-m",
+                    "Predicted lane merge",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GIT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode or not result.stdout.strip():
+            return None
+        base = result.stdout.strip()
+    return refusals
+
+
 def merge_blockers(
     root: Path, lane: Path, name: str, branch: str, session: str = ""
 ) -> Iterator[str]:
@@ -134,7 +263,8 @@ def merge_blockers(
     collects every one of them, so both report a condition in the same
     words. The branch is examined first because nothing else can be
     inspected once it is gone, and iteration stops there. Every check reads;
-    none writes.
+    none writes, beyond the unreferenced tree `predicted_conflicts` stores
+    while it predicts whether the merge would conflict.
 
     Args:
         root: Common repository root, which is always the base checkout.
@@ -190,6 +320,9 @@ def merge_blockers(
             "Commit them in the lane first; merge only ever merges commits."
         )
     yield from attributed_commits(root, "HEAD", branch)
+    predicted = predicted_conflicts(root, "HEAD", branch)
+    if predicted and predicted[1]:
+        yield conflict_refusal(name, branch, predicted[1])
     if session:
         yield session_busy(name)
 
@@ -207,9 +340,12 @@ def merge_preview(
     The preview only reads: it records no merge commit, moves no branch,
     leaves the index and working tree of both checkouts alone, and never
     takes the participant's session lock, so previewing a lane while its
-    agent still works cannot make that session fail. It attempts no trial
-    merge either, so a preview that names no refusal says the merge is not
-    currently refused, never that it would apply without conflicts.
+    agent still works cannot make that session fail. Conflicts are
+    predicted in the object store by `predicted_conflicts`, so a lane that
+    would conflict is refused with its paths and one that would not is
+    reported as merging cleanly. On a Git too old to predict, a preview
+    that names no refusal says only that the merge is not currently
+    refused, never that it would apply without conflicts.
 
     The file summary keeps the leading space Git indents every one of its
     rows with, which reading stripped command output would otherwise take
@@ -266,9 +402,13 @@ def merge_preview(
             f"Clear those, then run `agent-parley participant merge {name}`."
         )
     elif pending:
+        clean = (
+            "It merges cleanly."
+            if predicted_conflicts(root, "HEAD", branch) is not None
+            else "The preview merges nothing, so it cannot predict conflicts."
+        )
         report.append(
-            f"Nothing refuses this merge; it would land on {base}. The "
-            "preview merges nothing, so it cannot predict conflicts."
+            f"Nothing refuses this merge; it would land on {base}. {clean}"
         )
     return "\n".join(report)
 

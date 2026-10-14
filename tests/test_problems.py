@@ -1570,10 +1570,14 @@ def test_a_lane_ready_to_retire_carries_no_separate_orphan_row(monkeypatch):
     assert not orphaned_lane(LIVE, monkeypatch, problems.ORPHANED)
 
 
-def integrating_lane(monkeypatch, seconds, pull=True, approval=None):
+def integrating_lane(monkeypatch, seconds, pull=True, approval=None, **reading):
     """Derives a dead lane's rows holding a waiting ready report."""
     monkeypatch.setattr(supervision, "dirty_paths", lambda lane: [])
-    opened = {"number": 830, "url": "https://example.test/pull/830"}
+    opened = {
+        "number": 830,
+        "url": "https://example.test/pull/830",
+        **reading,
+    }
     claims = [
         {**ORPHANED[0], "pull_request": opened if pull else None},
     ]
@@ -1630,6 +1634,25 @@ def test_a_ready_report_waiting_on_its_pull_request_replaces_retirement(
     [row] = [row for row in held if row["condition"] == problems.INTEGRATE]
     assert row["command"] == "agent-parley approve claude --repo /root"
     assert "approve" in declared()
+
+
+def test_a_conflicting_or_red_pull_request_is_never_offered_for_merge(
+    monkeypatch,
+):
+    ceiling = supervision.DEFAULT_WAIT_CEILING
+    conflicting = integrating_lane(
+        monkeypatch, ceiling + 1, mergeable="CONFLICTING", checks="green"
+    )
+    [row] = [
+        row for row in conflicting if row["condition"] == problems.INTEGRATE
+    ]
+    assert "conflicts with its base" in row["detail"]
+    assert row["command"].startswith("rebase the claude branch")
+    assert "review and merge" not in row["command"]
+    red = integrating_lane(
+        monkeypatch, ceiling + 1, mergeable="MERGEABLE", checks="red"
+    )
+    assert problems.INTEGRATE not in {row["condition"] for row in red}
 
 
 def test_a_ready_claim_with_no_open_pull_request_is_reported(

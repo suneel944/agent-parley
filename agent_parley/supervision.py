@@ -6488,6 +6488,7 @@ def end_closed_issues(directory: Path, opened: dict, since: float) -> None:
 
 PULL_REQUEST_SECONDS = 60.0
 PULL_REQUEST_RECORD = "pull-requests.json"
+MERGE_SETTLED = frozenset({"MERGEABLE", "CONFLICTING"})
 PULL_REQUEST_HISTORY_SECONDS = 30 * 86400.0
 CHECKS_STALLED_SECONDS = 3600.0
 CHECKS_STALLED_FACTOR = 2
@@ -6535,9 +6536,11 @@ def pull_request_wakes(
     `PULL_REQUEST_SECONDS`, and each open pull request's last reading is
     kept in `PULL_REQUEST_RECORD`. A pull request whose checks finished green
     or red on a head commit not yet reported, which gained a review, or
-    whose merge state moved between mergeable and conflicting, is announced
-    to its lane as supervisor mail naming the number, head commit and new
-    state, with the failing check names on a red run. Unread mail is a wake
+    whose merge state moved between mergeable and conflicting, across any
+    `UNKNOWN` reading the forge gives while it recomputes, or which first
+    settled as conflicting, is announced to its lane as supervisor mail
+    naming the number, head commit and new state, with the failing check
+    names on a red run. Unread mail is a wake
     reason, so the ordinary wake path gives the lane its turn. A pull request
     seen for the first time with finished checks or reviews is announced
     once as well. A message reporting a new review or failed checks also
@@ -6636,6 +6639,7 @@ def pull_request_wakes(
             record["opened_at"] = float(previous.get("opened_at") or now)
         if previous.get("sha") == record["sha"] and previous.get("rerun"):
             record["rerun"] = previous["rerun"]
+        record["mergeable_settled"] = _merge_settled(previous, reading)
         kept[str(reading["number"])] = record
         changes = _pull_request_changes(previous, reading)
         limited = _ci_round_limit(
@@ -6651,7 +6655,11 @@ def pull_request_wakes(
         )
         if requested:
             changes.append(requested)
-        watched = changes or record["checks"] in {"pending", "red"}
+        watched = (
+            changes
+            or record["checks"] in {"pending", "red"}
+            or reading["mergeable"] == "CONFLICTING"
+        )
         name = _pull_request_lane(manifest, ledger, reading) if watched else ""
         if name:
             record["lane"] = name
@@ -7113,6 +7121,11 @@ def _not_started_decisions(
 def _pull_request_changes(before: dict, after: dict) -> list[str]:
     """Describes what changed between two readings of one pull request.
 
+    The merge state is compared against the last settled one
+    `_merge_settled` stored, so an `UNKNOWN` reading between two settled
+    ones neither wakes nor hides the change. A pull request first settled
+    as `CONFLICTING`, with no settled state before it, is a change.
+
     Args:
         before: The previous reading, or an empty mapping for a first one.
         after: This poll's reading from `forge.open_pull_requests`.
@@ -7140,14 +7153,37 @@ def _pull_request_changes(before: dict, after: dict) -> list[str]:
             for review in added
         )
         changes.append(f"review submitted: {listed}")
-    settled = {"MERGEABLE", "CONFLICTING"}
+    prior = before.get("mergeable_settled", before.get("mergeable"))
+    current = after["mergeable"]
     if (
-        before.get("mergeable") in settled
-        and after["mergeable"] in settled
-        and before["mergeable"] != after["mergeable"]
+        current in MERGE_SETTLED
+        and current != prior
+        and (prior in MERGE_SETTLED or current == "CONFLICTING")
     ):
-        changes.append(f"merge state is now {after['mergeable']}")
+        changes.append(f"merge state is now {current}")
     return changes
+
+
+def _merge_settled(previous: dict, reading: dict) -> str:
+    """Returns the last merge state the forge settled on for a pull request.
+
+    The forge computes mergeability lazily and reads `UNKNOWN` while it
+    recomputes after the base moves, so an `UNKNOWN` reading carries the
+    previous settled state forward. A record written before this field
+    existed falls back to its raw `mergeable` value.
+
+    Args:
+        previous: The pull request's stored record from the last poll.
+        reading: This poll's reading from `forge.open_pull_requests`.
+
+    Returns:
+        `MERGEABLE` or `CONFLICTING`, or an empty string when the forge
+        has never settled on either.
+    """
+    if reading["mergeable"] in MERGE_SETTLED:
+        return reading["mergeable"]
+    prior = previous.get("mergeable_settled", previous.get("mergeable"))
+    return prior if prior in MERGE_SETTLED else ""
 
 
 def _pull_request_feedback(

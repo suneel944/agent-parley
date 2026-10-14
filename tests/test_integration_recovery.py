@@ -140,7 +140,10 @@ def test_successful_recovery_verifies_the_exact_repaired_result(
     assert "Merged" in bridge.merge(repo, "codex")
 
 
-def test_a_conflict_is_recorded_before_the_base_changes(bridge, repo, paired):
+def test_a_conflict_is_recorded_before_the_base_changes(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(merges, "predicted_conflicts", lambda *args: None)
     (repo / "shared.txt").write_text("base edit\n")
     commit(repo, "Base edit")
     base = git(repo, "rev-parse", "HEAD")
