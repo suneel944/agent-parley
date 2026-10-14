@@ -262,6 +262,60 @@ def test_records_without_a_recorded_claim_carry_no_claim_suffix(
     assert "; claim c-1" in history.describe([], held)
 
 
+def test_the_row_cap_applies_after_the_lane_filter_and_says_so(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    claude = registered(bridge, paired, "claude")
+    codex = registered(bridge, paired, "codex")
+    store.call(
+        bridge.home,
+        claude,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Mine",
+            "body_md": "One.",
+            "idempotency_key": "mine",
+        },
+    )
+    for number in range(3):
+        store.call(
+            bridge.home,
+            codex,
+            "send_message",
+            {
+                "to": ["claude"],
+                "subject": f"Peer {number}",
+                "body_md": ".",
+                "idempotency_key": f"peer-{number}",
+            },
+        )
+    monkeypatch.setattr(history, "MAX_RECORDS", 2)
+    mine = bridge.history(repo, "participant", "claude", kinds=("message",))
+    assert [record["detail"] for record in mine["records"]] == ["Mine"]
+    assert mine["truncated"] is False
+    peer = bridge.history(repo, "participant", "codex", kinds=("message",))
+    assert len(peer["records"]) == 2
+    assert peer["truncated"] is True
+    arguments = ("--home", str(bridge.home), "history", "participant")
+    printed = run(monkeypatch, capsys, *arguments, "codex", "--repo", str(repo))
+    assert printed.splitlines()[-1] == (
+        "Older records omitted; narrow with --since."
+    )
+    document = json.loads(
+        run(
+            monkeypatch,
+            capsys,
+            *arguments,
+            "claude",
+            "--repo",
+            str(repo),
+            "--json",
+        )
+    )
+    assert document["truncated"] is False
+
+
 def test_filters_and_windows_narrow_the_listing(bridge, repo, paired):
     claude = paired["lanes"]["claude"]
     bridge.issue(claude, "claim", "42")

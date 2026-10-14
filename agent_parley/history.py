@@ -202,25 +202,89 @@ def _report_records(directory: Path, manifest: dict) -> list[dict]:
     return records
 
 
-def _store_records(home: Path, manifest: dict) -> list[dict]:
-    """Reads reservations and mail for one project, correlated where known."""
+def _scope(
+    alias: str, manifest: dict, participant: str, claim: str, since: float
+) -> tuple[str, list]:
+    """Builds the store filter that runs before the row cap applies.
+
+    Args:
+        alias: Table alias of the reservation or message row.
+        manifest: Project manifest holding the roster.
+        participant: Lane to report; every lane when empty.
+        claim: Claim identifier to report; every claim when empty.
+        since: Unix time floor; no floor when zero.
+
+    Returns:
+        The ``WHERE`` clause through its row limit, and its parameters. The
+        limit is one row above ``MAX_RECORDS`` so a caller can tell a capped
+        result from one that fits exactly.
+    """
+    clause = "WHERE p.human_key=?"
+    parameters: list = [manifest["root"]]
+    if participant:
+        entry = manifest["participants"].get(participant) or {}
+        clause += " AND a.name=?"
+        parameters.append(entry.get("display", participant))
+    if claim:
+        clause += f" AND {alias}.claim_id=?"
+        parameters.append(claim)
+    if since:
+        clause += f" AND unixepoch({alias}.created_ts)>=?"
+        parameters.append(since)
+    parameters.append(MAX_RECORDS + 1)
+    return f"{clause} ORDER BY {alias}.id DESC LIMIT ?", parameters
+
+
+def _store_records(
+    home: Path,
+    manifest: dict,
+    *,
+    kinds: tuple[str, ...] = (),
+    participant: str = "",
+    claim: str = "",
+    since: float = 0.0,
+) -> tuple[list[dict], bool]:
+    """Reads reservations and mail for one project, correlated where known.
+
+    The lane, claim and time filters run in SQL before each source is capped
+    at ``MAX_RECORDS`` rows, so one lane's rows are never crowded out by rows
+    other lanes wrote later.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest holding the roster.
+        kinds: Record kinds to read; every kind when empty.
+        participant: Lane to report; every lane when empty.
+        claim: Claim identifier to report; every claim when empty.
+        since: Unix time floor; no floor when zero.
+
+    Returns:
+        The records, and whether any source had more rows than the cap.
+    """
     if not store.present(home):
-        return []
+        return [], False
     lanes = {
         participant["display"]: name
         for name, participant in manifest["participants"].items()
     }
-    records = []
+    records: list[dict] = []
     with store.connect(home) as db:
-        for row in db.execute(
-            "SELECT a.name AS identity,f.path_pattern,f.claim_id,"
-            "unixepoch(f.created_ts) AS created,"
-            "unixepoch(f.released_ts) AS released FROM file_reservations f "
-            "JOIN agents a ON a.id=f.agent_id "
-            "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
-            "ORDER BY f.id DESC LIMIT ?",
-            (manifest["root"], MAX_RECORDS),
-        ):
+        rows = []
+        if not kinds or "reservation" in kinds:
+            clause, parameters = _scope(
+                "f", manifest, participant, claim, since
+            )
+            rows = db.execute(
+                "SELECT a.name AS identity,f.path_pattern,f.claim_id,"
+                "unixepoch(f.created_ts) AS created,"
+                "unixepoch(f.released_ts) AS released "
+                "FROM file_reservations f "
+                "JOIN agents a ON a.id=f.agent_id "
+                "JOIN projects p ON p.id=a.project_id " + clause,
+                parameters,
+            ).fetchall()
+        truncated = len(rows) > MAX_RECORDS
+        for row in rows[:MAX_RECORDS]:
             name = lanes.get(row["identity"], row["identity"])
             records.append(
                 {
@@ -235,15 +299,21 @@ def _store_records(home: Path, manifest: dict) -> list[dict]:
                     "detail": f"reserved {row['path_pattern']}",
                 }
             )
-        for row in db.execute(
-            "SELECT m.id,a.name AS identity,m.thread_id,m.claim_id,"
-            "substr(m.subject,1,80) AS subject,"
-            "unixepoch(m.created_ts) AS created FROM messages m "
-            "JOIN agents a ON a.id=m.sender_id "
-            "JOIN projects p ON p.id=a.project_id WHERE p.human_key=? "
-            "ORDER BY m.id DESC LIMIT ?",
-            (manifest["root"], MAX_RECORDS),
-        ):
+        rows = []
+        if not kinds or "message" in kinds:
+            clause, parameters = _scope(
+                "m", manifest, participant, claim, since
+            )
+            rows = db.execute(
+                "SELECT m.id,a.name AS identity,m.thread_id,m.claim_id,"
+                "substr(m.subject,1,80) AS subject,"
+                "unixepoch(m.created_ts) AS created FROM messages m "
+                "JOIN agents a ON a.id=m.sender_id "
+                "JOIN projects p ON p.id=a.project_id " + clause,
+                parameters,
+            ).fetchall()
+        truncated = truncated or len(rows) > MAX_RECORDS
+        for row in rows[:MAX_RECORDS]:
             name = lanes.get(row["identity"], row["identity"])
             records.append(
                 {
@@ -259,7 +329,59 @@ def _store_records(home: Path, manifest: dict) -> list[dict]:
                     "detail": row["subject"],
                 }
             )
-    return records
+    return records, truncated
+
+
+def query(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    *,
+    kinds: tuple[str, ...] = (),
+    participant: str = "",
+    provider: str = "",
+    issue: str = "",
+    claim: str = "",
+    since: float = 0.0,
+) -> tuple[list[dict], bool]:
+    """Returns matching coordination events and whether a cap omitted any.
+
+    Takes the same arguments as :func:`records`. Mail and reservations are
+    read at most ``MAX_RECORDS`` rows per source after the lane, claim and
+    time filters apply, so the flag means older matching rows exist.
+
+    Returns:
+        The records of :func:`records`, and whether the store held more
+        matching rows than the cap let through.
+    """
+    try:
+        collected = [
+            *_ledger_records(directory, manifest),
+            *_report_records(directory, manifest),
+        ]
+        stored, truncated = _store_records(
+            home,
+            manifest,
+            kinds=kinds,
+            participant=participant,
+            claim=claim,
+            since=since,
+        )
+    except (BridgeError, OSError, sqlite3.Error) as exc:
+        raise BridgeError(
+            f"Coordination history is unavailable: {exc}"
+        ) from exc
+    selected = [
+        record
+        for record in [*collected, *stored]
+        if (not kinds or record["kind"] in kinds)
+        and (not participant or record["participant"] == participant)
+        and (not provider or record["provider"] == provider)
+        and (not issue or str(record["issue"] or "") == issue)
+        and (not claim or record["claim_id"] == claim)
+        and record["at"] >= since
+    ]
+    return sorted(selected, key=lambda record: record["at"]), truncated
 
 
 def records(
@@ -292,27 +414,17 @@ def records(
         identifier because it predates the correlation is reported with a null
         claim rather than being attached to a claim it never named.
     """
-    try:
-        collected = [
-            *_ledger_records(directory, manifest),
-            *_report_records(directory, manifest),
-            *_store_records(home, manifest),
-        ]
-    except (BridgeError, OSError, sqlite3.Error) as exc:
-        raise BridgeError(
-            f"Coordination history is unavailable: {exc}"
-        ) from exc
-    selected = [
-        record
-        for record in collected
-        if (not kinds or record["kind"] in kinds)
-        and (not participant or record["participant"] == participant)
-        and (not provider or record["provider"] == provider)
-        and (not issue or str(record["issue"] or "") == issue)
-        and (not claim or record["claim_id"] == claim)
-        and record["at"] >= since
-    ]
-    return sorted(selected, key=lambda record: record["at"])
+    return query(
+        home,
+        directory,
+        manifest,
+        kinds=kinds,
+        participant=participant,
+        provider=provider,
+        issue=issue,
+        claim=claim,
+        since=since,
+    )[0]
 
 
 def _claim(claim_id: str | None) -> str:
@@ -329,16 +441,23 @@ def _claim(claim_id: str | None) -> str:
     return f"; claim {claim_id}" if claim_id else ""
 
 
-def describe(reported: list[dict], held: list[dict] | None = None) -> str:
+def describe(
+    reported: list[dict],
+    held: list[dict] | None = None,
+    *,
+    truncated: bool = False,
+) -> str:
     """Formats history for a terminal, oldest first.
 
     Args:
         reported: Records produced by :func:`records`.
         held: Optional ownership generations to summarize first.
+        truncated: Whether the row cap omitted older matching records.
 
     Returns:
         One line per generation and per record, or a notice that the query
-        matched nothing.
+        matched nothing, followed by a notice when older records were
+        omitted.
     """
     lines = []
     for generation in held or []:
@@ -356,4 +475,7 @@ def describe(reported: list[dict], held: list[dict] | None = None) -> str:
             f"{record['participant'] or 'unknown'}: {record['detail']}"
             f"{_claim(record['claim_id'])}"
         )
-    return "\n".join(lines) or "No matching history."
+    described = "\n".join(lines) or "No matching history."
+    if truncated:
+        described += "\nOlder records omitted; narrow with --since."
+    return described

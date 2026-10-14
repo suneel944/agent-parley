@@ -507,11 +507,13 @@ def history(reported: dict) -> dict:
         The subject queried, each ownership generation of an issue, and one
         record per matching coordination event. A record that carries no claim
         identifier reports null: the correlation was never recorded, and
-        history does not invent one.
+        history does not invent one. ``truncated`` is true when the row cap
+        omitted older matching mail or reservations.
     """
     return {
         "subject": reported["subject"],
         "value": reported["value"],
+        "truncated": bool(reported.get("truncated")),
         "holdings": [
             {
                 **generation,
