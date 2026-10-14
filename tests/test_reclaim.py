@@ -2079,3 +2079,121 @@ def test_gc_project_waits_for_the_service_to_retire_the_root(
         supervision.forget(bridge.home, str(repo), apply=True)
 
     assert (directory / "project.json").exists()
+
+
+def test_a_refused_retirement_keeps_the_gone_root_unretired_and_named(
+    bridge, repo, paired, monkeypatch
+):
+    withdraw = retirement.withdraw
+    refusal = "claude holds ready or operator-blocked work (#1)"
+
+    def refusing(directory, name):
+        """Refuses the claude lane's retirement as ready work would."""
+        if name == "claude":
+            raise BridgeError(refusal)
+        return withdraw(directory, name)
+
+    monkeypatch.setattr(retirement, "withdraw", refusing)
+    directory, _ = gone_root(bridge, repo, paired)
+
+    published = json.loads(
+        (directory / supervision.ROOT_PUBLICATION).read_text()
+    )
+    assert published["retired"] is None
+    assert not supervision.root_retired(directory)
+    [entry] = published["refused"]
+    assert entry["participant"] == "claude"
+    assert entry["refused"] == refusal
+    assert set(entry["checkpoints"]) == {"1"}
+    assert [lane["participant"] for lane in published["lanes"]] == ["codex"]
+    assert issues.snapshot(directory)["issues"]["1"]["owner"] == "claude"
+    assert supervision.root_refused(directory) == [entry]
+    with pytest.raises(cli.BridgeError, match=r"claude: claude holds ready"):
+        supervision.forget(bridge.home, str(repo), apply=True)
+    assert (directory / "project.json").exists()
+
+    result = supervision.forget(
+        bridge.home, str(repo), apply=True, discard=True
+    )
+
+    assert result["removed"] is True
+    assert not directory.exists()
+
+
+def test_a_root_publication_without_refused_reads_as_refusing_nothing(
+    tmp_path,
+):
+    (tmp_path / supervision.ROOT_PUBLICATION).write_text(
+        json.dumps({"since": 1, "retired": 2, "lanes": [], "live": []})
+    )
+
+    assert supervision.root_refused(tmp_path) == []
+
+
+def test_one_refused_reclaim_step_never_skips_the_others(
+    bridge, repo, idle, monkeypatch
+):
+    ran = []
+    reclaimed = cli.Bridge.reclaim
+    pruned = reclaim.prune
+
+    def refusing(self, root, *, apply=False):
+        """Refuses every worktree move."""
+        raise BridgeError("relocation refused")
+
+    def reclaiming(self, root, *, apply=False):
+        """Records that the lane reclaim ran."""
+        ran.append("reclaim")
+        return reclaimed(self, root, apply=apply)
+
+    def pruning(directory, manifest, now):
+        """Records that the file prune ran."""
+        ran.append("prune")
+        return pruned(directory, manifest, now)
+
+    logged = []
+    monkeypatch.setattr(cli.Bridge, "relocate_worktrees", refusing)
+    monkeypatch.setattr(cli.Bridge, "reclaim", reclaiming)
+    monkeypatch.setattr(reclaim, "prune", pruning)
+    monkeypatch.setattr(
+        server, "log", lambda home, kind, line: logged.append((kind, line))
+    )
+    manifest = roster.read(idle["directory"])
+
+    with pytest.raises(BridgeError, match="relocate: relocation refused"):
+        supervision.reclaim_lanes(bridge.home, idle["directory"], manifest)
+
+    assert ran == ["reclaim", "prune"]
+    published = json.loads(
+        (idle["directory"] / supervision.RECLAIM_PUBLICATION).read_text()
+    )
+    assert published["errors"] == [
+        {"step": "relocate", "error": "relocation refused"}
+    ]
+    assert published["swept"] > 0
+    assert (
+        "reclaim",
+        f"{idle['directory'].name}: relocate refused: relocation refused",
+    ) in logged
+    summary = supervision.reclaim_summary(idle["directory"])
+    assert reclaim.summary_line(summary).endswith(
+        "; sweep steps refused: 1, first relocate: relocation refused"
+    )
+
+
+def test_a_refused_reclaim_step_reaches_the_supervision_error(
+    bridge, repo, idle, monkeypatch
+):
+    store.initialize(bridge.home)
+
+    def refusing(self, root, *, apply=False):
+        """Refuses every worktree move."""
+        raise BridgeError("relocation refused")
+
+    monkeypatch.setattr(cli.Bridge, "relocate_worktrees", refusing)
+
+    supervision.poll(bridge.home, idle["directory"])
+
+    error = issues.supervision_error(idle["directory"])
+    assert error is not None
+    assert "relocate: relocation refused" in error["detail"]

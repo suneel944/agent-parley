@@ -1450,12 +1450,14 @@ def summary_line(summary: dict) -> str:
     """Renders what the last sweep measured for one project.
 
     Args:
-        summary: The state directory size and worktree counts the last
-            sweep published.
+        summary: The state directory size, worktree counts and refused
+            steps the last sweep published.
 
     Returns:
-        One line naming the state directory's size and the worktrees a
-        reclaim would remove, or an empty string before the first sweep.
+        One line naming the state directory's size, the worktrees a reclaim
+        would remove and, when the sweep refused any step, how many it
+        refused and the first refusal, or an empty string before the first
+        sweep.
     """
     if summary.get("state_bytes") is None:
         return ""
@@ -1465,6 +1467,15 @@ def summary_line(summary: dict) -> str:
     )
     if forced := summary.get("forceable"):
         line += f", {forced} more with --force"
+    errors = [
+        row for row in summary.get("errors") or [] if isinstance(row, dict)
+    ]
+    if errors:
+        first = errors[0]
+        line += (
+            f"; sweep steps refused: {len(errors)}, first "
+            f"{first.get('step')}: {first.get('error')}"
+        )
     return line
 
 
