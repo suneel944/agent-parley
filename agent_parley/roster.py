@@ -38,6 +38,35 @@ UNAVAILABLE_HOOKS: dict[str, tuple[str, ...]] = {
 }
 REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
 DELIVERY_HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
+APPROVAL: dict[str, str | None] = {
+    "claude": "settings",
+    "codex": None,
+    "copilot": "flag",
+    "gemini": "overlay",
+    "opencode": "overlay",
+    "amp": None,
+}
+"""How a launch carries the bridge tool opt-in into each adapter.
+
+``settings`` is the session's permission settings, ``flag`` a command-line
+allow and ``overlay`` the lane-private configuration the launch writes;
+each allows this bridge's own MCP server and nothing else. ``None`` marks
+an adapter with no such setting the launcher uses, so a recorded opt-in
+cannot reach its session and no opt-in gap is reported for it.
+"""
+POLLED_REQUIRED_HOOKS = ("PreToolUse",)
+"""Guards a polled-delivery adapter must still raise to launch at all.
+
+An adapter whose mail is polled starts as a degraded lane when it lacks
+other events in ``REQUIRED_HOOKS``: the launcher's delivery thread carries
+coordination in, ``PreToolUse`` still refuses a branch switch or an
+unclaimed edit, and every launch names the guards that do not run.
+"""
+DEGRADED_WARNING = (
+    "{name}: the {adapter!r} adapter cannot deliver {missing}, so this lane "
+    "runs degraded: mail arrives by polling and the guards those events "
+    "carry do not run."
+)
 WATCHED_HOOKS = ("PermissionRequest", "Stop")
 """Events whose absence leaves a lane's blocked or idle state to the watcher.
 

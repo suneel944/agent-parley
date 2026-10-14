@@ -1368,6 +1368,36 @@ def budget_changes(args: argparse.Namespace) -> dict | None:
     return changes
 
 
+def unmeasured_lanes(
+    bridge: Bridge,
+    repository: Path,
+    args: argparse.Namespace,
+    names: list[str] | None = None,
+) -> list[str]:
+    """Warns about the project lanes a token limit just given cannot count.
+
+    Args:
+        bridge: Bridge whose state root defines the providers.
+        repository: Repository whose project the limit applies to.
+        args: Parsed budget flags; only a positive ``--tokens`` is checked.
+        names: Lanes the limit covers; every participant when omitted.
+
+    Returns:
+        Sorted active lanes without a token reader, each named on one
+        stderr warning line, or an empty list when no positive token limit
+        was given.
+    """
+    from agent_parley import records
+
+    if not getattr(args, "tokens", None):
+        return []
+    _, directory = bridge.project(repository, create=False)
+    lanes = records.unmeasured(bridge.home, roster.read(directory), names)
+    if lanes:
+        print(records.unmeasured_warning(lanes), file=sys.stderr)
+    return lanes
+
+
 def selected(args: argparse.Namespace) -> bool:
     """Reports whether the command line carries any lane selector."""
     return bool(
@@ -5734,6 +5764,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 "consumes together; 0 removes it."
             ),
         )
+    ceiling_enforce.add_argument(
+        "--allow-unmeasured",
+        action="store_true",
+        help=(
+            "Enforce a token limit even though some lanes run a provider "
+            "whose tokens are not read."
+        ),
+    )
     ceiling_resume = ceiling_actions.add_parser(
         "resume",
         help="Clear an exhausted run budget so the service dispatches again.",
@@ -6717,9 +6755,13 @@ def main() -> int:
                 added = bridge.add_participant(
                     repository, args.name, args.provider, args.credentials
                 )
-                if supervision.opt_in_missing(bridge.home, added, args.name):
+                if gap := supervision.opt_in_adapter(
+                    bridge.home, added, args.name
+                ):
                     print(
-                        supervision.OPT_IN_WARNING.format(name=args.name),
+                        supervision.OPT_IN_WARNING.format(
+                            name=args.name, adapter=gap
+                        ),
                         file=sys.stderr,
                     )
             elif args.action == "restore":
@@ -6751,6 +6793,7 @@ def main() -> int:
                         budget_changes(args),
                     )
                 )
+                unmeasured_lanes(bridge, repository, args, [args.name])
                 return 0
             if getattr(args, "json", False):
                 _, directory = bridge.project(repository)
@@ -6846,6 +6889,15 @@ def main() -> int:
                     )
                 )
             elif args.action == "enforce":
+                if (
+                    unmeasured_lanes(bridge, repository, args)
+                    and not args.allow_unmeasured
+                ):
+                    raise BridgeError(
+                        "An enforced token limit would never stop the lanes "
+                        "named above, so it is not recorded; pass "
+                        "--allow-unmeasured to enforce it anyway."
+                    )
                 print(bridge.enforce(repository, budget_changes(args)))
             elif args.action == "resume":
                 from agent_parley import unattended
@@ -6865,6 +6917,7 @@ def main() -> int:
                         budget_changes(args) if args.action == "set" else None,
                     )
                 )
+                unmeasured_lanes(bridge, repository, args)
         elif args.command == "resources":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -7122,6 +7175,15 @@ def main() -> int:
                         Path.cwd(), "provider", args.name, budget_changes(args)
                     )
                 )
+                from agent_parley import records
+
+                if args.tokens and not records.measures_tokens(
+                    bridge.home, args.name
+                ):
+                    print(
+                        records.unmeasured_warning([args.name]),
+                        file=sys.stderr,
+                    )
                 return 0
             defined = roster.inspect(bridge.home)
             print(

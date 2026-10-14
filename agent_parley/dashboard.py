@@ -156,7 +156,8 @@ LEGEND = (
     "denied or blocked of retained hook events; CALLS served MCP calls, "
     "!rejected; TOKENS what that lane's own native client recorded for "
     "its session, not billed spend and not comparable between vendors, "
-    "blank when its records were not readable; IDLE observed coordination "
+    "blank when its records were not readable, n/a when its provider has "
+    "no token reader; IDLE observed coordination "
     "inactivity inside the window, measured from this lane's own recorded "
     "turn ends, with + when the window reaches past what retention kept. "
     "IDLE says how long a lane went without coordination activity; it "
@@ -514,6 +515,13 @@ def _row(
         "denied_by": events.get("denied_by", []),
         "calls": stats.get("calls", 0),
         "errors": stats.get("errors", 0),
+        "unmeasured": (
+            []
+            if records.measures_tokens(
+                home, str(participant.get("provider", ""))
+            )
+            else ["tokens"]
+        ),
         "tokens": records.reported_tokens(
             home, participant, context["records"]
         ),
@@ -832,7 +840,7 @@ def row_cells(row: dict) -> tuple[str, ...]:
         tables.size(row["injected_bytes"]),
         f"{row['denials']}/{row['hook_events']}",
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
-        _tokens(row["tokens"]),
+        "n/a" if row.get("unmeasured") else _tokens(row["tokens"]),
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _unused(row.get("accounting")),
         _fitness(row),

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import gemini, roster, store
+from agent_parley import dialogs, gemini, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -165,6 +165,70 @@ def test_a_native_after_agent_without_coordination_ends_the_turn(lane):
     )
 
 
+def test_a_tool_permission_notification_records_the_lane_blocked(lane):
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-3", "cwd": str(lane["lane"])},
+    )
+    output = fire(
+        lane,
+        "Notification",
+        {
+            "session_id": "session-3",
+            "cwd": str(lane["lane"]),
+            "notification_type": "ToolPermission",
+            "message": "Allow execution?",
+            "details": {"toolName": "run_shell_command", "command": "ls"},
+        },
+    )
+    assert output == {}
+    state = json.loads((lane["directory"] / "helper-activity.json").read_text())
+    assert state["activity"] == f"{dialogs.APPROVAL}: run_shell_command"
+    assert state["dialog"]["tool"] == "run_shell_command"
+
+
+def test_other_notifications_are_ignored_and_never_decide(lane):
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-4", "cwd": str(lane["lane"])},
+    )
+    output = fire(
+        lane,
+        "Notification",
+        {
+            "session_id": "session-4",
+            "cwd": str(lane["lane"]),
+            "notification_type": "Idle",
+        },
+    )
+    assert output == {}
+    state = json.loads((lane["directory"] / "helper-activity.json").read_text())
+    assert state["activity"] == "working"
+    assert "dialog" not in state
+
+
+def test_a_tool_permission_payload_names_the_shared_tool():
+    assert gemini.payload(
+        {
+            "hook_event_name": "Notification",
+            "notification_type": "ToolPermission",
+            "details": {"toolName": "mcp_agent_parley_send_message"},
+        }
+    ) == {
+        "hook_event_name": "PermissionRequest",
+        "notification_type": "ToolPermission",
+        "details": {"toolName": "mcp_agent_parley_send_message"},
+        "tool_name": "mcp__agent_parley__send_message",
+        "tool_input": {"toolName": "mcp_agent_parley_send_message"},
+    }
+    assert gemini.payload(
+        {"hook_event_name": "Notification", "notification_type": "Idle"}
+    ) == {"hook_event_name": "Notification", "notification_type": "Idle"}
+    assert gemini.response({}) == {}
+
+
 def test_resume_without_a_recorded_session_is_refused(lane, bridge, repo):
     with pytest.raises(BridgeError, match="No usable native session"):
         bridge.launch("helper", repo, "Continue", "gemini", resume=True)
@@ -248,3 +312,24 @@ def test_native_before_tool_can_receive_denial_and_recover_via_mcp():
     assert gemini.response(
         {"decision": "block", "reason": "Restore branch"}
     ) == {"decision": "deny", "reason": "Restore branch"}
+
+
+def test_an_opted_in_gemini_lane_trusts_only_the_bridge_server(
+    lane, bridge, repo, capsys
+):
+    assert "trust" not in lane["settings"]["mcpServers"]["agent_parley"]
+    capsys.readouterr()
+    assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
+    assert "helper is a gemini lane" in capsys.readouterr().err
+    path = lane["directory"] / "project.json"
+    manifest = json.loads(path.read_text())
+    manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    write_json(path, manifest)
+    lane["native"].write_text(
+        json.dumps({"mcpServers": {"docs": {"command": "docs-mcp"}}})
+    )
+    assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
+    assert "is a gemini lane" not in capsys.readouterr().err
+    servers = json.loads(lane["overlay"].read_text())["mcpServers"]
+    assert servers["agent_parley"]["trust"] is True
+    assert servers["docs"] == {"command": "docs-mcp"}

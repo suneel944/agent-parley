@@ -1363,6 +1363,30 @@ def test_a_claude_resume_without_the_approval_opt_in_is_withheld(
         assert not record["exhausted_at"]
 
 
+@pytest.mark.parametrize("adapter", roster.ADAPTERS)
+def test_every_adapter_that_carries_the_opt_in_reports_its_gap(bridge, adapter):
+    manifest = {"participants": {"lane": {"provider": adapter}}}
+    carried = roster.APPROVAL[adapter] is not None
+    assert supervision.opt_in_missing(bridge.home, manifest, "lane") is carried
+    assert supervision.opt_in_adapter(bridge.home, manifest, "lane") == (
+        adapter if carried else ""
+    )
+    manifest["supervision"] = {dialogs.PRE_APPROVE: True}
+    assert not supervision.opt_in_missing(bridge.home, manifest, "lane")
+
+
+def test_auto_mode_clears_the_gap_of_a_claude_lane_only(bridge):
+    manifest = {
+        "supervision": {dialogs.AUTO_MODE: True},
+        "participants": {
+            "claude": {"provider": "claude"},
+            "gemini": {"provider": "gemini"},
+        },
+    }
+    assert not supervision.opt_in_missing(bridge.home, manifest, "claude")
+    assert supervision.opt_in_missing(bridge.home, manifest, "gemini")
+
+
 def test_operator_stop_holds_until_the_next_launch(
     bridge, repo, paired, monkeypatch
 ):
@@ -1680,7 +1704,7 @@ def test_stopped_resume_keeps_native_interactive_permissions(
     )
     assert bridge.launch(provider, repo, terminal.PROMPT, resume=True) == 0
     warned = "no bridge tool approval is recorded" in capsys.readouterr().err
-    assert warned is (provider == "claude")
+    assert warned is (roster.APPROVAL[provider] is not None)
     assert "12345678-abcd-1234-abcd-123456789abc" in captured[0]
     assert "exec" not in captured[0] and "--print" not in captured[0]
     assert not any(

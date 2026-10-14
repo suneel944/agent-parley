@@ -157,7 +157,19 @@ def test_next_command_prefers_codex_when_claude_is_missing(tmp_path):
     )
 
 
-def test_next_command_names_both_clis_when_neither_is_installed(tmp_path):
+def test_next_command_runs_a_provider_that_needs_no_plugin(tmp_path):
+    install, _, binary, _ = build_machine(
+        tmp_path, clis=("agent-parley", "opencode")
+    )
+    stub(binary, "uv", UV)
+    result = install()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == (
+        "Next: cd your-repo && agent-parley run opencode"
+    )
+
+
+def test_next_command_names_every_provider_when_none_is_installed(tmp_path):
     install, _, binary, _ = build_machine(tmp_path, clis=("agent-parley",))
     stub(binary, "uv", UV)
     result = install()
@@ -165,5 +177,7 @@ def test_next_command_names_both_clis_when_neither_is_installed(tmp_path):
     lines = result.stdout.splitlines()
     assert "agent-parley run claude" not in result.stdout
     assert "agent-parley run codex" not in result.stdout
-    assert "install claude or codex" in lines[-2]
+    assert (
+        "install claude, codex, copilot, gemini, opencode or amp" in lines[-2]
+    )
     assert lines[-1] == "No CLI yet? Try: agent-parley demo"

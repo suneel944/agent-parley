@@ -150,6 +150,7 @@ def configure(
     url: str,
     hooks: dict,
     source_dir: str | None = None,
+    trusted: bool = False,
 ) -> Path:
     """Copies the user's OpenCode configuration into a lane-private directory.
 
@@ -171,6 +172,8 @@ def configure(
         source_dir: Configuration directory selected by the lane's
             credential profile; OpenCode's default location when unset,
             whatever the caller's environment exports.
+        trusted: Whether the operator opted this lane in to pre-approving
+            the bridge's own tools, which allows only ``agent_parley_*``.
 
     Returns:
         Directory for OPENCODE_CONFIG_DIR in this launch only.
@@ -209,6 +212,14 @@ def configure(
             protocol.HEADER: str(protocol.PROTOCOL),
         },
     }
+    if trusted:
+        permission = settings.setdefault("permission", {})
+        if not isinstance(permission, dict):
+            raise BridgeError(
+                "OpenCode permission settings must be an object to carry "
+                "the bridge tool approval."
+            )
+        permission["agent_parley_*"] = "allow"
     command = shlex.split(hooks["PreToolUse"][0]["hooks"][0]["command"])
     command += ["--adapter", "opencode"]
     if (source / "plugin" / "agent-parley.js").exists():

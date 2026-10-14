@@ -835,3 +835,61 @@ def test_a_half_written_rollout_is_matched_once_complete(tmp_path):
     assert records._codex_sources(tmp_path, lane) == []
     rollout.write_text(json.dumps({"payload": {"cwd": str(lane)}}) + "\n")
     assert records._codex_sources(tmp_path, lane) == [rollout]
+
+
+@pytest.mark.parametrize("provider", roster.ADAPTERS)
+def test_only_providers_with_a_record_reader_measure_tokens(bridge, provider):
+    assert records.measures_tokens(bridge.home, provider) is (
+        provider in ("claude", "codex")
+    )
+    assert not records.measures_tokens(bridge.home, "undefined-provider")
+
+
+def test_an_enforced_token_limit_with_an_unmeasured_lane_is_refused(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = bridge.project(repo, create=False)[1]
+    bridge.add_participant(repo, "gem", "gemini")
+    enforce = ("budget", "enforce", "--tokens", "500", "--repo", str(repo))
+    assert main(monkeypatch, bridge, *enforce)
+    err = capsys.readouterr().err
+    assert "no token count is read for gem," in err
+    assert "--allow-unmeasured" in err
+    assert "run_budget" not in roster.read(directory)
+    assert not main(monkeypatch, bridge, *enforce, "--allow-unmeasured")
+    assert "no token count is read for gem," in capsys.readouterr().err
+    assert roster.read(directory)["run_budget"] == {"tokens": 500}
+    assert not main(
+        monkeypatch,
+        bridge,
+        "budget",
+        "enforce",
+        "--calls",
+        "9",
+        "--repo",
+        str(repo),
+    )
+    assert "no token count" not in capsys.readouterr().err
+
+
+def test_an_advisory_token_limit_warns_for_each_unmeasured_lane(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    bridge.add_participant(repo, "gem", "gemini")
+    bridge.add_participant(repo, "pilot", "copilot")
+    project = ("--tokens", "500", "--repo", str(repo))
+    assert not main(monkeypatch, bridge, "budget", "set", *project)
+    assert "read for gem, pilot, so" in capsys.readouterr().err
+    assert not main(
+        monkeypatch, bridge, "participant", "budget", "claude", *project
+    )
+    assert "no token count" not in capsys.readouterr().err
+    assert not main(
+        monkeypatch, bridge, "participant", "budget", "pilot", *project
+    )
+    assert "no token count is read for pilot, so" in capsys.readouterr().err
+    monkeypatch.chdir(repo)
+    assert not main(
+        monkeypatch, bridge, "provider", "budget", "gemini", "--tokens", "5"
+    )
+    assert "no token count is read for gemini, so" in capsys.readouterr().err

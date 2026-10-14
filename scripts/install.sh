@@ -1,5 +1,6 @@
 #!/bin/sh
-# Installs Agent Parley and adds its plugin to each supported native CLI.
+# Installs Agent Parley and adds its plugin to each plugin-capable native CLI
+# (claude and codex); copilot, gemini, opencode and amp need no plugin.
 #
 #   curl -LsSf https://github.com/suneel944/agent-parley/releases/latest/download/install.sh | sh
 #
@@ -96,16 +97,17 @@ if [ "$failed" -ne 0 ]; then
 fi
 
 provider=""
-if command -v claude >/dev/null 2>&1; then
-    provider=claude
-elif command -v codex >/dev/null 2>&1; then
-    provider=codex
-fi
+for candidate in claude codex copilot gemini opencode amp; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        provider=$candidate
+        break
+    fi
+done
 say ""
 if [ -n "$provider" ]; then
     say "Next: cd your-repo && agent-parley run $provider"
 else
-    say "Next: install claude or codex, then cd your-repo && agent-parley run <provider>."
+    say "Next: install claude, codex, copilot, gemini, opencode or amp, then cd your-repo && agent-parley run <provider>."
     say "No CLI yet? Try: agent-parley demo"
 fi
 }

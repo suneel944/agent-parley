@@ -106,9 +106,11 @@ It installs [uv](https://docs.astral.sh/uv/) only when uv is missing, then
 installs or upgrades `agent-parley`, adds the plugin to each of `claude` and
 `codex` found on PATH with `agent-parley plugins install`, and runs
 `agent-parley doctor`. It never uses sudo, and re-running it upgrades in place.
-It ends with the next command, such as
-`Next: cd your-repo && agent-parley run claude`. With neither `claude` nor
-`codex` on PATH it says to install one first and offers `agent-parley demo`.
+It ends with the next command for the first of `claude`, `codex`, `copilot`,
+`gemini`, `opencode` and `amp` on PATH, such as
+`Next: cd your-repo && agent-parley run gemini`; only `claude` and `codex`
+take a plugin. With none of them on PATH it says to install one first and
+offers `agent-parley demo`.
 
 To install by hand instead:
 
@@ -164,8 +166,8 @@ completion, upgrades and the supported platforms are in
 Not sure where to start? Run `agent-parley` with no arguments in the
 repository. It reads, and writes nothing: whether this is a Git checkout,
 whether it has a first commit and uncommitted changes, whether the project is
-registered, which
-of `claude` and `codex` are on PATH and whether each has the plugin, and
+registered, which of the six providers are on PATH and, for `claude` and
+`codex`, the only two that take a plugin, whether each has it, and
 whether the coordination service is running. It then names the next one to
 three commands for exactly that state, such as `agent-parley plugins install`,
 `agent-parley run claude` or `agent-parley top`, or `agent-parley demo` when no

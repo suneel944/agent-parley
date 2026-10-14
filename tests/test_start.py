@@ -179,9 +179,40 @@ def test_run_repeats_the_stash_notice_after_an_attached_client_exits(
 
 def test_no_native_cli_offers_the_demo(path, repo, tmp_path, capsys):
     printed = screen(capsys, tmp_path / "home", repo)
-    assert "CLIs      none on PATH (claude, codex)" in printed
+    assert (
+        "CLIs      none on PATH (claude, codex, copilot, gemini, opencode, amp)"
+    ) in printed
     assert "agent-parley demo" in printed
     assert "agent-parley run" not in printed
+
+
+@pytest.mark.parametrize("name", ["gemini", "copilot", "opencode", "amp"])
+def test_a_provider_without_a_plugin_is_offered_to_run(
+    name, path, repo, tmp_path, capsys
+):
+    path(name)
+    printed = screen(capsys, tmp_path / "home", repo)
+    assert f"CLIs      {name} (no plugin needed)" in printed
+    assert printed.split("Next:\n")[1].startswith(f"  agent-parley run {name}")
+    assert "agent-parley demo" not in printed
+    assert "plugins install" not in printed
+
+
+def test_every_provider_on_path_wraps_within_the_screen(
+    path, repo, tmp_path, capsys
+):
+    for name in ("amp", "opencode", "gemini", "copilot", "codex", "claude"):
+        path(name)
+    claude_plugin()
+    printed = screen(capsys, tmp_path / "home", repo)
+    listed = printed.split("CLIs      ")[1].split("  Service")[0]
+    assert " ".join(listed.split()) == (
+        "claude (plugin added), codex (plugin missing), copilot (no plugin "
+        "needed), gemini (no plugin needed), opencode (no plugin needed), "
+        "amp (no plugin needed)"
+    )
+    assert "agent-parley run claude" in printed
+    assert "Add the plugin to codex." in printed
 
 
 def test_missing_plugin_offers_the_install(path, repo, tmp_path, capsys):

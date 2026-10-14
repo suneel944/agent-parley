@@ -367,6 +367,14 @@ def test_an_unknown_column_choice_still_shows_the_table():
     assert "PARTICIPANT" in text(dashboard.render(view, 120, columns=("XY",)))
 
 
+def test_an_unmeasured_lane_shows_n_a_in_the_tokens_cell():
+    rows = [lane("gem", unmeasured=["tokens"]), lane("cod", tokens=42)]
+    view = snapshot(("/repo", rows))
+    lines = dashboard.render(view, 160, columns=("PARTICIPANT", "TOKENS"))
+    assert any("gem" in line and "n/a" in line for line in lines)
+    assert not any("cod" in line and "n/a" in line for line in lines)
+
+
 def test_a_warning_row_is_marked_in_text_and_offered_for_colour():
     rows = [lane("codex"), lane("claude", drift=True)]
     frame = dashboard.layout(snapshot(("/repo", rows)), 200, 20)

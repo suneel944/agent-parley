@@ -1,5 +1,6 @@
 """Checks the Amp settings overlay and hook contract through the launcher."""
 
+import contextlib
 import json
 import os
 import subprocess
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import amp, cli, roster, store
+from agent_parley import amp, cli, delivery, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -58,9 +59,10 @@ def install(monkeypatch, tmp_path):
 def lane(bridge, repo, monkeypatch, tmp_path, account):
     """Launches an Amp lane as if Amp raised every required guard.
 
-    Amp raises no thread start or idle event, so the real launcher refuses
-    it; the guard table is narrowed here to exercise the launch path that
-    a future Amp release with those events would take.
+    Amp raises no thread start or idle event, so the real launcher starts
+    it degraded with polled delivery; the guard table is narrowed here to
+    exercise the launch path that a future Amp release with those events
+    would take.
     """
     install(monkeypatch, tmp_path)
     monkeypatch.setitem(roster.UNAVAILABLE_HOOKS, "amp", AVAILABLE)
@@ -332,12 +334,43 @@ def test_provider_inspection_exposes_unavailable_hooks(bridge):
     assert inspected["opencode"]["unavailable_hooks"] == ["SessionEnd"]
 
 
-def test_a_launch_is_refused_because_amp_lacks_required_guards(
+def test_an_amp_lane_launches_degraded_with_polled_delivery(
+    bridge, repo, monkeypatch, tmp_path, capsys
+):
+    install(monkeypatch, tmp_path)
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    monkeypatch.setattr(
+        cli.terminal,
+        "call",
+        lambda command, lane, env: subprocess.call(command, cwd=lane, env=env),
+    )
+    store.initialize(bridge.home)
+    started = []
+    polling = delivery.polling
+
+    @contextlib.contextmanager
+    def watched(*arguments, **keywords):
+        with polling(*arguments, **keywords) as running:
+            started.append(running)
+            yield running
+
+    monkeypatch.setattr(delivery, "polling", watched)
+    assert bridge.launch("helper", repo, "Coordinate", "amp") == 0
+    assert started == [True]
+    assert (tmp_path / "capture.json").exists()
+    warned = capsys.readouterr().err
+    assert "cannot deliver SessionStart, Stop" in warned
+    assert "runs degraded" in warned
+    directory = bridge.project(repo)[1]
+    activity = json.loads((directory / "helper-activity.json").read_text())
+    assert activity["degraded"] is True
+
+
+def test_a_polled_adapter_without_pre_tool_use_is_still_refused(
     bridge, repo, monkeypatch, tmp_path
 ):
     install(monkeypatch, tmp_path)
-    with pytest.raises(
-        BridgeError, match="cannot deliver SessionStart, Stop, so"
-    ):
+    monkeypatch.setitem(roster.UNAVAILABLE_HOOKS, "amp", (*roster.HOOK_EVENTS,))
+    with pytest.raises(BridgeError, match="cannot deliver SessionStart, "):
         bridge.launch("helper", repo, "Coordinate", "amp")
     assert not (tmp_path / "capture.json").exists()
