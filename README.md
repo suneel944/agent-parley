@@ -52,7 +52,8 @@ https://github.com/user-attachments/assets/1de399fc-4078-49da-a4f9-116789bccb7d
 - **Pull requests wake their lane.** Finished checks, a new review or a merge
   conflict reach the owning lane as mail.
 - **Unattended integration only by policy.** `unattended set` names the issues
-  and the target branch; `unattended run` merges on the same gate as
+  and the target branch; `unattended run`, or the service itself when the
+  policy adds `--auto`, merges on the same gate as
   `participant merge`, and a failed integration holds every other merge until
   it is verified.
 - **Churn is caught per issue.** An issue whose verification keeps failing is
@@ -266,7 +267,8 @@ default), a lane opens its own pull request once it has reported ready, passed
 the gate, stayed on its assigned branch and touched no peer's reservation.
 Each such pull request records what authorized it. Merging stays an
 operator step: `participant merge`, or `unattended run` for the issues a
-recorded `unattended` policy lists.
+recorded `unattended` policy lists, which the service runs itself only when
+that policy was recorded with `--auto`.
 
 Merged lanes are reclaimed by the service on its own; `agent-parley gc` runs
 the same sweep on demand:
@@ -494,7 +496,8 @@ be set and at least 12 characters; inbound status queries are off.
   [container-use](https://github.com/dagger/container-use) provides it;
   Agent Parley does not, and does not integrate with one.
 - **No silent merges.** A lane integrates only through `participant merge`, or
-  `unattended run` for an issue a recorded `unattended` policy lists.
+  `unattended run` for an issue a recorded `unattended` policy lists; with
+  `--auto` the service runs it and mails the lane every decision.
 - **No approvals on your behalf.** Two opt-ins exist:
   `approve_bridge_tools` allows this project's own MCP tools in every CLI's
   own per-server allow except Amp's, which has none, plus the CLI run as one

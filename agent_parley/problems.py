@@ -44,6 +44,7 @@ from agent_parley import (
     store,
     supervision,
     tables,
+    unattended,
 )
 from agent_parley.state import BridgeError
 from agent_parley.status import (
@@ -86,6 +87,7 @@ HOLDING = "holding a refused key"
 FOREIGN = "second session"
 REFUSED = "recovery refused"
 INTEGRATION = "integration unverified"
+UNATTENDED = "unattended integration failed"
 ROOT = "root missing"
 ROOT_RETURNED = "root returned"
 ESCALATED = "escalated plan revision"
@@ -1573,6 +1575,57 @@ def _refused_rows(directory: Path, root: str, now: float) -> list[dict]:
     return rows
 
 
+def _unattended_rows(
+    directory: Path, data: dict, root: str, now: float
+) -> list[dict]:
+    """Reports the service's own unattended integrations that failed.
+
+    A failure an operator's `unattended run` met was already printed to
+    that operator, so only a decision whose evidence names the service as
+    its actor raises a row. The row lasts while that decision is the lane's
+    newest and its claim generation is still the issue's current one, so a
+    later attempt, a release or a completion clears it.
+
+    Args:
+        directory: Private project state directory.
+        data: Project manifest holding every lane.
+        root: Canonical project key, which is the base checkout's path.
+        now: Unix time the decision ages are measured against.
+
+    Returns:
+        Zero or more rows, one per lane whose newest decision failed.
+    """
+    rows = []
+    with contextlib.suppress(OSError, ValueError):
+        ledger = issues.snapshot(directory)["issues"]
+        for name in data["participants"]:
+            decision = unattended.latest(directory, name)
+            if decision is None or decision["outcome"] != unattended.FAILED:
+                continue
+            evidence = decision.get("evidence") or {}
+            number = str(evidence.get("issue"))
+            record = ledger.get(number) or {}
+            if (
+                evidence.get("actor") != unattended.SERVICE
+                or not record.get("claim_id")
+                or record["claim_id"] != evidence.get("claim_id")
+            ):
+                continue
+            rows.append(
+                _row(
+                    UNATTENDED,
+                    f"issue #{number}: {decision.get('reason', '')}",
+                    "clear what the reason names, then run agent-parley "
+                    f"unattended run {name} --issue {number} --repo "
+                    f"{shlex.quote(root)}",
+                    _age(decision.get("at"), now),
+                    name,
+                    root,
+                )
+            )
+    return rows
+
+
 def _integration_rows(directory: Path, root: str, now: float) -> list[dict]:
     """Reports the integration the project's base has not verified.
 
@@ -2267,6 +2320,7 @@ def derive(
         aged.extend(_retired_rows(home, project))
         aged.extend(_refused_rows(directory, project["root"], stamp))
         aged.extend(_integration_rows(directory, project["root"], stamp))
+        aged.extend(_unattended_rows(directory, data, project["root"], stamp))
         aged.extend(_root_rows(directory, data, project["root"], stamp))
         aged.extend(_forge_rows(directory, project["root"], stamp))
         aged.extend(_plan_rows(directory, project["root"], stamp))

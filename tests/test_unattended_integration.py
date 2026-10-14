@@ -3,6 +3,7 @@
 import json
 import shlex
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,10 @@ from agent_parley import (
     lifecycle,
     merges,
     metrics,
+    problems,
     roster,
     store,
+    supervision,
     unattended,
 )
 from agent_parley.cli import git
@@ -459,6 +462,7 @@ def test_a_session_lock_still_excludes_a_live_lane(bridge, repo, ready):
         {"unattended": {"target": "main"}},
         {"unattended": {"target": "../main", "issues": ["42"]}},
         {"unattended": {"target": "main", "issues": ["42", "42"]}},
+        {"unattended": {"target": "main", "issues": ["42"], "auto": "yes"}},
         {"unattended": True},
         {"widen": {}},
         ["42"],
@@ -564,3 +568,137 @@ def test_the_command_line_sets_shows_and_clears_the_policy(
     )
     assert "operator-only" in run("unattended", "set", "--repo", str(repo))
     assert roster.read(ready["directory"])["integration"] == {}
+    assert "on its own" in run(
+        "unattended",
+        "set",
+        "42",
+        "--target",
+        ready["target"],
+        "--auto",
+        "--repo",
+        str(repo),
+    )
+    assert unattended.policy(roster.read(ready["directory"]))["auto"] is True
+
+
+def quiet(bridge, ready):
+    """Registers both lanes and turns off the stages these tests skip."""
+    store.initialize(bridge.home)
+    root = roster.read(ready["directory"])["root"]
+    for name in ("claude", "codex"):
+        store.register(bridge.home, root, name)
+    write_json(
+        bridge.home / "supervision.json",
+        {"prompts": False, "wake": False, "reclaim": False},
+    )
+
+
+def tick(bridge, directory):
+    """Runs one supervision poll and waits for the attempts it started."""
+    supervision.poll(bridge.home, directory)
+    for thread in threading.enumerate():
+        if thread.name.startswith("agent-parley-unattended-"):
+            thread.join(timeout=120)
+
+
+def subjects(bridge, repo):
+    """Returns the subjects of the unattended mail the lane received."""
+    with store.connect(bridge.home) as db:
+        rows = db.execute(
+            "SELECT m.subject FROM messages m JOIN projects p "
+            "ON p.id=m.project_id WHERE p.human_key=? "
+            "AND m.subject LIKE 'Unattended integration%' ORDER BY m.id",
+            (str(repo.resolve()),),
+        ).fetchall()
+    return [row["subject"] for row in rows]
+
+
+def test_auto_integrates_an_eligible_lane_once_within_one_poll(
+    bridge, repo, ready
+):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+
+    tick(bridge, directory)
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    [decision] = decisions(directory)
+    assert decision["outcome"] == unattended.INTEGRATED
+    assert decision["evidence"]["actor"] == unattended.SERVICE
+    integrated = git(repo, "rev-parse", "HEAD")
+    assert subjects(bridge, repo) == ["Unattended integration integrated"]
+
+    tick(bridge, directory)
+
+    assert git(repo, "rev-parse", "HEAD") == integrated
+    assert len(decisions(directory)) == 1
+    assert len(subjects(bridge, repo)) == 1
+
+
+def test_without_auto_the_service_integrates_nothing(bridge, repo, ready):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    authorize(bridge, repo, ready)
+
+    tick(bridge, directory)
+
+    assert not (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.READY
+    assert decisions(directory) == []
+    assert subjects(bridge, repo) == []
+
+
+def test_auto_records_an_unchanged_refusal_once(bridge, repo, ready):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+    git(repo, "switch", "-c", "elsewhere")
+
+    tick(bridge, directory)
+    tick(bridge, directory)
+
+    assert not (repo / "feature.txt").exists()
+    [refusal] = decisions(directory)
+    assert refusal["outcome"] == unattended.REFUSED
+    assert "not the policy target" in refusal["reason"]
+    assert subjects(bridge, repo) == ["Unattended integration refused"]
+
+
+def test_auto_records_a_failure_once_and_raises_a_problem(
+    bridge, repo, ready, tmp_path
+):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    bridge.verification(repo, gate(tmp_path, 1))
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+
+    tick(bridge, directory)
+    tick(bridge, directory)
+
+    assert not (repo / "feature.txt").exists()
+    [failure] = decisions(directory)
+    assert failure["outcome"] == unattended.FAILED
+    assert subjects(bridge, repo) == ["Unattended integration failed"]
+    [row] = [
+        row
+        for row in bridge.problems()
+        if row["condition"] == problems.UNATTENDED
+    ]
+    assert row["participant"] == "codex"
+    assert "unattended run codex --issue 42" in row["command"]
+
+
+def test_an_operator_failure_raises_no_problem(bridge, repo, ready, tmp_path):
+    bridge.verification(repo, gate(tmp_path, 1))
+    authorize(bridge, repo, ready)
+
+    with pytest.raises(BridgeError, match="recorded for recovery"):
+        unattended.integrate(bridge, repo, "codex")
+
+    assert not [
+        row
+        for row in bridge.problems()
+        if row["condition"] == problems.UNATTENDED
+    ]

@@ -526,7 +526,9 @@ lane's fitness first, and are revalidated before a wake delivers them; see
 [supervisor offers](operations.md#availability-reminders-and-waking). A ready
 lane whose issue is listed in the project's recorded unattended policy can be
 integrated with `unattended run`, an operator command, on the same gate and
-approval terms as `participant merge`; see
+approval terms as `participant merge`. When the operator also records
+`--auto`, the supervision service makes that attempt itself on its next poll
+and mails the lane the decision; see
 [Running unattended](lanes.md#running-unattended).
 
 ## The forge is selectable per project

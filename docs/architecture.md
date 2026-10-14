@@ -4,7 +4,8 @@ Agent Parley runs on one Linux or macOS host under one OS user. It coordinates p
 agents; it does not execute model requests, enforce filesystem permissions or
 replace native approvals. It integrates a lane's branch when an operator runs
 `participant merge`, or through `unattended run` for issues the operator
-listed in an explicit project policy, and never on an agent's own authority.
+listed in an explicit project policy, which the service also runs on its own
+when that policy records `auto`, and never on an agent's own authority.
 
 ## Responsibilities
 
@@ -957,8 +958,23 @@ policy is removed, is evaluated and refused on its own terms. Integration stays
 local and makes no forge calls: forge checks and reviews are enforced when the
 operator pushes the target branch, not at the local merge, and every decision
 records `forge: "deferred to push"` in its evidence to say so. Native
-authentication likewise applies unchanged at push. Automatic dispatch from the
-supervision service is intentionally not wired.
+authentication likewise applies unchanged at push.
+
+Dispatch from the supervision service is a second opt-in: `unattended set
+--auto` adds `auto: true` to the policy, absent meaning false. Only then does
+the poll's `unattended integration` stage call `unattended.supervise`, which
+starts `unattended.integrate` on a daemon thread for each listed issue whose
+claim is ready, so the gate never holds the poll. The service holds no lane
+token and runs from the base checkout, so the operator-only check passes on
+the same terms as an operator shell. A claim is skipped while its lane's
+session is running, since the merge step's session lock would refuse it, while
+an attempt for the lane is still running, and when the newest decision bound
+to the same issue, claim generation and source commit exists, unless that
+decision read a target commit the base has since left or failed only on the
+running session. A refusal of an unchanged claim is therefore recorded once.
+Service decisions carry `actor: "service"` in their evidence, each new one is
+mailed to the lane, and a `failed` one raises an
+`unattended integration failed` problem row while its claim is current.
 
 Manifests written by the earlier two-lane layout upgrade on first read. Migrated
 lanes keep their branches and registered identities, so existing mail, claims and
