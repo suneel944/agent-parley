@@ -558,6 +558,7 @@ on what evidence" must be recorded, not remembered.
 | [Accounts](https://github.com/suneel944/agent-parley/blob/main/docs/providers.md#accounts) | Provider, account and participant; a second account of one provider, end to end. |
 | [Commands](https://github.com/suneel944/agent-parley/blob/main/docs/commands.md) | The whole command surface, the MCP tools and the `--json` contract. |
 | [Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md) | The operator reference: install, platforms, run budgets, integration recovery, JSON errors, plugins and releases. |
+| [Troubleshooting](https://github.com/suneel944/agent-parley/blob/main/docs/troubleshooting.md) | First-run failures: the message, its cause and the command that fixes it. |
 | [Architecture](https://github.com/suneel944/agent-parley/blob/main/docs/architecture.md) | Module boundaries, protocol, persistence and stated limits. |
 
 ## Contributing

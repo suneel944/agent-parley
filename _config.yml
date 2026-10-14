@@ -69,6 +69,13 @@ defaults:
         Install, upgrade and operate Agent Parley on Linux, macOS and WSL2: daily
         use, providers, accounts, recovery and plugins.
   - scope:
+      path: docs/troubleshooting.md
+    values:
+      title: Troubleshooting
+      description: >-
+        First-run failures with the message Agent Parley prints, the cause and
+        the command that fixes it.
+  - scope:
       path: docs/providers.md
     values:
       title: Providers and accounts
