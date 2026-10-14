@@ -23,7 +23,7 @@ import re
 
 ACTOR = (
     r"(?:ai\b|claude\b|codex\b|chatgpt\b|copilot\b|openai\b|anthropic\b|"
-    r"gemini\b|\bamp\b)"
+    r"gemini\b|\bamp\b|opencode\b|deepseek\b|kimi\b|grok\b)"
 )
 MARKUP = r"[\[*_`\"']*"
 TRAILER = (

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_parley import roster
 from scripts import check_policy
 from scripts.check_policy import (
     action_pin_errors,
@@ -44,6 +45,13 @@ def test_rejects_authorship_credits(text):
 )
 def test_preserves_product_documentation_and_required_notices(text):
     assert not has_attribution(text)
+
+
+@pytest.mark.parametrize("name", sorted(roster.PRESETS))
+def test_every_provider_preset_is_an_assistant_name(name):
+    assert has_attribution("Co-Authored-By:" + f" {name} <bot@example.com>")
+    assert has_attribution("Written" + f" with {name}")
+    assert not has_attribution(f"Launch the {name} preset in its own lane.")
 
 
 PARAGRAPH = (
