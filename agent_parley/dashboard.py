@@ -805,7 +805,7 @@ def export(
     return views.exposition(view)
 
 
-def _cells(row: dict) -> tuple[str, ...]:
+def row_cells(row: dict) -> tuple[str, ...]:
     """Formats one row as the text of every column, in column order.
 
     Args:
@@ -976,7 +976,7 @@ def _widths(
     full = {
         name: max(
             [minimum, len(name)]
-            + [tables.measure(_cells(row)[index]) for row in rows]
+            + [tables.measure(row_cells(row)[index]) for row in rows]
         )
         for index, name, minimum in known
     }
@@ -1150,7 +1150,7 @@ def _blocks(view: dict, columns: list[tuple[int, str, int]]) -> list[dict]:
                 }
             )
         for row in project["rows"]:
-            cells = _cells(row)
+            cells = row_cells(row)
             line = tables.GAP.join(
                 tables.fit(cells[index], size) for index, _, size in columns
             ).rstrip()

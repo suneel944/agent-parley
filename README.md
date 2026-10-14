@@ -86,9 +86,12 @@ and one note per problem under the table. Read-only, no model call, `q` quits.
 A lane reads `working` while its session is alive and current, `idle` once its
 activity passes the inactivity threshold, and `stopped` only when its session
 process is gone: a quiet lane is not a lost one. Stopped lanes that hold
-nothing are counted in the summary; `top --all` draws them.
+nothing are counted in the summary; `top --all` draws them. `top --serve`
+serves the same view read-only to a browser tab and a Prometheus scraper on
+`127.0.0.1`.
 [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md)
-covers the columns, keys, filters, `problems`, `metrics` and `watch`.
+covers the columns, keys, filters, `problems`, `metrics`, the web view and
+`watch`.
 
 ## Install
 
