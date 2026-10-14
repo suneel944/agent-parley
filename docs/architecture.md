@@ -1135,11 +1135,17 @@ credential.
 
 A fourth surface moves without any number: the modules a running service
 loaded against the sources now on disk. The service fingerprints its sources
-with `protocol.revision` at start and compares at most once every two seconds;
-the first difference stops it accepting connections, answers every request
-until it exits as stale, and is reported by `status` and `doctor`. The next
-hook that finds the recorded process gone relaunches the service on current
-code, which initializes, and so migrates, the store before it serves.
+with `protocol.revision` at start and compares at most once every two seconds,
+from the serving loop as well as from each request, so an idle service notices
+too; the first difference stops it accepting connections, answers every request
+until then as stale, and is reported by `status` and `doctor`. The service then
+finishes the requests in flight and re-executes itself with the same
+interpreter, state root and configuration. Its process ID and creation identity
+survive the hand-over, so the published record stays valid and no hook asks for
+a second service; the new process initializes, and so migrates, the store before
+it serves. One `uv tool upgrade` therefore moves a running service without an
+operator command. A hook that finds the recorded process gone, as after a reboot
+or a re-execution the kernel refused, relaunches the service on current code.
 
 A work-order plan is one TOML file the operator writes, parsed by the standard
 library. Applying it records the same advisory dependency edges `issue block`
