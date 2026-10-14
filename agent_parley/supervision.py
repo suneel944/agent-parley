@@ -84,6 +84,7 @@ MAX_CLAIMS_PER_LANE = 100
 MAX_CONVERGENCE_REPEATS = 100
 ENDED = issues.ENDED
 RECLAIM_INTERVAL = 900.0
+PRUNE_INTERVAL = 3600.0
 RECLAIM_PUBLICATION = "reclaim.json"
 ROOT_PUBLICATION = "root-missing.json"
 ROOT_RETURNED = "root-returned.json"
@@ -10107,11 +10108,21 @@ def run(home: Path, stopped: threading.Event) -> None:
     This thread is started once and serves every project, so an unexpected
     `KeyError` from one malformed record used to end supervision for the
     whole service with no trace until it was restarted.
+
+    Once at start and then every `PRUNE_INTERVAL` seconds the store drops
+    settled rows past its retention window through `store.prune`.
     """
     from agent_parley import server
 
     deadlines: dict[Path, float] = {}
+    pruned: float | None = None
     while not stopped.is_set():
+        if pruned is None or time.monotonic() >= pruned:
+            try:
+                store.prune(home, time.time())
+            except Exception as exc:
+                server.log(home, "supervision", failure("prune store", exc))
+            pruned = time.monotonic() + PRUNE_INTERVAL
         for path in (home / "projects").glob("*/project.json"):
             if stopped.is_set():
                 return
