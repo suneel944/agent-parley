@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import forge, issues, recommend, store
+from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
 PLAN = """
@@ -89,6 +90,115 @@ def declared(monkeypatch, mapping):
         "agent_parley.recommend.forge.issue_providers",
         lambda repo, limit=forge.MAX_OPEN_ISSUES: mapping,
     )
+
+
+def cochanged(repo, *names):
+    """Commits the named files together three times in the base checkout."""
+    for index in range(3):
+        for name in names:
+            path = repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as handle:
+                handle.write(f"{index}\n")
+        git(repo, "add", "--", *names)
+        git(
+            repo,
+            "-c",
+            "user.name=Bridge Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            f"together {index}",
+        )
+
+
+def order(ranked):
+    """Lists the candidate numbers of one reading."""
+    return [record["issue"] for record in ranked["candidates"]]
+
+
+def test_work_on_held_files_gathers_on_the_lane_that_holds_them(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude = prepared(bridge, paired, tmp_path, repo)
+    codex = Path(paired["lanes"]["codex"])
+    bridge.issue(codex, "claim", "48")
+    cochanged(repo, "docs/guide.md", "db/schema.sql")
+    paths(
+        monkeypatch,
+        {
+            "42": ["src/api.py"],
+            "44": ["docs/guide.md"],
+            "46": ["src/api.py"],
+            "48": ["db/schema.sql"],
+        },
+    )
+    declared(monkeypatch, {})
+    ranked = bridge.issue_next(claude)
+    assert order(ranked) == ["46", "43", "44"]
+    first, _, last = ranked["candidates"]
+    assert first["same_files"] == ["42"] and not first["held_back"]
+    assert first["reasons"][1] == "same files as #42 you hold"
+    assert last["held_back"] == [{"issue": "48", "owner": "codex"}]
+    assert last["reasons"][1] == "held back: same files as #48 codex holds"
+    peer = bridge.issue_next(codex)
+    assert order(peer) == ["44", "43", "46"]
+    assert "same files as #48 you hold" in peer["candidates"][0]["reasons"]
+    assert (
+        "held back: same files as #42 claude holds"
+        in peer["candidates"][-1]["reasons"]
+    )
+    bridge.issue(codex, "release", "48")
+    returned = bridge.issue_next(claude)
+    assert order(returned)[:3] == ["46", "43", "44"]
+    assert returned["candidates"][2]["held_back"] == []
+    assert not any(
+        reason.startswith("held back")
+        for record in returned["candidates"]
+        for reason in record["reasons"]
+    )
+    assert bridge.issue(repo, "list")["issues"]["44"]["owner"] is None
+
+
+def test_claim_paths_are_read_once_per_interval(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(forge, "_paths_read", {})
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    monkeypatch.setattr(
+        forge,
+        "_run",
+        lambda command, timeout: (
+            calls.append(command) or '[{"files": [{"path": "src/api.py"}]}]'
+        ),
+    )
+    assert forge.issue_pull_request_paths(tmp_path, "48") == ["src/api.py"]
+    assert forge.issue_pull_request_paths(tmp_path, "48") == ["src/api.py"]
+    assert len(calls) == 1
+    forge.issue_pull_request_paths(tmp_path, "49")
+    assert len(calls) == 2
+    monkeypatch.setattr(forge, "PATHS_TTL", 0.0)
+    forge.issue_pull_request_paths(tmp_path, "48")
+    assert len(calls) == 3
+
+
+def test_the_dispatch_order_holds_back_another_lanes_files():
+    shared = {
+        "44": [{"issue": "48", "owner": "codex"}],
+        "46": [{"issue": "42", "owner": "claude"}],
+    }
+    assert recommend.for_lane(["43", "44", "46"], shared, "claude") == [
+        "46",
+        "43",
+        "44",
+    ]
+    assert recommend.for_lane(["43", "44", "46"], shared, "codex") == [
+        "44",
+        "43",
+        "46",
+    ]
+    assert recommend.for_lane(["43", "44"], {}, "claude") == ["43", "44"]
 
 
 def test_the_shortlist_prefers_a_started_group_and_clear_paths(

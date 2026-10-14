@@ -46,6 +46,18 @@ supervisor already named as another lane's next work ranks last, so claim
 before exploring or editing. Lanes read the same shortlist over the
 `next_issues` MCP tool.
 
+Work on the same files gathers on one lane. Each looked-up candidate's
+forecast paths, the paths its earlier pull requests touched plus the files
+the cached co-change history says change with them, are compared with the
+paths the live claims' own pull requests touched. A candidate that runs into
+a claim the reading lane holds ranks first with `same files as #N you hold`.
+One that runs into another lane's live claim ranks below everything else for
+every other lane with `held back: same files as #N LANE holds`, and returns
+once that claim completes or is released. The unattended work offer orders
+its candidates the same way. It is advice: nothing is claimed or blocked, no
+ledger field is written, and the forge and history readings stay within the
+bounds the shortlist already uses.
+
 ```sh
 agent-parley issue next --limit 3
 agent-parley issue claim 42

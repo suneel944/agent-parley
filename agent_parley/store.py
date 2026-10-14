@@ -3595,6 +3595,7 @@ def _recommended(home: Path, actor: dict, args: dict) -> dict:
         limit,
         supervision.named_leads(directory, manifest, key),
         supervision.own_lead(directory, key) if key else "",
+        key,
     )
 
 

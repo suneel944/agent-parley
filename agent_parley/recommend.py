@@ -23,6 +23,7 @@ from agent_parley import forecast, forge, issues
 
 MAX_SHORTLIST = 5
 MAX_LOOKUPS = 3
+MAX_CLAIM_LOOKUPS = 6
 MAX_REASONS = 6
 MINIMUM_TERM = 3
 COMMON_TERMS = frozenset(
@@ -91,6 +92,116 @@ def conflicts(
     }
 
 
+def candidate_paths(repo: Path, free: list[str]) -> dict[str, list[str]]:
+    """Reads the paths earlier pull requests touched for the first candidates.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        free: Unclaimed issues, best first.
+
+    Returns:
+        Paths per issue for the first ``MAX_LOOKUPS`` issues, leaving out an
+        issue the forge named no path for.
+    """
+    found = {
+        number: forge.issue_pull_request_paths(repo, number)
+        for number in free[:MAX_LOOKUPS]
+    }
+    return {number: paths for number, paths in found.items() if paths}
+
+
+def sharing(
+    state: dict,
+    looked: dict[str, list[str]],
+    commits: list[list[str]],
+    repo: Path,
+    overlap: Callable[[str, str], bool],
+    lane: str = "",
+) -> dict[str, list[dict]]:
+    """Names the live claims each candidate's forecast paths run into.
+
+    A candidate's forecast paths are the paths its earlier pull requests
+    touched together with the files ``forecast.cochanges`` says change with
+    them. A live claim's paths are the paths its own earlier pull requests
+    touched, read for at most ``MAX_CLAIM_LOOKUPS`` claims, the reading
+    lane's first. A claim the ledger records complete, or one released,
+    holds nothing, so a candidate it held back returns on the next reading.
+    Nothing is read from the forge when no candidate has paths, and each
+    path reading is kept for ``forge.PATHS_TTL`` seconds, so a poll that
+    repeats the ranking does not ask the forge's search again.
+
+    Args:
+        state: Published issue ledger.
+        looked: Paths per candidate, as ``candidate_paths`` reports them.
+        commits: Files per recent commit of the base checkout, as
+            ``forecast.history`` reports them.
+        repo: Repository or assigned worktree that selects the forge project.
+        overlap: The store's reservation overlap rule.
+        lane: Lane doing the reading, whose own claims are read first.
+
+    Returns:
+        Per candidate sharing paths with a live claim, one record per such
+        claim carrying ``issue`` and ``owner``, in issue number order.
+    """
+    if not looked:
+        return {}
+    owners = issues.holders(state)
+    order = [
+        *owners.get(lane, []),
+        *(
+            number
+            for owner in sorted(owners)
+            if owner != lane
+            for number in owners[owner]
+        ),
+    ]
+    claimed = {
+        number: forge.issue_pull_request_paths(repo, number)
+        for number in order[:MAX_CLAIM_LOOKUPS]
+    }
+    found: dict[str, list[dict]] = {}
+    for number, paths in looked.items():
+        predicted = [*paths, *forecast.cochanges(commits, paths, overlap)]
+        entries = [
+            {"issue": held, "owner": str(state["issues"][held]["owner"])}
+            for held in sorted(claimed, key=int)
+            if any(
+                overlap(path, key)
+                for path in predicted
+                for key in claimed[held]
+            )
+        ]
+        if entries:
+            found[number] = entries
+    return found
+
+
+def for_lane(
+    free: list[str], shared: dict[str, list[dict]], lane: str
+) -> list[str]:
+    """Orders free issues for one lane by the live claims they share paths with.
+
+    An issue sharing paths with a claim this lane holds moves to the front,
+    one sharing paths with another lane's claim moves to the back, and the
+    order is otherwise kept.
+
+    Args:
+        free: Unclaimed issues, best first.
+        shared: Live claims per candidate, as ``sharing`` reports them.
+        lane: Lane the order is for.
+
+    Returns:
+        The same issues in this lane's order.
+    """
+    return sorted(
+        free,
+        key=lambda number: (
+            any(e["owner"] != lane for e in shared.get(number, [])),
+            not any(e["owner"] == lane for e in shared.get(number, [])),
+        ),
+    )
+
+
 def _grouped(groups: dict[str, list[str]]) -> dict[str, str]:
     """Maps each planned issue to the first group alphabetically holding it."""
     return {
@@ -148,6 +259,15 @@ def _reasons(record: dict, known: bool, provider: str) -> list[str]:
         said.insert(1, f"already named as {record['named_to']}'s next work")
     if record.get("own"):
         said.insert(1, "named as this lane's next work")
+    if record.get("same_files"):
+        held = ", ".join(f"#{n}" for n in record["same_files"])
+        said.insert(1, f"same files as {held} you hold")
+    for entry in reversed(record.get("held_back") or []):
+        said.insert(
+            1,
+            f"held back: same files as #{entry['issue']} "
+            f"{entry['owner']} holds",
+        )
     return said[:MAX_REASONS]
 
 
@@ -160,13 +280,20 @@ def rank(
     limit: int = MAX_SHORTLIST,
     named: dict[str, str] | None = None,
     own: str = "",
+    shared: dict[str, list[dict]] | None = None,
+    lane: str = "",
 ) -> list[dict]:
     """Orders the issues a lane could take next, worst obstacle last.
 
     The order is a total one over the ledger's own contents, so the same
-    store state always produces the same shortlist. The issue the supervisor
-    named as this lane's own next work ranks first, so the lane claims what
-    it was pointed at rather than a lower-numbered free issue. An issue the
+    store state always produces the same shortlist. An issue whose forecast
+    paths run into another lane's live claim is held back below every other
+    issue until that claim completes or is released, and one whose forecast
+    paths run into a claim this lane holds ranks first, so work on the same
+    files gathers on one lane instead of colliding at integration. The issue
+    the supervisor named as this lane's own next work ranks next, so the
+    lane claims what it was pointed at rather than a lower-numbered free
+    issue. An issue the
     supervisor already named as another lane's next work sinks below every
     issue no lane was pointed at, so lanes reading the same ledger spread
     out instead of racing for one claim. An issue a peer already
@@ -190,15 +317,21 @@ def rank(
             work names it to, as its next lead or first pull pick.
         own: Issue the supervisor's published work names as the reading
             lane's own next lead, or empty when it names none.
+        shared: Live claims per candidate, as ``sharing`` reports them.
+        lane: Lane doing the reading, which owns the claims it shares
+            paths with rather than being held back by them.
 
     Returns:
         One record per candidate carrying its number, recorded title, plan
         group, the issues it unblocks and which of those are planned rather
         than owned, the provider it declares, the peer reservations and
         forecast collisions found for it, the lane it is named to, whether
-        it is this lane's own lead, and the reasons for its position.
+        it is this lane's own lead, the claims of this lane it shares paths
+        with, the other lanes' claims holding it back, and the reasons for
+        its position.
     """
     named = named or {}
+    shared = shared or {}
     waiting = issues.waiters(state, owned_only=False)
     owned = issues.waiters(state)
     placed = _grouped(groups)
@@ -220,11 +353,23 @@ def rank(
             "collisions": risk.get("collisions", []),
             "named_to": "" if number == own else named.get(number, ""),
             "own": number == own,
+            "same_files": [
+                entry["issue"]
+                for entry in shared.get(number, [])
+                if entry["owner"] == lane
+            ],
+            "held_back": [
+                entry
+                for entry in shared.get(number, [])
+                if entry["owner"] != lane
+            ],
         }
         record["reasons"] = _reasons(record, number in risks, provider)
         ranked.append(record)
     ranked.sort(
         key=lambda record: (
+            bool(record["held_back"]),
+            not record["same_files"],
             not record["own"],
             bool(record["named_to"]),
             bool(record["overlaps"]),
@@ -249,6 +394,7 @@ def shortlist(
     limit: int = MAX_SHORTLIST,
     named: dict[str, str] | None = None,
     own: str = "",
+    lane: str = "",
 ) -> dict:
     """Reads the ledger, the plan and the forge, and ranks what is free.
 
@@ -260,7 +406,10 @@ def shortlist(
     earlier pull requests touched are read for the first ``MAX_LOOKUPS``
     candidates only, and a forge that is absent, slow or unwilling yields a
     shortlist ordered by the ledger and the plan alone rather than a failure.
-    Nothing is claimed, offered or written.
+    When a candidate has paths, the live claims' paths are read through
+    `sharing`, bounded by ``MAX_CLAIM_LOOKUPS``, and the co-change history
+    comes from the same cached `forecast.history` reading the collision
+    forecast uses. Nothing is claimed, offered or written.
 
     The recorded plan is read through a deferred import, because the hook path
     imports this module through the store and must not pay for a TOML parser
@@ -279,7 +428,9 @@ def shortlist(
         named: Issue number to the other lane whose published work names
             it, which ranks it below every issue no lane was pointed at.
         own: Issue the reading lane's own published work names as its
-            lead, which ranks first.
+            lead, which ranks first after work on its own claims' files.
+        lane: Ledger name of the reading lane, which `sharing` uses to tell
+            its own claims from the claims that hold a candidate back.
 
     Returns:
         The provider considered, whether the forge answered with any paths,
@@ -289,11 +440,7 @@ def shortlist(
 
     state = issues.with_forge(directory, issues.snapshot(directory))
     free = issues.unclaimed(state)
-    paths = {
-        number: forge.issue_pull_request_paths(repo, number)
-        for number in free[:MAX_LOOKUPS]
-    }
-    looked = {number: found for number, found in paths.items() if found}
+    looked = candidate_paths(repo, free)
     commits = forecast.history(root, directory) if looked else []
     risks = {
         number: conflicts(found, held, commits, overlap)
@@ -311,6 +458,8 @@ def shortlist(
             limit,
             named,
             own,
+            sharing(state, looked, commits, repo, overlap, lane),
+            lane,
         ),
     }
 

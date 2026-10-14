@@ -65,6 +65,8 @@ GITHUB_REMOTE = re.compile(
 )
 
 _selected: dict[str, str] = {}
+PATHS_TTL = 600.0
+_paths_read: dict[tuple[str, str], tuple[float, list[str]]] = {}
 
 
 def select(repo: Path, manifest: dict | None = None) -> str:
@@ -1132,6 +1134,12 @@ def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
     and a slow or refusing forge reports nothing rather than raising. Only
     the GitHub forge has pull requests, so every other forge reports nothing.
 
+    Each reading is kept in this process for ``PATHS_TTL`` seconds per
+    project and issue, so the ranking a supervisor poll and `issue next`
+    repeat asks the forge's search at most once per interval for a claim or
+    candidate. A failed reading is kept too, so a refusing forge is not
+    asked again on every poll.
+
     Args:
         repo: Repository or assigned worktree that selects the forge project.
         number: Bare repository issue number.
@@ -1146,6 +1154,26 @@ def issue_pull_request_paths(repo: Path, number: str) -> list[str]:
     project = _reachable(repo)
     if project is None:
         return []
+    now = time.monotonic()
+    cached = _paths_read.get((project, number))
+    if cached and now - cached[0] < PATHS_TTL:
+        return list(cached[1])
+    paths = _pull_request_paths(project, number)
+    _paths_read[(project, number)] = (now, paths)
+    return list(paths)
+
+
+def _pull_request_paths(project: str, number: str) -> list[str]:
+    """Asks the forge which files the pull requests closing an issue touched.
+
+    Args:
+        project: GitHub ``owner/name`` slug.
+        number: Bare repository issue number.
+
+    Returns:
+        Sorted unique paths, at most ``MAX_PATHS``, or an empty list when the
+        forge does not answer or no pull request refers to the issue.
+    """
     output = _run(
         [
             "gh",

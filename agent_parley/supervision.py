@@ -2636,6 +2636,40 @@ def _first_untaken(available: list[str], taken: set[str]) -> list[str]:
     return available
 
 
+def _shared_claims(
+    directory: Path, manifest: dict, pool: dict, available: list[str]
+) -> dict[str, list[dict]]:
+    """Names the live claims the top free issues share forecast paths with.
+
+    The reading is the one `agent-parley issue next` takes through
+    `recommend.sharing`, made once per poll, so `work` and the wake that
+    derives the offer again read the same answer and the forge is asked
+    at most once for it.
+
+    Args:
+        directory: Private project state directory holding the cache.
+        manifest: Current participant manifest.
+        pool: Issue ledger with the open forge issues added.
+        available: Unclaimed and unblocked issues, best first.
+
+    Returns:
+        Live claims per candidate, as `recommend.sharing` reports them.
+    """
+    from agent_parley import forecast, recommend
+
+    root = str(manifest["root"])
+
+    def measure() -> dict[str, list[dict]]:
+        """Reads candidate and claim paths and compares them."""
+        looked = recommend.candidate_paths(Path(root), available)
+        commits = forecast.history(root, directory) if looked else []
+        return recommend.sharing(
+            pool, looked, commits, Path(root), store.overlapping
+        )
+
+    return _once_per_poll(("shared_claims", *available), measure)
+
+
 def _pull_text(available: list[str], busy: list[str]) -> str:
     """Describes the work an idle lane could take from the ledger."""
     parts = ["Work offer. You hold no claim and no fit check found a blocker."]
@@ -2731,6 +2765,7 @@ def _idle_leads(
     ledger: dict,
     after: float,
     taken: set[str] | None = None,
+    shared: dict[str, list[dict]] | None = None,
 ) -> dict | None:
     """Gathers the next work for a lane whose held claims cannot move.
 
@@ -2765,6 +2800,9 @@ def _idle_leads(
         ledger: Current issue ledger.
         after: Claim idle interval a peer claim must pass without progress.
         taken: Issues already named to another lane in this sweep.
+        shared: Live claims per candidate, as `_shared_claims` reports
+            them, so work on this lane's own claims' files ranks first and
+            work on another lane's is held back.
 
     Returns:
         The mail senders with their message identifiers, the top candidate
@@ -2798,6 +2836,8 @@ def _idle_leads(
                 {},
                 str(participant.get("provider", "")),
                 len(taken) + 1,
+                shared=shared,
+                lane=name,
             )
         ],
         taken,
@@ -3249,7 +3289,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         manifest: Current participant manifest.
         config: Resolved supervision settings.
     """
-    from agent_parley import recovery
+    from agent_parley import recommend, recovery
 
     after = config["stalled_after"]
     ledger = issues.snapshot(directory)
@@ -3306,6 +3346,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
         home, directory, manifest, results, stretches, owned, ledger, config
     )
     taken: set[str] = set()
+    shared = _shared_claims(directory, manifest, pool, available)
     for name in sorted(serving):
         result = results[name]
         offer = _work_offer(
@@ -3313,7 +3354,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
             results,
             stretches,
             owned,
-            _first_untaken(available, taken),
+            _first_untaken(recommend.for_lane(available, shared, name), taken),
             pool,
             after,
             recipients,
@@ -3325,6 +3366,7 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 pool,
                 config["claim_idle_after"],
                 taken,
+                shared,
             ),
         )
         if offer and offer.get("lead"):
@@ -9332,6 +9374,8 @@ def _work_backlog(
     Returns:
         Backlog key and offer, or None when no actionable offer is published.
     """
+    from agent_parley import recommend
+
     offer = record.get("offer") or {}
     dispatch = record.get("dispatch") or {}
     if not config["prompts"] or not offer.get("id") or not dispatch:
@@ -9359,6 +9403,7 @@ def _work_backlog(
         peer: idle_seconds(directory, peer) for peer in manifest["participants"]
     }
     free = lifecycle.actionable(pool)
+    shared = _shared_claims(directory, manifest, pool, free)
     leads = _idle_leads(
         home,
         directory,
@@ -9367,13 +9412,14 @@ def _work_backlog(
         pool,
         config["claim_idle_after"],
         taken,
+        shared,
     )
     current = _work_offer(
         name,
         results,
         stretches,
         owned,
-        _first_untaken(free, taken),
+        _first_untaken(recommend.for_lane(free, shared, name), taken),
         pool,
         config["stalled_after"],
         share_recipients(
