@@ -1,5 +1,6 @@
 """Checks the inbound status reader, decision answers and the passcode gate."""
 
+import io
 import json
 import threading
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import cli, decisions, inbound, notify, store, timeouts
+from agent_parley.state import BridgeError
 
 PASSCODE = "correct-horse-battery"
 CONFIG = {
@@ -247,6 +249,86 @@ def test_the_reader_refuses_to_start_without_a_usable_passcode(
     inbound.run(bridge.home, threading.Event())
     assert calls == []
     assert "AGENT_PARLEY_INBOUND_PASSCODE" in capsys.readouterr().out
+
+
+def test_a_failing_poll_logs_once_and_logs_its_recovery(
+    bridge, monkeypatch, capsys
+):
+    token = "123456:SECRET-bot-token"
+    for variable, value in (
+        ("AGENT_PARLEY_INBOUND", "telegram"),
+        ("AGENT_PARLEY_INBOUND_PASSCODE", PASSCODE),
+        ("AGENT_PARLEY_NOTIFY", "telegram"),
+        ("AGENT_PARLEY_TELEGRAM_TOKEN", token),
+        ("AGENT_PARLEY_TELEGRAM_CHAT", "42"),
+    ):
+        monkeypatch.setenv(variable, value)
+    monkeypatch.setattr(inbound, "RETRY_SECONDS", 0)
+    stopped = threading.Event()
+    answers = [
+        BridgeError(f"Telegram answered 409 at /bot{token}/getUpdates."),
+        BridgeError(f"Telegram answered 409 at /bot{token}/getUpdates."),
+        [],
+    ]
+
+    def updates(config, offset):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        stopped.set()
+        return answer
+
+    monkeypatch.setattr(inbound, "updates", updates)
+    inbound.run(bridge.home, stopped)
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if " inbound " in line]
+    assert len(lines) == 3
+    assert lines[0].endswith(inbound.POLLING)
+    assert lines[1].endswith(
+        inbound.POLL_FAILED.format(
+            reason="BridgeError: Telegram answered 409 at "
+            f"/bot{inbound.REDACTED_TOKEN}/getUpdates."
+        )
+    )
+    assert inbound.REDACTED_TOKEN in lines[1]
+    assert lines[2].endswith(inbound.RECOVERED)
+    assert token not in out
+
+
+def test_the_reader_is_not_polling_after_a_logged_failure(tmp_path):
+    log = tmp_path / "server.log"
+    log.write_text(
+        "2026-09-29T10:00:00+0000 bound 127.0.0.1:1\n"
+        f"2026-09-29T10:00:01+0000 inbound {inbound.POLLING}\n"
+        "2026-09-29T10:00:02+0000 inbound "
+        + inbound.POLL_FAILED.format(reason="HTTPError: HTTP 401")
+        + "\n"
+    )
+    assert not inbound.polling(tmp_path)
+    with log.open("a") as stream:
+        stream.write(f"2026-09-29T10:01:00+0000 inbound {inbound.RECOVERED}\n")
+    assert inbound.polling(tmp_path)
+
+
+def test_a_failure_names_the_http_status_without_the_token():
+    import urllib.error
+
+    config = {"telegram": {"token": "999:TOKEN"}}
+    with urllib.error.HTTPError(
+        "https://api/bot999:TOKEN/getUpdates",
+        409,
+        "Conflict",
+        {},
+        io.BytesIO(),
+    ) as refused:
+        assert inbound.failure(config, refused) == (
+            "HTTPError: HTTP 409 Conflict"
+        )
+    lookup = urllib.error.URLError("no route to bot999:TOKEN")
+    assert inbound.failure(config, lookup) == (
+        f"URLError: no route to bot{inbound.REDACTED_TOKEN}"
+    )
+    assert inbound.failure(config, ValueError()) == "ValueError"
 
 
 def test_the_reader_stays_off_when_the_environment_never_asked(

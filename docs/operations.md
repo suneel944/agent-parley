@@ -2792,6 +2792,14 @@ no webhook is registered. A message must start with the passcode, come from the
 configured chat, and carry `status` with the filters `agent-parley status`
 takes; the reply is that reading.
 
+A failed poll is retried every five seconds. The service log names the
+failure once, as `polling Telegram failed (...)` with the error class and its
+cause, such as `HTTP 409 Conflict` when a second poller uses the same token or
+`HTTP 401 Unauthorized` for a revoked one, and logs again only when the cause
+changes. The bot token is replaced by `<bot token>` in that text. The first
+poll that succeeds afterwards logs `polling recovered`, and until then
+`notify` does not report the reader as polling.
+
 A private chat with the operator is the supported shape. In a group chat every
 member could answer, so the reader refuses to start until
 `AGENT_PARLEY_TELEGRAM_USERS` (or `notify setup --users`) lists the numeric
