@@ -2670,7 +2670,7 @@ outbound and inbound are on and, when off, why.
 | `AGENT_PARLEY_TELEGRAM_CHAT` | Chat identifier the bot posts to. |
 | `AGENT_PARLEY_SMTP_HOST` | SMTP server host. |
 | `AGENT_PARLEY_SMTP_PORT` | SMTP port; 587 by default, 465 with implicit TLS. |
-| `AGENT_PARLEY_SMTP_TLS` | `starttls` (default), `implicit` or `none`. |
+| `AGENT_PARLEY_SMTP_TLS` | `starttls` (default), `implicit` or `none`. Both TLS modes verify the server certificate and host name against the system trust store. `none` with `AGENT_PARLEY_SMTP_USER` set is refused unless the host is `127.0.0.1`, `localhost` or `::1`, because the login would travel in the clear. |
 | `AGENT_PARLEY_SMTP_USER` | SMTP user; omit it for a server that needs no login. |
 | `AGENT_PARLEY_SMTP_PASSWORD` | SMTP password. |
 | `AGENT_PARLEY_SMTP_FROM` | Sender address. |
