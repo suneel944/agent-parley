@@ -1579,12 +1579,19 @@ class StatusMixin(BridgeCore):
     def _health(self, report: dict) -> None:
         """Prints the service, code, store, notify and state directory lines.
 
+        A stopped service is followed by `protocol.START`, the remedy
+        `doctor` prints for it, since `status` is the first command a new
+        user runs and its lane states are stale until the service is up.
+
         Args:
             report: Reading produced by `status_snapshot`.
         """
         from agent_parley.cli import notification_line, store
 
-        print(f"Service: {service_state(report['server'])}")
+        serving = service_state(report["server"])
+        print(f"Service: {serving}")
+        if serving == protocol.STOPPED:
+            print(protocol.START)
         if report["server"].get("state") == protocol.STALE:
             print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
         schema = store.schema_state(store.schema_version(self.home))
