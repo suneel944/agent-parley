@@ -55,6 +55,7 @@ listed in an explicit project policy, and never on an agent's own authority.
 | `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
 | `archive` | Consistent export of the store snapshot, ledgers, records and attachments as one validated tar archive without credentials, and its inspection and import |
 | `dashboard` | Read-only live operator view and metrics frames of every participant |
+| `webview` | `top --serve`: a loopback-only HTTP server, separate from the MCP transport, that renders cached `dashboard` readings as an HTML page, the `top --json` frame and Prometheus text behind a random path token; it answers `GET` only and writes no state |
 | `demo` | `agent-parley demo`: a throwaway sandbox (temporary repository, state home and free port) whose stub lanes run the real coordination path, one printed line per step, and whose every child, worktree and directory is removed on each exit path; also the harness `scripts/record_demo.py` records with |
 | `demo_scenario` | The coordination story, one function per chapter: the full recording (`record`) and the command's short cut (`tour`) of the same steps and captions |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |

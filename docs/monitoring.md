@@ -546,10 +546,48 @@ agent-parley metrics --output /var/lib/node_exporter/parley.prom --every 30
 
 `--output` writes the frame by atomic rename, so the textfile collector of
 `node_exporter` never reads a partial one, and `--every` rewrites it on that
-interval until you interrupt it. There is no HTTP endpoint and no new port: the
-file is the interface. The command reads the records `top` reads, holds no lock
+interval until you interrupt it. `metrics` itself opens no port: the file is
+the interface, and `top --serve` below is the endpoint to scrape instead. The
+command reads the records `top` reads, holds no lock
 and writes no coordination state, and its `tokens` counter is what the native
 client counted rather than billed spend, exactly as the `TOKENS` column is.
+
+### Web view and scrape endpoint
+
+`top --serve [PORT]` serves the same frame in a browser tab. It binds
+`127.0.0.1` only, on `PORT` or a free port when none is given, and prints an
+address carrying a random token generated for that run:
+
+```sh
+agent-parley top --serve 8790 --interval 5
+Serving a read-only view at http://127.0.0.1:8790/<token>/
+```
+
+| Path | Content |
+| --- | --- |
+| `/<token>/` | HTML table of every lane with each `top` column and its problem notes, reloading every `--interval` seconds, without JavaScript |
+| `/<token>/frame.json` | The document `top --json` prints |
+| `/<token>/metrics` | The Prometheus text `metrics` prints |
+
+A request without the token gets 404, one whose `Host` header is not
+`127.0.0.1:PORT` or `localhost:PORT` gets 403, as a guard against DNS
+rebinding, and any method but `GET` gets 405. No route writes state, answers a
+decision or sends mail; steering stays in the CLI. The reading is cached for
+the interval, at least one second, so several tabs or a scraper share one
+reading. `--provider`, `--repo`, `--participant`, `--since`, `--sort` and
+`--no-operator-edits` narrow the served frame as they narrow `top`. The token
+is the only credential: treat the printed address as a secret, and stop the
+command to revoke it.
+
+To watch from another machine, forward the same port number over SSH, so the
+`Host` header still names the served port:
+
+```sh
+ssh -N -L 8790:127.0.0.1:8790 operator@workstation
+```
+
+then open the printed address locally. A Prometheus job scrapes
+`/<token>/metrics` with `metrics_path` set to that path.
 
 ### Pull request outcomes
 

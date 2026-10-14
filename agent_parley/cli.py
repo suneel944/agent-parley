@@ -3885,6 +3885,18 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Seconds between redraws of the live view.",
     )
     watch.add_argument(
+        "--serve",
+        type=int,
+        nargs="?",
+        const=0,
+        metavar="PORT",
+        help=(
+            "Serve a read-only web page, its JSON frame and Prometheus "
+            "metrics on 127.0.0.1 at PORT, a free one when omitted, "
+            "behind a random path token the command prints."
+        ),
+    )
+    watch.add_argument(
         "--provider",
         action="append",
         metavar="NAME",
@@ -6074,28 +6086,36 @@ def main() -> int:
                     f"Unknown sort column {args.sort}. Choose from: "
                     f"{', '.join(dashboard.SORT_KEYS)}."
                 )
-            if args.json:
-                print(
-                    views.render(
-                        "top",
-                        views.frame(
-                            dashboard.select(
-                                dashboard.collect(
-                                    bridge.home,
-                                    bool(bridge.server_process()),
-                                    {},
-                                    tuple(args.provider or ()),
-                                    args.since,
-                                    operator_edits=not args.no_operator_edits,
-                                ),
-                                args.sort or "",
-                                args.reverse,
-                                tuple(args.project or ()),
-                                tuple(args.participant or ()),
-                            )
-                        ),
-                    )
+            if args.serve is not None and (args.json or args.once):
+                parser.error(
+                    "--serve cannot be combined with --json or --once."
                 )
+            if args.serve is not None and not 0 <= args.serve <= 65535:
+                parser.error("--serve takes a port from 0 to 65535.")
+
+            def top_view() -> dict:
+                """Reads one frame narrowed and ordered by the top filters."""
+                return dashboard.select(
+                    dashboard.collect(
+                        bridge.home,
+                        bool(bridge.server_process()),
+                        {},
+                        tuple(args.provider or ()),
+                        args.since,
+                        operator_edits=not args.no_operator_edits,
+                    ),
+                    args.sort or "",
+                    args.reverse,
+                    tuple(args.project or ()),
+                    tuple(args.participant or ()),
+                )
+
+            if args.serve is not None:
+                from agent_parley import webview
+
+                webview.serve(args.serve, top_view, args.interval)
+            elif args.json:
+                print(views.render("top", views.frame(top_view())))
             else:
                 dashboard.run(
                     bridge.home,
