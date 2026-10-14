@@ -185,8 +185,9 @@ and reads again once the cache is 300 seconds old. Between full reads, at most
 hourly, it reads only the issues updated since the last reading. When the read fails, the poll keeps the last reading and waits 60 seconds
 before trying again. `status` only reads the cache; a reading over 600 seconds
 old prints one `Forge:` line with its age and the cause, a failed read or a
-service that is not refreshing it. With no reading at all, or no GitHub forge,
-the `Forge:` line says so and claims on closed issues are not hidden.
+service that is not refreshing it. With no reading at all, no GitHub forge, or
+no GitHub `origin` remote, the `Forge:` line says so (`no GitHub`, `no GitHub
+remote`) and claims on closed issues are not hidden.
 Last, `Needs action:` lists each orphaned or overdue claim with the
 command that resolves it, `agent-parley issue claim N --take-orphaned` run from
 a peer lane or `agent-parley issue assign N LANE --reason TEXT`. When the
