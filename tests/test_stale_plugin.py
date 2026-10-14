@@ -179,17 +179,24 @@ def idle(bridge, lane, child, attached):
 
 
 def restart(bridge, lane, monkeypatch):
-    """Runs the stale plugin stage once and returns the launches it made."""
+    """Runs the stale plugin stage once and returns the launches it made.
+
+    Only launcher commands are captured. Other processes, such as the
+    ``ps`` call that reads a process identity on macOS, still run.
+    """
     launched = []
+    real = subprocess.Popen
 
     class Child:
         pid = 4321
 
-    monkeypatch.setattr(
-        supervision.subprocess,
-        "Popen",
-        lambda command, **kwargs: launched.append(command) or Child(),
-    )
+    def popen(command, **kwargs):
+        if command[:3] != [sys.executable, "-m", "agent_parley.cli"]:
+            return real(command, **kwargs)
+        launched.append(command)
+        return Child()
+
+    monkeypatch.setattr(supervision.subprocess, "Popen", popen)
     monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
     manifest = supervision.roster.read(lane["directory"])
     manifest["participants"]["codex"]["approve_bridge_tools"] = True
