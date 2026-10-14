@@ -1392,9 +1392,18 @@ def unmeasured_lanes(
     if not getattr(args, "tokens", None):
         return []
     _, directory = bridge.project(repository, create=False)
-    lanes = records.unmeasured(bridge.home, roster.read(directory), names)
+    manifest = roster.read(directory)
+    participants = manifest["participants"]
+    lanes = records.unmeasured(bridge.home, manifest, names)
+    ended = [
+        lane
+        for lane in lanes
+        if records.counts_at_end(
+            bridge.home, records.lane_provider(participants, lane)
+        )
+    ]
     if lanes:
-        print(records.unmeasured_warning(lanes), file=sys.stderr)
+        print(records.unmeasured_warning(lanes, ended), file=sys.stderr)
     return lanes
 
 
@@ -6953,9 +6962,9 @@ def main() -> int:
                     and not args.allow_unmeasured
                 ):
                     raise BridgeError(
-                        "An enforced token limit would never stop the lanes "
-                        "named above, so it is not recorded; pass "
-                        "--allow-unmeasured to enforce it anyway."
+                        "An enforced token limit could not stop the lanes "
+                        "named above while they run, so it is not recorded; "
+                        "pass --allow-unmeasured to enforce it anyway."
                     )
                 print(bridge.enforce(repository, budget_changes(args)))
             elif args.action == "resume":
@@ -7240,11 +7249,14 @@ def main() -> int:
                 )
                 from agent_parley import records
 
-                if args.tokens and not records.measures_tokens(
-                    bridge.home, args.name
+                late = records.counts_at_end(bridge.home, args.name)
+                if args.tokens and (
+                    late or not records.measures_tokens(bridge.home, args.name)
                 ):
                     print(
-                        records.unmeasured_warning([args.name]),
+                        records.unmeasured_warning(
+                            [args.name], [args.name] if late else []
+                        ),
                         file=sys.stderr,
                     )
                 return 0

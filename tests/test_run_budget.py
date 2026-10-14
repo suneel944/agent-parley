@@ -892,3 +892,27 @@ def test_an_advisory_token_limit_warns_for_each_unmeasured_lane(
         monkeypatch, bridge, "provider", "budget", "amp", "--tokens", "5"
     )
     assert "no token count is read for amp, so" in capsys.readouterr().err
+
+
+def test_an_active_copilot_lane_counts_as_unmeasured_until_its_session_ends(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = bridge.project(repo, create=False)[1]
+    bridge.add_participant(repo, "pilot", "copilot")
+    assert records.measures_tokens(bridge.home, "copilot")
+    assert records.counts_at_end(bridge.home, "copilot")
+    assert records.unmeasured(bridge.home, roster.read(directory)) == ["pilot"]
+    enforce = ("budget", "enforce", "--tokens", "500", "--repo", str(repo))
+    assert main(monkeypatch, bridge, *enforce)
+    err = capsys.readouterr().err
+    assert "pilot report tokens only once their session ends" in err
+    assert "no token count is read" not in err
+    assert "--allow-unmeasured" in err
+    assert "run_budget" not in roster.read(directory)
+    assert not main(monkeypatch, bridge, *enforce, "--allow-unmeasured")
+    assert roster.read(directory)["run_budget"] == {"tokens": 500}
+    monkeypatch.chdir(repo)
+    assert not main(
+        monkeypatch, bridge, "provider", "budget", "copilot", "--tokens", "5"
+    )
+    assert "copilot report tokens only once" in capsys.readouterr().err

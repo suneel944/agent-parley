@@ -427,6 +427,7 @@ SOURCES: dict[str, Callable[[Path, Path], list[Path]]] = {
     "copilot": _copilot_sources,
     "gemini": _gemini_sources,
 }
+END_OF_SESSION = frozenset({"copilot"})
 MARKS = {"gemini": GEMINI_MARK}
 TOTALS: dict[str, Callable[[Path], list[tuple[str, float, int]] | None]] = {
     "opencode": _opencode_sessions,
@@ -435,6 +436,34 @@ UNMEASURED_WARNING = (
     "warning: no token count is read for {lanes}, so a token limit never "
     "counts their use; only {readers} lanes report tokens."
 )
+END_OF_SESSION_WARNING = (
+    "warning: {lanes} report tokens only once their session ends, so a "
+    "token limit cannot stop them while a session runs."
+)
+
+
+def _adapter(home: Path, provider: str) -> str:
+    """Names the adapter a provider rides, or nothing for an undefined one."""
+    try:
+        entry = roster.provider(home, provider)
+    except BridgeError:
+        return ""
+    return str(entry.get("adapter", ""))
+
+
+def counts_at_end(home: Path, provider: str) -> bool:
+    """Reports whether a provider's lanes read tokens only after a session.
+
+    Args:
+        home: Private bridge state root.
+        provider: Provider name a lane runs.
+
+    Returns:
+        True when the provider's adapter is in ``END_OF_SESSION``: its reader
+        sees a session's tokens only once that session has ended, so a
+        running lane reads 0 and a token limit cannot fire mid-session.
+    """
+    return _adapter(home, provider) in END_OF_SESSION
 
 
 def measures_tokens(home: Path, provider: str) -> bool:
@@ -449,11 +478,7 @@ def measures_tokens(home: Path, provider: str) -> bool:
         record reader in ``ADAPTERS`` or ``TOTALS``; a provider without one
         always reports no tokens, so a token limit can never count its lanes.
     """
-    try:
-        entry = roster.provider(home, provider)
-    except BridgeError:
-        return False
-    return str(entry.get("adapter", "")) in readers()
+    return _adapter(home, provider) in readers()
 
 
 def readers() -> list[str]:
@@ -464,7 +489,7 @@ def readers() -> list[str]:
 def unmeasured(
     home: Path, manifest: dict, names: Iterable[str] | None = None
 ) -> list[str]:
-    """Names the active lanes whose tokens no reader can count.
+    """Names the active lanes a token limit cannot count while they run.
 
     Args:
         home: Private bridge state root.
@@ -473,7 +498,7 @@ def unmeasured(
 
     Returns:
         Sorted names of active lanes whose provider ``measures_tokens``
-        rejects.
+        rejects or ``counts_at_end`` accepts.
     """
     participants = manifest.get("participants") or {}
     return sorted(
@@ -481,24 +506,53 @@ def unmeasured(
         for name in (participants if names is None else names)
         if name in participants
         and not roster.retired(participants[name])
-        and not measures_tokens(
-            home, str(participants[name].get("provider", name))
+        and (
+            not measures_tokens(home, lane_provider(participants, name))
+            or counts_at_end(home, lane_provider(participants, name))
         )
     )
 
 
-def unmeasured_warning(lanes: Iterable[str]) -> str:
-    """Formats the warning for lanes or providers no token reader counts.
+def lane_provider(participants: dict, name: str) -> str:
+    """Names the provider a participant runs, defaulting to its own name.
+
+    Args:
+        participants: Manifest participants keyed by name.
+        name: Participant name present in ``participants``.
+
+    Returns:
+        The recorded provider name.
+    """
+    return str(participants[name].get("provider", name))
+
+
+def unmeasured_warning(lanes: Iterable[str], ended: Iterable[str] = ()) -> str:
+    """Formats the warning for lanes or providers a token limit cannot count.
 
     Args:
         lanes: Names of the unmeasured lanes or providers.
+        ended: Those of ``lanes`` whose tokens are read once their session
+            ends, rather than never.
 
     Returns:
-        One warning line naming each of them and the readable adapters.
+        A line naming the lanes no reader counts and the readable adapters,
+        and a line naming the lanes counted only at session end; a line
+        with no lanes is left out.
     """
-    return UNMEASURED_WARNING.format(
-        lanes=", ".join(lanes), readers=", ".join(readers())
-    )
+    later = set(ended)
+    unread = [lane for lane in lanes if lane not in later]
+    lines = []
+    if unread:
+        lines.append(
+            UNMEASURED_WARNING.format(
+                lanes=", ".join(unread), readers=", ".join(readers())
+            )
+        )
+    if later:
+        lines.append(
+            END_OF_SESSION_WARNING.format(lanes=", ".join(sorted(later)))
+        )
+    return "\n".join(lines)
 
 
 def _stamp(value: object) -> float | None:
