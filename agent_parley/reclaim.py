@@ -58,7 +58,7 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 
-from agent_parley import forge, issues, pool, retirement, store
+from agent_parley import forge, issues, pool, process, retirement, store
 from agent_parley.lanes import extras
 from agent_parley.state import BridgeError, LockBusy, lock
 
@@ -91,6 +91,7 @@ OUTSIDE = "its worktree is outside the project state directory"
 UNREGISTERED = "the base checkout does not register its worktree"
 UNREADABLE = "Git could not inspect it"
 SESSION = "a session is running in it"
+UNLISTED = "the processes working in it could not be listed"
 IDLE = "an idle session is still running in it"
 CLAIMED = "it still holds a claim"
 UNCOMMITTED = "it holds uncommitted changes"
@@ -324,34 +325,25 @@ def _busy(directory: Path, name: str) -> bool:
         return True
 
 
-def _occupied(path: Path) -> bool:
+def _occupied(path: Path) -> bool | None:
     """Reports whether any process works inside a worktree.
 
     Moving a directory out from under a process strands its shell or
     session, whoever started it, so every process whose working directory
-    is the worktree or lies inside it counts. Linux exposes that through
-    `/proc`; a host without it, such as macOS, reports none, and only the
-    owning lane's session lock guards the move there.
+    is the worktree or lies inside it counts. Linux reads that from
+    `/proc` and macOS from `lsof`.
 
     Args:
         path: Worktree about to be moved.
 
     Returns:
-        Whether a readable process has its working directory inside it.
+        Whether a process has its working directory inside it, or None
+        when the platform could not list working directories, as when
+        `lsof` is missing or times out. A caller treats None as occupied,
+        so the worktree is never moved blind.
     """
-    proc = Path("/proc")
-    if not proc.is_dir():
-        return False
-    target = path.resolve()
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            if Path(os.readlink(entry / "cwd")).is_relative_to(target):
-                return True
-        except OSError:
-            continue
-    return False
+    pids = process.cwd_pids(path)
+    return None if pids is None else bool(pids)
 
 
 def assess(
@@ -1113,7 +1105,7 @@ def strays(directory: Path, manifest: dict, *, sizes: bool) -> list[dict]:
                 entry,
                 busy=_busy(directory, owner)
                 if owner
-                else path.parent not in owned and _occupied(path),
+                else path.parent not in owned and _occupied(path) is not False,
                 retired=bool(owner)
                 and bool(participants[owner].get("retired")),
                 after=after,
@@ -1240,7 +1232,11 @@ def relocations(directory: Path, manifest: dict) -> list[dict]:
             reason = NESTED
         elif entry["locked"]:
             reason = LOCKED
-        elif (owner and _busy(directory, owner)) or _occupied(path):
+        elif owner and _busy(directory, owner):
+            reason = SESSION
+        elif (occupied := _occupied(path)) is None:
+            reason = UNLISTED
+        elif occupied:
             reason = SESSION
         elif time.time() - _used(path) < RELOCATE_AFTER:
             reason = FRESH

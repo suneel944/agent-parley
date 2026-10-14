@@ -50,12 +50,12 @@ checkpoint, so `agent-parley top` reports its delivered context in `CONTEXT`.
 | Refused-tool event | `PermissionDenied` | none | none | none | none | none |
 | Blocked-on-approval source | hook | hook | hook | dialog watcher | hook | dialog watcher |
 | Removed by `participant retire` | `-mcp.json` | nothing to remove | the lane's hooks in the profile, and the MCP entry once no lane hook remains | overlay file | overlay directory | overlay file |
-| Forked-session rebind | Linux only | Linux only | Linux only | Linux only | Linux only | Linux only |
+| Forked-session rebind | Linux and macOS | Linux and macOS | Linux and macOS | Linux and macOS | Linux and macOS | Linux and macOS |
 
 Every row is read from the adapter branches in `agent_parley/launch.py`, the
 retire path and `agent_parley/process.py`. A forked or resumed session started
 outside the launcher is found by the working directory of its process, which
-only the Linux process reader can see.
+Linux reads from `/proc` and macOS from `lsof`.
 
 ### How idle, blocked and prompt states are detected
 

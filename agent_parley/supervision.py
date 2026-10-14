@@ -111,6 +111,8 @@ WAKE_DIGEST_THREADS = 8
 UNKNOWN = "unknown"
 UNREADABLE = "unknown; activity record unreadable"
 UNREADABLE_STOPPED = "stopped; activity record unreadable"
+IDENTITY_UNREADABLE = "unknown; session process identity unreadable"
+STILL_RUNNING = (UNREADABLE, IDENTITY_UNREADABLE)
 DIALOG_WAKES = frozenset({"busy:input", "manual attention required"})
 WAKE_BACKOFF_CEILING = 3600.0
 TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
@@ -314,7 +316,7 @@ def lane_state(
     identified = (
         type(pid) is int and pid > 1 and isinstance(ticks, str) and bool(ticks)
     )
-    alive = process.alive(pid, ticks) if identified else None
+    alive = process.alive_or_unknown(pid, ticks) if identified else None
     if identified and rebooted(published):
         alive = False
     recorded = published.get("updated")
@@ -336,6 +338,8 @@ def lane_state(
             "stale": stale and state != STOPPED,
         }
 
+    if identified and alive is None:
+        return reading(UNKNOWN, IDENTITY_UNREADABLE)
     if alive is not True:
         if alive is False or activity == "stopped" or not published:
             return reading(STOPPED, "stopped")
@@ -498,7 +502,8 @@ def rebind_sessions(home: Path, directory: Path, manifest: dict) -> list[str]:
                 if (
                     not state
                     or rebooted(state)
-                    or lane_state(state)["process_alive"] is True
+                    or (reading := lane_state(state))["process_alive"] is True
+                    or reading["evidence"] == IDENTITY_UNREADABLE
                 ):
                     continue
                 foreign = state.get("foreign_session") or {}
@@ -658,7 +663,7 @@ def _known_process_gone(path: Path) -> bool:
     Returns:
         Whether the record names a process identity that no longer runs.
         A missing, unreadable or incomplete record proves nothing and reads
-        as False.
+        as False, as does a running process whose identity cannot be read.
     """
     try:
         kept = json.loads(path.read_text())
@@ -670,7 +675,7 @@ def _known_process_gone(path: Path) -> bool:
     ticks = kept.get("session_ticks")
     if type(pid) is not int or pid <= 1 or not isinstance(ticks, str):
         return False
-    return bool(ticks) and not process.alive(pid, ticks)
+    return bool(ticks) and process.alive_or_unknown(pid, ticks) is False
 
 
 def recorded_presence(record: dict | None, observed: dict) -> dict:
@@ -1682,9 +1687,16 @@ def work_evidence(
             raise BridgeError(
                 f"Process {pid} is the lane's own session, not its work."
             )
-        if process.read_ps_field("uid=", pid) != str(os.getuid()):
+        try:
+            owner = process.read_ps_field("uid=", pid)
+            ticks = process.start_ticks(pid)
+        except process.IdentityUnknown as error:
+            raise BridgeError(
+                f"Process {pid} could not be identified: {error}"
+            ) from error
+        if owner != str(os.getuid()):
             raise BridgeError(f"Process {pid} belongs to another user.")
-        record.update(pid=pid, ticks=process.start_ticks(pid))
+        record.update(pid=pid, ticks=ticks)
     if output.strip():
         root = lane.resolve()
         path = (root / Path(output.strip()).expanduser()).resolve()
@@ -7779,7 +7791,7 @@ def missing_root(
         reading = presence(directory, name, config["inactive_after"])
         if (
             reading["process_alive"] is True
-            or reading["evidence"] == UNREADABLE
+            or reading["evidence"] in STILL_RUNNING
         ):
             live.append(name)
             continue
@@ -7965,7 +7977,7 @@ def forget(
         reading = presence(directory, name)
         if (
             reading["process_alive"] is True
-            or reading["evidence"] == UNREADABLE
+            or reading["evidence"] in STILL_RUNNING
         ):
             live.append(name)
     if live:

@@ -432,6 +432,10 @@ def relaunch(home: str) -> None:
     backward clock step leaves, is read as expired rather than holding
     relaunch off until the clock catches up.
 
+    A recorded service whose identity cannot be read, as when ``ps``
+    times out on a loaded macOS host, is left running rather than raced
+    by a second start.
+
     A home with no record is left alone: nothing claimed to serve it, and
     the first start belongs to the lane launch or to the operator. The
     request is detached and never waited on, so the hook that made it
@@ -449,7 +453,12 @@ def relaunch(home: str) -> None:
     try:
         with open(os.path.join(home, "server.json")) as stream:
             record = json.load(stream)
-        if process.alive(record.get("pid"), record.get("start_ticks")):
+        if (
+            process.alive_or_unknown(
+                record.get("pid"), record.get("start_ticks")
+            )
+            is not False
+        ):
             return
         failures = int(record.get("failures", 0) or 0)
         interval = RELAUNCH_INTERVAL * 2 ** min(max(failures - 1, 0), 4)

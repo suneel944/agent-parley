@@ -1126,6 +1126,25 @@ def test_no_relaunch_is_asked_for_without_a_recorded_service(
     assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
 
 
+def test_no_relaunch_is_asked_for_while_the_service_identity_is_unknown(
+    bridge, monkeypatch
+):
+    def timed_out(field, pid):
+        raise process.IdentityUnknown("ps timed out")
+
+    write_json(
+        bridge.home / "server.json",
+        {"pid": os.getpid(), "start_ticks": "Wed Sep 10 11:22:33 2026"},
+    )
+    monkeypatch.setattr(
+        process, "PLATFORM", process.darwin_platform(timed_out, timed_out)
+    )
+    asked = requests(monkeypatch)
+    hook.relaunch(str(bridge.home))
+    assert asked == []
+    assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
+
+
 def test_a_start_that_times_out_is_retried_after_the_backoff(
     bridge, monkeypatch
 ):
