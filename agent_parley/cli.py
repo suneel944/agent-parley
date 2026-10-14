@@ -4224,6 +4224,24 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         type=Path,
         help="Repository root or any of its worktrees to register.",
     )
+    setup.add_argument(
+        "--verify",
+        dest="verify_command",
+        metavar="COMMAND",
+        help=(
+            "Also record the command every merge must pass, as "
+            "`verify set` does and under the same guards."
+        ),
+    )
+    setup.add_argument(
+        "--init",
+        dest="init_command",
+        metavar="COMMAND",
+        help=(
+            "Also record the command every new lane runs before it starts, "
+            "as `init set` does and under the same guards."
+        ),
+    )
     setup.add_argument("--json", action="store_true", help=JSON_HELP)
     run = commands.add_parser(
         "run", help="Launch one participant's native CLI in this terminal."
@@ -6214,11 +6232,26 @@ def main() -> int:
                 else "Store passed its integrity check; nothing was moved."
             )
         elif args.command == "setup":
-            registered = bridge.setup(args.repo.resolve())
+            from agent_parley.core import suggested_gate
+
+            repository = args.repo.resolve()
+            registered = bridge.setup(repository)
+            if args.verify_command is not None:
+                bridge.verification(repository, args.verify_command)
+            if args.init_command is not None:
+                bridge.initialization(repository, args.init_command)
+            configured = bridge.commands(repository)
+            registered["verify"] = configured["verify"]
+            registered["initialize"] = configured["initialize"]
             print(
                 views.render("setup", registered)
                 if args.json
-                else views.setup_text(registered)
+                else views.setup_text(
+                    registered,
+                    None
+                    if registered["verify"]
+                    else suggested_gate(Path(registered["root"])),
+                )
             )
         elif args.command == "run":
             status = bridge.launch(

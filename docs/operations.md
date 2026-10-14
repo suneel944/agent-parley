@@ -3352,6 +3352,19 @@ it refuses inside an assigned worktree and in any process holding a lane's
 `AGENT_PARLEY_TOKEN`, so a lane cannot replace or clear the gate its own merge
 has to pass. `verify show` stays readable from a lane.
 
+`setup PATH --verify COMMAND --init COMMAND` records the gate and the lane
+initialization command in the same call, through the same paths and guards as
+`verify set` and `init set`. Without `--json`, `setup` prints labeled lines:
+`Root`, `Base`, `Forge`, `Verify`, `Init` and `Next`. An empty gate reads
+`Verify: none; participant merge runs no gate`, and when a file committed at
+HEAD declares a check command, a `Suggested:` line names the exact call, such as
+`agent-parley verify set "make check"`. Detection reads, in order, a
+`Makefile` `check` or `test` target (`make check`, `make test`), a
+`package.json` test script (`npm test`), a `pyproject.toml` `[tool.pytest`
+table (`pytest -q`), a `Cargo.toml` (`cargo test`) and a `go.mod`
+(`go test ./...`). It only suggests; nothing is recorded until the operator
+runs that command.
+
 ## Requiring a recorded approval
 
 A repository can require your own recorded decision before either command that

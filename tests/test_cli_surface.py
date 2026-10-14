@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import BridgeError, cli, protocol, roster, start, store, views
+from agent_parley.cli import git
 
 NEW_COMMANDS = (
     ("version",),
@@ -1349,10 +1350,19 @@ def test_setup_confirms_in_plain_text_and_json_carries_the_envelope(
         monkeypatch, capsys, "--home", str(bridge.home), "setup", str(repo)
     )
     assert not printed.startswith("{")
-    first, second = printed.splitlines()
-    assert first.startswith(f"Registered {repo.resolve()} at ")
-    assert first.endswith(".") and "Forge: " in first
-    assert second == "Next: agent-parley run claude"
+    lines = printed.splitlines()
+    assert lines[0] == f"Root: {repo.resolve()}"
+    assert [line.split(":")[0] for line in lines] == [
+        "Root",
+        "Base",
+        "Forge",
+        "Verify",
+        "Init",
+        "Next",
+    ]
+    assert lines[3] == "Verify: none; participant merge runs no gate"
+    assert lines[4] == "Init: none"
+    assert lines[-1] == "Next: agent-parley run claude"
     document = envelope(
         run(
             monkeypatch,
@@ -1366,7 +1376,82 @@ def test_setup_confirms_in_plain_text_and_json_carries_the_envelope(
         "setup",
     )
     assert document["root"] == str(repo.resolve())
-    assert first.split(" at ")[1].startswith(document["base"][:12])
+    assert lines[1] == f"Base: {document['base'][:12]}"
+
+
+def test_setup_suggests_the_gate_its_committed_makefile_declares(
+    bridge, repo, monkeypatch, capsys
+):
+    (repo / "Makefile").write_text("lint:\n\ttrue\ncheck: lint\n\ttrue\n")
+    git(repo, "add", "Makefile")
+    git(
+        repo,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Add a check target",
+    )
+    printed = text(
+        monkeypatch, capsys, "--home", str(bridge.home), "setup", str(repo)
+    )
+    assert "Verify: none; participant merge runs no gate" in printed
+    assert 'Suggested: agent-parley verify set "make check"' in printed
+    assert printed.splitlines()[-1].startswith("Next: ")
+    assert roster.read(bridge.project(repo)[1])["verify"] == []
+
+
+def test_setup_records_the_gate_and_init_under_the_operator_guard(
+    bridge, repo, monkeypatch, capsys
+):
+    monkeypatch.chdir(repo)
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "setup",
+        str(repo),
+        "--verify",
+        "make check",
+        "--init",
+        "uv sync",
+    )
+    assert "Verify: make check" in printed
+    assert "Init: uv sync" in printed
+    assert "Suggested:" not in printed
+    stored = roster.read(bridge.project(repo)[1])
+    assert stored["verify"] == ["make", "check"]
+    assert stored["initialize"] == ["uv", "sync"]
+    document = run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "setup",
+        str(repo),
+        "--json",
+    )
+    assert document["verify"] == ["make", "check"]
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "setup",
+            str(repo),
+            "--verify",
+            "true",
+        ],
+    )
+    assert cli.main() != 0
+    assert "AGENT_PARLEY_TOKEN" in capsys.readouterr().err
+    assert roster.read(bridge.project(repo)[1])["verify"] == ["make", "check"]
 
 
 def test_credentials_add_names_its_settings_without_values(
