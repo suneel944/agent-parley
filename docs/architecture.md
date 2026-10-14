@@ -1297,8 +1297,9 @@ import and every caller goes through that bundle, so no call site tests the
 platform. Each bundle supplies a creation-identity reader, a hook's foreground
 process group reader, a parent process reader for walking a hook's ancestry
 without a controlling terminal, an existence check, a zombie check, a
-command-line match, a terminate step and a boot identifier, so a process
-record written before a restart is known to be from an earlier boot.
+command-line match, a terminate step, a boot identifier, so a process
+record written before a restart is known to be from an earlier boot, and a
+listing of the processes whose working directory lies inside a path.
 
 A zombie counts as exited. A process that has exited but is not yet reaped
 keeps its process ID and its creation identity, so neither alone tells it from
@@ -1323,7 +1324,14 @@ from `ps -o args=`, compared against the end of the printed line rather than
 split into words, which keeps a state directory whose path contains a space
 exact. Liveness uses `os.kill(pid, 0)`: a lookup error means the process is
 gone, and a permission error means it exists under another user and therefore
-counts as running. Shutdown re-reads the creation time immediately before
+counts as running. A `ps` call that times out, cannot start or fails while
+`os.kill(pid, 0)` still finds the process raises `IdentityUnknown` instead of
+reading as an exit: `alive_or_unknown` then answers None, so supervision skips
+that lane for the poll, the hook does not relaunch the service, and shutdown
+refuses to signal. Working directories come from `lsof -d cwd`, for reclaim
+and for finding a native client running in a lane worktree; when `lsof`
+cannot list them, reclaim leaves the worktree in place.
+Shutdown re-reads the creation time immediately before
 `os.kill(pid, SIGTERM)` and then polls, reaping first so an unreaped child does
 not read as alive. The identity guarantee is the same on both platforms; only
 Linux can additionally close the window between the identity check and the

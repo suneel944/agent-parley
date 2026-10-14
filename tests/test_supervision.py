@@ -111,6 +111,32 @@ def test_presence_separates_an_idle_lane_from_a_stopped_one(tmp_path):
     assert unknown["process_alive"] is None
 
 
+def test_a_session_whose_identity_ps_cannot_read_is_never_stopped(
+    tmp_path, monkeypatch
+):
+    def timed_out(field, pid):
+        raise process.IdentityUnknown("ps timed out")
+
+    known = tmp_path / "lane-session-process.json"
+    record = {
+        "session_pid": os.getpid(),
+        "session_ticks": "Wed Sep 10 11:22:33 2026",
+    }
+    write_json(
+        tmp_path / "lane-activity.json",
+        {**record, "updated": time.time(), "activity": "stopped"},
+    )
+    write_json(known, record)
+    monkeypatch.setattr(
+        process, "PLATFORM", process.darwin_platform(timed_out, timed_out)
+    )
+    reading = supervision.presence(tmp_path, "lane")
+    assert reading["process_alive"] is None
+    assert reading["activity"] == supervision.UNKNOWN
+    assert reading["evidence"] == supervision.IDENTITY_UNREADABLE
+    assert supervision._known_process_gone(known) is False
+
+
 def live(tmp_path, **extra):
     """Publishes an activity record whose session process is alive."""
     write_json(

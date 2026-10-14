@@ -59,8 +59,9 @@ working directory is the lane worktree. The activity record then names that
 process and carries a `rebound` entry with its process ID, session and time,
 and the next hook from it is adopted under its new session ID. So a lane is
 never read as stopped, aged into `dead` or has its claims orphaned while a
-client still runs in its worktree. On macOS, where `ps` reports no working
-directory, only the recorded second session is found this way.
+client still runs in its worktree. Linux reads each client's working
+directory from `/proc` and macOS from `lsof`; when `lsof` cannot run, only the
+recorded second session is found this way.
 
 A client the launcher did not start has no wake socket, so a wake cannot reach
 it. The wake is recorded as `unavailable`, `problems` shows a `wake attention`

@@ -341,6 +341,88 @@ def test_macos_hook_identifies_the_foreground_native_process(monkeypatch):
     assert process.foreground_process(9999) is None
 
 
+def test_a_ps_call_that_times_out_leaves_a_live_process_unknown(monkeypatch):
+    pid = os.getpid()
+    created = process.read_ps_field("lstart=", pid)
+
+    def timed_out(*args, **named):
+        raise subprocess.TimeoutExpired(args[0], process.PS_TIMEOUT)
+
+    monkeypatch.setattr(process, "PLATFORM", process.darwin_platform())
+    assert process.alive_or_unknown(pid, created) is True
+    monkeypatch.setattr(process.subprocess, "run", timed_out)
+    with pytest.raises(process.IdentityUnknown):
+        process.read_ps_field("lstart=", pid)
+    assert process.alive_or_unknown(pid, created) is None
+    assert process.alive(pid, created) is False
+    monkeypatch.setattr(process, "darwin_running", lambda pid: False)
+    assert process.read_ps_field("lstart=", pid) == ""
+    assert process.alive_or_unknown(pid, created) is False
+
+
+def test_a_failed_ps_call_for_a_running_process_is_not_an_exit(monkeypatch):
+    failed = subprocess.CompletedProcess([], 1, "", "")
+    monkeypatch.setattr(process.subprocess, "run", lambda *a, **k: failed)
+    with pytest.raises(process.IdentityUnknown):
+        process.read_ps_field("lstart=", os.getpid())
+    with pytest.raises(process.IdentityUnknown):
+        process.darwin_start_ticks(lambda field, pid: "", os.getpid())
+    monkeypatch.setattr(process, "darwin_running", lambda pid: False)
+    assert process.read_ps_field("lstart=", os.getpid()) == ""
+    with pytest.raises(ProcessLookupError):
+        process.darwin_start_ticks(lambda field, pid: "", os.getpid())
+
+
+def test_macos_finds_native_clients_working_inside_a_lane(
+    monkeypatch, tmp_path
+):
+    lane = (tmp_path / "lane").resolve()
+    (lane / "sub").mkdir(parents=True)
+    listing = "".join(
+        f"p{pid}\nfcwd\nn{path}\n"
+        for pid, path in (
+            (101, lane),
+            (102, lane / "sub"),
+            (103, tmp_path.resolve() / "other"),
+            (104, lane),
+        )
+    )
+    created = "Wed Sep 10 11:22:33 2026"
+    reader = macos_ps(
+        dict.fromkeys((101, 102, 103, 104), created),
+        {
+            101: "claude --resume abc",
+            102: "node /opt/bin/claude",
+            103: "claude",
+            104: "-zsh",
+        },
+    )
+    monkeypatch.setattr(os, "kill", lambda pid, number: None)
+    monkeypatch.setattr(
+        process,
+        "PLATFORM",
+        process.darwin_platform(reader, reader, lambda: listing),
+    )
+    assert process.cwd_pids(lane) == [101, 102, 104]
+    assert process.PLATFORM.worktree_clients(lane, "claude") == [101, 102]
+    assert process.worktree_client(lane, "claude").pid in {101, 102}
+
+
+def test_macos_reports_unknown_when_lsof_cannot_list_cwds(monkeypatch):
+    def missing(*args, **named):
+        raise FileNotFoundError("lsof")
+
+    monkeypatch.setattr(process.subprocess, "run", missing)
+    with pytest.raises(process.IdentityUnknown):
+        process.read_lsof_cwds()
+    darwin = process.darwin_platform()
+    assert darwin.cwd_pids(Path("/")) is None
+    assert darwin.worktree_clients(Path("/"), "claude") == []
+    partial = subprocess.CompletedProcess([], 1, "p7\nfcwd\nn/x\n", "")
+    monkeypatch.setattr(process.subprocess, "run", lambda *a, **k: partial)
+    assert process.parse_lsof_cwds(process.read_lsof_cwds()) == {7: Path("/x")}
+
+
 @contextlib.contextmanager
 def launcher_ancestry():
     """Starts a real client-and-hook chain below the running test process."""

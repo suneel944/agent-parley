@@ -1188,6 +1188,17 @@ def test_a_stray_worktree_a_process_works_in_is_left_in_place(
     assert path.exists()
 
 
+def test_a_stray_worktree_is_left_in_place_when_cwds_cannot_be_listed(
+    bridge, repo, idle, tmp_path, monkeypatch
+):
+    path = made(repo, tmp_path, "codex-pr-26")
+    monkeypatch.setattr(reclaim.process, "cwd_pids", lambda target: None)
+    moved = bridge.relocate_worktrees(repo, apply=True)
+
+    assert worktree_of(moved, path)["reason"] == reclaim.UNLISTED
+    assert path.exists()
+
+
 def test_a_move_git_refuses_is_reported_and_moves_nothing(
     bridge, repo, idle, tmp_path
 ):
