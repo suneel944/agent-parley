@@ -1570,6 +1570,114 @@ def test_a_lane_ready_to_retire_carries_no_separate_orphan_row(monkeypatch):
     assert not orphaned_lane(LIVE, monkeypatch, problems.ORPHANED)
 
 
+def ready_estate(bridge, repo, monkeypatch, live=("gemini",)):
+    """Orphans every lane's claims past the ceiling; `live` lanes still run."""
+    bridge.add_participant(repo, "gemini", "gemini")
+    directory = bridge.project(repo)[1]
+    for name in ("claude", "codex", "gemini"):
+        stopped(directory, name)
+    original = cli.Bridge.status_snapshot
+
+    def orphaned(self):
+        report = original(self)
+        report["server"]["ready"] = True
+        for project in report["projects"]:
+            for record in project["participants"]:
+                record["claims"] = ORPHANED
+                record["availability"] = (
+                    LIVE if record["participant"] in live else GONE
+                )
+        return report
+
+    monkeypatch.setattr(cli.Bridge, "status_snapshot", orphaned)
+    return directory
+
+
+def retire_ready(bridge, repo, monkeypatch, capsys, *flags):
+    """Runs `participant retire --ready` and returns its code and output."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "participant",
+            "retire",
+            "--ready",
+            "--repo",
+            str(repo),
+            *flags,
+        ],
+    )
+    code = cli.main()
+    return code, capsys.readouterr().out
+
+
+def test_retire_ready_retires_only_the_lanes_problems_lists_as_ready(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(bridge, repo, monkeypatch)
+    assert problems.ready(bridge.problems(), paired["root"]) == [
+        "claude",
+        "codex",
+    ]
+
+    code, out = retire_ready(bridge, repo, monkeypatch, capsys, "--yes")
+
+    assert code == 0, out
+    assert "Done 2 of 2: claude, codex." in out
+    assert set(roster.read(directory)["participants"]) == {"gemini"}
+
+
+def test_retire_ready_reports_a_refusal_and_carries_on(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(bridge, repo, monkeypatch, live=())
+    original = cli.Bridge.retire
+
+    def refusing(self, repo, name, **extra):
+        if name == "claude":
+            raise cli.BridgeError("claude refused")
+        return original(self, repo, name, **extra)
+
+    monkeypatch.setattr(cli.Bridge, "retire", refusing)
+
+    code, out = retire_ready(bridge, repo, monkeypatch, capsys, "--yes")
+
+    assert code == 1
+    assert "- claude: refused. claude refused" in out
+    assert "Refused or failed: claude" in out
+    assert set(roster.read(directory)["participants"]) == {"claude"}
+
+
+def test_retire_ready_with_nothing_ready_retires_nothing(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(
+        bridge, repo, monkeypatch, live=("claude", "codex", "gemini")
+    )
+
+    code, out = retire_ready(bridge, repo, monkeypatch, capsys)
+
+    assert code == 0
+    assert "No lane is ready to retire" in out
+    assert len(roster.read(directory)["participants"]) == 3
+
+
+@pytest.mark.parametrize("words", [[], ["claude", "--ready"]])
+def test_retire_takes_a_name_or_ready_exactly(bridge, monkeypatch, words):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "participant", "retire"]
+        + words,
+    )
+    with pytest.raises(SystemExit) as exited:
+        cli.main()
+    assert exited.value.code == 2
+
+
 def integrating_lane(monkeypatch, seconds, pull=True, approval=None, **reading):
     """Derives a dead lane's rows holding a waiting ready report."""
     monkeypatch.setattr(supervision, "dirty_paths", lambda lane: [])

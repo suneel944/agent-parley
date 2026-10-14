@@ -582,7 +582,7 @@ condition, that count, its age and what clears it:
 | `escalated plan revision` | A lane's plan revision touched an edge already revised back and forth under the current plan version, so it was escalated instead of applied. One row per escalated proposal, on the proposing lane, among the retained proposals. | `agent-parley plan approve ID` or `agent-parley plan reject ID --reason TEXT` |
 | `plan revisions pending` | Plan revisions outside the operator's envelope wait for a decision. One row per project counts them and ages from the oldest. | `agent-parley plan proposals`, then approve or reject each |
 | `orphaned claims` | The lane's session process is gone and the supervisor marked claims it holds orphaned, and the lane is not yet `ready to retire`. The row is derived from the ledger, so it shows whether or not a notification transport is configured. | `agent-parley issue claim N --take-orphaned` from a live peer lane; with no live lane besides the holder, start one with `agent-parley run NAME` and have it take the claim, or `agent-parley issue release N`. |
-| `ready to retire` | The lane's session process is gone, every claim it holds has been orphaned for longer than `orphan_retire_after` and no peer took it. Never shown while the lane's ready report waits on an open pull request. | `agent-parley participant retire NAME` |
+| `ready to retire` | The lane's session process is gone, every claim it holds has been orphaned for longer than `orphan_retire_after` and no peer took it. Never shown while the lane's ready report waits on an open pull request. | `agent-parley participant retire NAME`, or `participant retire --ready` for every such lane |
 | `ready to integrate` | The lane's latest report is ready, a claim it holds has an open pull request in the cached forge reading, and the report has waited for integration longer than the default wait ceiling of 3600 seconds. It replaces `ready to retire` and `orphaned claims` for that lane, since retiring or releasing would drop the claim the pull request closes. It clears when the pull request merges or closes, or a newer report supersedes the ready one. Nothing merges on its own. | `agent-parley approve NAME` when the project requires approval and the report is not approved; otherwise review and merge the named pull request, or `agent-parley participant merge NAME`. |
 | `ready without a pull request` | A claim the lane holds has been in the ready state longer than the default wait ceiling of 3600 seconds, the project has a cached forge reading, that reading holds no open pull request for the claim, and no approval is pending. Ready work stays claimed through integration, so a claim whose pull requests all merged or closed while the issue stayed open would otherwise wait for good while the lane is told it waits on CI and review. The row names the longest-ready claim and counts the rest. | Open the claim's pull request, close the issue if its work already merged, or `agent-parley issue release N`. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
@@ -3799,6 +3799,11 @@ participant's coordination credential, and drops its manifest entry. Removing
 the worktree deletes its ignored files, such as a local `.env` or build
 output, so retire lists them and asks first; `--yes` answers in advance, and a
 declined or unanswered question retires nothing and exits non-zero.
+`participant retire --ready` takes the place of a lane name and retires every
+lane `problems` lists as `ready to retire`, one at a time through the same
+path, so each lane still asks about its ignored files unless `--yes` is given.
+It prints one result line per lane, carries on past a lane that refuses or
+is declined, and exits non-zero if any did.
 `gc --apply` reclaims
 only lanes whose work has already landed, so it removes their ignored files
 without asking. The branch is deleted

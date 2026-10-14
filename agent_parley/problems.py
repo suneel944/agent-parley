@@ -2442,6 +2442,26 @@ def derive(
     return rows + aged
 
 
+def ready(rows: list[dict], root: str) -> list[str]:
+    """Names the lanes of one project that `derive` reports ready to retire.
+
+    Args:
+        rows: Rows `derive` produced.
+        root: Canonical project key whose lanes are named.
+
+    Returns:
+        Each participant carrying a `READY` row in that project, once, in
+        the order the rows list them.
+    """
+    return list(
+        dict.fromkeys(
+            row["participant"]
+            for row in rows
+            if row["condition"] == READY and row["project"] == root
+        )
+    )
+
+
 def _stale(row: dict) -> bool:
     """Tells whether the oldest item behind a row has held past a day.
 
