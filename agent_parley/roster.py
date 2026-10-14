@@ -40,7 +40,7 @@ REQUIRED_HOOKS = ("SessionStart", "PreToolUse", "Stop")
 DELIVERY_HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop")
 APPROVAL: dict[str, str | None] = {
     "claude": "settings",
-    "codex": None,
+    "codex": "flag",
     "copilot": "flag",
     "gemini": "overlay",
     "opencode": "overlay",
@@ -50,9 +50,19 @@ APPROVAL: dict[str, str | None] = {
 
 ``settings`` is the session's permission settings, ``flag`` a command-line
 allow and ``overlay`` the lane-private configuration the launch writes;
-each allows this bridge's own MCP server and nothing else. ``None`` marks
-an adapter with no such setting the launcher uses, so a recorded opt-in
-cannot reach its session and no opt-in gap is reported for it.
+each allows this bridge's own MCP server and nothing else. A `codex` lane
+carries it only from `CODEX_APPROVAL_RELEASE` on. ``None`` marks an
+adapter with no such setting the launcher uses, so a recorded opt-in
+cannot reach its session; no opt-in gap is reported for it, and a
+recorded opt-in is reported as unsupported instead of silently ignored.
+"""
+CODEX_APPROVAL_RELEASE = (0, 153, 0)
+"""Oldest Codex CLI release verified to read a per-server tool approval.
+
+From this release a launch passes
+``mcp_servers.agent_parley.default_tools_approval_mode="approve"``, which
+approves the tools of this bridge's own MCP server and no other. An older
+or unreadable release gets no such override, and the launch says so.
 """
 POLLED_REQUIRED_HOOKS = ("PreToolUse",)
 """Guards a polled-delivery adapter must still raise to launch at all.

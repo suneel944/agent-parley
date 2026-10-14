@@ -1287,6 +1287,7 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
         bridge, paired, directory, "codex", 300, session="manual-session"
     )
     assert observed["process_alive"] is False
+    paired.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
     supervision.wake(
         bridge.home,
         directory,
@@ -1387,6 +1388,43 @@ def test_auto_mode_clears_the_gap_of_a_claude_lane_only(bridge):
     assert supervision.opt_in_missing(bridge.home, manifest, "gemini")
 
 
+@pytest.mark.parametrize("adapter", roster.ADAPTERS)
+def test_a_recorded_opt_in_an_adapter_cannot_carry_is_named(bridge, adapter):
+    manifest = {"participants": {"lane": {"provider": adapter}}}
+    assert not supervision.opt_in_unsupported(bridge.home, manifest, "lane")
+    manifest["supervision"] = {dialogs.PRE_APPROVE: True}
+    warning = supervision.opt_in_unsupported(bridge.home, manifest, "lane")
+    if roster.APPROVAL[adapter] is None:
+        assert warning.startswith(f"lane is a {adapter} lane with a bridge")
+        assert "agent-parley run lane --resume" in warning
+    else:
+        assert warning == ""
+
+
+@pytest.mark.parametrize(
+    ("version", "named"),
+    [
+        (None, False),
+        ("codex-cli 0.153.0", False),
+        ("codex-cli 0.152.9", True),
+        ("", True),
+    ],
+)
+def test_a_codex_release_without_the_server_approval_is_named(
+    bridge, version, named
+):
+    manifest = {
+        "supervision": {dialogs.PRE_APPROVE: True},
+        "participants": {"lane": {"provider": "codex"}},
+    }
+    warning = supervision.opt_in_unsupported(
+        bridge.home, manifest, "lane", version
+    )
+    assert bool(warning) is named
+    if named:
+        assert "predates the per-server tool approval codex 0.153.0" in warning
+
+
 def test_operator_stop_holds_until_the_next_launch(
     bridge, repo, paired, monkeypatch
 ):
@@ -1445,6 +1483,7 @@ def test_stopping_a_live_session_with_backlog_is_not_resumed_by_a_wake(
     bridge, repo, paired, monkeypatch
 ):
     actors = registered(bridge, paired)
+    paired.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
     directory = Path(paired["lanes"]["codex"]).parent
     path = directory / "codex-activity.json"
     send(bridge, actors["claude"], "codex")

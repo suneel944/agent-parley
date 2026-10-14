@@ -142,6 +142,12 @@ OPT_IN_WARNING = (
     "would stop at a permission prompt nobody sees; the service reports "
     "that lane instead of resuming it. To opt in, " + OPT_IN_REMEDY + "."
 )
+OPT_IN_UNSUPPORTED = (
+    "{name} is a {adapter} lane with a bridge tool approval recorded, but "
+    "{limit}, so the approval cannot reach its session and a resume may "
+    "stop at a native permission prompt; answer it in your own terminal "
+    "with `agent-parley run {name} --resume`."
+)
 WORKING = "working"
 WAITING = "waiting"
 TOOL_TIMEOUT = 600
@@ -3462,6 +3468,54 @@ def opt_in_adapter(home: Path, manifest: dict, name: str) -> str:
     ):
         return ""
     return adapter
+
+
+def opt_in_unsupported(
+    home: Path, manifest: dict, name: str, version: str | None = None
+) -> str:
+    """Explains why a recorded bridge tool approval cannot reach a lane.
+
+    An adapter `roster.APPROVAL` gives no way to carry the opt-in, and a
+    `codex` client older than `roster.CODEX_APPROVAL_RELEASE`, would start
+    without it, so the operator's recorded choice would change nothing.
+    This names that limitation instead of leaving it silent.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest as the roster reports it.
+        name: Participant that owns the lane.
+        version: First line the lane's client printed for `--version`, or
+            None when it was not asked, which leaves a `codex` lane's
+            release unjudged.
+
+    Returns:
+        `OPT_IN_UNSUPPORTED` filled in for the lane, or an empty
+        string when no approval is recorded or its adapter carries it.
+    """
+    participant = (manifest.get("participants") or {}).get(name) or {}
+    if not dialogs.pre_approved(manifest, name):
+        return ""
+    try:
+        adapter = roster.provider(home, participant.get("provider", name))[
+            "adapter"
+        ]
+    except BridgeError:
+        return ""
+    if roster.APPROVAL.get(adapter) is None:
+        limit = f"{adapter} offers no per-server tool approval to pass"
+    elif (
+        adapter == "codex"
+        and version is not None
+        and dialogs.release_of(version) < roster.CODEX_APPROVAL_RELEASE
+    ):
+        release = ".".join(map(str, roster.CODEX_APPROVAL_RELEASE))
+        limit = (
+            f"codex {version or 'of unknown release'} predates the "
+            f"per-server tool approval codex {release} reads"
+        )
+    else:
+        return ""
+    return OPT_IN_UNSUPPORTED.format(name=name, adapter=adapter, limit=limit)
 
 
 def reminders(

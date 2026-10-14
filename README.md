@@ -495,10 +495,12 @@ be set and at least 12 characters; inbound status queries are off.
   Agent Parley does not, and does not integrate with one.
 - **No silent merges.** A lane integrates only through `participant merge`, or
   `unattended run` for an issue a recorded `unattended` policy lists.
-- **No approvals on your behalf.** Two opt-ins exist for `claude` lanes:
-  `approve_bridge_tools` allows this project's own MCP tools and the CLI run
-  as one plain command, and `auto_mode` starts the client's own auto
-  permission mode, whose classifier still decides each command. Record either
+- **No approvals on your behalf.** Two opt-ins exist:
+  `approve_bridge_tools` allows this project's own MCP tools in every CLI's
+  own per-server allow except Amp's, which has none, plus the CLI run as one
+  plain command in a `claude` lane, and `auto_mode` starts the `claude`
+  client's own auto permission mode, whose classifier still decides each
+  command. Record either
   with `agent-parley approval resume --bridge-tools on` or
   `--auto-mode on`. A CLI call combined with a variable, `cd`, `;`, `&&`, a
   pipe or a redirect is refused with that one-command rule instead of

@@ -160,8 +160,10 @@ The command writes `approve_bridge_tools` under `supervision` in the project
 manifest, or on one lane with `--participant`; `--auto-mode on|off` records
 `auto_mode` the same way, and `approval resume` with no flag reports both for
 each lane. Only the operator can change them. The default is off and changes
-nothing about the client's configuration. While a `claude` lane the service
-could resume has neither this opt-in nor `auto_mode`, `run` and
+nothing about the client's configuration. Every adapter but `amp` carries the
+opt-in in its own per-server allow; [Providers](providers.md) lists each one.
+While such a lane the service could resume has neither this opt-in nor, for
+`claude`, `auto_mode`, `run` and
 `participant add` say so on standard error, `doctor` lists the lane under
 `approvals` as a setup gap with that command, and the service withholds its
 resume: the wake is recorded as `setup gap: bridge tool approval not recorded`

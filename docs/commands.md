@@ -105,7 +105,7 @@ on standard output and export to a file.
 | `issue ... --idempotency-key KEY` | Retry a transition safely; the repeat returns the first result. `issue claim`, `release`, `offer`, `accept`, `decline`, `cancel`, `block`, `unblock` and `request`, and `report`, accept it; `issue recover`, `resolve` and `assign` do not. |
 | `participant list` | List the project's lanes and their identities. |
 | `participant show NAME` | Show one lane: its branch, worktree, provider, account profile, advisory budget, current claims, reported outcome, last coordination, and how long its last launch took to reach the native CLI, split into worktree, `init` and CLI start. |
-| `participant add NAME` | Create a lane with an optional provider and credential profile. For a `claude` lane with no bridge tool approval recorded it warns that a service resume would stop at an unseen permission prompt and names `agent-parley approval resume --bridge-tools on` as the opt-in. |
+| `participant add NAME` | Create a lane with an optional provider and credential profile. For a lane on any adapter but `amp` with no bridge tool approval recorded it warns that a service resume would stop at an unseen permission prompt and names `agent-parley approval resume --bridge-tools on` as the opt-in. |
 | `participant restore NAME` | Restore the assigned branch while preserving work. |
 | `participant retire NAME` | Retire a lane that is no longer working while preserving recoverable work. Its issue claims return to the pool, takeover requests it made are withdrawn, its reservations are released and granted to queued peers, and mail it has not read or acknowledged is marked superseded. A lane holding ready work awaiting integration is refused before anything is removed. Lists the ignored files removing its worktree deletes and asks first; `--yes` skips the question. |
 | `participant pause NAME` | Refuse a lane's calls and tool use; keep its session and claims. |
@@ -120,7 +120,7 @@ on standard output and export to a file.
 | `reject NAME REASON` | Record a rejection and deliver the reason to the lane. |
 | `approval show` | Show which steps require a recorded approval first. |
 | `approval set [STEP ...]` | Require an approval before `merge`, `pr`, both, or none. |
-| `approval resume [--bridge-tools on\|off] [--auto-mode on\|off] [--participant NAME]` | Show or record whether the service may resume a `claude` lane without a terminal. |
+| `approval resume [--bridge-tools on\|off] [--auto-mode on\|off] [--participant NAME]` | Show or record whether the service may resume a lane without a terminal. With `--participant` it refuses `--auto-mode on` for a lane that is not `claude` and `--bridge-tools on` for an `amp` lane, naming the adapter. |
 | `provider list` | List built-in presets and local overrides. |
 | `provider show NAME` | Show one provider definition with the hooks its adapter cannot serve. |
 | `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
