@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
@@ -39,6 +40,12 @@ TIMEOUT = 300.0
 HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 CODEX_CACHE = Path("plugins/cache/agent-parley/agent-parley")
 SHELL = "shell"
+REPAIR_RECORD = "plugin-repair.json"
+REPAIRED = "repaired"
+FAILED = "failed"
+RETRY_FIRST = 60.0
+RETRY_CEILING = 3600.0
+REPAIR_ENV = "AGENT_PARLEY_PLUGIN_REPAIR"
 
 
 class Client(NamedTuple):
@@ -513,3 +520,118 @@ def install(home: Path | None = None) -> tuple[list[str], bool]:
                 lines.append(f"{prefix}: failed: {error}")
                 succeeded = False
     return lines, succeeded
+
+
+def repairs(home: Path) -> dict[str, dict]:
+    """Reads the service's record of plugin repairs, one entry per home.
+
+    Args:
+        home: Private bridge state root holding `REPAIR_RECORD`.
+
+    Returns:
+        Entries keyed by CLI name and config home, empty when the record is
+        missing or unreadable.
+    """
+    try:
+        recorded = json.loads((home / REPAIR_RECORD).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(recorded, dict):
+        return {}
+    return {
+        key: entry for key, entry in recorded.items() if isinstance(entry, dict)
+    }
+
+
+def repair(home: Path, now: float = 0.0) -> list[str]:
+    """Refreshes every installed plugin the running launcher has outgrown.
+
+    `uv tool upgrade` replaces the launcher and leaves the plugin each lane
+    loads in the native CLI's own cache, so six releases once ran with a
+    0.13.0 plugin in every lane. The coordination service calls this from
+    its supervision thread, never from a hook, so the repair runs inside a
+    process that is already running after every upgrade instead of
+    depending on an operator remembering `agent-parley plugins install`.
+
+    A config home is repaired only when the CLI's record already names an
+    installed manifest whose version differs from the launcher's, so a home
+    the operator never installed into is left alone. Each CLI and home is
+    installed at most once per launcher version. An install that fails, or
+    that leaves the manifest at another version, is recorded with the CLI's
+    error and retried on later calls after a delay doubling from
+    `RETRY_FIRST` to `RETRY_CEILING`. The install is `install_one`, so the
+    CLI's own plugin commands run in the operator's environment and nothing
+    reads a credential or loosens a permission. An operator who manages the
+    plugin another way sets `REPAIR_ENV` to ``off`` and nothing is run.
+
+    Args:
+        home: Private bridge state root, read for credential profile homes
+            and holding `REPAIR_RECORD`.
+        now: Unix time; the clock when zero.
+
+    Returns:
+        One line per install attempted, empty when nothing needed one.
+    """
+    from agent_parley.state import write_json
+
+    if os.environ.get(REPAIR_ENV, "").strip().lower() == "off":
+        return []
+    stamp = now or time.time()
+    launcher = protocol.launcher_version()
+    recorded = repairs(home)
+    done = []
+    for client, executable in detected():
+        for label, directory in config_dirs(home, client.name):
+            manifest = installed_manifest(client.name, directory)
+            if manifest is None:
+                continue
+            before = assessed(manifest)["version"]
+            key = f"{client.name}:{directory}"
+            prior = recorded.get(key) or {}
+            same = prior.get("launcher") == launcher
+            if before == launcher or (
+                same
+                and (
+                    prior.get("state") == REPAIRED
+                    or stamp < float(prior.get("next_at") or 0)
+                )
+            ):
+                continue
+            prefix = f"{client.name} ({label})" if label else client.name
+            error = ""
+            try:
+                install_one(
+                    client,
+                    executable,
+                    environment(client.name, label, directory),
+                    label,
+                )
+            except Failed as failure:
+                error = str(failure)
+            found = installed_manifest(client.name, directory)
+            after = assessed(found)["version"] if found else ""
+            if not error and after != launcher:
+                error = f"plugin still at {after or 'unknown'} after install"
+            attempts = int(prior.get("attempts") or 0) + 1 if same else 1
+            delay = min(RETRY_FIRST * 2 ** (attempts - 1), RETRY_CEILING)
+            recorded[key] = {
+                "client": client.name,
+                "label": label,
+                "directory": str(directory),
+                "launcher": launcher,
+                "from": before,
+                "to": after,
+                "state": FAILED if error else REPAIRED,
+                "at": stamp,
+                "attempts": attempts,
+                "next_at": stamp + delay if error else 0,
+                "error": error,
+            }
+            done.append(
+                f"{prefix}: plugin {before} {FAILED}: {error}"
+                if error
+                else f"{prefix}: plugin {before} {REPAIRED} to {after}"
+            )
+    if done:
+        write_json(home / REPAIR_RECORD, recorded)
+    return done

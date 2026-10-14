@@ -83,6 +83,7 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
             records.DEFAULT_HOMES, adapter, str(tmp_path / variable.lower())
         )
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    monkeypatch.setenv("AGENT_PARLEY_PLUGIN_REPAIR", "off")
     monkeypatch.delenv("OPENCODE_DB", raising=False)
     monkeypatch.delenv("AGENT_PARLEY_TOKEN", raising=False)
     monkeypatch.delenv("FORCE_COLOR", raising=False)

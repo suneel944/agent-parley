@@ -10237,11 +10237,19 @@ def run(home: Path, stopped: threading.Event) -> None:
 
     Once at start and then every `PRUNE_INTERVAL` seconds the store drops
     settled rows past its retention window through `store.prune`.
+
+    Once at start and then once per default poll interval, every installed
+    plugin older than this launcher is refreshed through `plugins.repair`.
+    A service starts after every upgrade, because a moved package restarts
+    it, so the first pass repairs the plugin without an operator command.
+    `up` does not repeat the call: the service it starts runs this pass at
+    once, and two installs into one CLI home at the same time would race.
     """
-    from agent_parley import server
+    from agent_parley import plugins, server
 
     deadlines: dict[Path, float] = {}
     pruned: float | None = None
+    repaired: float | None = None
     while not stopped.is_set():
         if pruned is None or time.monotonic() >= pruned:
             try:
@@ -10249,6 +10257,13 @@ def run(home: Path, stopped: threading.Event) -> None:
             except Exception as exc:
                 server.log(home, "supervision", failure("prune store", exc))
             pruned = time.monotonic() + PRUNE_INTERVAL
+        if repaired is None or time.monotonic() >= repaired:
+            try:
+                for line in plugins.repair(home):
+                    server.log(home, "plugins", line)
+            except Exception as exc:
+                server.log(home, "supervision", failure("repair plugins", exc))
+            repaired = time.monotonic() + DEFAULTS["interval"]
         for path in (home / "projects").glob("*/project.json"):
             if stopped.is_set():
                 return
