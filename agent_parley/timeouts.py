@@ -4,16 +4,17 @@ Hands-free work stalls whenever the operator is away: a question nobody
 answers holds its lane indefinitely, even when the choice is reversible and
 has an obvious answer. `KINDS` is the one table of decision kinds. Each kind
 declares whether it is ``reversible`` or ``irreversible``, the option the
-service recommends, and the command that undoes that option.
+service recommends, and the command that undoes that option. Every
+reversible kind is one `sweep` can settle, so `EVENTS` maps a notification
+to it; a kind with no producer is not declared.
 
 A reversible kind waits `TIMEOUT_SECONDS` for an answer. When it expires
 unanswered, `settle` returns the recommended option as ``applied by
 timeout`` with the evidence it used, `record` appends that to the lane's
 report log and `announce` sends one line naming what was done and the
 command that undoes it. A reversible kind whose evidence is already
-conclusive, such as an issue closed by a merged pull request from the
-current claim generation, is settled without asking at all and recorded as
-``applied on evidence``.
+conclusive is settled without asking at all and recorded as ``applied on
+evidence``.
 
 Each supervision poll runs `sweep` over the project's open decision records.
 `EVENTS` names the table kind each recorded notification kind settles as; a
@@ -87,24 +88,6 @@ KINDS: dict[str, Kind] = {
         "agent-parley issue assign {issue} {lane}",
         "reassign a dead lane's orphaned claim",
     ),
-    "closed_claim": Kind(
-        REVERSIBLE,
-        "resolve",
-        "agent-parley issue assign {issue} {lane}",
-        "end a claim whose issue a merged pull request closed",
-    ),
-    "idle_key": Kind(
-        REVERSIBLE,
-        "release",
-        "agent-parley say {lane} {key} --subject 'Reserve this key again'",
-        "release a key its idle holder never uses",
-    ),
-    "failed_ci": Kind(
-        REVERSIBLE,
-        "rerun once",
-        "gh run cancel {run}",
-        "re-run a failed CI job once",
-    ),
     "merge_default": Kind(
         IRREVERSIBLE, WAIT, "", "merge to the default branch"
     ),
@@ -143,21 +126,26 @@ def policy(manifest: dict) -> dict[str, dict]:
     Args:
         manifest: Project manifest using the participant roster layout.
 
+    An entry for a kind `KINDS` no longer declares, such as one a project
+    stored before that kind was retired, is dropped rather than refused, so
+    an old manifest keeps polling; it never made any kind act sooner.
+
     Returns:
         Per-kind entries, each either ``{"ask": True}`` or ``{"seconds":
         N}`` with N at least `TIMEOUT_SECONDS`.
 
     Raises:
-        BridgeError: If the recorded policy names an unknown kind, gives an
-            irreversible kind a timeout, or shortens a timeout. An invalid
-            policy is refused, never read as permission to act sooner.
+        BridgeError: If the recorded policy gives an irreversible kind a
+            timeout or shortens a timeout. An invalid policy is refused,
+            never read as permission to act sooner.
     """
     recorded = manifest.get(POLICY) or {}
     if not isinstance(recorded, dict):
         raise BridgeError("The recorded decision timeout policy is invalid.")
-    for name, entry in recorded.items():
+    known = {name: entry for name, entry in recorded.items() if name in KINDS}
+    for name, entry in known.items():
         _valid(name, entry)
-    return recorded
+    return known
 
 
 def _valid(name: str, entry: object) -> None:
