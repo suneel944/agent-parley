@@ -16,8 +16,17 @@ from agent_parley.worktrees import git
 
 @pytest.fixture
 def lanes(bridge, paired):
-    """Registers claude and codex and names the codex lane that edits."""
+    """Registers claude and codex and names the codex lane that edits.
+
+    The manifest starts without ``case_insensitive``, because Git on a
+    case-insensitive host such as macOS reports ``core.ignorecase`` true
+    and setup records the flag there.
+    """
     lane = Path(paired["lanes"]["codex"])
+    path = lane.parent / "project.json"
+    manifest = json.loads(path.read_text())
+    manifest.pop("case_insensitive", None)
+    write_json(path, manifest)
     store.initialize(bridge.home)
     actors = {
         name: store.authenticate(
