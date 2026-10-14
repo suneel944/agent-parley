@@ -708,13 +708,18 @@ def settled(directory: Path) -> None:
 def apply(db: sqlite3.Connection, root: str, items: list[dict]) -> int:
     """Applies queued evidence to the lane records in arrival order.
 
-    A hook seen from a lane recorded as dead or reclaimed proves a running
-    session, so the lane is started before the observed state is applied.
-    A new session identity is passed through, so a session change becomes
-    a transition that records both identities rather than a dropped hook.
-    An observation older than the record's last update, because it waited
-    in the spool while the store was busy, is applied at that update time
-    so a record's times never run backwards.
+    An observation taken before the lane entered its recorded state, such
+    as a tool hook still spooled when the launcher recorded `stopped`, is
+    older than that direct transition and moves nothing; it is recorded as
+    a `superseded` event instead. A reclaimed lane is left only by a launch,
+    so queued evidence never moves it either. A hook seen after a lane was
+    recorded dead proves a running session, so the lane is started before
+    the observed state is applied. A new session identity is passed
+    through, so a session change becomes a transition that records both
+    identities rather than a dropped hook. An observation that is newer
+    than the record's state but older than its last update, because it
+    waited in the spool while the store was busy, is applied at that update
+    time so a record's times never run backwards.
 
     Args:
         db: Open write transaction on the coordination store.
@@ -737,11 +742,27 @@ def apply(db: sqlite3.Connection, root: str, items: list[dict]) -> int:
         session = str(item.get("session", "")) or None
         current = read(db, root, lane)
         moment = float(item.get("ts") or time.time())
+        stale = current is not None and (
+            moment < float(current["since"]) or current["state"] == RECLAIMED
+        )
         if current is not None:
             moment = max(moment, float(current["updated"]))
+        if current is not None and stale:
+            _event(
+                db,
+                root,
+                lane,
+                "superseded",
+                current["state"],
+                target,
+                cause=cause,
+                evidence=evidence[:MAX_EVIDENCE],
+                now=moment,
+            )
+            continue
         if (
             current is not None
-            and current["state"] in (DEAD, RECLAIMED)
+            and current["state"] == DEAD
             and target in LIVE - {STARTING}
         ):
             transition(db, root, lane, STARTING, evidence=evidence, now=moment)
