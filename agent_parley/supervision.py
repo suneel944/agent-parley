@@ -33,6 +33,7 @@ from agent_parley import (
     lifecycle,
     notify,
     process,
+    protocol,
     reclaim,
     records,
     recovery,
@@ -8691,6 +8692,7 @@ def _poll(home: Path, directory: Path) -> None:
         manifest,
         config,
     )
+    stage("stale plugins", stale_plugins, home, directory, manifest, config)
     stage("dependencies", lifecycle.settle_dependencies, directory)
     stage(
         "forge issues",
@@ -10524,28 +10526,7 @@ def wake(
                 ) is None:
                     result = "busy:stale"
                 else:
-                    with (directory / f"{name}-wake.log").open("ab") as output:
-                        child = subprocess.Popen(
-                            [
-                                sys.executable,
-                                "-m",
-                                "agent_parley.cli",
-                                "--home",
-                                str(home),
-                                "run",
-                                name,
-                                "--repo",
-                                manifest["root"],
-                                "--resume",
-                                "--task",
-                                prompt,
-                            ],
-                            stdin=subprocess.DEVNULL,
-                            stdout=output,
-                            stderr=output,
-                            start_new_session=True,
-                        )
-                    track_launcher(child)
+                    child = _resume(home, directory, manifest, name, prompt)
                     result = f"resume requested (launcher {child.pid})"
         probe_exhaustion(directory, name, result)
         gap = result == OPT_IN_MISSING
@@ -10600,6 +10581,194 @@ def wake(
             None,
             result,
         )
+
+
+def _resume(
+    home: Path, directory: Path, manifest: dict, name: str, task: str = ""
+) -> subprocess.Popen[bytes]:
+    """Starts a detached launcher that resumes one lane's recorded session.
+
+    The launcher is this package's own ``run --resume``, so the lane keeps
+    its native authentication and permissions, and its output goes to the
+    lane's wake log.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant whose lane is resumed.
+        task: Prompt the resumed session starts on, or none.
+
+    Returns:
+        The tracked launcher process.
+    """
+    command = [
+        sys.executable,
+        "-m",
+        "agent_parley.cli",
+        "--home",
+        str(home),
+        "run",
+        name,
+        "--repo",
+        manifest["root"],
+        "--resume",
+    ]
+    if task:
+        command += ["--task", task]
+    with (directory / f"{name}-wake.log").open("ab") as output:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=output,
+            start_new_session=True,
+        )
+    track_launcher(child)
+    return child
+
+
+def _idle(home: Path, root: str, name: str, state: dict) -> bool:
+    """Reports whether a lane is idle with no turn in flight.
+
+    The lane condition decides; the activity label stands in only when no
+    condition was recorded.
+
+    Args:
+        home: Private bridge state root.
+        root: Repository root the lane belongs to.
+        name: Lane participant name.
+        state: The lane's activity record.
+
+    Returns:
+        True when the lane is idle.
+    """
+    seen = condition(home, root, name) or {}
+    return (seen.get("state") or state.get("activity")) == lanes.IDLE
+
+
+def stale_plugins(
+    home: Path, directory: Path, manifest: dict, config: dict
+) -> list[str]:
+    """Restarts unattended lanes whose session loaded a replaced plugin.
+
+    A running native session cannot reload its hooks and skills, so a lane
+    launched before an upgrade keeps the old plugin until it restarts. The
+    hook tells every such lane to finish its step and resume; a lane whose
+    launcher has no terminal, which the service resumes and nobody types
+    in, is restarted here instead so a headless estate converges without
+    an operator. A lane is restarted only when its activity record names a
+    ``plugin_version`` other than the launcher's, `plugins.repair` recorded
+    a successful refresh of its config home for this launcher, its session
+    is alive and idle with no turn in flight, and the service would resume
+    it at all: wakes are on, it is neither paused, retired, stopped by the
+    operator nor waiting on a bridge tool opt-in, it has a resumable
+    session no takeover fenced, and its provider is a native adapter that
+    needs no extra environment. These are the checks the wake path makes
+    before a resume, so no lane is ended that ``run --resume`` cannot bring
+    back. A lane with a terminal is never restarted, because its operator's
+    session must not vanish under them. Under the lane's checkpoint lock
+    the activity record is read again, and the lane is skipped unless the
+    same session process is still idle. The stop runs after the lock is
+    released, because the ending session's own hooks take that lock and
+    would hold its exit past the shutdown timeout. The session is ended
+    through the same verified stop `participant stop` uses, whose start
+    identity check refuses a replaced process, and resumed with
+    ``run --resume``. The
+    launcher version is recorded as ``plugin_restart`` before the stop, so
+    a lane is restarted at most once per launcher version even if its new
+    session still loads an old plugin.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        config: Resolved supervision settings.
+
+    Returns:
+        The lanes this pass restarted, in name order.
+    """
+    from agent_parley import checkpoints, plugins
+
+    recorded = plugins.repairs(home) if config["wake"] else {}
+    if not recorded:
+        return []
+    launcher = protocol.launcher_version()
+    restarted = []
+    for name in sorted(manifest["participants"]):
+        participant = manifest["participants"][name]
+        if (
+            not participant.get("wake", True)
+            or participant.get("paused", False)
+            or roster.retired(participant)
+        ):
+            continue
+        state = checkpoints.activity(directory, name)
+        loaded, aged = protocol.lane_plugin(state)
+        if (
+            not aged
+            or state.get("attached") is not False
+            or state.get("operator_stopped")
+            or state.get("plugin_restart") == launcher
+            or rebooted(state)
+        ):
+            continue
+        repair = plugins.lane_repair(home, participant, recorded)
+        if (
+            repair.get("state") != plugins.REPAIRED
+            or repair.get("launcher") != launcher
+        ):
+            continue
+        if not _idle(home, manifest["root"], name, state):
+            continue
+        session = str(
+            state.get("resumable_session", state.get("session_id")) or ""
+        )
+        entry = roster.provider(home, participant["provider"])
+        if (
+            not session
+            or _fenced(directory, name, state)
+            or entry["adapter"] not in roster.ADAPTERS
+            or entry.get("require_env")
+        ):
+            continue
+        pid = state.get("session_pid")
+        ticks = str(state.get("session_ticks") or "")
+        if (
+            type(pid) is not int
+            or not process.alive(pid, ticks)
+            or opt_in_missing(home, manifest, name)
+        ):
+            continue
+        try:
+            with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+                current = checkpoints.activity(directory, name)
+                if (
+                    current.get("session_pid") != pid
+                    or str(current.get("session_ticks") or "") != ticks
+                    or not _idle(home, manifest["root"], name, current)
+                ):
+                    continue
+                current.update(plugin_restart=launcher)
+                write_json(directory / f"{name}-activity.json", current)
+            process.ServerProcess(pid, ticks).stop()
+        except (BridgeError, OSError) as exc:
+            issues.note_supervision_error(
+                directory, f"plugin restart {name}: {exc}"
+            )
+            continue
+        child = _resume(home, directory, manifest, name)
+        checkpoints.record(
+            directory,
+            name,
+            {"hook_event_name": "RuntimeWake"},
+            checkpoints.Reason.WAKE_REQUESTED,
+            None,
+            f"plugin {loaded} replaced by {launcher}: resume requested "
+            f"(launcher {child.pid})",
+        )
+        restarted.append(name)
+    return restarted
 
 
 def run(home: Path, stopped: threading.Event) -> None:

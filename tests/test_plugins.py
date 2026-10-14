@@ -345,16 +345,16 @@ def test_lanes_started_before_a_repair_are_named_with_their_resume(
     bridge.add_participant(repo, "lane-2", "claude")
     directory = bridge.project(repo, create=False)[1]
     plugins.repair(bridge.home, now=1000.0)
-    for name, started in (("lane-1", 900.0), ("lane-2", 1100.0)):
-        (directory / f"{name}-activity.json").write_text(
-            json.dumps({"session_started": started, "client": "claude"})
-        )
     root = str(repo.resolve())
     project = {
         "root": root,
         "participants": [
-            {"participant": name, "availability": {"process_alive": True}}
-            for name in ("lane-1", "lane-2")
+            {
+                "participant": name,
+                "availability": {"process_alive": True},
+                "session_started": started,
+            }
+            for name, started in (("lane-1", 900.0), ("lane-2", 1100.0))
         ],
     }
     data = roster.read(directory)
@@ -378,3 +378,33 @@ def test_lanes_started_before_a_repair_are_named_with_their_resume(
     [row] = problems._plugin_rows(bridge.home, directory, data, project, 1200)
     assert "failed, retrying: offline" in row["detail"]
     assert row["command"] == "agent-parley plugins install"
+
+
+def test_lanes_on_an_older_plugin_name_the_oldest_resume(bridge, repo):
+    from agent_parley import problems
+
+    for name in ("lane-1", "lane-2", "lane-3"):
+        bridge.add_participant(repo, name, "claude")
+    directory = bridge.project(repo, create=False)[1]
+    project = {
+        "root": str(repo.resolve()),
+        "participants": [
+            {
+                "participant": name,
+                "availability": {"process_alive": True},
+                "plugin_stale": name != "lane-3",
+                "session_started": started,
+            }
+            for name, started in (
+                ("lane-1", 900.0),
+                ("lane-2", 800.0),
+                ("lane-3", 700.0),
+            )
+        ],
+    }
+    data = roster.read(directory)
+    [row] = problems._plugin_rows(bridge.home, directory, data, project, 1000)
+    assert "lane-1, lane-2" in row["detail"] and "lane-3" not in row["detail"]
+    assert "agent-parley run lane-2 --repo" in row["command"]
+    assert "lane-1" not in row["command"]
+    assert (row["count"], row["seconds"]) == (2, 200)

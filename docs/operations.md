@@ -41,10 +41,31 @@ at most once per launcher version and home. A home the plugin was never
 installed into is left alone. A failed refresh is logged with the CLI's error
 and retried with a delay doubling from one minute to an hour. Native sessions
 read their plugin at start, so `problems` then lists a `plugin stale` row
-naming the live lanes started before the refresh, with the command that
-relaunches each. Setting `AGENT_PARLEY_PLUGIN_REPAIR=off` in the service's
+naming the live lanes started before the refresh or running an older plugin,
+with the command that relaunches the oldest. Setting `AGENT_PARLEY_PLUGIN_REPAIR=off` in the service's
 environment turns the repair off for an estate that manages its plugins another
-way. The manual steps follow.
+way.
+
+Each launch records the plugin version its session loaded in the lane's
+activity record, and `status --json` and `top --json` carry it per lane as
+`plugin_version`, with `plugin_stale` true when it differs from the launcher.
+A lane launched before the field existed reports `unknown` and is never stale.
+Neither command nor the hook reads a plugin manifest to answer this. A stale
+lane is marked in `top` with `plugin VERSION stale; agent-parley run NAME
+--resume`, and its hook tells it once to finish its current step and end its
+turn, blocking one `Stop` so the notice is read. The agent never runs the
+restart itself; the operator, or the service for an unattended lane, runs
+`agent-parley run NAME --resume`. A lane counts as unattended when its
+activity record says `attached` is false, meaning its launcher has no
+terminal, and its participant has wakes on; the manifest has no separate
+unattended marker. The service restarts an unattended lane once its plugin
+refresh for that lane's config home succeeded and the lane could be resumed at
+all: it has a resumable session no takeover fenced, a native provider that
+needs no extra environment, and no missing bridge tool opt-in. When the same
+session process is still idle with no turn in flight, the session is ended the
+way `participant stop` ends one and resumed with `run --resume`, at most once
+per launcher version. A lane with a terminal is never restarted; the notice
+and the `top` marker are its surface. The manual steps follow.
 
 Installing needs no clone. `uv tool install agent-parley` takes the published
 distribution from PyPI. `uv tool install git+https://github.com/suneel944/agent-parley`
@@ -579,7 +600,7 @@ condition, that count, its age and what clears it:
 | `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
 | `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
 | `root returned` | The project root came back after lanes retired for its absence. The row names those lanes until each is re-admitted. | `agent-parley participant add NAME --repo ROOT` for each lane named |
-| `plugin stale` | The service refreshed a plugin older than the launcher, and these live lanes started their sessions before the refresh, so they still run the old plugin. A refresh that failed is named with the CLI's error instead; the service retries it. | End each named session, then `agent-parley run NAME --repo ROOT --resume`; for a failed refresh, `agent-parley plugins install` |
+| `plugin stale` | These live lanes run an old plugin: the service refreshed it after their sessions started, or their recorded `plugin_version` differs from the launcher. One row per project names them all. A refresh that failed is named with the CLI's error instead; the service retries it. | End the oldest named session, then `agent-parley run NAME --repo ROOT --resume`; for a failed refresh, `agent-parley plugins install` |
 | `escalated plan revision` | A lane's plan revision touched an edge already revised back and forth under the current plan version, so it was escalated instead of applied. One row per escalated proposal, on the proposing lane, among the retained proposals. | `agent-parley plan approve ID` or `agent-parley plan reject ID --reason TEXT` |
 | `plan revisions pending` | Plan revisions outside the operator's envelope wait for a decision. One row per project counts them and ages from the oldest. | `agent-parley plan proposals`, then approve or reject each |
 | `orphaned claims` | The lane's session process is gone and the supervisor marked claims it holds orphaned, and the lane is not yet `ready to retire`. The row is derived from the ledger, so it shows whether or not a notification transport is configured. | `agent-parley issue claim N --take-orphaned` from a live peer lane; with no live lane besides the holder, start one with `agent-parley run NAME` and have it take the claim, or `agent-parley issue release N`. |

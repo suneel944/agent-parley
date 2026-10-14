@@ -1790,8 +1790,10 @@ def _plugin_rows(
 
     A native CLI reads its plugin when a session starts, so a refresh that
     `plugins.repair` records reaches only the sessions started after it. A
-    live lane whose config home was refreshed after its session started is
-    named with the command that relaunches it. A config home whose refresh
+    live lane whose config home was refreshed after its session started, or
+    whose status reports ``plugin_stale`` from the version its launch
+    recorded, is named, and the row carries the command that relaunches the
+    one whose session started first. A config home whose refresh
     failed is named with the CLI's error instead, because relaunching a lane
     onto it would load the same old plugin; the service retries the refresh.
 
@@ -1805,12 +1807,10 @@ def _plugin_rows(
     Returns:
         One row naming the stale lanes or failed refreshes, or none.
     """
-    from agent_parley import checkpoints, plugins
+    from agent_parley import plugins
 
     recorded = plugins.repairs(home)
-    if not recorded:
-        return []
-    stale: list[str] = []
+    stale: dict[str, float] = {}
     failed: dict[str, dict] = {}
     since: float | None = None
     for record in project["participants"]:
@@ -1822,39 +1822,31 @@ def _plugin_rows(
             or availability.get("process_alive") is not True
         ):
             continue
-        try:
-            provider = roster.provider(home, entry["provider"])
-            selected = roster.config_home(
-                home, provider, entry.get("credential")
-            )
-        except (BridgeError, KeyError):
-            continue
-        adapter = provider.get("adapter", "")
-        if adapter not in plugins.HOME_ENV:
-            continue
-        config = (
-            Path(selected)
-            if selected
-            else Path(records.DEFAULT_HOMES[adapter]).expanduser()
-        )
-        repair = recorded.get(f"{adapter}:{config}")
-        if not repair:
-            continue
+        repair = plugins.lane_repair(home, entry, recorded) if recorded else {}
         if repair.get("state") == plugins.FAILED:
-            failed[f"{adapter}:{config}"] = repair
+            key = f"{repair.get('client')}:{repair.get('directory')}"
+            failed[key] = repair
             continue
-        started = checkpoints.activity(directory, name).get("session_started")
+        aged = record.get("plugin_stale") is True
+        if not (aged or repair):
+            continue
+        started = record.get("session_started")
         at = float(repair.get("at") or 0)
-        if isinstance(started, (int, float)) and started < at:
-            stale.append(name)
-            since = at if since is None else min(since, at)
+        before = isinstance(started, (int, float)) and started < at
+        if not (aged or before):
+            continue
+        stale[name] = (
+            float(started) if isinstance(started, (int, float)) else now
+        )
+        mark = at or stale[name]
+        since = mark if since is None else min(since, mark)
     if not stale and not failed:
         return []
     parts = []
     if stale:
         parts.append(
-            "these lanes loaded their plugin before the service refreshed "
-            f"it: {', '.join(stale)}"
+            "these lanes run a plugin older than the launcher or the "
+            f"service's refresh: {', '.join(stale)}"
         )
     for repair in failed.values():
         prefix = repair.get("client", "")
@@ -1868,10 +1860,8 @@ def _plugin_rows(
         since = at if since is None else min(since, at)
     repo = f"--repo {shlex.quote(project['root'])}"
     command = (
-        "end each session, then: "
-        + "; ".join(
-            f"agent-parley run {name} {repo} --resume" for name in stale
-        )
+        "end the oldest session, then: agent-parley run "
+        f"{min(stale, key=stale.__getitem__)} {repo} --resume"
         if stale
         else "agent-parley plugins install"
     )

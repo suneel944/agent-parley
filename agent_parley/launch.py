@@ -491,7 +491,12 @@ reported.
         The activity record names the client's adapter as ``client`` and
         the first line its ``--version`` prints as ``client_version``, so
         the dialog watcher and ``doctor`` can name the release that drew a
-        dialog; a client that cannot say leaves the version empty.
+        dialog; a client that cannot say leaves the version empty. It also
+        holds the version of the plugin manifest this launch read as
+        ``plugin_version``, so the hook, `status`, `top` and supervision
+        learn that the session runs a plugin older than the launcher without
+        reading a manifest themselves, and it drops ``plugin_notified`` so
+        the new session is told once if it is stale too.
 
         Before anything is registered the launch takes one
         `process.host_load` reading and refuses while the host is past the
@@ -630,8 +635,10 @@ reported.
         manifest = loaded or protocol.manifests(protocol.plugin_root()).get(
             entry["adapter"]
         )
+        plugin_version = ""
         if manifest is not None and manifest.exists():
             reading = plugins.assessed(manifest)
+            plugin_version = str(reading["version"] or "")
             if reading["state"] == protocol.MISMATCH:
                 raise BridgeError(
                     protocol.mismatch("installed plugin", reading["protocol"]),
@@ -991,8 +998,10 @@ reported.
                     attached=sys.stdin.isatty(),
                     client=entry["adapter"],
                     client_version=client_version,
+                    plugin_version=plugin_version,
                     degraded=degraded,
                 )
+                previous.pop("plugin_notified", None)
                 previous.pop("last_prompt", None)
                 previous.pop("operator_stopped", None)
                 previous.pop("rotation", None)
