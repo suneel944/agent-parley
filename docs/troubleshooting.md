@@ -13,7 +13,7 @@ detail: [Running lanes](lanes.md), [Monitoring](monitoring.md),
 | --- | --- | --- |
 | `Service:` reads `not running` in `agent-parley status` | The coordination service is a user process and does not survive a reboot or a `down`. | Run `agent-parley up`. `agent-parley run` starts it too. To bring it back after a reboot, see [Keeping the service across reboots](operations.md#keeping-the-service-across-reboots). |
 | `Install and sign in to the native` CLI named for the lane's provider, then `first.` | The provider's command is not on your path. Agent Parley drives the vendor's own CLI and keeps its sign-in. | Install that CLI, sign in to it in your own terminal, and run the command again. [Providers](providers.md) names the CLI for each provider. |
-| `Run this from an assigned agent worktree, not the main checkout.` | The command acts as a lane and found no lane for the directory it ran in. | Run it from the lane's worktree. `agent-parley participant list` shows the lanes and where each one works. |
+| `Run this from an assigned agent worktree, not the main checkout` | The command acts as a lane and found no lane for the directory it ran in. The message names an active lane's worktree, or says the project has no active lane yet. | Run it from the named worktree, or start a lane with `agent-parley run claude`. `agent-parley participant list` shows the lanes and where each one works. |
 
 ## Reading `status`
 
