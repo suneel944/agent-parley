@@ -241,7 +241,9 @@ lane. The supervision key `titles` turns the tab title off; the details are in
 
 ## `status`
 
-`status` prints the `Service:` line, a `Code:` line only when the service is
+`status` prints the `Service:` line, followed by `agent-parley up starts the
+coordination service these lanes need.` only when the service is not running,
+the same remedy `doctor` prints, a `Code:` line only when the service is
 stale, a `Store:` line only when the schema needs a repair, the `Notify:` line
 and the `State:` line, and then,
 per project, the open work: each live claim's issue, title, owner, lane state,

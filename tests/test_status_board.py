@@ -17,6 +17,7 @@ from agent_parley import (
     forge,
     issues,
     lifecycle,
+    protocol,
     roster,
     store,
     supervision,
@@ -795,3 +796,17 @@ def test_fold_after_is_bounded_like_every_other_interval():
     assert supervision.settings({})["fold_after"] == 86400
     with pytest.raises(cli.BridgeError, match="fold_after"):
         supervision.settings({"fold_after": 0})
+
+
+def test_a_stopped_service_names_agent_parley_up_once(bridge, capsys):
+    stopped = {"server": {"ready": False, "state": ""}, "state_directory": "s"}
+    bridge._health(stopped)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == [f"Service: {protocol.STOPPED}", protocol.START]
+    assert lines.count(protocol.START) == 1
+    for server in (
+        {"ready": True, "state": "ready"},
+        {"ready": False, "state": protocol.STALE},
+    ):
+        bridge._health({"server": server, "state_directory": "s"})
+        assert protocol.START not in capsys.readouterr().out
