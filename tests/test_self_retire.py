@@ -435,3 +435,76 @@ def test_a_held_lane_lock_refuses_the_retirement_and_changes_nothing(
     result = retirement.withdraw(directory, "claude")
     assert result["worktree"] == retirement.PRUNED
     assert not identity.exists()
+
+
+def lapsed(directory, number):
+    """Ages one record's takeover request past any grace window."""
+    ledger = issues.snapshot(directory)
+    ledger["issues"][number]["request"]["created"] = time.time() - 3600
+    write_json(directory / "issues.json", ledger)
+
+
+def test_a_retiring_lane_withdraws_the_requests_it_made(bridge, repo, paired):
+    directory = bridge.project(repo)[1]
+    bridge.issue(paired["lanes"]["codex"], "claim", "8")
+    bridge.issue(paired["lanes"]["claude"], "request", "8")
+
+    retirement.withdraw(directory, "claude")
+
+    record = issues.snapshot(directory)["issues"]["8"]
+    assert record["request"] is None
+    assert record["history"][-1]["action"] == "withdraw"
+    assert record["owner"] == "codex"
+
+
+def test_a_retired_lane_is_never_prompted_for_the_claims_it_released(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    bridge.issue(paired["lanes"]["claude"], "claim", "4")
+    codex = paired["lanes"]["codex"]
+    bridge.issue(codex, "claim", "5")
+    bridge.report(
+        codex, "blocked", "Waiting.", "needs #4", "", issue="5", resume_on="4"
+    )
+    retirement.withdraw(directory, "claude")
+
+    supervision.reminders(directory, roster.read(directory), set())
+
+    prompt = issues.snapshot(directory)["issues"]["4"]["handoff_prompt"]
+    assert prompt["holder"] == "claude"
+    assert prompt["responded_at"]
+    assert prompt["answered_by"] == "supervisor"
+
+
+def test_a_lapsed_request_by_a_retired_lane_is_withdrawn_not_granted(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    bridge.issue(paired["lanes"]["codex"], "claim", "8")
+    bridge.issue(paired["lanes"]["claude"], "request", "8")
+    retirement.mark(directory, "claude", time.time())
+    lapsed(directory, "8")
+
+    assert issues.grant_requests(directory, 0.0, {}, {"codex"}) == []
+
+    record = issues.snapshot(directory)["issues"]["8"]
+    assert record["offer"] is None
+    assert record["request"] is None
+    assert record["history"][-1]["action"] == "withdraw"
+    assert record["history"][-1]["actor"] == "supervisor"
+
+
+def test_a_dead_lanes_claim_is_never_given_to_a_retired_requester(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    bridge.issue(paired["lanes"]["codex"], "claim", "8")
+    bridge.issue(paired["lanes"]["claude"], "request", "8")
+    retirement.mark(directory, "claude", time.time())
+
+    report = retirement.abandon(directory, "codex")
+
+    assert report["released"] == ["8"]
+    assert report["given"] == {}
+    assert issues.snapshot(directory)["issues"]["8"]["owner"] is None

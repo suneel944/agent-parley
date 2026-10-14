@@ -8199,6 +8199,11 @@ def _poll(home: Path, directory: Path) -> None:
             directory,
             config["takeover_grace"],
             manifest.get("deadlines") or {},
+            {
+                name
+                for name, participant in manifest["participants"].items()
+                if not roster.retired(participant)
+            },
         )
     stage("blueprints", blueprint_runs, home, directory, manifest)
     stage(

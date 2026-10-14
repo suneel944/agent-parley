@@ -2156,7 +2156,8 @@ issue to the requesting lane; the holder answers with `issue accept` or
 `issue decline` and the request identifier, and a holder that neither answers
 nor records progress on the claim within `takeover_grace` has the request
 granted by the supervisor as an offer to the requesting lane, whose acceptance
-moves ownership.
+moves ownership. A request from a lane that has since retired or left the
+project is withdrawn by the supervisor instead of granted.
 The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
 `wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant

@@ -159,6 +159,11 @@ def _awaits(record: dict) -> bool:
 def return_work(directory: Path, manifest: dict, name: str) -> dict:
     """Returns every piece of work a retiring lane holds or was offered.
 
+    Every takeover request the lane made is withdrawn and every completion
+    reminder addressed to it is stamped answered, as `abandon` does for a
+    dead lane, so the supervisor never grants a retired lane a peer's claim
+    and no peer waits on a reminder the lane will never answer.
+
     Args:
         directory: Private state directory for the common repository.
         manifest: Current project manifest.
@@ -221,6 +226,7 @@ def return_work(directory: Path, manifest: dict, name: str) -> dict:
             offer_id=str(offer["id"]),
         )
         declined.append(number)
+    _silence(directory, name)
     return {"released": released, "declined": declined, "senders": senders}
 
 
@@ -346,6 +352,11 @@ def abandon(directory: Path, name: str, cap: int | None = None) -> dict:
         if participant is None or roster.retired(participant):
             return report
         participants = set(manifest["participants"])
+        live = {
+            peer
+            for peer, entry in manifest["participants"].items()
+            if not roster.retired(entry)
+        }
         ledger = issues.snapshot(directory)
         for number in sorted(ledger["issues"], key=int):
             offer = ledger["issues"][number].get("offer") or {}
@@ -387,7 +398,7 @@ def abandon(directory: Path, name: str, cap: int | None = None) -> dict:
                 report["kept"].append(number)
                 continue
             report["released"].append(number)
-            if peer in participants - {name} and not issues.closed(record):
+            if peer in live - {name} and not issues.closed(record):
                 try:
                     issues.change(
                         directory,
@@ -405,11 +416,11 @@ def abandon(directory: Path, name: str, cap: int | None = None) -> dict:
 
 
 def _silence(directory: Path, name: str) -> None:
-    """Withdraws a dead lane's requests and answers its reminders.
+    """Withdraws a gone lane's requests and answers its reminders.
 
     Args:
         directory: Private state directory for the common repository.
-        name: Participant proved dead.
+        name: Participant proved dead or retiring.
     """
     now = time.time()
     with lock(directory / "issues.lock", timeout=LOCK_SECONDS):
