@@ -20,7 +20,13 @@ answered.
 
 The patterns are recorded from the client versions `RECORDED` names: the
 `claude` CLI's dialogs, and the Codex CLI's trust prompt and its approvals to
-run a command, make edits and grant permissions. The launch records the
+run a command, make edits and grant permissions. The approvals of the
+Gemini CLI, GitHub Copilot CLI, OpenCode and Amp are read from the option
+words those releases ship, `Allow once` followed by a wider allow or a
+reject, and Copilot's `Do you want to run this command?`; none of them is
+answered, each is escalated as an unrecognized prompt after the deadline,
+because only Claude's and Codex's option lists were recorded from a live
+terminal. The launch records the
 version of the client it starts, every published dialog names it, and
 `doctor` reports a lane whose client is newer than its recorded version or
 whose dialog this module could not read, so a reworded dialog is found
@@ -91,7 +97,14 @@ ESCALATE_AFTER = 30.0
 REPEAT_LIMIT = 2
 SILENT_AFTER = 5.0
 VERSION_TIMEOUT = 5.0
-RECORDED = {"claude": "2.1.270", "codex": "0.153.4"}
+RECORDED = {
+    "claude": "2.1.270",
+    "codex": "0.153.4",
+    "copilot": "1.0.35",
+    "gemini": "0.64.0",
+    "opencode": "1.19.0",
+    "amp": "0.0.1791936083",
+}
 PENDING_TOOL = "PreToolUse"
 STALLED = "a silent screen after a tool call"
 RELEASE = re.compile(r"\d+(?:\.\d+)+")
@@ -137,7 +150,7 @@ FOOTER = re.compile(
 QUESTION_LINE = re.compile(r"([^?!›❯☐☒✔]{3,}\?)")
 PROMPT_SHAPE = re.compile(
     r"do you want to|\(y/n\)|press enter to confirm|esc to cancel"
-    r"|\d\.\s+yes\b",
+    r"|\d\.\s+yes\b|\ballow once\b.{1,80}?\b(?:allow|reject)\b",
     re.IGNORECASE,
 )
 RESETS = re.compile(

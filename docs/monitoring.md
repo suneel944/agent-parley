@@ -96,6 +96,19 @@ parks the lane. Once a dialog is answered, by the launcher or by a digit,
 Enter, Esc or Ctrl-C you type in the lane's terminal, the next screen output
 releases the lane; any other key leaves it held.
 
+Any other screen that ends on a waiting prompt is escalated as an unrecognized
+native prompt once it has stayed unchanged for thirty seconds, and is never
+answered. That covers the approval prompts of the other providers, read from
+the wording their releases ship: Gemini CLI 0.64.0 (`Allow execution of
+[Shell]?` or `Apply this change?` over `1. Allow once`), GitHub Copilot CLI
+1.0.35 (`Do you want to run this command?`), OpenCode 1.19.0 (`Permission
+required` with `Allow once`, `Always allow` and `Reject`) and Amp
+0.0.1791936083 (`Approval Required` with `Allow Once` and `Allow All for This
+Session`). A screen in wording nobody recorded is escalated the same way when
+it stays silent after the lane's last hook announced a tool call. `doctor`
+names a lane whose client is newer than the release its wording was read
+from.
+
 `directory-trust` is the screen that asks whether you trust the folder. Codex
 records that trust for the repository root, so trusting a lane's worktree also
 covers the shared project. `question` is the client asking you a question
