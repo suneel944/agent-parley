@@ -272,6 +272,14 @@ gh workflow run release-version.yml --ref main --field kind=patch
 
 When the request counts no product commit, the changelog entry lists every
 commit the release ships under `Changes` instead of the typed sections.
+A counted commit whose body has `### ` subsections under
+`## Problem and result`, such as a milestone squash, contributes those
+subsections and their bullets instead of one line. The bullets of its
+`## Compatibility and risks` section, without the template checklist, become
+`Upgrade notes`, and one line links the closed issues of the milestone named
+after the version through a title search rather than the milestone number,
+so the entry needs no network. Other commits keep one line each with one link
+per issue.
 Dispatching `Release` by hand with an existing tag is the retry and
 republication route; it never creates a version.
 
