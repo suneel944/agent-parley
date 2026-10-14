@@ -310,7 +310,11 @@ away the dialog record must be withdrawn and the previous activity
 restored.
 
 An unrecognized prompt that holds an unchanged screen for thirty seconds
-escalates rather than guessing a key.
+escalates rather than guessing a key. The Gemini CLI, GitHub Copilot CLI,
+OpenCode and Amp approvals take that path; their wording was read from the
+releases [monitoring](monitoring.md#a-lane-held-by-a-native-dialog) names,
+not captured from a live terminal, so record one live approval per provider
+and note the client version when that provider is available.
 
 ## Answering a dialog
 

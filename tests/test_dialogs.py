@@ -97,10 +97,81 @@ CODEX_GRANT = (
     "\r\n\r\n  Press enter to confirm or esc to cancel\r\n"
 )
 
-OPENCODE_LIKE = (
-    "\x1b[2J\x1b[H  △ Permission required\r\n  $ rm -rf build\r\n"
-    "  Allow once   Allow always   Reject\r\n"
+UNRECORDED_APPROVAL = (
+    "\x1b[2J\x1b[H  ⚠ Tool call held\r\n  $ rm -rf build\r\n"
+    "  [a] Approve   [d] Deny\r\n"
 )
+
+GEMINI_RUN = (
+    "\x1b[2J\x1b[H\x1b[38;2;249;226;175m╭──────────────────────────────────"
+    "──────────╮\r\n│ ?  Shell rm -rf build                       │\r\n│"
+    "                                            │\r\n│   rm -rf build    "
+    "                         │\r\n│                                       "
+    "     │\r\n│ Allow execution of [Shell]?                │\r\n│      "
+    "                                      │\r\n│ ● 1. Allow once         "
+    "                   │\r\n│   2. Allow for this session              "
+    "  │\r\n│   3. Allow this command for all future sessions │\r\n│   4."
+    " No, suggest changes (esc)               │\r\n╰──────────────────────"
+    "──────────────────────╯\x1b[0m\r\n"
+)
+
+GEMINI_EDIT = (
+    "\x1b[2J\x1b[H╭────────────────────────────────────────────╮\r\n│ ?"
+    "  WriteFile Writing to README.md          │\r\n│   1 + Install with "
+    "uv.                      │\r\n│ Apply this change?                    "
+    "     │\r\n│ ● 1. Allow once                            │\r\n│   2. "
+    "Allow for this session                 │\r\n│   3. Allow for this fi"
+    "le in all future sessions │\r\n│   4. Modify with external editor    "
+    "       │\r\n│   5. No, suggest changes (esc)               │\r\n╰────"
+    "────────────────────────────────────────╯\r\n"
+)
+
+COPILOT_RUN = (
+    "\x1b[2J\x1b[H ╭───────────────────────────────────────────────────────"
+    "──╮\r\n │ Run command                                             │\r\n"
+    " │ $ sed -i 's/old/new/' README.md                         │\r\n │ Do"
+    " you want to run this command?                          │\r\n │      "
+    "                                                   │\r\n │ ❯ 1. Yes   "
+    "                                             │\r\n │   2. Yes, and appr"
+    "ove `sed` for the rest of the running session │\r\n │   3. No, and tel"
+    "l Copilot what to do differently (Esc)       │\r\n ╰─────────────────"
+    "────────────────────────────────────────╯\r\n"
+)
+
+OPENCODE_PERMISSION = (
+    "\x1b[2J\x1b[H┃  \x1b[38;2;245;167;66m△\x1b[0m Permission required\r\n"
+    "┃  ← Bash  Remove the build directory\r\n┃\r\n┃  $ rm -rf build\r\n"
+    "┃\r\n┃  \x1b[48;2;250;178;131m Allow once \x1b[0m  Always allow   Reject"
+    "      ctrl+f fullscreen   ⇆ select   enter confirm\r\n"
+)
+
+AMP_APPROVAL = (
+    "\x1b[2J\x1b[H╭─ Approval Required ───────────────────────────────╮\r\n"
+    "│ Bash  rm -rf build                                │\r\n│           "
+    "                                        │\r\n│ ▸ Allow Once            "
+    "                          │\r\n│   Allow All for This Session         "
+    "             │\r\n│   Allow All for Every Session                     "
+    "│\r\n│   Reject with feedback                            │\r\n╰──────"
+    "─────────────────────────────────────────────╯\r\n"
+)
+
+AMP_GUARDED = (
+    "\x1b[2J\x1b[H╭─ Guarded File Modification ───────────────────────╮\r\n"
+    "│ edit_file  .github/workflows/check.yml            │\r\n│ ▸ Allow On"
+    "ce                                        │\r\n│   Always Allow This Pa"
+    "th                            │\r\n│   Reject                         "
+    "                 │\r\n╰───────────────────────────────────────────────"
+    "────╯\r\n"
+)
+
+APPROVALS = {
+    "claude": TOOL_PERMISSION,
+    "codex": CODEX_RUN,
+    "copilot": COPILOT_RUN,
+    "gemini": GEMINI_RUN,
+    "opencode": OPENCODE_PERMISSION,
+    "amp": AMP_APPROVAL,
+}
 
 CLAUDE_TRUST = (
     "\x1b[2J\x1b[H╭────╮\r\n│ Do you trust the files in this folder? │\r\n"
@@ -1430,11 +1501,11 @@ def test_a_silent_screen_after_a_tool_call_escalates_after_the_deadline(
         tmp_path / "lane-activity.json",
         {"activity": "working", "event": "PreToolUse"},
     )
-    screen = dialogs.flatten(OPENCODE_LIKE.encode())
+    screen = dialogs.flatten(UNRECORDED_APPROVAL.encode())
     assert dialogs.match(screen) is None
     assert dialogs.prompted(screen) is False
     watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
-    assert watch.advance(OPENCODE_LIKE.encode(), 0.0) == b""
+    assert watch.advance(UNRECORDED_APPROVAL.encode(), 0.0) == b""
     assert watch.advance(b"", 0.5) == b""
     assert watch.holding is False
     assert watch.advance(b"", 1.6) == b""
@@ -1445,7 +1516,7 @@ def test_a_silent_screen_after_a_tool_call_escalates_after_the_deadline(
     assert dialogs.lane_cause(state["dialog"]) == lanes.PROMPT
     [fields] = delivered
     assert fields["detail"].startswith(dialogs.TERMINAL_ONLY)
-    assert "Allow once" in fields["detail"]
+    assert "[a] Approve" in fields["detail"]
 
 
 def test_a_silent_screen_with_no_pending_tool_call_never_escalates(tmp_path):
@@ -1454,11 +1525,67 @@ def test_a_silent_screen_with_no_pending_tool_call_never_escalates(tmp_path):
     )
     watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
     for now in (0.0, 1.0, 40.0, 400.0):
-        output = OPENCODE_LIKE.encode() if now == 0.0 else b""
+        output = UNRECORDED_APPROVAL.encode() if now == 0.0 else b""
         assert watch.advance(output, now) == b""
     assert watch.holding is False
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert "dialog" not in state
+
+
+def test_every_provider_has_a_recorded_approval_fixture():
+    assert set(APPROVALS) == set(roster.ADAPTERS)
+    assert set(dialogs.RECORDED) == set(roster.ADAPTERS)
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [*APPROVALS.values(), GEMINI_EDIT, AMP_GUARDED],
+    ids=[*APPROVALS, "gemini-edit", "amp-guarded"],
+)
+def test_a_recorded_approval_escalates_within_the_deadline(
+    tmp_path, delivered, capture
+):
+    """Escalates every provider's approval with no hook naming a tool."""
+    write_json(
+        tmp_path / "lane-activity.json", {"activity": "idle", "event": "Stop"}
+    )
+    screen = dialogs.flatten(capture.encode())
+    assert dialogs.match(screen) or dialogs.prompted(screen)
+    watch = dialogs.Watch(tmp_path, "lane", deadline=dialogs.ESCALATE_AFTER)
+    assert watch.advance(capture.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    assert watch.advance(b"", dialogs.ESCALATE_AFTER + 0.5) == b""
+    assert watch.holding is True
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
+    assert dialogs.lane_cause(state["dialog"]) in {lanes.APPROVAL, lanes.PROMPT}
+    assert delivered
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [COPILOT_RUN, GEMINI_RUN, OPENCODE_PERMISSION, AMP_APPROVAL],
+    ids=["copilot", "gemini", "opencode", "amp"],
+)
+def test_another_providers_approval_is_never_answered(tmp_path, capture):
+    """Leaves a prompt without a recorded option list to the operator."""
+    watch = dialogs.Watch(
+        tmp_path, "lane", {dialogs.PERMISSION: "yes"}, deadline=1.0
+    )
+    for now in (0.0, 0.5, 1.5, 40.0):
+        output = capture.encode() if now == 0.0 else b""
+        assert watch.advance(output, now) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["name"] == "unknown"
+    assert state["activity"] == "dialog: an unrecognized native prompt"
+
+
+def test_an_allow_once_mention_in_output_is_not_a_prompt():
+    screen = dialogs.flatten(
+        b"  \xe2\x8e\xbf  Documented that Gemini offers Allow once on each "
+        b"tool prompt. Read 4 files, ran 2 shell commands"
+    )
+    assert dialogs.prompted(screen) is False
 
 
 def test_a_published_dialog_names_the_client_version_that_drew_it(
@@ -1498,7 +1625,8 @@ def test_drift_names_a_newer_client_and_an_unread_dialog(tmp_path):
             "dialog": {"name": "unknown", "screen": ["Allow once  Reject"]},
         },
         "current": {"client": "claude", "client_version": "2.1.270"},
-        "untracked": {"client": "gemini", "client_version": "9.0.0"},
+        "untracked": {"client": "", "client_version": "9.0.0"},
+        "recorded": {"client": "gemini", "client_version": "0.64.0"},
         "unversioned": {"client": "claude"},
     }
     for name, state in seen.items():
