@@ -1,5 +1,6 @@
 """Observes lane availability and reminds holders about waiting peers."""
 
+import ast
 import contextlib
 import contextvars
 import copy
@@ -3856,6 +3857,315 @@ def end_merged_claims(
             )
             resolved.append(number)
     return resolved
+
+
+SYMBOL_FILES = 20
+SYMBOL_NAMES = 20
+SYMBOL_PENDING_SECONDS = 86400.0
+SCRIPT_DEFINITION = (
+    r"(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?"
+    r"(?:function\*?|class|const|let|var|interface|type|enum)\s+"
+    r"([A-Za-z_$][\w$]*)"
+)
+TOP_LEVEL_DEFINITIONS = {
+    suffix: re.compile(pattern)
+    for suffix, pattern in {
+        ".go": r"(?:func(?:\s*\([^)]*\))?|type|var|const)\s+([A-Za-z_]\w*)",
+        ".rs": (
+            r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?"
+            r"(?:fn|struct|enum|trait|type|const|static|mod)\s+"
+            r"([A-Za-z_]\w*)"
+        ),
+        **dict.fromkeys(
+            (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"), SCRIPT_DEFINITION
+        ),
+    }.items()
+}
+HUNK = re.compile(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_symbol_merges: dict[tuple[str, str], tuple[float, dict]] = {}
+_symbol_reads: set[tuple[str, str]] = set()
+
+
+def _signatures(source: str) -> dict[str, str]:
+    """Reads the signature of each definition a Python module declares.
+
+    Module-level and class-level `def` and `class` statements are read;
+    one nested in a function body is local and no other file names it. A
+    function's signature is its parameters and return annotation, and a
+    class's is its bases and keywords, so a body edit is not a change a
+    caller sees.
+
+    Args:
+        source: Module text. Text that does not parse declares nothing.
+
+    Returns:
+        Signature text keyed by qualified name, such as ``Session.login``.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    found: dict[str, str] = {}
+    scopes: list[tuple[str, list[ast.stmt]]] = [("", tree.body)]
+    while scopes:
+        prefix, body = scopes.pop()
+        for node in body:
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                found[prefix + node.name] = ast.dump(node.args) + (
+                    ast.dump(node.returns) if node.returns else ""
+                )
+            elif isinstance(node, ast.ClassDef):
+                found[prefix + node.name] = "".join(
+                    ast.dump(item) for item in [*node.bases, *node.keywords]
+                )
+                scopes.append((f"{prefix}{node.name}.", node.body))
+    return found
+
+
+def _diff_lines(text: str) -> list[tuple[str, str, int, str]]:
+    """Splits a zero-context unified diff into its changed lines.
+
+    Args:
+        text: Output of `git diff --no-prefix -U0`.
+
+    Returns:
+        One ``(sign, path, line, text)`` per changed line: ``-`` lines carry
+        the old path and line number, ``+`` lines the new ones.
+    """
+    lines = []
+    header = False
+    old_path = new_path = ""
+    old = new = 0
+    for line in text.splitlines():
+        hunk = HUNK.match(line)
+        if line.startswith("diff "):
+            header = True
+        elif header and line.startswith("--- "):
+            old_path = line[4:].split("\t")[0]
+        elif header and line.startswith("+++ "):
+            new_path = line[4:].split("\t")[0]
+        elif hunk:
+            header = False
+            old, new = int(hunk[1]), int(hunk[2])
+        elif not header and line.startswith("-"):
+            lines.append(("-", old_path, old, line[1:]))
+            old += 1
+        elif not header and line.startswith("+"):
+            lines.append(("+", new_path, new, line[1:]))
+            new += 1
+    return lines
+
+
+def merged_definitions(root: str, commit: str) -> list[tuple[str, str]]:
+    """Names the definitions a merged commit changed against its parent.
+
+    Python files are read through `ast` before and after the merge: a
+    definition the merge removed, renamed or gave another signature is
+    changed. A file whose extension has a pattern in
+    `TOP_LEVEL_DEFINITIONS` contributes each top-level identifier that
+    pattern matches on a line the merge removed, which is what a rename or
+    a signature edit leaves. Any other file contributes nothing. The first
+    `SYMBOL_FILES` such files are read and the first `SYMBOL_NAMES` names
+    kept, so one large merge costs a bounded reading.
+
+    Args:
+        root: Base checkout holding the merge commit.
+        commit: Merge commit; its first parent is the base before the merge.
+
+    Returns:
+        ``(name, path)`` pairs, empty when Git could not answer.
+    """
+    paths = [
+        path
+        for path in _changed(root, f"{commit}^", commit)
+        if path.endswith(".py") or Path(path).suffix in TOP_LEVEL_DEFINITIONS
+    ][:SYMBOL_FILES]
+    found: dict[str, str] = {}
+    for path in paths:
+        if not path.endswith(".py"):
+            continue
+        before = _signatures(_read(root, "show", f"{commit}^:{path}") or "")
+        after = _signatures(_read(root, "show", f"{commit}:{path}") or "")
+        for name, signature in before.items():
+            if after.get(name) != signature:
+                found.setdefault(name, path)
+    patterned = {path for path in paths if not path.endswith(".py")}
+    if patterned:
+        diff = _read(
+            root,
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--no-prefix",
+            "-U0",
+            f"{commit}^",
+            commit,
+        )
+        for sign, path, _, text in _diff_lines(diff or ""):
+            pattern = TOP_LEVEL_DEFINITIONS.get(Path(path).suffix)
+            match = (
+                pattern.match(text)
+                if pattern and sign == "-" and path in patterned
+                else None
+            )
+            if match:
+                found.setdefault(match[1], path)
+    return list(found.items())[:SYMBOL_NAMES]
+
+
+def lane_references(
+    lane: str, commit: str, names: list[str]
+) -> dict[str, tuple[str, int]]:
+    """Finds where a lane's own diff names each of some symbols.
+
+    The lane's diff is its worktree, committed or not, against the point
+    its branch forked from the merge commit's history, so the merged
+    change itself is never read as the lane's. Only added lines count,
+    and a name matches as a whole identifier: the bare name, so a method
+    ``Session.login`` matches ``login``.
+
+    Args:
+        lane: Lane worktree.
+        commit: Merge commit the lane is compared with.
+        names: Names `merged_definitions` reported.
+
+    Returns:
+        The first ``(path, line)`` in the lane's diff per name it names.
+    """
+    fork = _read(lane, "merge-base", "HEAD", commit)
+    if not fork:
+        return {}
+    diff = _read(
+        lane,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-renames",
+        "--no-prefix",
+        "-U0",
+        fork,
+    )
+    patterns = {
+        name: re.compile(
+            rf"(?<![\w$]){re.escape(name.rsplit('.', 1)[-1])}(?![\w$])"
+        )
+        for name in names
+    }
+    found: dict[str, tuple[str, int]] = {}
+    for sign, path, line, text in _diff_lines(diff or ""):
+        if sign != "+":
+            continue
+        for name, pattern in patterns.items():
+            if name not in found and pattern.search(text):
+                found[name] = (path, line)
+    return found
+
+
+def symbol_notices(
+    home: Path, directory: Path, manifest: dict, ended: dict[str, dict]
+) -> list[tuple[str, str]]:
+    """Mails a lane when a merged change alters a symbol its diff names.
+
+    Every other overlap signal keys on a shared path, so a lane editing a
+    caller of a function a peer just changed in another file heard
+    nothing. Each pull request `completed_claims` observed merged, with its
+    merge commit, is read once through `merged_definitions`. Every lane
+    that is not retired, did not land it and does not own the claim it
+    closed is then searched through `lane_references`, and each hit sends
+    that lane one message naming the pull request, the symbol and the file
+    and line in its own diff. The idempotency key is the pull request,
+    symbol and lane, so the lane hears of each pair once.
+
+    A merge commit the base checkout has not fetched yet is kept for
+    `SYMBOL_PENDING_SECONDS` and read once it arrives. The notice is
+    advisory and says the change may affect the lane, since a name match
+    can be a false positive; nothing is refused, rebased or changed.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        ended: This poll's forge observations from `completed_claims`.
+
+    Returns:
+        ``(lane, symbol)`` for each message delivered or already delivered.
+    """
+    root = str(manifest["root"])
+    now = time.time()
+    owners = (
+        {
+            number: str(record.get("owner") or "")
+            for number, record in issues.snapshot(directory)["issues"].items()
+        }
+        if ended
+        else {}
+    )
+    for number, seen in ended.items():
+        key = (root, str(seen.get("commit") or ""))
+        if (
+            seen.get("state") != "MERGED"
+            or not seen.get("pull_request")
+            or not lifecycle.COMMIT.fullmatch(key[1])
+            or key in _symbol_reads
+            or key in _symbol_merges
+        ):
+            continue
+        merged_by = [owners.get(number, ""), str(seen.get("landed_by") or "")]
+        _symbol_merges[key] = (now, {**seen, "merged_by": merged_by})
+    sent: list[tuple[str, str]] = []
+    for key, (since, seen) in list(_symbol_merges.items()):
+        if key[0] != root:
+            continue
+        commit = key[1]
+        if _read(root, "cat-file", "-e", f"{commit}^{{commit}}") is None:
+            if now - since > SYMBOL_PENDING_SECONDS:
+                _symbol_merges.pop(key, None)
+            continue
+        _symbol_merges.pop(key, None)
+        _symbol_reads.add(key)
+        definitions = merged_definitions(root, commit)
+        if not definitions:
+            continue
+        number = seen["pull_request"]
+        link = f"#{number} {seen.get('url') or ''}".strip()
+        base = seen.get("base") or "the base branch"
+        for name, participant in manifest["participants"].items():
+            if (
+                name in seen["merged_by"]
+                or participant.get("branch") == seen.get("branch")
+                or roster.retired(participant)
+            ):
+                continue
+            hits = lane_references(
+                str(participant["lane"]),
+                commit,
+                [symbol for symbol, _ in definitions],
+            )
+            display = participant["display"]
+            for symbol, path in definitions:
+                if symbol not in hits:
+                    continue
+                where = f"{hits[symbol][0]}:{hits[symbol][1]}"
+                digest = hashlib.sha256(
+                    f"{root}\x00{number}\x00{symbol}\x00{display}".encode()
+                ).hexdigest()[:32]
+                with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+                    store.speak(
+                        home,
+                        root,
+                        display,
+                        f"Merged #{number} may affect {symbol} in your diff",
+                        f"Pull request {link} merged into {base} and changed "
+                        f"the definition of {symbol} in {path}. Your diff "
+                        f"names it at {where}, so the change may affect your "
+                        "work. This is a name match and can be a false "
+                        "positive: check that use before you merge. Nothing "
+                        "was refused, rebased or changed for you.",
+                        f"symbol:{digest}",
+                    )
+                    sent.append((name, symbol))
+    return sent
 
 
 def deadline_notices(directory: Path, manifest: dict) -> None:
@@ -8859,6 +9169,7 @@ def _remind(
         ),
     )
     ended = read[0] if read else {}
+    stage("symbol notices", symbol_notices, home, directory, manifest, ended)
     stage(
         "forge completions",
         end_merged_claims,
