@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -217,7 +218,17 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         "dialogs",
         "tokens",
         "host load",
+        "hooks",
     }
+    [hooks] = [
+        entry
+        for entry in reported["components"]
+        if entry["component"] == "hooks"
+    ]
+    assert hooks["compatible"] is True
+    assert hooks["state"] == (
+        "ok, 0 deadline expiries in 7 days of the service log on disk"
+    )
     [tokens] = [
         entry
         for entry in reported["components"]
@@ -245,6 +256,33 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
     assert "Consistent." in text
     assert f"approvals: {approvals['remedy']}" in text
     assert str(bridge.home) not in text
+
+
+def test_doctor_counts_recent_hook_expiries_and_names_the_slowest_stage(
+    bridge, repo, paired, answering
+):
+    store.initialize(bridge.home)
+    stamp = "%Y-%m-%dT%H:%M:%S%z"
+    old = time.strftime(stamp, time.localtime(time.time() - 8 * 86400))
+    new = time.strftime(stamp)
+    (bridge.home / server.LOG_NAME).write_text(
+        f"{old} expired /hook claude undecided after 1.600 seconds; "
+        "answered as still deciding: roster 0.010s in mailbox 1.590s\n"
+        f"{new} bound 127.0.0.1\n"
+        f"{new} expired /hook claude undecided after 1.504 seconds; "
+        "answered as refused by a command guard: roster 0.010s "
+        "branch 1.204s in lock 0.290s\n"
+    )
+
+    reported = bridge.doctor()
+
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["hooks"]["compatible"] is True
+    assert named["hooks"]["state"] == (
+        "1 deadline expiries in 7 days of the service log on disk; "
+        "slowest stage in the latest: branch 1.204s"
+    )
+    assert reported["consistent"] is True
 
 
 def test_doctor_names_a_recorded_opt_in_the_cli_cannot_carry(

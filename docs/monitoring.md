@@ -542,14 +542,19 @@ is reported stale with the restart that clears it, rather than reported ready.
 Then `projects` names each registered root that no longer exists, `notify`
 says whether outbound and inbound notification are active, `approvals` names
 each lane lacking the resume opt-in, `tokens` names the defined providers
-whose token usage is read and those not measured, and a platform line names the kernel
+whose token usage is read and those not measured, `hooks` counts the hook
+decisions that ran past the service deadline in the last 7 days and names the
+stage that spent the most time in the latest one, read from the `expired`
+entries in `server.log` and its rotated `server.log.1`, so only entries the
+log rotation kept are counted, and a platform line names the kernel
 release, the WSL generation and whether `pidfd_open` is available. `doctor`
 exits non-zero on a plugin protocol mismatch, a store schema this build cannot
 use, a stale service, a service that is not running while a registered project
 has lanes, a missing project root, a damaged decisions record kept aside,
 outbound notification configured but unable to send, or an inbound poller
 fault such as a passcode shorter than twelve characters, so a script can gate
-on it; notification that is off and an `approvals` setup gap leave it at zero. It reads only, and
+on it; notification that is off, an `approvals` setup gap and any `hooks`
+count leave it at zero. It reads only, and
 prints no credential.
 
 ## `metrics`
