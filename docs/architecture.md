@@ -231,7 +231,11 @@ no mailbox. A broadcast, a send to every other live lane with at least
 `BROADCAST_MIN` recipients, reaches only the lanes it concerns: an
 acknowledgement request, a mention of the lane, or a reservation or claimed
 work the text touches. The rest are reported as `withheld` and read it in the
-feed. A send to a chosen subset is delivered to everyone it names. The preview
+feed. A fresh session, which has no feed cursor, sees the three newest live
+entries. After that, one read shows the three oldest live entries past the
+lane's cursor and how many newer ones are pending, so a burst of merge notes
+arrives over successive reads instead of being skipped. A send to a chosen subset is
+delivered to everyone it names. The preview
 digest orders mail by that relevance and states how many unread and
 superseded messages it left out.
 

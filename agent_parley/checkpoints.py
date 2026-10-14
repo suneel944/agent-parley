@@ -1986,12 +1986,16 @@ def feed_notice(news: dict) -> str:
         news: Result of `store.feed` for the reading lane.
 
     Returns:
-        The bounded feed line, or an empty string when nothing is new.
+        The bounded feed line, or an empty string when nothing is new. A
+        line from a page that left newer entries for the next read says how
+        many before any entry, so clipping cannot hide the count.
     """
     if not news["items"]:
         return ""
+    omitted = news.get("omitted", 0)
     return clip(
-        "Project feed, newest first: "
+        "Project feed, newest first"
+        + (f", {omitted} newer pending: " if omitted else ": ")
         + "; ".join(
             f"{item['sender']}: {excerpt(item['subject'], 400)}"
             for item in news["items"]
