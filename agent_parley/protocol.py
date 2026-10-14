@@ -60,6 +60,17 @@ REPAIR = (
 )
 RELAUNCH = "agent-parley up starts a service on the code in the checkout."
 START = "agent-parley up starts the coordination service these lanes need."
+REFRESH = (
+    "a running agent-parley service reinstalls this plugin on its own and "
+    "names the lanes to restart; with no service running, agent-parley "
+    "plugins install reinstalls it."
+)
+RESTART = (
+    "the service re-executes itself once it sees its sources move; if it "
+    "does not, agent-parley down then agent-parley up restarts it on this "
+    "version."
+)
+ABSENT = "not installed"
 CLI_MODULE = "agent_parley.cli"
 UNKNOWN = -1
 OK = "ok"
@@ -244,7 +255,9 @@ def render(reported: dict) -> str:
         credential is printed. One platform line names the kernel release,
         the WSL generation and whether ``pidfd_open`` is available. A setup
         gap or a dialog matcher drift does not make the set inconsistent, so
-        its remedy follows the verdict on a line of its own.
+        its remedy follows the verdict on a line of its own. A name or
+        version wider than its column is still followed by one space, so
+        ``claude plugin (shell)`` never runs into its version.
     """
     lines = []
     for component in reported["components"]:
@@ -252,8 +265,8 @@ def render(reported: dict) -> str:
         speaks = "no protocol" if number == UNKNOWN else f"protocol {number}"
         state = component["state"]
         lines.append(
-            f"{component['component']:<16}"
-            f"{component['version'] or '-':<12}"
+            f"{component['component']:<15} "
+            f"{component['version'] or '-':<11} "
             f"{speaks:<14}"
             f"{state if component['compatible'] else state.upper()}"
         )

@@ -518,7 +518,15 @@ class StatusMixin(BridgeCore):
             The `tokens` component names the defined providers whose
             lanes report tokens and those no reader measures, so a token
             limit's blind spots are visible before one is set; it never
-            makes the set inconsistent.
+            makes the set inconsistent. Each CLI and config home holding
+            the plugin is one row, failing when its version differs from
+            the launcher's or its protocol is refused; its remedy names the
+            reinstall a running service performs on its own and the command
+            for an estate with no service. A service answering on another
+            version than the launcher is stale and names its restart. The
+            ``plugins`` list and ``server`` record carry the same versions
+            for scripts; a CLI with no plugin in any home is listed as not
+            installed and does not fail the set.
         """
         from agent_parley import decisions, plugins
         from agent_parley.cli import (
@@ -532,10 +540,11 @@ class StatusMixin(BridgeCore):
             supervision,
         )
 
+        launcher = protocol.launcher_version()
         components = [
             {
                 "component": "launcher",
-                "version": protocol.launcher_version(),
+                "version": launcher,
                 "protocol": protocol.PROTOCOL,
                 "state": protocol.OK,
                 "remedy": "",
@@ -543,16 +552,27 @@ class StatusMixin(BridgeCore):
             }
         ]
         bundled = protocol.manifests(protocol.plugin_root())
+        installed = []
         for client in protocol.CLIENTS:
             rows = []
             for label, directory in plugins.config_dirs(self.home, client):
                 manifest = plugins.installed_manifest(client, directory)
                 if manifest is not None:
                     suffix = f" ({label})" if label else ""
-                    rows.append(
+                    row = {
+                        "component": f"{client} plugin{suffix}",
+                        **plugins.assessed(manifest),
+                    }
+                    if not row["compatible"]:
+                        row["remedy"] = protocol.REFRESH
+                    rows.append(row)
+                    installed.append(
                         {
-                            "component": f"{client} plugin{suffix}",
-                            **plugins.assessed(manifest),
+                            "cli": client,
+                            "home": label or "default",
+                            "version": row["version"],
+                            "expected": launcher,
+                            "state": row["state"],
                         }
                     )
             if not rows:
@@ -561,6 +581,15 @@ class StatusMixin(BridgeCore):
                         "component": f"{client} plugin",
                         **plugins.assessed(bundled[client]),
                         "version": "bundled",
+                    }
+                )
+                installed.append(
+                    {
+                        "cli": client,
+                        "home": "default",
+                        "version": "",
+                        "expected": launcher,
+                        "state": protocol.ABSENT,
                     }
                 )
             components.extend(rows)
@@ -586,15 +615,24 @@ class StatusMixin(BridgeCore):
         stopped = serving == protocol.STOPPED and any(
             manifest.get("participants") for manifest in manifests
         )
-        remedy = protocol.RELAUNCH if stale else ""
+        version = str(served.get("version", ""))
+        behind = serving == "ready" and version != launcher
+        state = protocol.OK if serving == "ready" else serving
+        remedy = ""
+        if stopped:
+            remedy = protocol.START
+        elif stale:
+            remedy = protocol.RELAUNCH
+        elif behind:
+            state, remedy = protocol.STALE, protocol.RESTART
         components.append(
             {
                 "component": "service",
-                "version": str(served.get("version", "")),
+                "version": version,
                 "protocol": protocol.PROTOCOL,
-                "state": protocol.OK if serving == "ready" else serving,
-                "remedy": protocol.START if stopped else remedy,
-                "compatible": not stale and not stopped,
+                "state": state,
+                "remedy": remedy,
+                "compatible": not stale and not stopped and not behind,
             }
         )
         gone = sorted(
@@ -730,6 +768,8 @@ class StatusMixin(BridgeCore):
             "schema": store.SCHEMA_VERSION,
             "platform": process.host_report(),
             "components": components,
+            "plugins": installed,
+            "server": {"version": version, "expected": launcher},
             "consistent": all(
                 component["compatible"] for component in components
             ),

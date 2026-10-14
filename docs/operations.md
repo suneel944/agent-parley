@@ -433,7 +433,39 @@ The first hook to read the published record of that gone process asks for a
 new service, so the relaunch follows the stop. `status` prints the same drift
 as a
 `Code: stale` line, and `agent-parley up` then starts a service on the code in
-the checkout.
+the checkout. A service that answers ready on a package version other than the
+launcher's is `stale` too: it normally re-executes itself once it sees its
+sources move, and when it has not, `agent-parley down` then `agent-parley up`
+restarts it on this version.
+
+#### Plugin and server version drift
+
+Each supported CLI gets one `<cli> plugin` line per config home that holds the
+plugin: the CLI default, the directory the shell exports (`(shell)`) and each
+credential profile a lane runs on (`(<profile>)`). The line names the
+installed plugin version, and the launcher line above it names the version it
+is expected to match. A plugin on another version is `stale` and a plugin
+declaring a protocol this build refuses is `mismatch`; either fails the
+verdict and exits non-zero. The remedy names both paths: a running service
+reinstalls a stale plugin on its own and names the lanes to restart, and on a
+cold estate with no service `agent-parley plugins install` does the same. A CLI
+with the plugin in no home is reported from the bundled manifest and does not
+fail the verdict.
+
+`doctor --json` carries the same reading for scripts:
+
+| Field | Meaning |
+| --- | --- |
+| `plugins[].cli` | `claude` or `codex`. |
+| `plugins[].home` | `default`, `shell` or the credential profile name; never a path. |
+| `plugins[].version` | Installed plugin version, empty when not installed. |
+| `plugins[].expected` | Launcher version the plugin should match. |
+| `plugins[].state` | `ok`, `stale`, `mismatch` or `not installed`. |
+| `server.version` | Version the running service answers on, empty when none answers. |
+| `server.expected` | Launcher version the service should match. |
+
+`doctor` only reads: it opens no network connection beyond the local health
+request to the configured port and writes nothing.
 
 The `projects` component is `ok` while every registered project's root
 checkout exists. A project whose root is gone, such as a probe run from a

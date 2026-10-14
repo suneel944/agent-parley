@@ -388,7 +388,103 @@ def test_doctor_reports_a_profile_plugin_speaking_another_protocol(
     assert (row["protocol"], row["state"]) == (2, protocol.MISMATCH)
     assert reported["consistent"] is False
     assert "MISMATCH" in protocol.render(reported)
+    assert "claude plugin (work) " in protocol.render(reported)
     assert str(tmp_path / "work") not in protocol.render(reported)
+    assert {
+        "cli": "claude",
+        "home": "work",
+        "version": protocol.launcher_version(),
+        "expected": protocol.launcher_version(),
+        "state": protocol.MISMATCH,
+    } in reported["plugins"]
+
+
+def doctor_document(bridge, monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "doctor", "--json"],
+    )
+    status = cli.main()
+    return status, json.loads(capsys.readouterr().out)
+
+
+def test_doctor_passes_a_plugin_on_the_launcher_version(
+    bridge, repo, paired, answering, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    launcher = protocol.launcher_version()
+    claude_plugin(Path(records.DEFAULT_HOMES["claude"]), launcher, 1)
+    status, document = doctor_document(bridge, monkeypatch, capsys)
+    assert status == 0
+    assert {
+        "cli": "claude",
+        "home": "default",
+        "version": launcher,
+        "expected": launcher,
+        "state": protocol.OK,
+    } in document["plugins"]
+    assert document["server"] == {"version": launcher, "expected": launcher}
+
+
+def test_doctor_fails_a_plugin_behind_the_launcher_and_names_the_repair(
+    bridge, repo, paired, answering, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    claude_plugin(Path(records.DEFAULT_HOMES["claude"]), "0.13.0", 1)
+    status, document = doctor_document(bridge, monkeypatch, capsys)
+    assert status == 1
+    assert {
+        "cli": "claude",
+        "home": "default",
+        "version": "0.13.0",
+        "expected": protocol.launcher_version(),
+        "state": protocol.STALE,
+    } in document["plugins"]
+    row = claude_rows(document)["claude plugin"]
+    assert row["remedy"] == protocol.REFRESH
+    assert protocol.REFRESH in protocol.verdict(document["components"])
+
+
+def test_doctor_lists_an_absent_plugin_without_failing(
+    bridge, repo, paired, answering, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    status, document = doctor_document(bridge, monkeypatch, capsys)
+    assert status == 0
+    assert {
+        (entry["cli"], entry["home"], entry["version"], entry["state"])
+        for entry in document["plugins"]
+    } == {
+        ("claude", "default", "", protocol.ABSENT),
+        ("codex", "default", "", protocol.ABSENT),
+    }
+
+
+def test_doctor_fails_a_service_answering_on_another_version(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    monkeypatch.setattr(
+        cli.Bridge,
+        "health",
+        lambda self: {"status": "ready", "version": "0.13.0"},
+    )
+    status, document = doctor_document(bridge, monkeypatch, capsys)
+    assert status == 1
+    assert document["server"] == {
+        "version": "0.13.0",
+        "expected": protocol.launcher_version(),
+    }
+    [service] = [
+        entry
+        for entry in document["components"]
+        if entry["component"] == "service"
+    ]
+    assert (service["state"], service["remedy"]) == (
+        protocol.STALE,
+        protocol.RESTART,
+    )
 
 
 @pytest.fixture
