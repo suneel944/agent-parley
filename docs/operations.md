@@ -61,7 +61,12 @@ reads participant names, issue numbers, providers and credential profiles from
 the state directory, both for positional values such as `say NAME` and
 `participant restart NAME` and for options such as `--credentials`.
 
-Upgrading needs no action: the store upgrades in place on first use, keeping
+Upgrading needs no action: a running service notices the new package within
+two seconds, finishes the requests in flight and re-executes itself on it under
+the same process ID, so `agent-parley down` and `agent-parley up` are not
+needed after `uv tool upgrade agent-parley`; the service log records the
+hand-over as `drifted`, `stopped`, `relaunching` and a new `bound` entry. The
+store upgrades in place on first use, keeping
 every message, claim and lease. Issue ledgers upgrade lazily: 0.11 derives
 lifecycle defaults for older records without an `execution` field and persists
 them when a lifecycle transition next writes the record. Stop running sessions
