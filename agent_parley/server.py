@@ -652,11 +652,14 @@ class Server(ThreadingHTTPServer):
                     owed.get("evidence"),
                 )
             except Exception as exc:
+                from agent_parley import supervision
+
                 self.coalesce(
                     "unrecovered",
                     lane,
                     f"{lane[1]} recovery checkpoint not written; the next "
-                    f"event captures again: {type(exc).__name__}",
+                    f"event captures again: "
+                    f"{supervision.failure('recovery', exc)}",
                 )
             with self.counting:
                 waiting = self.recovering.get(lane)
