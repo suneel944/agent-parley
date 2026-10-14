@@ -212,13 +212,11 @@ The provider and profile are recorded when the lane is created, and a later
 Participant claude-2 already uses provider claude with the default account.
 ```
 
-The recorded pair fixes the account only when it names a profile. A lane
-created without `--credentials` uses the CLI's default configuration home as
-the launching environment selects it; an exported `CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, `COPILOT_HOME`, `GEMINI_CLI_HOME`, `OPENCODE_CONFIG_DIR` or
-`AMP_SETTINGS_FILE` in the shell that runs `run`, or in the one that started
-the service, changes the account. Bind a profile when the account must not
-change.
+A default-account lane runs on the client's own default configuration home on
+every launch and resume. A configuration-home variable such as
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` exported by the shell that runs `run`, or
+by the one that started the service, is removed from the lane's environment;
+only a credential profile selects another account.
 
 Passing the same pair again is accepted and changes nothing. There is no command
 that rebinds a lane, because the lane's configuration, its registered identity

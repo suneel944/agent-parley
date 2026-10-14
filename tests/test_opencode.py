@@ -292,6 +292,58 @@ def test_a_jsonc_only_configuration_is_refused_with_the_fix(bridge, tmp_path):
         )
 
 
+def test_a_profile_overlay_keeps_every_file_and_resolves_instructions(
+    bridge, tmp_path
+):
+    home = tmp_path / "profile"
+    for relative in ("agent/a.md", "command/c.md", "AGENTS.md", "rules.md"):
+        (home / relative).parent.mkdir(parents=True, exist_ok=True)
+        (home / relative).write_text(relative)
+    (home / "node_modules" / "dep").mkdir(parents=True)
+    (home / ".git").mkdir()
+    write_json(
+        home / "opencode.json",
+        {"instructions": ["rules.md", "/abs/x.md", "https://x/y.md"]},
+    )
+    overlay = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(home),
+    )
+    for relative in ("agent/a.md", "command/c.md", "AGENTS.md"):
+        assert (overlay / relative).read_text() == relative
+    assert (overlay / "plugin" / "agent-parley.js").exists()
+    assert not (overlay / "node_modules").exists()
+    assert not (overlay / ".git").exists()
+    assert overlay.stat().st_mode & 0o777 == 0o700
+    settings = json.loads((overlay / "opencode.json").read_text())
+    assert settings["instructions"] == [
+        str(home / "rules.md"),
+        "/abs/x.md",
+        "https://x/y.md",
+    ]
+    source = json.loads((home / "opencode.json").read_text())
+    assert source["instructions"][0] == "rules.md"
+
+
+def test_a_profile_that_already_ships_the_bridge_plugin_file_is_refused(
+    bridge, tmp_path
+):
+    home = tmp_path / "shadow"
+    (home / "plugin").mkdir(parents=True)
+    (home / "plugin" / "agent-parley.js").write_text("export {}")
+    with pytest.raises(BridgeError, match="rename it first"):
+        opencode.configure(
+            tmp_path,
+            "lane",
+            "http://127.0.0.1/mcp/",
+            bridge.hooks("lane", tmp_path),
+            str(home),
+        )
+
+
 PLUGIN_RUN = """
 const { AgentParley } = await import(process.argv[1]);
 const hooks = await AgentParley({ client: {}, directory: "/lane" });

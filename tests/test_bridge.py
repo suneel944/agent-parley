@@ -2495,7 +2495,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         report = subprocess.run(
             [str(executable), "doctor"],
             cwd=tmp_path,
-            env=environment,
+            env={**environment, "HOME": str(tmp_path / "doctor-home")},
             capture_output=True,
             text=True,
             check=False,
@@ -2668,7 +2668,7 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     )
     captured = json.loads((tmp_path / "capture.json").read_text())
     assert captured["home"] == str(account)
-    assert captured["argv"][0] == "-p"
+    assert captured["argv"][0] == "-i"
     assert "Work on issue 42" in captured["argv"][1]
     assert not [flag for flag in captured["argv"] if flag.startswith("--al")]
 
@@ -2686,6 +2686,38 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     assert hook["timeoutSec"] == 3
     assert bridge_hook(hook["bash"])
     assert hook["bash"].endswith("--adapter copilot")
+
+
+@pytest.mark.parametrize(
+    "provider,home_env",
+    [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")],
+)
+def test_a_default_account_lane_ignores_an_exported_config_home(
+    bridge, repo, monkeypatch, tmp_path, provider, home_env
+):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / provider
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        f" json.dump({{'home': os.environ.get({home_env!r})}}, f)\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv(home_env, str(tmp_path / "other-account"))
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    store.initialize(bridge.home)
+    assert bridge.launch("helper", repo, "Work on issue 7", provider) == 0
+    assert json.loads(capture.read_text()) == {"home": None}
+    roster.define_credential(
+        bridge.home, "second", str(tmp_path / "second"), [], []
+    )
+    assert bridge.launch("other", repo, "Work", provider, "second") == 0
+    assert json.loads(capture.read_text()) == {"home": str(tmp_path / "second")}
 
 
 def test_provider_definitions_never_store_credential_values(

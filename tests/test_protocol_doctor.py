@@ -13,7 +13,17 @@ import pytest
 from agent_parley import (
     BridgeError as PackageBridgeError,
 )
-from agent_parley import checkpoints, cli, protocol, server, store, views
+from agent_parley import (
+    checkpoints,
+    cli,
+    plugins,
+    protocol,
+    records,
+    roster,
+    server,
+    store,
+    views,
+)
 from agent_parley.state import BridgeError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -253,6 +263,116 @@ def reported_store(bridge):
         for entry in bridge.doctor()["components"]
         if entry["component"] == "store"
     ][0]
+
+
+def claude_plugin(config_dir, version, number):
+    """Writes the Claude Code record of one installed plugin version."""
+    install = config_dir / "cache" / version
+    (install / ".claude-plugin").mkdir(parents=True)
+    (install / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"version": version, "protocol": number})
+    )
+    (config_dir / "plugins").mkdir(parents=True, exist_ok=True)
+    (config_dir / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    plugins.PLUGIN: [
+                        {"scope": "user", "installPath": str(install)}
+                    ]
+                },
+            }
+        )
+    )
+
+
+def claude_rows(reported):
+    return {
+        entry["component"]: entry
+        for entry in reported["components"]
+        if entry["component"].startswith("claude plugin")
+    }
+
+
+def test_doctor_reads_the_plugin_the_cli_loads_not_the_bundled_one(
+    bridge, repo, paired, answering
+):
+    store.initialize(bridge.home)
+    assert claude_rows(bridge.doctor())["claude plugin"]["version"] == (
+        "bundled"
+    )
+    claude_plugin(Path(records.DEFAULT_HOMES["claude"]), "0.13.0", 1)
+    reported = bridge.doctor()
+    row = claude_rows(reported)["claude plugin"]
+    assert (row["version"], row["state"]) == ("0.13.0", protocol.STALE)
+    assert reported["consistent"] is False
+    text = protocol.render(reported)
+    assert "STALE" in text
+    assert "agent-parley plugins install" in text
+
+
+def test_doctor_reports_a_profile_plugin_speaking_another_protocol(
+    bridge, repo, paired, answering, tmp_path
+):
+    store.initialize(bridge.home)
+    roster.define_credential(
+        bridge.home, "work", str(tmp_path / "work"), [], []
+    )
+    bridge.add_participant(repo, "helper", "claude", "work")
+    claude_plugin(tmp_path / "work", protocol.launcher_version(), 2)
+    reported = bridge.doctor()
+    row = claude_rows(reported)["claude plugin (work)"]
+    assert (row["protocol"], row["state"]) == (2, protocol.MISMATCH)
+    assert reported["consistent"] is False
+    assert "MISMATCH" in protocol.render(reported)
+    assert str(tmp_path / "work") not in protocol.render(reported)
+
+
+@pytest.fixture
+def claude_on_path(bridge, monkeypatch, tmp_path):
+    """Puts a stub claude on PATH that records it was started."""
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "claude"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "open(os.environ['CAPTURE'], 'w').close()\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "started"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + ":" + "/usr/bin:/bin")
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    store.initialize(bridge.home)
+    roster.define_credential(
+        bridge.home, "work", str(tmp_path / "work"), [], []
+    )
+    return capture
+
+
+def test_a_lane_whose_profile_plugin_speaks_another_protocol_is_refused(
+    bridge, repo, tmp_path, claude_on_path
+):
+    claude_plugin(tmp_path / "work", protocol.launcher_version(), 2)
+    with pytest.raises(BridgeError, match="installed plugin") as refused:
+        bridge.launch("helper", repo, "Work on issue 9", "claude", "work")
+    assert refused.value.next_command == "agent-parley plugins install"
+    assert not claude_on_path.exists()
+
+
+def test_a_lane_on_an_older_plugin_starts_with_a_warning(
+    bridge, repo, tmp_path, claude_on_path, capsys
+):
+    claude_plugin(tmp_path / "work", "0.13.0", 1)
+    assert (
+        bridge.launch("helper", repo, "Work on issue 9", "claude", "work") == 0
+    )
+    assert claude_on_path.exists()
+    warning = capsys.readouterr().err
+    assert "0.13.0" in warning
+    assert "agent-parley plugins install" in warning
 
 
 def test_a_store_behind_this_build_breaks_consistency(bridge, repo, paired):

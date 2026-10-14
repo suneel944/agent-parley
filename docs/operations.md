@@ -2909,7 +2909,7 @@ names the one to use:
 | --- | --- | --- | --- |
 | `claude` | `--mcp-config FILE` | `--append-system-prompt TEXT` | `--settings '{"hooks":…}'` |
 | `codex` | `-c mcp_servers.agent_parley.url=…` | appended to the prompt argument | `-c hooks.EVENT=…` |
-| `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-p` argument | `hooks` in `settings.json` there |
+| `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-i` argument | `hooks` in `settings.json` there |
 | `gemini` | `mcpServers` in the lane-private system settings overlay | prepended to `--prompt-interactive` | `hooks` in that overlay, `--adapter gemini` |
 | `opencode` | `mcp` in the lane-private `opencode.json` | prepended to `--prompt` | `plugin/agent-parley.js` in the lane-private directory, `--adapter opencode` |
 | `amp` | `amp.mcpServers` in the lane-private `settings.json` | prepended to the prompt argument after `--settings-file` | `amp.hooks` in that file, `--adapter amp` |

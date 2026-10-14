@@ -6003,9 +6003,9 @@ def main() -> int:
         from agent_parley import plugins
 
         if args.action == "status":
-            print("\n".join(plugins.status()))
+            print("\n".join(plugins.status(home)))
             return 0
-        outcome, succeeded = plugins.install()
+        outcome, succeeded = plugins.install(home)
         print("\n".join(outcome))
         return 0 if succeeded else 1
     if args.command == "demo":

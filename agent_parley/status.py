@@ -509,7 +509,7 @@ class StatusMixin(BridgeCore):
             `supervision.opt_in_missing` reports as a setup gap; it is the
             operator's choice, so it leaves the set consistent.
         """
-        from agent_parley import decisions
+        from agent_parley import decisions, plugins
         from agent_parley.cli import (
             inbound_status,
             json,
@@ -531,21 +531,28 @@ class StatusMixin(BridgeCore):
                 "compatible": True,
             }
         ]
-        for client, manifest in protocol.manifests(
-            protocol.plugin_root()
-        ).items():
-            declared = protocol.installed(manifest)
-            accepted = protocol.compatible(declared)
-            components.append(
-                {
-                    "component": f"{client} plugin",
-                    "version": "",
-                    "protocol": declared,
-                    "state": protocol.OK if accepted else protocol.MISMATCH,
-                    "remedy": "" if accepted else protocol.UPDATE,
-                    "compatible": accepted,
-                }
-            )
+        bundled = protocol.manifests(protocol.plugin_root())
+        for client in protocol.CLIENTS:
+            rows = []
+            for label, directory in plugins.config_dirs(self.home, client):
+                manifest = plugins.installed_manifest(client, directory)
+                if manifest is not None:
+                    suffix = f" ({label})" if label else ""
+                    rows.append(
+                        {
+                            "component": f"{client} plugin{suffix}",
+                            **plugins.assessed(manifest),
+                        }
+                    )
+            if not rows:
+                rows.append(
+                    {
+                        "component": f"{client} plugin",
+                        **plugins.assessed(bundled[client]),
+                        "version": "bundled",
+                    }
+                )
+            components.extend(rows)
         schema = store.schema_version(self.home)
         state = store.schema_state(schema)
         components.append(

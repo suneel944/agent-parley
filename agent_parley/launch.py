@@ -464,8 +464,10 @@ reported.
                 retirement removes the worktree under the same lock, or
                 ``issue`` is not an issue number or its claim is refused,
                 or a blueprint is named without ``issue``, from a lane, or
-                is unknown.
+                is unknown, or a ``copilot`` lane's profile already runs
+                another live lane's hooks.
         """
+        from agent_parley import plugins, records
         from agent_parley.cli import (
             COPILOT_EVENTS,
             LAUNCH_LOCK_SECONDS,
@@ -490,6 +492,8 @@ reported.
             terminal,
             write_json,
         )
+        from agent_parley.copilot import occupants
+        from agent_parley.hook import PARTICIPANT_ENV
 
         began = time.monotonic()
         number = parse_issue(issue) if issue else ""
@@ -532,15 +536,32 @@ reported.
                 f"Install and sign in to the native {entry['command']} CLI "
                 "first."
             )
-        manifest = protocol.manifests(protocol.plugin_root()).get(
+        loaded = None
+        if entry["adapter"] in plugins.HOME_ENV:
+            selected = account.get(entry.get("home_env", ""))
+            loaded = plugins.installed_manifest(
+                entry["adapter"],
+                Path(selected)
+                if selected
+                else Path(records.DEFAULT_HOMES[entry["adapter"]]).expanduser(),
+            )
+        manifest = loaded or protocol.manifests(protocol.plugin_root()).get(
             entry["adapter"]
         )
         if manifest is not None and manifest.exists():
-            declared = protocol.installed(manifest)
-            if not protocol.compatible(declared):
+            reading = plugins.assessed(manifest)
+            if reading["state"] == protocol.MISMATCH:
                 raise BridgeError(
-                    protocol.mismatch("installed plugin", declared),
+                    protocol.mismatch("installed plugin", reading["protocol"]),
                     next_command="agent-parley plugins install",
+                )
+            if loaded and reading["state"] == protocol.STALE:
+                print(
+                    f"The {entry['adapter']} plugin this lane loads is "
+                    f"{reading['version'] or 'of unknown version'}, the "
+                    f"launcher is {protocol.launcher_version()}. "
+                    f"{protocol.UPDATE}",
+                    file=sys.stderr,
                 )
         missing = [
             event
@@ -604,11 +625,14 @@ reported.
                     supervision.forget_delivered(lane.parent, agent)
             prompt = self.protocol(agent, data)
             hooks = self.hooks(agent, lane.parent)
+            inherited = dict(os.environ)
+            inherited.pop(entry.get("home_env") or "", None)
             env = {
-                **os.environ,
+                **inherited,
                 **account,
                 "AGENT_PARLEY_TOKEN": identity["registration_token"],
                 "AGENT_PARLEY_HOME": str(self.home),
+                PARTICIPANT_ENV: agent,
             }
             if entry["adapter"] == "claude":
                 config = lane.parent / f"{agent}-mcp.json"
@@ -719,6 +743,19 @@ reported.
                         "DIR`, sign in to it once, and launch with "
                         "--credentials NAME."
                     )
+                sharing = occupants(
+                    self.home, Path(config_home), lane.parent, agent
+                )
+                if sharing:
+                    raise BridgeError(
+                        f"Copilot profile {participant['credential']!r} "
+                        f"already runs the hooks of {', '.join(sharing)}, "
+                        "and Copilot runs every hook in a profile for every "
+                        "session on it, so each lane would decide the "
+                        "other's tool calls. Define a second profile with "
+                        "`agent-parley credentials add NAME --config-home "
+                        "DIR` and launch this lane with --credentials NAME."
+                    )
                 configure_copilot(
                     Path(config_home),
                     {
@@ -742,10 +779,11 @@ reported.
                         for event, groups in hooks.items()
                         if event in COPILOT_EVENTS
                     },
+                    agent,
                 )
                 command = [
                     executable,
-                    "-p",
+                    "-i",
                     prompt + "\nUser task:\n" + task,
                 ]
             else:

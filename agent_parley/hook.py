@@ -56,6 +56,7 @@ RELAUNCH_STAMP = "relaunch.stamp"
 RELAUNCH_INTERVAL = 60.0
 HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
 ANSWERED_ENV = "AGENT_PARLEY_SERVICE_ANSWERED"
+PARTICIPANT_ENV = "AGENT_PARLEY_PARTICIPANT"
 DECIDING = 202
 
 CLIENT_SCRIPT = r"""#!/usr/bin/env bash
@@ -81,6 +82,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 payload="$(cat)"
+
+if [ "$adapter" = "copilot" ] \
+  && [ "$participant" != "${@PARTICIPANT_ENV@-}" ]; then
+  exit 0
+fi
 
 decide_in_process() {
   printf '%s' "$payload" | "@PYTHON@" -m agent_parley.hook "${arguments[@]}"
@@ -234,6 +240,7 @@ def write_client(home: str, python: str) -> str:
         .replace("@DECIDING@", str(DECIDING))
         .replace("@MAX_INPUT@", str(MAX_INPUT_BYTES))
         .replace("@ANSWERED@", ANSWERED_ENV)
+        .replace("@PARTICIPANT_ENV@", PARTICIPANT_ENV)
         .replace("@status_header@", STATUS_HEADER)
         .replace("@stdout_header@", STDOUT_HEADER)
         .replace("@receipt_header@", RECEIPT_HEADER)
@@ -513,9 +520,19 @@ def main() -> int:
     A payload past `MAX_INPUT_BYTES` is never posted: the service would
     refuse it, and the in-process path records it as oversize and runs
     only the guards its small fields allow.
+
+    A Copilot profile runs every hook registered in it for every session on
+    it, so a ``copilot`` hook whose participant is not the session's own,
+    named in `PARTICIPANT_ENV` by the launcher, emits nothing and succeeds.
+    A session the launcher did not start carries no name, so another lane's
+    hook never decides an operator's own session either.
     """
     raw, size = read_input(sys.stdin)
     selected = options(sys.argv[1:])
+    if selected.get("adapter") == "copilot" and selected.get(
+        "participant"
+    ) != os.environ.get(PARTICIPANT_ENV):
+        return 0
     if size > MAX_INPUT_BYTES:
         return fallback(raw, "oversize payload", size=size)
     if refused := os.environ.get(ANSWERED_ENV, ""):
