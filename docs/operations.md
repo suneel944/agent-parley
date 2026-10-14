@@ -424,9 +424,11 @@ state folder is removed. The remedy names the command for each root:
 `agent-parley gc --project ROOT` reports the removal and `--apply` performs
 it. It refuses while the root exists, while any lane's session process may
 still run, and before the service has retired the project's lanes, which it
-does one supervision interval after it finds the root gone. The project's
-recovery checkpoints move to `recovered/` under the state root, named by the
-project's key, unless `--yes` deletes them with the rest.
+does one supervision interval after it finds the root gone. While the service
+records a lane whose retirement it refused, it names each such lane and its
+refusal and refuses too, unless `--yes` deletes that work with the rest. The
+project's recovery checkpoints move to `recovered/` under the state root,
+named by the project's key, unless `--yes` deletes them with the rest.
 
 The store has four states. `absent` means no store has been created yet, which
 is consistent because the service writes it at the current schema. `ok` means
@@ -1848,7 +1850,9 @@ and one entry per project holding
 `root`, its private state `directory`, `root_missing` when the root is no
 longer a directory, `dormant` when the root is gone or every lane has been
 stopped for a long time, `reclaim` as the last sweep's `state_bytes`,
-`reclaimable` and `forceable` worktrees and when it was `swept`, the issue
+`reclaimable` and `forceable` worktrees, when it was `swept` and the steps it
+refused as `errors` (null for a sweep published before refusals were kept),
+the issue
 ledger as `revision` and `issues`, `ready_groups` naming the plan groups whose
 every member is held by a lane reported ready, `participants`,
 `supervision_error` as the last supervision failure's `at`, `since` and
@@ -2709,7 +2713,12 @@ service sweeps them at most once every 900 seconds, after the rest of a poll,
 and `agent-parley gc` runs the same sweep on demand: without `--apply` it
 reports what it would do, with `--apply` it removes what it may. The outcome
 of the service's own sweep is published in `reclaim.json` in the project state
-directory, so the next sweep is bounded even when one fails.
+directory, so the next sweep is bounded even when one fails. Each step of the
+sweep (worktree moves, lane reclaim, lane-made worktrees, file pruning and
+bundle pruning) runs on its own, so a refusal in one never skips the rest.
+Each refusal is published under `errors` with its `step` and `error`, written
+to the service log as a `reclaim` entry, and recorded as the project's
+supervision error; the `status` reclaim line counts them and names the first.
 
 A lane is reclaimed only when every one of these holds: its worktree is a
 registered worktree directly inside this project's state directory; no session
@@ -2892,7 +2901,11 @@ volume, is marked `unreachable` and never retires a lane. The marker names,
 per lane, the claims released and the checkpoint each one left, and the state
 directory for the operator to remove. A lane whose session is still live is
 kept, and `agent-parley problems` names it under `root missing` until its
-session ends. The project then leaves `status`, `top` and `metrics`. A root
+session ends. A lane whose retirement is refused, because it holds ready work
+awaiting integration or work an operator blocked, keeps its claims and is
+named under `refused` with the refusal and its checkpoints; the project is
+not recorded retired while any lane is refused, and each later poll tries the
+lane again. The project then leaves `status`, `top` and `metrics`. A root
 that returns clears the marker on the next poll; when lanes had retired, the
 marker moves to `root-returned.json` with `returned_at`, and
 `agent-parley problems` lists them under `root returned` with each re-admit

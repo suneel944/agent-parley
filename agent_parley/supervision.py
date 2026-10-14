@@ -7505,10 +7505,22 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     stops growing by one bundle per capture of an issue nothing owns
     anymore.
 
+    Each step runs on its own, so a refusal from one, such as a worktree
+    move Git declines, never skips the steps after it. Every refusal is
+    published under `errors` with its step and message, written to the
+    service log as a `reclaim` entry, and raised once the sweep finishes,
+    so the poll stage records it as the supervision error `status` and
+    `problems` show. The sweep is still stamped, so a step that refuses
+    every time is retried once an interval rather than on every poll.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory holding the lanes.
         manifest: Project manifest naming the root and the participants.
+
+    Raises:
+        BridgeError: If any step refused, naming each step and its refusal,
+            after every other step ran and the publication was written.
     """
     from agent_parley import cli, server
 
@@ -7529,16 +7541,35 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     moved: list[dict] = []
     pruned: list[str] = []
     bundles: list[str] = []
+    errors: list[dict] = []
     bridge = cli.Bridge(home)
+    root = Path(manifest["root"])
+
+    def step(label: str, call: Callable[[], list]) -> list:
+        """Runs one sweep step, recording rather than raising its refusal."""
+        try:
+            return call()
+        except BridgeError as exc:
+            errors.append({"step": label, "error": str(exc)})
+            return []
+
     try:
-        moved = bridge.relocate_worktrees(Path(manifest["root"]), apply=True)
-        rows = bridge.reclaim(Path(manifest["root"]), apply=True)
-        made = bridge.reclaim_worktrees(Path(manifest["root"]), apply=True)
-        pruned = reclaim.prune(directory, roster.read(directory), now)
+        moved = step(
+            "relocate", lambda: bridge.relocate_worktrees(root, apply=True)
+        )
+        rows = step("reclaim", lambda: bridge.reclaim(root, apply=True))
+        made = step(
+            "worktrees", lambda: bridge.reclaim_worktrees(root, apply=True)
+        )
+        pruned = step(
+            "prune",
+            lambda: reclaim.prune(directory, roster.read(directory), now),
+        )
         with contextlib.suppress(OSError, ValueError):
-            bundles = recovery.prune(directory, issues.snapshot(directory))
-    except BridgeError:
-        pass
+            bundles = step(
+                "bundles",
+                lambda: recovery.prune(directory, issues.snapshot(directory)),
+            )
     finally:
         left = [row for row in made if not row.get("removed")]
         with contextlib.suppress(OSError):
@@ -7554,6 +7585,7 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
                     "reclaimable": sum(row["reclaim"] for row in left),
                     "forceable": sum(reclaim.forceable(row) for row in left),
                     "bundles_pruned": len(bundles),
+                    "errors": errors,
                 },
             )
     acted = [
@@ -7578,6 +7610,17 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
                     lanes.RECLAIMED,
                     evidence="reclaim removed the lane after its work landed",
                 )
+    for error in errors:
+        server.log(
+            home,
+            "reclaim",
+            f"{directory.name}: {error['step']} refused: {error['error']}",
+        )
+    if errors:
+        raise BridgeError(
+            "reclaim: "
+            + "; ".join(f"{row['step']}: {row['error']}" for row in errors)
+        )
 
 
 def reclaim_summary(directory: Path) -> dict:
@@ -7588,8 +7631,10 @@ def reclaim_summary(directory: Path) -> dict:
 
     Returns:
         The state directory's size in bytes, the worktrees a reclaim would
-        remove and the further ones only a forced reclaim would, and when
-        they were measured; every value is None before the first sweep.
+        remove and the further ones only a forced reclaim would, when they
+        were measured, and the steps the sweep refused; every value is None
+        before the first sweep, and `errors` is None for a sweep published
+        before refusals were recorded.
     """
     try:
         published = json.loads((directory / RECLAIM_PUBLICATION).read_text())
@@ -7599,7 +7644,13 @@ def reclaim_summary(directory: Path) -> dict:
         published = {}
     return {
         key: published.get(key)
-        for key in ("state_bytes", "reclaimable", "forceable", "swept")
+        for key in (
+            "state_bytes",
+            "reclaimable",
+            "forceable",
+            "swept",
+            "errors",
+        )
     }
 
 
@@ -7617,6 +7668,29 @@ def root_retired(directory: Path) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(published, dict) and bool(published.get("retired"))
+
+
+def root_refused(directory: Path) -> list[dict]:
+    """Reads the lanes `missing_root` could not retire for a gone root.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        One entry per refused lane, naming it, the refusal and the
+        checkpoints captured for its claims; empty when the publication is
+        missing, unreadable or predates the `refused` key.
+    """
+    try:
+        published = json.loads((directory / ROOT_PUBLICATION).read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(published, dict):
+        return []
+    refused = published.get("refused")
+    if not isinstance(refused, list):
+        return []
+    return [entry for entry in refused if isinstance(entry, dict)]
 
 
 def missing_root(
@@ -7654,6 +7728,15 @@ def missing_root(
     record cannot be read has no process evidence either way, so it is
     counted as live rather than retired on an unreadable file.
 
+    A lane `retirement.withdraw` refuses, because it holds ready work still
+    awaiting integration or work an operator blocked, keeps its claims and
+    its credential. The publication names it under `refused` with the
+    refusal and the checkpoints captured for its claims, and the project is
+    not recorded retired, so `forget` cannot delete the only record of that
+    work unless the operator explicitly discards it. Each later poll tries
+    such a lane again. A publication written before `refused` existed
+    reads as refusing nothing.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -7689,6 +7772,7 @@ def missing_root(
         return
     lanes = list(recorded.get("lanes") or [])
     live = []
+    refused: list[dict] = []
     for name, participant in manifest["participants"].items():
         if roster.retired(participant):
             continue
@@ -7711,7 +7795,14 @@ def missing_root(
                 )["id"]
         try:
             report = retirement.withdraw(directory, name)
-        except BridgeError:
+        except BridgeError as exc:
+            refused.append(
+                {
+                    "participant": name,
+                    "refused": str(exc),
+                    "checkpoints": checkpoints,
+                }
+            )
             continue
         with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
             store.revoke(home, manifest["root"], participant["display"])
@@ -7726,11 +7817,12 @@ def missing_root(
         path,
         {
             "since": since,
-            "retired": None if live else now,
+            "retired": None if live or refused else now,
             "state_directory": str(directory),
             "unreachable": False,
             "lanes": lanes,
             "live": live,
+            "refused": refused,
         },
     )
 
@@ -7827,7 +7919,10 @@ def forget(
     the projects folder in one step, so no reader ever sees half of it.
     The recovery checkpoints `missing_root` captured are moved to
     `RECOVERED_FOLDER` under the state root, beside the project's key,
-    unless ``discard`` asks for them to be deleted with the rest.
+    unless ``discard`` asks for them to be deleted with the rest. A project
+    whose publication names lanes `missing_root` could not retire is kept,
+    naming each lane and its refusal, unless ``discard`` explicitly deletes
+    that work along with the checkpoints.
 
     Args:
         home: Private bridge state root.
@@ -7842,8 +7937,9 @@ def forget(
 
     Raises:
         BridgeError: If no registered project names the root, the root
-            exists, a lane's session process is alive or unreadable, or the
-            supervisor has not retired the project yet.
+            exists, a lane's session process is alive or unreadable, a lane
+            whose retirement was refused is recorded and ``discard`` is
+            false, or the supervisor has not retired the project yet.
     """
     wanted = {root, str(Path(root).expanduser().absolute())}
     found = None
@@ -7877,7 +7973,19 @@ def forget(
             f"Lanes of {named} may still be running: {', '.join(live)}; "
             "stop their sessions, then run this again."
         )
-    if not root_retired(directory):
+    refused = root_refused(directory)
+    if refused and not discard:
+        listed = "; ".join(
+            f"{entry.get('participant')}: {entry.get('refused')}"
+            for entry in refused
+        )
+        raise BridgeError(
+            f"Lanes of {named} hold work their retirement refused to "
+            f"release, and removing the state deletes its only record: "
+            f"{listed}. Recover that work from its checkpoints, or rerun "
+            "with --yes to delete it with the recovery checkpoints."
+        )
+    if not refused and not root_retired(directory):
         raise BridgeError(
             f"The service has not retired {named} yet; it does so one "
             "supervision interval after it finds the root gone. Run "
