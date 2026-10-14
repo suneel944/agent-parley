@@ -80,6 +80,14 @@ is never handed out, and the next fill or `gc --apply` removes its worktree and
 branch. `status` counts spares as ready, preparing or stale, and `gc` lists each
 one. Like `init set`, `pool set` runs only from an operator shell.
 
+A path any participant records as its lane, live, retired or reclaimed, stays
+claimed until that participant leaves the roster: a fill never creates a spare
+there, and a spare recorded at such a path is dropped from the record without
+touching its worktree and is never handed out. Re-admitting a retired lane
+recreates its own worktree on its own branch; when its path already holds a
+recorded spare, another participant's lane, or a worktree on another branch,
+re-admission refuses instead of sharing that worktree.
+
 ### Starting on an issue
 
 ```sh

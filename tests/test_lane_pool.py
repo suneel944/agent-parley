@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import pool, roster, terminal
+from agent_parley import pool, retirement, roster, terminal
 from agent_parley.state import BridgeError, write_json
 from agent_parley.worktrees import git
 
@@ -158,3 +158,81 @@ def test_a_pool_set_to_zero_lets_gc_remove_the_spares(
 def test_the_pool_size_is_a_bounded_whole_number(size):
     with pytest.raises(BridgeError):
         roster.pool_size(size)
+
+
+def recorded_lanes(directory):
+    """Lists every lane path the roster records, one per participant."""
+    return [
+        participant["lane"]
+        for participant in roster.read(directory)["participants"].values()
+    ]
+
+
+def test_a_retired_pooled_lane_keeps_its_path_through_refill_and_readmit(
+    bridge, repo, monkeypatch, tmp_path
+):
+    directory, _ = prepared(bridge, repo, monkeypatch, tmp_path)
+    manifest = bridge.add_participant(repo, "claude", "claude")
+    claude = manifest["participants"]["claude"]
+    retirement.withdraw(directory, "claude")
+    git(repo, "worktree", "remove", "--force", claude["lane"])
+    bridge.fill_pool(repo)
+    spare = pool.spares(directory)[0]
+    assert spare["path"] != claude["lane"]
+    bridge.add_participant(repo, "claude", "claude")
+    lane = Path(claude["lane"])
+    assert git(lane, "symbolic-ref", "--short", "HEAD") == claude["branch"]
+    assert pool.spares(directory) == [spare]
+    codex = bridge.add_participant(repo, "codex", "codex")["participants"]
+    assert codex["codex"]["lane"] == spare["path"]
+    lanes = recorded_lanes(directory)
+    assert len(lanes) == len(set(lanes)) == 2
+
+
+def test_a_reclaimed_pooled_lane_path_is_never_refilled(
+    bridge, repo, monkeypatch, tmp_path
+):
+    directory, _ = prepared(bridge, repo, monkeypatch, tmp_path)
+    manifest = bridge.add_participant(repo, "claude", "claude")
+    lane = manifest["participants"]["claude"]["lane"]
+    git(repo, "worktree", "remove", "--force", lane)
+    bridge.fill_pool(repo)
+    recorded = [spare["path"] for spare in pool.spares(directory)]
+    assert len(recorded) == 1
+    assert lane not in recorded
+
+
+def test_a_spare_recorded_at_a_lane_path_is_never_handed_out_or_removed(
+    bridge, repo, monkeypatch, tmp_path
+):
+    directory, _ = prepared(bridge, repo, monkeypatch, tmp_path)
+    spare = pool.spares(directory)[0]
+    data = roster.read(directory)
+    data["participants"]["claude"] = {"lane": spare["path"]}
+    assert pool.take(repo, directory, data) is None
+    assert pool.spares(directory) == []
+    assert Path(spare["path"]).is_dir()
+
+
+def test_readmission_refuses_a_lane_path_that_holds_a_spare(
+    bridge, repo, monkeypatch, tmp_path
+):
+    directory, _ = prepared(bridge, repo, monkeypatch, tmp_path)
+    manifest = bridge.add_participant(repo, "claude", "claude")
+    claude = manifest["participants"]["claude"]
+    retirement.withdraw(directory, "claude")
+    git(repo, "worktree", "remove", "--force", claude["lane"])
+    bridge.fill_pool(repo)
+    git(repo, "worktree", "add", "-b", "elsewhere", claude["lane"])
+    records = pool.spares(directory)
+    write_json(
+        directory / pool.RECORD,
+        {"spares": [*records, {**records[0], "path": claude["lane"]}]},
+    )
+    with pytest.raises(BridgeError, match="a pool spare"):
+        bridge.add_participant(repo, "claude", "claude")
+    pool.fill(repo, directory, roster.read(directory))
+    paths = [spare["path"] for spare in pool.spares(directory)]
+    assert claude["lane"] not in paths
+    with pytest.raises(BridgeError, match="'elsewhere'"):
+        bridge.add_participant(repo, "claude", "claude")

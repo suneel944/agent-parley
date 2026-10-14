@@ -148,6 +148,27 @@ def discard(root: Path, spare: dict) -> bool:
     return True
 
 
+def lanes(manifest: dict) -> set[str]:
+    """Names every worktree path a participant records as its lane.
+
+    A lane that took a spare keeps the spare's path, and a retired or
+    reclaimed participant keeps its recorded path after the worktree is
+    gone, so these paths stay claimed until the participant leaves the
+    roster. No spare is ever created at, or handed out from, one of them.
+
+    Args:
+        manifest: Project manifest holding the participant roster.
+
+    Returns:
+        Every recorded lane path, live, retired or reclaimed.
+    """
+    return {
+        str(Path(participant["lane"]))
+        for participant in manifest.get("participants", {}).values()
+        if participant.get("lane")
+    }
+
+
 def _slot(directory: Path, key: str, prefix: str, taken: set[str]) -> dict:
     """Names the next free spare worktree path and branch.
 
@@ -170,12 +191,15 @@ def fill(root: Path, directory: Path, manifest: dict) -> list[dict]:
     Each missing spare is reserved in the record, then created and prepared
     without the record's lock held, and marked ready only when ``init``
     succeeded. A spare whose creation or ``init`` failed is removed again.
+    A new spare never takes a path a participant records as its lane, and a
+    recorded spare at such a path leaves the record with its worktree left
+    in place, because that worktree belongs to the lane.
 
     Args:
         root: Base checkout of the project.
         directory: Private project state directory.
         manifest: Project manifest holding the pool size, base, branch
-            prefix and ``init`` command.
+            prefix, ``init`` command and participant roster.
 
     Returns:
         The spares recorded once the fill finished.
@@ -187,8 +211,11 @@ def fill(root: Path, directory: Path, manifest: dict) -> list[dict]:
     with lock(directory / LOCK, timeout=LOCK_SECONDS):
         kept: list[dict] = []
         dropped: list[dict] = []
+        claimed = lanes(manifest)
         for spare in spares(directory):
             condition = state(spare, manifest)
+            if str(Path(spare["path"])) in claimed:
+                continue
             if condition == PREPARING or (
                 condition == READY and len(kept) < wanted
             ):
@@ -196,7 +223,7 @@ def fill(root: Path, directory: Path, manifest: dict) -> list[dict]:
             else:
                 dropped.append(spare)
         refs = _git(root, "for-each-ref", "--format=%(refname:short)")
-        taken = set((refs or "").splitlines())
+        taken = set((refs or "").splitlines()) | claimed
         for spare in kept:
             taken.update((spare["path"], spare["branch"]))
         reserved = []
@@ -273,12 +300,16 @@ def take(root: Path, directory: Path, manifest: dict) -> dict | None:
     for the current base and ``init`` command, and its worktree still sits
     on its own branch at exactly that base. A ready spare whose worktree
     moved off that branch or base is removed here; any other unusable spare
-    is left for the next fill or sweep to remove.
+    is left for the next fill or sweep to remove. A spare at a path a
+    participant records as its lane is never handed out and leaves the
+    record with its worktree left in place, because that worktree belongs
+    to the lane.
 
     Args:
         root: Base checkout of the project.
         directory: Private project state directory.
-        manifest: Project manifest holding the base and ``init`` command.
+        manifest: Project manifest holding the base, ``init`` command and
+            participant roster.
 
     Returns:
         The spare taken, or None when the pool holds no usable one.
@@ -286,10 +317,15 @@ def take(root: Path, directory: Path, manifest: dict) -> dict | None:
     if not (directory / RECORD).exists():
         return None
     moved: list[dict] = []
+    owned: list[dict] = []
     chosen = None
+    claimed = lanes(manifest)
     with lock(directory / LOCK, timeout=LOCK_SECONDS):
         recorded = spares(directory)
         for spare in recorded:
+            if str(Path(spare["path"])) in claimed:
+                owned.append(spare)
+                continue
             if state(spare, manifest) != READY:
                 continue
             path = Path(spare["path"])
@@ -302,13 +338,15 @@ def take(root: Path, directory: Path, manifest: dict) -> dict | None:
                 continue
             chosen = spare
             break
-        if chosen is not None or moved:
+        if chosen is not None or moved or owned:
             _write(
                 directory,
                 [
                     entry
                     for entry in recorded
-                    if entry is not chosen and entry not in moved
+                    if entry is not chosen
+                    and entry not in moved
+                    and entry not in owned
                 ],
             )
     for spare in moved:
@@ -409,10 +447,15 @@ def sweep(
 ) -> list[dict]:
     """Assesses, and optionally removes, stale and surplus spares for ``gc``.
 
+    A recorded spare at a path a participant records as its lane is no
+    spare: it gets no row, its worktree is never removed here, and an
+    applied sweep drops it from the record.
+
     Args:
         root: Base checkout of the project.
         directory: Private project state directory.
-        manifest: Project manifest holding the pool size and base.
+        manifest: Project manifest holding the pool size, base and
+            participant roster.
         apply: Whether stale spares and spares beyond the pool size are
             removed, as the sweep that removes dead lanes does.
 
@@ -426,8 +469,11 @@ def sweep(
     with lock(directory / LOCK, timeout=LOCK_SECONDS):
         kept: list[dict] = []
         dropped: list[dict] = []
+        claimed = lanes(manifest)
         for spare in spares(directory):
             condition = state(spare, manifest)
+            if str(Path(spare["path"])) in claimed:
+                continue
             if condition == PREPARING or (
                 condition == READY
                 and sum(state(entry, manifest) == READY for entry in kept)
