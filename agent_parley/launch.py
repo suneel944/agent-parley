@@ -449,6 +449,13 @@ reported.
         the dialog watcher and ``doctor`` can name the release that drew a
         dialog; a client that cannot say leaves the version empty.
 
+        Before anything is registered the launch takes one
+        `process.host_load` reading and refuses while the host is past the
+        project's ``max_load_ratio`` or below its ``min_available_mib``,
+        naming the numbers and the setting. There is no override flag; the
+        thresholds are supervision settings. An unreadable reading is not
+        judged, and on Windows the check is skipped with one line saying so.
+
         Args:
             agent: Participant name within the project.
             repo: Target Git repository.
@@ -468,7 +475,8 @@ reported.
                 the participant already has a launcher, or the repository
                 lies on a mounted Windows drive under WSL, or the lane's
                 checkpoint lock stays held for `LAUNCH_LOCK_SECONDS`, or the
-                project's enforced run budget is exhausted, or the lane
+                project's enforced run budget is exhausted, or the host is
+                past its launch load threshold, or the lane
                 retired while the launch waited for that lock, since a
                 retirement removes the worktree under the same lock, or
                 ``issue`` is not an issue number or its claim is refused,
@@ -512,16 +520,31 @@ reported.
             )
         process.check_repository_host(repo)
         directory = self.project(repo, create=False)[1]
-        stopped = (
-            budgets.halted(directory, roster.read(directory))
+        recorded = (
+            roster.read(directory)
             if (directory / "project.json").exists()
-            else None
+            else {}
         )
+        stopped = budgets.halted(directory, recorded) if recorded else None
         if stopped:
             raise BridgeError(
                 f"The run budget is exhausted ({stopped['cause']}), so no "
                 f"lane is launched or resumed; {budgets.RESUME}.",
                 next_command="agent-parley budget resume",
+            )
+        host = process.host_load()
+        if host.skipped:
+            print(host.skipped, file=sys.stderr)
+        limits = supervision.configuration(self.home, recorded)
+        if pressure := process.overloaded(
+            host, limits["max_load_ratio"], limits["min_available_mib"]
+        ):
+            raise BridgeError(
+                f"The host is past its launch threshold ({pressure}), so no "
+                "lane is launched or resumed; change that setting under "
+                "supervision in the project manifest or supervision.json, "
+                "or launch again once the host has headroom.",
+                next_command="agent-parley doctor",
             )
         data = self.add_participant(repo, agent, provider, credential)
         if gap := supervision.opt_in_adapter(self.home, data, agent):

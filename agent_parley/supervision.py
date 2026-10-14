@@ -77,9 +77,14 @@ DEFAULTS: dict[str, Any] = {
     "ci_rounds": 2,
     "fold_after": 86400,
     "forge_skip_labels": list(issues.FORGE_SKIP_LABELS),
+    "max_load_ratio": 1.5,
+    "min_available_mib": 1024,
 }
 
 MAX_COMPLETION_REMINDERS = 100
+MAX_LOAD_RATIO = 1000
+MAX_AVAILABLE_MIB = 1048576
+HOST_LOADED = "busy:host load"
 MAX_CI_ROUNDS = 100
 MAX_CLAIMS_PER_LANE = 100
 MAX_CONVERGENCE_REPEATS = 100
@@ -247,6 +252,16 @@ def settings(value: dict) -> dict:
     if type(rounds) is not int or not 1 <= rounds <= MAX_CI_ROUNDS:
         raise BridgeError(
             f"ci_rounds must be between 1 and {MAX_CI_ROUNDS} rounds."
+        )
+    ratio = result["max_load_ratio"]
+    if type(ratio) not in (int, float) or not 0 < ratio <= MAX_LOAD_RATIO:
+        raise BridgeError(
+            f"max_load_ratio must be above 0 and at most {MAX_LOAD_RATIO}."
+        )
+    floor = result["min_available_mib"]
+    if type(floor) is not int or not 0 <= floor <= MAX_AVAILABLE_MIB:
+        raise BridgeError(
+            f"min_available_mib must be between 0 and {MAX_AVAILABLE_MIB} MiB."
         )
     for field in (
         "prompts",
@@ -9895,6 +9910,11 @@ def wake(
     never escalates the lane; the backlog waits until the operator records
     the opt-in with `approval resume` or resumes the lane, and only the
     first such refusal is written to the checkpoint history.
+    A resume also takes one `process.host_load` reading first. A host past
+    the project's ``max_load_ratio`` or below its ``min_available_mib`` is
+    not given another lane: the attempt is recorded as `HOST_LOADED` with
+    the numbers, a busy refusal that spends no attempt, and the launch is
+    deferred to a later poll instead of refused.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
     lane; waking only asks the lane to take its own turn.
 
@@ -10136,6 +10156,12 @@ def wake(
             ):
                 if opt_in_missing(home, manifest, name):
                     result = OPT_IN_MISSING
+                elif loaded := process.overloaded(
+                    process.host_load(),
+                    config["max_load_ratio"],
+                    config["min_available_mib"],
+                ):
+                    result = f"{HOST_LOADED}: {loaded}"
                 elif (
                     prompt := terminal.selected_prompt(directory, name, home)
                 ) is None:

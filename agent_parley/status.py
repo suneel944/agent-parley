@@ -526,7 +526,11 @@ class StatusMixin(BridgeCore):
             version than the launcher is stale and names its restart. The
             ``plugins`` list and ``server`` record carry the same versions
             for scripts; a CLI with no plugin in any home is listed as not
-            installed and does not fail the set.
+            installed and does not fail the set. The `host load` component
+            prints one `process.host_load` reading against the global
+            launch threshold, ``supervision.json`` over the defaults, and
+            whether `run` would refuse and dispatch defer; a load is not
+            drift, so it never makes the set inconsistent either.
         """
         from agent_parley import decisions, plugins
         from agent_parley.cli import (
@@ -757,6 +761,21 @@ class StatusMixin(BridgeCore):
                 "state": TOKEN_READERS.format(
                     read=", ".join(measured) or "none",
                     unread=", ".join(unmeasured) or "none",
+                ),
+                "remedy": "",
+                "compatible": True,
+            }
+        )
+        limits = supervision.configuration(self.home, {})
+        components.append(
+            {
+                "component": "host load",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": process.load_line(
+                    process.host_load(),
+                    limits["max_load_ratio"],
+                    limits["min_available_mib"],
                 ),
                 "remedy": "",
                 "compatible": True,
