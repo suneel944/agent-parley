@@ -996,6 +996,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `merges`, `integration`, `unattended` | `integration.json`; `merge.lock` |
 | `forecast` | `cochanges.json` (co-change cache) |
 | `lanes` | `lane-evidence.jsonl`, drained through `lane-evidence.draining.jsonl`, under `lane-evidence.lock` |
+| `evidence` | `review-<head>.json`, naming its `review-<head>-events.jsonl` export by file and SHA-256, both written atomically with mode `0600`; each push keeps only the newest `REVIEW_RETAINED` (20) pairs |
 | `pool` | `spares.json` under `pool.lock`; `pool.log` |
 | `supervision` | `boot.json`, `capacity-candidates.json` under `capacity-candidates.lock`, `git-readings.json`, `key-holds.json` under `key-holds.lock`, `pull-requests.json`, `reclaim.json`, `root-missing.json`, `root-returned.json`, `supervision-poll.json` |
 | `attachments` | `attachments/` |
