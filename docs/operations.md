@@ -1139,12 +1139,15 @@ attachment is readable by its own lane.
 
 One attachment is capped at 65,536 bytes and a lane holds at most 1 MiB of
 attachments in total; a body past either cap is refused with the cap named.
-Messages are never pruned, so when a long message would pass the lane's
+When a long message would pass the lane's
 allowance, the lane's oldest message attachments that every recipient has read
 are released first, only as far as the new body needs. A released attachment
 reads as released and its message keeps the first slice. A message with an
 unread recipient, or with no recipient such as a feed-only post, keeps its
-attachment. A report attachment is
+attachment. The allowance is counted from the index `attachments/held.json`,
+which lists each lane's unreleased attachments, so a long send costs the same
+however many attachments were ever written; a state directory without the
+index rebuilds it once from the metadata files. A report attachment is
 removed when the report log rotates past that record; an offer attachment is
 removed when the offer is declined, cancelled or replaced, and an accepted
 offer keeps it until the issue is released. `top` and `status` count as
@@ -1667,10 +1670,25 @@ report log, and the pull request that ended the claim.
 record is rewritten, so a history query is safe beside running lanes. Retention
 follows each substrate: the issue ledger keeps its records until the project is
 removed, the report log keeps the newest 2000 records and is rewritten in
-place once it passes 256 KB, and mail and reservations keep theirs for as long
-as the store does. A record written before this correlation existed carries
+place once it passes 256 KB, and mail and reservations follow the store
+retention below. A record written before this correlation existed carries
 no claim and is reported as `unknown`; nothing is back-filled, because an
 invented correlation is worse than an honest gap.
+
+**Store retention.** The service prunes settled store rows older than 90 days
+when it starts and then once an hour, in batches of 5,000 rows per write
+transaction. A recipient's copy of a message goes once it is acknowledged, or
+read when no acknowledgement was asked for; the message goes once no copy is
+left. Released reservations, answered reservation requests and delivered or
+cancelled scheduled items go too. Unread and unacknowledged mail, decisions,
+live reservations, queued requests and pending scheduled items stay at any
+age. A message that ends with an attachment marker stays with its copies,
+because its search entry holds the full body and deleting the row would
+damage the search index; its attachment stays bounded by the writer's
+allowance. The newest row of each table always stays, so an identifier is
+never handed out twice. A history window cannot reach past rows that
+retention removed. Freed pages stay in `bridge.sqlite3` for reuse rather
+than shrinking the file.
 
 ### Following one lane
 

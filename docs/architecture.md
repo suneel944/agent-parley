@@ -265,7 +265,12 @@ directory by `agent_parley/attachments.py`, keyed by an opaque
 `kind-identifier` reference that is validated by pattern and resolved only
 inside that folder; the record keeps a bounded slice ending with the
 reference. No MCP tool serves an attachment; `mail show --full` and
-`report show --full` print one whole. Sends require an idempotency
+`report show --full` print one whole. Each lane's unreleased attachments are
+listed in `attachments/held.json`, so the allowance check of a long send reads
+that index rather than every metadata file. The service prunes settled mail,
+released reservations, answered requests and finished scheduled items older
+than 90 days through `store.prune`; unread and unacknowledged mail, decisions
+and attachment-bearing messages stay. Sends require an idempotency
 key: identical retries return the original message ID; changed retries fail.
 Fetching never marks a message read or acknowledges it.
 
@@ -998,7 +1003,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `lanes` | `lane-evidence.jsonl`, drained through `lane-evidence.draining.jsonl`, under `lane-evidence.lock` |
 | `pool` | `spares.json` under `pool.lock`; `pool.log` |
 | `supervision` | `boot.json`, `capacity-candidates.json` under `capacity-candidates.lock`, `git-readings.json`, `key-holds.json` under `key-holds.lock`, `pull-requests.json`, `reclaim.json`, `root-missing.json`, `root-returned.json`, `supervision-poll.json` |
-| `attachments` | `attachments/` |
+| `attachments` | `attachments/`, with the allowance index `attachments/held.json` under `attachments.lock` |
 | `recovery` | `recovery/` (mode `0700`): capture records `<id>.json`, Git bundles `<id>.bundle`, their `-approval.json` and `-quiesce.json` records, and `issue-<n>-refusal.json` |
 
 Per-lane files sit in the same project directory, prefixed with the lane

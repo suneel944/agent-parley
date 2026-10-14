@@ -41,6 +41,46 @@ MAX_RESULT_BYTES = 8192
 MAX_RECIPIENTS = 16
 MAX_ROSTER = 32
 MAX_EVENT_ROWS = 2000
+RETENTION_DAYS = 90
+PRUNE_BATCH = 5000
+SETTLED_BEFORE = "datetime(:epoch,'unixepoch')"
+UNATTACHED = "m.body_md NOT LIKE '%[attachment message-%'"
+PRUNES = (
+    (
+        "message_recipients",
+        "DELETE FROM message_recipients WHERE rowid IN (SELECT r.rowid FROM "
+        "message_recipients r JOIN messages m ON m.id=r.message_id WHERE "
+        f"m.created_ts<{SETTLED_BEFORE} AND m.decision=0 AND {UNATTACHED} "
+        "AND (r.ack_ts IS NOT NULL OR (r.read_ts IS NOT NULL "
+        "AND m.ack_required=0)) LIMIT :limit)",
+    ),
+    (
+        "messages",
+        "DELETE FROM messages WHERE id IN (SELECT m.id FROM messages m WHERE "
+        f"m.created_ts<{SETTLED_BEFORE} AND m.decision=0 AND {UNATTACHED} "
+        "AND m.id<(SELECT max(id) FROM messages) AND NOT EXISTS (SELECT 1 "
+        "FROM message_recipients r WHERE r.message_id=m.id) LIMIT :limit)",
+    ),
+    (
+        "file_reservations",
+        "DELETE FROM file_reservations WHERE id IN (SELECT id FROM "
+        f"file_reservations WHERE released_ts<{SETTLED_BEFORE} "
+        "AND id<(SELECT max(id) FROM file_reservations) LIMIT :limit)",
+    ),
+    (
+        "reservation_requests",
+        "DELETE FROM reservation_requests WHERE id IN (SELECT id FROM "
+        "reservation_requests WHERE "
+        f"coalesce(granted_ts,cancelled_ts)<{SETTLED_BEFORE} "
+        "AND id<(SELECT max(id) FROM reservation_requests) LIMIT :limit)",
+    ),
+    (
+        "scheduled_deliveries",
+        "DELETE FROM scheduled_deliveries WHERE id IN (SELECT id FROM "
+        "scheduled_deliveries WHERE coalesce(delivered_ts,cancelled_ts)<:epoch "
+        "AND id<(SELECT max(id) FROM scheduled_deliveries) LIMIT :limit)",
+    ),
+)
 REFUSAL_SECONDS = 86400.0
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
@@ -1525,7 +1565,7 @@ def _send(
             MAX_BODY_BYTES,
             actor["name"],
             sorted(readers),
-            _settled_attachments(db, actor, message_id),
+            _settled_attachments(db, actor, message_id, directory),
         )
         db.execute(
             "UPDATE messages SET body_md=? WHERE id=?", (stored, message_id)
@@ -1536,36 +1576,98 @@ def _send(
 
 
 def _settled_attachments(
-    db: sqlite3.Connection, actor: dict, message_id: int | None
+    db: sqlite3.Connection,
+    actor: dict,
+    message_id: int | None,
+    directory: Path,
 ) -> list[str]:
     """Lists the sender's attachment-bearing messages every recipient read.
 
-    Messages are never pruned, so this is what lets a lane's attachment
-    allowance free again. A recipient whose copy was superseded counts as
-    finished with it; a message with no recipient row, such as a feed-only
-    post, and a decision, which every participant may read, are never
-    listed. The list is oldest first so the longest-settled
-    bodies are released before newer ones.
+    This is what lets a lane's attachment allowance free again. A recipient
+    whose copy was superseded counts as finished with it; a message with no
+    recipient row, such as a feed-only post, and a decision, which every
+    participant may read, are never listed. The list is oldest first so the
+    longest-settled bodies are released before newer ones.
+
+    Only messages whose attachment the sender still holds are examined,
+    read from the allowance index, so the query runs while the write lock
+    is held at a cost bounded by the sender's live attachments rather than
+    by every message it ever wrote.
 
     Args:
         db: Open store connection.
         actor: Sending participant.
         message_id: Message being sent, which is never listed.
+        directory: Private state directory of the sender's project.
 
     Returns:
         Attachment references of those messages, oldest first.
     """
+    ids = [
+        int(number)
+        for ref in attachments.held(directory, actor["name"])
+        if (number := ref.removeprefix("message-")) != ref and number.isdigit()
+    ]
+    if not ids:
+        return []
+    marks = ",".join("?" for _ in ids)
     rows = db.execute(
-        "SELECT m.id FROM messages m WHERE m.sender_id=? AND m.id IS NOT ? "
-        "AND m.decision=0 AND m.body_md LIKE '%[attachment message-%' "
+        f"SELECT m.id FROM messages m WHERE m.id IN ({marks}) "
+        "AND m.sender_id=? AND m.id IS NOT ? AND m.decision=0 "
         "AND EXISTS ("
         "SELECT 1 FROM message_recipients r WHERE r.message_id=m.id) "
         "AND NOT EXISTS ("
         "SELECT 1 FROM message_recipients r WHERE r.message_id=m.id "
         "AND r.read_ts IS NULL AND r.superseded_ts IS NULL) ORDER BY m.id",
-        (actor["id"], message_id),
+        (*ids, actor["id"], message_id),
     ).fetchall()
     return [attachments.reference("message", row[0]) for row in rows]
+
+
+def prune(
+    home: Path, now: float, keep_days: float = RETENTION_DAYS
+) -> dict[str, int]:
+    """Deletes settled coordination rows older than the retention window.
+
+    A recipient copy goes once it is acknowledged, or read when the message
+    asks for no acknowledgement; a message goes once no recipient copy is
+    left. Unread and unacknowledged mail therefore stays at any age, and so
+    do decisions. A released reservation, an answered reservation request
+    and a delivered or cancelled scheduled item go once they are older than
+    the window; a live reservation, a queued request and a pending item
+    stay.
+
+    A message that carries an attachment marker stays with its recipient
+    copies. Its search entry was indexed from the full body, which the
+    message row no longer holds, and deleting it would hand the search index
+    a body it never indexed; its attachment stays bounded by the writer's
+    allowance instead. The newest row of every table stays too, because
+    SQLite gives the next row the highest identifier plus one, and a reused
+    message identifier would name an earlier message's attachment.
+
+    Each batch of at most `PRUNE_BATCH` rows is its own write transaction,
+    so a large first pass never holds the write lock for long. Freed pages
+    stay in the file for reuse.
+
+    Args:
+        home: Private bridge state root.
+        now: Current wall-clock time in seconds since the epoch.
+        keep_days: Age in days a settled row must reach before it goes.
+
+    Returns:
+        Number of rows deleted from each table.
+    """
+    counts = {table: 0 for table, _ in PRUNES}
+    if not present(home):
+        return counts
+    bounds = {"epoch": now - keep_days * 86400, "limit": PRUNE_BATCH}
+    for table, statement in PRUNES:
+        deleted = PRUNE_BATCH
+        while deleted == PRUNE_BATCH:
+            with connect(home, write=True) as db:
+                deleted = db.execute(statement, bounds).rowcount
+            counts[table] += deleted
+    return counts
 
 
 def _roster(db: sqlite3.Connection, actor: dict) -> dict:
