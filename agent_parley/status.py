@@ -36,6 +36,7 @@ FORGE_PAGE = 100
 FORGE_TIMEOUT = 3 + 2 * -(-FORGE_LIMIT // FORGE_PAGE)
 FORGE_FULL_SECONDS = 3600.0
 FORGE_OVERLAP = 120.0
+TOKEN_READERS = "read for {read}; not measured for {unread}"
 
 
 def reading(
@@ -514,6 +515,10 @@ class StatusMixin(BridgeCore):
             a client newer than its recorded dialog matchers or a dialog
             none of them read, as a matcher drift that also leaves the set
             consistent, because the lane still escalates what it cannot read.
+            The `tokens` component names the defined providers whose
+            lanes report tokens and those no reader measures, so a token
+            limit's blind spots are visible before one is set; it never
+            makes the set inconsistent.
         """
         from agent_parley import decisions, plugins
         from agent_parley.cli import (
@@ -694,6 +699,28 @@ class StatusMixin(BridgeCore):
                 "protocol": protocol.PROTOCOL,
                 "state": protocol.DRIFT if drifted else protocol.OK,
                 "remedy": "; ".join(drifted),
+                "compatible": True,
+            }
+        )
+        from agent_parley import records, roster
+
+        defined = roster.providers(self.home)
+        measured = sorted(
+            name
+            for name, entry in defined.items()
+            if str(entry.get("adapter", "")) in records.readers()
+        )
+        unmeasured = sorted(set(defined) - set(measured))
+        components.append(
+            {
+                "component": "tokens",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": TOKEN_READERS.format(
+                    read=", ".join(measured) or "none",
+                    unread=", ".join(unmeasured) or "none",
+                ),
+                "remedy": "",
                 "compatible": True,
             }
         )

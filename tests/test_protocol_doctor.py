@@ -215,7 +215,16 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         "notify",
         "approvals",
         "dialogs",
+        "tokens",
     }
+    [tokens] = [
+        entry
+        for entry in reported["components"]
+        if entry["component"] == "tokens"
+    ]
+    assert tokens["compatible"] is True
+    assert tokens["state"].endswith("; not measured for amp")
+    assert "read for claude, codex, copilot, " in tokens["state"]
     [drift] = [
         entry
         for entry in reported["components"]

@@ -302,7 +302,9 @@ advisory limits on a lane; the same flags on `provider budget NAME` and
 `budget set` give every lane of a provider or a project defaults to inherit,
 participant over provider over project, field by field, and any limit may stay
 unset. Consumption comes from what is already read: tokens as the `TOKENS`
-column counts them, calls from the served-call records, hours from the recorded
+column counts them, which covers `claude`, `codex`, `copilot`, `gemini` and
+`opencode` lanes but not `amp` lanes, whose client keeps no local usage
+record, so a token limit on an `amp` lane is flagged as not measured, calls from the served-call records, hours from the recorded
 session. No vendor is asked and no price is applied, so a token budget is a
 count and not spend; only `report usage` turns tokens into an estimate, and
 only for a provider the operator priced

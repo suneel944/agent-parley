@@ -514,8 +514,8 @@ be set and at least 12 characters; inbound status queries are off.
 - **`ready` is not done.** A ready report means ready for review, not verified
   completion.
 - **No token-saving claims.** `CONTEXT` counts the bytes coordination injects
-  and `TOKENS` repeats what a `claude` or `codex` lane's client counted;
-  `gemini`, `copilot`, `opencode` and `amp` lanes report no token count.
+  and `TOKENS` repeats what a `claude`, `codex`, `copilot`, `gemini` or
+  `opencode` lane's client counted; `amp` lanes report no token count.
   Neither is billed spend.
 
 ## How it compares
