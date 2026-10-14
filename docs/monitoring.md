@@ -400,7 +400,11 @@ reporting. `top --once` prints full detail.
 `TOKENS` is the session total that lane's own native client already wrote to
 disk. No vendor is asked, no key is read and no price is applied, so it is a
 relative signal between refreshes rather than billed spend, and the cell is
-blank when nothing could be read.
+blank when nothing could be read. `claude`, `codex`, `copilot`, `gemini` and
+`opencode` lanes are read; an `amp` lane, whose client keeps no local usage
+record, prints `n/a`. A `copilot` lane counts only once its session ends.
+[Token reading](providers.md#token-reading) names the file each provider is
+read from.
 
 ## Idle time is a number, not an impression
 
@@ -524,7 +528,8 @@ service against the code installed here. A service started from an older build
 is reported stale with the restart that clears it, rather than reported ready.
 Then `projects` names each registered root that no longer exists, `notify`
 says whether outbound and inbound notification are active, `approvals` names
-each lane lacking the resume opt-in, and a platform line names the kernel
+each lane lacking the resume opt-in, `tokens` names the defined providers
+whose token usage is read and those not measured, and a platform line names the kernel
 release, the WSL generation and whether `pidfd_open` is available. `doctor`
 exits non-zero on a plugin protocol mismatch, a store schema this build cannot
 use, a stale service, a service that is not running while a registered project

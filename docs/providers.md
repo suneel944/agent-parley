@@ -51,11 +51,45 @@ checkpoint, so `agent-parley top` reports its delivered context in `CONTEXT`.
 | Blocked-on-approval source | hook | hook | hook | dialog watcher | hook | dialog watcher |
 | Removed by `participant retire` | `-mcp.json` | nothing to remove | the lane's hooks in the profile, and the MCP entry once no lane hook remains | overlay file | overlay directory | overlay file |
 | Forked-session rebind | Linux and macOS | Linux and macOS | Linux and macOS | Linux and macOS | Linux and macOS | Linux and macOS |
+| Token reading | transcript `usage` | rollout `token_count` totals | `session.shutdown` totals | chat log message `tokens` | `opencode.db` session counters | not measured |
 
 Every row is read from the adapter branches in `agent_parley/launch.py`, the
-retire path and `agent_parley/process.py`. A forked or resumed session started
-outside the launcher is found by the working directory of its process, which
-Linux reads from `/proc` and macOS from `lsof`.
+retire path and `agent_parley/process.py`; the token row is read from
+`agent_parley/records.py`. A forked or resumed session started outside the
+launcher is found by the working directory of its process, which Linux reads
+from `/proc` and macOS from `lsof`.
+
+### Token reading
+
+`TOKENS` and token budgets read what each native client already wrote to
+disk, under the config home the lane launched with. No vendor is asked.
+
+- `claude` reads the `usage` of each assistant message in the session
+  transcripts.
+- `codex` reads the running total of the `token_count` events in the lane's
+  rollouts.
+- `copilot` reads the `session.shutdown` event in
+  `session-state/<id>/events.jsonl` under `COPILOT_HOME` (default
+  `~/.copilot`). The event carries the session total across resumes, and
+  Parley sums its input and output tokens over every model. Copilot CLI
+  keeps per-call usage only in its live event stream, so a session that is
+  still running reads 0 until it ends.
+- `gemini` reads `tokens.total` of each `gemini` message in the chat logs
+  under `.gemini/tmp/<project>/chats` in `GEMINI_CLI_HOME` (default `~`).
+  The project directory comes from `.gemini/projects.json`. A message that
+  the client rewrites after an update is counted once.
+- `opencode` reads the input, output, reasoning, cache read and cache write
+  counters of each session in `opencode.db` under `$XDG_DATA_HOME/opencode`
+  (default `~/.local/share/opencode`), or in the file `OPENCODE_DB` names. A
+  subagent session is folded into its parent. `OPENCODE_CONFIG_DIR` does not
+  move that database, so every OpenCode account in one lane directory shares
+  it. Releases before the SQLite store kept JSON files, which are not read.
+- `amp` keeps no local usage record, so an `amp` lane is not measured. Its
+  `TOKENS` cell prints `n/a`, a token limit warns, and `budget enforce
+  --tokens` refuses unless `--allow-unmeasured` is given.
+
+`agent-parley doctor` lists the providers with and without a token reader on
+its `tokens` line.
 
 ### How idle, blocked and prompt states are detected
 

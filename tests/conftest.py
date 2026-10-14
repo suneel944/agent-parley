@@ -75,10 +75,15 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
     for adapter, variable in (
         ("claude", "CLAUDE_CONFIG_DIR"),
         ("codex", "CODEX_HOME"),
+        ("copilot", "COPILOT_HOME"),
+        ("gemini", "GEMINI_CLI_HOME"),
+        ("opencode", "OPENCODE_CONFIG_DIR"),
     ):
         monkeypatch.setitem(
             records.DEFAULT_HOMES, adapter, str(tmp_path / variable.lower())
         )
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    monkeypatch.delenv("OPENCODE_DB", raising=False)
     monkeypatch.delenv("AGENT_PARLEY_TOKEN", raising=False)
     monkeypatch.delenv("FORCE_COLOR", raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))

@@ -908,7 +908,10 @@ prints the lane's own limits and its standing against the limits that apply.
 Consumption is measured from readings that already exist. Tokens are what the
 lane's own native client recorded for its session, exactly as the `TOKENS`
 column reports them: no vendor request, no key, no price, so a token budget is
-a count and **not** spend. Calls are the coordination calls the store served
+a count and **not** spend. Tokens are read for `claude`, `codex`, `copilot`,
+`gemini` and `opencode` lanes; an `amp` lane is not measured, and a `copilot`
+lane counts only once its session ends
+([Token reading](providers.md#token-reading)). Calls are the coordination calls the store served
 for the lane within retention. Hours are how long the session process the
 launcher recorded has been alive; a stopped lane counts no hours.
 
@@ -1432,9 +1435,13 @@ version changed — and a blank cell means "not read", never "spent nothing".
 Claude is read from that client's transcript for the lane's working directory.
 Codex is read from the rollout whose own record names that lane, searched only
 in the last two days of rollouts, so a Codex session older than that reports
-nothing. Reading is incremental: each refresh folds only the records appended
-since the previous one, up to 1 MiB per lane, so watching a long session never
-re-reads its history.
+nothing. Copilot is read from the latest `session.shutdown` event of the
+newest session whose start names that lane, Gemini from the chat logs of the
+project `.gemini/projects.json` maps the lane to, and OpenCode from the
+session counters in `opencode.db` for the lane directory. An `amp` lane prints
+`n/a`: its client keeps no local usage record. Reading is incremental: each
+refresh folds only the records appended since the previous one, up to 1 MiB
+per lane, so watching a long session never re-reads its history.
 
 `UNUSED` is the lane state accounting `status` prints on its `Lanes:` line,
 per lane: idle lane-minutes per observed lane-hour, then unaccountable

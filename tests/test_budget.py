@@ -233,9 +233,9 @@ def test_standing_counts_a_transcript_longer_than_one_read(
     starts = []
     advance = records._advance
 
-    def spied(record_path, fold, prior):
+    def spied(record_path, fold, prior, mark=records.USAGE_MARK):
         starts.append(int(prior.get("offset", 0)))
-        return advance(record_path, fold, prior)
+        return advance(record_path, fold, prior, mark)
 
     monkeypatch.setattr(records, "_advance", spied)
     again = budgets.standing(bridge.home, directory, data, "claude")

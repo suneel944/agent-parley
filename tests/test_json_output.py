@@ -133,6 +133,7 @@ def test_top_names_the_lanes_whose_tokens_are_unmeasured(
     bridge, repo, paired, monkeypatch, capsys
 ):
     bridge.add_participant(repo, "gem", "gemini")
+    bridge.add_participant(repo, "orb", "amp")
     document = envelope(
         run(monkeypatch, capsys, "--home", str(bridge.home), "top", "--json"),
         "top",
@@ -141,7 +142,8 @@ def test_top_names_the_lanes_whose_tokens_are_unmeasured(
     assert {row["participant"]: row["unmeasured"] for row in rows} == {
         "claude": [],
         "codex": [],
-        "gem": ["tokens"],
+        "gem": [],
+        "orb": ["tokens"],
     }
 
 
