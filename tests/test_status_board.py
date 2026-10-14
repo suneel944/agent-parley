@@ -402,6 +402,11 @@ def rows(lines):
     return [line.split()[0] for line in lines if line.startswith("#")]
 
 
+def on_github(monkeypatch):
+    """Gives the fixture's origin-less repository a GitHub project."""
+    monkeypatch.setattr(forge, "slug", lambda repo: "owner/name")
+
+
 def poll_forge(bridge, repo):
     """Runs the supervisor's forge refresh for the fixture's project."""
     directory = bridge.project(repo)[1]
@@ -412,6 +417,7 @@ def test_status_never_reads_the_forge_or_writes_its_cache(
     bridge, repo, paired, monkeypatch, capsys, offline
 ):
     cache = claimed(bridge, repo, paired, monkeypatch)
+    on_github(monkeypatch)
     offline["answer"] = {"42": {"title": "Wire the forge", "labels": []}}
     lines = board(monkeypatch, bridge, capsys)
     assert offline["calls"] == []
@@ -566,6 +572,7 @@ def test_a_failed_refresh_falls_back_to_the_stale_reading_once(
     bridge, repo, paired, monkeypatch, capsys, offline
 ):
     cache = claimed(bridge, repo, paired, monkeypatch)
+    on_github(monkeypatch)
     edit(bridge, repo, "42", older_than_reading)
     write_json(
         cache,
@@ -595,6 +602,7 @@ def test_no_forge_reading_hides_nothing_and_says_so(
     bridge, repo, paired, monkeypatch, capsys, offline
 ):
     cache = claimed(bridge, repo, paired, monkeypatch)
+    on_github(monkeypatch)
     poll_forge(bridge, repo)
     lines = board(monkeypatch, bridge, capsys)
     assert rows(lines) == ["#42", "#43"]
@@ -610,6 +618,20 @@ def test_no_forge_reading_hides_nothing_and_says_so(
     assert offline["calls"] == [FORGE_TIMEOUT]
     assert rows(lines) == ["#42", "#43"]
     assert any("unavailable (no GitHub)" in line for line in lines)
+
+
+def test_a_repository_without_a_github_remote_says_so(
+    bridge, repo, paired, monkeypatch, capsys, offline
+):
+    claimed(bridge, repo, paired, monkeypatch)
+    poll_forge(bridge, repo)
+    lines = board(monkeypatch, bridge, capsys)
+    assert rows(lines) == ["#42", "#43"]
+    assert [line for line in lines if line.startswith("Forge:")] == [
+        "Forge: open issues unavailable (no GitHub remote); claims on "
+        "closed issues are not hidden"
+    ]
+    assert not any("service not refreshing" in line for line in lines)
 
 
 def lane_reading(bridge, repo, name="claude"):

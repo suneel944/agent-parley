@@ -1680,7 +1680,9 @@ class StatusMixin(BridgeCore):
         never calls the forge: the service's poll keeps `FORGE_ISSUES`
         current through `supervision.refresh_forge_issues`, and this reads
         that file alone. A reading older than `FORGE_STALE` seconds is
-        reported stale, with a recorded failed read named as the cause.
+        reported stale, with a recorded failed read named as the cause. A
+        repository whose origin is missing or not on GitHub is named as
+        such, since the service has nothing to read there.
 
         Args:
             directory: Private state directory of the project.
@@ -1713,6 +1715,10 @@ class StatusMixin(BridgeCore):
             manifest = {}
         if forge.select(Path(root), manifest) != "github":
             return reading(issues, limit, now - read_at, False, "no GitHub")
+        if forge.slug(Path(root)) is None:
+            return reading(
+                issues, limit, now - read_at, False, "no GitHub remote"
+            )
         failed = float(cached.get("failed_at") or 0) > read_at
         failure = cached.get("failure")
         kind = failure.get("kind") if isinstance(failure, dict) else None
