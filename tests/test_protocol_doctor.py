@@ -228,11 +228,31 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         if entry["component"] == "approvals"
     ]
     assert approvals["state"] == protocol.SETUP_GAP
-    assert approvals["remedy"].endswith(f"{paired['root']} claude")
+    assert approvals["remedy"].endswith(
+        f"{paired['root']} claude, {paired['root']} codex"
+    )
     text = protocol.render(reported)
     assert "Consistent." in text
     assert f"approvals: {approvals['remedy']}" in text
     assert str(bridge.home) not in text
+
+
+def test_doctor_names_a_recorded_opt_in_the_cli_cannot_carry(
+    bridge, repo, paired, answering
+):
+    store.initialize(bridge.home)
+    bridge.add_participant(repo, "amper", "amp", None)
+    bridge.resume_opt_in(repo, bridge_tools=True)
+    [approvals] = [
+        entry
+        for entry in bridge.doctor()["components"]
+        if entry["component"] == "approvals"
+    ]
+    assert approvals["state"] == protocol.SETUP_GAP
+    assert approvals["remedy"] == (
+        "the CLI cannot carry the recorded bridge tool approval, so resume "
+        f"these lanes in your own terminal: {paired['root']} amper"
+    )
 
 
 def test_doctor_names_a_project_whose_root_is_gone(

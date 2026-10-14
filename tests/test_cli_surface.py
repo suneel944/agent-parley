@@ -1350,6 +1350,44 @@ def test_approval_resume_records_the_service_resume_opt_ins(
     assert "nobody is not a participant" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("name", "flag", "message"),
+    [
+        ("codex", "--auto-mode", "codex lane, and auto_mode starts"),
+        ("amper", "--bridge-tools", "the amp CLI offers no per-server"),
+    ],
+)
+def test_approval_resume_refuses_an_opt_in_the_lane_cannot_carry(
+    bridge, repo, paired, monkeypatch, capsys, name, flag, message
+):
+    bridge.add_participant(repo, "amper", "amp", None)
+    directory = bridge.project(repo)[1]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "approval",
+            "resume",
+            flag,
+            "on",
+            "--participant",
+            name,
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() != 0
+    assert message in capsys.readouterr().err
+    lane = roster.read(directory)["participants"][name]
+    assert "auto_mode" not in lane
+    assert "approve_bridge_tools" not in lane
+    resume = bridge.resume_opt_in(repo, participant="codex", bridge_tools=True)
+    assert resume == "codex: approve_bridge_tools on, auto_mode off"
+
+
 def test_setup_confirms_in_plain_text_and_json_carries_the_envelope(
     bridge, repo, monkeypatch, capsys
 ):

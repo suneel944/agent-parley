@@ -1161,7 +1161,63 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
         parsed = tomllib.loads("\n".join(overrides))
         assert "PreToolUse" in parsed["hooks"]
         assert "SessionEnd" in parsed["hooks"]
+        assert "default_tools_approval_mode" not in " ".join(result["argv"])
     assert "bypass" not in " ".join(result["argv"])
+
+
+@pytest.mark.parametrize(
+    ("version", "approved"),
+    [
+        ("codex-cli 0.153.0", True),
+        ("codex-cli 0.200.1", True),
+        ("codex-cli 0.152.9", False),
+        ("", False),
+    ],
+)
+def test_an_opted_in_codex_lane_approves_only_the_bridge_server(
+    bridge, repo, monkeypatch, tmp_path, capsys, version, approved
+):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "codex"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        " sys.exit(print(os.environ['VERSION']) if os.environ['VERSION'] "
+        "else 1)\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump(sys.argv[1:], f)\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("VERSION", version)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    bridge.add_participant(repo, "codex", "codex", None)
+    bridge.resume_opt_in(repo, participant="codex", bridge_tools=True)
+    capsys.readouterr()
+    assert bridge.launch("codex", repo, "Coordinate") == 0
+    argv = json.loads(capture.read_text())
+    overrides = [arg for arg in argv if "approval_mode" in arg]
+    if approved:
+        assert overrides == [
+            'mcp_servers.agent_parley.default_tools_approval_mode="approve"'
+        ]
+        assert "predates" not in capsys.readouterr().err
+    else:
+        assert overrides == []
+        assert "codex lane with a bridge tool approval recorded" in (
+            capsys.readouterr().err
+        )
+    assert "bypass" not in " ".join(argv)
+    assert "approval_policy" not in " ".join(argv)
 
 
 def test_mcp_two_clients_conflict_handoff_auth_and_restart(

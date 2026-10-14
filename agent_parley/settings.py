@@ -130,12 +130,17 @@ class SettingsMixin(BridgeCore):
     ) -> str:
         """Reports or records the opt-ins a service resume of a lane needs.
 
-        A `claude` lane the service resumes has nobody at the keyboard, so
+        A lane the service resumes has nobody at the keyboard, so
         the service withholds the resume until the operator records
         `approve_bridge_tools` or `auto_mode`. Both stay explicit operator
         choices that default to off; this writes the same manifest fields
         `roster.approval_opt_in` validates, for the project under
         `supervision` or for one lane, so no one edits private state by hand.
+
+        A lane-scoped opt-in its adapter cannot carry is refused rather than
+        recorded to no effect: `auto_mode` on a lane that is not `claude`,
+        and `approve_bridge_tools` on an adapter `roster.APPROVAL` gives no
+        way to pass it.
 
         Args:
             repo: Any checkout of the target repository.
@@ -149,7 +154,8 @@ class SettingsMixin(BridgeCore):
 
         Raises:
             BridgeError: If the repository has no project yet, the named
-                participant is not in it, or a change comes from a lane or a
+                participant is not in it, or its adapter cannot carry the
+                requested opt-in, or a change comes from a lane or a
                 process holding a lane's token.
         """
         from agent_parley import dialogs, unattended
@@ -169,6 +175,29 @@ class SettingsMixin(BridgeCore):
             raise BridgeError(
                 f"{participant} is not a participant in this project.",
                 next_command="agent-parley participant list",
+            )
+        adapter = ""
+        if participant and (bridge_tools or auto_mode):
+            lane = data["participants"][participant]
+            try:
+                adapter = roster.provider(
+                    self.home, lane.get("provider", participant)
+                )["adapter"]
+            except BridgeError:
+                adapter = ""
+        if auto_mode and adapter not in ("", "claude"):
+            raise BridgeError(
+                f"{participant} is a {adapter} lane, and auto_mode starts the "
+                "claude CLI's own auto permission mode, which the "
+                f"{adapter} CLI does not have; auto_mode was not recorded."
+            )
+        if bridge_tools and adapter and roster.APPROVAL.get(adapter) is None:
+            raise BridgeError(
+                f"{participant} is a {adapter} lane, and the {adapter} CLI "
+                "offers no per-server tool approval the launch could pass, "
+                "so recording one would change nothing; resume the lane in "
+                f"your own terminal with agent-parley run {participant} "
+                "--resume."
             )
         if changes:
             unattended.operator_only(

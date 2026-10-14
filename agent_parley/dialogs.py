@@ -1531,8 +1531,15 @@ def version_of(executable: str) -> str:
     return lines[0].strip() if lines else ""
 
 
-def _release_of(version: str) -> tuple[int, ...]:
-    """Reads the dotted release number a version line carries."""
+def release_of(version: str) -> tuple[int, ...]:
+    """Reads the dotted release number a version line carries.
+
+    Args:
+        version: First line a client printed for `--version`.
+
+    Returns:
+        The release as integers, or an empty tuple when the line names none.
+    """
     found = RELEASE.search(version)
     return tuple(int(part) for part in found[0].split(".")) if found else ()
 
@@ -1561,7 +1568,7 @@ def drift(directory: Path, manifest: dict) -> list[str]:
         if client not in RECORDED:
             continue
         version = str(state.get("client_version") or "")
-        if _release_of(version) > _release_of(RECORDED[client]):
+        if release_of(version) > release_of(RECORDED[client]):
             found.append(
                 f"{root} {name}: {client} {version} is newer than the "
                 f"{RECORDED[client]} the dialog matchers were recorded from"

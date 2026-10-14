@@ -138,10 +138,30 @@ in the launching shell; the launcher refuses to start when a required variable
 is unset rather than falling back to another account. Coordination state records
 variable names and config directories, never credential values.
 
-The service-resume opt-ins, `approve_bridge_tools` and `auto_mode` (see
-[Lanes](lanes.md#requiring-your-own-decision)), apply to `claude` lanes only;
-other providers resume without a pre-approval and may stop at the native
-prompt.
+The service-resume opt-in `approve_bridge_tools` (see
+[Lanes](lanes.md#requiring-your-own-decision)) is carried into each CLI's own
+per-server allow, scoped to the `agent_parley` MCP server and nothing else:
+
+| Adapter | How a recorded `approve_bridge_tools` reaches the session |
+| --- | --- |
+| `claude` | `permissions.allow` in the `--settings` the launch passes |
+| `codex` | `-c mcp_servers.agent_parley.default_tools_approval_mode="approve"`, from Codex CLI 0.153.0 |
+| `copilot` | `--allow-tool agent_parley` |
+| `gemini` | `trust: true` on the `agent_parley` server in the lane's settings overlay |
+| `opencode` | `permission` `agent_parley_*: allow` in the lane's `opencode.json` overlay |
+| `amp` | none; Amp offers no per-server approval the launcher can pass |
+
+A lane on any adapter but `amp` that the service could resume, with no opt-in
+recorded, gets the same standard-error warning and `setup gap: bridge tool
+approval not recorded` wake result as a `claude` lane. An opt-in the CLI
+cannot carry is never dropped silently: `approval resume --bridge-tools on
+--participant NAME` refuses it for an `amp` lane, a project-wide opt-in is
+named on standard error when such a lane launches and under `approvals` in
+`doctor`, and a `codex` lane whose `codex --version` is older than 0.153.0 or
+unreadable starts without the override and says so. `auto_mode` is the
+`claude` CLI's own auto permission mode; it applies to `claude` lanes only,
+and `approval resume --auto-mode on --participant NAME` refuses any other
+adapter by name.
 
 Each preset names one configuration-home variable. A credential profile's
 `--config-home` is applied to that variable for the launch, which is what makes

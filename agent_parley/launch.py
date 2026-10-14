@@ -419,7 +419,11 @@ reported.
         and only where the operator recorded the opt-in for this project or
         this lane, the launch allows that one MCP server through those native
         settings. No other tool is named, no permission decision is weakened
-        and no bypass flag is ever passed. A lane without that opt-in that the
+        and no bypass flag is ever passed. A recorded opt-in the client
+        cannot carry, because its adapter has no such setting or its `codex`
+        release predates one, is named on standard error through
+        `supervision.opt_in_unsupported` instead of being dropped silently.
+        A lane without that opt-in that the
         service could resume is named on standard error, because the service
         withholds its resume rather than start a session nobody can answer.
         A client whose adapter `denials.EVENTS` names also runs the lane's
@@ -654,6 +658,11 @@ reported.
                 "AGENT_PARLEY_HOME": str(self.home),
                 PARTICIPANT_ENV: agent,
             }
+            client_version = dialogs.version_of(executable)
+            if limit := supervision.opt_in_unsupported(
+                self.home, data, agent, client_version
+            ):
+                print(limit, file=sys.stderr)
             if entry["adapter"] == "claude":
                 config = lane.parent / f"{agent}-mcp.json"
                 write_json(
@@ -819,6 +828,15 @@ reported.
                     "-c",
                     'mcp_servers.agent_parley.bearer_token_env_var="AGENT_PARLEY_TOKEN"',
                 ]
+                if dialogs.pre_approved(data, agent) and (
+                    dialogs.release_of(client_version)
+                    >= roster.CODEX_APPROVAL_RELEASE
+                ):
+                    command += [
+                        "-c",
+                        "mcp_servers.agent_parley."
+                        'default_tools_approval_mode="approve"',
+                    ]
                 for event, groups in hooks.items():
                     hook = groups[0]["hooks"][0]
                     value = (
@@ -834,9 +852,6 @@ reported.
                 f"Shared project: {data['root']}",
                 flush=True,
             )
-            from agent_parley import dialogs
-
-            client_version = dialogs.version_of(executable)
             with lock(
                 lane.parent / f"{agent}-checkpoint.lock",
                 timeout=LAUNCH_LOCK_SECONDS,
