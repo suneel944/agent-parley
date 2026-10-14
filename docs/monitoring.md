@@ -625,6 +625,43 @@ one `Pull requests` summary to its issues line and `status` one line per
 project over the last 7 days, each only when the window holds any, and `top --json` carries each lane's figures
 under `pull_requests`.
 
+## Usage per issue
+
+A claim records what its lane had consumed when it began and again when it
+resolved, from the same readings a budget uses: tokens from the lane's own
+session transcript, served calls from the store and hours from the session's
+age. The difference is written on the claim's resolution and its `resolve`
+history entry as `usage` with `tokens`, `calls`, `hours` and a `basis`.
+`basis: claim` means both readings came from the same session. `basis:
+session` means the session rotated during the claim, so the figures cover
+the final session only and may be lower than what the claim used. A figure
+that could not be read is `null`. `history issue N` shows it on the
+`resolve` line, and `--json` carries it under each record's `usage`.
+
+```sh
+agent-parley report usage --since 7d
+agent-parley report usage --since 7d --json
+```
+
+`report usage` lists every claim resolved in the window. Each row names the
+issue, its lane and provider, the outcome, the pull request and its state, and
+the usage. A total line follows the rows. A ledger written before this
+reading existed loads unchanged and reports its figures as unknown.
+
+No figure is spend. An operator who wants an estimate records a blended price
+per million tokens for a provider from an operator shell:
+
+```sh
+agent-parley provider price claude --per-mtok 3
+agent-parley provider price claude --per-mtok 0
+```
+
+The second command removes the price. When a price is set, each row with a
+token count gains an `estimated_spend` and the totals gain a sum. The text
+output labels the total as an estimate from recorded prices, not a bill. A lane
+cannot set or change a price: the command refuses a lane worktree and any
+process holding a lane's `AGENT_PARLEY_TOKEN`.
+
 ## `watch`
 
 One lane can be followed as a stream. `agent-parley watch NAME` prints one line

@@ -672,6 +672,57 @@ class SettingsMixin(BridgeCore):
             + f" Standing: {standing}. A budget informs and does not gate."
         )
 
+    def price(self, repo: Path, name: str, per_mtok: float | None) -> str:
+        """Reports or records the operator's price on one provider.
+
+        A price turns a recorded token count into an estimated spend in
+        `report usage`; nothing is fetched from a vendor. Only the operator
+        records one: a process holding a lane's token is refused wherever
+        it runs, and so is a command run from a lane's worktree, the same
+        boundary every operator-only project setting keeps.
+
+        Args:
+            repo: Directory the command runs from.
+            name: Provider the price belongs to.
+            per_mtok: Price per million tokens, 0 to remove it, or None to
+                report the recorded price.
+
+        Returns:
+            An account of the recorded price.
+
+        Raises:
+            BridgeError: If the provider is unknown, the price is unusable,
+                or a change comes from a lane or a process holding a lane's
+                token.
+        """
+        import os
+
+        from agent_parley import unattended
+        from agent_parley.cli import roster
+
+        if per_mtok is not None:
+            if os.environ.get(roster.LANE_TOKEN):
+                raise BridgeError(
+                    "A price is recorded from an operator shell, never from "
+                    f"a process holding a lane's {roster.LANE_TOKEN}."
+                )
+            try:
+                root, directory = self.project(repo, create=False)
+            except BridgeError:
+                root = None
+            if root is not None:
+                unattended.operator_only(
+                    repo, root, roster.read(directory), "A price is recorded"
+                )
+            roster.provider_price(self.home, name, per_mtok)
+        recorded = roster.provider(self.home, name).get("price")
+        if not recorded:
+            return f"provider {name} has no price; report usage shows no spend."
+        return (
+            f"provider {name} price {recorded['per_mtok']:g} per million "
+            "tokens; report usage shows spend as an estimate."
+        )
+
     def enforce(self, repo: Path, changes: dict | None = None) -> str:
         """Reports or records the run budget a project opted into enforcing.
 

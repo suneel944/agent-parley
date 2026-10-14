@@ -206,6 +206,7 @@ class ClaimsMixin(ReportsMixin):
         """
         from agent_parley.cli import (
             attachments,
+            budgets,
             change,
             forge,
             git,
@@ -310,6 +311,11 @@ class ClaimsMixin(ReportsMixin):
                         "max_claims_per_lane"
                     ]
                     if action in ("claim", "request", "accept")
+                    else None
+                ),
+                usage=(
+                    budgets.claim_reading(self.home, directory, data, agent)
+                    if action in ("claim", "accept")
                     else None
                 ),
             )
@@ -771,6 +777,7 @@ class ClaimsMixin(ReportsMixin):
                 unresolved-completion escalation.
         """
         from agent_parley.cli import (
+            budgets,
             forge,
             issues,
             lifecycle,
@@ -835,6 +842,7 @@ class ClaimsMixin(ReportsMixin):
             outcome="release" if release else "complete",
             actor=roster.OPERATOR,
             reason=reason,
+            usage=budgets.claim_reading(self.home, directory, data, holder),
         )
         if release:
             forge_unclaim(Path(data["root"]), directory, issue)

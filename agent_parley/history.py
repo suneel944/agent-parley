@@ -20,7 +20,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from agent_parley import issues, metrics, store
+from agent_parley import issues, metrics, roster, store
 from agent_parley.state import BridgeError
 
 KINDS = (
@@ -56,12 +56,34 @@ def _provider(manifest: dict, participant: str | None) -> str:
     return str(entry["provider"]) if entry else ""
 
 
+def spent(usage: dict) -> str:
+    """Formats what one claim used, naming an unknown figure ``n/a``.
+
+    Args:
+        usage: Tokens, calls and hours a resolution recorded.
+
+    Returns:
+        Text such as ``tokens 412,000, calls 1,830, 2.4 h``.
+    """
+    tokens, calls = usage.get("tokens"), usage.get("calls")
+    hours = usage.get("hours")
+    return (
+        f"tokens {'n/a' if tokens is None else f'{tokens:,}'}, "
+        f"calls {'n/a' if calls is None else f'{calls:,}'}, "
+        f"{'n/a' if hours is None else f'{float(hours):g}'} h"
+    )
+
+
 def _detail(action: str, number: str, entry: dict) -> str:
     """Names one ledger transition, carrying any operator-stated reason."""
     detail = f"{action} #{number}"
     pending = entry.get("offer") or entry.get("request") or {}
     reason = pending.get("reason")
-    return f"{detail}: {reason}" if reason else detail
+    if reason:
+        detail = f"{detail}: {reason}"
+    if isinstance(entry.get("usage"), dict):
+        detail = f"{detail}; {spent(entry['usage'])}"
+    return detail
 
 
 def _ledger_records(directory: Path, manifest: dict) -> list[dict]:
@@ -87,6 +109,11 @@ def _ledger_records(directory: Path, manifest: dict) -> list[dict]:
                     "claim_id": entry.get("claim_id"),
                     "owner": entry.get("owner"),
                     "detail": _detail(action, number, entry),
+                    **(
+                        {"usage": entry["usage"]}
+                        if isinstance(entry.get("usage"), dict)
+                        else {}
+                    ),
                 }
             )
     return records
@@ -479,3 +506,128 @@ def describe(
     if truncated:
         described += "\nOlder records omitted; narrow with --since."
     return described
+
+
+def _price(home: Path, provider: str) -> float | None:
+    """Returns the operator's recorded price per million tokens, if any."""
+    try:
+        entry = roster.provider(home, provider)
+    except BridgeError:
+        return None
+    value = (entry.get("price") or {}).get("per_mtok")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def usage(
+    home: Path, directory: Path, manifest: dict, since: float = 0.0
+) -> dict:
+    """Reports what each resolved claim used, with its pull request outcome.
+
+    Every resolution the issue ledger still holds is one row: the issue,
+    the lane that held it and its provider, the outcome, the pull request
+    the forge evidence named and its state, and the tokens, calls and hours
+    the resolution recorded. A resolution recorded before usage was kept,
+    or for a provider with no token reader, reports those figures as null
+    rather than zero.
+
+    Money appears only where the operator recorded a price for the lane's
+    provider with ``provider price``. It is the recorded token count times
+    that price, an estimate and never a bill: the count is the client's own,
+    one figure for input and output alike.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private state directory for the common repository.
+        manifest: Project manifest holding the roster.
+        since: Unix time floor; older resolutions are omitted.
+
+    Returns:
+        ``rows`` oldest first and ``totals`` summing each known figure.
+        ``estimated_spend`` appears on a row and in the totals only when a
+        price applies to at least one row.
+    """
+    rows = []
+    prices: dict[str, float | None] = {}
+    for number, record in issues.snapshot(directory)["issues"].items():
+        for entry in record.get("history", []):
+            at = float(entry.get("at", 0) or 0)
+            if entry.get("action") != "resolve" or at < since:
+                continue
+            used = entry.get("usage") or {}
+            evidence = entry.get("evidence") or {}
+            holder = str(entry.get("holder") or "")
+            provider = _provider(manifest, holder)
+            row = {
+                "issue": int(number),
+                "title": record.get("title") or "",
+                "claim_id": entry.get("claim_id"),
+                "participant": holder,
+                "provider": provider,
+                "outcome": entry.get("outcome", ""),
+                "at": at,
+                "pull_request": evidence.get("pull_request"),
+                "pull_request_state": evidence.get("state", ""),
+                "tokens": used.get("tokens"),
+                "calls": used.get("calls"),
+                "hours": used.get("hours"),
+            }
+            if provider not in prices:
+                prices[provider] = _price(home, provider) if provider else None
+            price = prices[provider]
+            if price is not None and row["tokens"] is not None:
+                row["estimated_spend"] = round(
+                    row["tokens"] * price / 1_000_000, 2
+                )
+            rows.append(row)
+    rows.sort(key=lambda row: row["at"])
+    totals: dict = {
+        field: sum(row[field] for row in rows if row[field] is not None)
+        for field in ("tokens", "calls", "hours")
+    }
+    totals["hours"] = round(totals["hours"], 2)
+    priced = [
+        row["estimated_spend"] for row in rows if "estimated_spend" in row
+    ]
+    if priced:
+        totals["estimated_spend"] = round(sum(priced), 2)
+    return {"since": since, "rows": rows, "totals": totals}
+
+
+def describe_usage(reading: dict) -> str:
+    """Formats a usage report for a terminal.
+
+    Args:
+        reading: Report produced by :func:`usage`.
+
+    Returns:
+        One line per resolved claim and a totals line, or a notice that no
+        claim was resolved in the window. Spend is labeled an estimate.
+    """
+    if not reading["rows"]:
+        return "No claim was resolved in this window."
+    lines = []
+    for row in reading["rows"]:
+        pull = (
+            f"PR #{row['pull_request']} {row['pull_request_state'].lower()}"
+            if row["pull_request"]
+            else "no PR"
+        )
+        money = (
+            f", est. ${row['estimated_spend']:,.2f}"
+            if "estimated_spend" in row
+            else ""
+        )
+        lines.append(
+            f"#{row['issue']} {row['participant'] or 'unknown'} "
+            f"({row['provider'] or 'unknown'}) {row['outcome']}, {pull}: "
+            f"{spent(row)}{money}"
+        )
+    totals = reading["totals"]
+    money = (
+        f", est. ${totals['estimated_spend']:,.2f} (an estimate from "
+        "recorded prices, not a bill)"
+        if "estimated_spend" in totals
+        else ""
+    )
+    lines.append(f"Total: {spent(totals)}{money}")
+    return "\n".join(lines)

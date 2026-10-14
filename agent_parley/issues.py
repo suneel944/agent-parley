@@ -802,6 +802,7 @@ def change(
     take_orphaned: bool = False,
     takeover: dict | None = None,
     cap: int | None = None,
+    usage: dict | None = None,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -847,6 +848,10 @@ def change(
             a takeover request. None applies no cap. Like a title it is
             project configuration read at execution time, so it is excluded
             from the arguments a key is compared against.
+        usage: The acting lane's consumption reading, recorded on a claim
+            or an acceptance as the start its resolution is measured from.
+            It is a reading, not intent, so it is excluded from the
+            arguments a key is compared against.
 
     Returns:
         The persisted issue record, including its capped transition history.
@@ -877,6 +882,7 @@ def change(
             take_orphaned=take_orphaned,
             takeover=takeover,
             cap=cap,
+            usage=usage,
             **transition,
         )
     key = retries.validate(key)
@@ -899,6 +905,7 @@ def change(
             take_orphaned=take_orphaned,
             takeover=takeover,
             cap=cap,
+            usage=usage,
             **transition,
         )
     except Transient:
@@ -1367,6 +1374,7 @@ def _change(
     take_orphaned: bool = False,
     takeover: dict | None = None,
     cap: int | None = None,
+    usage: dict | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -1409,6 +1417,8 @@ def _change(
             gone without progress. Acceptance moves ownership exactly as a
             claim does, so an uncapped acceptance let a lane collect claims
             past the cap one offer at a time.
+        usage: The acting lane's consumption reading, kept on a claim or an
+            acceptance it makes as the start of the new generation.
 
     A transition that ends an ownership generation, by releasing it, by
     handing it to another lane, by taking it from an orphaned owner or by the
@@ -1524,7 +1534,7 @@ def _change(
                 "claim_id": uuid.uuid4().hex[:16],
                 "execution": previous.get("execution"),
             }
-            lifecycle.claimed(record, record["claim_id"])
+            lifecycle.claimed(record, record["claim_id"], usage)
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
@@ -1593,7 +1603,7 @@ def _change(
                         budget=budgets.get("attempts") or None,
                         claim_id=uuid.uuid4().hex[:16],
                     )
-                    lifecycle.claimed(record, record["claim_id"])
+                    lifecycle.claimed(record, record["claim_id"], usage)
                     cleared = _clear_recovery(record)
                     if ended := record.pop("ended_on_forge", None):
                         cleared["ended_on_forge"] = ended

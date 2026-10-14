@@ -4363,6 +4363,24 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Print the whole attached evidence after the record.",
     )
     showing_report.add_argument("--json", action="store_true", help=JSON_HELP)
+    usage_report = records.add_parser(
+        "usage",
+        help=(
+            "List what each resolved claim used: tokens, calls, hours and "
+            "its pull request outcome."
+        ),
+    )
+    usage_report.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    usage_report.add_argument(
+        "--since",
+        type=duration,
+        default=0.0,
+        metavar="WINDOW",
+        help="Report only claims resolved inside this window, such as 7d.",
+    )
+    usage_report.add_argument("--json", action="store_true", help=JSON_HELP)
     reviewing_report = records.add_parser(
         "review",
         help="Record this lane's verdict on another lane's report.",
@@ -5873,6 +5891,23 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     capping.add_argument("name", help="Provider whose limits are shown or set.")
     add_budget_flags(capping)
+    pricing = definitions.add_parser(
+        "price",
+        help=(
+            "Show or record the operator's price per million tokens, which "
+            "report usage turns into an estimated spend."
+        ),
+    )
+    pricing.add_argument("name", help="Provider whose price is shown or set.")
+    pricing.add_argument(
+        "--per-mtok",
+        type=float,
+        metavar="AMOUNT",
+        help=(
+            "Price per million recorded tokens; 0 removes it. Never "
+            "fetched, and refused from a lane."
+        ),
+    )
     accounts = commands.add_parser(
         "credentials", help="Inspect or define per-account profiles."
     )
@@ -6347,6 +6382,19 @@ def main() -> int:
                 views.render("report_show", record)
                 if args.json
                 else shown_record(record)
+            )
+        elif args.command == "report" and args.action == "usage":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            spent = history.usage(
+                bridge.home,
+                directory,
+                roster.read(directory),
+                time.time() - args.since if args.since else 0.0,
+            )
+            print(
+                views.render("report_usage", views.usage(spent))
+                if args.json
+                else history.describe_usage(spent)
             )
         elif args.command == "report" and args.action == "review":
             recorded = bridge.review_report(
@@ -7184,6 +7232,9 @@ def main() -> int:
                         records.unmeasured_warning([args.name]),
                         file=sys.stderr,
                     )
+                return 0
+            elif args.action == "price":
+                print(bridge.price(Path.cwd(), args.name, args.per_mtok))
                 return 0
             defined = roster.inspect(bridge.home)
             print(

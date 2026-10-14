@@ -535,6 +535,26 @@ def history(reported: dict) -> dict:
     }
 
 
+def usage(reading: dict) -> dict:
+    """Reports per-claim usage with RFC 3339 instants.
+
+    Args:
+        reading: Report produced by ``history.usage``.
+
+    Returns:
+        The window floor, null for all recorded history, one row per
+        resolved claim and the totals. ``estimated_spend`` is present only
+        where the operator recorded a price, and is an estimate.
+    """
+    return {
+        "since": timestamp(reading["since"]) if reading["since"] else None,
+        "rows": [
+            {**row, "at": timestamp(row["at"])} for row in reading["rows"]
+        ],
+        "totals": reading["totals"],
+    }
+
+
 def ledger(state: dict) -> dict:
     """Reports the whole issue ledger with the revision it was read at."""
     return {"revision": state["revision"], "issues": issues(state)}
