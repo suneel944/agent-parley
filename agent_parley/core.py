@@ -676,16 +676,29 @@ class BridgeCore:
         credential is not reissued here; the next launch registers one, which
         is the only path that has ever issued a lane's credential.
 
+        A worktree already at the lane path is kept only when it is this
+        lane's own: on the lane branch, and neither a recorded spare nor
+        another participant's lane. Anything else is refused, because
+        adopting it would put two participants, or a lane and a spare the
+        pool may still hand out, in one worktree.
+
         Args:
             root: Common repository root.
             directory: Private state directory for the repository.
             data: Manifest being updated, under the held setup lock.
             name: Retired participant being re-admitted.
+
+        Raises:
+            BridgeError: If the lane path holds a spare, another
+                participant's lane, or a worktree on another branch.
         """
+        from agent_parley import pool
         from agent_parley.cli import (
+            drift,
             git,
             has_branch,
             initialize_lane,
+            lane_branch,
             preparation,
             write_json,
         )
@@ -693,7 +706,31 @@ class BridgeCore:
         participant = data["participants"][name]
         lane = Path(participant["lane"])
         branch = participant["branch"]
-        if not lane.exists():
+        if lane.exists():
+            holders = sorted(
+                other
+                for other, entry in data["participants"].items()
+                if other != name and Path(entry["lane"]) == lane
+            )
+            if holders or any(
+                Path(spare["path"]) == lane for spare in pool.spares(directory)
+            ):
+                holder = f"{holders[0]}'s lane" if holders else "a pool spare"
+                raise BridgeError(
+                    f"{name}'s recorded lane {lane} now holds {holder}, so "
+                    "re-admitting there would share one worktree. Move that "
+                    f"worktree away with `git worktree move`, then run "
+                    f"agent-parley run {shlex.quote(name)} again.",
+                    next_command=f"git -C {shlex.quote(str(root))} "
+                    "worktree list",
+                )
+            actual = lane_branch(lane)
+            if actual != branch:
+                raise BridgeError(
+                    drift(name, participant, actual),
+                    next_command=f"agent-parley participant restore {name}",
+                )
+        else:
             started = time.monotonic()
             git(root, "worktree", "prune")
             if has_branch(root, branch):
