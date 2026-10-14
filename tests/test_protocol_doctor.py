@@ -214,7 +214,14 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         "decisions",
         "notify",
         "approvals",
+        "dialogs",
     }
+    [drift] = [
+        entry
+        for entry in reported["components"]
+        if entry["component"] == "dialogs"
+    ]
+    assert (drift["state"], drift["remedy"]) == (protocol.OK, "")
     [approvals] = [
         entry
         for entry in reported["components"]
@@ -249,6 +256,32 @@ def test_doctor_names_a_project_whose_root_is_gone(
     assert str(repo) not in named["projects"]["remedy"]
     assert reported["consistent"] is False
     assert str(gone) in protocol.render(reported)
+
+
+def test_doctor_warns_on_a_client_newer_than_its_dialog_matchers(
+    bridge, answering, tmp_path
+):
+    store.initialize(bridge.home)
+    root = tmp_path / "parley-probe-drift"
+    root.mkdir()
+    directory = bridge.home / "projects" / "0000000000000001"
+    directory.mkdir(parents=True)
+    (directory / "project.json").write_text(
+        json.dumps({"root": str(root), "participants": {"lane": {}}})
+    )
+    (directory / "lane-activity.json").write_text(
+        json.dumps({"client": "claude", "client_version": "2.1.999 (Claude)"})
+    )
+
+    reported = bridge.doctor()
+
+    named = {entry["component"]: entry for entry in reported["components"]}
+    assert named["dialogs"]["state"] == protocol.DRIFT
+    assert named["dialogs"]["compatible"] is True
+    assert (
+        "lane: claude 2.1.999 (Claude) is newer" in (named["dialogs"]["remedy"])
+    )
+    assert f"dialogs: {named['dialogs']['remedy']}" in protocol.render(reported)
 
 
 def store_schema(bridge, schema):

@@ -1030,6 +1030,8 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
     executable.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        " sys.exit(print('9.9.9 (fake client)'))\n"
         "with open(os.environ['CAPTURE'], 'w') as f:\n"
         " json.dump({'argv': sys.argv[1:], 'cwd': os.getcwd(), "
         "'has_token': bool(os.environ.get('AGENT_PARLEY_TOKEN'))}, f)\n"
@@ -1048,6 +1050,11 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
     assert bridge.launch(agent, repo, task) == 0
     result = json.loads(capture.read_text())
     assert result["cwd"] == bridge.setup(repo)["lanes"][agent]
+    state = json.loads(
+        (Path(result["cwd"]).parent / f"{agent}-activity.json").read_text()
+    )
+    assert state["client"] == agent
+    assert state["client_version"] == "9.9.9 (fake client)"
     assert result["has_token"]
     assert task in result["argv"][-1]
     assert bridge.config["token"] not in json.dumps(result)
