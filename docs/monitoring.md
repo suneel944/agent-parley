@@ -557,9 +557,9 @@ window, or the last 7 days when no window is given:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `agent_parley_lane_pull_requests_opened_total` | counter | Pull requests supervision first saw open in the window |
-| `agent_parley_lane_pull_requests_merged_total` | counter | Pull requests a claim resolution recorded as merged in the window |
-| `agent_parley_lane_pull_requests_closed_total` | counter | Pull requests that left the open list in the window with no recorded merge |
+| `agent_parley_lane_pull_requests_opened_window` | gauge | Pull requests supervision first saw open in the window |
+| `agent_parley_lane_pull_requests_merged_window` | gauge | Pull requests a claim resolution recorded as merged in the window |
+| `agent_parley_lane_pull_requests_closed_window` | gauge | Pull requests that left the open list in the window with no recorded merge |
 | `agent_parley_lane_first_pass_ratio` | gauge | Share of merged pull requests with a known CI round count that merged after one round and no `CHANGES_REQUESTED` review |
 | `agent_parley_lane_ci_rounds_unknown` | gauge | Merged pull requests with no stored CI round count, left out of the ratio and the median |
 | `agent_parley_lane_ci_rounds_median` | gauge | Median CI rounds over merged pull requests with a known count |
@@ -573,7 +573,14 @@ when it was first seen; one that leaves the open list moves to that file's
 resolution names, so its lane is the claim's holder and its claim-to-merge time
 runs from the claim to the forge's close instant. A pull request that left the
 open list without such a resolution counts as closed unmerged, which includes a
-merge no claim recorded. A window with nothing in it reports zeros. `top` adds
+merge no claim recorded. A window with nothing in it reports zero counts and no
+ratio or median sample: a lane with no merged pull request, or none with a known
+CI round count, exports no `first_pass_ratio` or `ci_rounds_median` sample, and
+one with no timed merge no `claim_to_merge_seconds_median`, so an idle lane
+never reads as a 0 % first pass or an instant merge; `top --json` carries
+`null` for those fields. The counts are gauges, not counters, because a pull request
+that leaves the window lowers them; read them as levels rather than through
+`rate()` or `increase()`. `top` adds
 one `Pull requests` summary to its issues line and `status` one line per
 project over the last 7 days, each only when the window holds any, and `top --json` carries each lane's figures
 under `pull_requests`.

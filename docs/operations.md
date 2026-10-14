@@ -1948,29 +1948,38 @@ every project series `project`. The lane families are
 `agent_parley_lane_issues_held`, `agent_parley_lane_offers_pending`,
 `agent_parley_lane_mail_unread`, `agent_parley_lane_mail_pending_ack`,
 `agent_parley_lane_leases_held`, `agent_parley_lane_leases_stale`,
-`agent_parley_lane_idle_seconds`, `agent_parley_lane_context_bytes_total`,
-`agent_parley_lane_hook_events_total`,
-`agent_parley_lane_hook_denials_total`,
-`agent_parley_lane_served_calls_total`,
-`agent_parley_lane_served_rejections_total`,
+`agent_parley_lane_idle_seconds`, `agent_parley_lane_context_bytes_window`,
+`agent_parley_lane_hook_events_window`,
+`agent_parley_lane_hook_denials_window`,
+`agent_parley_lane_served_calls_retained`,
+`agent_parley_lane_served_rejections_retained`,
 `agent_parley_lane_tokens_total`,
-`agent_parley_lane_pull_requests_opened_total`,
-`agent_parley_lane_pull_requests_merged_total`,
-`agent_parley_lane_pull_requests_closed_total`,
+`agent_parley_lane_pull_requests_opened_window`,
+`agent_parley_lane_pull_requests_merged_window`,
+`agent_parley_lane_pull_requests_closed_window`,
 `agent_parley_lane_first_pass_ratio`, `agent_parley_lane_ci_rounds_unknown`,
 `agent_parley_lane_ci_rounds_median` and
 `agent_parley_lane_claim_to_merge_seconds_median`. The project families are
 `agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
-`agent_parley_project_context_bytes_total`,
-`agent_parley_project_hook_events_total`,
-`agent_parley_project_hook_denials_total` and
+`agent_parley_project_context_bytes_window`,
+`agent_parley_project_hook_events_window`,
+`agent_parley_project_hook_denials_window` and
 `agent_parley_project_pull_requests_excluded`; the summed families add up the
 rows that project reports, so a total never counts a lane the export does not
 show. The pull request families are explained in
 [Monitoring](monitoring.md).
-`agent_parley_lane_hook_denials_by_cause_total` splits a lane's denials by
+`agent_parley_lane_hook_denials_by_cause_window` splits a lane's denials by
 `reason` and `tool`, so a refusal over a reserved path or an expiring offer
 reads apart from a policy refusal.
+
+Every `_window` and `_retained` family is a gauge, not a counter. A `_window`
+family counts what falls inside the `--since` window, or inside the retained
+hook log when no window is given; the pull request families use the last 7
+days instead. The `_retained` families count the tool events the store still
+keeps. Each can fall between two scrapes as old events leave the window, the
+log rotates or the store retires events, so read them as levels rather than
+through `rate()` or `increase()`. `agent_parley_lane_tokens_total` stays a
+counter: it is the native session's own running count.
 `tokens` is what the native client counted, not billed spend, exactly as the
 `TOKENS` column is.
 

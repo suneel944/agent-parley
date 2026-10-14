@@ -111,7 +111,9 @@ def test_a_replayed_window_gives_exact_counts_and_medians():
     assert codex["pull_requests_opened"] == 2
     assert codex["pull_requests_merged"] == 0
     assert codex["pull_requests_closed"] == 1
-    assert codex["first_pass_rate"] == 0.0
+    assert codex["first_pass_rate"] is None
+    assert codex["ci_rounds_median"] is None
+    assert codex["claim_to_merge_seconds"] is None
     line = metrics.outcome_line(reading, "7d")
     assert line == (
         "Pull requests (last 7d): 5 opened, 3 merged, 1 closed unmerged, "
@@ -221,9 +223,10 @@ def test_metrics_status_and_top_report_recorded_outcomes(
         f'project="{paired["root"]}",participant="claude",provider="claude"'
     )
     empty = run(monkeypatch, capsys, *home, "metrics")
-    assert f"agent_parley_lane_pull_requests_merged_total{{{labels}}} 0" in (
+    assert f"agent_parley_lane_pull_requests_merged_window{{{labels}}} 0" in (
         empty
     )
+    assert f"agent_parley_lane_first_pass_ratio{{{labels}}}" not in empty
     assert (
         f'agent_parley_project_pull_requests_excluded{{project="'
         f'{paired["root"]}"}} 0' in empty
@@ -241,7 +244,7 @@ def test_metrics_status_and_top_report_recorded_outcomes(
         )
     )
     text = run(monkeypatch, capsys, *home, "metrics")
-    assert f"agent_parley_lane_pull_requests_opened_total{{{labels}}} 1" in (
+    assert f"agent_parley_lane_pull_requests_opened_window{{{labels}}} 1" in (
         text
     )
     assert (
@@ -256,6 +259,7 @@ def test_metrics_status_and_top_report_recorded_outcomes(
         if participant["participant"] == "claude"
     )
     assert row["pull_requests"]["pull_requests_opened"] == 1
+    assert row["pull_requests"]["first_pass_rate"] is None
     summary = "1 opened, 0 merged, 0 closed unmerged"
     assert summary in run(monkeypatch, capsys, *home, "top", "--once")
     assert summary in run(monkeypatch, capsys, *home, "status")

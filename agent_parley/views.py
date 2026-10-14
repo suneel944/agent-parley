@@ -77,34 +77,34 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "Seconds the lane has been idle in the reported window.",
     ),
     (
-        "agent_parley_lane_context_bytes_total",
-        "counter",
+        "agent_parley_lane_context_bytes_window",
+        "gauge",
         "injected_bytes",
         "Coordination context bytes injected in the reported window.",
     ),
     (
-        "agent_parley_lane_hook_events_total",
-        "counter",
+        "agent_parley_lane_hook_events_window",
+        "gauge",
         "hook_events",
         "Hook events recorded in the reported window.",
     ),
     (
-        "agent_parley_lane_hook_denials_total",
-        "counter",
+        "agent_parley_lane_hook_denials_window",
+        "gauge",
         "denials",
         "Hook events that denied an action in the reported window.",
     ),
     (
-        "agent_parley_lane_served_calls_total",
-        "counter",
+        "agent_parley_lane_served_calls_retained",
+        "gauge",
         "calls",
-        "Coordination tool calls served for this participant.",
+        "Retained coordination tool calls served for this participant.",
     ),
     (
-        "agent_parley_lane_served_rejections_total",
-        "counter",
+        "agent_parley_lane_served_rejections_retained",
+        "gauge",
         "errors",
-        "Coordination tool calls rejected for this participant.",
+        "Retained coordination tool calls rejected for this participant.",
     ),
     (
         "agent_parley_lane_tokens_total",
@@ -113,20 +113,21 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "Tokens the native client counted, never billed spend.",
     ),
     (
-        "agent_parley_lane_pull_requests_opened_total",
-        "counter",
+        "agent_parley_lane_pull_requests_opened_window",
+        "gauge",
         "pull_requests_opened",
         "Pull requests first seen open in the outcome window.",
     ),
     (
-        "agent_parley_lane_pull_requests_merged_total",
-        "counter",
+        "agent_parley_lane_pull_requests_merged_window",
+        "gauge",
         "pull_requests_merged",
-        "Pull requests a claim resolution recorded as merged.",
+        "Pull requests a claim resolution recorded as merged in the outcome "
+        "window.",
     ),
     (
-        "agent_parley_lane_pull_requests_closed_total",
-        "counter",
+        "agent_parley_lane_pull_requests_closed_window",
+        "gauge",
         "pull_requests_closed",
         "Pull requests that left the open list without a recorded merge.",
     ),
@@ -157,19 +158,19 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
-NO_OUTCOMES: dict[str, int | float] = {
+NO_OUTCOMES: dict[str, int | float | None] = {
     "pull_requests_opened": 0,
     "pull_requests_merged": 0,
     "pull_requests_closed": 0,
     "first_pass": 0,
     "first_pass_known": 0,
-    "first_pass_rate": 0.0,
+    "first_pass_rate": None,
     "ci_rounds_unknown": 0,
-    "ci_rounds_median": 0.0,
-    "claim_to_merge_seconds": 0.0,
+    "ci_rounds_median": None,
+    "claim_to_merge_seconds": None,
 }
 
-DENIAL_CAUSES = "agent_parley_lane_hook_denials_by_cause_total"
+DENIAL_CAUSES = "agent_parley_lane_hook_denials_by_cause_window"
 
 PROJECT_METRICS: tuple[tuple[str, str, str, str], ...] = (
     (
@@ -185,20 +186,20 @@ PROJECT_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "Idle seconds summed over the project's reported lanes.",
     ),
     (
-        "agent_parley_project_context_bytes_total",
-        "counter",
+        "agent_parley_project_context_bytes_window",
+        "gauge",
         "injected_bytes",
         "Context bytes injected across the project's reported lanes.",
     ),
     (
-        "agent_parley_project_hook_events_total",
-        "counter",
+        "agent_parley_project_hook_events_window",
+        "gauge",
         "hook_events",
         "Hook events recorded across the project's reported lanes.",
     ),
     (
-        "agent_parley_project_hook_denials_total",
-        "counter",
+        "agent_parley_project_hook_denials_window",
+        "gauge",
         "denials",
         "Denials recorded across the project's reported lanes.",
     ),
@@ -965,7 +966,7 @@ def families(view: dict) -> list[dict]:
     reported.append(
         {
             "name": DENIAL_CAUSES,
-            "type": "counter",
+            "type": "gauge",
             "help": "Hook denials in the reported window by reason and tool.",
             "samples": [
                 {
