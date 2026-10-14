@@ -1244,29 +1244,37 @@ def mark_read(home: Path, root: str, name: str, ids: list[int]) -> int:
 
 
 def feed(home: Path, root: str, after: int = 0, limit: int = 3) -> dict:
-    """Reads the newest live project feed entries after a cursor.
+    """Reads one page of live project feed entries after a cursor.
 
     An entry is live while no newer entry from the same sender carries the
-    same non-empty topic; a replaced entry is only counted.
+    same non-empty topic; a replaced entry is only counted. A reader with no
+    cursor, such as a fresh session, gets the newest live entries and owes
+    no backlog. A reader with a cursor gets the oldest live entries after
+    it, so moving the cursor to the newest returned entry shows every live
+    entry over successive reads instead of skipping those older than the
+    newest page.
 
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
-        after: Last feed entry this reader already saw.
+        after: Last feed entry this reader already saw, or 0 for none.
         limit: Most entries to return.
 
     Returns:
         ``items`` newest first, each with its identifier, sender, topic,
-        subject and creation time, and ``superseded``, the number of entries
-        after the cursor that a newer one replaced.
+        subject and creation time; ``superseded``, the number of replaced
+        entries after the cursor, up to the newest returned entry when a
+        cursor is set; and ``omitted``, the number of live entries after a
+        cursor's page left for the next read, always 0 without a cursor.
     """
     if not (home / DATABASE).exists():
-        return {"items": [], "superseded": 0}
+        return {"items": [], "superseded": 0, "omitted": 0}
     replaced = (
         "EXISTS (SELECT 1 FROM messages n WHERE n.project_id=m.project_id "
         "AND n.feed=1 AND n.sender_id=m.sender_id AND n.topic=m.topic "
         "AND m.topic<>'' AND n.id>m.id)"
     )
+    fresh = after <= 0
     with connect(home) as db:
         rows = db.execute(
             "SELECT m.id,a.name AS sender,m.topic,substr(m.subject,1,80) "
@@ -1274,16 +1282,22 @@ def feed(home: Path, root: str, after: int = 0, limit: int = 3) -> dict:
             "JOIN agents a ON a.id=m.sender_id "
             "JOIN projects p ON p.id=m.project_id WHERE p.human_key=? "
             f"AND m.feed=1 AND m.id>? AND NOT {replaced} "
-            "ORDER BY m.id DESC LIMIT ?",
+            f"ORDER BY m.id {'DESC' if fresh else 'ASC'} LIMIT ?",
             (root, after, limit),
         ).fetchall()
-        superseded = db.execute(
-            "SELECT count(*) FROM messages m JOIN projects p "
-            "ON p.id=m.project_id WHERE p.human_key=? AND m.feed=1 "
-            f"AND m.id>? AND {replaced}",
-            (root, after),
-        ).fetchone()[0]
-    return {"items": [dict(row) for row in rows], "superseded": superseded}
+        newest = rows[-1]["id"] if rows and not fresh else 2**63 - 1
+        superseded, live = db.execute(
+            f"SELECT coalesce(sum({replaced} AND m.id<=?),0),"
+            f"coalesce(sum(NOT {replaced}),0) FROM messages m "
+            "JOIN projects p ON p.id=m.project_id WHERE p.human_key=? "
+            "AND m.feed=1 AND m.id>?",
+            (newest, root, after),
+        ).fetchone()
+    return {
+        "items": [dict(row) for row in (rows if fresh else reversed(rows))],
+        "superseded": superseded,
+        "omitted": 0 if fresh else live - len(rows),
+    }
 
 
 def _ack_window(directory: Path | None) -> float:

@@ -147,6 +147,28 @@ def test_polled_delivery_shows_the_project_feed_once(bridge, polled):
     assert delivery.deliver(bridge.home, directory, "helper") == 0
 
 
+def test_polled_delivery_pages_a_long_feed(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    delivery.deliver(bridge.home, directory, "helper")
+    send(bridge, polled, "helper", "merge-seed", "Merged #0 into main")
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    subjects = [f"Merged #{number} into main" for number in range(1, 6)]
+    for number, subject in enumerate(subjects):
+        send(bridge, polled, "helper", f"merge-{number}", subject)
+    with sqlite3.connect(bridge.home / store.DATABASE) as db:
+        db.execute("UPDATE messages SET topic=subject WHERE feed=1")
+
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    first = checkpoints.activity(directory, "helper")["batches"][-1]["text"]
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    second = checkpoints.activity(directory, "helper")["batches"][-1]["text"]
+
+    assert all(subject in first for subject in subjects[:3])
+    assert "Project feed, newest first, 2 newer pending: " in first
+    assert all(subject in second for subject in subjects[3:])
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
+
+
 def test_polled_delivery_names_owed_acknowledgements_once(bridge, polled):
     directory = Path(polled["lanes"]["helper"]).parent
     asked = send(bridge, polled, "helper", "ask", "Sign off", ack_required=True)
