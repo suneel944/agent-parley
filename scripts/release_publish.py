@@ -545,6 +545,66 @@ def acceptance_errors(
     return errors
 
 
+def body_sections(message: str) -> tuple[list[str], list[str]]:
+    """Reads the release-note parts of a pull request template body.
+
+    A milestone squash commit describes its release under
+    `## Problem and result` in `### ` subsections, one bullet per change,
+    and lists what upgraders must know under `## Compatibility and risks`.
+    The subsections keep their `### ` level, which matches the typed
+    sections of a changelog entry, and stop at the next `## ` heading so
+    they can never split the entry. The template checklist is not an
+    upgrade note and is left out.
+
+    Args:
+        message: Full commit message.
+
+    Returns:
+        The subsection lines, starting at the first `### ` heading under
+        `## Problem and result` and without trailing blank lines, and the
+        bullets of `## Compatibility and risks`. The first list is empty
+        when the body has no such subsections.
+    """
+    notes: list[str] = []
+    upgrade: list[str] = []
+    section = ""
+    for line in message.splitlines():
+        text = line.rstrip()
+        if text.startswith("## "):
+            section = text[3:].strip().lower()
+        elif section == "problem and result":
+            if notes or text.startswith("### "):
+                notes.append(text)
+        elif section == "compatibility and risks" and (
+            text.startswith(("- ", "* "))
+            and not text[2:].startswith(("[x] ", "[X] ", "[ ] "))
+        ):
+            upgrade.append(f"- {text[2:].strip()}")
+    while notes and not notes[-1]:
+        notes.pop()
+    return notes, upgrade
+
+
+def milestone_link(version: str) -> str:
+    """Links the closed issues of the milestone a release delivers.
+
+    Milestones carry the bare version as their title, so a title search
+    finds them without asking the forge for the milestone number, and the
+    entry stays the same whether or not the network is reachable.
+
+    Args:
+        version: Version being prepared.
+
+    Returns:
+        A Markdown line linking the milestone's closed issues.
+    """
+    query = f"is%3Aissue%20is%3Aclosed%20milestone%3A{version}"
+    return (
+        f"Closed issues: [milestone {version}]"
+        f"({REPOSITORY_URL}/issues?q={query})."
+    )
+
+
 def changelog_entry(
     root: Path, baseline: str, approved: str, version: str
 ) -> str:
@@ -555,6 +615,12 @@ def changelog_entry(
     release a maintainer requested may count nothing, because the change that
     justified it lives outside the package; its notes then list every commit
     the release ships instead, so the published entry is never empty.
+
+    A counted commit whose body has `### ` subsections under
+    `## Problem and result`, such as a milestone squash, contributes those
+    subsections instead of one line, its compatibility bullets as upgrade
+    notes, and a single link to the release milestone's closed issues in
+    place of one link per issue. Other commits render as one line each.
 
     Args:
         root: Checkout holding the release history.
@@ -580,6 +646,8 @@ def changelog_entry(
     _, _, references = release_history(root)
     sections: dict[str, set[str]] = {}
     shipped: list[str] = []
+    described: list[str] = []
+    upgrades: list[str] = []
     for record in log.split("\x00")[1:]:
         commit, message, names = record.split("\x01")
         shipped.append(f"* {message.splitlines()[0].strip()}")
@@ -589,6 +657,11 @@ def changelog_entry(
             for name in names.splitlines()
             for path in PACKAGE_PATHS
         ):
+            continue
+        notes, upgrade = body_sections(message)
+        if notes:
+            described += ["", *notes]
+            upgrades += upgrade
             continue
         headline = message.splitlines()[0][subject.end() :].strip()
         numbers = set(ISSUE_REFERENCE.findall(message)) | {
@@ -603,10 +676,15 @@ def changelog_entry(
     compare = f"{REPOSITORY_URL}/compare/v{approved}...v{version}"
     date = datetime.date.today().isoformat()
     lines = [f"## [{version}]({compare}) ({date})", ""]
+    lines += described
     for kind, title in CHANGELOG_SECTIONS:
         if kind in sections:
             lines += ["", f"### {title}", "", *sorted(sections[kind])]
-    if not sections and shipped:
+    if upgrades:
+        lines += ["", "### Upgrade notes", "", *upgrades]
+    if described:
+        lines += ["", milestone_link(version)]
+    elif not sections and shipped:
         lines += ["", "### Changes", "", *shipped]
     return "\n".join(lines) + "\n\n"
 

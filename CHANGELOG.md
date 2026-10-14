@@ -3,9 +3,82 @@
 ## [0.19.0](https://github.com/suneel944/agent-parley/compare/v0.18.2...v0.19.0) (2026-10-14)
 
 
-### Features
+0.19.0 delivers the 0.19.0 milestone: 139 issues from the 0.19.0 audit, merged as #1230. Numbers below are the pull requests that carried each change.
 
-* deliver the 0.19.0 milestone (#1230) ([#999](https://github.com/suneel944/agent-parley/issues/999)) ([#1000](https://github.com/suneel944/agent-parley/issues/1000)) ([#1001](https://github.com/suneel944/agent-parley/issues/1001)) ([#1025](https://github.com/suneel944/agent-parley/issues/1025)) ([#1026](https://github.com/suneel944/agent-parley/issues/1026)) ([#1027](https://github.com/suneel944/agent-parley/issues/1027)) ([#1028](https://github.com/suneel944/agent-parley/issues/1028)) ([#1029](https://github.com/suneel944/agent-parley/issues/1029)) ([#1030](https://github.com/suneel944/agent-parley/issues/1030)) ([#1031](https://github.com/suneel944/agent-parley/issues/1031)) ([#1032](https://github.com/suneel944/agent-parley/issues/1032)) ([#1033](https://github.com/suneel944/agent-parley/issues/1033)) ([#1034](https://github.com/suneel944/agent-parley/issues/1034)) ([#1035](https://github.com/suneel944/agent-parley/issues/1035)) ([#1036](https://github.com/suneel944/agent-parley/issues/1036)) ([#1037](https://github.com/suneel944/agent-parley/issues/1037)) ([#1038](https://github.com/suneel944/agent-parley/issues/1038)) ([#1039](https://github.com/suneel944/agent-parley/issues/1039)) ([#1040](https://github.com/suneel944/agent-parley/issues/1040)) ([#1041](https://github.com/suneel944/agent-parley/issues/1041)) ([#1042](https://github.com/suneel944/agent-parley/issues/1042)) ([#1043](https://github.com/suneel944/agent-parley/issues/1043)) ([#1044](https://github.com/suneel944/agent-parley/issues/1044)) ([#1045](https://github.com/suneel944/agent-parley/issues/1045)) ([#1046](https://github.com/suneel944/agent-parley/issues/1046)) ([#1047](https://github.com/suneel944/agent-parley/issues/1047)) ([#1048](https://github.com/suneel944/agent-parley/issues/1048)) ([#1049](https://github.com/suneel944/agent-parley/issues/1049)) ([#1050](https://github.com/suneel944/agent-parley/issues/1050)) ([#1051](https://github.com/suneel944/agent-parley/issues/1051)) ([#1052](https://github.com/suneel944/agent-parley/issues/1052)) ([#1053](https://github.com/suneel944/agent-parley/issues/1053)) ([#1054](https://github.com/suneel944/agent-parley/issues/1054)) ([#1055](https://github.com/suneel944/agent-parley/issues/1055)) ([#1056](https://github.com/suneel944/agent-parley/issues/1056)) ([#1057](https://github.com/suneel944/agent-parley/issues/1057)) ([#1058](https://github.com/suneel944/agent-parley/issues/1058)) ([#1059](https://github.com/suneel944/agent-parley/issues/1059)) ([#1060](https://github.com/suneel944/agent-parley/issues/1060)) ([#1061](https://github.com/suneel944/agent-parley/issues/1061)) ([#1062](https://github.com/suneel944/agent-parley/issues/1062)) ([#1063](https://github.com/suneel944/agent-parley/issues/1063)) ([#1064](https://github.com/suneel944/agent-parley/issues/1064)) ([#1065](https://github.com/suneel944/agent-parley/issues/1065)) ([#1066](https://github.com/suneel944/agent-parley/issues/1066)) ([#1067](https://github.com/suneel944/agent-parley/issues/1067)) ([#1068](https://github.com/suneel944/agent-parley/issues/1068)) ([#1069](https://github.com/suneel944/agent-parley/issues/1069)) ([#1070](https://github.com/suneel944/agent-parley/issues/1070)) ([#1071](https://github.com/suneel944/agent-parley/issues/1071)) ([#1072](https://github.com/suneel944/agent-parley/issues/1072)) ([#1073](https://github.com/suneel944/agent-parley/issues/1073)) ([#1074](https://github.com/suneel944/agent-parley/issues/1074)) ([#1075](https://github.com/suneel944/agent-parley/issues/1075)) ([#1076](https://github.com/suneel944/agent-parley/issues/1076)) ([#1077](https://github.com/suneel944/agent-parley/issues/1077)) ([#1078](https://github.com/suneel944/agent-parley/issues/1078)) ([#1079](https://github.com/suneel944/agent-parley/issues/1079)) ([#1080](https://github.com/suneel944/agent-parley/issues/1080)) ([#1081](https://github.com/suneel944/agent-parley/issues/1081)) ([#1082](https://github.com/suneel944/agent-parley/issues/1082)) ([#1083](https://github.com/suneel944/agent-parley/issues/1083)) ([#1084](https://github.com/suneel944/agent-parley/issues/1084)) ([#1085](https://github.com/suneel944/agent-parley/issues/1085)) ([#1086](https://github.com/suneel944/agent-parley/issues/1086)) ([#1087](https://github.com/suneel944/agent-parley/issues/1087)) ([#1088](https://github.com/suneel944/agent-parley/issues/1088)) ([#1089](https://github.com/suneel944/agent-parley/issues/1089)) ([#1090](https://github.com/suneel944/agent-parley/issues/1090)) ([#1091](https://github.com/suneel944/agent-parley/issues/1091)) ([#1092](https://github.com/suneel944/agent-parley/issues/1092)) ([#1093](https://github.com/suneel944/agent-parley/issues/1093)) ([#1094](https://github.com/suneel944/agent-parley/issues/1094)) ([#1095](https://github.com/suneel944/agent-parley/issues/1095)) ([#1096](https://github.com/suneel944/agent-parley/issues/1096)) ([#1097](https://github.com/suneel944/agent-parley/issues/1097)) ([#1098](https://github.com/suneel944/agent-parley/issues/1098)) ([#1099](https://github.com/suneel944/agent-parley/issues/1099)) ([#1100](https://github.com/suneel944/agent-parley/issues/1100)) ([#1101](https://github.com/suneel944/agent-parley/issues/1101)) ([#1102](https://github.com/suneel944/agent-parley/issues/1102)) ([#1103](https://github.com/suneel944/agent-parley/issues/1103)) ([#1104](https://github.com/suneel944/agent-parley/issues/1104)) ([#1105](https://github.com/suneel944/agent-parley/issues/1105)) ([#1106](https://github.com/suneel944/agent-parley/issues/1106)) ([#1107](https://github.com/suneel944/agent-parley/issues/1107)) ([#1108](https://github.com/suneel944/agent-parley/issues/1108)) ([#1109](https://github.com/suneel944/agent-parley/issues/1109)) ([#1110](https://github.com/suneel944/agent-parley/issues/1110)) ([#1111](https://github.com/suneel944/agent-parley/issues/1111)) ([#1112](https://github.com/suneel944/agent-parley/issues/1112)) ([#1113](https://github.com/suneel944/agent-parley/issues/1113)) ([#1114](https://github.com/suneel944/agent-parley/issues/1114)) ([#1115](https://github.com/suneel944/agent-parley/issues/1115)) ([#1116](https://github.com/suneel944/agent-parley/issues/1116)) ([#1117](https://github.com/suneel944/agent-parley/issues/1117)) ([#1118](https://github.com/suneel944/agent-parley/issues/1118)) ([#1119](https://github.com/suneel944/agent-parley/issues/1119)) ([#1120](https://github.com/suneel944/agent-parley/issues/1120)) ([#1121](https://github.com/suneel944/agent-parley/issues/1121)) ([#1122](https://github.com/suneel944/agent-parley/issues/1122)) ([#1123](https://github.com/suneel944/agent-parley/issues/1123)) ([#1124](https://github.com/suneel944/agent-parley/issues/1124)) ([#1125](https://github.com/suneel944/agent-parley/issues/1125)) ([#1126](https://github.com/suneel944/agent-parley/issues/1126)) ([#1127](https://github.com/suneel944/agent-parley/issues/1127)) ([#1128](https://github.com/suneel944/agent-parley/issues/1128)) ([#1129](https://github.com/suneel944/agent-parley/issues/1129)) ([#1130](https://github.com/suneel944/agent-parley/issues/1130)) ([#1131](https://github.com/suneel944/agent-parley/issues/1131)) ([#1132](https://github.com/suneel944/agent-parley/issues/1132)) ([#1133](https://github.com/suneel944/agent-parley/issues/1133)) ([#1134](https://github.com/suneel944/agent-parley/issues/1134)) ([#1135](https://github.com/suneel944/agent-parley/issues/1135)) ([#1136](https://github.com/suneel944/agent-parley/issues/1136)) ([#1137](https://github.com/suneel944/agent-parley/issues/1137)) ([#1138](https://github.com/suneel944/agent-parley/issues/1138)) ([#1139](https://github.com/suneel944/agent-parley/issues/1139)) ([#1140](https://github.com/suneel944/agent-parley/issues/1140)) ([#1141](https://github.com/suneel944/agent-parley/issues/1141)) ([#1142](https://github.com/suneel944/agent-parley/issues/1142)) ([#1143](https://github.com/suneel944/agent-parley/issues/1143)) ([#1144](https://github.com/suneel944/agent-parley/issues/1144)) ([#1145](https://github.com/suneel944/agent-parley/issues/1145)) ([#1146](https://github.com/suneel944/agent-parley/issues/1146)) ([#1147](https://github.com/suneel944/agent-parley/issues/1147)) ([#1148](https://github.com/suneel944/agent-parley/issues/1148)) ([#1149](https://github.com/suneel944/agent-parley/issues/1149)) ([#1150](https://github.com/suneel944/agent-parley/issues/1150)) ([#1151](https://github.com/suneel944/agent-parley/issues/1151)) ([#1152](https://github.com/suneel944/agent-parley/issues/1152)) ([#1153](https://github.com/suneel944/agent-parley/issues/1153)) ([#1154](https://github.com/suneel944/agent-parley/issues/1154)) ([#1155](https://github.com/suneel944/agent-parley/issues/1155)) ([#1156](https://github.com/suneel944/agent-parley/issues/1156)) ([#1180](https://github.com/suneel944/agent-parley/issues/1180)) ([#1185](https://github.com/suneel944/agent-parley/issues/1185)) ([#1223](https://github.com/suneel944/agent-parley/issues/1223)) ([#1224](https://github.com/suneel944/agent-parley/issues/1224))
+### Highlights
+
+- **Webhook notifications** for Slack, Discord, Teams and generic receivers (#1173).
+- **Unattended integration**: the service can merge ready work with `--auto` (#1227).
+- **Web view of `top`**: a read-only loopback page (#1210).
+- **Every built-in provider** is detected, launched and budgeted, with token usage read for gemini, copilot and opencode and usage reported per resolved claim (#1202, #1228, #1217).
+- **Approval prompts** of every provider are recognized and escalated, Codex included (#1178, #1229).
+
+### Security and policy
+
+- Archive import and roster adoption are hardened (#1157).
+- Linked attribution footers are caught and every forge text command is gated (#1158).
+- Operator-only settings and plan revisions stay out of lane reach; accepted plan revisions survive a re-applied plan file (#1159, #1163).
+- Lane gates are read through shell wrappers, compound syntax and `cd` (#1160).
+- Late and oversize PreToolUse decisions are refused instead of allowed (#1161).
+- Dialog answers are tied to the prompt the operator saw; Telegram answers are bound to one occurrence and one operator (#1164, #1166).
+- Merge admission is preflighted and approvals are bound to the reported commit (#1165).
+- Peer text in mail previews stays on one quoted line (#1162).
+
+### Coordination and dispatch
+
+- Dispatcher wakes no longer present a record id as a work offer, next work is ranked by published leads, and issues closed on the forge or landed on integration are no longer offered (#1177, #1186).
+- Ownership generations end on handoff and completion; the overdue transition stays off claims whose quiet is not the holder's; held-issue mail wakes the holder (#1176, #1175, #1187).
+- A retiring lane withdraws its takeover requests; refused lanes stay in the gone-root record and every reclaim step runs; an unanswered orphan decision stays open until its work returns; the timeout sweep retires decision kinds it never settles (#1215, #1208, #1222, #1214).
+- A spare never takes a path a participant records as its lane; reservation paths compare without case on case-insensitive checkouts (#1218, #1220).
+- Plan, pull request and merge conflict reporting is settled (#1179).
+- A refusing forge is backed off, the issue catalog is paged and forge assignment is respected (#1170).
+
+### Store and recovery
+
+- Read-only commands no longer create an empty store; corrupt activity records are set aside with a named repair; a missing required key names the state file (#1181, #1183, #1171).
+- Damaged decision files are kept and negated convergence evidence is refused (#1174).
+- Settled store rows are pruned and the attachment allowance is indexed (#1221).
+- Review evidence is bounded and exported atomically; stale spooled lane evidence no longer overrides newer states; a failed recovery checkpoint logs its cause (#1212, #1213, #1211).
+- Cross-device strays are rebuilt and preserved worktrees are restored (#1172).
+- Timed-out blueprint nodes and demo sandboxes are stopped, and starter blueprints ship (#1182).
+
+### Providers
+
+- copilot, opencode and default-account lanes keep their own configuration (#1203).
+- The bridge tool opt-in reaches codex, and opt-ins a CLI cannot carry are named (#1226).
+- `doctor` lists the token usage readers (#1228).
+- macOS process identity and working directories are read without guessing (#1219).
+
+### Operator surface
+
+- `watch` stays in order and the history row cap applies to the query; the project feed pages so older entries are not skipped (#1205, #1216).
+- `problems` reads dirtiness in parallel and honours `NO_COLOR` (#1206).
+- Lanes are refused in a repository with no commits; first-commit and stash behavior is described and a pending stash is listed (#1189, #1192).
+- Refusals on the new-user path point at a remedy that works; setup and credential commands print plain confirmations; a refused tool call names the offending keys; setup summarizes its merge gate and suggests a detected check (#1190, #1191, #1196, #1209).
+- Every CLI argument has help and positional values complete (#1188).
+
+### Notifications and MCP
+
+- Missing SMTP settings are reported as an outbound fault; a decision is retried only on the transports that refused it; notice-only polled batches are kept until the lane acts (#1197, #1198, #1199).
+- Spilled `send_message` bodies are accepted over MCP and the request limit is named (#1200).
+
+### Metrics
+
+- Sliding-window and retained totals are exported as gauges with `_window` or `_retained` suffixes, and empty medians are omitted (#1204).
+
+### Documentation, tests and CI
+
+- Documentation matches the code across monitoring, operations, acceptance, provider, state layout, catalog and release guides (#1167, #1193, #1194, #1195, #1201).
+- The suite is isolated from host state and tolerates clock drift (#1168, #1225).
+- Action pins are unified, dependency bumps are grouped and coverage is measured (#1169).
+
+### Upgrade notes
+
+- **Prometheus metric names:** twelve families that were `_total` counters are now gauges named with a `_window` or `_retained` suffix (#1204). Dashboards and alert rules that query the old `_total` names return no data on 0.19.0. 0.19.1 exports the old names again as deprecated aliases (#1232). `agent_parley_lane_tokens_total` is unchanged.
+- The store now prunes settled messages, recipients and released reservations (#1221).
+- `--auto` integration and the webhook transport are opt-in.
+
+Closed issues: [milestone 0.19.0](https://github.com/suneel944/agent-parley/milestone/36?closed=1).
 
 ## [0.18.2](https://github.com/suneel944/agent-parley/compare/v0.18.1...v0.18.2) (2026-10-12)
 
