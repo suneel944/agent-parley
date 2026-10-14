@@ -39,6 +39,7 @@ from agent_parley import (
     store,
     terminal,
     timeouts,
+    unattended,
 )
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 from agent_parley.status import (
@@ -8249,6 +8250,10 @@ def poll(home: Path, directory: Path) -> None:
     its record names the stage, the lane a wake belongs to and the line that
     raised, so one lane's failure never starves the lanes after it.
 
+    A project whose unattended integration policy records ``auto`` has its
+    ready, listed claims attempted by `unattended.supervise` on threads of
+    their own, before any lane is woken.
+
     Each poll records when it finished, how long it took and when the last
     clean poll finished, which status reports as the supervisor's liveness.
     The record also holds the wall seconds of each stage, so a slow poll
@@ -8377,6 +8382,13 @@ def _poll(home: Path, directory: Path) -> None:
         directory,
         manifest,
         config,
+    )
+    stage(
+        "unattended integration",
+        unattended.supervise,
+        home,
+        directory,
+        manifest,
     )
     if config["wake"]:
         for name, participant in manifest["participants"].items():

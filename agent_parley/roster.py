@@ -1603,14 +1603,17 @@ def integration_policy(value: object) -> dict:
     The only setting is ``unattended``: the ``target`` branch the base
     checkout must have checked out, and the bounded list of ``issues`` whose
     ready work may be integrated there without an operator at the keyboard.
-    An empty mapping is the shipped default and authorizes nothing.
+    An optional ``auto`` boolean, false when absent, lets the supervision
+    service attempt that integration on its own. An empty mapping is the
+    shipped default and authorizes nothing.
 
     Args:
         value: The ``integration`` object from the private project manifest.
 
     Returns:
         ``{}`` when no policy is recorded, otherwise the validated policy
-        with issue numbers as decimal strings in ascending order.
+        with issue numbers as decimal strings in ascending order and
+        ``auto`` present only when it is true.
 
     Raises:
         BridgeError: If a setting is unknown, missing or has an invalid value.
@@ -1621,13 +1624,17 @@ def integration_policy(value: object) -> dict:
     if "unattended" not in value:
         return {}
     unattended = value["unattended"]
-    if not isinstance(unattended, dict) or set(unattended) != {
+    if not isinstance(unattended, dict) or set(unattended) - {"auto"} != {
         "target",
         "issues",
     }:
         raise BridgeError(
-            invalid + "`unattended` must name exactly `target` and `issues`."
+            invalid + "`unattended` must name exactly `target` and `issues`, "
+            "and may add `auto`."
         )
+    auto = unattended.get("auto", False)
+    if type(auto) is not bool:
+        raise BridgeError(invalid + "`auto` must be a boolean.")
     target = unattended["target"]
     if not branch_name(target):
         raise BridgeError(invalid + "`target` must be one Git branch name.")
@@ -1650,6 +1657,7 @@ def integration_policy(value: object) -> dict:
         "unattended": {
             "target": target,
             "issues": sorted(numbers, key=int),
+            **({"auto": True} if auto else {}),
         }
     }
 

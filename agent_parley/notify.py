@@ -163,6 +163,7 @@ PROBLEM_CONDITIONS = frozenset(
         "second session",
         "recovery refused",
         "integration unverified",
+        "unattended integration failed",
         "wake attention",
         "waiting on approval",
         "held by a native dialog",

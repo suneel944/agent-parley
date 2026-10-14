@@ -147,7 +147,7 @@ on standard output and export to a file.
 | `verify show` | Show the project's configured pre-merge command. |
 | `verify set COMMAND` | Set that command; an empty string removes it. |
 | `unattended show` | Show the unattended integration policy, or that integration is operator-only. |
-| `unattended set ISSUE ... --target BRANCH` | Authorize unattended integration of those issues into `BRANCH`; no issues removes the policy. Base checkout only. |
+| `unattended set ISSUE ... --target BRANCH [--auto]` | Authorize unattended integration of those issues into `BRANCH`; no issues removes the policy. `--auto` lets the service attempt it for ready lanes on each poll instead of waiting for `unattended run`. Base checkout only. |
 | `timeout show` | List every decision kind with its class, recommended default and the timeout the project policy leaves it. |
 | `timeout set KIND [--ask \| --after WINDOW]` | Make a reversible kind always ask, or wait longer than 30 minutes; neither flag restores the default. Irreversible kinds always ask. Base checkout only. |
 | `unattended run NAME` | Integrate one eligible lane under the policy on `participant merge` terms, recording the decision or the refusal; `--issue N` names the claim when the lane holds several ready ones. Base checkout only. |

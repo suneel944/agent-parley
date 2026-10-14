@@ -300,11 +300,14 @@ or independent verification.
 
 ## Running unattended
 
-A project can authorize, ahead of time, the integration of named issues so a
-ready lane need not wait for you to be at the terminal. From the base checkout:
+A project can authorize, ahead of time, the integration of named issues.
+Without `--auto` the policy only sets the terms an operator-typed
+`unattended run` applies; with `--auto` the service runs it, so a ready lane
+need not wait for you to be at the terminal. From the base checkout:
 
 ```sh
 agent-parley unattended set 42 43 --target main   # record the policy
+agent-parley unattended set 42 43 --target main --auto  # let the service run it
 agent-parley unattended show                      # report it
 agent-parley unattended run claude-1              # integrate one lane under it
 agent-parley unattended set                       # remove it
@@ -315,11 +318,21 @@ claim and ready commit are current, the base sits on the target branch, its
 dependencies are verified complete, a verification command is configured and
 no peer reservation covers a changed path. The merge is the
 `participant merge` step with the same locks, approvals and gate, and every
-attempt records a decision in the lane's report log. It never pushes, never
-repairs an unverified integration, and the service never runs it on its own:
-it is an operator command. A lane holding several claims integrates its only
-ready one; when several are ready, name one with `--issue N`, which
-`participant merge NAME` accepts too. The full policy is in
+attempt records a decision in the lane's report log. It never pushes and
+never repairs an unverified integration. A lane holding several claims
+integrates its only ready one; when several are ready, name one with
+`--issue N`, which `participant merge NAME` accepts too.
+
+With `--auto` recorded, each supervision poll makes that same attempt for
+every listed issue whose claim is ready, on its own thread so a slow gate
+never holds the poll. A lane whose session is still running waits until the
+session ends, because every merge refuses a running session. The service
+attempts one claim once per issue, claim generation, ready commit and target
+commit, so an unchanged refusal is recorded once, not on every poll; after
+fixing what it names, run `unattended run NAME` or let a new commit move it.
+Each new decision is mailed to the lane, and a failed attempt raises an
+`unattended integration failed` row in `problems`. Without `--auto` the
+service never attempts it. The full policy is in
 [Operations](operations.md#requiring-a-recorded-approval).
 
 A lane is not left pushing fix after fix against red CI. The `ci_rounds`

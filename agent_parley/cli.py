@@ -5403,6 +5403,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Branch the base checkout must have checked out.",
     )
     standing_set.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Let the service integrate ready listed lanes on its own "
+            "instead of waiting for `unattended run`."
+        ),
+    )
+    standing_set.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     standing_run = standings.add_parser(
@@ -7119,7 +7127,11 @@ def main() -> int:
             if args.action == "set":
                 print(
                     unattended.configure(
-                        bridge, repository, args.target, args.issues
+                        bridge,
+                        repository,
+                        args.target,
+                        args.issues,
+                        args.auto,
                     )
                 )
             elif args.action == "run":

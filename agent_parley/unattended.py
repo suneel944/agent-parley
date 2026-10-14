@@ -32,15 +32,25 @@ A merge or gate failure goes through the merge step's durable recovery record,
 which holds every other lane and moves the claim to repair; `failed` then
 records the unattended decision beside it. Unattended integration never
 repairs: while the base carries an unverified integration, every attempt is
-refused and repair stays with the lane owner or the operator. Integration
-dispatch from the supervision service is deliberately not wired here.
+refused and repair stays with the lane owner or the operator.
+
+The supervision service attempts integration on its own only when the
+operator also records ``auto`` with `agent-parley unattended set --auto`.
+`supervise` then calls `integrate` for each listed, ready claim, once per
+issue, claim generation, source commit and target commit, so an unchanged
+refusal is recorded once rather than on every poll. A lane whose session is
+still running is left until the session ends, since every merge refuses a
+running session. Each new decision is mailed to the lane, and a failure the
+service recorded is raised as a problem for the operator.
 """
 
 from __future__ import annotations
 
+import contextlib
 import shlex
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -68,6 +78,9 @@ LANE_TOKEN = "AGENT_PARLEY_TOKEN"
 FORGE = "deferred to push"
 """Where forge checks and reviews are enforced; the local merge never
 pushes, so they apply when the operator pushes the target branch."""
+
+SERVICE = "service"
+"""Evidence ``actor`` of a decision the supervision service made itself."""
 
 
 def policy(manifest: dict) -> dict | None:
@@ -152,11 +165,21 @@ def describe(bridge: Bridge, repo: Path) -> str:
         f"{recorded['target']} for issues "
         + ", ".join(f"#{number}" for number in recorded["issues"])
         + ", on the terms of `participant merge`."
+        + (
+            " The service attempts it on its own for ready lanes."
+            if recorded.get("auto")
+            else " It runs only when an operator types "
+            "`agent-parley unattended run`."
+        )
     )
 
 
 def configure(
-    bridge: Bridge, repo: Path, target: str | None, issues: list[str]
+    bridge: Bridge,
+    repo: Path,
+    target: str | None,
+    issues: list[str],
+    auto: bool = False,
 ) -> str:
     """Records or removes the unattended integration authorization.
 
@@ -171,6 +194,8 @@ def configure(
             unless the policy is being removed.
         issues: Issue numbers, optionally prefixed with ``#``, whose ready
             work may be integrated; empty to remove the policy.
+        auto: Whether the supervision service attempts the integration on
+            its own instead of waiting for `agent-parley unattended run`.
 
     Returns:
         An account of the recorded policy.
@@ -194,7 +219,13 @@ def configure(
         )
     else:
         recorded = roster.integration_policy(
-            {"unattended": {"target": target, "issues": numbers}}
+            {
+                "unattended": {
+                    "target": target,
+                    "issues": numbers,
+                    "auto": auto,
+                }
+            }
         )
     with lock(directory / "setup.lock"):
         data = roster.read(directory)
@@ -500,7 +531,14 @@ def _conditions(
     return ""
 
 
-def integrate(bridge: Bridge, repo: Path, name: str, issue: str = "") -> str:
+def integrate(
+    bridge: Bridge,
+    repo: Path,
+    name: str,
+    issue: str = "",
+    *,
+    actor: str = "",
+) -> str:
     """Integrates one lane under the project's unattended policy.
 
     The attempt holds the project merge lock throughout, so a concurrent
@@ -515,6 +553,8 @@ def integrate(bridge: Bridge, repo: Path, name: str, issue: str = "") -> str:
         name: Participant whose ready work is integrated.
         issue: Claimed issue to integrate, or empty to take the lane's only
             ready claim.
+        actor: `SERVICE` when the supervision service makes the attempt,
+            recorded in the decision's evidence; empty for an operator.
 
     Returns:
         An account of the merge, or of the earlier integration a replay
@@ -541,6 +581,8 @@ def integrate(bridge: Bridge, repo: Path, name: str, issue: str = "") -> str:
         with lock(directory / "setup.lock"):
             data = bridge._project(root, directory, verify={name})
         evidence, unmet = _evaluate(bridge, root, directory, data, name, issue)
+        if actor:
+            evidence["actor"] = actor
         key = (
             evidence.get("issue"),
             evidence.get("claim_id"),
@@ -580,3 +622,169 @@ def integrate(bridge: Bridge, repo: Path, name: str, issue: str = "") -> str:
         f"#{evidence['issue']} at {evidence['source_commit'][:12]} into "
         f"{evidence['target']}."
     )
+
+
+def latest(directory: Path, name: str) -> dict | None:
+    """Reads the newest unattended decision recorded for one lane.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant whose report log is read.
+
+    Returns:
+        The newest decision record, or None when the lane has none.
+    """
+    for record in reversed(metrics.report_records(directory, name)):
+        if record.get("kind") == KIND:
+            return record
+    return None
+
+
+def _decided(
+    directory: Path, name: str, key: tuple, target_commit: str
+) -> bool:
+    """Reports whether an earlier decision already settled this attempt.
+
+    The newest decision bound to the same issue, claim generation and
+    source commit settles it, unless that decision read a target commit
+    the base has since moved from, or it failed only because the lane's
+    session was running, which ends without changing anything the key
+    names.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant whose decisions are read.
+        key: Issue, claim generation and source commit of the claim.
+        target_commit: Commit the base checkout has checked out now.
+
+    Returns:
+        True when the service should not attempt the claim again.
+    """
+    from agent_parley.cli import merges
+
+    for record in reversed(metrics.report_records(directory, name)):
+        if record.get("kind") != KIND:
+            continue
+        evidence = record.get("evidence") or {}
+        bound = (
+            evidence.get("issue"),
+            evidence.get("claim_id"),
+            evidence.get("source_commit"),
+        )
+        if bound != key:
+            continue
+        read = evidence.get("target_commit")
+        return not (read and read != target_commit) and record.get(
+            "reason"
+        ) != merges.session_busy(name)
+    return False
+
+
+def _attempt(
+    bridge: Bridge, root: Path, directory: Path, name: str, issue: str
+) -> None:
+    """Makes one service attempt and tells the lane what was decided.
+
+    Nothing is mailed when no decision was recorded, as when another merge
+    holds the merge lock; the next poll tries again. A failure this thread
+    did not expect is recorded beside the issue ledger, never lost.
+
+    Args:
+        bridge: Coordination runtime owning the project state.
+        root: Common repository root, which is the base checkout.
+        directory: Private state directory for the common repository.
+        name: Participant whose ready claim is integrated.
+        issue: Listed issue the claim covers.
+    """
+    from agent_parley import issues
+
+    try:
+        before = latest(directory, name)
+        with contextlib.suppress(BridgeError):
+            integrate(bridge, root, name, issue, actor=SERVICE)
+        decision = latest(directory, name)
+        if decision is None or decision == before:
+            return
+        outcome = decision["outcome"]
+        text = (
+            f"The service recorded unattended integration of issue #{issue} "
+            f"as {outcome} under {POLICY}."
+        )
+        if decision.get("reason"):
+            text += f" {decision['reason']}"
+        bridge.say(
+            root, name, text, subject=f"Unattended integration {outcome}"
+        )
+    except Exception as exc:
+        issues.note_supervision_error(
+            directory,
+            f"unattended {name}: {type(exc).__name__}: {exc}",
+        )
+
+
+def supervise(
+    home: Path, directory: Path, manifest: dict
+) -> list[threading.Thread]:
+    """Starts the service's attempts for the claims the policy covers.
+
+    Nothing starts unless the recorded policy carries ``auto``. A claim is
+    attempted when its issue is listed, its execution is ready, its lane is
+    in the roster, not retired and running no session, no attempt for the
+    lane is already running, and `_decided` finds no decision that settles
+    it. Each attempt runs `integrate` on a daemon thread, so a slow
+    verification gate never holds the poll.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+
+    Returns:
+        The threads started, so a caller may wait for them.
+
+    Raises:
+        BridgeError: If the recorded policy is invalid.
+    """
+    from agent_parley.cli import Bridge, git, merges, snapshot
+
+    recorded = policy(manifest)
+    if not recorded or not recorded.get("auto"):
+        return []
+    root = Path(manifest["root"])
+    running = {thread.name for thread in threading.enumerate()}
+    target_commit = ""
+    started = []
+    for number, record in snapshot(directory)["issues"].items():
+        name = record.get("owner")
+        participant = manifest["participants"].get(name)
+        execution = lifecycle.state(record)
+        label = f"agent-parley-unattended-{directory.name}-{name}"
+        if (
+            participant is None
+            or roster.retired(participant)
+            or number not in recorded["issues"]
+            or execution["state"] != lifecycle.READY
+            or label in running
+        ):
+            continue
+        source = str(
+            execution.get("source_commit") or execution["commit"] or ""
+        )
+        target_commit = target_commit or git(root, "rev-parse", "HEAD")
+        if _decided(
+            directory,
+            name,
+            (number, execution["claim_id"], source),
+            target_commit,
+        ) or merges.lane_session(directory, name):
+            continue
+        thread = threading.Thread(
+            target=_attempt,
+            args=(Bridge(home), root, directory, name, number),
+            name=label,
+            daemon=True,
+        )
+        thread.start()
+        running.add(label)
+        started.append(thread)
+    return started

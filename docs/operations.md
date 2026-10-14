@@ -517,6 +517,7 @@ condition, that count, its age and what clears it:
 | `shares to a retired lane` | Retirement superseded shares the lane still owed; the row sits on the retired lane, counts them and lasts while their acknowledgement deadlines run, or one day for a share without one. It is informational. | Nothing; the row clears when those deadlines pass. |
 | `recovery refused` | An `issue recover` approval could not proceed on the last poll, because the owner is idle, paused, at an approval prompt or on another session, or the approval is gone. The row sits on the owner's lane, names the issue and the reason, and lasts while the refused claim is the issue's current claim. | Clear what the reason names in the owner's lane; the service retries the recovery on every poll. |
 | `integration unverified` | The base checkout carries a merge that failed its gate, conflicted or was interrupted, or the record of one cannot be read. One row per project, on the lane that may repair it, naming the kind, the attempt and the gate result; every further merge is held. | The step the row names: rerun `agent-parley participant merge NAME` after the repair, `--renew-recovery` once attempts are used, or `agent-parley participant merge --verify-recovery` when no lane may repair it. See [Recovering an unverified integration](#recovering-an-unverified-integration). |
+| `unattended integration failed` | The service's own attempt under an unattended policy recorded with `--auto` failed after the lane was found eligible, as a gate, approval or merge failure. One row per lane while that decision is its newest and its claim is current. | Clear what the reason names, then `agent-parley unattended run NAME --issue N`. |
 | `crossing ready` | The project records an integration base, no claim is held, at least one issue landed there by a merged pull request is still open on the forge, and the cached reading holds every open issue. One row per project names the landed issues still open and ages from the newest landing or the newest claim end, whichever is later; with notifications configured it opens one decision, which never applies anything. The decision opens only while that age is under one day. | `gh pr create --head BRANCH`, naming each landed issue as `Closes #N`; review and merge it yourself, since that merge cannot be undone. |
 | `checks stalled` | Supervision marked an open pull request's pending head stalled; the lane was already told once. The row names the pending checks and clears when the head finishes or changes. | `gh pr checks URL`, then re-run once with `gh run rerun RUN --failed`, cancelling first a run still in progress past its job timeout. |
 | `checks failed` | An open pull request's checks are red with at least one check the forge ran and failed, or its head is pending on the one automatic re-run supervision requested. The row names the attempt and the failed checks. | `gh pr checks URL`, then fix and push or re-run; while the automatic re-run is pending, wait for its conclusion; after it, run the re-run command the row names yourself, or fix and push. |
@@ -3637,8 +3638,27 @@ is merged. Running it again after a recorded integration merges nothing; an
 earlier integration never stands in for a different issue, claim or commit.
 It never pushes and makes no forge calls: forge checks and reviews are enforced
 when you push the target branch, not at the local merge, and each decision
-records `forge: "deferred to push"`. The supervision service does not
-dispatch it automatically.
+records `forge: "deferred to push"`.
+
+The supervision service attempts it on its own only when the policy also
+records `auto`:
+
+```bash
+agent-parley unattended set 42 43 --target main --auto
+```
+
+which stores `"auto": true` beside `target` and `issues`; absent means false,
+so existing projects are unchanged. Each poll then attempts every listed issue
+whose claim is ready, on a thread of its own, with the same command's checks
+and gates. A lane whose session is running is left until it ends. A claim is
+attempted once per issue, claim generation, ready commit and target commit, so
+an unchanged refusal is recorded once rather than on every poll; fix what it
+names and run `unattended run NAME`, or let a new commit or a moved base bring
+the next attempt. The lane is mailed every new decision, the decision's
+evidence carries `actor: "service"`, and a failed attempt shows as an
+`unattended integration failed` row in `problems` until a later decision, a
+release or a completion clears it. The service still never pushes and never
+merges into anything but the recorded target.
 
 `participant retire` removes one lane: it refuses while a session is running,
 the worktree is dirty or the lane holds ready work awaiting integration, then
@@ -3804,9 +3824,10 @@ Worktrees start at a captured commit and persist. Ignored environment files,
 dependencies and untracked configuration are not copied. Set up each worktree
 as needed. Review each lane's branch, integrate it with `participant merge` or
 with Git directly, then run the target repository's combined verification gate.
-The service never starts a merge: `participant merge` and `unattended run` are
-both operator commands, run from the base checkout. A reported `ready` outcome
-does not establish that a branch is fit to merge.
+`participant merge` and `unattended run` are both operator commands, run from
+the base checkout. The service starts a merge only for issues an unattended
+policy recorded with `--auto` lists, on that command's terms. A reported
+`ready` outcome does not establish that a branch is fit to merge.
 
 ## Plugins
 
