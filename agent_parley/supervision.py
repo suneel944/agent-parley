@@ -3652,7 +3652,12 @@ def completion_escalations(
             write_json(directory / "issues.json", ledger)
 
 
-def end_merged_claims(directory: Path, ended: dict[str, dict]) -> list[str]:
+def end_merged_claims(
+    directory: Path,
+    ended: dict[str, dict],
+    home: Path | None = None,
+    manifest: dict | None = None,
+) -> list[str]:
     """Ends each claim a merged pull request closed on the forge.
 
     A holder that stops before filing its completion would otherwise keep
@@ -3676,11 +3681,23 @@ def end_merged_claims(directory: Path, ended: dict[str, dict]) -> list[str]:
     Args:
         directory: Private project state directory.
         ended: This poll's forge observations from `completed_claims`.
+        home: Private bridge state root. With ``manifest`` it lets each
+            resolution record the holder's usage; without them none is
+            recorded.
+        manifest: Current participant manifest.
 
     Returns:
         Issue numbers whose claims were ended.
     """
     resolved = []
+    owners = (
+        {
+            number: str(record.get("owner") or "")
+            for number, record in issues.snapshot(directory)["issues"].items()
+        }
+        if ended and home is not None and manifest is not None
+        else {}
+    )
     for number, seen in ended.items():
         commit = str(seen.get("commit") or "")
         closed = seen.get("closed")
@@ -3717,6 +3734,15 @@ def end_merged_claims(directory: Path, ended: dict[str, dict]) -> list[str]:
                     else "merged pull request closed the issue on the forge"
                 ),
                 claim_id=str(seen["claim_id"]),
+                usage=(
+                    budgets.claim_reading(
+                        home, directory, manifest, owners[number]
+                    )
+                    if home is not None
+                    and manifest is not None
+                    and owners.get(number)
+                    else None
+                ),
             )
             resolved.append(number)
     return resolved
@@ -8704,7 +8730,14 @@ def _remind(
         ),
     )
     ended = read[0] if read else {}
-    stage("forge completions", end_merged_claims, directory, ended)
+    stage(
+        "forge completions",
+        end_merged_claims,
+        directory,
+        ended,
+        home,
+        manifest,
+    )
     closed = set(ended)
     stage(
         "reminders",

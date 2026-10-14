@@ -304,6 +304,9 @@ participant over provider over project, field by field, and any limit may stay
 unset. Consumption comes from what is already read: tokens as the `TOKENS`
 column counts them, calls from the served-call records, hours from the recorded
 session. No vendor is asked and no price is applied, so a token budget is a
+count and not spend; only `report usage` turns tokens into an estimate, and
+only for a provider the operator priced
+([Usage per issue](monitoring.md#usage-per-issue)). A token budget stays a
 count and not spend. Past a limit `top` and `status` mark the lane
 `over budget` with the share consumed, the lane receives one bounded notice
 naming the crossed limit, and `--over-budget` selects such lanes, so

@@ -90,8 +90,8 @@ nothing are counted in the summary; `top --all` draws them. `top --serve`
 serves the same view read-only to a browser tab and a Prometheus scraper on
 `127.0.0.1`.
 [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md)
-covers the columns, keys, filters, `problems`, `metrics`, the web view and
-`watch`.
+covers the columns, keys, filters, `problems`, `metrics`, the web view,
+`watch` and `report usage`, which lists what each resolved issue used.
 
 ## Install
 
@@ -546,7 +546,7 @@ on what evidence" must be recorded, not remembered.
 | --- | --- |
 | [Running lanes](https://github.com/suneel944/agent-parley/blob/main/docs/lanes.md) | Launching, steering, pausing, merging, unattended integration, pull requests, gates and approvals. |
 | [Coordination](https://github.com/suneel944/agent-parley/blob/main/docs/coordination.md) | Claims, handoffs, reservations, mail, hooks, deadlines, budgets and history. |
-| [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md) | `status`, `top`, `problems`, `metrics`, `watch` and the four presence states. |
+| [Monitoring](https://github.com/suneel944/agent-parley/blob/main/docs/monitoring.md) | `status`, `top`, `problems`, `metrics`, `watch`, `report usage` and the four presence states. |
 | [Providers](https://github.com/suneel944/agent-parley/blob/main/docs/providers.md) | Which native CLI drives a lane, adapters, accounts and credential profiles. |
 | [Accounts](https://github.com/suneel944/agent-parley/blob/main/docs/providers.md#accounts) | Provider, account and participant; a second account of one provider, end to end. |
 | [Commands](https://github.com/suneel944/agent-parley/blob/main/docs/commands.md) | The whole command surface, the MCP tools and the `--json` contract. |

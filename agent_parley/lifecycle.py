@@ -186,12 +186,15 @@ def authorize(record: dict) -> dict:
     return execution
 
 
-def claimed(record: dict, claim_id: str) -> dict:
+def claimed(record: dict, claim_id: str, usage: dict | None = None) -> dict:
     """Starts a new authorized execution generation on a claim.
 
     Args:
         record: Mutable issue ledger record carrying earlier execution state.
         claim_id: Newly generated ownership identifier.
+        usage: The new owner's consumption reading at the claim, kept as
+            ``usage_start`` so resolution can report what the claim used.
+            None drops any reading an earlier generation left.
 
     Returns:
         The execution mapping stored on the record.
@@ -210,7 +213,55 @@ def claimed(record: dict, claim_id: str) -> dict:
         progress=previous.get("progress"),
     )
     record["execution"] = execution
+    if usage:
+        record["usage_start"] = dict(usage)
+    else:
+        record.pop("usage_start", None)
     return execution
+
+
+def usage_between(start: dict | None, end: dict) -> dict:
+    """Reports what one claim consumed between two consumption readings.
+
+    Within one session the claim used the difference of each reading. When
+    the claim started before this ledger recorded readings, or the lane
+    rotated to a new session inside it, the token and hour figures are the
+    current session's own, and served calls, which are counted per lane
+    rather than per session, are unknown without a starting reading.
+
+    Args:
+        start: Reading taken at the claim, or None when none was recorded.
+        end: Reading taken at resolution.
+
+    Returns:
+        Tokens, calls and hours, each None when unknown and never negative,
+        and ``basis``: ``claim`` for a difference within one session,
+        ``session`` when the current session's own figures stand in.
+    """
+    begun = (
+        start
+        if start and start.get("participant") == end.get("participant")
+        else None
+    )
+    same = begun is not None and begun.get("session") == end.get("session")
+    base = begun if same and begun else {}
+    tokens = end.get("tokens")
+    calls = end.get("calls")
+    hours = float(end.get("hours") or 0.0)
+    return {
+        "tokens": (
+            None
+            if tokens is None
+            else max(0, int(tokens) - int(base.get("tokens") or 0))
+        ),
+        "calls": (
+            None
+            if begun is None or calls is None
+            else max(0, int(calls) - int(begun.get("calls") or 0))
+        ),
+        "hours": round(max(0.0, hours - float(base.get("hours") or 0.0)), 2),
+        "basis": "claim" if same else "session",
+    }
 
 
 def released(record: dict, closed: bool = False) -> dict:
@@ -847,6 +898,7 @@ def resolve(
     actor: str,
     reason: str = "",
     claim_id: str | None = None,
+    usage: dict | None = None,
 ) -> dict:
     """Ends a claim whose holder never answered its completion reminder.
 
@@ -881,6 +933,10 @@ def resolve(
         reason: Operator rationale kept beside the evidence.
         claim_id: Claim the supervisor observed ending on the forge, which
             stands in for the escalation and must still be current.
+        usage: The holder's consumption reading taken just before this
+            call. Its difference from the reading taken at the claim is
+            kept as ``usage`` on the resolution and its history entry. A
+            reading of another participant, or none, records no usage.
 
     Returns:
         The resolved issue record.
@@ -959,6 +1015,12 @@ def resolve(
                 gate=None,
             )
         drop_offer(directory, record)
+        started = record.pop("usage_start", None)
+        used = (
+            {"usage": usage_between(started, usage)}
+            if usage and usage.get("participant") == holder
+            else {}
+        )
         record.update(
             owner=None,
             offer=None,
@@ -973,6 +1035,7 @@ def resolve(
                 "at": now,
                 "claim_id": record.get("claim_id"),
                 "evidence": dict(evidence),
+                **used,
             },
         )
         record.pop("unresolved_completion", None)
@@ -990,6 +1053,7 @@ def resolve(
                 "outcome": outcome,
                 "holder": holder,
                 "evidence": dict(evidence),
+                **used,
             },
         )
         if outcome == "complete":

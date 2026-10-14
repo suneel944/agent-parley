@@ -907,7 +907,7 @@ def validated_provider(name: str, entry: object) -> dict:
     Args:
         name: Provider name.
         entry: Candidate definition with adapter, command, home_env, env,
-            require_env and an optional budget.
+            require_env and an optional budget and price.
 
     Returns:
         The definition holding only the recognised fields.
@@ -956,6 +956,8 @@ def validated_provider(name: str, entry: object) -> dict:
     }
     if "budget" in entry:
         result["budget"] = budget(entry["budget"])
+    if "price" in entry:
+        result["price"] = price(entry["price"])
     return result
 
 
@@ -1022,6 +1024,57 @@ def provider_budget(home: Path, name: str, changes: dict) -> dict:
     entry["budget"] = merged_budget(
         budget(dict(entry.get("budget") or {})), changes
     )
+    return _define(home, PROVIDERS, name, entry)
+
+
+def price(value: object) -> dict:
+    """Validates the price an operator recorded on one provider.
+
+    A price is never fetched. It is the operator's own figure per million
+    tokens, applied to the one token count a client records for input and
+    output alike, so it yields an estimate and never a bill.
+
+    Args:
+        value: Recorded price, holding ``per_mtok``.
+
+    Returns:
+        The validated price.
+
+    Raises:
+        BridgeError: If a field is unknown or the price is not positive.
+    """
+    if not isinstance(value, dict) or set(value) != {"per_mtok"}:
+        raise BridgeError("A price accepts only: per_mtok.")
+    amount = value["per_mtok"]
+    if type(amount) not in (int, float) or not 0 < amount <= MAX_BUDGET:
+        raise BridgeError(
+            "The price per million tokens must be a positive number no "
+            f"greater than {MAX_BUDGET}."
+        )
+    return {"per_mtok": amount}
+
+
+def provider_price(home: Path, name: str, per_mtok: float) -> dict:
+    """Records or removes the operator's price on one provider definition.
+
+    Like a budget, a price on a built-in preset is kept on a local override,
+    and `provider remove` drops it with the override.
+
+    Args:
+        home: Private bridge state root.
+        name: Provider name.
+        per_mtok: Price per million tokens; 0 removes the price.
+
+    Returns:
+        The stored provider definition.
+
+    Raises:
+        BridgeError: If the provider is not defined or the price is unusable.
+    """
+    entry = dict(provider(home, name))
+    entry.pop("price", None)
+    if per_mtok:
+        entry["price"] = price({"per_mtok": per_mtok})
     return _define(home, PROVIDERS, name, entry)
 
 

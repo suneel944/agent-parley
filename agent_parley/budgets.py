@@ -246,6 +246,58 @@ def standing(home: Path, directory: Path, manifest: dict, name: str) -> dict:
     return reading
 
 
+def claim_reading(
+    home: Path, directory: Path, manifest: dict, name: str
+) -> dict | None:
+    """Reads one lane's consumption so far, for a claim to start or end on.
+
+    The same three readings a budget compares are taken whole, with no limit
+    needed: the tokens the lane's client recorded in its current session,
+    the calls the store has served it and the hours its session has been
+    alive. The session's start instant is kept beside them, so a claim that
+    spans a session rotation is not measured against another session's
+    count.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private state directory for the common repository.
+        manifest: Project manifest holding this participant.
+        name: Participant that owns the lane.
+
+    Returns:
+        The participant, the readings, the session start and the instant
+        read, or None when the participant is unknown or nothing could be
+        read. A reading never fails the transition it is taken for.
+    """
+    if name not in manifest.get("participants", {}):
+        return None
+    try:
+        usage = store.usage(home, manifest["root"])
+    except (sqlite3.Error, OSError):
+        usage = {}
+    try:
+        with READING:
+            used = consumption(
+                home,
+                directory,
+                manifest,
+                name,
+                usage,
+                READINGS,
+                set(roster.BUDGET_FIELDS),
+                whole=True,
+            )
+        session = checkpoints.activity(directory, name).get("session_started")
+    except (BridgeError, OSError, ValueError):
+        return None
+    return {
+        "participant": name,
+        **used,
+        "session": session if isinstance(session, (int, float)) else None,
+        "at": time.time(),
+    }
+
+
 def _figure(field: str, value: float | None) -> str:
     """Formats one reading or limit in the units of its field."""
     if value is None:

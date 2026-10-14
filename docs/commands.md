@@ -69,6 +69,7 @@ on standard output and export to a file.
 | `report` | Record `--state partial|blocked|ready|waiting`, `--summary`, and required `--remaining` or `--evidence`; `--backlog COUNT` states the work units left on the claim, which is what lets the supervisor offer a split once the lane goes idle on it; `--issue` binds the report to one owned issue, `--resume-on N` resumes a blocked report once that issue completes, `--until SECONDS` sets the seconds until the lane's next check and is required with `--state waiting`, capped by the project's wait deadline, `--pid PID` and `--output-file PATH` name the process still doing the lane's work and the file it writes, so the supervisor holds the reported claim while that process runs or that file was written after the report within the last 600 seconds, at most until the project's wait deadline after the report and only while the lane still holds that claim; the report must be bound to a claim, the process must be the reporting user's and not the lane's own session, and the file must lie inside the lane worktree or its `<lane>-wt` directory, and `--idempotency-key` makes a retry safe. Each report replaces the process evidence the last one named. |
 | `report show ID` | Print one report this lane recorded, the latest verdict a peer recorded against it, and with `--full` the whole attached evidence. |
 | `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
+| `report usage` | List every claim resolved in the `--since` window (all of them without it) with the tokens, served calls and session hours it used and the pull request that ended it, plus totals; `--json` prints it under the `read/v1` schema. A row shows an estimated spend only when the operator recorded a price for its provider ([Monitoring](monitoring.md#usage-per-issue)). |
 | `say NAME TEXT` | Send as `operator`; `--subject` sets the inbox subject line, `--ack` requests acknowledgement, `--within 15m` records a deadline for it that only reads overdue, and `--key` controls deduplication. |
 | `say NAME TEXT --after 30m` | Record the message for later; `--at 18:00`, `--when-released N` and `--unless-reported` set the trigger, and `--every 1h --until 18:00` records a bounded repeat. |
 | `issue list` | Show claims, dependencies and handoff offers; each offer carries the offering lane's head commit, the reservations that move with it and its remaining work. |
@@ -125,6 +126,7 @@ on standard output and export to a file.
 | `provider add NAME` | Define a provider; warn when shadowing a built-in preset. |
 | `provider remove NAME` | Delete a local definition, restoring a shadowed preset. |
 | `provider budget NAME` | Show or set the advisory limits every lane on that provider inherits. |
+| `provider price NAME --per-mtok AMOUNT` | Record what one million tokens cost on that provider, so `report usage` shows an estimated spend; `0` removes it. Operator only: refused from a lane worktree or under a lane's `AGENT_PARLEY_TOKEN`. |
 | `credentials list` | List native account profiles. |
 | `credentials show NAME` | Show one profile with every recorded value redacted: the config home, the override names and the variables required from your shell. A profile that sets none of them reads `Account: selects no account`, because it launches on the default account. |
 | `credentials add NAME` | Define a config home and environment requirements. It needs at least one of `--config-home`, `--env` or `--require-env`; a profile with none would select no account, so it exits 2 and writes nothing. |
@@ -174,7 +176,7 @@ on standard output and export to a file.
 | `decision list [QUERY]` | List or search the decisions recorded for this project; `--since` bounds their age and `--limit` the page. |
 | `mail pending` | List operator messages and offers recorded but not delivered, and each orphan decision waiting on the operator. |
 | `mail cancel ID` | Remove one recorded operator item before it is delivered. |
-| `history issue N` | List every record that touched an issue, with each holding. |
+| `history issue N` | List every record that touched an issue, with each holding and the tokens, calls and hours a resolved claim used. |
 | `history participant NAME` | List everything one lane filed. |
 | `history claim ID` | Follow one claim to the pull request that ended it. |
 | `history ... --kind K --since W` | All three `history` readings take a repeatable `--kind`, plus `--participant`, `--provider`, `--issue` and `--since` to narrow the records, and `--output FILE` to export the same reading as one JSON document. |
@@ -192,7 +194,8 @@ document, so a script, a shell prompt or another agent reads coordination state
 without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 `issue list`, `issue show`, `issue next`, `issue match`, `participant list`,
 `participant show`, `mail show`, `mail thread`, `mail search`, `mail list`,
-`mail pending`, `decision list`, `report show`, `history issue`,
+`mail pending`, `decision list`, `report show`, `report usage`,
+`history issue`,
 `history participant`, `history claim`, `plan diff`, `plan show`,
 `plan proposals`,
 `approval show`, `verify show`, `init show`, `branch show`, `forge show`,
