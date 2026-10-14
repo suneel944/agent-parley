@@ -1180,6 +1180,19 @@ def launch_environment(
     return result
 
 
+def case_insensitive(manifest: dict) -> bool:
+    """Reports whether a project's checkout ignores case in file names.
+
+    Args:
+        manifest: Normalized project manifest.
+
+    Returns:
+        Whether reservation paths are compared without regard to case. A
+        manifest written before the field existed reports False.
+    """
+    return manifest.get("case_insensitive") is True
+
+
 def normalize(manifest: dict) -> dict:
     """Reads a project manifest, upgrading the two-lane layout in memory.
 
@@ -1278,6 +1291,7 @@ def normalize(manifest: dict) -> dict:
         "approval": approval_steps(manifest.get("approval") or []),
         "pull_request": pull_request_policy(manifest.get("pull_request", {})),
         "integration": manifest.get("integration", {}),
+        **({"case_insensitive": True} if case_insensitive(manifest) else {}),
         **(
             {"integration_base": integration_base(manifest["integration_base"])}
             if manifest.get("integration_base")

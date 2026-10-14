@@ -1934,12 +1934,18 @@ def bridge_invocation(words: list[str]) -> bool:
     )
 
 
-def touched_path(payload: dict, lane: Path) -> str:
+def touched_path(payload: dict, lane: Path, *, fold: bool = False) -> str:
     """Names the lane-relative path a file tool call would write.
+
+    Resolving a path does not canonicalize its case on a case-insensitive
+    file system, so an absolute path whose lane prefix is spelled in
+    another case still names a file in the lane. Folding case accepts that
+    prefix and keeps the rest of the path as the call spelled it.
 
     Args:
         payload: Native ``PreToolUse`` hook payload.
         lane: Resolved lane worktree the call runs in.
+        fold: Whether the lane prefix is matched without regard to case.
 
     Returns:
         The POSIX path relative to the lane, or an empty string when the
@@ -1955,7 +1961,16 @@ def touched_path(payload: dict, lane: Path) -> str:
             if not path.is_absolute():
                 path = lane / path
             with contextlib.suppress(OSError, ValueError):
-                return path.resolve().relative_to(lane).as_posix()
+                resolved = path.resolve()
+                depth = len(lane.parts)
+                if (
+                    fold
+                    and not resolved.is_relative_to(lane)
+                    and Path(*resolved.parts[:depth]).as_posix().casefold()
+                    == lane.as_posix().casefold()
+                ):
+                    resolved = lane.joinpath(*resolved.parts[depth:])
+                return resolved.relative_to(lane).as_posix()
     return ""
 
 
@@ -2172,7 +2187,13 @@ def digest(
 
 
 def hazard(
-    payload: dict, lane: Path, agent: str, mail: dict, issues: dict
+    payload: dict,
+    lane: Path,
+    agent: str,
+    mail: dict,
+    issues: dict,
+    *,
+    fold: bool = False,
 ) -> tuple[Reason, str] | None:
     """Finds the coordination hazard that makes one tool call unsafe.
 
@@ -2190,6 +2211,7 @@ def hazard(
         agent: Assigned native lane name.
         mail: Mailbox batch read for this decision.
         issues: Issue ledger snapshot read for this decision.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         The denial cause and its reason text, or None when the call is safe.
@@ -2205,7 +2227,7 @@ def hazard(
         )
     if exempt(payload):
         return None
-    if conflict := reserved_conflict(payload, lane, mail):
+    if conflict := reserved_conflict(payload, lane, mail, fold=fold):
         path, held = conflict
         return Reason.RESERVED_PATH, (
             f"{path} overlaps {held['pattern']}, reserved by "
@@ -2245,7 +2267,7 @@ def exempt(payload: dict) -> bool:
 
 
 def reserved_conflict(
-    payload: dict, lane: Path, mail: dict
+    payload: dict, lane: Path, mail: dict, *, fold: bool = False
 ) -> tuple[str, dict] | None:
     """Finds the peer reservation one tool call would write into.
 
@@ -2253,18 +2275,19 @@ def reserved_conflict(
         payload: Native ``PreToolUse`` hook payload.
         lane: Resolved lane worktree the call runs in.
         mail: Mailbox batch carrying the peers' exclusive reservations.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         The lane-relative path the call writes and the overlapping
         reservation with its ``pattern`` and ``holder``, or None.
     """
-    path = touched_path(payload, lane)
+    path = touched_path(payload, lane, fold=fold)
     if not path:
         return None
     for held in mail.get("peer_reservations") or []:
         pattern = str(held["pattern"])
         if not store.named_resource(pattern) and store.overlapping(
-            pattern, path
+            pattern, path, fold=fold
         ):
             return path, held
     return None
@@ -2319,6 +2342,8 @@ def overlaps(
     held: dict[str, list[str]],
     pulls: list[dict],
     ledger: dict,
+    *,
+    fold: bool = False,
 ) -> list[dict]:
     """Names the peer reservations and pull requests touching some paths.
 
@@ -2328,6 +2353,7 @@ def overlaps(
             own identity already excluded.
         pulls: Other lanes' open pull requests from `peer_pull_requests`.
         ledger: Issue records by number, read for claim owners.
+        fold: Whether reservation keys are compared without regard to case.
 
     Returns:
         One finding per overlap, each with a stable ``key`` the lane is
@@ -2339,7 +2365,7 @@ def overlaps(
         for peer, patterns in sorted(held.items()):
             for pattern in patterns:
                 if not store.named_resource(pattern) and store.overlapping(
-                    pattern, path
+                    pattern, path, fold=fold
                 ):
                     found.append(
                         {
@@ -2513,8 +2539,9 @@ def overlap_notice(
     """
     if exempt(payload):
         return None
+    fold = roster.case_insensitive(manifest)
     filed = filed_issue(payload, lane)
-    path = "" if filed else touched_path(payload, lane)
+    path = "" if filed else touched_path(payload, lane, fold=fold)
     paths = filed[1] if filed else [path] if path else []
     if not filed and not path:
         return None
@@ -2524,7 +2551,7 @@ def overlap_notice(
         held = store.active_reservations(home, manifest["root"])
         held.pop(name, None)
         pulls = peer_pull_requests(directory, manifest, agent)
-    found = overlaps(paths, held, pulls, issues.get("issues") or {})
+    found = overlaps(paths, held, pulls, issues.get("issues") or {}, fold=fold)
     if filed:
         found += claimed_matches(filed[0], issues, agent)
     fresh = [item for item in found if item["key"] not in shown]
@@ -2546,7 +2573,7 @@ def overlap_notice(
         }
     reminder = f"unreserved:{path}"
     unreserved = reminder not in shown and not any(
-        store.overlapping(pattern, path)
+        store.overlapping(pattern, path, fold=fold)
         for pattern in mail.get("reserved") or []
         if not store.named_resource(pattern)
     )
@@ -2599,6 +2626,8 @@ def hazard_denial(
     lane: Path,
     mail: dict,
     danger: tuple[Reason, str],
+    *,
+    fold: bool = False,
 ) -> dict:
     """Builds the native denial for a hazard and records who caused it.
 
@@ -2615,12 +2644,13 @@ def hazard_denial(
         lane: Resolved lane worktree the call runs in.
         mail: Mailbox batch the hazard was found in.
         danger: Denial cause and reason text `hazard` returned.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         Native hook output that denies the call with the reason text.
     """
     reason, unsafe = danger
-    conflict = reserved_conflict(payload, lane, mail)
+    conflict = reserved_conflict(payload, lane, mail, fold=fold)
     if reason is Reason.RESERVED_PATH and conflict:
         path, held = conflict
         with contextlib.suppress(OSError, sqlite3.Error, BridgeError):
@@ -2642,6 +2672,8 @@ def unscanned_hazard(
     payload: dict,
     lane: Path,
     agent: str,
+    *,
+    fold: bool = False,
 ) -> tuple[dict, tuple[Reason, str]] | None:
     """Finds a hazard for a call decided without the context scans.
 
@@ -2659,6 +2691,7 @@ def unscanned_hazard(
         payload: Native ``PreToolUse`` hook payload.
         lane: Resolved lane worktree the call runs in.
         agent: Assigned native lane name.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         The mailbox batch read and the hazard found, or None when the call
@@ -2668,7 +2701,9 @@ def unscanned_hazard(
         return None
     try:
         mail = mailbox(home, root, name)
-        danger = hazard(payload, lane, agent, mail, snapshot(directory))
+        danger = hazard(
+            payload, lane, agent, mail, snapshot(directory), fold=fold
+        )
     except (OSError, sqlite3.Error, BridgeError):
         return None
     return (mail, danger) if danger else None
@@ -3978,6 +4013,7 @@ def checkpoint(
             payload,
             lane,
             agent,
+            fold=roster.case_insensitive(manifest),
         )
     stages.enter("lock")
     waits = settle if event in SETTLING or record_only else LOCK_SECONDS
@@ -4182,7 +4218,14 @@ def checkpoint(
                     else {"items": [], "superseded": 0}
                 )
                 danger = (
-                    hazard(payload, lane, agent, mail, issues)
+                    hazard(
+                        payload,
+                        lane,
+                        agent,
+                        mail,
+                        issues,
+                        fold=roster.case_insensitive(manifest),
+                    )
                     if event == "PreToolUse"
                     else None
                 )
@@ -4349,6 +4392,7 @@ def checkpoint(
                             lane,
                             mail,
                             danger,
+                            fold=roster.case_insensitive(manifest),
                         )
                     elif overlap and overlap["filing"]:
                         reason = Reason.FILING_OVERLAP
@@ -4411,6 +4455,7 @@ def checkpoint(
                 payload,
                 lane,
                 *urgent,
+                fold=roster.case_insensitive(manifest),
             )
         if event in RECOVERY_EVENTS and pending is not None:
             pending["recovery"] = True
@@ -4741,12 +4786,22 @@ def lane_refusal(
     name = json.loads((directory / f"{agent}-identity.json").read_text())[
         "name"
     ]
+    fold = roster.case_insensitive(manifest)
     urgent = unscanned_hazard(
-        home, directory, manifest["root"], name, payload, lane, agent
+        home,
+        directory,
+        manifest["root"],
+        name,
+        payload,
+        lane,
+        agent,
+        fold=fold,
     )
     if urgent is None:
         return None
-    denial = hazard_denial(home, manifest["root"], name, payload, lane, *urgent)
+    denial = hazard_denial(
+        home, manifest["root"], name, payload, lane, *urgent, fold=fold
+    )
     return denial, urgent[1][0]
 
 

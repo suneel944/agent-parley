@@ -2085,7 +2085,7 @@ def pull_request_body(
 
 
 def reserved_overlaps(
-    changed: list[str], held: dict[str, list[str]]
+    changed: list[str], held: dict[str, list[str]], *, fold: bool = False
 ) -> list[str]:
     """Names the peer reservations a lane's own changed paths run into.
 
@@ -2093,6 +2093,7 @@ def reserved_overlaps(
         changed: Repository-relative paths the lane's branch changed.
         held: Active reservation keys per peer identity, with the lane's own
             identity already removed.
+        fold: Whether paths are compared without regard to case.
 
     Returns:
         One sentence per overlap, ordered by path and then by peer, naming
@@ -2103,7 +2104,7 @@ def reserved_overlaps(
         for path in sorted(changed)
         for peer, patterns in sorted(held.items())
         for pattern in sorted(patterns)
-        if store.overlapping(path, pattern)
+        if store.overlapping(path, pattern, fold=fold)
     ]
 
 
@@ -2723,7 +2724,9 @@ class Bridge(
                 f"no overlap with a peer can be ruled out: {exc}"
             ) from exc
         held.pop(participant["display"], None)
-        if overlaps := reserved_overlaps(changed, held):
+        if overlaps := reserved_overlaps(
+            changed, held, fold=roster.case_insensitive(data)
+        ):
             raise BridgeError(
                 f"{refused} A peer reservation covers what {branch} changed: "
                 + "; ".join(overlaps[:MAX_OVERLAPS])
