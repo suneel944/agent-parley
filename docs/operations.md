@@ -2180,7 +2180,37 @@ which a dead lane with no claim and no process is folded out of the default
 `status` and `problems` views. Numeric second values range from 1 to 86400
 seconds. `rotate` false keeps a lane resuming its recorded native session
 after a ready or blocked report instead of starting a fresh one; see
-[Running lanes](lanes.md#running-unattended).
+[Running lanes](lanes.md#running-unattended). `max_load_ratio` (1.5, above 0
+and at most 1000) and `min_available_mib` (1024 MiB, 0 to 1048576) set the
+host load gate below.
+
+### Host load gate
+
+Before every launch, `agent-parley run` takes one reading of the host: the
+one-minute load average divided by the CPU count, and the memory available to
+new work, `MemAvailable` from `/proc/meminfo` on Linux or the free, inactive
+and speculative pages `vm_stat` reports on macOS. A ratio above
+`max_load_ratio` or memory below `min_available_mib` refuses the launch in
+one sentence naming each number, its threshold and the setting that moves
+it, followed by `next: agent-parley doctor`. There is no override flag: set
+the thresholds under `supervision` in the project manifest, or globally in
+`supervision.json`. `min_available_mib` 0 turns the memory check off.
+
+A resume the service would start for unattended dispatch takes the same
+reading. Past the threshold it is not refused: the wake records
+`busy:host load: ...` with the numbers, spends no attempt and the dispatch
+reads `deferred`, so a later poll launches the lane once the host has
+headroom. The reading is taken once per launch or dispatch; nothing samples
+the host continuously.
+
+A reading the host cannot give, such as a missing `/proc/meminfo` or a
+failing `vm_stat`, is not judged, so the launch goes ahead on the readings
+that remain. On native Windows the check is skipped and the launch prints
+one line saying so. `agent-parley doctor` prints the current reading against
+the global thresholds on its `host load` line, and whether `run` would
+refuse; a project's own settings still decide its launches. The sandbox of
+`agent-parley demo` records thresholds that never refuse, because its stub
+lanes only sleep.
 
 Issue convergence is accounted separately from wakes and liveness.
 `convergence.py` keeps one account per owned issue and claim generation in

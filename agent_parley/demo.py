@@ -63,6 +63,7 @@ COLUMNS = 132
 ROWS = 30
 FRAME_LINES = 24
 DEFAULT_PORT = 8876
+SANDBOX_LOAD = {"max_load_ratio": 1000, "min_available_mib": 0}
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[=>]|\x1b\][^\x07]*\x07")
 INHERITED = ("AGENT_PARLEY_", "CLAUDE", "CODEX_")
 BOLD = "\x1b[1m"
@@ -155,6 +156,10 @@ def git(*arguments: str, cwd: Path | None = None) -> None:
 def fixtures(base: Path) -> tuple[Path, Path, Path]:
     """Builds the temporary state home, stub CLIs and demo repository.
 
+    The sandbox's stub lanes only sleep, so its home records
+    `SANDBOX_LOAD`, launch thresholds a busy host never crosses, and the
+    tour runs on a machine whose real lanes the load gate would hold back.
+
     Args:
         base: Directory every artefact of this run is created under.
 
@@ -168,6 +173,7 @@ def fixtures(base: Path) -> tuple[Path, Path, Path]:
     for path in (home, binaries, repository / "src" / "payments"):
         path.mkdir(parents=True)
     home.chmod(0o700)
+    (home / "supervision.json").write_text(json.dumps(SANDBOX_LOAD))
     for tool in ("claude", "codex"):
         stub = binaries / tool
         stub.write_text("#!/usr/bin/env bash\nexec sleep 900\n")

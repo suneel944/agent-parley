@@ -10,6 +10,9 @@ Neither platform reports mere existence as identity. A recorded process
 is recognized only when its creation time still matches the one stored
 beside its process ID, so a reused process ID never passes for the
 session that first claimed it.
+
+The module also takes the one host load and memory reading a launch is
+gated on, through `host_load`.
 """
 
 import ctypes
@@ -952,6 +955,172 @@ def host_report(release: str | None = None) -> dict:
         "wsl": wsl_version(release),
         "pidfd_open": pidfd_available(),
     }
+
+
+MEMINFO = Path("/proc/meminfo")
+MIB = 1024 * 1024
+DARWIN_AVAILABLE = ("Pages free", "Pages inactive", "Pages speculative")
+LOAD_SKIPPED = (
+    "Host load is not read on Windows, so the launch load threshold is skipped."
+)
+
+
+class HostLoad(NamedTuple):
+    """One reading of the host's load and available memory.
+
+    Attributes:
+        ratio: One-minute load average per CPU, or None when unreadable.
+        available_mib: Memory new work can take, or None when unreadable.
+        skipped: Why no reading was taken, empty when one was.
+    """
+
+    ratio: float | None
+    available_mib: int | None
+    skipped: str = ""
+
+
+def linux_available_mib(path: Path = MEMINFO) -> int | None:
+    """Reads the memory Linux says new work can take without swapping.
+
+    Args:
+        path: Memory statistics file; tests supply a file of their own.
+
+    Returns:
+        ``MemAvailable`` in MiB, or None when the file or field is
+        unreadable.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        field, _, value = line.partition(":")
+        words = value.split()
+        if field == "MemAvailable" and words and words[0].isdigit():
+            return int(words[0]) // 1024
+    return None
+
+
+def darwin_available_mib(output: str | None = None) -> int | None:
+    """Reads the free, inactive and speculative pages ``vm_stat`` reports.
+
+    Args:
+        output: ``vm_stat`` output; read from the host when omitted.
+
+    Returns:
+        Those pages in MiB, or None when ``vm_stat`` fails or prints no
+        page size or one of the counts.
+    """
+    if output is None:
+        try:
+            output = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                timeout=PS_TIMEOUT,
+                check=True,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    lines = output.splitlines()
+    size = lines[0].partition("page size of ")[2].split() if lines else []
+    counts = {}
+    for line in lines[1:]:
+        field, _, value = line.partition(":")
+        counts[field.strip()] = value.strip().rstrip(".")
+    pages = [counts.get(field, "") for field in DARWIN_AVAILABLE]
+    if not size or not size[0].isdigit():
+        return None
+    if not all(page.isdigit() for page in pages):
+        return None
+    return sum(int(page) for page in pages) * int(size[0]) // MIB
+
+
+def host_load(system: str = sys.platform) -> HostLoad:
+    """Reads the host's load and available memory once, for one launch.
+
+    The load ratio is the one-minute load average divided by the CPU
+    count, so the same number means the same pressure on any machine.
+    Nothing samples it continuously; each launch and each dispatch takes
+    its own reading.
+
+    Args:
+        system: Platform name as ``sys.platform`` reports it.
+
+    Returns:
+        The ratio rounded to two places and the available memory, each
+        None when unreadable; on Windows no reading, with `LOAD_SKIPPED`.
+    """
+    if system == "win32":
+        return HostLoad(None, None, LOAD_SKIPPED)
+    try:
+        ratio: float | None = round(
+            os.getloadavg()[0] / (os.cpu_count() or 1), 2
+        )
+    except OSError:
+        ratio = None
+    available = (
+        darwin_available_mib() if system == "darwin" else linux_available_mib()
+    )
+    return HostLoad(ratio, available)
+
+
+def overloaded(reading: HostLoad, max_ratio: float, min_mib: int) -> str:
+    """Names each reading past the launch threshold.
+
+    An unreadable reading is never judged, so a host that cannot report
+    its load still launches.
+
+    Args:
+        reading: A `host_load` reading.
+        max_ratio: The ``max_load_ratio`` supervision setting.
+        min_mib: The ``min_available_mib`` supervision setting.
+
+    Returns:
+        Each reading past its threshold beside the setting that moves it,
+        joined in one clause, or empty text when none is.
+    """
+    causes = []
+    if reading.ratio is not None and reading.ratio > max_ratio:
+        causes.append(
+            f"load ratio {reading.ratio} per CPU is above max_load_ratio "
+            f"{max_ratio}"
+        )
+    available = reading.available_mib
+    if available is not None and available < min_mib:
+        causes.append(
+            f"{available} MiB available is below min_available_mib {min_mib}"
+        )
+    return " and ".join(causes)
+
+
+def load_line(reading: HostLoad, max_ratio: float, min_mib: int) -> str:
+    """Words a `host_load` reading against its threshold for ``doctor``.
+
+    Args:
+        reading: A `host_load` reading.
+        max_ratio: The ``max_load_ratio`` supervision setting.
+        min_mib: The ``min_available_mib`` supervision setting.
+
+    Returns:
+        The skipped line on Windows, else both readings beside their
+        thresholds and whether a launch would go ahead.
+    """
+    if reading.skipped:
+        return reading.skipped
+    ratio = "unreadable" if reading.ratio is None else reading.ratio
+    available = (
+        "unreadable" if reading.available_mib is None else reading.available_mib
+    )
+    verdict = (
+        "over the launch threshold, so run refuses and dispatch defers"
+        if overloaded(reading, max_ratio, min_mib)
+        else "under the launch threshold"
+    )
+    return (
+        f"load ratio {ratio} of at most {max_ratio}, {available} MiB "
+        f"available of at least {min_mib}; {verdict}"
+    )
 
 
 def check_repository_host(repo: Path, release: str | None = None) -> None:

@@ -216,6 +216,7 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         "approvals",
         "dialogs",
         "tokens",
+        "host load",
     }
     [tokens] = [
         entry

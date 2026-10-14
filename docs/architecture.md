@@ -32,7 +32,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `server` | Authenticated MCP transport and bounded tool contracts |
 | `store` | SQLite schema, migration, scoped mail, atomic leases, the queue waiting on a held key, and tool events |
 | `attachments` | Oversized coordination payloads spilled to bounded files under project state, and their paged reads |
-| `process` | Per-platform process identity, session liveness and shutdown |
+| `process` | Per-platform process identity, session liveness and shutdown, and the one-shot host load and available-memory reading `launch` refuses on and `supervision` defers a dispatch on |
 | `issues` | Claim and handoff state transitions, and resolution of the claim a lane holds |
 | `lifecycle` | Execution state an issue's owner still owes, stored in the issue ledger so an ownership transition and its claim generation publish together, and the dependency settlement completion triggers |
 | `recovery` | Capture and restore of an abandoned claim's work as recovery checkpoints, operator-authorized takeover, and the persisted capacity recovery candidates |

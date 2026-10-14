@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from agent_parley import forge, records
+from agent_parley import forge, process, records
 from agent_parley.cli import Bridge, git
 from agent_parley.state import write_json
 
@@ -93,6 +93,19 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
     for variable in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(forge, "_failure", {})
+
+
+@pytest.fixture(autouse=True)
+def calm_host(monkeypatch):
+    """Reads a host with headroom, so a busy test runner launches lanes.
+
+    A parallel suite loads the machine past the default launch threshold,
+    and every in-process launch and dispatch would then be refused. Tests
+    of the gate itself patch their own reading over this one.
+    """
+    monkeypatch.setattr(
+        process, "host_load", lambda system="": process.HostLoad(0.1, 65536)
+    )
 
 
 @pytest.fixture

@@ -1302,6 +1302,72 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
     assert record["result"] == "resume requested (launcher 4321)"
 
 
+@pytest.mark.parametrize(
+    ("reading", "deferred"),
+    [
+        (process.HostLoad(0.4, 8192), False),
+        (process.HostLoad(2.5, 8192), True),
+        (process.HostLoad(0.4, 512), True),
+        (process.HostLoad(None, None), False),
+    ],
+)
+def test_a_dispatch_past_the_host_load_threshold_waits_for_a_later_poll(
+    bridge, paired, monkeypatch, reading, deferred
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    native = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    native_ticks = process.start_ticks(native.pid)
+    native.kill()
+    native.wait(timeout=5)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "session_id": "manual-session",
+            "session_pid": native.pid,
+            "session_ticks": native_ticks,
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+
+    class Child:
+        pid = 4321
+
+    launched = []
+    monkeypatch.setattr(
+        supervision.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append(command) or Child(),
+    )
+    monkeypatch.setattr(supervision, "track_launcher", lambda child: None)
+    monkeypatch.setattr(process, "host_load", lambda: reading)
+    paired.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        sampled(
+            bridge, paired, directory, "codex", 300, session="manual-session"
+        ),
+        supervision.DEFAULTS,
+    )
+    record = json.loads((directory / "codex-wake.json").read_text())
+    if deferred:
+        assert not launched
+        assert record["result"].startswith(supervision.HOST_LOADED + ": ")
+        assert "max_load_ratio" in record["result"] or (
+            "min_available_mib" in record["result"]
+        )
+        assert record["attempts"] == 0
+    else:
+        assert launched and "--resume" in launched[0]
+        assert record["result"] == "resume requested (launcher 4321)"
+
+
 @pytest.mark.parametrize("opted", [False, True])
 def test_a_claude_resume_without_the_approval_opt_in_is_withheld(
     bridge, paired, monkeypatch, opted
