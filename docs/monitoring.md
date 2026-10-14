@@ -386,7 +386,8 @@ of the frame is read on every redraw, keeping a normal frame under a second.
 
 A lane that drifted from its branch, holds a stale lease, had a call rejected,
 owns an overdue issue or lost its session process is drawn in colour where the
-terminal offers it and in bold where it does not. Each of those also prints its
+terminal offers it and in bold where it does not. Set `NO_COLOR` to keep
+emphasis bold-only. Each of those also prints its
 own marker in the table or a note under it, so a monochrome pipe reads exactly
 the same.
 

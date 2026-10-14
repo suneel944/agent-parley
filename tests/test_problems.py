@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1964,3 +1965,49 @@ def test_a_dead_lane_holding_a_claim_keeps_its_old_rows():
     problems._fold([row], project, 86400)
     assert "folded" not in row
     assert any(line.endswith("woken; x y") for line in problems.lines([row]))
+
+
+def test_dirtiness_is_read_once_per_reporting_lane_on_worker_threads(
+    monkeypatch,
+):
+    calls = []
+
+    def recorder(lane):
+        calls.append((lane, threading.current_thread()))
+        return ["draft.txt"]
+
+    monkeypatch.setattr(supervision, "dirty_paths", recorder)
+    stopped = {
+        "state": supervision.STOPPED,
+        "process_alive": False,
+        "age_seconds": 900,
+    }
+    records = [
+        lane_record(participant="quiet", availability=stopped),
+        lane_record(participant="live"),
+        lane_record(participant="drifted", availability=stopped, drift=True),
+        {"participant": "gone"},
+    ]
+    data = {
+        "participants": {
+            name: {"lane": f"/{name}", "branch": "work"}
+            for name in ("quiet", "live", "drifted")
+        }
+        | {"gone": {"lane": "/gone", "branch": "work", "retired": 1.0}}
+    }
+    dirt = problems._dirt({"participants": records}, data)
+    assert dirt == {"/gone": ["draft.txt"], "/quiet": ["draft.txt"]}
+    assert sorted(lane for lane, _ in calls) == ["/gone", "/quiet"]
+    assert all(thread is not threading.main_thread() for _, thread in calls)
+    calls.clear()
+    rows = problems._lane_rows(
+        records[0],
+        data["participants"]["quiet"],
+        "/root",
+        supervision.DEFAULTS,
+        600,
+        time.time(),
+        dirt=dirt,
+    )
+    assert problems.DIRTY in {row["condition"] for row in rows}
+    assert calls == []

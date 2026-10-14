@@ -1285,6 +1285,7 @@ class StatusMixin(BridgeCore):
             roster,
             store,
             supervision,
+            tables,
             views,
         )
 
@@ -1312,7 +1313,9 @@ class StatusMixin(BridgeCore):
                         advances.get(agent, []),
                         context=context,
                     )
-                    for agent in sorted(data["participants"])
+                    for agent in sorted(
+                        data["participants"], key=tables.natural_key
+                    )
                 ]
                 projects.append(
                     {
@@ -1347,6 +1350,7 @@ class StatusMixin(BridgeCore):
                         **self._integration(path.parent, data, context),
                     }
                 )
+        projects.sort(key=lambda project: project["root"])
         return {
             "server": {"ready": healthy, "state": state},
             "state_directory": str(self.home),
@@ -1694,8 +1698,12 @@ class StatusMixin(BridgeCore):
         if selection.filtered() and not matched:
             print(f"No participant matches {selection.describe()}.")
             return matched
-        for path in sorted((self.home / "projects").glob("*/project.json")):
-            data = roster.normalize(json.loads(path.read_text()))
+        readings = [
+            (path, roster.normalize(json.loads(path.read_text())))
+            for path in (self.home / "projects").glob("*/project.json")
+        ]
+        readings.sort(key=lambda item: item[1]["root"])
+        for path, data in readings:
             project = kept.get(data["root"])
             if project is None:
                 continue

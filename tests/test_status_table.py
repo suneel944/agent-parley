@@ -90,6 +90,19 @@ def test_several_projects_each_get_their_own_table(
     assert f"Project: {repo}" in lines
 
 
+def test_projects_are_listed_in_root_order(
+    bridge, repo, paired, tmp_path, capsys
+):
+    other = second_project(bridge, tmp_path)
+    roots = sorted([str(repo), str(other)])
+    assert [
+        project["root"] for project in bridge.status_snapshot()["projects"]
+    ] == roots
+    bridge.status()
+    shown = [line for line in printed(capsys) if line.startswith("Project: ")]
+    assert shown == [f"Project: {root}" for root in roots]
+
+
 def test_a_named_participant_replaces_its_row_with_the_reading(
     bridge, repo, paired, capsys
 ):
