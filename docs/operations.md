@@ -1924,8 +1924,10 @@ command where one applies; `--json` is the stable machine form.
 `group` and whether that group is `group_underway`, the owned issues it
 `unblocks`, the `provider` it declares, the peer `overlaps` and forecast
 `collisions` its likely paths run into, `named_to`, the other lane whose
-published work names it as next work or empty, and the ordered `reasons` for
-its place.
+published work names it as next work or empty, `same_files`, the claims
+this lane holds whose paths its forecast paths run into, `held_back`, the
+other lanes' live claims doing so as `issue` and `owner` records, and the
+ordered `reasons` for its place.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory`, `inbound` as

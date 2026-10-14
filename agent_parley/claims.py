@@ -564,7 +564,10 @@ class ClaimsMixin(ReportsMixin):
         rare, an issue another lane's published work names as its next lead
         or first pull pick, through `supervision.named_leads`, ranks below
         the issues no lane was pointed at, and the lead this lane's own
-        publication names, through `supervision.own_lead`, ranks first.
+        publication names, through `supervision.own_lead`, ranks first. A
+        candidate whose forecast paths run into a claim this lane holds ranks
+        above even that lead, and one whose forecast paths run into another
+        lane's live claim is held back, through `recommend.sharing`.
 
         Args:
             repo: Assigned worktree, which names the lane doing the reading.
@@ -604,6 +607,7 @@ class ClaimsMixin(ReportsMixin):
                 limit,
                 supervision.named_leads(directory, data, agent),
                 supervision.own_lead(directory, agent),
+                agent,
             ),
         }
 
