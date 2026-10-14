@@ -20,6 +20,7 @@ from agent_parley import (
 from agent_parley.state import BridgeError, lock, write_json
 
 WINDOW = 300
+LIVE = {"claude", "codex"}
 IDLE_AFTER = 3600
 
 
@@ -248,7 +249,7 @@ def test_a_peer_takeover_request_is_granted_after_the_grace_window(
         codex, "request", "8", summary="claude is not working #8"
     )
     assert requested["request"]["to"] == "codex"
-    assert issues.grant_requests(directory, WINDOW, {}) == []
+    assert issues.grant_requests(directory, WINDOW, {}, LIVE) == []
 
     edit(
         directory,
@@ -257,7 +258,7 @@ def test_a_peer_takeover_request_is_granted_after_the_grace_window(
             created=time.time() - WINDOW - 1
         ),
     )
-    assert issues.grant_requests(directory, WINDOW, {}) == ["8"]
+    assert issues.grant_requests(directory, WINDOW, {}, LIVE) == ["8"]
     record = issues.snapshot(directory)["issues"]["8"]
     assert record["request"] is None
     assert record["offer"]["to"] == "codex"
@@ -281,7 +282,7 @@ def test_a_request_on_a_progressing_claim_waits_for_its_holder(bridge, paired):
     lifecycle.record_report(
         directory, "claude", "partial", "", "tests remain", issue="7"
     )
-    assert issues.grant_requests(directory, WINDOW, {}) == []
+    assert issues.grant_requests(directory, WINDOW, {}, LIVE) == []
     assert issues.snapshot(directory)["issues"]["7"]["request"]
 
 

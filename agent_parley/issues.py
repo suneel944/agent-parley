@@ -1102,7 +1102,9 @@ def _operator_offer(entry: dict, issue: str, budgets: dict) -> dict:
     }
 
 
-def grant_requests(directory: Path, grace: float, budgets: dict) -> list[str]:
+def grant_requests(
+    directory: Path, grace: float, budgets: dict, participants: set[str]
+) -> list[str]:
     """Grants a peer's takeover request its holder let lapse.
 
     A request that needs the holder's agreement stays pending for ever when
@@ -1112,22 +1114,47 @@ def grant_requests(directory: Path, grace: float, budgets: dict) -> list[str]:
     it into an offer to the peer, recorded in history, and the peer's
     acceptance moves ownership as any accepted handoff does. An operator
     request still waits for the holder, because the operator can withdraw or
-    restate it.
+    restate it. A peer's request from a lane that retired or left the
+    project is withdrawn by the supervisor instead, since nobody would ever
+    accept the offer and it would hide the claim from idle peers.
 
     Args:
         directory: Private state directory for the common repository.
         grace: Seconds the holder has to answer or record progress.
         budgets: Project deadline and attempt-budget defaults.
+        participants: Unretired participants a request may be granted to.
 
     Returns:
         Issue numbers whose request was granted.
     """
     granted = []
+    changed = False
     now = time.time()
     with lock(directory / "issues.lock", timeout=1):
         state = snapshot(directory)
         for number, record in state["issues"].items():
             request = record.get("request") or {}
+            if (
+                request
+                and offer_source(request) == PEER
+                and request.get("to") not in participants
+            ):
+                record["request"] = None
+                lifecycle.append_history(
+                    record,
+                    {
+                        "action": "withdraw",
+                        "actor": "supervisor",
+                        "at": now,
+                        "owner": record.get("owner"),
+                        "offer": record.get("offer"),
+                        "request": None,
+                        "offer_id": request.get("id"),
+                        "claim_id": record.get("claim_id"),
+                    },
+                )
+                changed = True
+                continue
             if (
                 not request
                 or offer_source(request) != PEER
@@ -1153,7 +1180,7 @@ def grant_requests(directory: Path, grace: float, budgets: dict) -> list[str]:
                 },
             )
             granted.append(number)
-        if granted:
+        if granted or changed:
             state["revision"] += 1
             write_json(directory / "issues.json", state)
     return granted
