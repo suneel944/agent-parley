@@ -1236,6 +1236,9 @@ class StatusMixin(BridgeCore):
                 state["dialog"] if isinstance(state.get("dialog"), dict) else {}
             ),
             "foreign_session": checkpoints.foreign_reading(state),
+            "plugin_version": protocol.lane_plugin(state)[0],
+            "plugin_stale": protocol.lane_plugin(state)[1],
+            "session_started": state.get("session_started"),
             "wake_log": (
                 str(directory / f"{agent}-wake.log")
                 if state.get("attached") is False

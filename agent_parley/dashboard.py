@@ -20,6 +20,7 @@ from agent_parley import (
     metrics,
     plan,
     process,
+    protocol,
     records,
     roster,
     store,
@@ -535,6 +536,8 @@ def _row(
         "budget": budget,
         "over_budget": budget["over"],
         "budget_marker": budgets.marker(budget),
+        "plugin_version": protocol.lane_plugin(state)[0],
+        "plugin_stale": protocol.lane_plugin(state)[1],
         "fit": published["fit"],
         "unfit": published["reason"],
         "work_offer": bool(published["offer"]),
@@ -880,7 +883,8 @@ def notes(row: dict) -> list[str]:
 
     Returns:
         The branch drift, rejected call, stall, operator edit, base
-        advance, orphan, budget, fitness, work offer, failed review,
+        advance, orphan, budget, stale plugin, fitness, work offer, failed
+        review,
         escalated dispatch and blueprint run markers the lane holds, in
         that order. The note
         row already names the lane, so a fitness reason drops its own copy
@@ -902,6 +906,10 @@ def notes(row: dict) -> list[str]:
         row.get("base_advance", ""),
         row.get("orphan", ""),
         row.get("budget_marker", ""),
+        f"plugin {row['plugin_version']} stale; agent-parley run "
+        f"{row['participant']} --resume"
+        if row.get("plugin_stale")
+        else "",
         str(row["unfit"] or "").replace(f"): {row['participant']} ", "): ", 1),
         " ".join(("work offered", row.get("offer_kind", ""))).strip()
         if row["work_offer"] and row.get("offer_kind") != "continue"

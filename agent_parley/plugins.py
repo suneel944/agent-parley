@@ -543,6 +543,40 @@ def repairs(home: Path) -> dict[str, dict]:
     }
 
 
+def lane_repair(home: Path, participant: dict, recorded: dict) -> dict:
+    """Finds the recorded repair of the config home a lane's CLI loads.
+
+    Args:
+        home: Private bridge state root.
+        participant: The lane's manifest entry.
+        recorded: Entries `repairs` read.
+
+    Returns:
+        The entry for the lane's CLI and config home, empty when its CLI
+        takes no published plugin, its provider cannot be read, or no
+        repair was recorded there.
+    """
+    from agent_parley import records, roster
+    from agent_parley.state import BridgeError
+
+    try:
+        provider = roster.provider(home, participant["provider"])
+        selected = roster.config_home(
+            home, provider, participant.get("credential")
+        )
+    except (BridgeError, KeyError):
+        return {}
+    adapter = provider.get("adapter", "")
+    if adapter not in HOME_ENV:
+        return {}
+    config = (
+        Path(selected)
+        if selected
+        else Path(records.DEFAULT_HOMES[adapter]).expanduser()
+    )
+    return recorded.get(f"{adapter}:{config}") or {}
+
+
 def repair(home: Path, now: float = 0.0) -> list[str]:
     """Refreshes every installed plugin the running launcher has outgrown.
 

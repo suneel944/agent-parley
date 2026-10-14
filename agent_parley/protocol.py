@@ -52,6 +52,14 @@ UPDATE = (
     "agent-parley plugins install reinstalls the plugin; a lane already "
     "running on the old one must be restarted to pick it up."
 )
+STALE_PLUGIN = (
+    "Plugin stale: this session loaded the agent-parley plugin {version} "
+    "and the launcher is {launcher}, so its hooks and skills are out of "
+    "date and cannot reload. Finish your current step and end your turn; "
+    "do not run agent-parley yourself. The operator, or the service for "
+    "a lane without a terminal, restarts this lane with "
+    "`agent-parley run {name} --resume`."
+)
 MIGRATE = "agent-parley up migrates the store in place; no lane is stopped."
 UPGRADE = "A newer agent-parley wrote this store; install that version."
 REPAIR = (
@@ -182,6 +190,28 @@ def launcher_version() -> str:
         The running package version.
     """
     return __version__
+
+
+def lane_plugin(record: dict) -> tuple[str, bool]:
+    """Reads the plugin version a lane's session loaded, and whether it aged.
+
+    A launch records the version in the lane's activity record as
+    ``plugin_version``, so every reader compares that field with
+    `launcher_version` and none reads a plugin manifest on its own tick. A
+    record written before the field existed reads ``unknown`` and is never
+    stale, because nothing says what that session loaded.
+
+    Args:
+        record: The lane's activity record.
+
+    Returns:
+        The recorded version or ``unknown``, and whether it differs from
+        the running launcher.
+    """
+    version = str(record.get("plugin_version") or "")
+    if not version:
+        return "unknown", False
+    return version, version != launcher_version()
 
 
 def revision() -> str:

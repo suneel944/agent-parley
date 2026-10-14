@@ -1600,9 +1600,10 @@ def lifts_run_budget(payload: dict, depth: int = 2) -> bool:
 def continuation_refused(directory: Path, manifest: dict, agent: str) -> bool:
     """Decides whether a Stop hook may keep a lane working on new notices.
 
-    Blocking a Stop to deliver issue or work notices starts another turn,
-    so it is admitted through the run budget like any other dispatch, and
-    an admitted continuation reserves a call where a calls limit applies.
+    Blocking a Stop to deliver issue, work or stale plugin notices starts
+    another turn, so it is admitted through the run budget like any other
+    dispatch, and an admitted continuation reserves a call where a calls
+    limit applies.
 
     Args:
         directory: Private state directory for the common repository.
@@ -3760,6 +3761,11 @@ def checkpoint(
     advances and budget standing) run before the lane's checkpoint lock is
     taken, so the lock guards only the lane's record and mail cursor and a
     slow scan in one decision never holds another event's record behind it.
+    A lane whose recorded ``plugin_version`` differs from the launcher, as
+    `protocol.lane_plugin` reads it, is told once per session to finish its
+    step and resume, and a ``Stop`` carrying that notice is blocked once
+    the way issue and work notices block it; the version comes from the
+    record, so the hook reads no manifest.
     Any other event that finds a later event already applied still delivers
     its context and writes its record, but leaves the later event's activity
     label and dialog in place. A `record_only` decision, which the service
@@ -4193,12 +4199,15 @@ def checkpoint(
                 state["budget_notified"] = notified
                 budget_notice = bool(set(standing["crossed"]) - set(notified))
                 missed = str(scanned.get("wake") or "")
+                loaded, aged = protocol.lane_plugin(state)
+                plugin_notice = aged and loaded != state.get("plugin_notified")
                 for kind, stands in (
                     ("offer", offer),
                     ("edits", edited),
                     ("advance", advanced),
                     ("budget", standing["crossed"]),
                     ("wake", missed),
+                    ("plugin", aged),
                 ):
                     if not stands:
                         (state.get("delivered_items") or {}).pop(kind, None)
@@ -4255,6 +4264,7 @@ def checkpoint(
                     or edit_notice
                     or advance_notice
                     or budget_notice
+                    or plugin_notice
                     or missed
                     or owed
                     or news["items"]
@@ -4319,6 +4329,17 @@ def checkpoint(
                         sections.append(
                             ("budget", clip(budgets.notice(standing), 300))
                         )
+                    if plugin_notice:
+                        sections.append(
+                            (
+                                "plugin",
+                                protocol.STALE_PLUGIN.format(
+                                    version=loaded,
+                                    launcher=protocol.launcher_version(),
+                                    name=agent,
+                                ),
+                            )
+                        )
                     if missed:
                         sections.append(
                             (
@@ -4367,7 +4388,7 @@ def checkpoint(
                     if quiet or (
                         event == "Stop"
                         and (
-                            not {"issues", "offer"} & set(kinds)
+                            not {"issues", "offer", "plugin"} & set(kinds)
                             or continuation_refused(directory, manifest, agent)
                         )
                     ):
@@ -4382,6 +4403,8 @@ def checkpoint(
                                 "additionalContext": text,
                             }
                         }
+                    if "plugin" in kinds and output:
+                        settled["plugin_notified"] = loaded
                     if danger:
                         reason = danger[0]
                         output = hazard_denial(
