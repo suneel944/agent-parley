@@ -9,6 +9,8 @@ time.
 from __future__ import annotations
 
 import contextlib
+import datetime
+import re
 import shlex
 import time
 from pathlib import Path
@@ -37,6 +39,12 @@ FORGE_TIMEOUT = 3 + 2 * -(-FORGE_LIMIT // FORGE_PAGE)
 FORGE_FULL_SECONDS = 3600.0
 FORGE_OVERLAP = 120.0
 TOKEN_READERS = "read for {read}; not measured for {unread}"
+HOOK_WINDOW_DAYS = 7
+HOOK_EXPIRIES = (
+    "{count} deadline expiries in {days} days of the service log on disk"
+)
+HOOK_SLOWEST = "; slowest stage in the latest: {slowest}"
+STAGE_SPENT = re.compile(r"(\S+) (\d+\.\d+)s(?:\s|$)")
 
 
 def reading(
@@ -465,6 +473,54 @@ def registered_root(home: Path, path: Path) -> str:
     return ""
 
 
+def hook_expiries(home: Path, after: float) -> tuple[int, str]:
+    """Counts the hook deadline expiries the service log still holds.
+
+    The service writes one ``expired`` entry each time a hook decision runs
+    past its deadline, naming the elapsed time and the time each decision
+    step spent. This reads those entries back rather than keeping a second
+    record, so it sees only what the log rotation left on disk: the rotated
+    window and the current log. Both are bounded by the shared log ceiling,
+    so the read is bounded too.
+
+    Args:
+        home: Private bridge state root holding the service log.
+        after: Epoch seconds; entries stamped earlier are not counted.
+
+    Returns:
+        The number of expiries stamped at or after ``after``, and the step
+        that spent the most time in the latest of them with its seconds, or
+        an empty string when none was counted or it named no step.
+    """
+    from agent_parley.server import LOG_NAME, ROTATED_NAME
+
+    count = 0
+    slowest = ""
+    for name in (ROTATED_NAME, LOG_NAME):
+        try:
+            text = (home / name).read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stamp, _, rest = line.partition(" expired ")
+            try:
+                instant = datetime.datetime.strptime(
+                    stamp, "%Y-%m-%dT%H:%M:%S%z"
+                ).timestamp()
+            except ValueError:
+                continue
+            if instant < after:
+                continue
+            count += 1
+            report = rest.partition("; answered as ")[2].partition(": ")[2]
+            steps = STAGE_SPENT.findall(report)
+            slowest = ""
+            if steps:
+                step, seconds = max(steps, key=lambda pair: float(pair[1]))
+                slowest = f"{step} {seconds}s"
+    return count, slowest
+
+
 class StatusMixin(BridgeCore):
     """Health check, problem list and per-lane status reporting."""
 
@@ -518,7 +574,11 @@ class StatusMixin(BridgeCore):
             The `tokens` component names the defined providers whose
             lanes report tokens and those no reader measures, so a token
             limit's blind spots are visible before one is set; it never
-            makes the set inconsistent. Each CLI and config home holding
+            makes the set inconsistent. The `hooks` component counts the
+            hook deadline expiries the service log still holds from the last
+            seven days and names the stage that spent the most time in the
+            latest one; it reads only what the log rotation kept, and it
+            never makes the set inconsistent. Each CLI and config home holding
             the plugin is one row, failing when its version differs from
             the launcher's or its protocol is refused; its remedy names the
             reinstall a running service performs on its own and the command
@@ -777,6 +837,21 @@ class StatusMixin(BridgeCore):
                     limits["max_load_ratio"],
                     limits["min_available_mib"],
                 ),
+                "remedy": "",
+                "compatible": True,
+            }
+        )
+        expired, slowest = hook_expiries(
+            self.home, time.time() - HOOK_WINDOW_DAYS * 86400.0
+        )
+        components.append(
+            {
+                "component": "hooks",
+                "version": "",
+                "protocol": protocol.PROTOCOL,
+                "state": ("" if expired else f"{protocol.OK}, ")
+                + HOOK_EXPIRIES.format(count=expired, days=HOOK_WINDOW_DAYS)
+                + (HOOK_SLOWEST.format(slowest=slowest) if slowest else ""),
                 "remedy": "",
                 "compatible": True,
             }
