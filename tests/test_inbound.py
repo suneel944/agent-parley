@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, decisions, inbound, notify, store
+from agent_parley import cli, decisions, inbound, notify, store, timeouts
 
 PASSCODE = "correct-horse-battery"
 CONFIG = {
@@ -343,6 +343,23 @@ def test_a_tap_answers_the_decision_and_hands_it_to_the_lane(
     assert mail[0]["name"] == "codex"
     assert mail[0]["key"] == f"decision:{record['id']}"
     assert "decline" in mail[0]["subject"]
+
+
+def test_a_timeout_answer_is_not_attributed_to_the_operator(
+    bridge, paired, mail
+):
+    record = waiting(paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    answered = decisions.answer(
+        directory, record["id"], "accept", timeouts.ANSWERED_BY
+    )
+
+    inbound.settle(bridge.home, directory, answered)
+
+    assert "operator" not in mail[0]["body"]
+    assert mail[0]["body"].startswith(
+        f"The service's decision timeout answered decision {record['id']}"
+    )
 
 
 def test_a_second_tap_is_refused_with_who_answered_first(
