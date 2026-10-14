@@ -113,6 +113,26 @@ def test_an_unusable_issue_number_is_refused_before_launch(
     assert launched == []
 
 
+def test_a_missing_native_cli_refuses_before_registering_the_lane(
+    bridge, repo, launched, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    worktrees = cli.git(repo, "worktree", "list", "--porcelain")
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: None if name == "gemini" else "/bin/true",
+    )
+    with pytest.raises(BridgeError, match="native gemini CLI") as caught:
+        bridge.launch("gemini", repo, "")
+    assert caught.value.next_command == "agent-parley run gemini"
+    manifest = json.loads((directory / "project.json").read_text())
+    assert "gemini" not in manifest["participants"]
+    assert not (directory / "gemini").exists()
+    assert cli.git(repo, "worktree", "list", "--porcelain") == worktrees
+    assert launched == []
+
+
 def test_the_digest_names_verify_and_the_self_service_outcome():
     data = {
         "verify": ["make", "check"],

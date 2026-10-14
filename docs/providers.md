@@ -314,6 +314,12 @@ be passed to `--provider`. A credential profile expresses exactly what that
 alias expresses, because the launch sets the provider's configuration-home
 variable to the profile's directory.
 
+`run` checks for that executable before it registers anything. When the
+provider's CLI is not on `PATH`, the launch is refused with no lane added to
+the roster and no worktree or branch created, and the refusal's `next:` line
+is the same `agent-parley run` command to repeat once the CLI is installed and
+signed in.
+
 Removing a definition leaves participant references intact. Redefine that name
 before relaunching a lane that uses it. A removed provider override immediately
 reveals its built-in preset, if any.
