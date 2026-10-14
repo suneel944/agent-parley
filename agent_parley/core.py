@@ -12,7 +12,9 @@ moved method reads. This module never imports `cli` at import time, because
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -25,6 +27,54 @@ if TYPE_CHECKING:
     from agent_parley import process
 
 TIMING_LOCK_SECONDS = 5
+
+
+def suggested_gate(root: Path) -> list[str] | None:
+    """Names the check command a repository's committed files declare.
+
+    Detection only suggests: the operator owns the merge gate, so nothing
+    found here is ever recorded. Only files committed at HEAD count, which
+    keeps an untracked scratch file from shaping the suggestion.
+
+    Args:
+        root: Base checkout of the repository.
+
+    Returns:
+        The argument list of the first match, in order: a ``Makefile``
+        ``check`` or ``test`` target, a ``package.json`` test script, a
+        ``pyproject.toml`` pytest table, a ``Cargo.toml``, a ``go.mod``;
+        None when nothing matches or HEAD cannot be read.
+    """
+    from agent_parley.cli import git
+
+    try:
+        committed = set(git(root, "ls-tree", "--name-only", "HEAD").split())
+        files = {
+            name: git(root, "show", f"HEAD:{name}")
+            for name in ("Makefile", "package.json", "pyproject.toml")
+            if name in committed
+        }
+    except BridgeError:
+        return None
+    targets = re.findall(
+        r"^([\w.-]+)\s*:", files.get("Makefile", ""), re.MULTILINE
+    )
+    for target in ("check", "test"):
+        if target in targets:
+            return ["make", target]
+    try:
+        scripts = json.loads(files.get("package.json") or "{}")["scripts"]
+    except (ValueError, KeyError, TypeError):
+        scripts = {}
+    if isinstance(scripts, dict) and scripts.get("test"):
+        return ["npm", "test"]
+    if "[tool.pytest" in files.get("pyproject.toml", ""):
+        return ["pytest", "-q"]
+    if "Cargo.toml" in committed:
+        return ["cargo", "test"]
+    if "go.mod" in committed:
+        return ["go", "test", "./..."]
+    return None
 
 
 class BridgeCore:

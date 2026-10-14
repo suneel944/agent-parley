@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import shlex
 
 from agent_parley import issues as issues_state
 
@@ -654,21 +655,45 @@ def credential_detail(name: str, entry: dict) -> dict:
     return shown
 
 
-def setup_text(manifest: dict) -> str:
-    """Confirms a registered project in two lines a reader can act on.
+def setup_text(manifest: dict, suggestion: list[str] | None = None) -> str:
+    """Summarizes a registered project as labeled lines a reader can act on.
+
+    An empty merge gate is stated rather than left silent, because
+    ``participant merge`` then runs no check at all.
 
     Args:
         manifest: Project manifest ``setup`` created or verified.
+        suggestion: Check command the repository's committed files declare,
+            printed as the ``verify set`` call to record it while the gate
+            is empty; None when nothing was detected.
 
     Returns:
-        The common root, the abbreviated base commit and the selected forge,
+        Root, abbreviated base commit, forge, merge gate and lane
+        initialization, the suggested ``verify set`` call where one applies,
         then the command that starts the first lane.
     """
-    return (
-        f"Registered {manifest['root']} at {manifest['base'][:12]}. "
-        f"Forge: {manifest.get('forge') or 'none'}.\n"
-        "Next: agent-parley run claude"
-    )
+    verify = manifest.get("verify") or []
+    initialize = manifest.get("initialize") or []
+    lines = [
+        f"Root: {manifest['root']}",
+        f"Base: {manifest['base'][:12]}",
+        f"Forge: {manifest.get('forge') or 'none'}",
+        "Verify: "
+        + (
+            shlex.join(verify)
+            if verify
+            else "none; participant merge runs no gate"
+        ),
+    ]
+    if not verify and suggestion:
+        lines.append(
+            f'Suggested: agent-parley verify set "{shlex.join(suggestion)}"'
+        )
+    lines += [
+        f"Init: {shlex.join(initialize) if initialize else 'none'}",
+        "Next: agent-parley run claude",
+    ]
+    return "\n".join(lines)
 
 
 def _settings(entry: dict) -> list[str]:
