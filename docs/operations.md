@@ -2366,6 +2366,22 @@ longer owns the issue, whether it released, handed off, was reclaimed or was
 resolved, so the former holder is not woken, sent or listed a reminder for
 work it no longer holds.
 
+A merged pull request that changes a definition another lane's diff calls is
+mailed to that lane, even when the two touch different files. The same
+completion reading names the pull request and its merge commit; once the
+base checkout holds that commit (it waits up to a day for a fetch), the
+service reads the merge against its first parent once. Python files are
+parsed with `ast`, and a module or class `def` or `class` the merge removed,
+renamed or gave another signature is changed. JavaScript, TypeScript, Go and
+Rust files use one top-level identifier pattern per extension on the removed
+lines; other files are not read. At most 20 files and 20 names are read per
+pull request. Each lane that is not retired and did not land the change has
+its diff against its fork point, committed or not, searched for those names
+on added lines, and each hit sends one message naming the pull request, the
+symbol and the file and line in the lane's diff, once per pull request,
+symbol and lane. The notice says the change may affect the lane: a name
+match can be a false positive, and nothing is refused, rebased or changed.
+
 A lane that opens a pull request and ends its turn to wait is woken when that
 pull request changes. At most once a minute the service reads up to 30 open
 pull requests with their head commit, checks, latest reviews, merge state and
