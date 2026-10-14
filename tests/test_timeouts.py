@@ -91,45 +91,45 @@ def test_an_irreversible_decision_never_times_out(kind):
 
 
 def test_conclusive_evidence_skips_the_question():
-    closed = question(
-        "closed_claim",
+    dead = question(
+        "orphan_claim",
         conclusive=True,
-        evidence=["#42 closed by merged pull request #7 in generation 3"],
+        evidence=["lane codex worktree removed"],
     )
 
-    applied = timeouts.settle({}, closed, ASKED)
+    applied = timeouts.settle({}, dead, ASKED)
 
     assert applied is not None
     assert applied["outcome"] == timeouts.CONCLUDED
-    assert applied["option"] == "resolve"
-    assert applied["evidence"] == [
-        "#42 closed by merged pull request #7 in generation 3"
-    ]
+    assert applied["option"] == "reassign"
+    assert applied["evidence"] == ["lane codex worktree removed"]
+
+
+def test_every_reversible_kind_has_a_producer():
+    reversible = {
+        name
+        for name, kind in timeouts.KINDS.items()
+        if kind.reversibility == timeouts.REVERSIBLE
+    }
+    assert reversible <= set(timeouts.EVENTS.values())
 
 
 def test_a_project_policy_override_is_honoured():
     manifest = {
         timeouts.POLICY: {
             "orphan_claim": {timeouts.ASK: True},
-            "failed_ci": {timeouts.SECONDS: 7200},
         }
     }
     late = ASKED + timeouts.MAX_TIMEOUT_SECONDS
     assert timeouts.settle(manifest, question("orphan_claim"), late) is None
     conclusive = question("orphan_claim", conclusive=True)
     assert timeouts.settle(manifest, conclusive, ASKED) is None
-    ci = question("failed_ci", fields={"run": "99"})
-    assert timeouts.settle(manifest, ci, ASKED + 7199) is None
-    applied = timeouts.settle(manifest, ci, ASKED + 7200)
+    longer = {timeouts.POLICY: {"orphan_claim": {timeouts.SECONDS: 7200}}}
+    orphan = question("orphan_claim")
+    assert timeouts.settle(longer, orphan, ASKED + 7199) is None
+    applied = timeouts.settle(longer, orphan, ASKED + 7200)
     assert applied is not None
-    assert applied["undo"] == "gh run cancel 99"
-    assert timeouts.timeout(manifest, "idle_key") == timeouts.TIMEOUT_SECONDS
-    key = question("idle_key", fields={"lane": "codex", "key": "port:5432"})
-    applied = timeouts.settle(manifest, key, ASKED + timeouts.TIMEOUT_SECONDS)
-    assert applied is not None
-    assert applied["undo"] == (
-        "agent-parley say codex port:5432 --subject 'Reserve this key again'"
-    )
+    assert applied["undo"] == "agent-parley issue assign 42 codex"
 
 
 @pytest.mark.parametrize(
@@ -138,7 +138,6 @@ def test_a_project_policy_override_is_honoured():
         ({"merge_default": {timeouts.SECONDS: 3600}}, "irreversible"),
         ({"orphan_claim": {timeouts.SECONDS: 60}}, "only raise"),
         ({"orphan_claim": {timeouts.ASK: False}}, "invalid"),
-        ({"not_a_kind": {timeouts.ASK: True}}, "not a decision kind"),
     ],
 )
 def test_no_policy_makes_a_kind_less_cautious(entry, match):
@@ -194,6 +193,17 @@ def open_decision(directory: Path, event: notify.Event) -> dict:
     )
 
 
+@pytest.mark.parametrize("name", ["closed_claim", "idle_key", "failed_ci"])
+def test_a_stored_policy_for_a_retired_kind_is_ignored(tmp_path: Path, name):
+    manifest = {timeouts.POLICY: {name: {timeouts.SECONDS: 7200}}}
+    assert timeouts.policy(manifest) == {}
+    assert name not in timeouts.describe(manifest)
+    open_decision(tmp_path, notify.Event.ORPHAN_DECISION)
+    due = ASKED + timeouts.TIMEOUT_SECONDS
+    applied = timeouts.sweep(tmp_path, tmp_path, manifest, due)
+    assert [entry["decision"] for entry in applied] == ["orphan_claim"]
+
+
 def test_the_sweep_answers_only_a_due_reversible_decision(
     tmp_path: Path, monkeypatch
 ):
@@ -247,19 +257,20 @@ def test_the_command_line_sets_shows_and_resets_a_kind(
         return capsys.readouterr().out
 
     shown = run(
-        "timeout", "set", "failed_ci", "--after", "2h", "--repo", str(repo)
+        "timeout", "set", "orphan_claim", "--after", "2h", "--repo", str(repo)
     )
-    assert "failed_ci: reversible, default rerun once, 7200s" in shown
-    shown = run("timeout", "set", "idle_key", "--ask", "--repo", str(repo))
-    assert "idle_key: reversible, default release, always asks" in shown
-    assert "merge_default: irreversible" in run(
-        "timeout", "show", "--repo", str(repo)
-    )
-    run("timeout", "set", "failed_ci", "--repo", str(repo))
+    assert "orphan_claim: reversible, default reassign, 7200s" in shown
+    shown = run("timeout", "show", "--repo", str(repo))
+    assert "merge_default: irreversible" in shown
+    assert "failed_ci" not in shown
+    with pytest.raises(BridgeError, match="not a decision kind"):
+        timeouts.configure(bridge, repo, "failed_ci", seconds=7200)
     _, directory = bridge.project(repo, create=False)
     assert roster.read(directory)[timeouts.POLICY] == {
-        "idle_key": {timeouts.ASK: True}
+        "orphan_claim": {timeouts.SECONDS: 7200}
     }
+    run("timeout", "set", "orphan_claim", "--repo", str(repo))
+    assert not roster.read(directory).get(timeouts.POLICY)
 
 
 def test_a_lane_cannot_set_a_timeout(bridge, repo, paired, monkeypatch):
