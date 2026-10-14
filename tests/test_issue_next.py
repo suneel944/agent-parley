@@ -280,6 +280,19 @@ def test_the_limit_bounds_the_shortlist(
     assert len(bridge.issue_next(claude, 0)["candidates"]) == 1
 
 
+def test_the_main_checkout_names_a_lane_worktree_to_run_it_in(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude = prepared(bridge, paired, tmp_path, repo)
+    with pytest.raises(BridgeError) as raised:
+        bridge.issue_next(repo)
+    assert "assigned agent worktree" in str(raised.value)
+    assert raised.value.next_command.startswith(
+        "agent-parley issue next --repo "
+    )
+    assert str(claude) in raised.value.next_command
+
+
 def test_the_served_tool_recommends_without_writing_anything(
     bridge, repo, paired, tmp_path, monkeypatch
 ):

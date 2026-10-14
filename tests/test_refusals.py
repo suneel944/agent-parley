@@ -134,10 +134,27 @@ def test_unregistered_repository_names_setup(tmp_path):
     assert failure.next_command == "agent-parley setup ."
 
 
-def test_main_checkout_names_the_lane_list(tmp_path):
+def test_main_checkout_without_lanes_names_run(tmp_path):
     failure = refused(roster.resolve, {"participants": {}}, tmp_path)
     assert "assigned agent worktree" in str(failure)
+    assert failure.next_command == "agent-parley run claude"
+
+
+def test_main_checkout_names_the_first_active_lane_worktree(tmp_path):
+    manifest = {
+        "participants": {
+            "zed": {"lane": str(tmp_path / "zed")},
+            "abe": {"lane": str(tmp_path / "abe"), "retired": 1.0},
+            "ada": {"lane": str(tmp_path / "a d a")},
+        }
+    }
+    failure = refused(roster.resolve, manifest, tmp_path)
+    assert f"ada's at {tmp_path / 'a d a'}" in str(failure)
     assert failure.next_command == "agent-parley participant list"
+    chooser = refused(roster.resolve, manifest, tmp_path, False, True)
+    assert chooser.next_command == (
+        f"agent-parley issue next --repo '{tmp_path / 'a d a'}'"
+    )
 
 
 def test_main_checkout_mail_reader_names_as_with_the_first_lane(tmp_path):
