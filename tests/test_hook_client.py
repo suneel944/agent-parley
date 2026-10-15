@@ -1584,6 +1584,7 @@ def test_a_lane_only_records_events_while_one_is_abandoned(
 ):
     deciding = checkpoints.serve
     asked = stalling(monkeypatch, server.DECISION_SECONDS * 2)
+    monkeypatch.setattr(hook, "REPLY_TIMEOUT", server.DECISION_SECONDS + 10)
     lane = Path(paired["lanes"]["codex"])
     identity = json.loads((lane.parent / "codex-identity.json").read_text())
     token = identity["registration_token"]

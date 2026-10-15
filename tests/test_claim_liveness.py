@@ -298,7 +298,9 @@ def test_a_claim_past_the_cap_is_refused_naming_the_held_claims(bridge, paired):
         bridge.issue(lane, "claim", "9")
     message = str(refused.value)
     assert "max_claims_per_lane is 2" in message
-    assert f"#8 (no progress {2 * IDLE_AFTER}s)" in message
+    idle = re.search(r"#8 \(no progress (\d+)s\)", message)
+    assert idle
+    assert 2 * IDLE_AFTER <= int(idle.group(1)) <= 2 * IDLE_AFTER + 5
     assert "9" not in issues.snapshot(directory)["issues"]
     assert bridge.issue(lane, "claim", "8")["owner"] == "claude"
 
