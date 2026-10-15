@@ -966,8 +966,13 @@ def prepare(root: Path, tag: str) -> str:
 
 
 def pypi_files(version: str) -> list[dict[str, Any]]:
-    """Reads PyPI file metadata, treating only HTTP 404 as an absent version."""
-    url = f"https://pypi.org/pypi/agent-parley/{version}/json"
+    """Reads PyPI file metadata, treating only HTTP 404 as an absent project.
+
+    The project endpoint is read rather than the per-version one because
+    PyPI's CDN has served the per-version page as an empty HTTP 200 after
+    an upload, which left the v0.20.1 GitHub release in draft (#1293).
+    """
+    url = "https://pypi.org/pypi/agent-parley/json"
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             data = json.load(response)
@@ -975,7 +980,7 @@ def pypi_files(version: str) -> list[dict[str, Any]]:
         if error.code == 404:
             return []
         raise
-    return list(data["urls"])
+    return list(data["releases"].get(version, []))
 
 
 def pending_files(

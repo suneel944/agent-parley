@@ -956,6 +956,21 @@ def test_pypi_response_requires_the_expected_schema(monkeypatch):
         release.pypi_files(VERSION)
 
 
+def test_pypi_files_come_from_the_project_releases_map(monkeypatch):
+    seen = []
+    files = [{"filename": "agent_parley.whl"}]
+    body = json.dumps({"releases": {VERSION: files, "0.0.1": []}})
+
+    def request(url, **kwargs):
+        seen.append(url)
+        return io.BytesIO(body.encode())
+
+    monkeypatch.setattr(release.urllib.request, "urlopen", request)
+    assert release.pypi_files(VERSION) == files
+    assert release.pypi_files("9.9.9") == []
+    assert seen[0] == "https://pypi.org/pypi/agent-parley/json"
+
+
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
 def test_only_github_404_means_a_release_is_absent(monkeypatch, status):
     monkeypatch.setenv("GH_REPO", "owner/repo")
