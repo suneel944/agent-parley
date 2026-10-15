@@ -57,7 +57,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TextIO
 
-from agent_parley import demo_scenario
+from agent_parley import demo_scenario, plugins
 
 COLUMNS = 132
 ROWS = 30
@@ -206,7 +206,10 @@ def environment(
         the stub executables and a free loopback port. Variables a native
         client or an enclosing lane set are dropped, so a run started from
         inside a lane has operator authority in the sandbox and carries none
-        of that lane's credentials.
+        of that lane's credentials. Plugin repair is off: the sandbox
+        service would otherwise find the operator's own installed plugin
+        under the default CLI home and run a stub CLI to refresh it, and
+        that child outlives the service it was started from.
     """
     values = {
         key: value
@@ -218,6 +221,7 @@ def environment(
     values["AGENT_PARLEY_PORT"] = str(free_port() if port is None else port)
     values["CLAUDE_CONFIG_DIR"] = str(base / "native" / "claude")
     values["CODEX_HOME"] = str(base / "native" / "codex")
+    values[plugins.REPAIR_ENV] = "off"
     values["COLUMNS"] = str(COLUMNS)
     values["LINES"] = str(ROWS)
     values["NO_COLOR"] = "1"

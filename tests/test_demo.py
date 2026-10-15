@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import demo, demo_scenario, roster, server
+from agent_parley import demo, demo_scenario, plugins, roster, server
 
 STAGES = (
     ("One loopback coordination server", "$ agent-parley up"),
@@ -47,6 +47,12 @@ def test_a_line_wider_than_the_frame_wraps_between_words():
     wrapped = demo.lines(body)
     assert wrapped == (first, "agent-parley ends")
     assert len(wrapped[0]) <= demo.COLUMNS
+
+
+def test_the_sandbox_never_repairs_the_operators_plugin(tmp_path, monkeypatch):
+    monkeypatch.setenv(plugins.REPAIR_ENV, "on")
+    values = demo.environment(tmp_path, tmp_path / "bin", tmp_path, port=0)
+    assert values[plugins.REPAIR_ENV] == "off"
 
 
 def test_the_tour_is_a_cut_of_the_recorded_story():
