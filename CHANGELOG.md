@@ -2,10 +2,47 @@
 
 ## [0.20.0](https://github.com/suneel944/agent-parley/compare/v0.19.1...v0.20.0) (2026-10-15)
 
+### Upgrades
 
-### Features
+- One `uv tool upgrade` now upgrades the estate. The service re-executes itself when its sources move after a launcher upgrade (#1240).
+- The service refreshes a stale plugin itself and names the lanes that must restart (#1239). Lanes learn their plugin is stale; unattended lanes restart themselves and attended lanes receive a notice (#1241).
+- `doctor` reports plugin and server version drift per config home (#1245).
 
-* deliver the 0.20.0 milestone (#1283) ([#1239](https://github.com/suneel944/agent-parley/issues/1239)) ([#1240](https://github.com/suneel944/agent-parley/issues/1240)) ([#1241](https://github.com/suneel944/agent-parley/issues/1241)) ([#1242](https://github.com/suneel944/agent-parley/issues/1242)) ([#1243](https://github.com/suneel944/agent-parley/issues/1243)) ([#1244](https://github.com/suneel944/agent-parley/issues/1244)) ([#1245](https://github.com/suneel944/agent-parley/issues/1245)) ([#1248](https://github.com/suneel944/agent-parley/issues/1248)) ([#1249](https://github.com/suneel944/agent-parley/issues/1249)) ([#1250](https://github.com/suneel944/agent-parley/issues/1250)) ([#1251](https://github.com/suneel944/agent-parley/issues/1251)) ([#1252](https://github.com/suneel944/agent-parley/issues/1252)) ([#1253](https://github.com/suneel944/agent-parley/issues/1253)) ([#1254](https://github.com/suneel944/agent-parley/issues/1254)) ([#1255](https://github.com/suneel944/agent-parley/issues/1255)) ([#1256](https://github.com/suneel944/agent-parley/issues/1256)) ([#1257](https://github.com/suneel944/agent-parley/issues/1257)) ([#1258](https://github.com/suneel944/agent-parley/issues/1258)) ([#1259](https://github.com/suneel944/agent-parley/issues/1259)) ([#1260](https://github.com/suneel944/agent-parley/issues/1260)) ([#1261](https://github.com/suneel944/agent-parley/issues/1261)) ([#1262](https://github.com/suneel944/agent-parley/issues/1262))
+### Coordination
+
+- A lane receives mail when a merged change alters a symbol its diff calls (#1242).
+- `run` and dispatch refuse a new lane past a host load threshold (#1243).
+- Dispatch groups backlog issues that share forecast paths onto one lane (#1244).
+- `participant retire --ready` retires every lane that `problems` lists as ready to retire (#1248).
+- A token budget no longer treats copilot lanes as measured while they read zero until the session ends (#1253).
+
+### Diagnostics
+
+- `doctor` reports recent hook deadline expiries and the slowest stage (#1249).
+- `doctor` no longer runs the component and version columns together for the shell plugin row (#1262).
+- `status` names `agent-parley up` when the service is not running (#1261), and no longer says the service is not refreshing when the project has no GitHub remote (#1259).
+- `issue next` from the main checkout gives a next step that works (#1260).
+- `run` for a provider whose CLI is not installed no longer leaves a registered lane and worktree behind (#1256).
+
+### Notifications and policy
+
+- Email notifications verify the SMTP server certificate and refuse to send credentials in clear (#1250).
+- The Telegram status reader logs why polling fails instead of retrying silently (#1251).
+- The attribution policy refuses credits naming opencode, kimi, deepseek and grok lanes (#1252).
+
+### Documentation
+
+- Keeping the service across reboots on macOS and WSL2 is documented (#1254).
+- A short troubleshooting page covers first-run failures (#1258).
+- The provider capability table states that resume approval opt-ins reach only claude lanes (#1255).
+- README examples no longer steer, merge and restart a `claude-2` lane the quickstart never creates (#1257).
+
+### Upgrade notes
+
+- The service re-executes itself when its source files change and rewrites the installed plugin when it is older than the launcher. Unattended lanes restart on a stale plugin; attended lanes only receive a notice.
+- SMTP notifications now refuse unverified certificates and clear-text logins, which can stop mail from a misconfigured relay.
+
+Closed issues: [milestone 0.20.0](https://github.com/suneel944/agent-parley/issues?q=is%3Aissue%20is%3Aclosed%20milestone%3A0.20.0).
 
 ## [0.19.1](https://github.com/suneel944/agent-parley/compare/v0.19.0...v0.19.1) (2026-10-14)
 
