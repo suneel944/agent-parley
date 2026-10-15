@@ -5,22 +5,9 @@ import threading
 
 import pytest
 
-from agent_parley import cli, inbound, notify, server
+from agent_parley import cli, inbound, notify
 
 PASSCODE = "correct-horse-battery"
-
-
-@pytest.fixture
-def service(bridge):
-    """Serves the bridge's configured loopback port on a thread."""
-    with server.Server(bridge.home, bridge.config) as instance:
-        thread = threading.Thread(target=instance.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield instance
-        finally:
-            instance.shutdown()
-            thread.join(timeout=2)
 
 
 @pytest.fixture

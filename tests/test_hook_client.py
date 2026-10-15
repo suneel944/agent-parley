@@ -64,19 +64,6 @@ def registered(request):
             asyncio.run(bridge.identity(name, paired))
 
 
-@pytest.fixture
-def service(bridge):
-    """Serves the bridge's configured loopback port on a thread."""
-    with server.Server(bridge.home, bridge.config) as instance:
-        thread = threading.Thread(target=instance.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield instance
-        finally:
-            instance.shutdown()
-            thread.join(timeout=2)
-
-
 def importable():
     """Returns an environment that can import this checkout anywhere.
 
@@ -447,16 +434,9 @@ def test_a_stale_service_answers_the_hook_with_a_fallback_status(
 
 
 @pytest.fixture
-def watched_service(bridge):
+def watched_service(threaded_service):
     """Serves on a thread the test watches return when the service stops."""
-    with server.Server(bridge.home, bridge.config) as instance:
-        thread = threading.Thread(target=instance.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield instance, thread
-        finally:
-            instance.shutdown()
-            thread.join(timeout=2)
+    return threaded_service
 
 
 def hook_request(bridge, lane, payload):

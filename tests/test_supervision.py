@@ -2237,7 +2237,7 @@ def test_a_recovery_burst_queues_one_capture_with_merged_evidence(
             "payload": payload,
         }
 
-    with server.Server(bridge.home, bridge.config) as instance:
+    with server.Server(bridge.home, {**bridge.config, "port": 0}) as instance:
         instance.recover(lane, owed({"step": 0}))
         assert started.wait(20)
         instance.recover(lane, owed(passing))

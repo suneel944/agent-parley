@@ -3,10 +3,11 @@
 import socket
 import subprocess
 import sys
+import threading
 
 import pytest
 
-from agent_parley import forge, process, records
+from agent_parley import forge, process, records, server
 from agent_parley.cli import Bridge, git
 from agent_parley.state import write_json
 
@@ -120,6 +121,34 @@ def bridge(tmp_path):
     write_json(instance.home / "config.json", instance.config)
     yield instance
     instance.down()
+
+
+@pytest.fixture
+def threaded_service(bridge):
+    """Serves the bridge on a thread, on a port the service binds itself.
+
+    The port ``bridge`` records was released when its probe socket closed,
+    and under ``pytest -n auto`` another worker can take it before a later
+    bind. The service binds port 0 instead, and the port it holds is
+    written back to the bridge's configuration before any test reads it.
+    """
+    with server.Server(bridge.home, {**bridge.config, "port": 0}) as instance:
+        bridge.config["port"] = instance.server_port
+        bridge.url = f"http://127.0.0.1:{instance.server_port}"
+        write_json(bridge.home / "config.json", bridge.config)
+        thread = threading.Thread(target=instance.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield instance, thread
+        finally:
+            instance.shutdown()
+            thread.join(timeout=2)
+
+
+@pytest.fixture
+def service(threaded_service):
+    """Returns the service ``threaded_service`` runs for the test."""
+    return threaded_service[0]
 
 
 @pytest.fixture
