@@ -82,6 +82,7 @@ DIAGNOSTIC_TOOLS = frozenset(
 READ_ONLY_TOOLS = DIAGNOSTIC_TOOLS | {"WebFetch", "WebSearch"}
 PATH_FIELDS = ("file_path", "notebook_path", "path")
 COMMAND_FIELDS = ("command", "cmd")
+COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 KEPT_FIELDS = ("hook_event_name", "event", "tool_name", "cwd", "session_id")
 OFFER_REPLY_SECONDS = 120.0
 DIGEST_HEADER_BYTES = 120
@@ -2959,6 +2960,53 @@ def recorded_branch(lane: Path) -> str:
     return "<detached HEAD>" if re.fullmatch(r"[0-9a-f]{7,64}", head) else ""
 
 
+def recorded_head(lane: Path) -> str:
+    """Reads the commit a lane's checkout is on without running Git.
+
+    The branch reference is looked up as a loose file in the checkout's
+    administrative directory, then in the common directory a linked
+    worktree's ``commondir`` names, then in that directory's
+    ``packed-refs``. A hook calls this on every prompt, so it reads small
+    files only and never spawns a process.
+
+    Args:
+        lane: Assigned bridge worktree.
+
+    Returns:
+        The full commit identifier, or an empty string when the metadata is
+        missing, unborn or not in the documented format.
+    """
+    directory = _git_directory(lane)
+    if directory is None:
+        return ""
+    try:
+        head = (directory / "HEAD").read_text().strip()
+        if COMMIT.fullmatch(head):
+            return head
+        if not head.startswith("ref: "):
+            return ""
+        ref = head.removeprefix("ref: ")
+        common = directory
+        pointer = directory / "commondir"
+        if pointer.is_file():
+            common = directory / pointer.read_text().strip()
+        for base in (directory, common):
+            loose = base / ref
+            if loose.is_file():
+                value = loose.read_text().strip()
+                return value if COMMIT.fullmatch(value) else ""
+        packed = common / "packed-refs"
+        if not packed.is_file():
+            return ""
+        for line in packed.read_text().splitlines():
+            value, _, name = line.partition(" ")
+            if name == ref and COMMIT.fullmatch(value):
+                return value
+    except (OSError, ValueError):
+        return ""
+    return ""
+
+
 def lane_branch(lane: Path) -> str:
     """Reports a lane's branch without failing on an unusable worktree.
 
@@ -4137,6 +4185,10 @@ def checkpoint(
             state.pop("dialog", None)
             state.update(prior, updated=applied)
         if event == "UserPromptSubmit":
+            state["turn"] = {
+                "started": time.time(),
+                "head": recorded_head(lane),
+            }
             prompt = str(payload.get("prompt", ""))
             if operator_prompt(prompt):
                 state["last_prompt"] = prompt[:240]

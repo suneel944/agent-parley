@@ -79,6 +79,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
 | `plugins` | Adds the published marketplace and plugin to each supported native CLI on PATH through that CLI's own plugin commands, reading its listing first so a re-run never duplicates an entry |
 | `decisions` | Durable records of the situations that wait on an operator's answer, one open record per situation, queued and retried with backoff until every configured transport accepts the delivery |
+| `recaps` | The byte-capped recap of the turn that left a lane waiting on the operator: its last assistant message and commands from the native session record, failed commands, and files changed since the commit the prompt hook recorded; read by lane detail and the decision message only, never by another lane, and built without a model call |
 | `denials` | Recognition of a tool call a native permission layer refused, from the hook event each adapter raises for one, recorded as one irreversible operator decision per lane, claim and command that holds the lane's wakes while it is open |
 | `notify` | Outbound Telegram and SMTP notification of the coordination changes an absent owner needs, selected from decisions the event log already recorded |
 | `inbound` | Read-only status queries long-polled from the Telegram bot, admitted by chat identifier and passcode, parsed by the command line's own status filters |
@@ -1047,6 +1048,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `plan` | `plan.json` under `plan.lock` |
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `followups` | `followups.json` under `followups.lock` |
+| `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
 | `quota` | `quota-ledger.json` under `quota.lock` |
 | `convergence` | `convergence.json` under `convergence.lock` |

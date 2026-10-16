@@ -48,6 +48,8 @@ from agent_parley.status import (
     bucket_of,
     bucket_order,
     lane_bucket,
+    recap_note,
+    waiting_recap,
 )
 
 BRANCH_TTL = 5.0
@@ -147,7 +149,9 @@ LEGEND = (
     "the age of the oldest wait, then working, idle and done. A sort "
     "orders rows inside each bucket only, and a lane moves bucket only "
     "when its recorded state changes; (inferred) marks a wait the dialog "
-    "watcher or the liveness sample inferred.",
+    "watcher or the liveness sample inferred. A lane in needs input also "
+    "gets a last turn note: its last message and the count of failed "
+    "commands and changed files, read from the stored turn recap.",
     "STATE idle means the lane is alive, has served no coordination call "
     "within the configured interval, and holds mail at least that old; its "
     "note names the oldest waiting item. Nothing is revoked and no ownership "
@@ -597,6 +601,7 @@ def _row(
         **_blueprint(directory, agent, owned),
     }
     row["bucket"] = lane_bucket(row)
+    row["recap"] = waiting_recap(directory, row)
     return row
 
 
@@ -970,6 +975,7 @@ def notes(row: dict) -> list[str]:
     if row["work_dispatch"].get("state") == "escalated":
         found.append(row["work_dispatch"]["last_result"])
     found.append(row.get("blueprint", ""))
+    found.append(recap_note(row))
     return [str(note) for note in found if note]
 
 
