@@ -48,7 +48,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null`, the ready-report comment posted there, and one bounded reading of the check, review and merge state of up to `MAX_PULL_REQUESTS` (30) open pull requests on GitHub, and of the issues the newest `MAX_LANDINGS` (100) pull requests merged into the recorded integration base close by keyword |
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
-| `followups` | Follow-up work a lane suggests through `suggest_followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
+| `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
@@ -1145,7 +1145,7 @@ addressed can neither take a key nor be told that it did. `agent-parley status`
 names the requests queued on a lane's keys and who asked; `agent-parley top`
 marks the count with `+` in the `LEASES` column.
 
-`suggest_followup` is served outside the store transaction, like
+Mail to `@followup` is answered outside the store transaction, like
 `next_issues`, because it writes only `followups.json` and an operator
 decision beside the ledger. It files no issue, offers nothing and starts no
 lane; at most `MAX_PENDING` (50) suggestions wait per project and each expires

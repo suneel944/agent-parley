@@ -3471,16 +3471,25 @@ def _dispatch(
     first and then opens one transaction for the mail, the leases and the
     credential it ends with.
 
-    A follow-up suggestion writes only the project's suggestion record and
-    an operator decision beside the ledger, never the store, so it runs
-    outside the transaction and records its event separately.
+    A follow-up suggestion is mail addressed to ``followups.ADDRESS``. It
+    writes only the project's suggestion record and an operator decision
+    beside the ledger, never the store, so it runs outside the transaction
+    and records its event separately.
     """
+    from agent_parley import followups
+
     if tool == "next_issues":
         return _recommended(home, actor, args)
     if tool == RETIRE:
         return _retire(home, actor, started)
-    if tool == "suggest_followup":
-        return _suggested(home, actor, args, started)
+    to = args.get("to") if tool == "send_message" else None
+    if isinstance(to, list) and to[:1] == [followups.ADDRESS]:
+        suggestion = {
+            "title": args.get("subject"),
+            "why": args.get("body_md"),
+            "paths": to[1:],
+        }
+        return _suggested(home, actor, suggestion, started)
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool in RESERVING

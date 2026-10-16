@@ -43,8 +43,9 @@ the whole file when a call returns something this page does not explain.
   reservations. `issue cancel` keeps the work. `issue release` only after a
   partial or blocked report; never after a ready one. Silence and process
   exits never transfer ownership.
-- Found work outside your issue? Call `suggest_followup` with a `title`,
-  the `why` and any `paths`, then keep working; never file it or widen scope.
+- Found work outside your issue? `send_message` to `["@followup", paths...]`
+  with the title as `subject`, the why as `body_md`, then keep working; never
+  file it or widen scope.
 
 ## Report outcomes
 

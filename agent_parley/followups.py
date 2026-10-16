@@ -2,9 +2,12 @@
 
 A lane often notices an adjacent problem it was not asked to fix. Mentioning
 it in a report or in mail buries it, and filing it itself would let a lane
-widen its own scope. The ``suggest_followup`` tool records the suggestion
-here instead and returns at once, so the lane keeps the work it holds. The
-record files nothing, offers nothing and starts no lane.
+widen its own scope. Mail sent to `ADDRESS` records the suggestion here
+instead and returns at once, so the lane keeps the work it holds. The record
+files nothing, offers nothing and starts no lane. The address rides the
+existing ``send_message`` tool rather than a tool of its own because every
+lane pays for the served tool list in each session; ``@`` keeps it apart
+from every participant name.
 
 The operator reads pending suggestions through `pending` and accepts one with
 ``agent-parley followup accept ID`` or the Telegram decision button. Only
@@ -24,6 +27,7 @@ from pathlib import Path
 from agent_parley.state import BridgeError, lock, write_json
 
 TOOL = "suggest_followup"
+ADDRESS = "@followup"
 KIND = "followup"
 ACCEPT = "accept"
 RECORD_NAME = "followups.json"

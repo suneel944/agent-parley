@@ -66,22 +66,29 @@ def claimed(lane, owner, number, title):
     )
 
 
-def suggestion(**overrides):
-    """Builds valid suggestion arguments."""
+def suggestion(
+    title="Retry the flaky forge read in status",
+    why="The status forge read fails once a day on a timeout.",
+    paths=("agent_parley/forge.py",),
+):
+    """Builds valid mail arguments addressed to the follow-up address."""
     return {
-        "title": "Retry the flaky forge read in status",
-        "why": "The status forge read fails once a day on a timeout.",
-        "paths": ["agent_parley/forge.py"],
-        **overrides,
+        "to": [followups.ADDRESS, *paths],
+        "subject": title,
+        "body_md": why,
+        "idempotency_key": "followup-1",
     }
+
+
+def suggest(bridge, lane, arguments):
+    """Sends one suggestion through the store as a lane's mail."""
+    return store.call(bridge.home, lane["actor"], "send_message", arguments)
 
 
 def test_a_suggestion_is_recorded_without_filing_or_offering(
     bridge, lane, filed
 ):
-    result = store.call(
-        bridge.home, lane["actor"], followups.TOOL, suggestion()
-    )
+    result = suggest(bridge, lane, suggestion())
     assert result["id"] == "f1"
     assert result["state"] == followups.PENDING
     assert result["repeated"] is False
@@ -95,8 +102,8 @@ def test_a_suggestion_is_recorded_without_filing_or_offering(
 
 
 def test_a_repeated_suggestion_is_recorded_once(bridge, lane):
-    first = store.call(bridge.home, lane["actor"], followups.TOOL, suggestion())
-    again = store.call(bridge.home, lane["actor"], followups.TOOL, suggestion())
+    first = suggest(bridge, lane, suggestion())
+    again = suggest(bridge, lane, suggestion())
     assert again["id"] == first["id"]
     assert again["repeated"] is True
     assert len(followups.pending(lane["directory"])) == 1
@@ -108,10 +115,18 @@ def test_invalid_suggestions_are_refused(bridge, lane):
         suggestion(why="   "),
         suggestion(title="x" * (followups.MAX_TITLE + 1)),
         suggestion(paths=["a"] * (followups.MAX_PATHS + 1)),
-        suggestion(paths="agent_parley/forge.py"),
+        suggestion(paths=[""]),
     ):
         with pytest.raises(BridgeError):
-            store.call(bridge.home, lane["actor"], followups.TOOL, invalid)
+            suggest(bridge, lane, invalid)
+    assert followups.pending(lane["directory"]) == []
+
+
+def test_the_address_only_counts_as_the_first_recipient(bridge, lane):
+    mail = suggestion()
+    mail["to"] = ["claude", followups.ADDRESS]
+    with pytest.raises(BridgeError):
+        suggest(bridge, lane, mail)
     assert followups.pending(lane["directory"]) == []
 
 
@@ -155,9 +170,7 @@ def test_a_suggestion_matching_a_claim_or_open_issue_shows_duplicates(
             "read_at": time.time(),
         },
     )
-    result = store.call(
-        bridge.home, lane["actor"], followups.TOOL, suggestion()
-    )
+    result = suggest(bridge, lane, suggestion())
     assert {item["issue"] for item in result["duplicates"]} == {"41", "52"}
     held = next(item for item in result["duplicates"] if item["issue"] == "41")
     assert held["owner"] == "claude"
@@ -243,9 +256,7 @@ def test_a_forge_refusal_keeps_the_suggestion_pending(
 def test_the_telegram_accept_button_files_through_the_decision(
     bridge, repo, lane, filed
 ):
-    result = store.call(
-        bridge.home, lane["actor"], followups.TOOL, suggestion()
-    )
+    result = suggest(bridge, lane, suggestion())
     opened = decisions.list_open(lane["directory"])
     assert [record["kind"] for record in opened] == [followups.KIND]
     name = opened[0]["id"]
@@ -336,27 +347,25 @@ def rpc(running, token, method, params):
     ).json()
 
 
-def test_the_tool_is_served_over_real_mcp_transport(bridge, lane, filed):
+def test_mail_to_the_address_suggests_over_real_mcp_transport(
+    bridge, lane, filed
+):
     with serving(bridge) as running:
         listed = rpc(running, lane["token"], "tools/list", {})
         called = rpc(
             running,
             lane["token"],
             "tools/call",
-            {"name": followups.TOOL, "arguments": suggestion()},
+            {"name": "send_message", "arguments": suggestion()},
         )
         refused = rpc(
             running,
             lane["token"],
             "tools/call",
-            {"name": followups.TOOL, "arguments": {"title": "Only a title"}},
+            {"name": "send_message", "arguments": suggestion(why=" ")},
         )
-    tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
-    assert tools[followups.TOOL]["inputSchema"]["required"] == [
-        "title",
-        "why",
-    ]
-    assert "readOnlyHint" not in tools[followups.TOOL]["annotations"]
+    names = {tool["name"] for tool in listed["result"]["tools"]}
+    assert followups.TOOL not in names
     result = json.loads(called["result"]["content"][0]["text"])
     assert result["id"] == "f1"
     assert result["state"] == followups.PENDING

@@ -179,8 +179,11 @@ can show what was denied, to whom, and how often.
 
 ## Follow-up work is suggested, never self-filed
 
-A lane that notices work outside its issue calls `suggest_followup` with a
-`title`, the `why` and optional repository `paths`. The call records the
+A lane that notices work outside its issue sends mail to `@followup`: the
+`subject` is the title, `body_md` is the why, and any further `to` entries are
+repository paths. A participant name never starts with `@`, so the address
+reaches no lane, and it rides `send_message` because every lane pays for each
+served tool in every session. The call records the
 suggestion in `followups.json` beside the issue ledger and returns at once:
 it files no issue, offers nothing and starts no lane, so the lane keeps the
 work it holds and its scope does not grow. The result lists the open issues

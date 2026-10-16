@@ -179,7 +179,7 @@ lane that holds the issue, because only that lane can hand it on.
 
 ### Accepting follow-up work a lane suggested
 
-A lane that finds work outside its issue calls `suggest_followup` instead of
+A lane that finds work outside its issue mails it to `@followup` instead of
 filing it or widening its own scope. Nothing is filed until you accept it:
 
 ```bash

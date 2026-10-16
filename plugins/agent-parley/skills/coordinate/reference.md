@@ -296,8 +296,9 @@ own report. The verdict is your own claim about work you did not do, so it is
 neither an approval nor independent verification; it appears in `status`,
 `top`, `report show` and the pull request body labelled as that claim.
 
-Found work outside your issue? Call `suggest_followup` with a `title`, the
-`why` and any `paths`, then keep working on what you hold. It files nothing
+Found work outside your issue? Call `send_message` with `to` set to
+`["@followup", ...paths]`, the title as `subject` and the why as `body_md`,
+then keep working on what you hold. It reaches no lane and files nothing
 and starts no lane: the operator reviews it with `agent-parley followup list`
 and files it with `agent-parley followup accept ID`. The result lists open
 issues and claims it may duplicate. Do not file the issue or widen your own

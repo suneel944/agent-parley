@@ -91,7 +91,7 @@ on standard output and export to a file.
 | `issue assign NUMBER NAME` | Offer an issue to a lane as `operator`; `--reason` travels with the offer and `--unassign` withdraws one no lane accepted. |
 | `issue recover NUMBER --reason TEXT` | As `operator`, approve stopping the live owner of a claim once a matching exhausted-capacity observation is published; the approval alone moves nothing. Refused outside the base checkout, and from any process carrying a lane's `AGENT_PARLEY_TOKEN`. |
 | `issue resolve NUMBER` | End a claim whose holder never filed the completion its pull request already landed, as `operator` and never as the lane. The forge is read at that moment: the issue must have closed inside the current claim, with its closing pull request recorded whichever branch it came from, or, when the forge cannot say, the lane branch pull request must have been opened inside it, and the supervisor must already have escalated the claim as an unresolved completion, so an answering holder is never resolved out from under it. `--reason` is kept beside the recorded evidence, and `--release` returns the work to the queue instead, which a pull request closed without merging requires. |
-| `followup list` | List the follow-up work lanes suggested with `suggest_followup` and nobody accepted yet, oldest first, each with its lane, why, paths, expiry and the open issues or claims whose titles it may duplicate; `--json` prints it for scripts. Suggestions expire seven days after they are made. |
+| `followup list` | List the follow-up work lanes suggested by mail to `@followup` and nobody accepted yet, oldest first, each with its lane, why, paths, expiry and the open issues or claims whose titles it may duplicate; `--json` prints it for scripts. Suggestions expire seven days after they are made. |
 | `followup accept ID` | As `operator`, file one suggestion as a forge issue in the active milestone (the open milestone due soonest, else the oldest; `--milestone TITLE` names another) and offer it to a running lane that holds no claim and has no offer waiting, through the same offer `issue assign` records; `--to LANE` names the lane. With no idle lane the issue is left unclaimed for the next lane that pulls work. A repeat returns the issue already filed. Filing needs the GitHub forge. A Telegram digest carries the same accept as a button. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
@@ -306,7 +306,6 @@ participant or project. Reservations are advisory, not filesystem locks.
 | `next_issues` | Rank the unclaimed, unblocked issues this lane could take next, with the reason for each; `limit` bounds the list. It claims nothing, so the chosen issue is still taken by an explicit claim. |
 | `retire` | Retire this lane from the project when it has nothing left to do. Every issue it holds is released back to the pool and every handoff offered to it is declined, so the offering lane owns that work again; every takeover request it made is withdrawn and every completion reminder addressed to it is marked answered; each lane that had handed it work is told by mail. Its advisory reservations are released, any key a peer queued for is granted, its worktree is removed when Git reports it clean and kept with its changed paths reported when it is not; files Git ignores keep it too, listed the same way, because removing the worktree would delete them. The listed paths stop where the result would pass its 8 KB budget and `dirty_count` carries the full number, so a checkout full of untracked files never produces a reply the client cannot show. Its credential is invalidated last. The lane is then never woken, never relaunched by the service and never named as a peer work could move to. Only the operator returns it to service, with `agent-parley participant add`. |
 | `review_report` | Record this lane's `verdict` of `pass` or `fail` on the peer report named by `report_id`, with the `evidence` it checked. The report's own author is refused. A verdict is that lane's own claim about work it did not do: it is not independent verification, it approves nothing and it gates no integration. |
-| `suggest_followup` | Record follow-up work outside this lane's issue, with a `title`, the `why` and optional `paths`, for the operator to accept. It files no issue, offers nothing and starts no lane, so the lane keeps its work. The result names the suggestion and lists the open issues and claims it may duplicate. An unaccepted suggestion expires after seven days. |
 
 `send_message` also takes a `decision` flag. A message marked that way is
 additionally recorded in the project's decision log, which every registered
@@ -314,6 +313,13 @@ lane searches with `search_decisions`, so a third lane learns an agreement it
 was never addressed in. Nothing else widens: mail without the flag stays
 readable by its sender and its recipients alone, and a decision obeys the same
 body cap and attachment rules as any other message.
+
+`send_message` with `@followup` as the first `to` entry records follow-up work
+outside this lane's issue for the operator to accept: the `subject` is its
+title, `body_md` the why and any further `to` entries repository paths. It
+reaches no lane, files no issue, offers nothing and starts no lane, so the lane
+keeps its work. The result names the suggestion and lists the open issues and
+claims it may duplicate. An unaccepted suggestion expires after seven days.
 
 `send_message` takes an optional `topic` of at most 80 characters. A newer
 message on the same topic supersedes the recipient's unread older one, and

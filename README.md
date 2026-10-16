@@ -328,7 +328,7 @@ lane setup.
   `max_claims_per_lane` claims, two by default.
 - **Choosing work is a reading, not a guess.** `agent-parley issue next` ranks
   the unclaimed, unblocked issues with a reason for each, and claims nothing.
-- **A lane suggests follow-up work; only you file it.** `suggest_followup`
+- **A lane suggests follow-up work; only you file it.** Mail to `@followup`
   records the idea with its likely duplicates and the lane keeps working.
   `agent-parley followup accept ID` files the issue in the active milestone
   and offers it to an idle lane; `followup list` shows what waits.
