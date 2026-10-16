@@ -296,6 +296,15 @@ own report. The verdict is your own claim about work you did not do, so it is
 neither an approval nor independent verification; it appears in `status`,
 `top`, `report show` and the pull request body labelled as that claim.
 
+To run a subtask in parallel without a peer, call the `spawn_child` MCP tool
+with the `task` and the repository `paths` the child may reserve. The child
+is an ordinary lane under your provider and credential, on a branch cut from
+yours; its reservation tools refuse keys outside those paths, and it cannot
+spawn children of its own. Its first ready or blocked report reaches you as
+one capped message; you never read its transcript. Merge its branch into
+yours with Git. A parent may hold three unreturned children and a project
+eight, and the participant cap still applies.
+
 `agent-parley top --once` prints a snapshot; `top --provider NAME --since 6h`
 narrows it. `agent-parley events export --since 7d --output FILE` exports
 retained hook evidence. Neither view independently proves a reported result.
