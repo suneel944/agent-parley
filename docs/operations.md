@@ -2173,6 +2173,41 @@ no HTTP endpoint and no new port: the file is the interface, and the
 coordination server's loopback listener is unchanged. The command reads the
 same records `top` reads, takes no lock and writes no coordination state.
 
+### Throughput since an instant
+
+```bash
+agent-parley metrics throughput --since 2026-10-15T09:01:00Z
+agent-parley metrics throughput --since 7d --json
+```
+
+`metrics throughput` reports what each project and each lane delivered since
+an instant, so a release can record a baseline and later measure against it.
+`--since` takes an ISO 8601 instant or a window such as `6h` or `7d`. The
+reading comes from the store and native client records only; it calls no
+model and writes nothing.
+
+Per lane it reports:
+
+- merged issues: ledger claims resolved complete by a merged pull request;
+- active, idle, operator-wait and blocked lane-hours, replayed from recorded
+  lane transitions. Active is `starting` or `working`. Operator wait is
+  `blocked` on a `dialog`, `prompt` or `approval` cause. Blocked is any other
+  blocked cause;
+- input and output tokens from the client's own session records, placed in
+  the window by each record's timestamp. OpenCode records one combined total,
+  so its split prints `n/a`;
+- operator touches: recorded approvals, answered decisions, mail the operator
+  sent, and operator `pause --resume` or `restart`;
+- unattributed starts: a lane started again after `stopped` or `dead`. An
+  operator `run` and a service relaunch record the same transition, so these
+  are counted apart and never guessed;
+- merge-queue waits: ready reports, how many still wait for integration, and
+  the hours they waited.
+
+The project total counts a merged issue and an operator message once. A lane
+whose retained transitions start inside the window is named, because its
+hours understate the window; each project keeps its latest 2000 lane events.
+
 ## Participants, providers and accounts
 
 ### Availability, reminders and waking
@@ -2233,12 +2268,17 @@ The private project manifest accepts `"supervision"` with `interval` (default
 `convergence_repeats` (3 failures, 1 to 100), `convergence_after`
 (14400 seconds), `prompts`, `wake`,
 `reclaim`, `titles`, `rerun_cancelled` and `rotate` (all true), `ci_rounds`
-(2 rounds, 1 to 100), and `fold_after` (86400 seconds), the retention past
+(2 rounds, 1 to 100), `fold_after` (86400 seconds), the retention past
 which a dead lane with no claim and no process is folded out of the default
-`status` and `problems` views. Numeric second values range from 1 to 86400
-seconds. `rotate` false keeps a lane resuming its recorded native session
-after a ready or blocked report instead of starting a fresh one; see
-[Running lanes](lanes.md#running-unattended). `max_load_ratio` (1.5, above 0
+`status` and `problems` views, `cache_window` (3300 seconds) and
+`cache_restart_tokens` (50000 tokens, 0 to 1000000000). Numeric second values
+range from 1 to 86400 seconds. `rotate` false keeps a lane resuming its
+recorded native session after a ready or blocked report, or after its prompt
+cache expired, instead of starting a fresh one; see
+[Running lanes](lanes.md#running-unattended). A service wake or resume of a
+lane idle longer than `cache_window` starts a fresh session when the lane's
+session recorded at least `cache_restart_tokens` tokens; 0 restarts every such
+lane. `max_load_ratio` (1.5, above 0
 and at most 1000) and `min_available_mib` (1024 MiB, 0 to 1048576) set the
 host load gate below.
 

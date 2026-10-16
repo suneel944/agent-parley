@@ -195,7 +195,11 @@ After asking a peer something you cannot continue without, call
 ending your turn. It takes the same filters as `fetch_inbox` and
 `timeout_seconds`; it returns the reply as soon as it lands, and an expired
 wait returns an empty page. Wait when the answer is minutes away and the work
-resumes with it. Report what you did and stop when the peer is unreachable or
+resumes with it. When it is longer away, or you wait for a handoff or a pull
+request's checks, call `wait_for_message` with `hand_off` set to `mail`,
+`handoff` or `check` as the last call of your turn: when it returns
+`end_turn: true`, end your turn and the service wakes you once it arrives;
+with `end_turn: false` it has held an ordinary wait. Report what you did and stop when the peer is unreachable or
 paused, when the answer needs a human decision, or when a wait has already
 expired once; waiting twice for a silent peer buys nothing.
 

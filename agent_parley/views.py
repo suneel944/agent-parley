@@ -902,8 +902,11 @@ def _count(value: object) -> int | None:
 
 def _row(row: dict) -> dict:
     """Reports one live view row with the identifiers its cells abbreviate."""
+    from agent_parley.status import bucket_of
+
     return {
         "participant": row["participant"],
+        "bucket": dict(bucket_of(row)),
         "provider": row["provider_name"],
         "credential": row["credential"],
         "state": row["state"],

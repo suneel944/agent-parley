@@ -16,6 +16,7 @@ from typing import Any
 from agent_parley import (
     approvals,
     budgets,
+    decisions,
     lanes,
     metrics,
     plan,
@@ -39,12 +40,21 @@ from agent_parley.checkpoints import (
     read_events,
 )
 from agent_parley.issues import deadline_state, snapshot
+from agent_parley.issues import ended as claim_ended
 from agent_parley.state import BridgeError
+from agent_parley.status import (
+    NEEDS_INPUT,
+    bucket_cell,
+    bucket_of,
+    bucket_order,
+    lane_bucket,
+)
 
 BRANCH_TTL = 5.0
 MAX_PROMPT = 120
 COLUMNS = (
     ("PARTICIPANT", 14),
+    ("BUCKET", 6),
     ("PROVIDER", 16),
     ("STATE", 22),
     ("EVENT", 6),
@@ -64,6 +74,7 @@ COLUMNS = (
 )
 DEFAULT_COLUMNS = (
     "PARTICIPANT",
+    "BUCKET",
     "STATE",
     "BRANCH",
     "ISSUES",
@@ -94,6 +105,7 @@ DROP_ORDER = (
 )
 SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "PARTICIPANT": lambda row: row["participant"],
+    "BUCKET": lambda row: -(bucket_of(row)["seconds"] or 0),
     "PROVIDER": lambda row: row["provider"],
     "STATE": lambda row: row["state"],
     "EVENT": lambda row: -row["last_event_ts"],
@@ -131,6 +143,11 @@ LEGEND = (
     "Each lane is one row. A lane that needs you also gets one line in the "
     "notes under the table, marked with !, so the table stays one row per "
     "lane and a monochrome pipe reads the same as colour.",
+    "BUCKET groups the rows: needs input first, with what it waits on and "
+    "the age of the oldest wait, then working, idle and done. A sort "
+    "orders rows inside each bucket only, and a lane moves bucket only "
+    "when its recorded state changes; (inferred) marks a wait the dialog "
+    "watcher or the liveness sample inferred.",
     "STATE idle means the lane is alive, has served no coordination call "
     "within the configured interval, and holds mail at least that old; its "
     "note names the oldest waiting item. Nothing is revoked and no ownership "
@@ -308,7 +325,8 @@ def dormant(row: dict) -> bool:
     Returns:
         True when the lane is retired or out of a live state and it owns no
         issue, holds no offer, holds or waits on no lease, has no unread or
-        unacknowledged mail, and no ready report awaits the operator. A lane
+        unacknowledged mail, no ready report awaits the operator, and its
+        bucket is not ``needs input``. A lane
         with a state record is live while that record is in `lanes.LIVE`; a
         lane without one falls back to its session cell reading stopped. A
         mailbox or lease store that could not be read is not dormant, so a
@@ -325,6 +343,7 @@ def dormant(row: dict) -> bool:
         and not row["owned"]
         and not row["offers"]
         and not row["awaiting_approval"]
+        and bucket_of(row)["bucket"] != NEEDS_INPUT
         and row.get("usage_read", True)
         and not row["leases"]
         and not row["queued"]
@@ -421,9 +440,10 @@ def _row(
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
     condition = context.get("conditions", {}).get(agent)
-    inferred = lanes.inference(
-        lanes.provenance(condition, supervision.hook_gaps(home, participant))
+    provenance = lanes.provenance(
+        condition, supervision.hook_gaps(home, participant)
     )
+    inferred = lanes.inference(provenance)
     liveness = (
         lanes.describe(condition) + (f"; {inferred}" if inferred else "")
         if condition
@@ -444,7 +464,8 @@ def _row(
     )
     review = metrics.latest_review(directory, agent) or {}
     asked = budgets.asked(directory, agent)
-    return {
+    reported_at = state.get("reported_at")
+    row = {
         "participant": agent,
         "provider_name": participant["provider"],
         "alive": process.alive(
@@ -467,6 +488,27 @@ def _row(
             ),
         ),
         "lane_state": condition["state"] if condition else None,
+        "condition": lanes.view(condition),
+        "provenance": provenance,
+        "paused": participant.get("paused", False),
+        "retired_at": participant.get("retired"),
+        "outcome": state.get("outcome", "unknown"),
+        "report_age_seconds": (
+            int(time.time() - float(reported_at)) if reported_at else None
+        ),
+        "decisions": [
+            {
+                "id": item.get("id", ""),
+                "kind": item.get("kind", ""),
+                "created": item.get("created"),
+            }
+            for item in context.get("decisions", [])
+            if item.get("lane") == agent
+        ],
+        "claims": [
+            {"issue": int(number), "ended": claim_ended(issues[number])}
+            for number in owned
+        ],
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": tables.idle_age(stalled) if stalled["stalled"] else 0,
@@ -554,6 +596,8 @@ def _row(
         ).replace("\n", " ")[:MAX_PROMPT],
         **_blueprint(directory, agent, owned),
     }
+    row["bucket"] = lane_bucket(row)
+    return row
 
 
 def _blueprint(directory: Path, agent: str, owned: list) -> dict:
@@ -745,6 +789,7 @@ def collect(
         context = {
             "accounts": accounts,
             "conditions": conditions,
+            "decisions": decisions.list_open(path.parent),
             "usage": usage,
             "usage_read": usage_read,
             "issues": ledger,
@@ -832,6 +877,7 @@ def row_cells(row: dict) -> tuple[str, ...]:
     """
     return (
         row["participant"],
+        bucket_cell(bucket_of(row)),
         row["provider"],
         state_cell(row),
         row["event_age"],
@@ -1093,7 +1139,7 @@ def select(
             rows = sorted(rows, key=key)
         if reverse:
             rows = list(reversed(rows))
-        selected.append({**project, "rows": rows})
+        selected.append({**project, "rows": bucket_order(rows)})
     return {
         **view,
         "projects": selected,

@@ -316,8 +316,12 @@ agent-parley unattended set                       # remove it
 `unattended run NAME` merges only when the lane's claimed issue is listed, its
 claim and ready commit are current, the base sits on the target branch, its
 dependencies are verified complete, a verification command is configured and
-no peer reservation covers a changed path. The merge is the
-`participant merge` step with the same locks, approvals and gate, and every
+no peer reservation covers a changed path. The gate runs first, outside the
+project merge lock, on the ready commit merged into the target in a scratch
+worktree holding tracked files only, so several ready lanes gate at once. The
+merge lock is then taken only to check the target has not moved and merge;
+a moved target is gated again, so an unverified result never lands. The merge
+is the `participant merge` step with the same locks and approvals, and every
 attempt records a decision in the lane's report log. It never pushes and
 never repairs an unverified integration. A lane holding several claims
 integrates its only ready one; when several are ready, name one with
@@ -358,6 +362,21 @@ provider starts a fresh session by leaving out its resume argument, so none is
 skipped. The activity record keeps the replaced session as `rotated_from`, and
 a session change by any other route, such as `/clear`, clears the point. Set
 the supervision key `rotate` to false to resume the recorded session instead.
+
+A lane idle past its provider's prompt cache rotates the same way. Native
+prompt caches last about an hour and the wake backoff doubles up to an hour, so
+a woken lane would otherwise re-read its whole transcript uncached. When the
+service wakes or resumes a lane whose last hook event is older than the
+`cache_window` supervision setting (default 3300 seconds, 55 minutes), it reads
+the tokens the lane's current session recorded. Below `cache_restart_tokens`
+(default 50000) the session resumes as before. At or above it, or when the
+count cannot be read, the service records a rotation point with outcome
+`cache` and the lane restarts as a fresh native session. Its first prompt names
+the lane, its branch, the claims it holds with their next action, its
+reservations, its unread mail count and the last report, so no work is lost:
+the worktree, claims, reservations and mail stay where they were. A lane in
+your own terminal, or resumed with `--resume` from one, is never rotated for its
+cache. The per-provider policy is in [Providers](providers.md#prompt-cache-policy).
 
 ## Revising the plan
 

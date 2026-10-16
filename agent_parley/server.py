@@ -232,13 +232,14 @@ TOOLS = [
     ),
     _tool(
         waits.TOOL,
-        "Wait for mail instead of polling.",
+        "Wait for mail instead of polling; long wait: set hand_off.",
         {
             "timeout_seconds": {
                 **INTEGER,
                 "minimum": 0,
                 "maximum": int(waits.MAX_SECONDS),
             },
+            "hand_off": {"enum": list(waits.HAND_OFF)},
             "thread_id": {**TEXT, "maxLength": 80},
             "after_id": INTEGER,
             "include_bodies": FLAG,
@@ -1357,7 +1358,10 @@ class Handler(BaseHTTPRequestHandler):
         call it has always been, and a delivered message wakes the lanes
         waiting for one before the sender is answered. A release that grants
         a queued request delivers such a message, so it wakes them too, and so
-        does a retirement, which tells the lanes that handed it work.
+        does a retirement, which tells the lanes that handed it work. A wait
+        that names `hand_off` is handed to the service by `waits.hand_off`,
+        and any other call ends the caller's handed-off wait, because the
+        lane is taking a turn again.
         """
         try:
             declared = self._declared_protocol()
@@ -1382,9 +1386,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise BridgeError(wrong)
             if roster.paused(self.server.home, actor["project"], actor["name"]):
                 raise BridgeError(roster.PAUSED_REASON)
+            if "hand_off" not in args:
+                waits.resumed(self.server.home, actor)
             if tool["name"] == waits.TOOL:
                 with self.server.waiting() as ceiling:
-                    result = waits.wait(
+                    serve = waits.hand_off if "hand_off" in args else waits.wait
+                    result = serve(
                         self.server.home,
                         actor,
                         args,

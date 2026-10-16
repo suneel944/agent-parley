@@ -63,15 +63,16 @@ when that policy records `auto`, and never on an agent's own authority.
 | `demo_scenario` | The coordination story, one function per chapter: the full recording (`record`) and the command's short cut (`tour`) of the same steps and captions |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text, and the one-line JSON `error` document a `--json` command prints on a runtime failure |
-| `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records |
+| `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records; also the `metrics throughput` reading: merged issues, lane-hours, native input and output tokens, operator touches and waits per lane since an instant |
 | `evidence` | Review evidence built from a claim window's retained coordination records |
 | `budgets` | A lane's consumption against its advisory budget, from recorded tokens, served calls and session hours; crossing a limit marks and notifies, never stops. Also the opt-in run budget: a durable per-project ledger, `run-budget.json`, of the same readings summed across lanes, restarts and retries. `supervision` admits every wake, work dispatch and capacity retry through it, `launch` refuses to launch or resume a lane while it is exhausted, and a `Stop` hook continuation (`checkpoints.continuation_refused`) is admitted through it like any other dispatch; exhaustion is recorded once and cleared only by the operator's `budget resume` |
+| `quota` | Per-credential quota parking for lanes that share one explicit credential profile on one adapter. A vendor rate-limit refusal that named a reset on any of them parks every lane on that credential until the reset; an optional window the operator records with `quota set` sums the lanes' native token counts and, past its threshold, parks every lane but the one holding the most unfinished claims, and all of them at the limit. Each poll rewrites `quota-ledger.json`; `supervision` defers wakes and fails the capacity fit check of a parked lane, and `checkpoints.continuation_refused` refuses its `Stop` hook continuation. Parking never moves a lane to another provider or credential and never touches its claims or reservations, and a park whose time passed reads as cleared. `headroom` derives remaining headroom per credential from the ledger, marked estimated when it comes from native counts rather than a vendor refusal |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `timeouts` | The table of decision kinds with their reversibility, recommended default and undo command, the project policy that can only make a kind more cautious, and settling an unanswered reversible decision to its default |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
-| `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn |
+| `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn, and the `lane_waits` store record of a long wait a lane handed to the service, which the supervisor's ordinary wake path marks woken and the lane's next served call ends |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies, and the proposals that revise their edges within the operator's envelope |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
@@ -786,7 +787,9 @@ the project merge lock and that participant's session lock, so the lane cannot
 start and no second merge can move the base. The setup lock is held only while
 the manifest is read, never across the gate, so other lanes launch and policy
 changes land while a gate runs; the merging lane's worktree and branch are
-checked again under its session lock. A non-zero exit
+checked again under its session lock. Unattended integration is the
+exception: it gates a scratch candidate before taking the merge lock, as
+described under unattended integration below. A non-zero exit
 refuses the merge and reports the exit status. The gate's output is not
 captured: it goes straight to the operator's terminal, and the refusal points
 there. Only lane initialization captures its command's output and reports the
@@ -925,18 +928,41 @@ repeated issue refuses unattended integration and is never read as consent,
 while the rest of the project keeps working.
 
 `agent-parley unattended run NAME` is the entry point. It runs from the base
-checkout only, holds the project merge lock for the whole attempt, so a second
-attempt or an operator merge is refused as busy, and evaluates eligibility
-under that lock immediately before merging: the lane's claimed issue is listed,
+checkout only and evaluates eligibility with no lock held, the setup lock
+covering only the manifest read: the lane's claimed issue is listed,
 its claim generation is the ledger's current one, it is reported ready at a
 source commit the lane still sits on, the base checkout has the target branch
 checked out, every dependency is verified complete, a verification command is
 configured, and no peer's advisory reservation covers a path the work changed.
-An eligible lane is then merged by the same step `participant merge` uses, so
-the session lock, any required operator approval, the pre- and post-merge
-gates and the source-commit binding all still apply; the policy never merges
-on easier terms. Completion, and with it dependent reconciliation, is recorded
-by that step only after the verified integration.
+
+The verification gate then runs outside the project merge lock, on the
+candidate: the ready source commit merged into the target commit the
+evaluation read, built in a scratch worktree inside the private project state
+directory and never in the base checkout. The scratch worktree is locked
+against the reclaim sweep and removed after the gate whatever the outcome. It
+holds tracked content only, so a gate that depends on files the base checkout
+ignores, such as a local virtual environment, has to create them itself. A
+candidate that conflicts, fails the gate, or whose content the gate changes is
+recorded as a failure and nothing is merged. Because no lock is held, several
+ready lanes run their gates at once.
+
+Only then is the merge lock taken, waiting up to a minute for a merge ahead of
+it before the attempt is refused as busy. Under the lock the attempt checks
+that the base checkout still has the target branch at the commit the
+candidate was built on. If it moved, the lock is released and the attempt
+evaluates and gates the new target afresh, up to three times, after which it
+is refused; the refusal reads a target the base has since left, so the
+service attempts the claim again on a later poll. A result its gate did not
+verify never lands. An eligible lane is merged by the same step
+`participant merge` uses, so the session lock, any required operator
+approval and the source-commit binding all still apply; the policy never
+merges on easier terms. That step replaces its pre-merge gate with the check
+that the base is still the verified commit, and skips the post-merge gate
+only when the merge commit's tree is exactly the verified candidate's tree;
+any other result is gated in the base checkout as before. A lane therefore
+waits on the merge lock for the merges ahead of it, never for their gates.
+Completion, and with it dependent reconciliation, is recorded by that step
+only after the verified integration.
 
 Every attempt appends a decision record of kind `unattended` to the lane's
 report log with bounded evidence: the policy, issue, claim generation, source
@@ -1008,6 +1034,7 @@ Files at the state root, grouped by the module that owns them:
 | `notify` | `notify.json` (stored notification settings) under `notify.lock` |
 | `inbound` | `inbound-gate.json` (inbound passcode failures and lockouts) |
 | `plugins` | `plugin-repair.json` (the service's plugin repair per client config home: versions, outcome, attempts, next retry) |
+| `quota` | `quotas.json` (the quota window recorded per credential profile) under `quotas.lock` |
 | `supervision`, `terminal` | `supervision.json` (global supervision settings, including the wake opt-out) |
 | `terminal` | `wake-<digest>.sock`, one control socket per project lane |
 
@@ -1021,6 +1048,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `followups` | `followups.json` under `followups.lock` |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
+| `quota` | `quota-ledger.json` under `quota.lock` |
 | `convergence` | `convergence.json` under `convergence.lock` |
 | `claims` | `forge-assigned.json` under `forge-assigned.json.lock` |
 | `status` | `forge-issues.json` (forge issue cache) |
