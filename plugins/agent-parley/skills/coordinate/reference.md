@@ -309,6 +309,14 @@ one capped message; you never read its transcript. Merge its branch into
 yours with Git. A parent may hold three unreturned children and a project
 eight, and the participant cap still applies.
 
+Found work outside your issue? Call `send_message` with `to` set to
+`["@followup", ...paths]`, the title as `subject` and the why as `body_md`,
+then keep working on what you hold. It reaches no lane and files nothing
+and starts no lane: the operator reviews it with `agent-parley followup list`
+and files it with `agent-parley followup accept ID`. The result lists open
+issues and claims it may duplicate. Do not file the issue or widen your own
+scope to fix it.
+
 `agent-parley top --once` prints a snapshot; `top --provider NAME --since 6h`
 narrows it. `agent-parley events export --since 7d --output FILE` exports
 retained hook evidence. Neither view independently proves a reported result.
@@ -351,7 +359,9 @@ issue ownership.
 identity. It is an operator action, not a way for a lane to impersonate a
 supervisor. The participant reads it at a checkpoint. The runtime can wake
 eligible idle lanes for pending mail; status reports attempts and
-manual-attention outcomes.
+manual-attention outcomes. `agent-parley followup accept ID` is the operator's
+step that turns a lane's suggestion into a forge issue in the active milestone
+and offers it to an idle lane; a lane never runs it.
 
 When integration is authorized, inspect `agent-parley verify show` and
 `agent-parley participant merge NAME --preview`. `verify set COMMAND`

@@ -45,7 +45,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from agent_parley import decisions, notify
+from agent_parley import decisions, followups, notify
 from agent_parley.state import BridgeError, write_json
 
 if TYPE_CHECKING:
@@ -790,6 +790,10 @@ def decide(
     dialog and reads no mail, and its launcher types the answer once it has
     read the screen again and found the same dialog.
 
+    Accepting a lane's follow-up suggestion files its issue and offers it
+    before the answer is recorded, so a forge refusal leaves the decision
+    open for another tap.
+
     Args:
         home: Private bridge state root.
         name: Decision identifier.
@@ -807,7 +811,8 @@ def decide(
 
     Raises:
         BridgeError: If the decision is unknown, was replaced by a newer
-            occurrence, is no longer open, or does not offer the option.
+            occurrence, is no longer open, or does not offer the option,
+            or the follow-up it accepts could not be filed.
     """
     directory, record = decisions.find(home, name)
     if nonce is not None and nonce != str(record.get("nonce") or ""):
@@ -818,6 +823,8 @@ def decide(
         if note:
             decisions.hold(directory, name, note)
         return CONFIRMING, record
+    if record.get("kind") == followups.KIND:
+        followups.accept_decision(directory, record)
     answered = decisions.answer(directory, name, option, answered_by, note=note)
     if answered.get("kind") == notify.Event.NATIVE_DIALOG.value:
         return ANSWERED, answered

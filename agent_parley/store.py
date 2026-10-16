@@ -3481,7 +3481,14 @@ def _dispatch(
     both from the project manifest, so each runs before any transaction.
     A spawn is a ``send_message`` whose first recipient is the reserved
     child address, so it is recognized here before recipients are read.
+
+    A follow-up suggestion is mail addressed to ``followups.ADDRESS``. It
+    writes only the project's suggestion record and an operator decision
+    beside the ledger, never the store, so it runs outside the transaction
+    and records its event separately.
     """
+    from agent_parley import followups
+
     if tool == "next_issues":
         return _recommended(home, actor, args)
     if tool == RETIRE:
@@ -3498,6 +3505,14 @@ def _dispatch(
             len(json.dumps(spawned)),
         )
         return spawned
+    to = args.get("to") if tool == "send_message" else None
+    if isinstance(to, list) and to[:1] == [followups.ADDRESS]:
+        suggestion = {
+            "title": args.get("subject"),
+            "why": args.get("body_md"),
+            "paths": to[1:],
+        }
+        return _suggested(home, actor, suggestion, started)
     if tool in RESERVING:
         children.confine(home, actor, args.get("paths"))
     declared = (
@@ -3556,6 +3571,83 @@ def _lane_provider(directory: Path, display: str) -> str:
         ),
         "",
     )
+
+
+def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
+    """Records a lane's follow-up suggestion for the operator to accept.
+
+    The suggestion files no issue, offers nothing and starts no lane; it
+    returns at once so the lane keeps working. The operator decision opened
+    beside it carries the Telegram accept button and is best effort: the
+    suggestion stands when that decision cannot be written.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: Tool arguments carrying ``title``, ``why`` and ``paths``.
+        started: Monotonic time the call began, for its event.
+
+    Returns:
+        The suggestion identifier, its state and expiry, whether it was
+        already recorded, the open issues and claims it duplicates and a
+        note that nothing was filed.
+
+    Raises:
+        BridgeError: If the project keeps no state directory, an argument is
+            invalid or the operator already has too many to review.
+    """
+    from agent_parley import decisions, followups
+
+    root = str(actor.get("project", ""))
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        raise BridgeError("This project keeps no issue ledger.")
+    recorded = followups.suggest(
+        directory,
+        actor["name"],
+        args.get("title"),
+        args.get("why"),
+        args.get("paths"),
+    )
+    if not recorded["repeated"]:
+        matched = ", ".join(
+            f"#{item['issue']}" for item in recorded["duplicates"]
+        )
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            opened = decisions.open_or_refresh(
+                directory,
+                project=root,
+                lane="",
+                kind=followups.KIND,
+                key=recorded["id"],
+                question=(
+                    f"{actor['name']} suggests follow-up {recorded['id']}: "
+                    f"{recorded['title']}"
+                ),
+                options=(followups.ACCEPT,),
+                detail=recorded["why"]
+                + (f"\nMay duplicate {matched}." if matched else ""),
+                confirm=(followups.ACCEPT,),
+                ttl=followups.TTL,
+            )
+            followups.link_decision(directory, recorded["id"], opened["id"])
+    result = {
+        "id": recorded["id"],
+        "state": recorded["state"],
+        "expires_at": recorded["expires"],
+        "repeated": recorded["repeated"],
+        "duplicates": recorded["duplicates"],
+        "note": recorded["note"],
+    }
+    _observe(
+        home,
+        actor,
+        followups.TOOL,
+        "ok",
+        started,
+        len(json.dumps(result, ensure_ascii=False).encode()),
+    )
+    return result
 
 
 def _recommended(home: Path, actor: dict, args: dict) -> dict:

@@ -1584,6 +1584,87 @@ def comment(repo: Path, number: str, body: str) -> bool:
     )
 
 
+def active_milestone(repo: Path) -> str | None:
+    """Names the open GitHub milestone new work is filed under.
+
+    The active milestone is the open one due soonest; with no due dates it
+    is the oldest open milestone, the lowest number.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+
+    Returns:
+        The milestone title, or None for any other forge, an unreachable
+        project, no open milestone or a failed read.
+    """
+    if _implementation(repo) != "github":
+        return None
+    project = _reachable(repo)
+    if project is None:
+        return None
+    output = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{project}/milestones?state=open&per_page=100",
+        ],
+        20,
+    )
+    try:
+        listed = json.loads(output or "[]")
+        ranked = sorted(
+            listed,
+            key=lambda item: (
+                not item.get("due_on"),
+                str(item.get("due_on") or ""),
+                int(item["number"]),
+            ),
+        )
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return str(ranked[0]["title"]) if ranked else None
+
+
+def file_issue(
+    repo: Path, title: str, body: str, milestone: str = ""
+) -> str | None:
+    """Opens one GitHub issue, optionally under a milestone.
+
+    Only an operator action calls this; no lane files an issue on its own.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        title: Issue title.
+        body: Issue body, already shaped by the caller.
+        milestone: Milestone title, or empty for none.
+
+    Returns:
+        The new issue's bare number, or None for any other forge, an
+        unreachable project or a refused filing; `last_failure` then says
+        why.
+    """
+    if _implementation(repo) != "github":
+        return None
+    project = _reachable(repo)
+    if project is None:
+        return None
+    args = [
+        "gh",
+        "issue",
+        "create",
+        "--repo",
+        project,
+        "--title",
+        title[:MAX_TITLE],
+        "--body",
+        body,
+    ]
+    if milestone:
+        args += ["--milestone", milestone]
+    found = re.search(r"/issues/(\d+)", _run(args, 30) or "")
+    return found.group(1) if found else None
+
+
 def report_comment(summary: str, evidence: str) -> str:
     """Shapes one lane's ready report for the issue it claims.
 
