@@ -90,7 +90,7 @@ def test_a_lane_read_on_its_own_still_answers_without_a_shared_frame(
         ]
         if participant["participant"] == "claude"
     )
-    project_wide = ("bucket", "decisions", "pull_requests_merged")
+    project_wide = ("bucket", "decisions", "pull_requests_merged", "recap")
     assert steady(alone) == {
         key: value
         for key, value in steady(shared).items()

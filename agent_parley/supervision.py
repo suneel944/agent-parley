@@ -35,6 +35,7 @@ from agent_parley import (
     process,
     protocol,
     quota,
+    recaps,
     reclaim,
     records,
     recovery,
@@ -9071,7 +9072,9 @@ def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
 
     The queue is discarded only after the transaction that applied it
     commits. A store that is busy raises out of this stage, so the queue is
-    kept and applied, still in order, at the next poll.
+    kept and applied, still in order, at the next poll. Every lane the queue
+    showed blocked then has its turn recapped by `recaps.ensure`, so the
+    operator surfaces can say what the lane did before it stopped.
 
     Args:
         home: Private bridge state root.
@@ -9084,6 +9087,15 @@ def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
     with store.connect(home, write=True) as db:
         lanes.apply(db, manifest["root"], items)
     lanes.settled(directory)
+    participants = manifest.get("participants") or {}
+    blocked = {
+        str(item.get("lane", ""))
+        for item in items
+        if item.get("state") == lanes.BLOCKED
+    }
+    for name in sorted(blocked):
+        if participant := participants.get(name):
+            recaps.ensure(home, directory, name, participant)
 
 
 def settle_lanes(

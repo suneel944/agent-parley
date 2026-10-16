@@ -26,9 +26,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import zoneinfo
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 from agent_parley import roster
@@ -63,6 +64,8 @@ DEFAULT_HOMES = {
 }
 UNSAFE = re.compile(r"[^A-Za-z0-9]")
 MAX_TAIL = 1 << 16
+EXIT_CODE = re.compile(r"(?:exit code|exited with code)\D{0,3}(-?\d+)", re.I)
+EXIT_SCAN = 200
 STRONG_EXHAUSTION = re.compile(
     r"usage limit|quota exceed|"
     r"(?:have|has|ve) hit (?:your|the) (?:[\w-]+ ){0,2}limit",
@@ -822,6 +825,45 @@ CAPACITY_READERS: dict[str, CapacityReader] = {
 }
 
 
+def _tail(
+    home: Path, participant: dict, readers: Mapping[str, object]
+) -> tuple[str, Path, list[bytes]] | None:
+    """Reads the last whole lines of a lane's newest native session record.
+
+    At most `MAX_TAIL` bytes are read, and a first line the cut split is
+    dropped, so a reader never parses a partial record.
+
+    Args:
+        home: Private bridge state root.
+        participant: Manifest entry naming the lane, provider and account.
+        readers: Readers keyed by adapter; a lane whose adapter has none
+            reads nothing.
+
+    Returns:
+        The adapter, the record path and its last lines, or None when the
+        lane's adapter has no reader or no record can be read.
+    """
+    try:
+        entry = roster.provider(home, str(participant.get("provider", "")))
+        adapter = str(entry.get("adapter", ""))
+        if adapter not in readers:
+            return None
+        finder = ADAPTERS[adapter][0]
+        config = _config_home(home, entry, participant.get("credential"))
+        if config is None:
+            return None
+        path = finder(config, Path(str(participant.get("lane", ""))))
+        if path is None:
+            return None
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - MAX_TAIL))
+            chunk = handle.read(MAX_TAIL)
+    except (BridgeError, KeyError, OSError, ValueError):
+        return None
+    return adapter, path, chunk.split(b"\n")[1 if size > MAX_TAIL else 0 :]
+
+
 def capacity_observation(home: Path, participant: dict) -> dict | None:
     """Reports the latest capacity event in a lane's native session record.
 
@@ -843,27 +885,15 @@ def capacity_observation(home: Path, participant: dict) -> dict | None:
         Latest capacity observation with its evidence source, record identity
         and session identity, or None when no validated event could be read.
     """
-    try:
-        entry = roster.provider(home, str(participant.get("provider", "")))
-        adapter = str(entry.get("adapter", ""))
-        finder = ADAPTERS[adapter][0]
-        reader = CAPACITY_READERS[adapter]
-        config = _config_home(home, entry, participant.get("credential"))
-        if config is None:
-            return None
-        path = finder(config, Path(str(participant.get("lane", ""))))
-        if path is None:
-            return None
-        size = path.stat().st_size
-        with path.open("rb") as handle:
-            handle.seek(max(0, size - MAX_TAIL))
-            chunk = handle.read(MAX_TAIL)
-    except (BridgeError, KeyError, OSError, ValueError):
+    tail = _tail(home, participant, CAPACITY_READERS)
+    if tail is None:
         return None
+    adapter, path, lines = tail
+    reader = CAPACITY_READERS[adapter]
     latest: dict | None = None
     last_progress: str | int | None = None
     seen_progress: set[str | int] = set()
-    for line in chunk.split(b"\n")[1 if size > MAX_TAIL else 0 :]:
+    for line in lines:
         try:
             record = json.loads(line)
         except ValueError:
@@ -909,6 +939,187 @@ def capacity_observation(home: Path, participant: dict) -> dict | None:
             latest["session_id"] = path.stem
             latest["observation_id"] = hashlib.sha256(line).hexdigest()[:16]
     return latest
+
+
+def _content_text(content: object) -> str:
+    """Joins the text parts of one native message's content.
+
+    Args:
+        content: A message's content, a string or a list of typed parts.
+
+    Returns:
+        The text the parts carry, without tool calls or their results.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(part.get("text", ""))
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") in ("text", "output_text")
+    ).strip()
+
+
+def _new_turn(reading: dict) -> None:
+    """Starts a turn reading over, as a fresh prompt begins a turn.
+
+    Args:
+        reading: Turn reading, changed in place.
+    """
+    reading.update(message="", commands=[], failed=[], calls={})
+
+
+def _claude_turn(record: dict, reading: dict) -> None:
+    """Folds one Claude transcript record into the current turn's reading.
+
+    A user record without a tool result is a prompt and starts a new turn;
+    one carrying tool results marks each command whose result Claude
+    recorded as an error as failed. Subagent records and injected meta
+    records are skipped, so they neither start a turn nor report a command
+    the lane itself did not run.
+
+    Args:
+        record: One parsed transcript record.
+        reading: Turn reading, changed in place.
+    """
+    message = record.get("message")
+    if record.get("isSidechain") or not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if record.get("type") == "user":
+        results = [
+            part
+            for part in (content if isinstance(content, list) else [])
+            if isinstance(part, dict) and part.get("type") == "tool_result"
+        ]
+        if not results and not record.get("isMeta"):
+            _new_turn(reading)
+        for result in results:
+            command = reading["calls"].get(str(result.get("tool_use_id", "")))
+            if command is not None and result.get("is_error"):
+                reading["failed"].append(command)
+        return
+    if record.get("type") != "assistant" or not isinstance(content, list):
+        return
+    if text := _content_text(content):
+        reading["message"] = text
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_use":
+            continue
+        arguments = part.get("input")
+        command = (
+            arguments.get("command") if isinstance(arguments, dict) else None
+        )
+        if isinstance(command, str) and command:
+            reading["commands"].append(command)
+            reading["calls"][str(part.get("id", ""))] = command
+
+
+def _codex_failed(output: object) -> bool:
+    """Reports whether one Codex tool output records a nonzero exit.
+
+    Args:
+        output: The ``output`` field of a function call output record.
+
+    Returns:
+        True when its structured metadata, or the exit line Codex prints
+        first, names a nonzero exit code.
+    """
+    text = output if isinstance(output, str) else json.dumps(output)
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if isinstance(value, dict) and isinstance(value.get("metadata"), dict):
+        code = value["metadata"].get("exit_code")
+        return isinstance(code, int) and code != 0
+    found = EXIT_CODE.search(text[:EXIT_SCAN])
+    return found is not None and int(found.group(1)) != 0
+
+
+def _codex_turn(record: dict, reading: dict) -> None:
+    """Folds one Codex rollout record into the current turn's reading.
+
+    A user message event starts a new turn, an agent message event is the
+    lane's latest reply, and each shell function call is a command whose
+    output says whether it failed.
+
+    Args:
+        record: One parsed rollout record.
+        reading: Turn reading, changed in place.
+    """
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return
+    kind = payload.get("type")
+    if record.get("type") == "event_msg":
+        if kind == "user_message":
+            _new_turn(reading)
+        elif kind == "agent_message" and payload.get("message"):
+            reading["message"] = str(payload["message"]).strip()
+        return
+    if record.get("type") != "response_item":
+        return
+    if kind == "function_call":
+        try:
+            arguments = json.loads(str(payload.get("arguments", "")))
+        except ValueError:
+            return
+        if not isinstance(arguments, dict):
+            return
+        command = arguments.get("command", arguments.get("cmd"))
+        if isinstance(command, list):
+            command = shlex.join(str(word) for word in command)
+        if isinstance(command, str) and command:
+            reading["commands"].append(command)
+            reading["calls"][str(payload.get("call_id", ""))] = command
+    elif kind == "function_call_output":
+        command = reading["calls"].get(str(payload.get("call_id", "")))
+        if command is not None and _codex_failed(payload.get("output")):
+            reading["failed"].append(command)
+
+
+TURN_READERS: dict[str, Fold] = {
+    "claude": _claude_turn,
+    "codex": _codex_turn,
+}
+
+
+def turn_reading(home: Path, participant: dict) -> dict | None:
+    """Reads what a lane's current turn did from its native session record.
+
+    Only the last `MAX_TAIL` bytes of the newest record are parsed, so the
+    cost stays bounded however long the session ran; a turn that began
+    before that window reports only what the window holds. No model is
+    asked and nothing is written.
+
+    Args:
+        home: Private bridge state root.
+        participant: Manifest entry naming the lane, provider and account.
+
+    Returns:
+        The turn's last assistant ``message``, the ``commands`` it ran and
+        the ``failed`` ones, in order, or None when the lane's client has no
+        turn reader or no record can be read.
+    """
+    tail = _tail(home, participant, TURN_READERS)
+    if tail is None:
+        return None
+    adapter, _, lines = tail
+    fold = TURN_READERS[adapter]
+    reading: dict = {}
+    _new_turn(reading)
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            fold(record, reading)
+    reading.pop("calls")
+    return reading
 
 
 def reported_refusal(home: Path, participant: dict) -> float | None:

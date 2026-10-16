@@ -301,6 +301,56 @@ def bucket_order(records: list[dict]) -> list[dict]:
     )
 
 
+def waiting_recap(directory: Path, record: dict) -> dict | None:
+    """Reads the stored turn recap of a lane that waits on the operator.
+
+    Args:
+        directory: Private project state directory.
+        record: One lane record or live view row with its ``bucket``.
+
+    Returns:
+        The lane's stored recap, or None when the lane is not in the
+        ``needs input`` bucket or holds no recap. Nothing is taken or
+        written, so a view never runs Git or reads a native record.
+    """
+    from agent_parley import recaps
+
+    if bucket_of(record)["bucket"] != NEEDS_INPUT:
+        return None
+    return recaps.lane_recap(directory, record["participant"])
+
+
+def recap_note(record: dict) -> str:
+    """Words a lane's recap as the one line every view shows.
+
+    Args:
+        record: One lane record or live view row with its ``recap``.
+
+    Returns:
+        Text such as ``last turn: Tests pass; 1 failed, 3 files changed``
+        led by the lane's last message, or an empty string when the lane
+        has no recap or it holds nothing to show.
+    """
+    recap = record.get("recap") or {}
+    parts = []
+    if recap.get("message"):
+        parts.append(" ".join(str(recap["message"]).split()))
+    failed = len(recap.get("failed") or []) + int(
+        str(recap.get("failed_omitted", 0) or 0)
+    )
+    changed = len(recap.get("files") or []) + int(
+        str(recap.get("files_omitted", 0) or 0)
+    )
+    counts = [
+        f"{count} {label}"
+        for count, label in ((failed, "failed"), (changed, "files changed"))
+        if count
+    ]
+    if counts:
+        parts.append(", ".join(counts))
+    return f"last turn: {'; '.join(parts)}" if parts else ""
+
+
 def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
     """Puts one heading above each bucket's rows of a laid-out table.
 
@@ -313,7 +363,8 @@ def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
         The table with a line such as ``Needs input (1): claude approval
         3m`` before the first row of each bucket, so the operator finds the
         lanes waiting on them, what each waits on and for how long, without
-        reading every row.
+        reading every row. A waiting lane's row is followed by its
+        `recap_note` when it has a recap.
     """
     if not records:
         return lines
@@ -333,6 +384,8 @@ def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
                 + (f" {waiting}" if waiting else "")
             )
         grouped.append(lines[index + 1])
+        if note := recap_note(records[index]):
+            grouped.append(f"  {note}")
     return grouped + lines[len(records) + 1 :]
 
 
@@ -1711,6 +1764,7 @@ class StatusMixin(BridgeCore):
                         .get("pull_requests_merged", 0)
                     )
                     record["bucket"] = lane_bucket(record)
+                    record["recap"] = waiting_recap(path.parent, record)
                 projects.append(
                     {
                         "root": data["root"],
