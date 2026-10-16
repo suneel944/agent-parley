@@ -238,6 +238,7 @@ agent-parley status   # this project's open work: issue, owner, state, PR
 agent-parley top      # every lane live, including what enforcement denied
 agent-parley problems # only what needs you now, oldest first
 agent-parley say codex "Rebase onto main before you open the pull request."
+agent-parley ask codex "Which test is still failing?"  # read-only, lane untouched
 ```
 
 `agent-parley --help` prints the grouped command list; `agent-parley version`
