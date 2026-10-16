@@ -15,6 +15,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `start` | The read-only start-here screen: Git checkout and cleanliness, registration from the recorded manifests, native CLIs on PATH with their plugin records, the recorded service's liveness, and the next commands for that state; for a registered project whose service runs, the count and two most urgent `problems` rows from the cached readings and whether outbound notification is off |
 | `cli` | Argument parsing and dispatch, plus the `Bridge` command object that joins the command groups below and keeps lane restore, pause, stop, restart, retirement, reclaim and pull requests |
 | `core` | Base of the `Bridge` command object: the private state root and its configuration, the mail server's start, stop and readiness, the project manifest and the participant lanes it records |
+| `projects` | The registered projects listed most recently used first, resolution of a project name to its root for `run --project`, named workspaces grouping several project roots for `status --workspace` and `up --workspace`, and the detached resume of a workspace project's stopped lanes through the service wake's own launcher; a workspace only groups roots, so each project keeps its own manifest, claims, reservations and integration target |
 | `settings` | The per-project settings commands: verification and initialization commands, approval policy, branch naming, issue tracker, declared resources, lane budgets and the limits of the enforced run budget (`budget enforce`) |
 | `integration` | The merge, preview and ordered integration commands, recovery of an integration the base has not verified (`--renew-recovery` grants the repairing lane more attempts, `--verify-recovery` clears the record once the base passes its gate), and the operator's approve and reject decisions that gate them |
 | `unattended` | The operator-recorded unattended integration policy, its eligibility checks, and the durable decision and refusal records of each attempt |
@@ -1001,6 +1002,7 @@ Files at the state root, grouped by the module that owns them:
 | `server` | `server.log`, rotated to `server.log.1` |
 | `store` | `bridge.sqlite3` (`store.DATABASE`) with its SQLite WAL companions, under `store.lock`; a legacy `mail.sqlite3` is imported once into a new store |
 | `roster` | `providers.json`, `credentials.json`, under `registry.lock` |
+| `projects` | `recent-projects.json` (each project root's last use) and `workspaces.json` (named groups of project roots), under `projects.lock` |
 | `notify` | `notify.json` (stored notification settings) under `notify.lock` |
 | `inbound` | `inbound-gate.json` (inbound passcode failures and lockouts) |
 | `plugins` | `plugin-repair.json` (the service's plugin repair per client config home: versions, outcome, attempts, next retry) |

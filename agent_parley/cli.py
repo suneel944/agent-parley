@@ -535,6 +535,8 @@ class Selection(NamedTuple):
         over_budget: Report only lanes over any of their advisory token,
             call or hour limits.
         issue: Issue number a lane must hold or be offered.
+        workspace: Recorded project roots of a named workspace; every
+            project when empty.
     """
 
     participant: str = ""
@@ -547,6 +549,7 @@ class Selection(NamedTuple):
     since: float = 0.0
     over_budget: bool = False
     issue: int = 0
+    workspace: tuple[str, ...] = ()
 
     def filtered(self) -> bool:
         """Reports whether the operator narrowed the reading at all."""
@@ -585,7 +588,9 @@ class Selection(NamedTuple):
         return " ".join(applied)
 
     def holds_project(self, root: str) -> bool:
-        """Reports whether one project root satisfies the project filter."""
+        """Reports whether one project root satisfies the project filters."""
+        if self.workspace and root not in self.workspace:
+            return False
         if not self.project:
             return True
         return root in (
@@ -3242,6 +3247,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "down",
             "setup",
             "run",
+            "projects",
+            "workspace",
             "plan",
             "state",
             "store",
@@ -3892,6 +3899,40 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "up", help="Start the local coordination server in the background."
     )
     starting.add_argument("--json", action="store_true", help=JSON_HELP)
+    starting.add_argument(
+        "--workspace",
+        metavar="NAME",
+        default="",
+        help=(
+            "Also resume, each in a detached launcher, the stopped lanes of "
+            "every project this recorded workspace groups."
+        ),
+    )
+    listing = commands.add_parser(
+        "projects",
+        help="List registered projects, most recently used first.",
+    )
+    listing.add_argument("--json", action="store_true", help=JSON_HELP)
+    grouping = commands.add_parser(
+        "workspace",
+        help="Record, list or forget named groups of projects.",
+    )
+    groups = grouping.add_subparsers(dest="action")
+    groups.add_parser("list", help="List every recorded workspace.")
+    recording = groups.add_parser(
+        "set", help="Record a workspace, replacing one of the same name."
+    )
+    recording.add_argument("name", help="Workspace name.")
+    recording.add_argument(
+        "projects",
+        nargs="+",
+        metavar="PROJECT",
+        help="Project name `projects` lists, or its root path.",
+    )
+    forgetting = groups.add_parser(
+        "remove", help="Forget a workspace; its projects stay registered."
+    )
+    forgetting.add_argument("name", help="Workspace name.")
     stopping = commands.add_parser(
         "down",
         help="Stop the coordination server; retain all data and worktrees.",
@@ -3921,6 +3962,12 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Report every project, not only the one the working directory "
             "belongs to, with dormant projects listed last."
         ),
+    )
+    health.add_argument(
+        "--workspace",
+        metavar="NAME",
+        default="",
+        help="Report every project this recorded workspace groups.",
     )
     health.add_argument(
         "--table",
@@ -4346,7 +4393,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     run.add_argument(
         "--credentials", help="Credential profile selecting one account."
     )
-    run.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    target = run.add_mutually_exclusive_group()
+    target.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    target.add_argument(
+        "--project",
+        metavar="NAME",
+        default="",
+        help=(
+            "Registered project to launch in instead of the working "
+            "directory's, by the name `projects` lists or its root."
+        ),
+    )
     run.add_argument(
         "--resume",
         action="store_true",
@@ -6192,7 +6249,17 @@ def main() -> int:
     try:
         bridge = Bridge(args.home)
         if args.command == "up":
+            from agent_parley import projects
+
+            roots = (
+                projects.members(bridge.home, args.workspace)
+                if args.workspace
+                else []
+            )
             bridge.up()
+            started = {
+                root: projects.start_lanes(bridge.home, root) for root in roots
+            }
             print(
                 views.render(
                     "up",
@@ -6200,6 +6267,7 @@ def main() -> int:
                         "url": f"{bridge.url}/mcp/",
                         "state_directory": str(bridge.home),
                         "ready": bridge.ready(),
+                        **({"lanes": started} if args.workspace else {}),
                     },
                 )
                 if args.json
@@ -6208,6 +6276,39 @@ def main() -> int:
                     notify.reported(notify.environment(bridge.home)),
                     inbound_status(bridge.home),
                 )
+                + "".join(
+                    f"\n{root}\n"
+                    + "".join(
+                        f"  {name}: {outcome}\n"
+                        for name, outcome in outcomes.items()
+                    )
+                    for root, outcomes in started.items()
+                )
+            )
+        elif args.command == "projects":
+            from agent_parley import projects
+
+            known = projects.listed(bridge.home)
+            print(
+                views.render("projects", {"projects": known})
+                if args.json
+                else projects.describe(known)
+            )
+        elif args.command == "workspace":
+            from agent_parley import projects
+
+            if args.action == "set":
+                projects.set_workspace(bridge.home, args.name, args.projects)
+            elif args.action == "remove":
+                projects.remove_workspace(bridge.home, args.name)
+            grouped = projects.workspaces(bridge.home)
+            print(
+                "\n".join(
+                    f"{name}: {', '.join(members)}"
+                    for name, members in sorted(grouped.items())
+                )
+                or "No workspaces; `agent-parley workspace set NAME "
+                "PROJECT...` records one."
             )
         elif args.command == "down":
             bridge.down()
@@ -6397,6 +6498,10 @@ def main() -> int:
 
             repository = args.repo.resolve()
             registered = bridge.setup(repository)
+            from agent_parley import projects
+
+            with contextlib.suppress(BridgeError, OSError):
+                projects.touch(bridge.home, registered["root"])
             if args.verify_command is not None:
                 bridge.verification(repository, args.verify_command)
             if args.init_command is not None:
@@ -6415,6 +6520,14 @@ def main() -> int:
                 )
             )
         elif args.command == "run":
+            from agent_parley import projects
+
+            if args.project:
+                args.repo = Path(projects.resolve(bridge.home, args.project))
+            used = bridge.project_at(args.repo.resolve())
+            if used:
+                with contextlib.suppress(BridgeError, OSError):
+                    projects.touch(bridge.home, used)
             status = bridge.launch(
                 args.participant,
                 args.repo.resolve(),
@@ -7365,12 +7478,21 @@ def main() -> int:
             )
         else:
             selection = selected_status(args)
+            workspace = getattr(args, "workspace", "")
+            if workspace:
+                from agent_parley import projects
+
+                selection = selection._replace(
+                    workspace=tuple(projects.members(bridge.home, workspace))
+                )
             if args.json:
                 narrowed = narrow(bridge.status_snapshot(), selection)
                 print(views.render("status", narrowed))
                 matched = reported_lanes(narrowed)
             else:
-                every_project = getattr(args, "all_projects", False)
+                every_project = bool(workspace) or getattr(
+                    args, "all_projects", False
+                )
                 if not selection.project and not every_project:
                     selection = selection._replace(
                         project=bridge.project_at(Path.cwd())
