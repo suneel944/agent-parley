@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from agent_parley import dashboard, views
+from agent_parley import dashboard, status, views
 from agent_parley.state import BridgeError
 
 HOST = "127.0.0.1"
@@ -156,12 +156,12 @@ def page(view: dict, refresh: float) -> str:
 
     Returns:
         A page with one table per project, every ``top`` column and the
-        lane's problem notes, each value escaped.
+        lane's problem notes, each value escaped. Rows are grouped by
+        bucket, needs input first, each group under a heading row that
+        counts its lanes.
     """
-    header = "".join(
-        f"<th>{name}</th>"
-        for name in [*(name for name, _ in dashboard.COLUMNS), "PROBLEMS"]
-    )
+    names = [*(name for name, _ in dashboard.COLUMNS), "PROBLEMS"]
+    header = "".join(f"<th>{name}</th>" for name in names)
     server = "running" if view["running"] else "stopped"
     parts = [
         "<!DOCTYPE html>",
@@ -173,7 +173,15 @@ def page(view: dict, refresh: float) -> str:
     for project in view["projects"]:
         parts.append(f"<h2>{html.escape(str(project['root']))}</h2>")
         parts.append(f"<table><tr>{header}</tr>")
-        for row in project["rows"]:
+        rows = status.bucket_order(project["rows"])
+        buckets = [status.bucket_of(row)["bucket"] for row in rows]
+        for index, row in enumerate(rows):
+            if not index or buckets[index - 1] != buckets[index]:
+                parts.append(
+                    f'<tr><th colspan="{len(names)}">'
+                    f"{html.escape(buckets[index].capitalize())} "
+                    f"({buckets.count(buckets[index])})</th></tr>"
+                )
             cells = [
                 *dashboard.row_cells(row),
                 "; ".join(dashboard.notes(row)),

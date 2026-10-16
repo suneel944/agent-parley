@@ -45,6 +45,19 @@ HOOK_EXPIRIES = (
 )
 HOOK_SLOWEST = "; slowest stage in the latest: {slowest}"
 STAGE_SPENT = re.compile(r"(\S+) (\d+\.\d+)s(?:\s|$)")
+NEEDS_INPUT = "needs input"
+WORKING = "working"
+IDLE = "idle"
+DONE = "done"
+BUCKETS = (NEEDS_INPUT, WORKING, IDLE, DONE)
+"""Lane buckets in the order every view groups them, needs input first."""
+BLOCKED_WAITS = {
+    "approval": "permission prompt",
+    "prompt": "question",
+    "dialog": "native dialog",
+    "": "blocked",
+}
+"""What a blocked lane waits on, by the cause its state record names."""
 
 
 def reading(
@@ -146,6 +159,181 @@ def lane_state(record: dict) -> str:
     if condition := record.get("condition"):
         return str(condition["state"])
     return str(record["availability"]["state"])
+
+
+def lane_bucket(record: dict, now: float | None = None) -> dict:
+    """Sorts one lane into the bucket that says whether it waits on you.
+
+    `status`, `top`, the dashboard frame, the web view and the outbound
+    notifications all call this one function, so a lane reads the same in
+    each. Only recorded facts decide the bucket: the lane state record, an
+    approval, an open decision, the lane's report and its claims. No age
+    threshold takes part, so a lane changes bucket only when one of those
+    facts changes. A lane needs input while it is blocked on a permission
+    prompt, a question such as AskUserQuestion or another native dialog,
+    while its ready report awaits an approval, while a decision for it is
+    open, or while it reports a claim it holds as blocked. Otherwise it is
+    working while starting or working, done once a claim it holds ended or
+    a pull request of it merged in the window or it reported ready, and
+    idle in every other state. A block on exhausted capacity waits on time,
+    not on the operator, so it reads as idle.
+
+    Args:
+        record: One lane record of the status reading or one row of the
+            live view. The keys read are ``condition``, ``provenance``,
+            ``availability``, ``retired_at``, ``paused``,
+            ``awaiting_approval``, ``decisions``, ``outcome``, ``claims``,
+            ``report_age_seconds`` and ``pull_requests_merged``; a missing
+            key is no evidence.
+        now: Unix time ages are measured to, or None for the clock.
+
+    Returns:
+        ``bucket``, one of `BUCKETS`; ``waits``, naming each source of
+        needed input; ``seconds``, the whole seconds of the oldest wait with
+        a known start, or None; and ``inferred``, whether a lane state the
+        dialog watcher or the liveness sample inferred decided the bucket.
+    """
+    moment = time.time() if now is None else now
+    condition = record.get("condition") or {}
+    availability = record.get("availability") or {}
+    state = str(condition.get("state") or availability.get("state") or "")
+    cause = str(condition.get("cause") or "")
+    observed = bool(condition) and bool(
+        (record.get("provenance") or {}).get("inferred")
+    )
+    if state == "waiting" and not condition:
+        state, cause, observed = "blocked", "prompt", True
+    report = record.get("report_age_seconds")
+    reported = None if report is None else moment - float(report)
+    waits: list[tuple[str, float | None]] = []
+    if state == "blocked" and cause != "capacity":
+        since = condition.get("since")
+        waits.append(
+            (
+                BLOCKED_WAITS.get(cause, cause),
+                None if since is None else float(since),
+            )
+        )
+    if record.get("awaiting_approval"):
+        waits.append(("approval", reported))
+    opened = [
+        float(item.get("created") or moment)
+        for item in record.get("decisions") or []
+    ]
+    if opened:
+        named = "decision" if len(opened) == 1 else f"{len(opened)} decisions"
+        waits.append((named, min(opened)))
+    if record.get("outcome") == "blocked" and record.get("claims"):
+        waits.append(("blocked claim", reported))
+    starts = [start for _, start in waits if start is not None]
+    ended = any(claim.get("ended") for claim in record.get("claims") or [])
+    if waits:
+        bucket = NEEDS_INPUT
+        observed = observed and state == "blocked"
+    elif record.get("retired_at") or record.get("paused"):
+        bucket = IDLE
+    elif state in ("starting", "working"):
+        bucket = WORKING
+    elif (
+        ended
+        or record.get("pull_requests_merged")
+        or record.get("outcome") == "ready"
+    ):
+        bucket = DONE
+    else:
+        bucket = IDLE
+    return {
+        "bucket": bucket,
+        "waits": [name for name, _ in waits],
+        "seconds": (
+            int(max(0.0, moment - min(starts))) if waits and starts else None
+        ),
+        "inferred": observed,
+    }
+
+
+def bucket_cell(bucket: dict) -> str:
+    """Words one lane's bucket for a table cell or a message line.
+
+    Args:
+        bucket: A bucket as `lane_bucket` returns it.
+
+    Returns:
+        Text such as ``needs input: approval, decision 3m`` or ``working``,
+        with ``inferred`` added when an inferred lane state decided it.
+    """
+    from agent_parley import tables
+
+    text = str(bucket["bucket"])
+    if bucket["waits"]:
+        text += ": " + ", ".join(bucket["waits"])
+    if bucket["seconds"] is not None:
+        text += f" {tables.age(bucket['seconds'])}"
+    return text + (" (inferred)" if bucket["inferred"] else "")
+
+
+def bucket_of(record: dict) -> dict:
+    """Reads the bucket a reading recorded for one lane, or derives it.
+
+    Args:
+        record: One lane record of the status reading or one live view row.
+
+    Returns:
+        The ``bucket`` the reading stored, else `lane_bucket` of the record.
+    """
+    return record.get("bucket") or lane_bucket(record)
+
+
+def bucket_order(records: list[dict]) -> list[dict]:
+    """Groups lanes by bucket, needs input first, keeping their order.
+
+    The sort is stable, so lanes inside one bucket keep the order the
+    caller read them in, by name, and an unchanged row never moves.
+
+    Args:
+        records: Lanes of the status reading or rows of the live view.
+
+    Returns:
+        The same records ordered by `BUCKETS`.
+    """
+    return sorted(
+        records, key=lambda record: BUCKETS.index(bucket_of(record)["bucket"])
+    )
+
+
+def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
+    """Puts one heading above each bucket's rows of a laid-out table.
+
+    Args:
+        lines: The table heading, one line per record in the same order, and
+            any trailing lines such as hidden columns.
+        records: The lanes the rows were built from, in `bucket_order`.
+
+    Returns:
+        The table with a line such as ``Needs input (1): claude approval
+        3m`` before the first row of each bucket, so the operator finds the
+        lanes waiting on them, what each waits on and for how long, without
+        reading every row.
+    """
+    if not records:
+        return lines
+    buckets = [bucket_of(record) for record in records]
+    names = [bucket["bucket"] for bucket in buckets]
+    grouped = lines[:1]
+    for index, name in enumerate(names):
+        if index == 0 or names[index - 1] != name:
+            waiting = "; ".join(
+                f"{record['participant']} "
+                + bucket_cell(bucket).removeprefix(f"{NEEDS_INPUT}: ")
+                for record, bucket in zip(records, buckets, strict=True)
+                if bucket["bucket"] == name == NEEDS_INPUT
+            )
+            grouped.append(
+                f"{name.capitalize()} ({names.count(name)}):"
+                + (f" {waiting}" if waiting else "")
+            )
+        grouped.append(lines[index + 1])
+    return grouped + lines[len(records) + 1 :]
 
 
 def service_state(server: dict) -> str:
@@ -1093,7 +1281,7 @@ class StatusMixin(BridgeCore):
         """
         import sqlite3
 
-        from agent_parley import lifecycle
+        from agent_parley import approvals, lifecycle
         from agent_parley.cli import (
             activity,
             budgets,
@@ -1366,6 +1554,9 @@ class StatusMixin(BridgeCore):
         )
         record["current_task"] = task_line(record, str(state.get("task") or ""))
         record["lane_state"] = lane_state(record)
+        record["awaiting_approval"] = (record["approval"] or {}).get(
+            "state"
+        ) in (approvals.AWAITING, "unreadable")
         if wake:
             next_at = wake.get("next_at")
             record["wake"] = {
@@ -1453,7 +1644,7 @@ class StatusMixin(BridgeCore):
             gone is left out; one whose root is missing or whose lanes all
             stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
-        from agent_parley import pool
+        from agent_parley import decisions, pool
         from agent_parley.cli import (
             inbound_status,
             issues,
@@ -1497,6 +1688,29 @@ class StatusMixin(BridgeCore):
                         data["participants"], key=tables.natural_key
                     )
                 ]
+                outcomes = metrics.pull_request_outcomes(
+                    context.get("pull_request_record"),
+                    context["ledger"],
+                    time.time() - metrics.OUTCOME_WINDOW,
+                )
+                waiting = decisions.list_open(path.parent)
+                for record in participants:
+                    agent = record["participant"]
+                    record["decisions"] = [
+                        {
+                            "id": item.get("id", ""),
+                            "kind": item.get("kind", ""),
+                            "created": item.get("created"),
+                        }
+                        for item in waiting
+                        if item.get("lane") == agent
+                    ]
+                    record["pull_requests_merged"] = (
+                        outcomes["lanes"]
+                        .get(agent, {})
+                        .get("pull_requests_merged", 0)
+                    )
+                    record["bucket"] = lane_bucket(record)
                 projects.append(
                     {
                         "root": data["root"],
@@ -1520,13 +1734,7 @@ class StatusMixin(BridgeCore):
                         ),
                         "supervision_poll": supervision.last_poll(path.parent),
                         "fold_after": context["configuration"]["fold_after"],
-                        "pull_request_outcomes": (
-                            metrics.pull_request_outcomes(
-                                context.get("pull_request_record"),
-                                context["ledger"],
-                                time.time() - metrics.OUTCOME_WINDOW,
-                            )
-                        ),
+                        "pull_request_outcomes": outcomes,
                         **self._integration(path.parent, data, context),
                     }
                 )
@@ -1763,7 +1971,8 @@ class StatusMixin(BridgeCore):
             print(note)
         opened = known["issues"] if known["complete"] else None
         work: list[tuple[int, tuple[str, ...]]] = []
-        lanes: list[tuple[str, ...]] = []
+        lanes: dict[str, tuple[str, ...]] = {}
+        roster: list[dict] = []
         notes: list[str] = []
         runs: list[str] = []
         ended: list[int] = []
@@ -1806,18 +2015,23 @@ class StatusMixin(BridgeCore):
                             tables.work_row(shown, owner, record["lane_state"]),
                         )
                     )
-            lanes.append(
-                (
-                    owner,
-                    record["lane_state"],
-                    str(live),
-                    record.get("current_task") or "-",
-                )
+            roster.append(record)
+            lanes[owner] = (
+                owner,
+                record["lane_state"],
+                str(live),
+                record.get("current_task") or "-",
             )
         rows = [row for _, row in sorted(work, key=lambda item: item[0])]
         for text in tables.work_table(rows, width) or ["No open claims."]:
             print(text)
-        for text in tables.lane_table(lanes, width):
+        roster = bucket_order(roster)
+        for text in bucket_lines(
+            tables.lane_table(
+                [lanes[record["participant"]] for record in roster], width
+            ),
+            roster,
+        ):
             print(text)
         if gone:
             print(fold_line(gone, after, "dead lane"))
@@ -1934,13 +2148,14 @@ class StatusMixin(BridgeCore):
                 for record in reported:
                     lane_detail(record, data)
                 continue
+            ordered = bucket_order(reported)
             rows = [
                 tables.status_row(
                     record, pending_offers(project, record["participant"])
                 )
-                for record in reported
+                for record in ordered
             ]
-            for row in tables.status_table(rows, width):
+            for row in bucket_lines(tables.status_table(rows, width), ordered):
                 print(row)
             for record in reported:
                 for claim in record["claims"]:

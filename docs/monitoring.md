@@ -359,8 +359,12 @@ total. The second counts lanes by state and the issues they hold, and says how
 many lanes are hidden. The third totals mail, leases, hook decisions and
 injected context. A count that is zero and says nothing is left out.
 
-Each lane is one row. The default columns are PARTICIPANT, STATE, BRANCH,
-ISSUES, MAIL, LEASES, DENIALS, TOKENS, IDLE and TASK, the lane's last prompt.
+Each lane is one row. The default columns are PARTICIPANT, BUCKET, STATE,
+BRANCH, ISSUES, MAIL, LEASES, DENIALS, TOKENS, IDLE and TASK, the lane's last
+prompt. BUCKET groups the rows: needs input first, with what the lane waits on
+and the age of the oldest wait, then working, idle and done. A sort orders rows
+inside each bucket only, so an unchanged lane keeps its place. `status`, the
+web view and Telegram notifications use the same bucket.
 `--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and FIT.
 A lane that needs you also gets one line under the table, marked with `!`:
 a stall, an operator edit, a base advance, an orphan claim, a budget marker,
