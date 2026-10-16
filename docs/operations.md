@@ -2145,6 +2145,41 @@ no HTTP endpoint and no new port: the file is the interface, and the
 coordination server's loopback listener is unchanged. The command reads the
 same records `top` reads, takes no lock and writes no coordination state.
 
+### Throughput since an instant
+
+```bash
+agent-parley metrics throughput --since 2026-10-15T09:01:00Z
+agent-parley metrics throughput --since 7d --json
+```
+
+`metrics throughput` reports what each project and each lane delivered since
+an instant, so a release can record a baseline and later measure against it.
+`--since` takes an ISO 8601 instant or a window such as `6h` or `7d`. The
+reading comes from the store and native client records only; it calls no
+model and writes nothing.
+
+Per lane it reports:
+
+- merged issues: ledger claims resolved complete by a merged pull request;
+- active, idle, operator-wait and blocked lane-hours, replayed from recorded
+  lane transitions. Active is `starting` or `working`. Operator wait is
+  `blocked` on a `dialog`, `prompt` or `approval` cause. Blocked is any other
+  blocked cause;
+- input and output tokens from the client's own session records, placed in
+  the window by each record's timestamp. OpenCode records one combined total,
+  so its split prints `n/a`;
+- operator touches: recorded approvals, answered decisions, mail the operator
+  sent, and operator `pause --resume` or `restart`;
+- unattributed starts: a lane started again after `stopped` or `dead`. An
+  operator `run` and a service relaunch record the same transition, so these
+  are counted apart and never guessed;
+- merge-queue waits: ready reports, how many still wait for integration, and
+  the hours they waited.
+
+The project total counts a merged issue and an operator message once. A lane
+whose retained transitions start inside the window is named, because its
+hours understate the window; each project keeps its latest 2000 lane events.
+
 ## Participants, providers and accounts
 
 ### Availability, reminders and waking
