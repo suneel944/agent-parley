@@ -6,11 +6,20 @@ import select
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, process, roster, terminal
+from agent_parley import (
+    checkpoints,
+    cli,
+    process,
+    records,
+    roster,
+    supervision,
+    terminal,
+)
 from agent_parley.state import BridgeError, write_json
 from agent_parley.supervision import settings
 
@@ -237,3 +246,112 @@ def test_a_detached_launcher_ends_an_idle_session_at_a_rotation_point(
             if child.poll() is None:
                 child.kill()
             child.communicate(timeout=10)
+
+
+def idle_for(directory, seconds):
+    """Records the lane's last hook event ``seconds`` ago."""
+    write_json(
+        directory / "claude-activity.json",
+        {**state(directory), "updated": time.time() - seconds},
+    )
+
+
+def test_the_cache_settings_default_and_validate():
+    assert settings({})["cache_window"] == 3300
+    assert settings({})["cache_restart_tokens"] == 50000
+    with pytest.raises(BridgeError, match="cache_window must be between"):
+        settings({"cache_window": 0})
+    with pytest.raises(BridgeError, match="cache_restart_tokens must be"):
+        settings({"cache_restart_tokens": -1})
+
+
+@pytest.mark.parametrize(
+    ("adapter", "idle", "tokens", "expected"),
+    [
+        ("claude", 60, None, supervision.CACHE_RESUME),
+        ("claude", 4000, 1000, supervision.CACHE_RESUME),
+        ("claude", 4000, 50000, supervision.CACHE_RESTART),
+        ("claude", 4000, None, supervision.CACHE_RESTART),
+        ("codex", 4000, 1000, supervision.CACHE_RESUME),
+        ("gemini", 4000, 1000, supervision.CACHE_RESUME),
+        ("opencode", 4000, 1000, supervision.CACHE_RESUME),
+        ("copilot", 4000, 0, supervision.CACHE_RESTART),
+        ("amp", 4000, 0, supervision.CACHE_RESTART),
+        ("unlisted", 4000, 0, supervision.CACHE_RESTART),
+    ],
+)
+def test_a_cold_wake_resumes_only_a_small_measured_session(
+    adapter, idle, tokens, expected
+):
+    config = settings({})
+    assert supervision.cache_action(adapter, idle, tokens, config) == expected
+
+
+def test_every_policy_names_compact_resume_and_fresh_session():
+    for policy in supervision.CACHE_POLICIES.values():
+        assert set(policy) == {"compact", "resume", "fresh", "sized"}
+        assert policy["fresh"] is True
+
+
+def test_a_lane_idle_past_its_cache_records_a_cache_rotation_point(
+    bridge, lane
+):
+    idle_for(lane, 4000)
+    point = supervision.cache_rotation(bridge.home, lane, "claude")
+    assert point is not None
+    assert point["outcome"] == supervision.CACHE_ROTATION
+    assert point["session"] == CONFIRMED
+    assert state(lane)["rotation"] == point
+
+
+def test_a_warm_lane_records_no_cache_rotation_point(bridge, lane):
+    idle_for(lane, 60)
+    assert supervision.cache_rotation(bridge.home, lane, "claude") is None
+    assert "rotation" not in state(lane)
+
+
+def test_a_small_cold_session_keeps_its_session(bridge, lane, monkeypatch):
+    monkeypatch.setattr(records, "reported_tokens", lambda *a, **k: 10)
+    idle_for(lane, 4000)
+    assert supervision.cache_rotation(bridge.home, lane, "claude") is None
+
+
+def test_rotation_off_records_no_cache_rotation_point(bridge, lane):
+    manifest = roster.read(lane)
+    manifest["supervision"] = {"rotate": False}
+    write_json(lane / "project.json", manifest)
+    idle_for(lane, 4000)
+    assert supervision.cache_rotation(bridge.home, lane, "claude") is None
+
+
+def test_a_service_resume_past_the_cache_starts_a_seeded_fresh_session(
+    bridge, repo, lane, monkeypatch
+):
+    worktree = roster.read(lane)["participants"]["claude"]["lane"]
+    bridge.issue(Path(worktree), "claim", "7")
+    idle_for(lane, 4000)
+    command = captured_launch(bridge, repo, monkeypatch)
+    assert "--resume" not in command
+    task = command[-1]
+    assert "after its prompt cache expired while it sat idle" in task
+    assert "\nBranch: " in task
+    assert "Open claims: #7 (" in task
+    assert "\nReservations: " in task
+    assert "\nMail: " in task
+    recorded = state(lane)
+    assert recorded["rotated_from"] == CONFIRMED
+    assert "rotation" not in recorded
+
+
+def test_a_service_resume_of_a_warm_lane_keeps_its_session(
+    bridge, repo, lane, monkeypatch
+):
+    idle_for(lane, 60)
+    command = captured_launch(bridge, repo, monkeypatch)
+    assert command[1:3] == ["--resume", CONFIRMED]
+
+
+def test_a_launcher_without_a_state_root_never_rotates_for_its_cache(
+    tmp_path,
+):
+    assert terminal._cache_expired(tmp_path, "lane", None) is False

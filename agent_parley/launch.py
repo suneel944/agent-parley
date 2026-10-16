@@ -169,18 +169,25 @@ def native_executable(
 
 
 def rotation_task(
-    agent: str, data: dict, directory: Path, state: dict, task: str
+    agent: str,
+    data: dict,
+    directory: Path,
+    state: dict,
+    task: str,
+    home: Path,
 ) -> str:
     """Builds the first prompt of a lane rotated to a fresh native session.
 
     A ready or blocked report records a rotation point on the lane's
-    activity record. The next resume starts a new native session rather
-    than continuing the one that filed the report, so each claim begins
-    from a bounded context instead of a transcript that grows for days.
-    The new session carries only what the lane needs to continue: its
-    identity, the claims it still holds with their next action, and the
-    last report, held to `ROTATION_REPORT_BYTES`, followed by the task the
-    resume was asked to deliver.
+    activity record, and so does `supervision.cache_rotation` when a lane
+    sat idle past its prompt cache. The next resume starts a new native
+    session rather than continuing the old one, so each claim begins from
+    a bounded context instead of a transcript that grows for days or is
+    re-read uncached. The new session carries only what the lane needs to
+    continue: the checkpoint from `lane_context`, the branch its worktree
+    has checked out, the reservations it holds and its unread mail count,
+    followed by the task the resume was asked to deliver. A branch or
+    mailbox that cannot be read is named as unknown.
 
     Args:
         agent: Participant name within the project.
@@ -188,16 +195,40 @@ def rotation_task(
         directory: Private project state directory holding the ledger.
         state: The lane's activity record carrying the last report.
         task: The prompt the resume was asked to deliver.
+        home: Private bridge state root holding the mailbox.
 
     Returns:
         The opening instruction for the fresh session.
     """
+    import subprocess
+
+    from agent_parley import checkpoints, supervision
+
+    rotation = state.get("rotation") or {}
+    if rotation.get("outcome") == supervision.CACHE_ROTATION:
+        reason = "its prompt cache expired while it sat idle"
+    else:
+        reason = "its last resolved claim"
+    participant = data["participants"][agent]
+    try:
+        branch = checkpoints.current_branch(Path(participant["lane"]))
+    except (BridgeError, OSError, subprocess.SubprocessError):
+        branch = "unknown"
+    try:
+        mail = checkpoints.mailbox(home, data["root"], agent)
+        reserved = ", ".join(mail["reserved"]) or "none"
+        unread = f"{mail['unread']} unread"
+    except (BridgeError, OSError, sqlite3.Error):
+        reserved = unread = "unknown"
     return "\n".join(
         [
             "Fresh session: this lane rotated to a new native session after "
-            "its last resolved claim, so nothing from the previous session "
-            "carries over. Continue from the state below.",
+            f"{reason}, so nothing from the previous session carries over. "
+            "Continue from the state below.",
             *lane_context(agent, data, directory, state),
+            f"Branch: {branch}.",
+            f"Reservations: {reserved}.",
+            f"Mail: {unread}.",
             "Task:",
             task,
         ]
@@ -220,7 +251,7 @@ def lane_context(
         it still holds with their next action, and its last report held to
         `ROTATION_REPORT_BYTES`.
     """
-    from agent_parley import issues, lifecycle
+    from agent_parley import issues, lifecycle, supervision
 
     ledger = issues.snapshot(directory)["issues"]
     held = sorted(
@@ -238,9 +269,15 @@ def lane_context(
         for number in held
     )
     rotation = state.get("rotation") or {}
+    if rotation.get("outcome") == supervision.CACHE_ROTATION:
+        heading = str(state.get("outcome") or "none")
+    else:
+        heading = (
+            f"{rotation.get('outcome') or state.get('outcome') or 'none'} on "
+            f"#{rotation.get('issue') or '?'}"
+        )
     report, _ = _clipped(
-        f"{rotation.get('outcome') or state.get('outcome') or 'none'} on "
-        f"#{rotation.get('issue') or '?'}: {state.get('summary') or ''}"
+        f"{heading}: {state.get('summary') or ''}"
         + (
             f" Remaining: {state['remaining']}"
             if state.get("remaining")
@@ -725,7 +762,11 @@ reported.
         A resume of a lane whose activity record carries a rotation point,
         left by a ready or blocked report, starts a fresh native session
         with `rotation_task`'s bootstrap instead of resuming the recorded
-        one, unless the supervision setting ``rotate`` is off. Every
+        one, unless the supervision setting ``rotate`` is off. A resume
+        that is not interactive also asks
+        `supervision.cache_rotation` whether the lane sat idle past its
+        prompt cache with a session too large to re-read, and rotates the
+        same way when it did. Every
         adapter starts a fresh session by omitting its resume argument, so
         no provider is skipped. Any launch consumes the point, and the
         session it replaced is kept as ``rotated_from``. The rotation also
@@ -970,8 +1011,17 @@ reported.
                 seen.get("rotation")
                 and supervision.configuration(self.home, data)["rotate"]
             )
+            if resume and not rotating and not sys.stdin.isatty():
+                point = supervision.cache_rotation(
+                    self.home, lane.parent, agent
+                )
+                if point is not None:
+                    seen["rotation"] = point
+                    rotating = True
             if rotating:
-                task = rotation_task(agent, data, lane.parent, seen, task)
+                task = rotation_task(
+                    agent, data, lane.parent, seen, task, self.home
+                )
                 with contextlib.suppress(BridgeError, OSError):
                     supervision.forget_delivered(lane.parent, agent)
             prompt = self.protocol(agent, data)
