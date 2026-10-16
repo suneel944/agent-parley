@@ -3470,11 +3470,23 @@ def _dispatch(
     worktree before it touches the store at all, so it too runs its own steps
     first and then opens one transaction for the mail, the leases and the
     credential it ends with.
+
+    A child spawn creates a worktree and starts a launcher, and a child
+    lane's reservation is checked against the paths it was spawned with,
+    both from the project manifest, so each runs before any transaction.
     """
+    from agent_parley import children
+
     if tool == "next_issues":
         return _recommended(home, actor, args)
     if tool == RETIRE:
         return _retire(home, actor, started)
+    if tool == children.TOOL:
+        spawned = children.spawn(home, actor, args)
+        _observe(home, actor, tool, "ok", started, len(json.dumps(spawned)))
+        return spawned
+    if tool in RESERVING:
+        children.confine(home, actor, args.get("paths"))
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool in RESERVING
@@ -4770,13 +4782,16 @@ def speak(
     *,
     ack: bool = False,
     within: float | None = None,
+    sender: str = OPERATOR,
 ) -> dict:
     """Delivers one supervising operator's message to a registered lane.
 
     The message takes the ordinary send path, so it is deduplicated by its
     key, can require acknowledgement, and is read back beside peer traffic.
     The operator row carries no credential digest, so it never resolves a
-    bearer token and no served session can write in its name.
+    bearer token and no served session can write in its name. A message the
+    package relays for a lane, such as a child lane's result, names that
+    registered lane as its ``sender`` instead.
 
     Args:
         home: Private bridge state root.
@@ -4789,14 +4804,16 @@ def speak(
         within: Seconds the acknowledgement is expected to take, recorded as a
             deadline beside the message. Past it the acknowledgement reads as
             overdue; nothing is escalated, resent or acknowledged for the lane.
+        sender: Identity the message is sent as; the operator by default,
+            otherwise a lane that must already be registered.
 
     Returns:
         The delivered message identifier, carrying ``duplicate`` when this key
         already named exactly this message.
 
     Raises:
-        BridgeError: If the project or the addressed participant is not
-            registered, or the message fails validation.
+        BridgeError: If the project, the addressed participant or a lane
+            sender is not registered, or the message fails validation.
     """
     if not (home / DATABASE).exists():
         raise BridgeError(NO_PROJECT)
@@ -4815,16 +4832,22 @@ def speak(
                 f"{name} has not registered with the coordination store; "
                 "launch that participant once with agent-parley run."
             )
-        db.execute(
-            "INSERT INTO agents(project_id,name) VALUES (?,?) "
-            "ON CONFLICT(project_id,name) DO NOTHING",
-            (project[0], OPERATOR),
-        )
+        if sender == OPERATOR:
+            db.execute(
+                "INSERT INTO agents(project_id,name) VALUES (?,?) "
+                "ON CONFLICT(project_id,name) DO NOTHING",
+                (project[0], OPERATOR),
+            )
         actor = db.execute(
             "SELECT id,project_id,name FROM agents "
             "WHERE project_id=? AND name=?",
-            (project[0], OPERATOR),
+            (project[0], sender),
         ).fetchone()
+        if not actor:
+            raise BridgeError(
+                f"{sender} has not registered with the coordination store; "
+                "launch that participant once with agent-parley run."
+            )
         return _send(
             db,
             dict(actor),

@@ -21,6 +21,7 @@ from types import FrameType
 from agent_parley import (
     attachments,
     checkpoints,
+    children,
     hook,
     metrics,
     protocol,
@@ -351,6 +352,23 @@ TOOLS = [
             "evidence": TEXT,
         },
         ["report_id", "verdict", "evidence"],
+    ),
+    _tool(
+        children.TOOL,
+        "Launch a child lane on its own branch cut from yours, limited to "
+        "reserving the given paths. You receive only its one result report, "
+        "then merge its branch. Refusals name the child or budget limit.",
+        {
+            "task": {**TEXT, "maxLength": children.TASK_BYTES},
+            "paths": {
+                "type": "array",
+                "items": TEXT,
+                "minItems": 1,
+                "maxItems": children.MAX_PATHS,
+                "description": "Repository-relative paths or globs.",
+            },
+        },
+        ["task", "paths"],
     ),
     _tool(
         store.RETIRE,
