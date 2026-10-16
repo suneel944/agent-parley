@@ -315,6 +315,24 @@ class ReportsMixin(BridgeCore):
                 "attachment": attached or None,
             },
         )
+        if outcome in ROTATION_OUTCOMES:
+            from agent_parley import children
+
+            try:
+                children.deliver(
+                    self.home,
+                    directory,
+                    agent,
+                    {
+                        "state": outcome,
+                        "commit": commit,
+                        "summary": summary,
+                        "remaining": remaining,
+                        "evidence": evidence,
+                    },
+                )
+            except BridgeError as exc:
+                print(f"Child result not relayed: {exc}", file=sys.stderr)
         owned = [str(claim["issue"])] if claim["issue"] is not None else []
         if outcome == "blocked":
             change_attempt(directory, agent, owned)

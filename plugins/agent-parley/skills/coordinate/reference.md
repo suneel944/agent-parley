@@ -167,7 +167,8 @@ thread and `reply_to` names the message answered, joining its thread.
 `decision: true` also records the message in the shared decision log. An
 optional `topic`, up to 80 characters, makes a newer message on the same topic
 supersede the recipient's unread older one, and `status` counts unread mail
-per topic.
+per topic. A first recipient of `@child` spawns a child lane instead of
+sending mail; see below.
 
 `ack_required` on `send_message` always carries a deadline. Set `ack_within`
 in seconds when the answer is needed sooner or later than the project
@@ -295,6 +296,18 @@ itself: the `review_report` MCP tool (`report_id`, `verdict` of `pass` or
 own report. The verdict is your own claim about work you did not do, so it is
 neither an approval nor independent verification; it appears in `status`,
 `top`, `report show` and the pull request body labelled as that claim.
+
+To run a subtask in parallel without a peer, call `send_message` with `to`
+set to the reserved address `@child` followed by the repository paths or
+globs the child may reserve, the task as `body_md`, a short `subject` and an
+`idempotency_key`. Only `@child` as the first recipient spawns; anywhere else
+it is refused as an unregistered recipient. The child
+is an ordinary lane under your provider and credential, on a branch cut from
+yours; its reservation tools refuse keys outside those paths, and it cannot
+spawn children of its own. Its first ready or blocked report reaches you as
+one capped message; you never read its transcript. Merge its branch into
+yours with Git. A parent may hold three unreturned children and a project
+eight, and the participant cap still applies.
 
 Found work outside your issue? Call `send_message` with `to` set to
 `["@followup", ...paths]`, the title as `subject` and the why as `body_md`,
