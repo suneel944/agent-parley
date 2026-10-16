@@ -356,7 +356,7 @@ def test_the_tool_is_served_over_real_mcp_transport(bridge, lane, filed):
         "title",
         "why",
     ]
-    assert tools[followups.TOOL]["annotations"]["readOnlyHint"] is False
+    assert "readOnlyHint" not in tools[followups.TOOL]["annotations"]
     result = json.loads(called["result"]["content"][0]["text"])
     assert result["id"] == "f1"
     assert result["state"] == followups.PENDING

@@ -372,8 +372,7 @@ TOOLS = [
     ),
     _tool(
         followups.TOOL,
-        "Suggest follow-up work outside your issue for the operator; files "
-        "nothing.",
+        "Suggest out-of-scope work to the operator; files nothing.",
         {"title": TEXT, "why": TEXT, "paths": {"type": "array", "items": TEXT}},
         ["title", "why"],
     ),
