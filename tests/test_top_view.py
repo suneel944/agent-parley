@@ -60,6 +60,14 @@ def lane(name: str, **changes: object) -> dict:
         "offer_kind": "",
         "work_dispatch": {},
         "awaiting_approval": False,
+        "task_plan": {
+            "source": "plan update",
+            "recorded": False,
+            "done": 0,
+            "total": 0,
+            "current": "",
+            "truncated": False,
+        },
         "prompt": "",
     }
     return {**row, **changes}

@@ -908,6 +908,7 @@ def _row(row: dict) -> dict:
         "participant": row["participant"],
         "bucket": dict(bucket_of(row)),
         "recap": row.get("recap"),
+        "task_plan": dict(row["task_plan"]),
         "provider": row["provider_name"],
         "credential": row["credential"],
         "state": row["state"],

@@ -22,6 +22,10 @@ Every observation reaches the record through this module: a supervision
 poll's liveness sample through `sample`, and hook events, dialog reads and
 session changes through `submit`, which queues them in a spool the next
 poll applies in arrival order with `apply`.
+
+A lane's own task plan is kept beside the record as one capped file per
+lane, written from the native todo tool a hook observes or from the
+``plan update`` command, so the hook path never opens the store to keep it.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
-from agent_parley.state import BridgeError, lock
+from agent_parley.roster import ADAPTERS
+from agent_parley.state import BridgeError, lock, write_json
 
 STARTING = "starting"
 WORKING = "working"
@@ -136,6 +141,163 @@ ACCOUNT_FIELDS = (
     "accounted",
 )
 EXTRAS = "-wt"
+PLAN_FILE = "-plan.json"
+PLAN_COMMAND = "plan update"
+NATIVE_PLAN_TOOL = "TodoWrite"
+PLAN_STATUSES = ("pending", "in_progress", "completed")
+MAX_PLAN_BYTES = 4096
+MAX_PLAN_ITEMS = 30
+MAX_STEP_CHARACTERS = 200
+
+
+def plan_items(entries: object, key: str) -> tuple[list[dict], bool]:
+    """Normalizes a submitted task list into capped plan items.
+
+    Each step's text is folded onto one line and clipped, and items stop
+    at `MAX_PLAN_ITEMS` or where the encoded list would pass
+    `MAX_PLAN_BYTES`, so a plan never grows past what a view can show.
+
+    Args:
+        entries: Submitted list of mappings, each with text and a status.
+        key: Field naming the step's text, such as ``content`` or ``step``.
+
+    Returns:
+        The kept items as ``{"text", "status"}`` mappings, and whether any
+        item was dropped or clipped by a cap.
+
+    Raises:
+        BridgeError: If the list, an item, its text or its status is
+            malformed.
+    """
+    if not isinstance(entries, list):
+        raise BridgeError("plan must be a list of steps.")
+    items: list[dict] = []
+    clipped = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BridgeError("Each plan step must be an object.")
+        text = entry.get(key)
+        status = entry.get("status")
+        if not isinstance(text, str) or not text.strip():
+            raise BridgeError(f"Each plan step needs a non-empty {key}.")
+        if status not in PLAN_STATUSES:
+            raise BridgeError(
+                f"Plan status must be one of: {', '.join(PLAN_STATUSES)}."
+            )
+        folded = " ".join(text.split())
+        clipped = clipped or len(folded) > MAX_STEP_CHARACTERS
+        items.append({"text": folded[:MAX_STEP_CHARACTERS], "status": status})
+    kept: list[dict] = []
+    size = 2
+    for item in items[:MAX_PLAN_ITEMS]:
+        size += len(json.dumps(item, ensure_ascii=False).encode()) + 1
+        if size > MAX_PLAN_BYTES:
+            break
+        kept.append(item)
+    return kept, clipped or len(kept) < len(items)
+
+
+def record_plan(
+    directory: Path, agent: str, entries: object, key: str, source: str
+) -> dict:
+    """Replaces a lane's recorded task plan with the submitted list.
+
+    Args:
+        directory: Common project state directory.
+        agent: Lane name the plan belongs to.
+        entries: Submitted task list, as `plan_items` reads it.
+        key: Field naming each step's text.
+        source: Where the list came from, such as ``plan update``.
+
+    Returns:
+        The recorded plan: ``items``, ``source``, ``updated`` and
+        ``truncated``.
+
+    Raises:
+        BridgeError: If the list is malformed.
+        OSError: If the plan file cannot be written.
+    """
+    items, truncated = plan_items(entries, key)
+    plan = {
+        "items": items,
+        "source": source,
+        "updated": time.time(),
+        "truncated": truncated,
+    }
+    write_json(directory / f"{agent}{PLAN_FILE}", plan)
+    return plan
+
+
+def observe_plan(directory: Path, agent: str, payload: dict) -> None:
+    """Records the task list a native todo tool call carried, if any.
+
+    Only a completed ``TodoWrite`` call is read, from the hook payload the
+    lane already sent; no transcript is parsed and no model is asked. A
+    malformed list or a failed write is dropped, because a missing plan
+    must never fail the hook that observed it.
+
+    Args:
+        directory: Common project state directory.
+        agent: Lane the hook event belongs to.
+        payload: Native ``PostToolUse`` hook payload.
+    """
+    if payload.get("tool_name") != NATIVE_PLAN_TOOL:
+        return
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return
+    with contextlib.suppress(BridgeError, OSError):
+        record_plan(
+            directory,
+            agent,
+            tool_input.get("todos"),
+            "content",
+            NATIVE_PLAN_TOOL,
+        )
+
+
+def lane_task_plan(directory: Path, agent: str) -> dict | None:
+    """Reads the latest task plan a lane recorded.
+
+    The plan is the operator's reading of one lane and is never delivered
+    to another lane.
+
+    Args:
+        directory: Common project state directory.
+        agent: Lane name.
+
+    Returns:
+        ``items`` as ``{"text", "status"}`` mappings in the lane's order,
+        with ``source``, ``updated`` and ``truncated``, or None when the
+        lane recorded no readable plan.
+    """
+    try:
+        plan = json.loads((directory / f"{agent}{PLAN_FILE}").read_text())
+        items, clipped = plan_items(plan["items"], "text")
+        return {
+            "items": items,
+            "source": str(plan.get("source", "")),
+            "updated": float(plan.get("updated", 0)),
+            "truncated": bool(plan.get("truncated")) or clipped,
+        }
+    except (BridgeError, OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def plan_source(adapter: str) -> str:
+    """Names how a provider's lanes report their task plan.
+
+    Args:
+        adapter: Native CLI contract of the lane's provider.
+
+    Returns:
+        ``TodoWrite`` for the Claude contract, whose hook carries the
+        native list, ``plan update`` for every other known contract, and an
+        empty string when the provider has no path.
+    """
+    if adapter == "claude":
+        return NATIVE_PLAN_TOOL
+    return PLAN_COMMAND if adapter in ADAPTERS else ""
 
 
 def extras(lane: Path | str) -> Path:

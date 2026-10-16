@@ -27,6 +27,8 @@ the whole file when a call returns something this page does not explain.
 - Run `agent-parley issue match "GOAL"` before opening an issue, and
   `agent-parley issue next` (MCP `next_issues`) before choosing one. Neither
   claims anything.
+- The operator sees your task list: Claude's `TodoWrite` is read by the hook;
+  others run `agent-parley plan update STATUS:TEXT ...` with the whole list.
 - Run `agent-parley issue claim NUMBER` before working. A peer's claim means
   other work or a negotiated handoff. Take an `orphaned` claim only with
   `--take-orphaned`. Read `agent-parley plan show` for the work order.

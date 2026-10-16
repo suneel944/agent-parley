@@ -369,7 +369,11 @@ also shows a `last turn:` line from its stored turn recap: its last message,
 the failed commands and the changed files, each capped in bytes. `status
 --json` and the live view carry the recap as `recap`, and a lane without one
 shows nothing.
-`--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and FIT.
+`--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED, FIT and
+PLAN. PLAN is the lane's own task list: steps done of all and the step in
+progress, `-` before the lane records one, `n/a` when its provider has no path
+to report one. `status` prints the same reading as a `Plan <lane>` line, and
+the web view and `top --json` rows carry it as `task_plan`.
 A lane that needs you also gets one line under the table, marked with `!`:
 a stall, an operator edit, a base advance, an orphan claim, a budget marker,
 a failed fit check or an escalated dispatch. On a bounded screen the notes

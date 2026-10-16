@@ -48,6 +48,8 @@ from agent_parley.status import (
     bucket_of,
     bucket_order,
     lane_bucket,
+    plan_cell,
+    plan_reading,
     recap_note,
     waiting_recap,
 )
@@ -72,6 +74,7 @@ COLUMNS = (
     ("IDLE", 8),
     ("UNUSED", 7),
     ("FIT", 8),
+    ("PLAN", 14),
     ("TASK", 4),
 )
 DEFAULT_COLUMNS = (
@@ -97,6 +100,7 @@ DROP_ORDER = (
     "CALLS",
     "TOKENS",
     "UNUSED",
+    "PLAN",
     "TASK",
     "LEASES",
     "FIT",
@@ -125,6 +129,7 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
         -(row.get("accounting") or {}).get("idle_per_lane_hour", -1.0)
     ),
     "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
+    "PLAN": lambda row: -row["task_plan"]["done"],
     "TASK": lambda row: row["prompt"],
 }
 KEYS = (
@@ -186,7 +191,10 @@ LEGEND = (
     "does not claim to know what the native client was doing inside a "
     "turn. UNUSED is the lane state accounting: idle lane-minutes per "
     "observed lane-hour, then unaccountable claim-minutes, blank before "
-    "the first poll accounts the lane. A branch marked ! left "
+    "the first poll accounts the lane. PLAN is the lane's own task list, "
+    "steps done of all and the step in progress, - before the lane records "
+    "one, n/a when its provider has no path to report one. A branch "
+    "marked ! left "
     "its assigned bridge branch. A lease past a declared time to live is "
     "counted apart from the live ones and still held: it keeps blocking "
     "until its holder renews it at a checkpoint or releases it, and the "
@@ -602,6 +610,9 @@ def _row(
     }
     row["bucket"] = lane_bucket(row)
     row["recap"] = waiting_recap(directory, row)
+    row["task_plan"] = plan_reading(
+        home, directory, agent, participant["provider"]
+    )
     return row
 
 
@@ -901,6 +912,7 @@ def row_cells(row: dict) -> tuple[str, ...]:
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _unused(row.get("accounting")),
         _fitness(row),
+        plan_cell(row["task_plan"]),
         row["prompt"] or "-",
     )
 

@@ -284,6 +284,81 @@ def bucket_of(record: dict) -> dict:
     return record.get("bucket") or lane_bucket(record)
 
 
+def plan_reading(home: Path, directory: Path, lane: str, provider: str) -> dict:
+    """Reads how far one lane is through the task plan it recorded.
+
+    `status`, `top`, the web view and the live view rows all call this one
+    function, so a lane's plan reads the same in each. Only the plan file
+    the lane's hook or `plan update` command wrote is read.
+
+    Args:
+        home: Private bridge state root.
+        directory: Common project state directory.
+        lane: Lane name.
+        provider: Provider name the lane runs.
+
+    Returns:
+        ``source``, the tool the provider's lanes report a plan through, or
+        an empty string when the provider has no path; ``recorded``,
+        whether the lane has a plan; ``done`` and ``total`` step counts;
+        ``current``, the in-progress step, else the first pending one, else
+        an empty string; and ``truncated``, whether a cap clipped the plan.
+    """
+    from agent_parley import lanes, roster
+
+    adapter = str(roster.providers(home).get(provider, {}).get("adapter", ""))
+    plan = lanes.lane_task_plan(directory, lane)
+    items = plan["items"] if plan else []
+    pending = [item for item in items if item["status"] != "completed"]
+    current = next(
+        (item for item in pending if item["status"] == "in_progress"),
+        pending[0] if pending else None,
+    )
+    return {
+        "source": plan["source"] if plan else lanes.plan_source(adapter),
+        "recorded": plan is not None,
+        "done": len(items) - len(pending),
+        "total": len(items),
+        "current": current["text"] if current else "",
+        "truncated": bool(plan and plan["truncated"]),
+    }
+
+
+def plan_cell(plan: dict) -> str:
+    """Words one lane's plan progress for a table cell or a status line.
+
+    Args:
+        plan: A plan as `plan_reading` returns it.
+
+    Returns:
+        Text such as ``2/5 write tests``, ``2/5 done`` for a finished plan,
+        ``-`` for a lane with no plan yet, and ``n/a`` when the provider
+        has no path to report one.
+    """
+    if not plan["recorded"]:
+        return "-" if plan["source"] else "n/a"
+    text = f"{plan['done']}/{plan['total']}"
+    return f"{text} {plan['current'] or 'done'}"
+
+
+def print_plan(record: dict) -> None:
+    """Prints one lane's plan progress under the status table.
+
+    Args:
+        record: One lane record of the status reading. A lane with no plan
+            yet prints nothing; a lane whose provider has no path to report
+            one says so, so the gap is not read as an empty plan.
+    """
+    plan = record["task_plan"]
+    if plan["recorded"]:
+        print(f"Plan {record['participant']}: {plan_cell(plan)}")
+    elif not plan["source"]:
+        print(
+            f"Plan {record['participant']}: n/a, "
+            f"{record['provider']} has no plan path"
+        )
+
+
 def bucket_order(records: list[dict]) -> list[dict]:
     """Groups lanes by bucket, needs input first, keeping their order.
 
@@ -1453,6 +1528,9 @@ class StatusMixin(BridgeCore):
             "participant": agent,
             "identity": name,
             "provider": participant["provider"],
+            "task_plan": plan_reading(
+                self.home, directory, agent, participant["provider"]
+            ),
             "credential": participant["credential"],
             "session": liveness,
             "condition": lanes.view(condition),
@@ -2201,6 +2279,7 @@ class StatusMixin(BridgeCore):
             if selection.participant:
                 for record in reported:
                     lane_detail(record, data)
+                    print_plan(record)
                 continue
             ordered = bucket_order(reported)
             rows = [
@@ -2212,6 +2291,7 @@ class StatusMixin(BridgeCore):
             for row in bucket_lines(tables.status_table(rows, width), ordered):
                 print(row)
             for record in reported:
+                print_plan(record)
                 for claim in record["claims"]:
                     if claim.get("blueprint"):
                         print(f"Blueprint {claim['blueprint']}")
