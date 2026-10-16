@@ -78,6 +78,8 @@ DEFAULTS: dict[str, Any] = {
     "titles": True,
     "rerun_cancelled": True,
     "rotate": True,
+    "cache_window": 3300,
+    "cache_restart_tokens": 50000,
     "ci_rounds": 2,
     "fold_after": 86400,
     "forge_skip_labels": list(issues.FORGE_SKIP_LABELS),
@@ -90,6 +92,44 @@ MAX_LOAD_RATIO = 1000
 MAX_AVAILABLE_MIB = 1048576
 HOST_LOADED = "busy:host load"
 MAX_CI_ROUNDS = 100
+MAX_CACHE_RESTART_TOKENS = 1_000_000_000
+CACHE_ROTATION = "cache"
+CACHE_RESUME = "resume"
+CACHE_RESTART = "restart"
+CACHE_POLICIES: dict[str, dict[str, Any]] = {
+    "claude": {
+        "compact": "/compact",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "codex": {
+        "compact": "/compact",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "copilot": {"compact": None, "resume": True, "fresh": True, "sized": False},
+    "gemini": {
+        "compact": "/compress",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "opencode": {
+        "compact": "/compact",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "amp": {"compact": None, "resume": True, "fresh": True, "sized": False},
+}
+FALLBACK_CACHE_POLICY: dict[str, Any] = {
+    "compact": None,
+    "resume": False,
+    "fresh": True,
+    "sized": False,
+}
 MAX_CLAIMS_PER_LANE = 100
 MAX_CONVERGENCE_REPEATS = 100
 ENDED = issues.ENDED
@@ -225,6 +265,7 @@ def settings(value: dict) -> dict:
         "takeover_grace",
         "convergence_after",
         "fold_after",
+        "cache_window",
     ):
         if (
             type(result[field]) not in (int, float)
@@ -256,6 +297,15 @@ def settings(value: dict) -> dict:
     if type(rounds) is not int or not 1 <= rounds <= MAX_CI_ROUNDS:
         raise BridgeError(
             f"ci_rounds must be between 1 and {MAX_CI_ROUNDS} rounds."
+        )
+    restart_tokens = result["cache_restart_tokens"]
+    if (
+        type(restart_tokens) is not int
+        or not 0 <= restart_tokens <= MAX_CACHE_RESTART_TOKENS
+    ):
+        raise BridgeError(
+            "cache_restart_tokens must be between 0 and "
+            f"{MAX_CACHE_RESTART_TOKENS} tokens."
         )
     ratio = result["max_load_ratio"]
     if type(ratio) not in (int, float) or not 0 < ratio <= MAX_LOAD_RATIO:
@@ -3480,6 +3530,118 @@ def configuration(home: Path, manifest: dict) -> dict:
     config["prompts"] = config["prompts"] and global_config["prompts"]
     config["reclaim"] = config["reclaim"] and global_config["reclaim"]
     return config
+
+
+def cache_action(
+    adapter: str, idle: float, tokens: int | None, config: dict
+) -> str:
+    """Chooses how a lane idle past its prompt cache comes back.
+
+    A native prompt cache lasts about an hour and the wake backoff reaches
+    `WAKE_BACKOFF_CEILING`, so a lane woken after ``cache_window`` seconds
+    would re-read its whole transcript uncached. A session whose recorded
+    tokens stay below ``cache_restart_tokens`` resumes as before, because
+    re-reading a small context costs less than a fresh bootstrap. A larger
+    one, one whose tokens cannot be read, one whose policy is not
+    ``sized`` because its client counts a running session late or never,
+    and any adapter `CACHE_POLICIES` does not name restart as a fresh
+    native session seeded from the lane's
+    checkpoint, since every client starts one by leaving out its resume
+    argument. The policy's ``compact`` command is named for the operator
+    only: compacting after the cache expired re-reads the same uncached
+    transcript, so the wake path never types it.
+
+    Args:
+        adapter: Native client adapter driving the lane.
+        idle: Seconds since the lane's last recorded hook event.
+        tokens: Tokens the lane's current session recorded, or None.
+        config: Resolved supervision settings.
+
+    Returns:
+        `CACHE_RESUME` or `CACHE_RESTART`.
+    """
+    policy = CACHE_POLICIES.get(adapter, FALLBACK_CACHE_POLICY)
+    if idle < config["cache_window"]:
+        return CACHE_RESUME
+    if (
+        policy["resume"]
+        and policy["sized"]
+        and tokens is not None
+        and tokens < config["cache_restart_tokens"]
+    ):
+        return CACHE_RESUME
+    return CACHE_RESTART
+
+
+def cache_rotation(
+    home: Path, directory: Path, name: str, now: float | None = None
+) -> dict | None:
+    """Records a rotation point on a lane whose prompt cache expired.
+
+    The point has the shape a ready or blocked report leaves, with the
+    outcome `CACHE_ROTATION` and no issue, so the existing rotation path
+    carries it: a detached launcher ends the idle session on the admitted
+    wake and the resume that follows starts a fresh session through
+    `launch.rotation_task`. Nothing is recorded when ``rotate`` is off,
+    when `cache_action` keeps the session, or when a hook event moved the
+    record while the transcript was read. A point already recorded is
+    returned unchanged.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        now: Instant to judge idleness at, the current time by default.
+
+    Returns:
+        The rotation point in force, or None when the lane keeps its
+        session.
+    """
+    now = time.time() if now is None else now
+    path = directory / f"{name}-activity.json"
+    try:
+        manifest = roster.read(directory)
+        config = configuration(home, manifest)
+        state = json.loads(path.read_text())
+        if not config["rotate"]:
+            return None
+        if state.get("rotation"):
+            return dict(state["rotation"])
+        updated = state.get("updated")
+        if type(updated) not in (int, float):
+            return None
+        idle = now - float(updated)
+        if idle < config["cache_window"]:
+            return None
+        participant = manifest["participants"][name]
+        adapter = str(
+            roster.provider(home, str(participant["provider"]))["adapter"]
+        )
+        sized = CACHE_POLICIES.get(adapter, FALLBACK_CACHE_POLICY)["sized"]
+        tokens = (
+            records.reported_tokens(home, participant, {}, whole=True)
+            if sized
+            else None
+        )
+        if cache_action(adapter, idle, tokens, config) != CACHE_RESTART:
+            return None
+        with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+            current = json.loads(path.read_text())
+            if current.get("updated") != updated:
+                return None
+            point = {
+                "at": now,
+                "issue": "",
+                "outcome": CACHE_ROTATION,
+                "session": str(current.get("session_id") or ""),
+                "idle": round(idle),
+                "tokens": tokens,
+            }
+            current["rotation"] = point
+            write_json(path, current)
+            return point
+    except (BridgeError, KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 def opt_in_missing(home: Path, manifest: dict, name: str) -> bool:
