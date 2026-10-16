@@ -1603,7 +1603,8 @@ def continuation_refused(directory: Path, manifest: dict, agent: str) -> bool:
     Blocking a Stop to deliver issue, work or stale plugin notices starts
     another turn, so it is admitted through the run budget like any other
     dispatch, and an admitted continuation reserves a call where a calls
-    limit applies.
+    limit applies. A lane `quota.held` parks on its credential's quota is
+    refused first, without touching the run ledger.
 
     Args:
         directory: Private state directory for the common repository.
@@ -1614,8 +1615,10 @@ def continuation_refused(directory: Path, manifest: dict, agent: str) -> bool:
         Whether the continuation is refused, including when the run ledger
         stays busy.
     """
-    from agent_parley import budgets
+    from agent_parley import budgets, quota
 
+    if quota.held(directory, agent):
+        return True
     try:
         return bool(budgets.admit(directory, manifest, agent))
     except LockBusy:
