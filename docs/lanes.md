@@ -316,8 +316,12 @@ agent-parley unattended set                       # remove it
 `unattended run NAME` merges only when the lane's claimed issue is listed, its
 claim and ready commit are current, the base sits on the target branch, its
 dependencies are verified complete, a verification command is configured and
-no peer reservation covers a changed path. The merge is the
-`participant merge` step with the same locks, approvals and gate, and every
+no peer reservation covers a changed path. The gate runs first, outside the
+project merge lock, on the ready commit merged into the target in a scratch
+worktree holding tracked files only, so several ready lanes gate at once. The
+merge lock is then taken only to check the target has not moved and merge;
+a moved target is gated again, so an unverified result never lands. The merge
+is the `participant merge` step with the same locks and approvals, and every
 attempt records a decision in the lane's report log. It never pushes and
 never repairs an unverified integration. A lane holding several claims
 integrates its only ready one; when several are ready, name one with

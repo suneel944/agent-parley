@@ -6,6 +6,7 @@ import sys
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agent_parley import (
@@ -367,9 +368,12 @@ def test_a_peer_reservation_over_the_change_is_refused(bridge, repo, ready):
     assert not (repo / "feature.txt").exists()
 
 
-def test_a_held_merge_lock_serializes_the_attempt(bridge, repo, ready):
+def test_a_held_merge_lock_serializes_the_attempt(
+    bridge, repo, ready, monkeypatch
+):
     directory = ready["directory"]
     authorize(bridge, repo, ready)
+    monkeypatch.setattr(unattended, "MERGE_WAIT", 0.2)
 
     with lock(directory / "merge.lock"):
         with pytest.raises(BridgeError, match="Another merge"):
@@ -702,3 +706,176 @@ def test_an_operator_failure_raises_no_problem(bridge, repo, ready, tmp_path):
         for row in bridge.problems()
         if row["condition"] == problems.UNATTENDED
     ]
+
+
+def logged_gate(tmp_path: Path) -> tuple[str, Path]:
+    """Writes a gate that logs its start and end.
+
+    Each run waits, for up to twenty seconds, until two runs have started,
+    so serialized gates log a start and an end before the second start.
+    """
+    log = tmp_path / "gate.log"
+    quoted = shlex.quote(str(log))
+    script = tmp_path / "logged-gate.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"echo start >> {quoted}\n"
+        "i=0\n"
+        f'while [ "$(grep -c start {quoted})" -lt 2 ] && [ "$i" -lt 100 ]; '
+        "do sleep 0.2; i=$((i + 1)); done\n"
+        f"echo end >> {quoted}\n"
+    )
+    script.chmod(0o755)
+    return shlex.quote(str(script)), log
+
+
+def picky_gate(tmp_path: Path) -> str:
+    """Writes a gate that fails on any tree carrying ``base-0.txt``."""
+    script = tmp_path / "picky-gate.sh"
+    script.write_text("#!/bin/sh\ntest ! -e base-0.txt\n")
+    script.chmod(0o755)
+    return shlex.quote(str(script))
+
+
+def served_subjects(service, token: str) -> list[str]:
+    """Reads a lane's unattended mail over the real local MCP transport."""
+    response = httpx.post(
+        f"http://127.0.0.1:{service.server_port}/mcp/",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "fetch_inbox", "arguments": {"limit": 5}},
+        },
+        trust_env=False,
+    )
+    result = response.json()["result"]
+    assert not result.get("isError")
+    return [
+        row["subject"]
+        for row in json.loads(result["content"][0]["text"])["messages"]
+        if row["subject"].startswith("Unattended integration")
+    ]
+
+
+def test_ready_lanes_gate_concurrently_and_merge_in_turn(
+    bridge, repo, ready, paired, service, tmp_path
+):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    command, log = logged_gate(tmp_path)
+    bridge.verification(repo, command)
+    peer = Path(paired["lanes"]["claude"])
+    bridge.issue(peer, "claim", "43")
+    commit(peer, "other.txt")
+    bridge.report(peer, "ready", "Peer result", "", "make check: 3 passed")
+    unattended.configure(bridge, repo, ready["target"], ["42", "43"], auto=True)
+
+    tick(bridge, directory)
+
+    runs = log.read_text().split()
+    assert runs[:2] == ["start", "start"]
+    assert len(runs) == 6
+    assert (repo / "feature.txt").exists()
+    assert (repo / "other.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert execution(directory, "43")["state"] == lifecycle.COMPLETE
+    root = roster.read(directory)["root"]
+    bound = {}
+    for name in ("claude", "codex"):
+        [decision] = decisions(directory, name)
+        assert decision["outcome"] == unattended.INTEGRATED
+        bound[name] = decision["evidence"]
+        token = store.register(bridge.home, root, name)["registration_token"]
+        assert served_subjects(service, token) == [
+            "Unattended integration integrated"
+        ]
+    claude, codex = bound["claude"], bound["codex"]
+    assert (claude["target_commit"] == codex["integrated_commit"]) != (
+        codex["target_commit"] == claude["integrated_commit"]
+    )
+    listing = git(repo, "worktree", "list", "--porcelain")
+    assert listing.count("worktree ") == 3
+
+
+def moving(monkeypatch, repo, times: int) -> list[str]:
+    """Commits to the base after each of the first candidate gates."""
+    candidate = unattended._candidate
+    moved: list[str] = []
+
+    def then_move(*arguments):
+        tree = candidate(*arguments)
+        if len(moved) < times:
+            moved.append(commit(repo, f"base-{len(moved)}.txt"))
+        return tree
+
+    monkeypatch.setattr(unattended, "_candidate", then_move)
+    return moved
+
+
+def test_a_target_moved_during_the_gate_is_gated_again(
+    bridge, repo, ready, monkeypatch
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    moved = moving(monkeypatch, repo, 1)
+
+    unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD^1") == moved[0]
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    [decision] = decisions(directory)
+    assert decision["outcome"] == unattended.INTEGRATED
+    assert decision["evidence"]["target_commit"] == moved[0]
+
+
+def test_a_moved_target_never_lands_an_unverified_result(
+    bridge, repo, ready, monkeypatch, tmp_path
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    bridge.verification(repo, picky_gate(tmp_path))
+    moved = moving(monkeypatch, repo, 1)
+
+    with pytest.raises(BridgeError, match="recorded for recovery"):
+        unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD") == moved[0]
+    assert not (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.READY
+    [failure] = decisions(directory)
+    assert failure["outcome"] == unattended.FAILED
+    assert failure["evidence"]["target_commit"] == moved[0]
+
+
+def test_a_target_that_keeps_moving_is_refused_for_the_next_attempt(
+    bridge, repo, ready, monkeypatch
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    moved = moving(monkeypatch, repo, unattended.ROUNDS)
+
+    with pytest.raises(BridgeError, match="moved while each"):
+        unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD") == moved[-1]
+    assert not (repo / "feature.txt").exists()
+    [refusal] = decisions(directory)
+    assert refusal["outcome"] == unattended.REFUSED
+    key = ("42", refusal["claim_id"], ready["source"])
+    assert not unattended._decided(directory, "codex", key, moved[-1])
+
+
+def test_a_candidate_that_fails_its_gate_leaves_no_scratch_worktree(
+    bridge, repo, ready, tmp_path
+):
+    authorize(bridge, repo, ready)
+    bridge.verification(repo, gate(tmp_path, 3))
+
+    with pytest.raises(BridgeError, match="recorded for recovery"):
+        unattended.integrate(bridge, repo, "codex")
+
+    listing = git(repo, "worktree", "list", "--porcelain")
+    assert listing.count("worktree ") == 3
+    assert not list(ready["directory"].glob(".candidate-*"))
