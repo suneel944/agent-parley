@@ -328,6 +328,10 @@ lane setup.
   `max_claims_per_lane` claims, two by default.
 - **Choosing work is a reading, not a guess.** `agent-parley issue next` ranks
   the unclaimed, unblocked issues with a reason for each, and claims nothing.
+- **A lane suggests follow-up work; only you file it.** `suggest_followup`
+  records the idea with its likely duplicates and the lane keeps working.
+  `agent-parley followup accept ID` files the issue in the active milestone
+  and offers it to an idle lane; `followup list` shows what waits.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
   updates only when coordination state changes. A prompt you type is never
@@ -363,8 +367,8 @@ flowchart TD
     Repo[Your repository] --> Launcher[Agent Parley launcher]
     Launcher --> Claude[Participant · own worktree]
     Launcher --> Codex[Participant · own worktree]
-    Claude <-->|Sixteen scoped MCP tools| Server[Local coordination service]
-    Codex <-->|Sixteen scoped MCP tools| Server
+    Claude <-->|Seventeen scoped MCP tools| Server[Local coordination service]
+    Codex <-->|Seventeen scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]
     Claude --> Claims[Atomic issue claims and handoffs]
     Codex --> Claims

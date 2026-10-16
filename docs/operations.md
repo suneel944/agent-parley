@@ -177,6 +177,34 @@ recipient, so only the recipient's `issue accept` moves it.
 nobody has answered. An offer that was already accepted is refused, naming the
 lane that holds the issue, because only that lane can hand it on.
 
+### Accepting follow-up work a lane suggested
+
+A lane that finds work outside its issue calls `suggest_followup` instead of
+filing it or widening its own scope. Nothing is filed until you accept it:
+
+```bash
+agent-parley followup list
+agent-parley followup accept f3
+agent-parley followup accept f4 --milestone 0.22.0 --to codex
+```
+
+`followup list` prints each pending suggestion with the lane that made it,
+why, the paths it names, when it expires and the open issues or claims whose
+titles it may duplicate. `followup accept ID` files the issue in the active
+milestone, the open one due soonest or else the oldest, and offers it to a
+running lane that holds no claim and has no offer waiting, as `issue assign`
+would. With no idle lane it stays unclaimed for the next lane that pulls work.
+A repeat prints the issue already filed. Filing needs the GitHub forge; a
+refusal leaves the suggestion pending. With Telegram configured, each
+suggestion also arrives as a decision with an `accept` button that takes a
+confirming tap. Unaccepted suggestions expire after seven days.
+
+`followup list --json` prints `kind: followup_list` with `suggestions`, each
+carrying `id`, `lane`, `title`, `why`, `paths`, `created`, `expires`, `state`
+and `duplicates` (`issue`, `title`, `owner`). `followup accept --json` prints
+`kind: followup_accept` with the same fields plus `issue`, `milestone`,
+`offered_to`, `offer_id` and `repeated`.
+
 ### Reading status
 
 `status` answers who is working on which open issue and whether it moves. Run

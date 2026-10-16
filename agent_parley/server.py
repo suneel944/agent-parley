@@ -21,6 +21,7 @@ from types import FrameType
 from agent_parley import (
     attachments,
     checkpoints,
+    followups,
     hook,
     metrics,
     protocol,
@@ -368,6 +369,13 @@ TOOLS = [
             }
         },
         [],
+    ),
+    _tool(
+        followups.TOOL,
+        "Suggest follow-up work outside your issue for the operator; files "
+        "nothing.",
+        {"title": TEXT, "why": TEXT, "paths": {"type": "array", "items": TEXT}},
+        ["title", "why"],
     ),
 ]
 
