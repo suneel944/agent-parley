@@ -135,6 +135,8 @@ on standard output and export to a file.
 | `credentials show NAME` | Show one profile with every recorded value redacted: the config home, the override names and the variables required from your shell. A profile that sets none of them reads `Account: selects no account`, because it launches on the default account. |
 | `credentials add NAME` | Define a config home and environment requirements. It needs at least one of `--config-home`, `--env` or `--require-env`; a profile with none would select no account, so it exits 2 and writes nothing. |
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
+| `quota show` | Show remaining headroom per credential profile the project's lanes share, with the lanes parked on it; `--json` prints the rows. Headroom from a vendor rate-limit refusal reads `rate limit reached` until its reset; headroom derived from native token counts against a recorded window is marked `estimated`. |
+| `quota set NAME --hours H --tokens N` | Record one credential's usage window; `--threshold F` (default 1) parks every lane on it but the one holding the most unfinished claims once that fraction of the estimated window is used, and every lane at the limit. `--tokens 0` removes the window. Without a window only a vendor refusal parks lanes. |
 | `branch show` | Show the prefix new lane branches are created under and the recorded integration base. |
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
 | `branch integration BRANCH` | Record the non-default branch a milestone's pull requests merge into, operator-only; a pull request merged there that closes a claimed issue lands the claim. An empty string removes it. |

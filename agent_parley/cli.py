@@ -3224,6 +3224,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "resources",
             "provider",
             "credentials",
+            "quota",
         ),
     ),
     (
@@ -6098,6 +6099,46 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Variable the launching shell must export; repeatable.",
     )
     profile.add_argument("--json", action="store_true", help=JSON_HELP)
+    quotas = commands.add_parser(
+        "quota",
+        help=(
+            "Show each credential's quota headroom or record its window; "
+            "lanes near the window park until it resets."
+        ),
+    )
+    quota_actions = quotas.add_subparsers(dest="action", required=True)
+    quota_show = quota_actions.add_parser(
+        "show", help="Show remaining headroom per credential profile."
+    )
+    quota_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    quota_show.add_argument("--json", action="store_true", help=JSON_HELP)
+    quota_set = quota_actions.add_parser(
+        "set", help="Record one credential's window length and token limit."
+    )
+    quota_set.add_argument("name", help="Credential profile the plan uses.")
+    quota_set.add_argument(
+        "--hours",
+        type=float,
+        default=0.0,
+        help="Length of the plan's usage window in hours.",
+    )
+    quota_set.add_argument(
+        "--tokens",
+        type=int,
+        required=True,
+        help="Native tokens the plan allows per window; 0 removes it.",
+    )
+    quota_set.add_argument(
+        "--threshold",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of the limit at which every lane but the "
+            "highest-priority one parks; 1 parks only at the limit."
+        ),
+    )
     parser.epilog = command_help(commands)
 
 
@@ -7402,6 +7443,26 @@ def main() -> int:
                     terminal_width(),
                 )
             )
+        elif args.command == "quota":
+            from agent_parley import quota
+
+            if args.action == "set":
+                recorded = quota.set_window(
+                    bridge.home,
+                    args.name,
+                    args.hours,
+                    args.tokens,
+                    args.threshold,
+                )
+                print(json.dumps({args.name: recorded.get(args.name)}))
+            else:
+                _, directory = bridge.project(args.repo.resolve(), create=False)
+                rows = quota.headroom(quota.read(directory), time.time())
+                print(
+                    views.render("quota", {"credentials": rows})
+                    if args.json
+                    else "\n".join(quota.lines(rows))
+                )
         elif args.command == "credentials" and args.action == "show":
             profile_shown = views.credential_detail(
                 args.name, roster.credential(bridge.home, args.name)

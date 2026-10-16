@@ -65,6 +65,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records |
 | `evidence` | Review evidence built from a claim window's retained coordination records |
 | `budgets` | A lane's consumption against its advisory budget, from recorded tokens, served calls and session hours; crossing a limit marks and notifies, never stops. Also the opt-in run budget: a durable per-project ledger, `run-budget.json`, of the same readings summed across lanes, restarts and retries. `supervision` admits every wake, work dispatch and capacity retry through it, `launch` refuses to launch or resume a lane while it is exhausted, and a `Stop` hook continuation (`checkpoints.continuation_refused`) is admitted through it like any other dispatch; exhaustion is recorded once and cleared only by the operator's `budget resume` |
+| `quota` | Per-credential quota parking for lanes that share one explicit credential profile on one adapter. A vendor rate-limit refusal that named a reset on any of them parks every lane on that credential until the reset; an optional window the operator records with `quota set` sums the lanes' native token counts and, past its threshold, parks every lane but the one holding the most unfinished claims, and all of them at the limit. Each poll rewrites `quota-ledger.json`; `supervision` defers wakes and fails the capacity fit check of a parked lane, and `checkpoints.continuation_refused` refuses its `Stop` hook continuation. Parking never moves a lane to another provider or credential and never touches its claims or reservations, and a park whose time passed reads as cleared. `headroom` derives remaining headroom per credential from the ledger, marked estimated when it comes from native counts rather than a vendor refusal |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `timeouts` | The table of decision kinds with their reversibility, recommended default and undo command, the project policy that can only make a kind more cautious, and settling an unanswered reversible decision to its default |
 | `history` | Read-only ownership history across the ledger, reports and store |
@@ -1006,6 +1007,7 @@ Files at the state root, grouped by the module that owns them:
 | `notify` | `notify.json` (stored notification settings) under `notify.lock` |
 | `inbound` | `inbound-gate.json` (inbound passcode failures and lockouts) |
 | `plugins` | `plugin-repair.json` (the service's plugin repair per client config home: versions, outcome, attempts, next retry) |
+| `quota` | `quotas.json` (the quota window recorded per credential profile) under `quotas.lock` |
 | `supervision`, `terminal` | `supervision.json` (global supervision settings, including the wake opt-out) |
 | `terminal` | `wake-<digest>.sock`, one control socket per project lane |
 
@@ -1018,6 +1020,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `plan` | `plan.json` under `plan.lock` |
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
+| `quota` | `quota-ledger.json` under `quota.lock` |
 | `convergence` | `convergence.json` under `convergence.lock` |
 | `claims` | `forge-assigned.json` under `forge-assigned.json.lock` |
 | `status` | `forge-issues.json` (forge issue cache) |

@@ -34,6 +34,7 @@ from agent_parley import (
     notify,
     process,
     protocol,
+    quota,
     reclaim,
     records,
     recovery,
@@ -2198,7 +2199,9 @@ def fit(
     is checked first against what the runtime can read locally: the lane's
     state record, its provider capacity, its worktree, and the
     acknowledgements it owes. Each check defaults to no opinion, and only a
-    check that actually failed makes a lane unfit.
+    check that actually failed makes a lane unfit. A lane `quota.held`
+    parks on its credential's quota fails the capacity check, so no new
+    claim is offered to it until the park ends.
 
     The result describes what was observed. It grants nothing, revokes
     nothing, and never moves ownership.
@@ -2248,9 +2251,14 @@ def _fit_reading(
     """
     participant = manifest["participants"][name]
     observed_capacity = capacity(home, directory, manifest, name)
+    capacity_result = _capacity_check(observed_capacity)
+    if capacity_result[0] is not False and (
+        parked_on := quota.held(directory, name)
+    ):
+        capacity_result = (False, f"is {parked_on['cause']}")
     results = {
         "session": _session_check(home, manifest["root"], name),
-        "capacity": _capacity_check(observed_capacity),
+        "capacity": capacity_result,
         "worktree": _worktree_check(participant),
         "mail": _mail_check(
             home, directory, manifest, name, after, inactive_after
@@ -8678,6 +8686,7 @@ def _poll(home: Path, directory: Path) -> None:
     )
     stage("lane accounting", account_lanes, home, directory, manifest)
     stage("run budget", budgets.account, home, directory, manifest)
+    stage("quota", quota.account, home, directory, manifest, published_capacity)
     observations = recorded_observations(home, manifest, observations)
     stage("presence", _publish_presence, home, manifest, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
@@ -9780,7 +9789,10 @@ def _wake_block(
     named a reset still ahead, because the attempt after that reset is itself
     the evidence that the lane is back. An exhaustion that named no reset is
     given one by `exhaustion_probe_due`, so a lane parked on a usage-limit
-    dialog is probed on a bounded backoff instead of never.
+    dialog is probed on a bounded backoff instead of never. A lane
+    `quota.held` parks because another lane on its credential reached a
+    rate limit, or its credential's recorded window is nearly spent, is
+    deferred the same way to the time that park ends.
 
     Every other cause is read from the lane state record, never from the
     activity file. A lane recorded `blocked` is deferred under its named
@@ -9839,6 +9851,8 @@ def _wake_block(
         and float(reset_at) > time.time()
     ):
         return reason, float(reset_at)
+    if parked_on := quota.held(directory, name):
+        return parked_on["cause"], float(parked_on["until"])
     if held := denials.waiting(directory, name):
         return f"blocked: {denials.CAUSE} ({held['id']})", 0.0
     lane = observed.get("record") or {}
