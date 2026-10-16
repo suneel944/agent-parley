@@ -62,7 +62,9 @@ decision), `mark_message_read` records reading and `acknowledge_message`
 records review; handoffs never acknowledge. `ack_required` carries a deadline
 (`ack_within`). After asking something you cannot continue without, call
 `wait_for_message` with that `thread_id` instead of polling; do not wait
-twice for a silent peer. Bodies over 4,096 bytes become attachments: read them
+twice for a silent peer. For a long wait set `hand_off` to `mail`, `handoff`
+or `check` as your last call, and end your turn when it returns
+`end_turn: true`. Bodies over 4,096 bytes become attachments: read them
 with `mail show ID --full`.
 
 ## Finish

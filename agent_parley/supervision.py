@@ -42,6 +42,7 @@ from agent_parley import (
     terminal,
     timeouts,
     unattended,
+    waits,
 )
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 from agent_parley.status import (
@@ -10274,6 +10275,11 @@ def wake(
     not given another lane: the attempt is recorded as `HOST_LOADED` with
     the numbers, a busy refusal that spends no attempt, and the launch is
     deferred to a later poll instead of refused.
+    A lane that handed its wait to the service through `waits.hand_off`
+    needs no reason of its own: the mail, handoff offer or pull request
+    notice it waits for is already a backlog reason above. An accepted wake
+    or a started resume marks that wait woken through `waits.woke`, so
+    `status` reads when the service gave the lane its turn back.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
     lane; waking only asks the lane to take its own turn.
 
@@ -10556,6 +10562,8 @@ def wake(
                 ),
             },
         )
+        if result == "accepted" or result.startswith("resume requested"):
+            waits.woke(home, root, participant["display"], now)
         if work_offer and not spent_before:
             _write_work_dispatch(
                 directory,
