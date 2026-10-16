@@ -364,7 +364,11 @@ BRANCH, ISSUES, MAIL, LEASES, DENIALS, TOKENS, IDLE and TASK, the lane's last
 prompt. BUCKET groups the rows: needs input first, with what the lane waits on
 and the age of the oldest wait, then working, idle and done. A sort orders rows
 inside each bucket only, so an unchanged lane keeps its place. `status`, the
-web view and Telegram notifications use the same bucket.
+web view and Telegram notifications use the same bucket. A lane in needs input
+also shows a `last turn:` line from its stored turn recap: its last message,
+the failed commands and the changed files, each capped in bytes. `status
+--json` and the live view carry the recap as `recap`, and a lane without one
+shows nothing.
 `--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and FIT.
 A lane that needs you also gets one line under the table, marked with `!`:
 a stall, an operator edit, a base advance, an orphan claim, a budget marker,

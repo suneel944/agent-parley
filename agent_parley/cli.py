@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         problems,
         process,
         protocol,
+        recaps,
         reclaim,
         recommend,
         roster,
@@ -159,6 +160,7 @@ DEFERRED_MODULES = (
     "problems",
     "process",
     "protocol",
+    "recaps",
     "reclaim",
     "recommend",
     "retries",
@@ -945,6 +947,31 @@ def decision_lines(page: dict) -> list[str]:
 def reported_lanes(report: dict) -> int:
     """Counts the lanes a narrowed status reading still holds."""
     return sum(len(project["participants"]) for project in report["projects"])
+
+
+def recap_lines(
+    directory: Path, name: str, now: float | None = None
+) -> list[str]:
+    """Renders the stored turn recap of one lane for its detail reading.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        now: Unix time to age the recap against, or None for the clock.
+
+    Returns:
+        Indented lines naming the recap's age and its content, or no lines
+        when the lane has no stored recap.
+    """
+    recap = recaps.lane_recap(directory, name)
+    text = recaps.format_recap(recap, recaps.MAX_RECAP_BYTES)
+    if not recap or not text:
+        return []
+    moment = time.time() if now is None else now
+    age = max(int(moment - float(recap.get("at", moment))), 0)
+    return [f"    Recap taken {age}s ago:"] + [
+        f"      {line}" for line in text.splitlines()
+    ]
 
 
 def lane_detail(record: dict, data: dict) -> None:
@@ -7072,6 +7099,8 @@ def main() -> int:
             else:
                 _, directory = bridge.project(repository, create=False)
                 lane_detail(record, roster.read(directory))
+                for line in recap_lines(directory, args.name):
+                    print(line)
         elif args.command == "decide":
             recorded = bridge.decide(
                 args.repo.resolve(), args.text, args.subject, args.key
