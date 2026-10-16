@@ -360,8 +360,17 @@ many lanes are hidden. The third totals mail, leases, hook decisions and
 injected context. A count that is zero and says nothing is left out.
 
 Each lane is one row. The default columns are PARTICIPANT, BUCKET, STATE,
-BRANCH, ISSUES, MAIL, LEASES, DENIALS, TOKENS, IDLE and TASK, the lane's last
-prompt. BUCKET groups the rows: needs input first, with what the lane waits on
+BRANCH, ISSUES, MAIL, LEASES, WINDOW, DIFF, DENIALS, TOKENS, IDLE and TASK,
+the lane's last prompt. WINDOW is how full the lane's context window is, as
+its own client recorded it: it reads `unknown` for a provider that records no
+window size, never a guess, and ends in `!` at or above `context_full_percent`
+(80 by default). DIFF is `+added/-deleted` lines and the count of files the
+lane changed since its branch forked from the base head, `-` when Git could
+not answer. One Git call per lane, run concurrently and cached for the branch
+refresh interval, reads every lane's diff. The lane detail (`status
+PARTICIPANT`, `top` enter, `participant show --json`) lists the changed paths
+and the host and worktree the lane runs in.
+BUCKET groups the rows: needs input first, with what the lane waits on
 and the age of the oldest wait, then working, idle and done. A sort orders rows
 inside each bucket only, so an unchanged lane keeps its place. `status`, the
 web view and Telegram notifications use the same bucket. A lane in needs input
@@ -369,11 +378,12 @@ also shows a `last turn:` line from its stored turn recap: its last message,
 the failed commands and the changed files, each capped in bytes. `status
 --json` and the live view carry the recap as `recap`, and a lane without one
 shows nothing.
-`--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED, FIT and
-PLAN. PLAN is the lane's own task list: steps done of all and the step in
-progress, `-` before the lane records one, `n/a` when its provider has no path
-to report one. `status` prints the same reading as a `Plan <lane>` line, and
-the web view and `top --json` rows carry it as `task_plan`.
+`--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED,
+FIT and PLAN. The web view shows every column. PLAN is the lane's own task
+list: steps done of all and the step in progress, `-` before the lane records
+one, `n/a` when its provider has no path to report one. `status` prints the
+same reading as a `Plan <lane>` line, and the web view and `top --json` rows
+carry it as `task_plan`.
 A lane that needs you also gets one line under the table, marked with `!`:
 a stall, an operator edit, a base advance, an orphan claim, a budget marker,
 a failed fit check or an escalated dispatch. On a bounded screen the notes

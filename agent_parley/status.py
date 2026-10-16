@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_parley import BridgeError, protocol
+from agent_parley.context import lane_diffstats, lane_fields
 from agent_parley.core import BridgeCore
 
 if TYPE_CHECKING:
@@ -1347,6 +1348,7 @@ class StatusMixin(BridgeCore):
             "ledger": snapshot(directory),
             "configuration": supervision.configuration(self.home, data),
             "usage": usage,
+            "diffstats": lane_diffstats(data),
             "schedules": schedules,
             "schedules_error": failure,
             "pull_request_record": cached,
@@ -1582,6 +1584,12 @@ class StatusMixin(BridgeCore):
             "injected_bytes": state.get("injected_bytes", 0),
             "injections": state.get("injections", 0),
             "injected_per_hour": checkpoints.hourly_rate(state),
+            **lane_fields(
+                self.home,
+                participant,
+                frame["diffstats"].get(agent),
+                configuration["context_full_percent"],
+            ),
             "claims": [
                 {
                     "issue": int(number),

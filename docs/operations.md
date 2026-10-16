@@ -2280,7 +2280,11 @@ lane idle longer than `cache_window` starts a fresh session when the lane's
 session recorded at least `cache_restart_tokens` tokens; 0 restarts every such
 lane. `max_load_ratio` (1.5, above 0
 and at most 1000) and `min_available_mib` (1024 MiB, 0 to 1048576) set the
-host load gate below.
+host load gate below. `context_full_percent` (80, above 0 and at most 100)
+is the context-window use at or above which a lane counts as full. The use
+is read only where the provider's own session record states the window
+size, which today is Codex; every other lane's use is unknown and never
+counts as full.
 
 ### Host load gate
 
