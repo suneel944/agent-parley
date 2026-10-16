@@ -543,6 +543,32 @@ def fold_line(count: int, after: float, noun: str) -> str:
     )
 
 
+def handed_note(handed: dict | None) -> str:
+    """Words a lane's handed-off wait for its session text.
+
+    Args:
+        handed: The wait as `waits.pending` reads it, or None.
+
+    Returns:
+        Text such as ``waiting on handoff for 12m, service wakes it`` or
+        ``waiting on mail for 1m, polling: wake is off for this lane``, or
+        an empty string when nothing is handed off.
+    """
+    from agent_parley import tables, waits
+
+    if not handed:
+        return ""
+    named = handed["kind"] + (
+        f" in {handed['thread_id']}" if handed["thread_id"] else ""
+    )
+    how = (
+        "service wakes it"
+        if handed["wake"] == waits.SERVICE
+        else f"polling: {handed['reason']}"
+    )
+    return f"waiting on {named} for {tables.age(handed['age_seconds'])}, {how}"
+
+
 def task_line(record: dict, fallback: str) -> str:
     """Describes the work one lane is on for its status task line.
 
@@ -1408,10 +1434,13 @@ class StatusMixin(BridgeCore):
             it last progressed and its cached pull request. `self_wait` names
             an unexpired self-declared wait and its next-check time, which the
             session text also names in place of a bare idle label.
+            `service_wait` is the wait the lane handed to the service, as
+            `waits.pending` reads it with its times in RFC 3339, or None;
+            with no self-declared wait the session text names it instead.
         """
         import sqlite3
 
-        from agent_parley import approvals, lifecycle
+        from agent_parley import approvals, lifecycle, waits
         from agent_parley.cli import (
             activity,
             budgets,
@@ -1484,6 +1513,7 @@ class StatusMixin(BridgeCore):
                 condition = lanes.read(db, data["root"], agent)
                 accounts = lanes.read_accounts(db, data["root"])
                 wake = lanes.read_wake(db, data["root"], agent)
+                handed = waits.pending(db, data["root"], name)
                 newer = (
                     store.issue_mail(
                         db, data["root"], name, open_issue, reported_at
@@ -1493,6 +1523,7 @@ class StatusMixin(BridgeCore):
                 )
         except (sqlite3.Error, BridgeError, OSError, ValueError):
             condition, accounts, wake, newer = None, {}, {}, 0
+            handed = None
         provenance = lanes.provenance(
             condition, supervision.hook_gaps(self.home, participant)
         )
@@ -1505,7 +1536,7 @@ class StatusMixin(BridgeCore):
                 f"waiting on {active_wait['reason']}, next check "
                 f"{views.timestamp(active_wait['until'])}"
                 if active_wait
-                else ""
+                else handed_note(handed)
             )
             liveness = (
                 lanes.describe(
@@ -1661,6 +1692,15 @@ class StatusMixin(BridgeCore):
                     else None
                 ),
             },
+            "service_wait": (
+                {
+                    **handed,
+                    "since": views.timestamp(handed["since"]),
+                    "woken_at": views.timestamp(handed["woken_at"]),
+                }
+                if handed
+                else None
+            ),
             "operator_edits": list(edited),
             "base_advance_paths": list(advanced),
             "base_advance": supervision.base_advance_marker(
