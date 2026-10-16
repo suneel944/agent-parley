@@ -146,21 +146,41 @@ def sweep(home: Path) -> int:
 def _tool(
     name: str, description: str, properties: dict, required: list[str]
 ) -> dict:
-    """Describes one narrow tool without repeating credentials or identity."""
+    """Describes one narrow tool without repeating credentials or identity.
+
+    Every lane pays for the serialized tool list in each session, so the
+    annotations state only what differs from the MCP defaults: a read-only
+    tool says so, and the spec ignores ``destructiveHint`` for it, while any
+    other tool declares that it destroys nothing. Neither reaches outside
+    the project. Reference detail lives in the coordinate skill's
+    ``reference.md``, not in these descriptions.
+
+    Args:
+        name: Tool name served in tools/list.
+        description: One short sentence on when to call the tool.
+        properties: JSON Schema of each accepted argument.
+        required: Arguments the call must carry. An empty list is left out,
+            since JSON Schema already requires nothing by default.
+
+    Returns:
+        The tools/list entry for the tool.
+    """
+    hints = (
+        {"readOnlyHint": True}
+        if name in store.READ_ONLY
+        else {"destructiveHint": False}
+    )
+    schema = {
+        "type": "object",
+        "properties": properties,
+        **({"required": required} if required else {}),
+        "additionalProperties": False,
+    }
     return {
         "name": name,
         "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "readOnlyHint": name in store.READ_ONLY,
-            "destructiveHint": False,
-            "openWorldHint": False,
-        },
+        "inputSchema": schema,
+        "annotations": {**hints, "openWorldHint": False},
     }
 
 
@@ -169,15 +189,11 @@ _INVALID = object()
 TEXT = {"type": "string"}
 INTEGER = {"type": "integer"}
 FLAG = {"type": "boolean"}
-RETRY_KEY = {
-    "type": "string",
-    "maxLength": retries.KEY_CHARACTERS,
-    "description": "Optional. Reuse on a retry; the repeat changes nothing.",
-}
+RETRY_KEY = {"type": "string", "maxLength": retries.KEY_CHARACTERS}
 TOOLS = [
     _tool(
         "send_message",
-        "Send a concise update. Reuse the key only on retries.",
+        "Send mail to peers.",
         {
             "to": {
                 "type": "array",
@@ -185,40 +201,24 @@ TOOLS = [
                 "maxItems": store.MAX_RECIPIENTS,
             },
             "subject": {**TEXT, "maxLength": 160},
-            "body_md": {
-                **TEXT,
-                "description": (
-                    f"Max {attachments.MAX_ATTACHMENT_BYTES} bytes; above "
-                    f"{store.MAX_BODY_BYTES} it spills to an attachment."
-                ),
-            },
+            "body_md": TEXT,
             "idempotency_key": {**TEXT, "maxLength": 80},
             "thread_id": {**TEXT, "maxLength": 80},
-            "reply_to": {
-                **INTEGER,
-                "description": "Message answered; joins its thread.",
-            },
+            "reply_to": INTEGER,
             "topic": TEXT,
             "ack_required": FLAG,
             "ack_within": {
                 "type": "number",
                 "minimum": 1,
                 "maximum": roster.MAX_DEADLINE,
-                "description": (
-                    "Seconds before it returns unanswered; omitted takes "
-                    "the default."
-                ),
             },
-            "decision": {
-                **FLAG,
-                "description": "Also record in the shared decision log.",
-            },
+            "decision": FLAG,
         },
         ["to", "subject", "body_md", "idempotency_key"],
     ),
     _tool(
         "fetch_inbox",
-        "Read incremental mail. Bodies opt-in; page long bodies.",
+        "Read new mail; bodies on request.",
         {
             "after_id": INTEGER,
             "limit": {**INTEGER, "minimum": 1, "maximum": 5},
@@ -231,8 +231,7 @@ TOOLS = [
     ),
     _tool(
         waits.TOOL,
-        "Await your next matching mail instead of polling or ending your "
-        "turn. Filters as fetch_inbox; an expired wait returns nothing.",
+        "Wait for mail instead of polling.",
         {
             "timeout_seconds": {
                 **INTEGER,
@@ -249,64 +248,33 @@ TOOLS = [
     ),
     _tool(
         "acknowledge_message",
-        "Explicitly acknowledge a reviewed message.",
+        "Acknowledge a reviewed message.",
         {"message_id": INTEGER, "idempotency_key": RETRY_KEY},
         ["message_id"],
     ),
     _tool(
         "mark_message_read",
-        "Mark an ordinary message reviewed; does not ack.",
+        "Mark a message read; not an ack.",
         {"message_id": INTEGER, "idempotency_key": RETRY_KEY},
         ["message_id"],
     ),
     _tool(
         "file_reservation_paths",
-        "Reserve repository-relative paths, or named resources written with a "
-        "scheme such as port:5432, db:local, suite:integration or "
-        "device:android-1, atomically; conflicts grant nothing and name the "
-        "blocking owner with that owner's reason.",
+        "Reserve paths or SCHEME:NAME keys; advisory.",
         {
-            "paths": {
-                "type": "array",
-                "items": TEXT,
-                "maxItems": 16,
-                "description": (
-                    "Repository-relative paths, or named resources written "
-                    "as SCHEME:NAME. A named resource conflicts on an exact "
-                    "match only."
-                ),
-            },
-            "ttl_seconds": {
-                **INTEGER,
-                "minimum": 30,
-                "maximum": 3600,
-                "description": (
-                    "Optional. Past it the lease reports stale and still "
-                    "holds; omit it and the lease never reports stale."
-                ),
-            },
+            "paths": {"type": "array", "items": TEXT, "maxItems": 16},
+            "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
             "exclusive": FLAG,
-            "reason": {
-                **TEXT,
-                "maxLength": 160,
-                "description": "Declared scope, shown to peers you block.",
-            },
+            "reason": {**TEXT, "maxLength": 160},
             "idempotency_key": RETRY_KEY,
         },
         ["paths"],
     ),
     _tool(
         "request_reservation",
-        "Reserve the same keys, and where a peer holds one, queue for it "
-        "instead of failing; the refusal names the holder and your place. "
-        "The holder's release grants it and sends you one notice.",
+        "Reserve keys; queue for held ones.",
         {
-            "paths": {
-                "type": "array",
-                "items": TEXT,
-                "maxItems": 16,
-                "description": "Keys as file_reservation_paths takes them.",
-            },
+            "paths": {"type": "array", "items": TEXT, "maxItems": 16},
             "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
             "exclusive": FLAG,
             "reason": {**TEXT, "maxLength": 160},
@@ -316,26 +284,25 @@ TOOLS = [
     ),
     _tool(
         "cancel_reservation_request",
-        "Withdraw one queued reservation request, or every one of yours.",
+        "Withdraw one queued request, or all.",
         {"request_id": INTEGER, "idempotency_key": RETRY_KEY},
         [],
     ),
     _tool(
         "release_file_reservations",
-        "Release your file reservations. A key another lane queued for is "
-        "granted to it here, and that lane is told in the same commit.",
+        "Release your reservations; queued lanes get them.",
         {"idempotency_key": RETRY_KEY},
         [],
     ),
     _tool(
         "list_participants",
-        "List the participants you can address in this project.",
+        "List addressable participants.",
         {},
         [],
     ),
     _tool(
         "read_thread",
-        "Read your mail in one thread, oldest first.",
+        "Read one mail thread, oldest first.",
         {
             "thread_id": {**TEXT, "maxLength": 80},
             "after_id": INTEGER,
@@ -349,7 +316,7 @@ TOOLS = [
     ),
     _tool(
         "search_messages",
-        "Search your mail by text, newest match first.",
+        "Search your mail by text.",
         {
             "query": {**TEXT, "maxLength": store.MAX_QUERY_BYTES},
             "limit": {
@@ -362,7 +329,7 @@ TOOLS = [
     ),
     _tool(
         "search_decisions",
-        "Search decisions any lane recorded. Empty query lists the newest.",
+        "Search the shared decision log.",
         {
             "query": {**TEXT, "maxLength": store.MAX_QUERY_BYTES},
             "limit": {
@@ -376,30 +343,23 @@ TOOLS = [
     ),
     _tool(
         "review_report",
-        "Record your verdict on a peer's report, never your own. A verdict "
-        "is your claim, not independent verification.",
+        "Record your verdict on a peer's report.",
         {
             "report_id": {**TEXT, "maxLength": 32},
             "verdict": {"type": "string", "enum": list(metrics.VERDICTS)},
-            "evidence": {
-                **TEXT,
-                "description": "What you checked.",
-            },
+            "evidence": TEXT,
         },
         ["report_id", "verdict", "evidence"],
     ),
     _tool(
         store.RETIRE,
-        "Retire when nothing is left: releases claims, handoffs and keys. "
-        "Refused over ready or operator-blocked work. Re-admit: agent-parley "
-        "participant add.",
+        "Retire when done; releases your claims and keys.",
         {},
         [],
     ),
     _tool(
         "next_issues",
-        "Rank unclaimed issues you could take next, with the reason for "
-        "each. Read this before claiming; it claims nothing.",
+        "Rank issues to claim next; claims nothing.",
         {
             "limit": {
                 **INTEGER,
@@ -855,7 +815,7 @@ def argument_refusal(tool: dict, args: dict) -> str | None:
     schema = tool["inputSchema"]
     accepted = sorted(schema["properties"])
     extra = sorted(set(args) - set(accepted))
-    missing = sorted(set(schema["required"]) - set(args))
+    missing = sorted(set(schema.get("required", [])) - set(args))
     if not extra and not missing:
         return None
     parts = [f"unexpected {', '.join(extra)}" if extra else ""]
