@@ -94,6 +94,32 @@ disk, under the config home the lane launched with. No vendor is asked.
 `agent-parley doctor` lists the providers with and without a token reader on
 its `tokens` line.
 
+### Prompt cache policy
+
+A lane the service wakes or resumes after it sat idle longer than
+`cache_window` comes back by the policy `CACHE_POLICIES` in
+`agent_parley/supervision.py` names for its adapter. A session that recorded
+fewer than `cache_restart_tokens` tokens resumes; a larger one, or one whose
+tokens cannot be read, restarts as a fresh session seeded with the lane's
+branch, claims, reservations, unread mail count and last report, as
+[Running lanes](lanes.md#running-unattended) describes.
+
+| Adapter | Native compact | Resume | Fresh session | Cold wake |
+| --- | --- | --- | --- | --- |
+| `claude` | `/compact` | `--resume ID` | yes | resume if small, else fresh |
+| `codex` | `/compact` | `resume ID` | yes | resume if small, else fresh |
+| `copilot` | none known | `--resume ID` | yes | fresh: live tokens read 0 |
+| `gemini` | `/compress` | `--resume ID` | yes | resume if small, else fresh |
+| `opencode` | `/compact` | `--session ID` | yes | resume if small, else fresh |
+| `amp` | none known | `threads continue ID` | yes | n/a: launch refused |
+| other | none | none | yes | fresh |
+
+The compact column is a record for the operator, not an action: compacting
+after the cache expired re-reads the same uncached transcript, so the wake
+path never types it. A running `copilot` session reads 0 tokens until it
+ends, so its size cannot be judged and a cold `copilot` lane always starts
+fresh.
+
 ### How idle, blocked and prompt states are detected
 
 A lane's state comes from a native hook when its client raises one, and

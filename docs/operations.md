@@ -2240,12 +2240,17 @@ The private project manifest accepts `"supervision"` with `interval` (default
 `convergence_repeats` (3 failures, 1 to 100), `convergence_after`
 (14400 seconds), `prompts`, `wake`,
 `reclaim`, `titles`, `rerun_cancelled` and `rotate` (all true), `ci_rounds`
-(2 rounds, 1 to 100), and `fold_after` (86400 seconds), the retention past
+(2 rounds, 1 to 100), `fold_after` (86400 seconds), the retention past
 which a dead lane with no claim and no process is folded out of the default
-`status` and `problems` views. Numeric second values range from 1 to 86400
-seconds. `rotate` false keeps a lane resuming its recorded native session
-after a ready or blocked report instead of starting a fresh one; see
-[Running lanes](lanes.md#running-unattended). `max_load_ratio` (1.5, above 0
+`status` and `problems` views, `cache_window` (3300 seconds) and
+`cache_restart_tokens` (50000 tokens, 0 to 1000000000). Numeric second values
+range from 1 to 86400 seconds. `rotate` false keeps a lane resuming its
+recorded native session after a ready or blocked report, or after its prompt
+cache expired, instead of starting a fresh one; see
+[Running lanes](lanes.md#running-unattended). A service wake or resume of a
+lane idle longer than `cache_window` starts a fresh session when the lane's
+session recorded at least `cache_restart_tokens` tokens; 0 restarts every such
+lane. `max_load_ratio` (1.5, above 0
 and at most 1000) and `min_available_mib` (1024 MiB, 0 to 1048576) set the
 host load gate below.
 

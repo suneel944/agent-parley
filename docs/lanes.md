@@ -363,6 +363,21 @@ skipped. The activity record keeps the replaced session as `rotated_from`, and
 a session change by any other route, such as `/clear`, clears the point. Set
 the supervision key `rotate` to false to resume the recorded session instead.
 
+A lane idle past its provider's prompt cache rotates the same way. Native
+prompt caches last about an hour and the wake backoff doubles up to an hour, so
+a woken lane would otherwise re-read its whole transcript uncached. When the
+service wakes or resumes a lane whose last hook event is older than the
+`cache_window` supervision setting (default 3300 seconds, 55 minutes), it reads
+the tokens the lane's current session recorded. Below `cache_restart_tokens`
+(default 50000) the session resumes as before. At or above it, or when the
+count cannot be read, the service records a rotation point with outcome
+`cache` and the lane restarts as a fresh native session. Its first prompt names
+the lane, its branch, the claims it holds with their next action, its
+reservations, its unread mail count and the last report, so no work is lost:
+the worktree, claims, reservations and mail stay where they were. A lane in
+your own terminal, or resumed with `--resume` from one, is never rotated for its
+cache. The per-provider policy is in [Providers](providers.md#prompt-cache-policy).
+
 ## Revising the plan
 
 A lane that finds a missing prerequisite or an obsolete edge in the applied
