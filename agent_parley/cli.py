@@ -438,6 +438,33 @@ def clock(text: str) -> float:
     return target.timestamp()
 
 
+def instant(text: str) -> float:
+    """Converts the start of a reporting window into a Unix time.
+
+    Args:
+        text: An ISO 8601 instant such as ``2026-10-15T09:01:00Z``, read in
+            the machine's timezone when it carries no offset, or a window
+            such as ``24h`` or ``7d`` counted back from now.
+
+    Returns:
+        The instant the window starts.
+
+    Raises:
+        ValueError: If the text is neither an instant nor a window.
+    """
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        pass
+    try:
+        return time.time() - duration(text)
+    except ValueError:
+        raise ValueError(
+            f"{text!r} is not an instant or a window; use "
+            "2026-10-15T09:01:00Z or 7d."
+        ) from None
+
+
 def repeat_plan(
     after: float | None,
     at: float | None,
@@ -4104,6 +4131,26 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "6h or 7d. The whole retained log is counted by default."
         ),
     )
+    readings = measured.add_subparsers(dest="reading")
+    delivered = readings.add_parser(
+        "throughput",
+        help=(
+            "Report what each project and lane delivered since an instant: "
+            "merged issues, lane-hours, tokens, operator touches and waits."
+        ),
+    )
+    delivered.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        required=True,
+        metavar="TIME",
+        help=(
+            "Start of the window, such as 2026-10-15T09:01:00Z, or a window "
+            "counted back from now, such as 7d."
+        ),
+    )
+    delivered.add_argument("--json", action="store_true", help=JSON_HELP)
     follow = commands.add_parser(
         "watch",
         help=(
@@ -6292,6 +6339,12 @@ def main() -> int:
                     lambda: problems.lines(bridge.problems()),
                     args.everything,
                 )
+        elif args.command == "metrics" and args.reading == "throughput":
+            reading = metrics.throughput(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_throughput(reading), end="")
         elif args.command == "metrics":
             from agent_parley import dashboard
 
