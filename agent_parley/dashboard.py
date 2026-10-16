@@ -39,6 +39,13 @@ from agent_parley.checkpoints import (
     participant_liveness,
     read_events,
 )
+from agent_parley.context import (
+    diff_cell,
+    lane_diffstats,
+    lane_fields,
+    location_cell,
+    window_cell,
+)
 from agent_parley.issues import deadline_state, snapshot
 from agent_parley.issues import ended as claim_ended
 from agent_parley.state import BridgeError
@@ -68,6 +75,9 @@ COLUMNS = (
     ("MAIL", 9),
     ("LEASES", 9),
     ("CONTEXT", 9),
+    ("WINDOW", 6),
+    ("DIFF", 4),
+    ("LOCATION", 24),
     ("DENIALS", 9),
     ("CALLS", 9),
     ("TOKENS", 9),
@@ -85,6 +95,8 @@ DEFAULT_COLUMNS = (
     "ISSUES",
     "MAIL",
     "LEASES",
+    "WINDOW",
+    "DIFF",
     "DENIALS",
     "TOKENS",
     "IDLE",
@@ -96,7 +108,10 @@ DROP_ORDER = (
     "PROVIDER",
     "EVENT",
     "BRANCH",
+    "LOCATION",
     "CONTEXT",
+    "DIFF",
+    "WINDOW",
     "CALLS",
     "TOKENS",
     "UNUSED",
@@ -121,6 +136,11 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "MAIL": lambda row: -_number(row["unread"]),
     "LEASES": lambda row: -row["leases"],
     "CONTEXT": lambda row: -row["injected_bytes"],
+    "WINDOW": lambda row: (
+        -(-1.0 if row["context_percent"] is None else row["context_percent"])
+    ),
+    "DIFF": lambda row: -(row["diff_added"] or 0) - (row["diff_deleted"] or 0),
+    "LOCATION": lambda row: row["worktree"],
     "DENIALS": lambda row: -row["denials"],
     "CALLS": lambda row: -row["calls"],
     "TOKENS": lambda row: -(row["tokens"] or 0),
@@ -175,7 +195,7 @@ LEGEND = (
     "budget counts what the client recorded, not spend.",
     "TASK is the lane's last prompt or recorded task, clipped to the "
     "terminal; enter shows it whole. The default columns leave out "
-    "PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and FIT; c or "
+    "PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED and FIT; c or "
     "--columns all shows them.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, +queued requests waiting on those "
@@ -215,6 +235,13 @@ LEGEND = (
     "context. A message, report or offer above its cap is kept whole as "
     "an attachment and its record carries a reference; the attachment's "
     "size is never counted here, only the reference that named it.",
+    "WINDOW is how full the lane's context window is, as its own client "
+    "recorded it; unknown when its provider records no window size, never "
+    "a guess, and marked ! at or above the context_full_percent setting. "
+    "DIFF is +added/-deleted lines and the files changed since the lane's "
+    "branch forked from the base head, counting commits and uncommitted "
+    "edits to tracked files; - when Git could not answer. LOCATION is the "
+    "host and worktree the lane runs in.",
     "A row carrying drift, a stale lease, a rejected call, an overdue or "
     "orphaned issue or a stopped session is drawn in colour where the "
     "terminal offers it and in bold where it does not. Every one of those "
@@ -581,6 +608,16 @@ def _row(
         "tokens": records.reported_tokens(
             home, participant, context["records"]
         ),
+        **_cached(
+            context["branches"],
+            ("window", str(participant["lane"])),
+            lambda: lane_fields(
+                home,
+                participant,
+                context["diffstats"].get(agent),
+                context["context_full_percent"],
+            ),
+        ),
         "side_questions": asked["count"],
         "side_question_tokens": asked["tokens"],
         "idle_seconds": idle["seconds"],
@@ -817,6 +854,16 @@ def collect(
             "inactive_after": supervised["inactive_after"],
             "operator_edits": edits if operator_edits else {},
             "base_advances": advances,
+            "context_full_percent": supervised["context_full_percent"],
+            "diffstats": (
+                _cached(
+                    branches,
+                    ("diffstats", data["root"]),
+                    functools.partial(lane_diffstats, data),
+                )
+                if present
+                else {}
+            ),
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -906,6 +953,9 @@ def row_cells(row: dict) -> tuple[str, ...]:
         + (f"+{row['queued']}" if row["queued"] else "")
         + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
         tables.size(row["injected_bytes"]),
+        window_cell(row),
+        diff_cell(row),
+        location_cell(row),
         f"{row['denials']}/{row['hook_events']}",
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         "n/a" if row.get("unmeasured") else _tokens(row["tokens"]),

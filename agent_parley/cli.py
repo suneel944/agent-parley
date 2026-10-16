@@ -127,6 +127,7 @@ if TYPE_CHECKING:
 
 from agent_parley import BridgeError, refusal
 from agent_parley.claims import ClaimsMixin
+from agent_parley.context import diff_cell, location_cell, window_cell
 from agent_parley.integration import IntegrationMixin
 from agent_parley.launch import LaunchMixin
 from agent_parley.settings import SettingsMixin
@@ -1088,6 +1089,12 @@ def lane_detail(record: dict, data: dict) -> None:
         f"{record.get('injected_per_hour', 0)} bytes per hour over the "
         "last day"
     )
+    print(
+        f"    Context window: {window_cell(record)}; diff "
+        f"{diff_cell(record)}; runs at {location_cell(record)}"
+    )
+    if paths := record.get("diff_paths"):
+        print(f"    Changed files: {', '.join(paths)}")
     if record["report_age_seconds"] is not None:
         print(f"    Report age: {record['report_age_seconds']}s")
     if record["summary"]:

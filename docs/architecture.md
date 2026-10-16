@@ -76,6 +76,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies, and the proposals that revise their edges within the operator's envelope |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |
+| `context` | Per-lane readings for operator views: context-window use where the provider's own session record states the window size (unknown otherwise), the diffstat of a lane's worktree against its fork point from the base head, and the host and worktree a lane runs in |
 | `completion` | Shell completion scripts generated from the live command parser, and the lock-free candidate lookup they call back into |
 | `plugins` | Adds the published marketplace and plugin to each supported native CLI on PATH through that CLI's own plugin commands, reading its listing first so a re-run never duplicates an entry |
 | `decisions` | Durable records of the situations that wait on an operator's answer, one open record per situation, queued and retried with backoff until every configured transport accepts the delivery |

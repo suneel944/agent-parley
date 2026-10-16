@@ -47,6 +47,14 @@ def lane(name: str, **changes: object) -> dict:
         "queued": 0,
         "queued_by": [],
         "injected_bytes": 0,
+        "context_percent": None,
+        "context_full": False,
+        "diff_files": None,
+        "diff_added": None,
+        "diff_deleted": None,
+        "diff_paths": [],
+        "host": "host",
+        "worktree": f"/work/{name}",
         "hook_events": 0,
         "denials": 0,
         "calls": 0,
@@ -273,7 +281,7 @@ def test_an_unbounded_frame_shows_every_row_and_leaves_the_legend_to_keys():
 
 def test_a_lane_is_one_row_with_its_task_and_one_note_per_warning():
     rows = lanes(6, stall="idle; message 3 waiting", prompt="build the gate")
-    frame = dashboard.layout(snapshot(("/repo", rows)), 128, 20)
+    frame = dashboard.layout(snapshot(("/repo", rows)), 150, 20)
     drawn = [line for line in frame["lines"] if line.startswith("lane-")]
     assert len(drawn) == frame["shown"] == 6
     assert all("build the gate" in line for line in drawn)

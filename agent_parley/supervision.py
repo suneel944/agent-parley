@@ -86,6 +86,7 @@ DEFAULTS: dict[str, Any] = {
     "forge_skip_labels": list(issues.FORGE_SKIP_LABELS),
     "max_load_ratio": 1.5,
     "min_available_mib": 1024,
+    "context_full_percent": 80,
 }
 
 MAX_COMPLETION_REMINDERS = 100
@@ -317,6 +318,11 @@ def settings(value: dict) -> dict:
     if type(floor) is not int or not 0 <= floor <= MAX_AVAILABLE_MIB:
         raise BridgeError(
             f"min_available_mib must be between 0 and {MAX_AVAILABLE_MIB} MiB."
+        )
+    full = result["context_full_percent"]
+    if type(full) not in (int, float) or not 0 < full <= 100:
+        raise BridgeError(
+            "context_full_percent must be above 0 and at most 100."
         )
     for field in (
         "prompts",
