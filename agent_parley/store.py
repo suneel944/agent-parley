@@ -15,6 +15,7 @@ from typing import Any
 
 from agent_parley import (
     attachments,
+    children,
     forecast,
     issues,
     protocol,
@@ -3099,7 +3100,11 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
             started,
             len(json.dumps(result, ensure_ascii=False).encode()),
         )
-    if tool == "send_message" and args.get("ack_required"):
+    if (
+        tool == "send_message"
+        and args.get("ack_required")
+        and children.requested(tool, args) is None
+    ):
         with contextlib.suppress(sqlite3.Error):
             _recipient_warnings(home, actor, args, result)
     return result
@@ -3474,16 +3479,24 @@ def _dispatch(
     A child spawn creates a worktree and starts a launcher, and a child
     lane's reservation is checked against the paths it was spawned with,
     both from the project manifest, so each runs before any transaction.
+    A spawn is a ``send_message`` whose first recipient is the reserved
+    child address, so it is recognized here before recipients are read.
     """
-    from agent_parley import children
-
     if tool == "next_issues":
         return _recommended(home, actor, args)
     if tool == RETIRE:
         return _retire(home, actor, started)
-    if tool == children.TOOL:
-        spawned = children.spawn(home, actor, args)
-        _observe(home, actor, tool, "ok", started, len(json.dumps(spawned)))
+    child = children.requested(tool, args)
+    if child is not None:
+        spawned = children.spawn(home, actor, child)
+        _observe(
+            home,
+            actor,
+            children.TOOL,
+            "ok",
+            started,
+            len(json.dumps(spawned)),
+        )
         return spawned
     if tool in RESERVING:
         children.confine(home, actor, args.get("paths"))

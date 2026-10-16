@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agent_parley import children, roster, store, supervision
+from agent_parley import children, roster, server, store, supervision
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
@@ -27,6 +27,16 @@ def served(service, token, tool, arguments):
     )
     assert response.status_code == 200
     return response.json()["result"]
+
+
+def spawning(task, paths, key="spawn"):
+    """Returns ``send_message`` arguments that address a child."""
+    return {
+        "to": [children.ADDRESS, *paths],
+        "subject": "Child",
+        "body_md": task,
+        "idempotency_key": key,
+    }
 
 
 def decoded(result):
@@ -80,8 +90,8 @@ def test_a_parent_spawns_two_children_and_receives_two_capped_reports(
             served(
                 service,
                 parent["token"],
-                "spawn_child",
-                {"task": f"Write part {index}", "paths": [f"part{index}/"]},
+                "send_message",
+                spawning(f"Part {index}", [f"part{index}/"], f"k{index}"),
             )
         )
         for index in (1, 2)
@@ -162,12 +172,29 @@ def test_a_spawn_past_the_per_parent_limit_names_the_limit(
     bridge, parent, service, launched, monkeypatch
 ):
     monkeypatch.setattr(children, "MAX_PER_PARENT", 1)
-    arguments = {"task": "Do it", "paths": ["docs"]}
-    decoded(served(service, parent["token"], "spawn_child", arguments))
-    refused = served(service, parent["token"], "spawn_child", arguments)
+    arguments = spawning("Do it", ["docs"])
+    decoded(served(service, parent["token"], "send_message", arguments))
+    refused = served(service, parent["token"], "send_message", arguments)
     assert refused.get("isError") is True
     assert "per-parent limit of 1" in refused["content"][0]["text"]
     assert len(launched) == 1
+
+
+def test_spawn_child_is_not_a_served_tool():
+    assert children.TOOL not in [tool["name"] for tool in server.TOOLS]
+
+
+def test_the_child_address_after_the_first_recipient_is_refused(
+    bridge, repo, parent, service, launched
+):
+    bridge.add_participant(repo, "codex", "codex")
+    store.register(bridge.home, parent["root"], "codex")
+    arguments = spawning("Do it", ["docs"])
+    arguments["to"] = ["codex", children.ADDRESS]
+    refused = served(service, parent["token"], "send_message", arguments)
+    assert refused.get("isError") is True
+    assert "not registered" in refused["content"][0]["text"]
+    assert launched == []
 
 
 def test_a_spawn_past_the_project_limit_names_the_limit(

@@ -1,7 +1,11 @@
 """Lets a lane spawn child lanes on its own branch and receive one report.
 
-A lane that wants parallel subtasks calls the ``spawn_child`` coordination
-tool with a task and the repository paths the child may reserve. The child is
+A lane that wants parallel subtasks calls ``send_message`` addressed first to
+the reserved recipient ``@child``, followed by the repository paths the child
+may reserve, with the task as the body. No participant name can begin with
+``@``, so the address never collides with a lane, and spawning needs no tool
+of its own in the served list; ``spawn_child`` remains the name the spawn is
+observed and refused under. The child is
 an ordinary participant: it is recorded in the project manifest beside every
 other lane, under the parent's provider and credential profile, on a worktree
 of its own whose branch is cut from the parent's branch. It launches through
@@ -36,6 +40,7 @@ from agent_parley import roster, worktrees
 from agent_parley.state import BridgeError, lock, write_json
 
 TOOL = "spawn_child"
+ADDRESS = "@child"
 MAX_PER_PARENT = 3
 MAX_PER_PROJECT = 8
 MAX_PATHS = 16
@@ -437,6 +442,29 @@ def launch(
         )
     supervision.track_launcher(child)
     return child
+
+
+def requested(tool: str, args: dict) -> dict | None:
+    """Reads a spawn request out of a ``send_message`` call, if it is one.
+
+    Only ``ADDRESS`` as the first recipient asks for a child; the same
+    address anywhere else is left to ordinary recipient validation, which
+    refuses it as an unregistered participant.
+
+    Args:
+        tool: Name of the coordination tool called.
+        args: Arguments of that call.
+
+    Returns:
+        The ``task`` and ``paths`` to spawn with, or None when the call does
+        not address a child.
+    """
+    to = args.get("to")
+    if tool != "send_message" or not isinstance(to, list) or not to:
+        return None
+    if to[0] != ADDRESS:
+        return None
+    return {"task": args.get("body_md"), "paths": to[1:]}
 
 
 def spawn(home: Path, actor: dict, args: dict) -> dict:
