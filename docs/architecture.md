@@ -784,7 +784,9 @@ the project merge lock and that participant's session lock, so the lane cannot
 start and no second merge can move the base. The setup lock is held only while
 the manifest is read, never across the gate, so other lanes launch and policy
 changes land while a gate runs; the merging lane's worktree and branch are
-checked again under its session lock. A non-zero exit
+checked again under its session lock. Unattended integration is the
+exception: it gates a scratch candidate before taking the merge lock, as
+described under unattended integration below. A non-zero exit
 refuses the merge and reports the exit status. The gate's output is not
 captured: it goes straight to the operator's terminal, and the refusal points
 there. Only lane initialization captures its command's output and reports the
@@ -923,18 +925,41 @@ repeated issue refuses unattended integration and is never read as consent,
 while the rest of the project keeps working.
 
 `agent-parley unattended run NAME` is the entry point. It runs from the base
-checkout only, holds the project merge lock for the whole attempt, so a second
-attempt or an operator merge is refused as busy, and evaluates eligibility
-under that lock immediately before merging: the lane's claimed issue is listed,
+checkout only and evaluates eligibility with no lock held, the setup lock
+covering only the manifest read: the lane's claimed issue is listed,
 its claim generation is the ledger's current one, it is reported ready at a
 source commit the lane still sits on, the base checkout has the target branch
 checked out, every dependency is verified complete, a verification command is
 configured, and no peer's advisory reservation covers a path the work changed.
-An eligible lane is then merged by the same step `participant merge` uses, so
-the session lock, any required operator approval, the pre- and post-merge
-gates and the source-commit binding all still apply; the policy never merges
-on easier terms. Completion, and with it dependent reconciliation, is recorded
-by that step only after the verified integration.
+
+The verification gate then runs outside the project merge lock, on the
+candidate: the ready source commit merged into the target commit the
+evaluation read, built in a scratch worktree inside the private project state
+directory and never in the base checkout. The scratch worktree is locked
+against the reclaim sweep and removed after the gate whatever the outcome. It
+holds tracked content only, so a gate that depends on files the base checkout
+ignores, such as a local virtual environment, has to create them itself. A
+candidate that conflicts, fails the gate, or whose content the gate changes is
+recorded as a failure and nothing is merged. Because no lock is held, several
+ready lanes run their gates at once.
+
+Only then is the merge lock taken, waiting up to a minute for a merge ahead of
+it before the attempt is refused as busy. Under the lock the attempt checks
+that the base checkout still has the target branch at the commit the
+candidate was built on. If it moved, the lock is released and the attempt
+evaluates and gates the new target afresh, up to three times, after which it
+is refused; the refusal reads a target the base has since left, so the
+service attempts the claim again on a later poll. A result its gate did not
+verify never lands. An eligible lane is merged by the same step
+`participant merge` uses, so the session lock, any required operator
+approval and the source-commit binding all still apply; the policy never
+merges on easier terms. That step replaces its pre-merge gate with the check
+that the base is still the verified commit, and skips the post-merge gate
+only when the merge commit's tree is exactly the verified candidate's tree;
+any other result is gated in the base checkout as before. A lane therefore
+waits on the merge lock for the merges ahead of it, never for their gates.
+Completion, and with it dependent reconciliation, is recorded by that step
+only after the verified integration.
 
 Every attempt appends a decision record of kind `unattended` to the lane's
 report log with bounded evidence: the policy, issue, claim generation, source
