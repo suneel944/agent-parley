@@ -70,7 +70,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
-| `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn |
+| `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn, and the `lane_waits` store record of a long wait a lane handed to the service, which the supervisor's ordinary wake path marks woken and the lane's next served call ends |
 | `plan` | Versioned work-order plans read from TOML and recorded as dependencies, and the proposals that revise their edges within the operator's envelope |
 | `protocol` | Wire-protocol contract between launcher, plugin, hooks and service |
 | `records` | Best-effort reading of native CLI session records on disk |

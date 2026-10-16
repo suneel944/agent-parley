@@ -287,7 +287,7 @@ participant or project. Reservations are advisory, not filesystem locks.
 | --- | --- |
 | `send_message` | Send to peers using an idempotency key; optionally join a thread or require acknowledgement. |
 | `fetch_inbox` | Page inbox metadata and optional bodies; filter with `unread` or `unacknowledged`. |
-| `wait_for_message` | Wait up to `timeout_seconds` for the next mail matching the same filters, plus `thread_id`; an expired wait is empty. |
+| `wait_for_message` | Wait up to `timeout_seconds` for the next mail matching the same filters, plus `thread_id`; an expired wait is empty. `hand_off` (`mail`, `handoff`, `check`) hands a long wait to the service instead. |
 | `mark_message_read` | Explicitly mark a received message read; takes an optional `idempotency_key`. |
 | `acknowledge_message` | Explicitly acknowledge a reviewed message; takes an optional `idempotency_key`. |
 | `file_reservation_paths` | Reserve advisory path patterns and report conflicts; takes an optional `idempotency_key`. |
@@ -328,6 +328,19 @@ returns an empty page: no error, no event and no receipt changed. A wait
 occupies no worker slot while it sleeps, so waiting lanes cannot starve the
 service of the sends they are waiting for; a pause, a revoked registration or a
 stopping service ends a wait at once.
+
+A wait longer than the ceiling is handed to the service instead of repeated:
+`wait_for_message` with `hand_off` set to `mail`, `handoff` or `check` reads
+the inbox once with the same filters and returns matching mail at once. With
+nothing there it records what the lane waits for and since when, and returns
+`end_turn: true` with the record under `hand_off`. The lane ends its turn; the
+supervisor's ordinary wake path asks it for one turn when the mail, handoff
+offer or pull request notice arrives, so a 30-minute wait costs one turn to
+start and one to resume. A repeated hand-off of the same wait keeps its first
+time, and the lane's next served call of any other kind ends the record. A lane
+the service cannot wake, because the wake loop is off for it or its provider
+has no resume path, gets `end_turn: false` and the ordinary bounded wait, and
+its record is marked `polling` with the reason.
 
 ## What does not fit in a message
 
