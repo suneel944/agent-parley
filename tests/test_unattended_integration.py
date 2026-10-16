@@ -385,6 +385,27 @@ def test_a_held_merge_lock_serializes_the_attempt(
     assert execution(directory)["state"] == lifecycle.COMPLETE
 
 
+def test_an_attempt_waits_for_a_held_setup_lock(bridge, repo, ready):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with lock(directory / "setup.lock"):
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(10)
+    threading.Timer(0.3, release.set).start()
+    unattended.integrate(bridge, repo, "codex")
+    holder.join(10)
+
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+
+
 def test_a_failing_gate_records_a_durable_failure(
     bridge, repo, ready, tmp_path
 ):
