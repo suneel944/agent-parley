@@ -469,6 +469,8 @@ interface changes, decisions, and blockers; request acknowledgement for changes
 the peer depends on. When finished, send a handoff containing the exact commit
 (if committed), changed files, verification commands/results, and limitations,
 then release your reservations. Avoid repeated empty inbox polling.
+Found work outside your issue? Mail it to @followup and keep going; only the
+operator files it. Never widen your own scope to fix it.
 
 Edit only your worktree. Do not reset, clean, switch, merge, or modify a peer
 worktree or the main checkout. Preserve existing work on your branch. Add any
