@@ -19,8 +19,10 @@ from agent_parley import (
     lifecycle,
     protocol,
     roster,
+    status,
     store,
     supervision,
+    waits,
 )
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
@@ -382,6 +384,51 @@ def test_json_status_shows_a_declared_wait_as_its_own_reason_and_deadline(
     )
     assert claude["self_wait"]["reason"] == "3 background jobs"
     assert claude["self_wait"]["until"]
+    assert claude["service_wait"] is None
+
+
+def test_status_shows_a_wait_handed_to_the_service_and_since_when(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    since = time.time() - 600
+    with store.connect(bridge.home, write=True) as db:
+        waits.ensure(db)
+        db.execute(
+            "INSERT INTO lane_waits(project,lane,kind,thread_id,since,wake,"
+            "reason) VALUES(?,?,?,?,?,?,?)",
+            (paired["root"], "claude", "handoff", "", since, waits.SERVICE, ""),
+        )
+    monkeypatch.chdir(repo)
+    assert run(monkeypatch, bridge, "status", "--json") == 0
+    document = json.loads(capsys.readouterr().out)
+    project = next(
+        item for item in document["projects"] if item["root"] == str(repo)
+    )
+    claude = next(
+        record
+        for record in project["participants"]
+        if record["participant"] == "claude"
+    )
+    handed = claude["service_wait"]
+    assert handed["kind"] == "handoff"
+    assert handed["wake"] == waits.SERVICE
+    assert handed["since"] and handed["age_seconds"] >= 600
+    assert handed["woken_at"] is None
+    note = status.handed_note({**handed, "age_seconds": 600})
+    assert note == "waiting on handoff for 10m, service wakes it"
+    polling = {
+        **handed,
+        "kind": "mail",
+        "thread_id": "ask",
+        "wake": waits.POLLING,
+        "reason": "wake is off for this lane",
+        "age_seconds": 120,
+    }
+    assert status.handed_note(polling) == (
+        "waiting on mail in ask for 2m, polling: wake is off for this lane"
+    )
+    assert status.handed_note(None) == ""
 
 
 def claimed(bridge, repo, paired, monkeypatch):
