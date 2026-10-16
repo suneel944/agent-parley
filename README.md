@@ -241,6 +241,21 @@ agent-parley say codex "Rebase onto main before you open the pull request."
 agent-parley ask codex "Which test is still failing?"  # read-only, lane untouched
 ```
 
+Work across several repositories, such as a front end and a back end, from
+one terminal. Every project you set up or run in is remembered in the state
+root, never in the repository, and a named workspace groups them:
+
+```sh
+agent-parley projects                      # registered projects, recent first
+agent-parley run codex --project backend   # launch there, not in the cwd
+agent-parley workspace set stack frontend backend
+agent-parley up --workspace stack          # resume the stopped lanes of both
+agent-parley status --workspace stack      # both projects in one view
+```
+
+Each project keeps its own claims, reservations and integration target; lanes
+stay on the local host.
+
 `agent-parley --help` prints the grouped command list; `agent-parley version`
 prints the version and state directory. Single records read through `show`:
 `issue show 42`, `participant show codex`, `provider show claude`,
