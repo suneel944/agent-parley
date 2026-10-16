@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         completion,
         convergence,
         evidence,
+        followups,
         forge,
         history,
         inbound,
@@ -144,6 +145,7 @@ DEFERRED_MODULES = (
     "delivery",
     "dialogs",
     "evidence",
+    "followups",
     "forecast",
     "forge",
     "gemini",
@@ -3250,6 +3252,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "followup",
             "mail",
             "say",
             "ask",
@@ -4913,6 +4916,42 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     inspecting.add_argument("--json", action="store_true", help=JSON_HELP)
+    following = commands.add_parser(
+        "followup",
+        help="Review follow-up work lanes suggested, and file what you accept.",
+    )
+    followup_actions = following.add_subparsers(dest="action", required=True)
+    listing_followups = followup_actions.add_parser(
+        "list",
+        help="List pending suggestions with the open issues they duplicate.",
+    )
+    accepting = followup_actions.add_parser(
+        "accept",
+        help=(
+            "File one suggestion as an issue in the active milestone and "
+            "offer it to an idle lane."
+        ),
+    )
+    accepting.add_argument("id", help="Suggestion identifier, such as f3.")
+    accepting.add_argument(
+        "--milestone",
+        default="",
+        metavar="TITLE",
+        help="Milestone to file under; the active open milestone if omitted.",
+    )
+    accepting.add_argument(
+        "--to",
+        default="",
+        metavar="LANE",
+        help="Lane to offer the issue to; an idle running lane if omitted.",
+    )
+    for followup_parser in (listing_followups, accepting):
+        followup_parser.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
+        followup_parser.add_argument(
+            "--json", action="store_true", help=JSON_HELP
+        )
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -6819,6 +6858,25 @@ def main() -> int:
                         withdraw=args.unassign,
                     )
                 )
+            )
+        elif args.command == "followup" and args.action == "list":
+            suggested = bridge.followup_list(args.repo.resolve())
+            print(
+                views.render("followup_list", {"suggestions": suggested})
+                if args.json
+                else followups.render(suggested)
+            )
+        elif args.command == "followup" and args.action == "accept":
+            accepted = bridge.followup_accept(
+                args.repo.resolve(),
+                args.id,
+                milestone=args.milestone,
+                to=args.to,
+            )
+            print(
+                views.render("followup_accept", accepted)
+                if args.json
+                else followups.accepted_text(accepted)
             )
         elif args.command == "issue" and args.action == "resolve":
             ended = bridge.issue_resolve(

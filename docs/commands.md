@@ -29,8 +29,9 @@ state globally;
 repository commands accept `--repo PATH` unless noted below. `problems`,
 `doctor` and `metrics` take no `--repo`, and `state export` and
 `state import` select one project with `--project ROOT`. Issue mutations,
-reports and lane mail resolve identity from the current lane. `say` and
-`issue assign` act as `operator` from any checkout of the repository.
+reports and lane mail resolve identity from the current lane. `say`,
+`issue assign` and `followup accept` act as `operator` from any checkout of
+the repository.
 
 Each operation has one canonical spelling, used throughout the docs, skills
 and generated remedies: `say` sends an operator message and `gc` reclaims
@@ -90,6 +91,8 @@ on standard output and export to a file.
 | `issue assign NUMBER NAME` | Offer an issue to a lane as `operator`; `--reason` travels with the offer and `--unassign` withdraws one no lane accepted. |
 | `issue recover NUMBER --reason TEXT` | As `operator`, approve stopping the live owner of a claim once a matching exhausted-capacity observation is published; the approval alone moves nothing. Refused outside the base checkout, and from any process carrying a lane's `AGENT_PARLEY_TOKEN`. |
 | `issue resolve NUMBER` | End a claim whose holder never filed the completion its pull request already landed, as `operator` and never as the lane. The forge is read at that moment: the issue must have closed inside the current claim, with its closing pull request recorded whichever branch it came from, or, when the forge cannot say, the lane branch pull request must have been opened inside it, and the supervisor must already have escalated the claim as an unresolved completion, so an answering holder is never resolved out from under it. `--reason` is kept beside the recorded evidence, and `--release` returns the work to the queue instead, which a pull request closed without merging requires. |
+| `followup list` | List the follow-up work lanes suggested by mail to `@followup` and nobody accepted yet, oldest first, each with its lane, why, paths, expiry and the open issues or claims whose titles it may duplicate; `--json` prints it for scripts. Suggestions expire seven days after they are made. |
+| `followup accept ID` | As `operator`, file one suggestion as a forge issue in the active milestone (the open milestone due soonest, else the oldest; `--milestone TITLE` names another) and offer it to a running lane that holds no claim and has no offer waiting, through the same offer `issue assign` records; `--to LANE` names the lane. With no idle lane the issue is left unclaimed for the next lane that pulls work. A repeat returns the issue already filed. Filing needs the GitHub forge. A Telegram digest carries the same accept as a button. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies, from the project base checkout only; `plan diff PATH` previews it. |
@@ -310,6 +313,13 @@ lane searches with `search_decisions`, so a third lane learns an agreement it
 was never addressed in. Nothing else widens: mail without the flag stays
 readable by its sender and its recipients alone, and a decision obeys the same
 body cap and attachment rules as any other message.
+
+`send_message` with `@followup` as the first `to` entry records follow-up work
+outside this lane's issue for the operator to accept: the `subject` is its
+title, `body_md` the why and any further `to` entries repository paths. It
+reaches no lane, files no issue, offers nothing and starts no lane, so the lane
+keeps its work. The result names the suggestion and lists the open issues and
+claims it may duplicate. An unaccepted suggestion expires after seven days.
 
 `send_message` takes an optional `topic` of at most 80 characters. A newer
 message on the same topic supersedes the recipient's unread older one, and
