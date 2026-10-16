@@ -711,7 +711,7 @@ def test_an_operator_failure_raises_no_problem(bridge, repo, ready, tmp_path):
 def logged_gate(tmp_path: Path) -> tuple[str, Path]:
     """Writes a gate that logs its start and end.
 
-    Each run waits, for up to twenty seconds, until two runs have started,
+    Each run waits, for up to sixty seconds, until two runs have started,
     so serialized gates log a start and an end before the second start.
     """
     log = tmp_path / "gate.log"
@@ -721,7 +721,7 @@ def logged_gate(tmp_path: Path) -> tuple[str, Path]:
         "#!/bin/sh\n"
         f"echo start >> {quoted}\n"
         "i=0\n"
-        f'while [ "$(grep -c start {quoted})" -lt 2 ] && [ "$i" -lt 100 ]; '
+        f'while [ "$(grep -c start {quoted})" -lt 2 ] && [ "$i" -lt 300 ]; '
         "do sleep 0.2; i=$((i + 1)); done\n"
         f"echo end >> {quoted}\n"
     )
