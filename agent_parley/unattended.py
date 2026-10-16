@@ -96,6 +96,10 @@ SERVICE = "service"
 MERGE_WAIT = 60.0
 """Seconds an attempt whose candidate passed waits for `merge.lock`."""
 
+SETUP_WAIT = 10.0
+"""Seconds an attempt waits for the setup lock to read the manifest, so
+attempts the service starts together do not refuse one another."""
+
 ROUNDS = 3
 """Candidate gates one attempt runs while the target keeps moving."""
 
@@ -675,7 +679,7 @@ def integrate(
     operator_only(repo, root, data, "Unattended integration runs")
     evidence: dict = {}
     for _ in range(ROUNDS):
-        with lock(directory / "setup.lock"):
+        with lock(directory / "setup.lock", timeout=SETUP_WAIT):
             data = bridge._project(root, directory, verify={name})
         evidence, unmet = _evaluate(bridge, root, directory, data, name, issue)
         if actor:
