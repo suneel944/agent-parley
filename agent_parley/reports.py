@@ -28,6 +28,59 @@ ROTATION_OUTCOMES = ("ready", "blocked")
 class ReportsMixin(BridgeCore):
     """Lane reports, peer review, hook event export, archive and history."""
 
+    def task_plan(
+        self, repo: Path, steps: list[str], document: str = ""
+    ) -> dict:
+        """Replaces the calling lane's own task plan.
+
+        The lane is the roster entry whose worktree holds the checkout, found
+        the way `report` finds it, so a lane never names itself or another
+        lane. The plan goes to the lane's capped plan file beside its state
+        record, which only operator views read and no peer is sent.
+
+        Args:
+            repo: The lane's own checkout.
+            steps: Steps written ``STATUS:TEXT``, where the status is one of
+                `lanes.PLAN_STATUSES`.
+            document: The whole list as JSON, ``[{"step", "status"}]``, in
+                place of `steps`; empty when the steps came as arguments.
+
+        Returns:
+            The recorded plan: ``items``, ``source``, ``updated`` and
+            ``truncated``.
+
+        Raises:
+            BridgeError: If both forms or neither are given, the list is
+                malformed, or the checkout is not a lane.
+        """
+        import json
+
+        from agent_parley import lanes
+        from agent_parley.cli import git, roster
+
+        if bool(steps) == bool(document.strip()):
+            raise BridgeError(
+                "Give the plan as STATUS:TEXT arguments or as JSON with "
+                "--stdin, not both and not neither."
+            )
+        if document.strip():
+            try:
+                entries = json.loads(document)
+            except ValueError as error:
+                raise BridgeError(f"Plan JSON is not valid: {error}.") from None
+        else:
+            entries = []
+            for step in steps:
+                status, _, text = step.partition(":")
+                entries.append({"step": text, "status": status.strip()})
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        return lanes.record_plan(
+            directory, agent, entries, "step", lanes.PLAN_COMMAND
+        )
+
     def report(
         self,
         repo: Path,

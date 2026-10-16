@@ -974,6 +974,31 @@ def recap_lines(
     ]
 
 
+PLAN_MARKS = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
+
+
+def plan_lines(plan: dict | None) -> list[str]:
+    """Lists a lane's recorded task plan with completed steps checked.
+
+    Args:
+        plan: Plan as `lanes.lane_task_plan` reads it, or None.
+
+    Returns:
+        The indented lines to print under the lane's detail; none when the
+        lane recorded no plan.
+    """
+    if plan is None:
+        return []
+    lines = [f"    Task plan (from {plan['source']}):"]
+    lines += [
+        f"      {PLAN_MARKS[item['status']]} {item['text']}"
+        for item in plan["items"]
+    ]
+    if plan["truncated"]:
+        lines.append("      (clipped to the plan cap)")
+    return lines
+
+
 def lane_detail(record: dict, data: dict) -> None:
     """Prints one lane's full reading under its table row.
 
@@ -5171,6 +5196,27 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 default=[],
                 help="What supports the change; repeatable.",
             )
+    updating = steps.add_parser(
+        "update",
+        help="Replace this lane's own task list, which only the operator sees.",
+    )
+    updating.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    updating.add_argument(
+        "step",
+        nargs="*",
+        metavar="STATUS:TEXT",
+        help=(
+            "One step, where STATUS is pending, in_progress or completed; "
+            "give the whole list each time."
+        ),
+    )
+    updating.add_argument(
+        "--stdin",
+        action="store_true",
+        help='Read the list as JSON, [{"step": "...", "status": "..."}].',
+    )
     mail = commands.add_parser(
         "mail",
         help=(
@@ -7000,6 +7046,16 @@ def main() -> int:
                 else notification_report(probed)
             )
             return 0 if all(item["ok"] for item in probed["results"]) else 1
+        elif args.command == "plan" and args.action == "update":
+            recorded = bridge.task_plan(
+                args.repo.resolve(),
+                args.step,
+                sys.stdin.read() if args.stdin else "",
+            )
+            clipped = (
+                " (clipped to the plan cap)" if recorded["truncated"] else ""
+            )
+            print(f"Recorded {len(recorded['items'])} plan steps{clipped}.")
         elif args.command == "plan" and args.action in (
             "propose",
             "approve",
@@ -7100,6 +7156,10 @@ def main() -> int:
                 _, directory = bridge.project(repository, create=False)
                 lane_detail(record, roster.read(directory))
                 for line in recap_lines(directory, args.name):
+                    print(line)
+                for line in plan_lines(
+                    lanes.lane_task_plan(directory, args.name)
+                ):
                     print(line)
         elif args.command == "decide":
             recorded = bridge.decide(

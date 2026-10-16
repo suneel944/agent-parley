@@ -3865,6 +3865,10 @@ def checkpoint(
     decision and answered with nothing, so the client is never told to
     retry the refused call.
 
+    A completed native todo call of the lane's own session replaces the
+    lane's recorded task plan through `lanes.observe_plan`, under the
+    lane's checkpoint lock and read from the payload alone.
+
     Args:
         home: Private bridge state root.
         directory: Common project state directory.
@@ -4122,6 +4126,8 @@ def checkpoint(
                 directory, agent, state, payload, session_process, denial
             )
             return denial or {}
+        if event == "PostToolUse":
+            lanes.observe_plan(directory, agent, payload)
         new_session = session != recorded and (
             event == "SessionStart" or adopted
         )
