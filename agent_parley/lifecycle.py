@@ -264,7 +264,7 @@ def usage_between(start: dict | None, end: dict) -> dict:
     }
 
 
-def released(record: dict, closed: bool = False) -> dict:
+def released(record: dict, closed: bool = False, issue: str | int = "") -> dict:
     """Returns unfinished work to its authorized queue after release.
 
     A claim whose issue closed on the forge inside its generation has no
@@ -286,18 +286,29 @@ def released(record: dict, closed: bool = False) -> dict:
         record: Mutable issue ledger record.
         closed: Whether the claim's issue closed on the forge inside the
             current ownership generation.
+        issue: Issue number the record tracks, named in a refusal so it
+            points at the exact merge command; empty when unknown.
 
     Returns:
         The execution mapping stored on the record.
 
     Raises:
-        BridgeError: If ready work still awaits verified integration.
+        BridgeError: If ready work still awaits verified integration. The
+            refusal's next command merges the owning lane's work.
     """
     execution = state(record)
     if execution["state"] == READY and not closed:
         raise BridgeError(
             "Ready work must remain claimed until verified integration "
-            "completes."
+            "completes. Keep "
+            + (f"issue #{issue}" if issue else "the claim")
+            + " and merge it, or report it partial or blocked with "
+            "--remaining before releasing it.",
+            next_command=(
+                "agent-parley participant merge"
+                + (f" {record['owner']}" if record.get("owner") else "")
+                + (f" --issue {issue}" if issue else "")
+            ),
         )
     if not closed and operator_blocked(record):
         execution.update(

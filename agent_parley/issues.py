@@ -1668,7 +1668,9 @@ def _change(
                 elif action == "release":
                     retired = str(record.get("claim_id") or "")
                     retired_reason = f"issue #{issue} released"
-                    lifecycle.released(record, closed=closed(record))
+                    lifecycle.released(
+                        record, closed=closed(record), issue=issue
+                    )
                     attachments.remove(directory, record.get("attachment", ""))
                     record.pop("attachment", None)
                     inherited = record.pop("handoff", None) or {}
@@ -2020,20 +2022,35 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
 
     Raises:
         BridgeError: If the selection is not currently owned or ownership is
-            ambiguous.
+            ambiguous. The refusal lists the issues the participant owns,
+            and an unowned selection names its holder and the command that
+            requests or claims it.
     """
+    ledger = snapshot(directory)["issues"]
     owned = {
         number: record
-        for number, record in snapshot(directory)["issues"].items()
+        for number, record in ledger.items()
         if record["owner"] == name
     }
+    held = ", ".join(f"#{number}" for number in sorted(owned, key=int))
     if issue:
         number = parse_issue(issue)
         if number not in owned:
-            raise BridgeError(f"Issue #{number} is not owned by {name}.")
+            holder = (ledger.get(number) or {}).get("owner")
+            raise BridgeError(
+                f"Issue #{number} is not owned by {name}"
+                + (f"; {holder} owns it." if holder else "; it is unclaimed.")
+                + (f" {name} owns {held}." if held else ""),
+                next_command=(
+                    f"agent-parley issue request {number}"
+                    if holder
+                    else f"agent-parley issue claim {number}"
+                ),
+            )
     elif len(owned) > 1:
         raise BridgeError(
-            f"{name} owns multiple issues; name one with --issue."
+            f"{name} owns multiple issues ({held}); name one with --issue, "
+            f"for example --issue {min(owned, key=int)}."
         )
     elif not owned:
         return {"issue": None, "claim_id": None}
