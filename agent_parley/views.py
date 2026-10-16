@@ -114,6 +114,18 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "Tokens the native client counted, never billed spend.",
     ),
     (
+        "agent_parley_lane_side_questions_retained",
+        "gauge",
+        "side_questions",
+        "Side questions answered for the operator by agent-parley ask.",
+    ),
+    (
+        "agent_parley_lane_side_question_tokens_retained",
+        "gauge",
+        "side_question_tokens",
+        "Tokens the lane's side questions counted, part of its budget.",
+    ),
+    (
         "agent_parley_lane_pull_requests_opened_window",
         "gauge",
         "pull_requests_opened",

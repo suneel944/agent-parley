@@ -443,6 +443,7 @@ def _row(
         home, directory, data, agent, context["usage"], context["records"]
     )
     review = metrics.latest_review(directory, agent) or {}
+    asked = budgets.asked(directory, agent)
     return {
         "participant": agent,
         "provider_name": participant["provider"],
@@ -526,6 +527,8 @@ def _row(
         "tokens": records.reported_tokens(
             home, participant, context["records"]
         ),
+        "side_questions": asked["count"],
+        "side_question_tokens": asked["tokens"],
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
         "accounting": (

@@ -3193,6 +3193,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "issue",
             "mail",
             "say",
+            "ask",
             "decide",
             "decision",
             "report",
@@ -4525,6 +4526,24 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     add_say_arguments(steer)
+    asking = commands.add_parser(
+        "ask",
+        help=(
+            "Ask a lane a side question from a separate read-only session; "
+            "the lane's session and context are untouched."
+        ),
+    )
+    asking.add_argument("participant", help="Lane the question is about.")
+    asking.add_argument("question", help="The question to answer.")
+    asking.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    asking.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help=(
+            "Answer from the lane's checkpoint even where the provider can "
+            "fork the lane's session."
+        ),
+    )
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -6504,6 +6523,13 @@ def main() -> int:
             args.command == "mail" and args.action == "send"
         ):
             return spoken(bridge, parser, args)
+        elif args.command == "ask":
+            return bridge.ask(
+                args.participant,
+                args.repo.resolve(),
+                args.question,
+                checkpoint=args.checkpoint,
+            )
         elif args.command == "issue" and args.action == "show":
             detail = bridge.issue_reading(args.repo.resolve(), args.number)
             print(

@@ -2068,6 +2068,8 @@ every project series `project`. The lane families are
 `agent_parley_lane_served_calls_retained`,
 `agent_parley_lane_served_rejections_retained`,
 `agent_parley_lane_tokens_total`,
+`agent_parley_lane_side_questions_retained`,
+`agent_parley_lane_side_question_tokens_retained`,
 `agent_parley_lane_pull_requests_opened_window`,
 `agent_parley_lane_pull_requests_merged_window`,
 `agent_parley_lane_pull_requests_closed_window`,
@@ -2092,7 +2094,9 @@ hook log when no window is given; the pull request families use the last 7
 days instead. The `_retained` families count the tool events the store still
 keeps. Each can fall between two scrapes as old events leave the window, the
 log rotates or the store retires events, so read them as levels rather than
-through `rate()` or `increase()`. `agent_parley_lane_tokens_total` stays a
+through `rate()` or `increase()`. The two side question families count every
+entry in the lane's `agent-parley ask` ledger and ignore `--since`.
+`agent_parley_lane_tokens_total` stays a
 counter: it is the native session's own running count.
 `tokens` is what the native client counted, not billed spend, exactly as the
 `TOKENS` column is.
