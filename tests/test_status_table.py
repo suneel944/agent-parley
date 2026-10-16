@@ -8,6 +8,7 @@ import pytest
 
 from agent_parley import checkpoints, cli, store
 from agent_parley.state import write_json
+from agent_parley.status import BUCKETS
 
 
 def second_project(bridge, tmp_path):
@@ -37,7 +38,7 @@ def printed(capsys):
 
 
 def rows_of(lines):
-    """Returns the participant rows of every table in a reading."""
+    """Returns the participant rows of every table, past bucket headings."""
     rows = []
     inside = False
     for line in lines:
@@ -45,7 +46,7 @@ def rows_of(lines):
             inside = True
         elif not line or line.startswith("Hidden columns:"):
             inside = False
-        elif inside:
+        elif inside and line.partition(" (")[0].lower() not in BUCKETS:
             rows.append(line)
     return rows
 
@@ -76,6 +77,7 @@ def test_one_project_prints_one_table(bridge, repo, paired, capsys):
     ]
     assert sum(line.startswith("PARTICIPANT") for line in lines) == 1
     assert [row.split()[0] for row in rows_of(lines)] == ["claude", "codex"]
+    assert lines[lines.index(heading) + 1] == "Idle (2):"
     assert "Reported outcome" not in "\n".join(lines)
 
 
