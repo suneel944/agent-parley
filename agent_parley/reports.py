@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     import argparse
 
 ROTATION_OUTCOMES = ("ready", "blocked")
+READY_SHOWN_PATHS = 5
 
 
 class ReportsMixin(BridgeCore):
@@ -130,6 +131,12 @@ class ReportsMixin(BridgeCore):
         next resume of the lane starts a fresh native session instead of
         continuing this one, as `launch.rotation_task` describes.
 
+        A ready report records the lane's HEAD commit as the code its evidence
+        verified, so it is refused while any tracked file differs from that
+        commit: evidence gathered on uncommitted edits would describe code a
+        reviewer and the integration gate never see. Untracked files are not
+        considered, because lanes keep scratch state and build output there.
+
         Args:
             repo: Assigned agent worktree.
             outcome: Partial, blocked, ready-for-review, or waiting state.
@@ -225,6 +232,18 @@ class ReportsMixin(BridgeCore):
         if key and (recorded := state.get("retries", {}).get(scope)):
             retries.replayed(recorded, "report", key, fingerprint)
             return ""
+        if outcome == "ready" and (
+            changed := git(lane, "diff", "--name-only", "HEAD").splitlines()
+        ):
+            shown = ", ".join(changed[:READY_SHOWN_PATHS])
+            more = len(changed) - READY_SHOWN_PATHS
+            raise BridgeError(
+                f"A ready report records commit {commit[:12]}, but "
+                f"{len(changed)} tracked file(s) differ from it: {shown}"
+                + (f" and {more} more" if more > 0 else "")
+                + ". Commit or revert them first, so the evidence describes "
+                "the recorded commit."
+            )
         ceiling = (data.get("deadlines") or {}).get(
             "wait", supervision.DEFAULT_WAIT_CEILING
         )

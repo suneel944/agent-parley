@@ -315,3 +315,37 @@ def test_the_batch_matcher_agrees_with_the_pairwise_rule():
             }
             assert store.overlapping_paths(keys, list(patterns)) == expected
     assert store.overlapping_paths(keys, []) == set()
+
+
+def test_the_folding_batch_matcher_agrees_with_the_pairwise_rule():
+    keys = [
+        "a",
+        "A/",
+        "a/B",
+        "A/b/",
+        "A/B/C.PY",
+        "a/b/c.py",
+        "A/*",
+        "a/B/*.py",
+        "*.PY",
+        "Ab",
+        "ab/C",
+        "X:y",
+        "x:Y",
+        "x:y/z",
+        "[AB]/c",
+        "?",
+        "C/d/E",
+    ]
+    for size in (1, 2):
+        for patterns in itertools.combinations(keys, size):
+            expected = {
+                path
+                for path in keys
+                for pattern in patterns
+                if store.overlapping(path, pattern, fold=True)
+            }
+            assert (
+                store.overlapping_paths(keys, list(patterns), fold=True)
+                == expected
+            ), patterns
