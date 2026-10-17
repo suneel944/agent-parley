@@ -7,6 +7,7 @@ moved method reads. This module never imports `cli` at import time.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -733,6 +734,61 @@ class ClaimsMixin(ReportsMixin):
         offer = record["offer"]
         result.update(recorded="offer", to=offer["to"], offer_id=offer["id"])
         return result
+
+    def followup_list(self, repo: Path) -> list[dict]:
+        """Lists the follow-up suggestions lanes left for the operator.
+
+        Args:
+            repo: Any checkout of the target repository.
+
+        Returns:
+            Each pending suggestion, oldest first, with its duplicates.
+
+        Raises:
+            BridgeError: If the repository has no project.
+        """
+        from agent_parley import followups
+
+        _, directory = self.project(repo)
+        return followups.pending(directory)
+
+    def followup_accept(
+        self, repo: Path, ident: str, *, milestone: str = "", to: str = ""
+    ) -> dict:
+        """Files one suggestion as an issue and offers it to an idle lane.
+
+        The decision that carried the suggestion's Telegram button is closed
+        once the issue is filed, so the button no longer answers. Closing it
+        is best effort; an unclosed one expires with the suggestion.
+
+        Args:
+            repo: Any checkout of the target repository.
+            ident: Suggestion identifier from ``followup list``.
+            milestone: Milestone title; the active milestone when empty.
+            to: Lane to offer the issue to; an idle lane when empty.
+
+        Returns:
+            What `followups.accept` returned.
+
+        Raises:
+            BridgeError: If the repository has no project, the suggestion is
+                unknown or expired, or the forge refused the filing.
+        """
+        from agent_parley import decisions, followups, roster
+
+        root, directory = self.project(repo)
+        accepted = followups.accept(
+            directory,
+            roster.read(directory),
+            root,
+            ident,
+            milestone=milestone,
+            to=to,
+        )
+        if accepted.get("decision"):
+            with contextlib.suppress(BridgeError, OSError, ValueError):
+                decisions.close(directory, accepted["decision"])
+        return accepted
 
     def issue_resolve(
         self,

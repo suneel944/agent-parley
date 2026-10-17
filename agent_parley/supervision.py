@@ -34,6 +34,8 @@ from agent_parley import (
     notify,
     process,
     protocol,
+    quota,
+    recaps,
     reclaim,
     records,
     recovery,
@@ -42,6 +44,7 @@ from agent_parley import (
     terminal,
     timeouts,
     unattended,
+    waits,
 )
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
 from agent_parley.status import (
@@ -76,11 +79,14 @@ DEFAULTS: dict[str, Any] = {
     "titles": True,
     "rerun_cancelled": True,
     "rotate": True,
+    "cache_window": 3300,
+    "cache_restart_tokens": 50000,
     "ci_rounds": 2,
     "fold_after": 86400,
     "forge_skip_labels": list(issues.FORGE_SKIP_LABELS),
     "max_load_ratio": 1.5,
     "min_available_mib": 1024,
+    "context_full_percent": 80,
 }
 
 MAX_COMPLETION_REMINDERS = 100
@@ -88,6 +94,44 @@ MAX_LOAD_RATIO = 1000
 MAX_AVAILABLE_MIB = 1048576
 HOST_LOADED = "busy:host load"
 MAX_CI_ROUNDS = 100
+MAX_CACHE_RESTART_TOKENS = 1_000_000_000
+CACHE_ROTATION = "cache"
+CACHE_RESUME = "resume"
+CACHE_RESTART = "restart"
+CACHE_POLICIES: dict[str, dict[str, Any]] = {
+    "claude": {
+        "compact": "/compact",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "codex": {
+        "compact": "/compact",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "copilot": {"compact": None, "resume": True, "fresh": True, "sized": False},
+    "gemini": {
+        "compact": "/compress",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "opencode": {
+        "compact": "/compact",
+        "resume": True,
+        "fresh": True,
+        "sized": True,
+    },
+    "amp": {"compact": None, "resume": True, "fresh": True, "sized": False},
+}
+FALLBACK_CACHE_POLICY: dict[str, Any] = {
+    "compact": None,
+    "resume": False,
+    "fresh": True,
+    "sized": False,
+}
 MAX_CLAIMS_PER_LANE = 100
 MAX_CONVERGENCE_REPEATS = 100
 ENDED = issues.ENDED
@@ -223,6 +267,7 @@ def settings(value: dict) -> dict:
         "takeover_grace",
         "convergence_after",
         "fold_after",
+        "cache_window",
     ):
         if (
             type(result[field]) not in (int, float)
@@ -255,6 +300,15 @@ def settings(value: dict) -> dict:
         raise BridgeError(
             f"ci_rounds must be between 1 and {MAX_CI_ROUNDS} rounds."
         )
+    restart_tokens = result["cache_restart_tokens"]
+    if (
+        type(restart_tokens) is not int
+        or not 0 <= restart_tokens <= MAX_CACHE_RESTART_TOKENS
+    ):
+        raise BridgeError(
+            "cache_restart_tokens must be between 0 and "
+            f"{MAX_CACHE_RESTART_TOKENS} tokens."
+        )
     ratio = result["max_load_ratio"]
     if type(ratio) not in (int, float) or not 0 < ratio <= MAX_LOAD_RATIO:
         raise BridgeError(
@@ -264,6 +318,11 @@ def settings(value: dict) -> dict:
     if type(floor) is not int or not 0 <= floor <= MAX_AVAILABLE_MIB:
         raise BridgeError(
             f"min_available_mib must be between 0 and {MAX_AVAILABLE_MIB} MiB."
+        )
+    full = result["context_full_percent"]
+    if type(full) not in (int, float) or not 0 < full <= 100:
+        raise BridgeError(
+            "context_full_percent must be above 0 and at most 100."
         )
     for field in (
         "prompts",
@@ -2198,7 +2257,9 @@ def fit(
     is checked first against what the runtime can read locally: the lane's
     state record, its provider capacity, its worktree, and the
     acknowledgements it owes. Each check defaults to no opinion, and only a
-    check that actually failed makes a lane unfit.
+    check that actually failed makes a lane unfit. A lane `quota.held`
+    parks on its credential's quota fails the capacity check, so no new
+    claim is offered to it until the park ends.
 
     The result describes what was observed. It grants nothing, revokes
     nothing, and never moves ownership.
@@ -2248,9 +2309,14 @@ def _fit_reading(
     """
     participant = manifest["participants"][name]
     observed_capacity = capacity(home, directory, manifest, name)
+    capacity_result = _capacity_check(observed_capacity)
+    if capacity_result[0] is not False and (
+        parked_on := quota.held(directory, name)
+    ):
+        capacity_result = (False, f"is {parked_on['cause']}")
     results = {
         "session": _session_check(home, manifest["root"], name),
-        "capacity": _capacity_check(observed_capacity),
+        "capacity": capacity_result,
         "worktree": _worktree_check(participant),
         "mail": _mail_check(
             home, directory, manifest, name, after, inactive_after
@@ -3471,6 +3537,118 @@ def configuration(home: Path, manifest: dict) -> dict:
     config["prompts"] = config["prompts"] and global_config["prompts"]
     config["reclaim"] = config["reclaim"] and global_config["reclaim"]
     return config
+
+
+def cache_action(
+    adapter: str, idle: float, tokens: int | None, config: dict
+) -> str:
+    """Chooses how a lane idle past its prompt cache comes back.
+
+    A native prompt cache lasts about an hour and the wake backoff reaches
+    `WAKE_BACKOFF_CEILING`, so a lane woken after ``cache_window`` seconds
+    would re-read its whole transcript uncached. A session whose recorded
+    tokens stay below ``cache_restart_tokens`` resumes as before, because
+    re-reading a small context costs less than a fresh bootstrap. A larger
+    one, one whose tokens cannot be read, one whose policy is not
+    ``sized`` because its client counts a running session late or never,
+    and any adapter `CACHE_POLICIES` does not name restart as a fresh
+    native session seeded from the lane's
+    checkpoint, since every client starts one by leaving out its resume
+    argument. The policy's ``compact`` command is named for the operator
+    only: compacting after the cache expired re-reads the same uncached
+    transcript, so the wake path never types it.
+
+    Args:
+        adapter: Native client adapter driving the lane.
+        idle: Seconds since the lane's last recorded hook event.
+        tokens: Tokens the lane's current session recorded, or None.
+        config: Resolved supervision settings.
+
+    Returns:
+        `CACHE_RESUME` or `CACHE_RESTART`.
+    """
+    policy = CACHE_POLICIES.get(adapter, FALLBACK_CACHE_POLICY)
+    if idle < config["cache_window"]:
+        return CACHE_RESUME
+    if (
+        policy["resume"]
+        and policy["sized"]
+        and tokens is not None
+        and tokens < config["cache_restart_tokens"]
+    ):
+        return CACHE_RESUME
+    return CACHE_RESTART
+
+
+def cache_rotation(
+    home: Path, directory: Path, name: str, now: float | None = None
+) -> dict | None:
+    """Records a rotation point on a lane whose prompt cache expired.
+
+    The point has the shape a ready or blocked report leaves, with the
+    outcome `CACHE_ROTATION` and no issue, so the existing rotation path
+    carries it: a detached launcher ends the idle session on the admitted
+    wake and the resume that follows starts a fresh session through
+    `launch.rotation_task`. Nothing is recorded when ``rotate`` is off,
+    when `cache_action` keeps the session, or when a hook event moved the
+    record while the transcript was read. A point already recorded is
+    returned unchanged.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        now: Instant to judge idleness at, the current time by default.
+
+    Returns:
+        The rotation point in force, or None when the lane keeps its
+        session.
+    """
+    now = time.time() if now is None else now
+    path = directory / f"{name}-activity.json"
+    try:
+        manifest = roster.read(directory)
+        config = configuration(home, manifest)
+        state = json.loads(path.read_text())
+        if not config["rotate"]:
+            return None
+        if state.get("rotation"):
+            return dict(state["rotation"])
+        updated = state.get("updated")
+        if type(updated) not in (int, float):
+            return None
+        idle = now - float(updated)
+        if idle < config["cache_window"]:
+            return None
+        participant = manifest["participants"][name]
+        adapter = str(
+            roster.provider(home, str(participant["provider"]))["adapter"]
+        )
+        sized = CACHE_POLICIES.get(adapter, FALLBACK_CACHE_POLICY)["sized"]
+        tokens = (
+            records.reported_tokens(home, participant, {}, whole=True)
+            if sized
+            else None
+        )
+        if cache_action(adapter, idle, tokens, config) != CACHE_RESTART:
+            return None
+        with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+            current = json.loads(path.read_text())
+            if current.get("updated") != updated:
+                return None
+            point = {
+                "at": now,
+                "issue": "",
+                "outcome": CACHE_ROTATION,
+                "session": str(current.get("session_id") or ""),
+                "idle": round(idle),
+                "tokens": tokens,
+            }
+            current["rotation"] = point
+            write_json(path, current)
+            return point
+    except (BridgeError, KeyError, OSError, TypeError, ValueError):
+        return None
 
 
 def opt_in_missing(home: Path, manifest: dict, name: str) -> bool:
@@ -8678,6 +8856,7 @@ def _poll(home: Path, directory: Path) -> None:
     )
     stage("lane accounting", account_lanes, home, directory, manifest)
     stage("run budget", budgets.account, home, directory, manifest)
+    stage("quota", quota.account, home, directory, manifest, published_capacity)
     observations = recorded_observations(home, manifest, observations)
     stage("presence", _publish_presence, home, manifest, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
@@ -8899,7 +9078,9 @@ def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
 
     The queue is discarded only after the transaction that applied it
     commits. A store that is busy raises out of this stage, so the queue is
-    kept and applied, still in order, at the next poll.
+    kept and applied, still in order, at the next poll. Every lane the queue
+    showed blocked then has its turn recapped by `recaps.ensure`, so the
+    operator surfaces can say what the lane did before it stopped.
 
     Args:
         home: Private bridge state root.
@@ -8912,6 +9093,15 @@ def settle_evidence(home: Path, directory: Path, manifest: dict) -> None:
     with store.connect(home, write=True) as db:
         lanes.apply(db, manifest["root"], items)
     lanes.settled(directory)
+    participants = manifest.get("participants") or {}
+    blocked = {
+        str(item.get("lane", ""))
+        for item in items
+        if item.get("state") == lanes.BLOCKED
+    }
+    for name in sorted(blocked):
+        if participant := participants.get(name):
+            recaps.ensure(home, directory, name, participant)
 
 
 def settle_lanes(
@@ -9780,7 +9970,10 @@ def _wake_block(
     named a reset still ahead, because the attempt after that reset is itself
     the evidence that the lane is back. An exhaustion that named no reset is
     given one by `exhaustion_probe_due`, so a lane parked on a usage-limit
-    dialog is probed on a bounded backoff instead of never.
+    dialog is probed on a bounded backoff instead of never. A lane
+    `quota.held` parks because another lane on its credential reached a
+    rate limit, or its credential's recorded window is nearly spent, is
+    deferred the same way to the time that park ends.
 
     Every other cause is read from the lane state record, never from the
     activity file. A lane recorded `blocked` is deferred under its named
@@ -9839,6 +10032,8 @@ def _wake_block(
         and float(reset_at) > time.time()
     ):
         return reason, float(reset_at)
+    if parked_on := quota.held(directory, name):
+        return parked_on["cause"], float(parked_on["until"])
     if held := denials.waiting(directory, name):
         return f"blocked: {denials.CAUSE} ({held['id']})", 0.0
     lane = observed.get("record") or {}
@@ -10274,6 +10469,11 @@ def wake(
     not given another lane: the attempt is recorded as `HOST_LOADED` with
     the numbers, a busy refusal that spends no attempt, and the launch is
     deferred to a later poll instead of refused.
+    A lane that handed its wait to the service through `waits.hand_off`
+    needs no reason of its own: the mail, handoff offer or pull request
+    notice it waits for is already a backlog reason above. An accepted wake
+    or a started resume marks that wait woken through `waits.woke`, so
+    `status` reads when the service gave the lane its turn back.
     Nothing reads, acknowledges, releases, accepts or transfers work for the
     lane; waking only asks the lane to take its own turn.
 
@@ -10556,6 +10756,8 @@ def wake(
                 ),
             },
         )
+        if result == "accepted" or result.startswith("resume requested"):
+            waits.woke(home, root, participant["display"], now)
         if work_offer and not spent_before:
             _write_work_dispatch(
                 directory,

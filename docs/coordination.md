@@ -177,6 +177,30 @@ enumerated reason and lands in that participant's event log; every served call
 is recorded inside the transaction that carried its effect. That is why `top`
 can show what was denied, to whom, and how often.
 
+## Follow-up work is suggested, never self-filed
+
+A lane that notices work outside its issue sends mail to `@followup`: the
+`subject` is the title, `body_md` is the why, and any further `to` entries are
+repository paths. A participant name never starts with `@`, so the address
+reaches no lane, and it rides `send_message` because every lane pays for each
+served tool in every session. The call records the
+suggestion in `followups.json` beside the issue ledger and returns at once:
+it files no issue, offers nothing and starts no lane, so the lane keeps the
+work it holds and its scope does not grow. The result lists the open issues
+and claims the title may duplicate, matched on shared title words against the
+ledger's live claims and the open issues supervision last read from the forge.
+A repeat of the same title from the same lane returns the recorded suggestion.
+
+Only the operator turns a suggestion into work. `agent-parley followup list`
+shows the pending ones with their duplicates, and `agent-parley followup
+accept ID` files the forge issue in the active milestone, then offers it to a
+running lane that holds no claim and has no offer waiting, through the same
+operator offer `issue assign` records. With no idle lane, the issue stays
+unclaimed for the next lane that pulls work. Each suggestion also opens an
+operator decision, so a configured Telegram digest carries an `accept` button
+that takes a confirming tap. A suggestion nobody accepts expires after seven
+days. The tool is served over MCP like every other, so every provider has it.
+
 ## A deadline reports until the holder stops working
 
 `issue claim 42 --within 2h`, `issue offer ... --within 30m` and

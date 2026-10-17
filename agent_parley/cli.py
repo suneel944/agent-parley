@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         completion,
         convergence,
         evidence,
+        followups,
         forge,
         history,
         inbound,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
         problems,
         process,
         protocol,
+        recaps,
         reclaim,
         recommend,
         roster,
@@ -125,6 +127,7 @@ if TYPE_CHECKING:
 
 from agent_parley import BridgeError, refusal
 from agent_parley.claims import ClaimsMixin
+from agent_parley.context import diff_cell, location_cell, window_cell
 from agent_parley.integration import IntegrationMixin
 from agent_parley.launch import LaunchMixin
 from agent_parley.settings import SettingsMixin
@@ -143,6 +146,7 @@ DEFERRED_MODULES = (
     "delivery",
     "dialogs",
     "evidence",
+    "followups",
     "forecast",
     "forge",
     "gemini",
@@ -159,6 +163,7 @@ DEFERRED_MODULES = (
     "problems",
     "process",
     "protocol",
+    "recaps",
     "reclaim",
     "recommend",
     "retries",
@@ -438,6 +443,33 @@ def clock(text: str) -> float:
     return target.timestamp()
 
 
+def instant(text: str) -> float:
+    """Converts the start of a reporting window into a Unix time.
+
+    Args:
+        text: An ISO 8601 instant such as ``2026-10-15T09:01:00Z``, read in
+            the machine's timezone when it carries no offset, or a window
+            such as ``24h`` or ``7d`` counted back from now.
+
+    Returns:
+        The instant the window starts.
+
+    Raises:
+        ValueError: If the text is neither an instant nor a window.
+    """
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        pass
+    try:
+        return time.time() - duration(text)
+    except ValueError:
+        raise ValueError(
+            f"{text!r} is not an instant or a window; use "
+            "2026-10-15T09:01:00Z or 7d."
+        ) from None
+
+
 def repeat_plan(
     after: float | None,
     at: float | None,
@@ -535,6 +567,8 @@ class Selection(NamedTuple):
         over_budget: Report only lanes over any of their advisory token,
             call or hour limits.
         issue: Issue number a lane must hold or be offered.
+        workspace: Recorded project roots of a named workspace; every
+            project when empty.
     """
 
     participant: str = ""
@@ -547,6 +581,7 @@ class Selection(NamedTuple):
     since: float = 0.0
     over_budget: bool = False
     issue: int = 0
+    workspace: tuple[str, ...] = ()
 
     def filtered(self) -> bool:
         """Reports whether the operator narrowed the reading at all."""
@@ -585,7 +620,9 @@ class Selection(NamedTuple):
         return " ".join(applied)
 
     def holds_project(self, root: str) -> bool:
-        """Reports whether one project root satisfies the project filter."""
+        """Reports whether one project root satisfies the project filters."""
+        if self.workspace and root not in self.workspace:
+            return False
         if not self.project:
             return True
         return root in (
@@ -915,6 +952,56 @@ def reported_lanes(report: dict) -> int:
     return sum(len(project["participants"]) for project in report["projects"])
 
 
+def recap_lines(
+    directory: Path, name: str, now: float | None = None
+) -> list[str]:
+    """Renders the stored turn recap of one lane for its detail reading.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        now: Unix time to age the recap against, or None for the clock.
+
+    Returns:
+        Indented lines naming the recap's age and its content, or no lines
+        when the lane has no stored recap.
+    """
+    recap = recaps.lane_recap(directory, name)
+    text = recaps.format_recap(recap, recaps.MAX_RECAP_BYTES)
+    if not recap or not text:
+        return []
+    moment = time.time() if now is None else now
+    age = max(int(moment - float(recap.get("at", moment))), 0)
+    return [f"    Recap taken {age}s ago:"] + [
+        f"      {line}" for line in text.splitlines()
+    ]
+
+
+PLAN_MARKS = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}
+
+
+def plan_lines(plan: dict | None) -> list[str]:
+    """Lists a lane's recorded task plan with completed steps checked.
+
+    Args:
+        plan: Plan as `lanes.lane_task_plan` reads it, or None.
+
+    Returns:
+        The indented lines to print under the lane's detail; none when the
+        lane recorded no plan.
+    """
+    if plan is None:
+        return []
+    lines = [f"    Task plan (from {plan['source']}):"]
+    lines += [
+        f"      {PLAN_MARKS[item['status']]} {item['text']}"
+        for item in plan["items"]
+    ]
+    if plan["truncated"]:
+        lines.append("      (clipped to the plan cap)")
+    return lines
+
+
 def lane_detail(record: dict, data: dict) -> None:
     """Prints one lane's full reading under its table row.
 
@@ -1002,6 +1089,12 @@ def lane_detail(record: dict, data: dict) -> None:
         f"{record.get('injected_per_hour', 0)} bytes per hour over the "
         "last day"
     )
+    print(
+        f"    Context window: {window_cell(record)}; diff "
+        f"{diff_cell(record)}; runs at {location_cell(record)}"
+    )
+    if paths := record.get("diff_paths"):
+        print(f"    Changed files: {', '.join(paths)}")
     if record["report_age_seconds"] is not None:
         print(f"    Report age: {record['report_age_seconds']}s")
     if record["summary"]:
@@ -3191,8 +3284,10 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "followup",
             "mail",
             "say",
+            "ask",
             "decide",
             "decision",
             "report",
@@ -3218,6 +3313,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "resources",
             "provider",
             "credentials",
+            "quota",
         ),
     ),
     (
@@ -3242,6 +3338,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "down",
             "setup",
             "run",
+            "projects",
+            "workspace",
             "plan",
             "state",
             "store",
@@ -3892,6 +3990,40 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "up", help="Start the local coordination server in the background."
     )
     starting.add_argument("--json", action="store_true", help=JSON_HELP)
+    starting.add_argument(
+        "--workspace",
+        metavar="NAME",
+        default="",
+        help=(
+            "Also resume, each in a detached launcher, the stopped lanes of "
+            "every project this recorded workspace groups."
+        ),
+    )
+    listing = commands.add_parser(
+        "projects",
+        help="List registered projects, most recently used first.",
+    )
+    listing.add_argument("--json", action="store_true", help=JSON_HELP)
+    grouping = commands.add_parser(
+        "workspace",
+        help="Record, list or forget named groups of projects.",
+    )
+    groups = grouping.add_subparsers(dest="action")
+    groups.add_parser("list", help="List every recorded workspace.")
+    recording = groups.add_parser(
+        "set", help="Record a workspace, replacing one of the same name."
+    )
+    recording.add_argument("name", help="Workspace name.")
+    recording.add_argument(
+        "projects",
+        nargs="+",
+        metavar="PROJECT",
+        help="Project name `projects` lists, or its root path.",
+    )
+    forgetting = groups.add_parser(
+        "remove", help="Forget a workspace; its projects stay registered."
+    )
+    forgetting.add_argument("name", help="Workspace name.")
     stopping = commands.add_parser(
         "down",
         help="Stop the coordination server; retain all data and worktrees.",
@@ -3921,6 +4053,12 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Report every project, not only the one the working directory "
             "belongs to, with dormant projects listed last."
         ),
+    )
+    health.add_argument(
+        "--workspace",
+        metavar="NAME",
+        default="",
+        help="Report every project this recorded workspace groups.",
     )
     health.add_argument(
         "--table",
@@ -4104,6 +4242,26 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "6h or 7d. The whole retained log is counted by default."
         ),
     )
+    readings = measured.add_subparsers(dest="reading")
+    delivered = readings.add_parser(
+        "throughput",
+        help=(
+            "Report what each project and lane delivered since an instant: "
+            "merged issues, lane-hours, tokens, operator touches and waits."
+        ),
+    )
+    delivered.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        required=True,
+        metavar="TIME",
+        help=(
+            "Start of the window, such as 2026-10-15T09:01:00Z, or a window "
+            "counted back from now, such as 7d."
+        ),
+    )
+    delivered.add_argument("--json", action="store_true", help=JSON_HELP)
     follow = commands.add_parser(
         "watch",
         help=(
@@ -4346,7 +4504,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     run.add_argument(
         "--credentials", help="Credential profile selecting one account."
     )
-    run.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    target = run.add_mutually_exclusive_group()
+    target.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    target.add_argument(
+        "--project",
+        metavar="NAME",
+        default="",
+        help=(
+            "Registered project to launch in instead of the working "
+            "directory's, by the name `projects` lists or its root."
+        ),
+    )
     run.add_argument(
         "--resume",
         action="store_true",
@@ -4525,6 +4693,24 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     add_say_arguments(steer)
+    asking = commands.add_parser(
+        "ask",
+        help=(
+            "Ask a lane a side question from a separate read-only session; "
+            "the lane's session and context are untouched."
+        ),
+    )
+    asking.add_argument("participant", help="Lane the question is about.")
+    asking.add_argument("question", help="The question to answer.")
+    asking.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    asking.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help=(
+            "Answer from the lane's checkpoint even where the provider can "
+            "fork the lane's session."
+        ),
+    )
     issue = commands.add_parser(
         "issue", help="Claim issues and explicitly hand off ownership."
     )
@@ -4762,6 +4948,42 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     inspecting.add_argument("--json", action="store_true", help=JSON_HELP)
+    following = commands.add_parser(
+        "followup",
+        help="Review follow-up work lanes suggested, and file what you accept.",
+    )
+    followup_actions = following.add_subparsers(dest="action", required=True)
+    listing_followups = followup_actions.add_parser(
+        "list",
+        help="List pending suggestions with the open issues they duplicate.",
+    )
+    accepting = followup_actions.add_parser(
+        "accept",
+        help=(
+            "File one suggestion as an issue in the active milestone and "
+            "offer it to an idle lane."
+        ),
+    )
+    accepting.add_argument("id", help="Suggestion identifier, such as f3.")
+    accepting.add_argument(
+        "--milestone",
+        default="",
+        metavar="TITLE",
+        help="Milestone to file under; the active open milestone if omitted.",
+    )
+    accepting.add_argument(
+        "--to",
+        default="",
+        metavar="LANE",
+        help="Lane to offer the issue to; an idle running lane if omitted.",
+    )
+    for followup_parser in (listing_followups, accepting):
+        followup_parser.add_argument(
+            "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+        )
+        followup_parser.add_argument(
+            "--json", action="store_true", help=JSON_HELP
+        )
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -5020,6 +5242,27 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                 default=[],
                 help="What supports the change; repeatable.",
             )
+    updating = steps.add_parser(
+        "update",
+        help="Replace this lane's own task list, which only the operator sees.",
+    )
+    updating.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    updating.add_argument(
+        "step",
+        nargs="*",
+        metavar="STATUS:TEXT",
+        help=(
+            "One step, where STATUS is pending, in_progress or completed; "
+            "give the whole list each time."
+        ),
+    )
+    updating.add_argument(
+        "--stdin",
+        action="store_true",
+        help='Read the list as JSON, [{"step": "...", "status": "..."}].',
+    )
     mail = commands.add_parser(
         "mail",
         help=(
@@ -6022,6 +6265,46 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Variable the launching shell must export; repeatable.",
     )
     profile.add_argument("--json", action="store_true", help=JSON_HELP)
+    quotas = commands.add_parser(
+        "quota",
+        help=(
+            "Show each credential's quota headroom or record its window; "
+            "lanes near the window park until it resets."
+        ),
+    )
+    quota_actions = quotas.add_subparsers(dest="action", required=True)
+    quota_show = quota_actions.add_parser(
+        "show", help="Show remaining headroom per credential profile."
+    )
+    quota_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    quota_show.add_argument("--json", action="store_true", help=JSON_HELP)
+    quota_set = quota_actions.add_parser(
+        "set", help="Record one credential's window length and token limit."
+    )
+    quota_set.add_argument("name", help="Credential profile the plan uses.")
+    quota_set.add_argument(
+        "--hours",
+        type=float,
+        default=0.0,
+        help="Length of the plan's usage window in hours.",
+    )
+    quota_set.add_argument(
+        "--tokens",
+        type=int,
+        required=True,
+        help="Native tokens the plan allows per window; 0 removes it.",
+    )
+    quota_set.add_argument(
+        "--threshold",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of the limit at which every lane but the "
+            "highest-priority one parks; 1 parks only at the limit."
+        ),
+    )
     parser.epilog = command_help(commands)
 
 
@@ -6192,7 +6475,17 @@ def main() -> int:
     try:
         bridge = Bridge(args.home)
         if args.command == "up":
+            from agent_parley import projects
+
+            roots = (
+                projects.members(bridge.home, args.workspace)
+                if args.workspace
+                else []
+            )
             bridge.up()
+            started = {
+                root: projects.start_lanes(bridge.home, root) for root in roots
+            }
             print(
                 views.render(
                     "up",
@@ -6200,6 +6493,7 @@ def main() -> int:
                         "url": f"{bridge.url}/mcp/",
                         "state_directory": str(bridge.home),
                         "ready": bridge.ready(),
+                        **({"lanes": started} if args.workspace else {}),
                     },
                 )
                 if args.json
@@ -6208,6 +6502,39 @@ def main() -> int:
                     notify.reported(notify.environment(bridge.home)),
                     inbound_status(bridge.home),
                 )
+                + "".join(
+                    f"\n{root}\n"
+                    + "".join(
+                        f"  {name}: {outcome}\n"
+                        for name, outcome in outcomes.items()
+                    )
+                    for root, outcomes in started.items()
+                )
+            )
+        elif args.command == "projects":
+            from agent_parley import projects
+
+            known = projects.listed(bridge.home)
+            print(
+                views.render("projects", {"projects": known})
+                if args.json
+                else projects.describe(known)
+            )
+        elif args.command == "workspace":
+            from agent_parley import projects
+
+            if args.action == "set":
+                projects.set_workspace(bridge.home, args.name, args.projects)
+            elif args.action == "remove":
+                projects.remove_workspace(bridge.home, args.name)
+            grouped = projects.workspaces(bridge.home)
+            print(
+                "\n".join(
+                    f"{name}: {', '.join(members)}"
+                    for name, members in sorted(grouped.items())
+                )
+                or "No workspaces; `agent-parley workspace set NAME "
+                "PROJECT...` records one."
             )
         elif args.command == "down":
             bridge.down()
@@ -6292,6 +6619,12 @@ def main() -> int:
                     lambda: problems.lines(bridge.problems()),
                     args.everything,
                 )
+        elif args.command == "metrics" and args.reading == "throughput":
+            reading = metrics.throughput(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_throughput(reading), end="")
         elif args.command == "metrics":
             from agent_parley import dashboard
 
@@ -6397,6 +6730,10 @@ def main() -> int:
 
             repository = args.repo.resolve()
             registered = bridge.setup(repository)
+            from agent_parley import projects
+
+            with contextlib.suppress(BridgeError, OSError):
+                projects.touch(bridge.home, registered["root"])
             if args.verify_command is not None:
                 bridge.verification(repository, args.verify_command)
             if args.init_command is not None:
@@ -6415,6 +6752,14 @@ def main() -> int:
                 )
             )
         elif args.command == "run":
+            from agent_parley import projects
+
+            if args.project:
+                args.repo = Path(projects.resolve(bridge.home, args.project))
+            used = bridge.project_at(args.repo.resolve())
+            if used:
+                with contextlib.suppress(BridgeError, OSError):
+                    projects.touch(bridge.home, used)
             status = bridge.launch(
                 args.participant,
                 args.repo.resolve(),
@@ -6504,6 +6849,13 @@ def main() -> int:
             args.command == "mail" and args.action == "send"
         ):
             return spoken(bridge, parser, args)
+        elif args.command == "ask":
+            return bridge.ask(
+                args.participant,
+                args.repo.resolve(),
+                args.question,
+                checkpoint=args.checkpoint,
+            )
         elif args.command == "issue" and args.action == "show":
             detail = bridge.issue_reading(args.repo.resolve(), args.number)
             print(
@@ -6559,6 +6911,25 @@ def main() -> int:
                         withdraw=args.unassign,
                     )
                 )
+            )
+        elif args.command == "followup" and args.action == "list":
+            suggested = bridge.followup_list(args.repo.resolve())
+            print(
+                views.render("followup_list", {"suggestions": suggested})
+                if args.json
+                else followups.render(suggested)
+            )
+        elif args.command == "followup" and args.action == "accept":
+            accepted = bridge.followup_accept(
+                args.repo.resolve(),
+                args.id,
+                milestone=args.milestone,
+                to=args.to,
+            )
+            print(
+                views.render("followup_accept", accepted)
+                if args.json
+                else followups.accepted_text(accepted)
             )
         elif args.command == "issue" and args.action == "resolve":
             ended = bridge.issue_resolve(
@@ -6740,6 +7111,16 @@ def main() -> int:
                 else notification_report(probed)
             )
             return 0 if all(item["ok"] for item in probed["results"]) else 1
+        elif args.command == "plan" and args.action == "update":
+            recorded = bridge.task_plan(
+                args.repo.resolve(),
+                args.step,
+                sys.stdin.read() if args.stdin else "",
+            )
+            clipped = (
+                " (clipped to the plan cap)" if recorded["truncated"] else ""
+            )
+            print(f"Recorded {len(recorded['items'])} plan steps{clipped}.")
         elif args.command == "plan" and args.action in (
             "propose",
             "approve",
@@ -6839,6 +7220,12 @@ def main() -> int:
             else:
                 _, directory = bridge.project(repository, create=False)
                 lane_detail(record, roster.read(directory))
+                for line in recap_lines(directory, args.name):
+                    print(line)
+                for line in plan_lines(
+                    lanes.lane_task_plan(directory, args.name)
+                ):
+                    print(line)
         elif args.command == "decide":
             recorded = bridge.decide(
                 args.repo.resolve(), args.text, args.subject, args.key
@@ -7263,6 +7650,26 @@ def main() -> int:
                     terminal_width(),
                 )
             )
+        elif args.command == "quota":
+            from agent_parley import quota
+
+            if args.action == "set":
+                recorded = quota.set_window(
+                    bridge.home,
+                    args.name,
+                    args.hours,
+                    args.tokens,
+                    args.threshold,
+                )
+                print(json.dumps({args.name: recorded.get(args.name)}))
+            else:
+                _, directory = bridge.project(args.repo.resolve(), create=False)
+                rows = quota.headroom(quota.read(directory), time.time())
+                print(
+                    views.render("quota", {"credentials": rows})
+                    if args.json
+                    else "\n".join(quota.lines(rows))
+                )
         elif args.command == "credentials" and args.action == "show":
             profile_shown = views.credential_detail(
                 args.name, roster.credential(bridge.home, args.name)
@@ -7365,12 +7772,21 @@ def main() -> int:
             )
         else:
             selection = selected_status(args)
+            workspace = getattr(args, "workspace", "")
+            if workspace:
+                from agent_parley import projects
+
+                selection = selection._replace(
+                    workspace=tuple(projects.members(bridge.home, workspace))
+                )
             if args.json:
                 narrowed = narrow(bridge.status_snapshot(), selection)
                 print(views.render("status", narrowed))
                 matched = reported_lanes(narrowed)
             else:
-                every_project = getattr(args, "all_projects", False)
+                every_project = bool(workspace) or getattr(
+                    args, "all_projects", False
+                )
                 if not selection.project and not every_project:
                     selection = selection._replace(
                         project=bridge.project_at(Path.cwd())

@@ -195,7 +195,7 @@ def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
         "",
     )
 
-    with pytest.raises(BridgeError, match="must remain claimed"):
+    with pytest.raises(BridgeError, match="must remain claimed") as refused:
         issues.change(
             tmp_path,
             "codex",
@@ -203,12 +203,36 @@ def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
             "9",
             participants={"codex"},
         )
+    assert "Keep issue #9 and merge it" in str(refused.value)
+    assert "partial or blocked" in str(refused.value)
+    assert refused.value.next_command == (
+        "agent-parley participant merge codex --issue 9"
+    )
 
     record = issues.snapshot(tmp_path)["issues"]["9"]
     assert record["owner"] == "codex"
     assert record["claim_id"] == current["claim_id"]
     assert record["execution"]["state"] == lifecycle.READY
     assert record["execution"]["commit"] == "e" * 40
+
+
+def test_unowned_selection_names_its_holder_and_the_next_command(tmp_path):
+    claim(tmp_path, "9", agent="claude")
+    claim(tmp_path, "11")
+
+    with pytest.raises(BridgeError) as held:
+        issues.exact_claim(tmp_path, "codex", "9")
+    assert str(held.value) == (
+        "Issue #9 is not owned by codex; claude owns it. codex owns #11."
+    )
+    assert held.value.next_command == "agent-parley issue request 9"
+
+    with pytest.raises(BridgeError) as free:
+        issues.exact_claim(tmp_path, "codex", "12")
+    assert str(free.value) == (
+        "Issue #12 is not owned by codex; it is unclaimed. codex owns #11."
+    )
+    assert free.value.next_command == "agent-parley issue claim 12"
 
 
 def test_old_generation_and_closed_pull_request_cannot_complete_new_claim(

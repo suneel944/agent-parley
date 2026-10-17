@@ -144,6 +144,7 @@ BODY_FIELDS = (
     "offer",
     "dialog",
     "detail",
+    "bucket",
 )
 
 _THREADS: list[threading.Thread] = []
@@ -923,6 +924,34 @@ def _decide(
     return record["id"]
 
 
+def _bucket(directory: Path, agent: str, event: Event) -> str:
+    """Words the bucket a notified lane is in, as the views word it.
+
+    Every notification opens or refreshes a decision for its lane, so the
+    lane needs input; the line counts that decision with the lane's other
+    open ones and ages the wait from the oldest, through the one bucket
+    function `status`, `top` and the web view use.
+
+    Args:
+        directory: Private project state directory.
+        agent: Lane the notification reports on.
+        event: Notification being sent.
+
+    Returns:
+        Text such as ``needs input: 2 decisions 4m``.
+    """
+    from agent_parley import status
+
+    waiting = [
+        record
+        for record in decisions.list_open(directory)
+        if record.get("lane") == agent
+    ]
+    if not any(record.get("kind") == event.value for record in waiting):
+        waiting.append({"kind": event.value, "created": time.time()})
+    return status.bucket_cell(status.lane_bucket({"decisions": waiting}))
+
+
 def deliver(
     directory: Path, agent: str, event: Event, fields: Mapping[str, object]
 ) -> str:
@@ -970,7 +999,13 @@ def deliver(
             _SENDING.discard(sending)
         return ""
     text = compose(
-        event.value, {**dict(fields), "lane": agent, "event": event.value}
+        event.value,
+        {
+            **dict(fields),
+            "lane": agent,
+            "event": event.value,
+            "bucket": _bucket(directory, agent, event),
+        },
     )
     thread = threading.Thread(
         target=_report,

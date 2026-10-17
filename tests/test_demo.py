@@ -207,6 +207,6 @@ def test_every_demo_tool_call_matches_its_server_schema():
     for tool_name, keys in calls:
         schema = schemas[tool_name]
         properties = set(schema["properties"])
-        required = set(schema["required"])
+        required = set(schema.get("required", []))
         assert keys <= properties, (tool_name, keys, properties)
         assert required <= keys, (tool_name, keys, required)

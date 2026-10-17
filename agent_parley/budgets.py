@@ -58,6 +58,57 @@ READINGS: dict = {}
 READING = threading.Lock()
 
 
+def ask_directory(directory: Path, name: str) -> Path:
+    """Names the private directory a lane's side questions run in.
+
+    `agent-parley ask` starts its side session here rather than in the lane
+    worktree, so supervision never mistakes it for the lane's own client
+    and its native session records sit apart from the lane's. Every reading
+    of that directory counts toward the lane that owns it.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        The side-question directory, which may not exist yet.
+    """
+    return directory / f"{name}-ask"
+
+
+def record_ask(directory: Path, name: str, entry: dict) -> None:
+    """Appends one answered side question to the lane's ask ledger.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+        entry: The question's mode, exit status, seconds and tokens.
+    """
+    with (directory / f"{name}-asks.jsonl").open("a") as ledger:
+        ledger.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def asked(directory: Path, name: str) -> dict:
+    """Totals the side questions a lane's ask ledger holds.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        The number of side questions and the tokens their native clients
+        recorded; a question whose tokens were unreadable adds none.
+    """
+    count = tokens = 0
+    with contextlib.suppress(OSError):
+        for line in (directory / f"{name}-asks.jsonl").read_text().splitlines():
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                entry = json.loads(line)
+                tokens += int(entry.get("tokens") or 0)
+                count += 1
+    return {"count": count, "tokens": tokens}
+
+
 def limits(home: Path, manifest: dict, name: str) -> dict:
     """Resolves the limits that apply to one lane.
 
@@ -122,8 +173,9 @@ def consumption(
 
     Returns:
         Tokens the lane's client recorded, including sessions its own shell
-        started in a worktree it made for a pull request or a sub-task, or
-        None when unreadable or not wanted; calls served for it; hours its
+        started in a worktree it made for a pull request or a sub-task and
+        the tokens its `asked` side questions recorded, or None when
+        unreadable or not wanted; calls served for it; hours its
         recorded session process has been alive, zero when no live session
         is recorded.
     """
@@ -145,6 +197,8 @@ def consumption(
             )
             if added is not None:
                 tokens = (tokens or 0) + added
+        if questions := asked(directory, name)["tokens"]:
+            tokens = (tokens or 0) + questions
     return {
         "tokens": tokens,
         "calls": int(usage.get(participant["display"], {}).get("calls", 0)),
@@ -601,7 +655,9 @@ def _fold(
     recorded for it, so a transcript that stopped growing between polls is
     read to its end. A new transcript is a new source even when it replays
     messages an earlier one recorded, so a resumed session can be counted
-    twice. The fold also records the unmetered lanes and releases the calls
+    twice. The records of a lane's side questions, kept under
+    `ask_directory`, are folded into that lane the same way. The fold also
+    records the unmetered lanes and releases the calls
     reserved by admissions, whose use it has now read.
 
     Args:
@@ -634,7 +690,16 @@ def _fold(
                 home, participant, known, float(ledger["started"])
             )
             unmetered = sources is None
-            for source in sources or []:
+            questions = records.lane_sources(
+                home,
+                {
+                    **participant,
+                    "lane": str(ask_directory(directory, name)),
+                },
+                known,
+                float(ledger["started"]),
+            )
+            for source in (sources or []) + (questions or []):
                 key = prefix + source["key"]
                 ledger["tokens"][key] = max(
                     ledger["tokens"].get(key, 0), source["tokens"]

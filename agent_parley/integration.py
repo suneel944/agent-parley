@@ -330,6 +330,7 @@ class IntegrationMixin(MailMixin):
         *,
         expected: tuple[str, str] | None = None,
         issue: str = "",
+        verified: tuple[str, str] | None = None,
     ) -> str:
         """Runs the gate and merges one lane while its session is excluded.
 
@@ -356,6 +357,11 @@ class IntegrationMixin(MailMixin):
                 lock; None when the caller bound none.
             issue: Claimed issue whose work is merged, or empty to take the
                 lane's only ready claim.
+            verified: Base commit and merged tree a gate already passed
+                outside `merge.lock`, or None. With it the pre-merge gate
+                is replaced by a check that the base is still that commit,
+                and the post-merge gate is skipped when the merge
+                reproduces that tree; any other result is gated as usual.
 
         Returns:
             An account of what was merged.
@@ -363,7 +369,8 @@ class IntegrationMixin(MailMixin):
         Raises:
             BridgeError: If the project requires an operator approval the
                 lane's current ready report does not have, if the claim or
-                source commit differs from ``expected``, if the gate fails,
+                source commit differs from ``expected``, if the base moved
+                from the commit ``verified`` names, if the gate fails,
                 if the base carries an unverified integration this attempt may
                 not continue, or if the merge cannot complete unattended.
         """
@@ -419,7 +426,13 @@ class IntegrationMixin(MailMixin):
                     f"{name}'s claim or ready commit changed after the "
                     "integration was authorized; nothing was merged."
                 )
-            if data["verify"] and held is None:
+            if verified is not None and held is None:
+                if git(root, "rev-parse", "HEAD") != verified[0]:
+                    raise BridgeError(
+                        f"The base moved from {verified[0][:12]} after the "
+                        "candidate was verified; nothing was merged."
+                    )
+            elif data["verify"] and held is None:
                 base_commit = git(root, "rev-parse", "HEAD")
                 verify_base(root, data["verify"])
                 if git(root, "rev-parse", "HEAD") != base_commit or git(
@@ -488,7 +501,11 @@ class IntegrationMixin(MailMixin):
             integrated = git(root, "rev-parse", "HEAD")
             entry["result"] = integrated
             merges.record_integration(directory, entry)
-            if data["verify"]:
+            if data["verify"] and not (
+                verified is not None
+                and held is None
+                and git(root, "rev-parse", "HEAD^{tree}") == verified[1]
+            ):
                 try:
                     verify_base(root, data["verify"], integrated=True)
                 except BridgeError as failure:

@@ -2372,8 +2372,11 @@ def test_a_report_requires_one_claim_and_comments_on_that_issue(
     bridge.issue(claude, "claim", "432")
     bridge.issue(claude, "claim", "433")
 
-    with pytest.raises(BridgeError, match="owns multiple issues"):
+    with pytest.raises(
+        BridgeError, match=r"owns multiple issues \(#432, #433\)"
+    ) as refused:
         bridge.report(claude, "partial", "Halfway", "More to do", "")
+    assert "--issue 432" in str(refused.value)
 
     bridge.report(
         claude,

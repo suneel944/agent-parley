@@ -16,6 +16,7 @@ from typing import Any
 from agent_parley import (
     approvals,
     budgets,
+    decisions,
     lanes,
     metrics,
     plan,
@@ -38,13 +39,33 @@ from agent_parley.checkpoints import (
     participant_liveness,
     read_events,
 )
+from agent_parley.context import (
+    diff_cell,
+    lane_diffstats,
+    lane_fields,
+    location_cell,
+    window_cell,
+)
 from agent_parley.issues import deadline_state, snapshot
+from agent_parley.issues import ended as claim_ended
 from agent_parley.state import BridgeError
+from agent_parley.status import (
+    NEEDS_INPUT,
+    bucket_cell,
+    bucket_of,
+    bucket_order,
+    lane_bucket,
+    plan_cell,
+    plan_reading,
+    recap_note,
+    waiting_recap,
+)
 
 BRANCH_TTL = 5.0
 MAX_PROMPT = 120
 COLUMNS = (
     ("PARTICIPANT", 14),
+    ("BUCKET", 6),
     ("PROVIDER", 16),
     ("STATE", 22),
     ("EVENT", 6),
@@ -54,21 +75,28 @@ COLUMNS = (
     ("MAIL", 9),
     ("LEASES", 9),
     ("CONTEXT", 9),
+    ("WINDOW", 6),
+    ("DIFF", 4),
+    ("LOCATION", 24),
     ("DENIALS", 9),
     ("CALLS", 9),
     ("TOKENS", 9),
     ("IDLE", 8),
     ("UNUSED", 7),
     ("FIT", 8),
+    ("PLAN", 14),
     ("TASK", 4),
 )
 DEFAULT_COLUMNS = (
     "PARTICIPANT",
+    "BUCKET",
     "STATE",
     "BRANCH",
     "ISSUES",
     "MAIL",
     "LEASES",
+    "WINDOW",
+    "DIFF",
     "DENIALS",
     "TOKENS",
     "IDLE",
@@ -80,10 +108,14 @@ DROP_ORDER = (
     "PROVIDER",
     "EVENT",
     "BRANCH",
+    "LOCATION",
     "CONTEXT",
+    "DIFF",
+    "WINDOW",
     "CALLS",
     "TOKENS",
     "UNUSED",
+    "PLAN",
     "TASK",
     "LEASES",
     "FIT",
@@ -94,6 +126,7 @@ DROP_ORDER = (
 )
 SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "PARTICIPANT": lambda row: row["participant"],
+    "BUCKET": lambda row: -(bucket_of(row)["seconds"] or 0),
     "PROVIDER": lambda row: row["provider"],
     "STATE": lambda row: row["state"],
     "EVENT": lambda row: -row["last_event_ts"],
@@ -103,6 +136,11 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "MAIL": lambda row: -_number(row["unread"]),
     "LEASES": lambda row: -row["leases"],
     "CONTEXT": lambda row: -row["injected_bytes"],
+    "WINDOW": lambda row: (
+        -(-1.0 if row["context_percent"] is None else row["context_percent"])
+    ),
+    "DIFF": lambda row: -(row["diff_added"] or 0) - (row["diff_deleted"] or 0),
+    "LOCATION": lambda row: row["worktree"],
     "DENIALS": lambda row: -row["denials"],
     "CALLS": lambda row: -row["calls"],
     "TOKENS": lambda row: -(row["tokens"] or 0),
@@ -111,6 +149,7 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
         -(row.get("accounting") or {}).get("idle_per_lane_hour", -1.0)
     ),
     "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
+    "PLAN": lambda row: -row["task_plan"]["done"],
     "TASK": lambda row: row["prompt"],
 }
 KEYS = (
@@ -131,6 +170,13 @@ LEGEND = (
     "Each lane is one row. A lane that needs you also gets one line in the "
     "notes under the table, marked with !, so the table stays one row per "
     "lane and a monochrome pipe reads the same as colour.",
+    "BUCKET groups the rows: needs input first, with what it waits on and "
+    "the age of the oldest wait, then working, idle and done. A sort "
+    "orders rows inside each bucket only, and a lane moves bucket only "
+    "when its recorded state changes; (inferred) marks a wait the dialog "
+    "watcher or the liveness sample inferred. A lane in needs input also "
+    "gets a last turn note: its last message and the count of failed "
+    "commands and changed files, read from the stored turn recap.",
     "STATE idle means the lane is alive, has served no coordination call "
     "within the configured interval, and holds mail at least that old; its "
     "note names the oldest waiting item. Nothing is revoked and no ownership "
@@ -149,7 +195,7 @@ LEGEND = (
     "budget counts what the client recorded, not spend.",
     "TASK is the lane's last prompt or recorded task, clipped to the "
     "terminal; enter shows it whole. The default columns leave out "
-    "PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and FIT; c or "
+    "PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED and FIT; c or "
     "--columns all shows them.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, +queued requests waiting on those "
@@ -165,7 +211,10 @@ LEGEND = (
     "does not claim to know what the native client was doing inside a "
     "turn. UNUSED is the lane state accounting: idle lane-minutes per "
     "observed lane-hour, then unaccountable claim-minutes, blank before "
-    "the first poll accounts the lane. A branch marked ! left "
+    "the first poll accounts the lane. PLAN is the lane's own task list, "
+    "steps done of all and the step in progress, - before the lane records "
+    "one, n/a when its provider has no path to report one. A branch "
+    "marked ! left "
     "its assigned bridge branch. A lease past a declared time to live is "
     "counted apart from the live ones and still held: it keeps blocking "
     "until its holder renews it at a checkpoint or releases it, and the "
@@ -186,6 +235,13 @@ LEGEND = (
     "context. A message, report or offer above its cap is kept whole as "
     "an attachment and its record carries a reference; the attachment's "
     "size is never counted here, only the reference that named it.",
+    "WINDOW is how full the lane's context window is, as its own client "
+    "recorded it; unknown when its provider records no window size, never "
+    "a guess, and marked ! at or above the context_full_percent setting. "
+    "DIFF is +added/-deleted lines and the files changed since the lane's "
+    "branch forked from the base head, counting commits and uncommitted "
+    "edits to tracked files; - when Git could not answer. LOCATION is the "
+    "host and worktree the lane runs in.",
     "A row carrying drift, a stale lease, a rejected call, an overdue or "
     "orphaned issue or a stopped session is drawn in colour where the "
     "terminal offers it and in bold where it does not. Every one of those "
@@ -308,7 +364,8 @@ def dormant(row: dict) -> bool:
     Returns:
         True when the lane is retired or out of a live state and it owns no
         issue, holds no offer, holds or waits on no lease, has no unread or
-        unacknowledged mail, and no ready report awaits the operator. A lane
+        unacknowledged mail, no ready report awaits the operator, and its
+        bucket is not ``needs input``. A lane
         with a state record is live while that record is in `lanes.LIVE`; a
         lane without one falls back to its session cell reading stopped. A
         mailbox or lease store that could not be read is not dormant, so a
@@ -325,6 +382,7 @@ def dormant(row: dict) -> bool:
         and not row["owned"]
         and not row["offers"]
         and not row["awaiting_approval"]
+        and bucket_of(row)["bucket"] != NEEDS_INPUT
         and row.get("usage_read", True)
         and not row["leases"]
         and not row["queued"]
@@ -421,9 +479,10 @@ def _row(
         mail = {}
     branch = _branch(Path(participant["lane"]), context["branches"])
     condition = context.get("conditions", {}).get(agent)
-    inferred = lanes.inference(
-        lanes.provenance(condition, supervision.hook_gaps(home, participant))
+    provenance = lanes.provenance(
+        condition, supervision.hook_gaps(home, participant)
     )
+    inferred = lanes.inference(provenance)
     liveness = (
         lanes.describe(condition) + (f"; {inferred}" if inferred else "")
         if condition
@@ -443,7 +502,9 @@ def _row(
         home, directory, data, agent, context["usage"], context["records"]
     )
     review = metrics.latest_review(directory, agent) or {}
-    return {
+    asked = budgets.asked(directory, agent)
+    reported_at = state.get("reported_at")
+    row = {
         "participant": agent,
         "provider_name": participant["provider"],
         "alive": process.alive(
@@ -466,6 +527,27 @@ def _row(
             ),
         ),
         "lane_state": condition["state"] if condition else None,
+        "condition": lanes.view(condition),
+        "provenance": provenance,
+        "paused": participant.get("paused", False),
+        "retired_at": participant.get("retired"),
+        "outcome": state.get("outcome", "unknown"),
+        "report_age_seconds": (
+            int(time.time() - float(reported_at)) if reported_at else None
+        ),
+        "decisions": [
+            {
+                "id": item.get("id", ""),
+                "kind": item.get("kind", ""),
+                "created": item.get("created"),
+            }
+            for item in context.get("decisions", [])
+            if item.get("lane") == agent
+        ],
+        "claims": [
+            {"issue": int(number), "ended": claim_ended(issues[number])}
+            for number in owned
+        ],
         "stalled": stalled["stalled"],
         "stall": supervision.stall_marker(stalled),
         "stall_age": tables.idle_age(stalled) if stalled["stalled"] else 0,
@@ -526,6 +608,18 @@ def _row(
         "tokens": records.reported_tokens(
             home, participant, context["records"]
         ),
+        **_cached(
+            context["branches"],
+            ("window", str(participant["lane"])),
+            lambda: lane_fields(
+                home,
+                participant,
+                context["diffstats"].get(agent),
+                context["context_full_percent"],
+            ),
+        ),
+        "side_questions": asked["count"],
+        "side_question_tokens": asked["tokens"],
         "idle_seconds": idle["seconds"],
         "idle_complete": idle["complete"],
         "accounting": (
@@ -551,6 +645,12 @@ def _row(
         ).replace("\n", " ")[:MAX_PROMPT],
         **_blueprint(directory, agent, owned),
     }
+    row["bucket"] = lane_bucket(row)
+    row["recap"] = waiting_recap(directory, row)
+    row["task_plan"] = plan_reading(
+        home, directory, agent, participant["provider"]
+    )
+    return row
 
 
 def _blueprint(directory: Path, agent: str, owned: list) -> dict:
@@ -742,6 +842,7 @@ def collect(
         context = {
             "accounts": accounts,
             "conditions": conditions,
+            "decisions": decisions.list_open(path.parent),
             "usage": usage,
             "usage_read": usage_read,
             "issues": ledger,
@@ -753,6 +854,16 @@ def collect(
             "inactive_after": supervised["inactive_after"],
             "operator_edits": edits if operator_edits else {},
             "base_advances": advances,
+            "context_full_percent": supervised["context_full_percent"],
+            "diffstats": (
+                _cached(
+                    branches,
+                    ("diffstats", data["root"]),
+                    functools.partial(lane_diffstats, data),
+                )
+                if present
+                else {}
+            ),
         }
         rows = [
             _row(home, path.parent, data, agent, context)
@@ -829,6 +940,7 @@ def row_cells(row: dict) -> tuple[str, ...]:
     """
     return (
         row["participant"],
+        bucket_cell(bucket_of(row)),
         row["provider"],
         state_cell(row),
         row["event_age"],
@@ -841,12 +953,16 @@ def row_cells(row: dict) -> tuple[str, ...]:
         + (f"+{row['queued']}" if row["queued"] else "")
         + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
         tables.size(row["injected_bytes"]),
+        window_cell(row),
+        diff_cell(row),
+        location_cell(row),
         f"{row['denials']}/{row['hook_events']}",
         f"{row['calls']}" + (f"!{row['errors']}" if row["errors"] else ""),
         "n/a" if row.get("unmeasured") else _tokens(row["tokens"]),
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _unused(row.get("accounting")),
         _fitness(row),
+        plan_cell(row["task_plan"]),
         row["prompt"] or "-",
     )
 
@@ -921,6 +1037,7 @@ def notes(row: dict) -> list[str]:
     if row["work_dispatch"].get("state") == "escalated":
         found.append(row["work_dispatch"]["last_result"])
     found.append(row.get("blueprint", ""))
+    found.append(recap_note(row))
     return [str(note) for note in found if note]
 
 
@@ -1090,7 +1207,7 @@ def select(
             rows = sorted(rows, key=key)
         if reverse:
             rows = list(reversed(rows))
-        selected.append({**project, "rows": rows})
+        selected.append({**project, "rows": bucket_order(rows)})
     return {
         **view,
         "projects": selected,

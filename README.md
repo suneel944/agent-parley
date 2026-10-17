@@ -238,7 +238,23 @@ agent-parley status   # this project's open work: issue, owner, state, PR
 agent-parley top      # every lane live, including what enforcement denied
 agent-parley problems # only what needs you now, oldest first
 agent-parley say codex "Rebase onto main before you open the pull request."
+agent-parley ask codex "Which test is still failing?"  # read-only, lane untouched
 ```
+
+Work across several repositories, such as a front end and a back end, from
+one terminal. Every project you set up or run in is remembered in the state
+root, never in the repository, and a named workspace groups them:
+
+```sh
+agent-parley projects                      # registered projects, recent first
+agent-parley run codex --project backend   # launch there, not in the cwd
+agent-parley workspace set stack frontend backend
+agent-parley up --workspace stack          # resume the stopped lanes of both
+agent-parley status --workspace stack      # both projects in one view
+```
+
+Each project keeps its own claims, reservations and integration target; lanes
+stay on the local host.
 
 `agent-parley --help` prints the grouped command list; `agent-parley version`
 prints the version and state directory. Single records read through `show`:
@@ -312,6 +328,10 @@ lane setup.
   `max_claims_per_lane` claims, two by default.
 - **Choosing work is a reading, not a guess.** `agent-parley issue next` ranks
   the unclaimed, unblocked issues with a reason for each, and claims nothing.
+- **A lane suggests follow-up work; only you file it.** Mail to `@followup`
+  records the idea with its likely duplicates and the lane keeps working.
+  `agent-parley followup accept ID` files the issue in the active milestone
+  and offers it to an idle lane; `followup list` shows what waits.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
   updates only when coordination state changes. A prompt you type is never
@@ -347,8 +367,8 @@ flowchart TD
     Repo[Your repository] --> Launcher[Agent Parley launcher]
     Launcher --> Claude[Participant · own worktree]
     Launcher --> Codex[Participant · own worktree]
-    Claude <-->|Sixteen scoped MCP tools| Server[Local coordination service]
-    Codex <-->|Sixteen scoped MCP tools| Server
+    Claude <-->|Seventeen scoped MCP tools| Server[Local coordination service]
+    Codex <-->|Seventeen scoped MCP tools| Server
     Server --> DB[(SQLite WAL · mail and reservations)]
     Claude --> Claims[Atomic issue claims and handoffs]
     Codex --> Claims

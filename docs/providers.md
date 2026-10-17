@@ -94,6 +94,32 @@ disk, under the config home the lane launched with. No vendor is asked.
 `agent-parley doctor` lists the providers with and without a token reader on
 its `tokens` line.
 
+### Prompt cache policy
+
+A lane the service wakes or resumes after it sat idle longer than
+`cache_window` comes back by the policy `CACHE_POLICIES` in
+`agent_parley/supervision.py` names for its adapter. A session that recorded
+fewer than `cache_restart_tokens` tokens resumes; a larger one, or one whose
+tokens cannot be read, restarts as a fresh session seeded with the lane's
+branch, claims, reservations, unread mail count and last report, as
+[Running lanes](lanes.md#running-unattended) describes.
+
+| Adapter | Native compact | Resume | Fresh session | Cold wake |
+| --- | --- | --- | --- | --- |
+| `claude` | `/compact` | `--resume ID` | yes | resume if small, else fresh |
+| `codex` | `/compact` | `resume ID` | yes | resume if small, else fresh |
+| `copilot` | none known | `--resume ID` | yes | fresh: live tokens read 0 |
+| `gemini` | `/compress` | `--resume ID` | yes | resume if small, else fresh |
+| `opencode` | `/compact` | `--session ID` | yes | resume if small, else fresh |
+| `amp` | none known | `threads continue ID` | yes | n/a: launch refused |
+| other | none | none | yes | fresh |
+
+The compact column is a record for the operator, not an action: compacting
+after the cache expired re-reads the same uncached transcript, so the wake
+path never types it. A running `copilot` session reads 0 tokens until it
+ends, so its size cannot be judged and a cold `copilot` lane always starts
+fresh.
+
 ### How idle, blocked and prompt states are detected
 
 A lane's state comes from a native hook when its client raises one, and
@@ -120,6 +146,49 @@ question prompt still reaches `problems` as a row for the operator.
 A hook-delivered lane idle at its prompt receives mail only when something
 makes its client raise a hook, such as a wake the service sends; a polled lane
 reads its delivery file on its own interval.
+
+### Asking a lane a side question
+
+`agent-parley ask NAME "QUESTION"` answers from a separate native session
+instead of sending mail, so the lane is not woken and nothing reaches its
+context. The answer prints to your terminal only. Add `--checkpoint` to skip
+the fork.
+
+| Provider | Context the answer starts from | How the client holds it read-only |
+| --- | --- | --- |
+| `claude` | a fork of the lane's recorded session, `--resume ID --fork-session`, which leaves the lane's transcript as it was; the checkpoint when no session is recorded | `-p --permission-mode plan` |
+| `codex` | the lane's checkpoint | `exec --sandbox read-only` |
+| `copilot` | the lane's checkpoint | `-p` with `--deny-tool write --deny-tool shell` |
+| `gemini` | the lane's checkpoint | `-p` with `--approval-mode default`, under which a non-interactive run offers no tool that needs approval |
+| `opencode` | the lane's checkpoint | `run --agent plan` |
+| `amp` | refused | Amp has no native read-only mode |
+
+The checkpoint is the lane's name and worktree, the claims it holds with
+their next action, and its last report, the same context a rotated session
+starts from. Each preset follows its adapter's row. The command lines are
+built in `ask_command` in `agent_parley/launch.py`.
+
+The side session runs under the lane's provider and account, with no
+coordination token, MCP server or hooks. It runs in
+`STATE/projects/PROJECT_KEY/NAME-ask`, a private Git directory outside the
+repository, never in the lane worktree: supervision binds a stopped lane to a
+native client running in its worktree, and Codex runs only in a Git
+directory. Its sessions are recorded there apart from the lane's own, and
+the worktree is read by path. No permission is widened and no bypass flag is
+passed. A refused tool stays refused.
+
+Each question is appended to `NAME-asks.jsonl` with the tokens its client
+recorded. Those tokens count toward the lane's budget, and an enforced run
+budget reads the side sessions' records with the lane's own. A run budget
+that is exhausted refuses `ask`. `agent-parley metrics` reports
+`agent_parley_lane_side_questions_retained` and
+`agent_parley_lane_side_question_tokens_retained`.
+
+Limits: Claude Code must find the forked session by its identifier from the
+side directory. If your client release cannot, it exits with its own error
+and `--checkpoint` answers instead. A forked transcript replays the lane's
+earlier messages, so its tokens can count them again, as a resumed session's
+do.
 
 ## Accounts
 

@@ -15,6 +15,7 @@ from typing import Any
 
 from agent_parley import (
     attachments,
+    children,
     forecast,
     issues,
     protocol,
@@ -3099,7 +3100,11 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
             started,
             len(json.dumps(result, ensure_ascii=False).encode()),
         )
-    if tool == "send_message" and args.get("ack_required"):
+    if (
+        tool == "send_message"
+        and args.get("ack_required")
+        and children.requested(tool, args) is None
+    ):
         with contextlib.suppress(sqlite3.Error):
             _recipient_warnings(home, actor, args, result)
     return result
@@ -3470,11 +3475,46 @@ def _dispatch(
     worktree before it touches the store at all, so it too runs its own steps
     first and then opens one transaction for the mail, the leases and the
     credential it ends with.
+
+    A child spawn creates a worktree and starts a launcher, and a child
+    lane's reservation is checked against the paths it was spawned with,
+    both from the project manifest, so each runs before any transaction.
+    A spawn is a ``send_message`` whose first recipient is the reserved
+    child address, so it is recognized here before recipients are read.
+
+    A follow-up suggestion is mail addressed to ``followups.ADDRESS``. It
+    writes only the project's suggestion record and an operator decision
+    beside the ledger, never the store, so it runs outside the transaction
+    and records its event separately.
     """
+    from agent_parley import followups
+
     if tool == "next_issues":
         return _recommended(home, actor, args)
     if tool == RETIRE:
         return _retire(home, actor, started)
+    child = children.requested(tool, args)
+    if child is not None:
+        spawned = children.spawn(home, actor, child)
+        _observe(
+            home,
+            actor,
+            children.TOOL,
+            "ok",
+            started,
+            len(json.dumps(spawned)),
+        )
+        return spawned
+    to = args.get("to") if tool == "send_message" else None
+    if isinstance(to, list) and to[:1] == [followups.ADDRESS]:
+        suggestion = {
+            "title": args.get("subject"),
+            "why": args.get("body_md"),
+            "paths": to[1:],
+        }
+        return _suggested(home, actor, suggestion, started)
+    if tool in RESERVING:
+        children.confine(home, actor, args.get("paths"))
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool in RESERVING
@@ -3531,6 +3571,83 @@ def _lane_provider(directory: Path, display: str) -> str:
         ),
         "",
     )
+
+
+def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
+    """Records a lane's follow-up suggestion for the operator to accept.
+
+    The suggestion files no issue, offers nothing and starts no lane; it
+    returns at once so the lane keeps working. The operator decision opened
+    beside it carries the Telegram accept button and is best effort: the
+    suggestion stands when that decision cannot be written.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: Tool arguments carrying ``title``, ``why`` and ``paths``.
+        started: Monotonic time the call began, for its event.
+
+    Returns:
+        The suggestion identifier, its state and expiry, whether it was
+        already recorded, the open issues and claims it duplicates and a
+        note that nothing was filed.
+
+    Raises:
+        BridgeError: If the project keeps no state directory, an argument is
+            invalid or the operator already has too many to review.
+    """
+    from agent_parley import decisions, followups
+
+    root = str(actor.get("project", ""))
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        raise BridgeError("This project keeps no issue ledger.")
+    recorded = followups.suggest(
+        directory,
+        actor["name"],
+        args.get("title"),
+        args.get("why"),
+        args.get("paths"),
+    )
+    if not recorded["repeated"]:
+        matched = ", ".join(
+            f"#{item['issue']}" for item in recorded["duplicates"]
+        )
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            opened = decisions.open_or_refresh(
+                directory,
+                project=root,
+                lane="",
+                kind=followups.KIND,
+                key=recorded["id"],
+                question=(
+                    f"{actor['name']} suggests follow-up {recorded['id']}: "
+                    f"{recorded['title']}"
+                ),
+                options=(followups.ACCEPT,),
+                detail=recorded["why"]
+                + (f"\nMay duplicate {matched}." if matched else ""),
+                confirm=(followups.ACCEPT,),
+                ttl=followups.TTL,
+            )
+            followups.link_decision(directory, recorded["id"], opened["id"])
+    result = {
+        "id": recorded["id"],
+        "state": recorded["state"],
+        "expires_at": recorded["expires"],
+        "repeated": recorded["repeated"],
+        "duplicates": recorded["duplicates"],
+        "note": recorded["note"],
+    }
+    _observe(
+        home,
+        actor,
+        followups.TOOL,
+        "ok",
+        started,
+        len(json.dumps(result, ensure_ascii=False).encode()),
+    )
+    return result
 
 
 def _recommended(home: Path, actor: dict, args: dict) -> dict:
@@ -4770,13 +4887,16 @@ def speak(
     *,
     ack: bool = False,
     within: float | None = None,
+    sender: str = OPERATOR,
 ) -> dict:
     """Delivers one supervising operator's message to a registered lane.
 
     The message takes the ordinary send path, so it is deduplicated by its
     key, can require acknowledgement, and is read back beside peer traffic.
     The operator row carries no credential digest, so it never resolves a
-    bearer token and no served session can write in its name.
+    bearer token and no served session can write in its name. A message the
+    package relays for a lane, such as a child lane's result, names that
+    registered lane as its ``sender`` instead.
 
     Args:
         home: Private bridge state root.
@@ -4789,14 +4909,16 @@ def speak(
         within: Seconds the acknowledgement is expected to take, recorded as a
             deadline beside the message. Past it the acknowledgement reads as
             overdue; nothing is escalated, resent or acknowledged for the lane.
+        sender: Identity the message is sent as; the operator by default,
+            otherwise a lane that must already be registered.
 
     Returns:
         The delivered message identifier, carrying ``duplicate`` when this key
         already named exactly this message.
 
     Raises:
-        BridgeError: If the project or the addressed participant is not
-            registered, or the message fails validation.
+        BridgeError: If the project, the addressed participant or a lane
+            sender is not registered, or the message fails validation.
     """
     if not (home / DATABASE).exists():
         raise BridgeError(NO_PROJECT)
@@ -4815,16 +4937,22 @@ def speak(
                 f"{name} has not registered with the coordination store; "
                 "launch that participant once with agent-parley run."
             )
-        db.execute(
-            "INSERT INTO agents(project_id,name) VALUES (?,?) "
-            "ON CONFLICT(project_id,name) DO NOTHING",
-            (project[0], OPERATOR),
-        )
+        if sender == OPERATOR:
+            db.execute(
+                "INSERT INTO agents(project_id,name) VALUES (?,?) "
+                "ON CONFLICT(project_id,name) DO NOTHING",
+                (project[0], OPERATOR),
+            )
         actor = db.execute(
             "SELECT id,project_id,name FROM agents "
             "WHERE project_id=? AND name=?",
-            (project[0], OPERATOR),
+            (project[0], sender),
         ).fetchone()
+        if not actor:
+            raise BridgeError(
+                f"{sender} has not registered with the coordination store; "
+                "launch that participant once with agent-parley run."
+            )
         return _send(
             db,
             dict(actor),
