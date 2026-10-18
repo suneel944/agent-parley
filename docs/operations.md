@@ -177,6 +177,34 @@ recipient, so only the recipient's `issue accept` moves it.
 nobody has answered. An offer that was already accepted is refused, naming the
 lane that holds the issue, because only that lane can hand it on.
 
+### Accepting follow-up work a lane suggested
+
+A lane that finds work outside its issue mails it to `@followup` instead of
+filing it or widening its own scope. Nothing is filed until you accept it:
+
+```bash
+agent-parley followup list
+agent-parley followup accept f3
+agent-parley followup accept f4 --milestone 0.22.0 --to codex
+```
+
+`followup list` prints each pending suggestion with the lane that made it,
+why, the paths it names, when it expires and the open issues or claims whose
+titles it may duplicate. `followup accept ID` files the issue in the active
+milestone, the open one due soonest or else the oldest, and offers it to a
+running lane that holds no claim and has no offer waiting, as `issue assign`
+would. With no idle lane it stays unclaimed for the next lane that pulls work.
+A repeat prints the issue already filed. Filing needs the GitHub forge; a
+refusal leaves the suggestion pending. With Telegram configured, each
+suggestion also arrives as a decision with an `accept` button that takes a
+confirming tap. Unaccepted suggestions expire after seven days.
+
+`followup list --json` prints `kind: followup_list` with `suggestions`, each
+carrying `id`, `lane`, `title`, `why`, `paths`, `created`, `expires`, `state`
+and `duplicates` (`issue`, `title`, `owner`). `followup accept --json` prints
+`kind: followup_accept` with the same fields plus `issue`, `milestone`,
+`offered_to`, `offer_id` and `repeated`.
+
 ### Reading status
 
 `status` answers who is working on which open issue and whether it moves. Run
@@ -2068,6 +2096,8 @@ every project series `project`. The lane families are
 `agent_parley_lane_served_calls_retained`,
 `agent_parley_lane_served_rejections_retained`,
 `agent_parley_lane_tokens_total`,
+`agent_parley_lane_side_questions_retained`,
+`agent_parley_lane_side_question_tokens_retained`,
 `agent_parley_lane_pull_requests_opened_window`,
 `agent_parley_lane_pull_requests_merged_window`,
 `agent_parley_lane_pull_requests_closed_window`,
@@ -2092,7 +2122,9 @@ hook log when no window is given; the pull request families use the last 7
 days instead. The `_retained` families count the tool events the store still
 keeps. Each can fall between two scrapes as old events leave the window, the
 log rotates or the store retires events, so read them as levels rather than
-through `rate()` or `increase()`. `agent_parley_lane_tokens_total` stays a
+through `rate()` or `increase()`. The two side question families count every
+entry in the lane's `agent-parley ask` ledger and ignore `--since`.
+`agent_parley_lane_tokens_total` stays a
 counter: it is the native session's own running count.
 `tokens` is what the native client counted, not billed spend, exactly as the
 `TOKENS` column is.
@@ -2140,6 +2172,41 @@ on an interval until the command is interrupted, and needs `--output`. There is
 no HTTP endpoint and no new port: the file is the interface, and the
 coordination server's loopback listener is unchanged. The command reads the
 same records `top` reads, takes no lock and writes no coordination state.
+
+### Throughput since an instant
+
+```bash
+agent-parley metrics throughput --since 2026-10-15T09:01:00Z
+agent-parley metrics throughput --since 7d --json
+```
+
+`metrics throughput` reports what each project and each lane delivered since
+an instant, so a release can record a baseline and later measure against it.
+`--since` takes an ISO 8601 instant or a window such as `6h` or `7d`. The
+reading comes from the store and native client records only; it calls no
+model and writes nothing.
+
+Per lane it reports:
+
+- merged issues: ledger claims resolved complete by a merged pull request;
+- active, idle, operator-wait and blocked lane-hours, replayed from recorded
+  lane transitions. Active is `starting` or `working`. Operator wait is
+  `blocked` on a `dialog`, `prompt` or `approval` cause. Blocked is any other
+  blocked cause;
+- input and output tokens from the client's own session records, placed in
+  the window by each record's timestamp. OpenCode records one combined total,
+  so its split prints `n/a`;
+- operator touches: recorded approvals, answered decisions, mail the operator
+  sent, and operator `pause --resume` or `restart`;
+- unattributed starts: a lane started again after `stopped` or `dead`. An
+  operator `run` and a service relaunch record the same transition, so these
+  are counted apart and never guessed;
+- merge-queue waits: ready reports, how many still wait for integration, and
+  the hours they waited.
+
+The project total counts a merged issue and an operator message once. A lane
+whose retained transitions start inside the window is named, because its
+hours understate the window; each project keeps its latest 2000 lane events.
 
 ## Participants, providers and accounts
 
@@ -2201,14 +2268,23 @@ The private project manifest accepts `"supervision"` with `interval` (default
 `convergence_repeats` (3 failures, 1 to 100), `convergence_after`
 (14400 seconds), `prompts`, `wake`,
 `reclaim`, `titles`, `rerun_cancelled` and `rotate` (all true), `ci_rounds`
-(2 rounds, 1 to 100), and `fold_after` (86400 seconds), the retention past
+(2 rounds, 1 to 100), `fold_after` (86400 seconds), the retention past
 which a dead lane with no claim and no process is folded out of the default
-`status` and `problems` views. Numeric second values range from 1 to 86400
-seconds. `rotate` false keeps a lane resuming its recorded native session
-after a ready or blocked report instead of starting a fresh one; see
-[Running lanes](lanes.md#running-unattended). `max_load_ratio` (1.5, above 0
+`status` and `problems` views, `cache_window` (3300 seconds) and
+`cache_restart_tokens` (50000 tokens, 0 to 1000000000). Numeric second values
+range from 1 to 86400 seconds. `rotate` false keeps a lane resuming its
+recorded native session after a ready or blocked report, or after its prompt
+cache expired, instead of starting a fresh one; see
+[Running lanes](lanes.md#running-unattended). A service wake or resume of a
+lane idle longer than `cache_window` starts a fresh session when the lane's
+session recorded at least `cache_restart_tokens` tokens; 0 restarts every such
+lane. `max_load_ratio` (1.5, above 0
 and at most 1000) and `min_available_mib` (1024 MiB, 0 to 1048576) set the
-host load gate below.
+host load gate below. `context_full_percent` (80, above 0 and at most 100)
+is the context-window use at or above which a lane counts as full. The use
+is read only where the provider's own session record states the window
+size, which today is Codex; every other lane's use is unknown and never
+counts as full.
 
 ### Host load gate
 

@@ -19,6 +19,9 @@ sender leases the decisions it is about to send, so two processes flushing at
 once do not both send them. The decisions one flush finds due go out
 together, as one digest message carrying one inline keyboard row per
 decision on Telegram and the text reply each takes on every other transport.
+A lane's decision carries the lane's turn recap from `recaps` as its last
+lines, right above the buttons; the recap is added to the message only and
+never stored on the record.
 
 Decisions are recorded only while notifications are configured, so a hook in
 an unconfigured estate pays nothing for them. The record holds no credential:
@@ -55,6 +58,7 @@ KEPT_SETTLED = 200
 CALLBACK_PREFIX = "d"
 CONFIRMED = "y"
 MAX_TEXT_BYTES = 1024
+RECAP_BYTES = 640
 NONCE_BYTES = 3
 OCCURRENCE = "."
 
@@ -654,7 +658,10 @@ def _block(record: Mapping[str, object]) -> str:
 
     Returns:
         The question, the situation detail, its reversibility, the options
-        with the recommended one marked, and the text reply that answers it.
+        with the recommended one marked, the text reply that answers it,
+        and the lane's recap when the send attached one. The recap comes
+        last, so it sits right above the buttons and a body clipped to the
+        message cap loses recap lines before the answers.
     """
     lines = [str(record.get("question", ""))]
     if record.get("detail"):
@@ -672,7 +679,36 @@ def _block(record: Mapping[str, object]) -> str:
         )
     )
     lines.append(f"reply: decide {record['id']} <option> [note]")
+    if record.get("recap"):
+        lines.append(str(record["recap"]))
     return "\n".join(lines)
+
+
+def _recap(directory: Path, pending: Sequence[dict]) -> None:
+    """Attaches each lane decision's recap text for this send only.
+
+    The text is added to the leased copies, never to the stored records,
+    so it reaches the operator's transports and nothing a lane reads.
+
+    Args:
+        directory: Private project state directory.
+        pending: Leased decision copies, changed in place.
+    """
+    from agent_parley import recaps, roster
+
+    try:
+        participants = roster.read(directory)["participants"]
+    except (BridgeError, OSError, ValueError):
+        return
+    for record in pending:
+        lane = str(record.get("lane", ""))
+        if participant := participants.get(lane):
+            record["recap"] = recaps.format_recap(
+                recaps.ensure(
+                    directory.parent.parent, directory, lane, participant
+                ),
+                RECAP_BYTES,
+            )
 
 
 def compose(records: Sequence[Mapping[str, object]]) -> tuple[str, str]:
@@ -796,6 +832,7 @@ def flush(directory: Path, config: dict, now: float = 0.0) -> dict:
     pending = _lease(directory, stamp)
     if not pending:
         return {"sent": [], "results": []}
+    _recap(directory, pending)
     groups: dict[tuple[str, ...], list[dict]] = {}
     for due in pending:
         delivered = due.get("delivered") or {}

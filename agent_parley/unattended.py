@@ -14,6 +14,15 @@ Authority never relaxes the terms of a merge. Every eligible lane is merged by
 the same `_integrate_lane` step `participant merge` uses, under the project
 merge lock and the lane's session lock, with the configured verification gate,
 any required operator approval and the source-commit binding all applied.
+
+The gate runs before the merge lock is taken. `_candidate` merges the ready
+source commit into the target commit the evaluation read, in a scratch
+worktree, and runs the gate there, so several lanes' gates run at once and a
+lane waits on the merge lock only for the merges ahead of it. Under the lock
+the attempt checks that the target has not moved and merges; the merge lands
+without a second gate only when it reproduces the verified tree exactly. A
+target that moved is evaluated and gated afresh, up to `ROUNDS` times, after
+which the attempt is refused and the next one starts over.
 What the policy adds is a stricter precondition: the claimed issue is listed,
 the claim generation is current, the work is reported ready at a commit the
 lane still sits on, the base checkout is on the target branch, every
@@ -48,8 +57,10 @@ from __future__ import annotations
 
 import contextlib
 import shlex
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -81,6 +92,19 @@ pushes, so they apply when the operator pushes the target branch."""
 
 SERVICE = "service"
 """Evidence ``actor`` of a decision the supervision service made itself."""
+
+MERGE_WAIT = 60.0
+"""Seconds an attempt whose candidate passed waits for `merge.lock`."""
+
+SETUP_WAIT = 10.0
+"""Seconds an attempt waits for the setup lock to read the manifest, so
+attempts the service starts together do not refuse one another."""
+
+ROUNDS = 3
+"""Candidate gates one attempt runs while the target keeps moving."""
+
+CANDIDATE = "agent-parley candidate gate"
+"""Lock reason of a scratch worktree, which keeps the reclaim sweep off it."""
 
 
 def policy(manifest: dict) -> dict | None:
@@ -531,6 +555,78 @@ def _conditions(
     return ""
 
 
+def _candidate(root: Path, directory: Path, data: dict, evidence: dict) -> str:
+    """Runs the verification gate on the merge an attempt would make.
+
+    The candidate is the ready source commit merged into the target commit
+    the evaluation read. It is built in a scratch worktree inside the
+    private state directory, never in the base checkout, so no lock is held
+    while the gate runs. The worktree is locked with `CANDIDATE` so the
+    reclaim sweep leaves it alone, and it is removed whatever the outcome.
+    It holds tracked content only: files the base checkout ignores, such as
+    a virtual environment, are absent while the gate runs.
+
+    Args:
+        root: Common repository root, which is the base checkout.
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the gate command.
+        evidence: Eligible evidence naming the participant, the target
+            commit and the source commit.
+
+    Returns:
+        The tree of the verified candidate, which the merge under
+        `merge.lock` has to reproduce exactly to land without another gate.
+
+    Raises:
+        BridgeError: If the candidate cannot be built, does not merge
+            cleanly, fails the gate, or the gate changes its content.
+        subprocess.TimeoutExpired: If a Git step exceeds its timeout.
+    """
+    from agent_parley.cli import git, verify_base
+
+    target = evidence["target_commit"]
+    source = evidence["source_commit"]
+    scratch = Path(
+        tempfile.mkdtemp(
+            prefix=f".candidate-{evidence['participant']}-", dir=directory
+        )
+    )
+    try:
+        git(
+            root,
+            "worktree",
+            "add",
+            "--lock",
+            "--reason",
+            CANDIDATE,
+            "--detach",
+            str(scratch),
+            target,
+        )
+        try:
+            git(scratch, "merge", "--no-ff", "--no-commit", source)
+        except BridgeError as exc:
+            raise BridgeError(
+                f"The ready commit {source[:12]} does not merge cleanly onto "
+                f"{target[:12]}; nothing was merged. {exc}"
+            ) from None
+        tree = git(scratch, "write-tree")
+        verify_base(scratch, data["verify"])
+        git(scratch, "add", "--all")
+        if git(scratch, "write-tree") != tree:
+            raise BridgeError(
+                "Verification changed the candidate's content, so it is not "
+                "verified; nothing was merged."
+            )
+        return tree
+    finally:
+        with contextlib.suppress(BridgeError, subprocess.TimeoutExpired):
+            git(root, "worktree", "remove", "--force", "--force", str(scratch))
+        shutil.rmtree(scratch, ignore_errors=True)
+        with contextlib.suppress(BridgeError, subprocess.TimeoutExpired):
+            git(root, "worktree", "prune")
+
+
 def integrate(
     bridge: Bridge,
     repo: Path,
@@ -541,10 +637,13 @@ def integrate(
 ) -> str:
     """Integrates one lane under the project's unattended policy.
 
-    The attempt holds the project merge lock throughout, so a concurrent
-    attempt or operator merge is refused with the merge-busy explanation.
-    Eligibility is evaluated under that lock, immediately before the lane is
-    merged by the step `participant merge` uses, and every outcome is
+    Eligibility is evaluated and the candidate gated by `_candidate` with no
+    lock held; the shared setup lock covers only the manifest read. The
+    project merge lock is then taken, waiting up to `MERGE_WAIT` seconds for
+    a merge ahead of it, and the lane is merged by the step `participant
+    merge` uses only if the target is still the commit the candidate was
+    built on. A target that moved is evaluated and gated afresh, so no
+    result is merged that its gate did not verify. Every outcome is
     recorded as a decision.
 
     Args:
@@ -562,10 +661,11 @@ def integrate(
 
     Raises:
         BridgeError: If the command runs inside a lane, another merge holds
-            the merge lock, the lane is not eligible, or the merge or its
-            gate fails; the last two are recorded durably first.
+            the merge lock past `MERGE_WAIT`, the lane is not eligible, the
+            target kept moving for `ROUNDS` gates, or the merge or its gate
+            fails; every case but the first two is recorded durably first.
     """
-    from agent_parley.cli import git, lock
+    from agent_parley.cli import current_branch, git, lock
     from agent_parley.integration import MERGE_BUSY
 
     root, directory = bridge.project(repo, create=False)
@@ -577,8 +677,9 @@ def integrate(
             next_command="agent-parley participant list",
         )
     operator_only(repo, root, data, "Unattended integration runs")
-    with lock(directory / "merge.lock", MERGE_BUSY):
-        with lock(directory / "setup.lock"):
+    evidence: dict = {}
+    for _ in range(ROUNDS):
+        with lock(directory / "setup.lock", timeout=SETUP_WAIT):
             data = bridge._project(root, directory, verify={name})
         evidence, unmet = _evaluate(bridge, root, directory, data, name, issue)
         if actor:
@@ -598,29 +699,56 @@ def integrate(
         if unmet:
             raise refuse(directory, name, evidence, unmet)
         try:
-            merged = bridge._integrate_lane(
-                root,
-                directory,
-                data,
-                name,
-                expected=(evidence["claim_id"], evidence["source_commit"]),
-                issue=evidence["issue"],
-            )
+            tree = _candidate(root, directory, data, evidence)
         except subprocess.TimeoutExpired as exc:
             raise failed(
                 directory,
                 name,
                 evidence,
-                f"Verification exceeded its {exc.timeout}s timeout.",
+                f"A Git step of the candidate gate exceeded its "
+                f"{exc.timeout}s timeout.",
             ) from exc
         except BridgeError as exc:
             raise failed(directory, name, evidence, str(exc)) from exc
-        evidence["integrated_commit"] = git(root, "rev-parse", "HEAD")
-        _record(directory, name, INTEGRATED, evidence)
-    return (
-        f"{merged}\nIntegrated unattended under {POLICY}: issue "
-        f"#{evidence['issue']} at {evidence['source_commit'][:12]} into "
-        f"{evidence['target']}."
+        with lock(directory / "merge.lock", MERGE_BUSY, timeout=MERGE_WAIT):
+            if (
+                git(root, "rev-parse", "HEAD") != evidence["target_commit"]
+                or current_branch(root) != evidence["target"]
+            ):
+                continue
+            try:
+                merged = bridge._integrate_lane(
+                    root,
+                    directory,
+                    data,
+                    name,
+                    expected=(evidence["claim_id"], evidence["source_commit"]),
+                    issue=evidence["issue"],
+                    verified=(evidence["target_commit"], tree),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise failed(
+                    directory,
+                    name,
+                    evidence,
+                    f"Verification exceeded its {exc.timeout}s timeout.",
+                ) from exc
+            except BridgeError as exc:
+                raise failed(directory, name, evidence, str(exc)) from exc
+            evidence["integrated_commit"] = git(root, "rev-parse", "HEAD")
+            _record(directory, name, INTEGRATED, evidence)
+        return (
+            f"{merged}\nIntegrated unattended under {POLICY}: issue "
+            f"#{evidence['issue']} at {evidence['source_commit'][:12]} into "
+            f"{evidence['target']}."
+        )
+    raise refuse(
+        directory,
+        name,
+        evidence,
+        f"The target {evidence['target']} moved while each of {ROUNDS} "
+        "candidate gates ran, so no verified result could be merged; the "
+        "next attempt evaluates it afresh.",
     )
 
 

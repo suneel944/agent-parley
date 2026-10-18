@@ -76,6 +76,25 @@ def _wake_flags(directory: Path, name: str, home: Path | None) -> dict:
     }
 
 
+def _cache_expired(directory: Path, name: str, home: Path | None) -> bool:
+    """Reports whether an admitted wake should restart a cold session.
+
+    Args:
+        directory: Private project state directory.
+        name: Validated participant name.
+        home: Private bridge state root, or None when it is unknown.
+
+    Returns:
+        True when `supervision.cache_rotation` recorded a rotation point
+        because the lane's prompt cache expired while it was idle.
+    """
+    if home is None:
+        return False
+    from agent_parley import supervision
+
+    return supervision.cache_rotation(home, directory, name) is not None
+
+
 def _work_bindings(ledger: dict, numbers: list[str]) -> list[dict]:
     """Captures fields that must still match at prompt admission."""
     bindings = []
@@ -821,7 +840,11 @@ def run(
     does instead of typing the prompt. The service then resumes the
     stopped lane on its ordinary wake path, and that resume starts a fresh
     native session. An attached launcher never ends its operator's session
-    this way; it rotates on its next resume.
+    this way; it rotates on its next resume. A wake admitted after the
+    lane sat idle past the ``cache_window`` supervision setting records a
+    rotation point first when `supervision.cache_rotation` judges the cold
+    session too large to resume, so it ends the same way instead of
+    re-reading its whole transcript uncached.
 
     An attached launcher owns the tab title: the lane name, its state and
     its claim progress lead, and the client's own title follows as a suffix.
@@ -1136,7 +1159,10 @@ def _session(
                             elif (
                                 rotate
                                 and not attached
-                                and state.get("rotation")
+                                and (
+                                    state.get("rotation")
+                                    or _cache_expired(lane.parent, name, home)
+                                )
                             ):
                                 result = ROTATING
                                 stopping.append(signal.SIGTERM)

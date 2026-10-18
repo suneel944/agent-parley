@@ -29,8 +29,9 @@ state globally;
 repository commands accept `--repo PATH` unless noted below. `problems`,
 `doctor` and `metrics` take no `--repo`, and `state export` and
 `state import` select one project with `--project ROOT`. Issue mutations,
-reports and lane mail resolve identity from the current lane. `say` and
-`issue assign` act as `operator` from any checkout of the repository.
+reports and lane mail resolve identity from the current lane. `say`,
+`issue assign` and `followup accept` act as `operator` from any checkout of
+the repository.
 
 Each operation has one canonical spelling, used throughout the docs, skills
 and generated remedies: `say` sends an operator message and `gc` reclaims
@@ -56,13 +57,15 @@ on standard output and export to a file.
 | --- | --- |
 | `--version`, `-V` | Print the installed version and exit. |
 | `version` | Print the installed version and the state directory in use. |
-| `up` | Start the local coordination server. |
+| `up` | Start the local coordination server. `--workspace NAME` then resumes, each in a detached launcher with output in the lane's wake log, the stopped lanes of every project the workspace groups; a paused or retired lane, a lane whose session still runs, one that never recorded a session and one a detached resume would leave on the bridge tools prompt are skipped, each with a line saying why. Lanes stay on the local host. |
+| `projects` | List the registered projects, most recently used by `run` or `setup` first, with each project's name, last use, lane count, workspaces and root. The record of last use is `recent-projects.json` in the state root; nothing is written into a repository. |
+| `workspace set NAME PROJECT...` | Record a named workspace grouping several projects, by the name `projects` lists or by root; it replaces a workspace of the same name. `workspace list` (or bare `workspace`) prints every workspace and `workspace remove NAME` forgets one. A workspace only groups roots: each project keeps its own lanes, claims, reservations and integration target. |
 | `down` | Stop the server while retaining state and worktrees. |
 | `completion SHELL` | Print a `bash`, `zsh` or `fish` completion script generated from the installed command tree. |
 | `demo` | Run the coordination story in a throwaway sandbox: a temporary Git repository, a temporary state home and a service on a free port, with two stub lanes that claim in parallel, meet a reservation collision and a hook refusal, hand off an issue and appear in a `top` snapshot. Each step prints one line naming what happened and the real command behind it. No native CLI, model, network or account is used, and the user's state home, repositories and running service are never touched. It finishes by itself in well under 90 seconds; `q` or Ctrl-C stops it early (exit 130), as do SIGTERM (exit 143) and SIGHUP from a closed terminal (exit 129), and every exit removes the worktrees, processes and temporary directories it created. Without a terminal it prints the same story as plain lines. `make demo-stub` renders the full recording from the same scenario; `python scripts/record_demo.py --short` writes the four-step cut to `docs/assets/demo-short.svg`, and `--video` writes the launch video's frames to `docs/video/frames.js`. The README shows the launch video, not these SVGs. |
-| `status` | Show the coordination service's health (`Service: running`, `not running` or `not ready`), whether the running service is behind the installed code, and the open work of the project the working directory belongs to, each lane's condition read from its authoritative state record; `--all-projects` reports every project with dormant ones last, `--table` prints the full per-lane table instead, and `--all` also lists claims whose issue or pull request ended on the forge. A lane that is dead, holds no claim, has no live process and whose last report and activity are older than the project's supervision setting `fold_after` (86400 seconds, 24 hours, by default) is left out of the lane table and counted on one line such as `3 dead lanes older than 24h hidden; --all shows them`; `--all` lists those lanes too. A dead lane still holding a claim always stays. `NAME` reports one lane in full, and `--repo`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since`, `--over-budget` and `--issue` narrow the rows; a named lane or any lane filter prints the table. |
+| `status` | Show the coordination service's health (`Service: running`, `not running` or `not ready`), whether the running service is behind the installed code, and the open work of the project the working directory belongs to, each lane's condition read from its authoritative state record; `--all-projects` reports every project with dormant ones last, `--workspace NAME` reports every project that workspace groups together, dormant ones included, `--table` prints the full per-lane table instead, and `--all` also lists claims whose issue or pull request ended on the forge. A lane that is dead, holds no claim, has no live process and whose last report and activity are older than the project's supervision setting `fold_after` (86400 seconds, 24 hours, by default) is left out of the lane table and counted on one line such as `3 dead lanes older than 24h hidden; --all shows them`; `--all` lists those lanes too. A dead lane still holding a claim always stays. `NAME` reports one lane in full, and `--repo`, `--provider`, `--outcome`, `--drifted`, `--pending`, `--idle`, `--since`, `--over-budget` and `--issue` narrow the rows; a named lane or any lane filter prints the table. |
 | `setup PATH` | Register a repository from committed HEAD and print its root, base, forge, verify gate, lane init and next command. An empty gate is stated, with the `verify set` call for a check command committed files declare; `--verify CMD` and `--init CMD` record both under the `verify set` and `init set` guards. |
-| `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`; `--resume` reopens the lane's recorded native session, or starts a fresh one after a ready or blocked report while the `rotate` supervision setting is on ([Running lanes](lanes.md#running-unattended)); `--issue N` claims issue N for the lane and opens with a bounded digest of it read from the forge ([Running lanes](lanes.md#starting-on-an-issue)); `--blueprint B` with `--issue N` also starts the claim on blueprint `B`, and without it a `blueprint default` for one of the issue's labels applies ([Running a claim through a blueprint](lanes.md#running-a-claim-through-a-blueprint)). |
+| `run NAME` | Launch a lane; supports `--provider`, `--credentials`, `--repo`, and `--task`; `--project P` launches in the registered project `projects` lists as `P`, or at that root, instead of the working directory's, and cannot be combined with `--repo`; `--resume` reopens the lane's recorded native session, or starts a fresh one after a ready or blocked report while the `rotate` supervision setting is on ([Running lanes](lanes.md#running-unattended)); `--issue N` claims issue N for the lane and opens with a bounded digest of it read from the forge ([Running lanes](lanes.md#starting-on-an-issue)); `--blueprint B` with `--issue N` also starts the claim on blueprint `B`, and without it a `blueprint default` for one of the issue's labels applies ([Running a claim through a blueprint](lanes.md#running-a-claim-through-a-blueprint)). |
 | `top` | The dashboard of live lanes; `--once` prints a snapshot, `--interval` sets refresh seconds, `--provider`, `--repo`, `--participant` and `--since` filter it, `--sort`, `--reverse` and `--columns` shape it; `--no-operator-edits` skips reading a base checkout that is always dirty for operator edits on reserved paths; `--all` also shows stopped lanes holding nothing and projects whose root is gone, which the header otherwise only counts; `--serve [PORT]` serves a read-only page, the `--json` frame and Prometheus metrics on `127.0.0.1` behind a printed path token. |
 | `title` | Print the current lane's name, state and claim progress for a native status line; prints nothing outside a lane. |
 | `metrics` | Export the live counters and gauges as Prometheus text or `--json`; `--output` writes a file atomically and `--every` rewrites it; `--provider` narrows the lanes and `--since` bounds the enforcement history counted. |
@@ -71,6 +74,7 @@ on standard output and export to a file.
 | `report review ID` | Record this lane's `--verdict pass\|fail` on another lane's report with the `--evidence` it checked. The report's own author is refused. A verdict is the reviewing lane's own claim about work it did not do, not independent verification, and it approves nothing. |
 | `report usage` | List every claim resolved in the `--since` window (all of them without it) with the tokens, served calls and session hours it used and the pull request that ended it, plus totals; `--json` prints it under the `read/v1` schema. A row shows an estimated spend only when the operator recorded a price for its provider ([Monitoring](monitoring.md#usage-per-issue)). |
 | `say NAME TEXT` | Send as `operator`; `--subject` sets the inbox subject line, `--ack` requests acknowledgement, `--within 15m` records a deadline for it that only reads overdue, and `--key` controls deduplication. |
+| `ask NAME QUESTION` | Answer a side question about a lane from a separate read-only native session, printed to you only; the lane's session, context and worktree are untouched and it is not woken. A Claude Code lane is forked from its recorded session; every other provider, and `--checkpoint`, starts a fresh session given the lane's checkpoint. Its tokens count toward the lane's budget ([Asking a lane a side question](providers.md#asking-a-lane-a-side-question)). |
 | `say NAME TEXT --after 30m` | Record the message for later; `--at 18:00`, `--when-released N` and `--unless-reported` set the trigger, and `--every 1h --until 18:00` records a bounded repeat. |
 | `issue list` | Show claims, dependencies and handoff offers; each offer carries the offering lane's head commit, the reservations that move with it and its remaining work. |
 | `issue show NUMBER` | Show one issue: its owner, deadline, attempts, blockers, pending offer, the reservations its owner holds, its convergence account for the current claim and its recorded history. |
@@ -87,10 +91,13 @@ on standard output and export to a file.
 | `issue assign NUMBER NAME` | Offer an issue to a lane as `operator`; `--reason` travels with the offer and `--unassign` withdraws one no lane accepted. |
 | `issue recover NUMBER --reason TEXT` | As `operator`, approve stopping the live owner of a claim once a matching exhausted-capacity observation is published; the approval alone moves nothing. Refused outside the base checkout, and from any process carrying a lane's `AGENT_PARLEY_TOKEN`. |
 | `issue resolve NUMBER` | End a claim whose holder never filed the completion its pull request already landed, as `operator` and never as the lane. The forge is read at that moment: the issue must have closed inside the current claim, with its closing pull request recorded whichever branch it came from, or, when the forge cannot say, the lane branch pull request must have been opened inside it, and the supervisor must already have escalated the claim as an unresolved completion, so an answering holder is never resolved out from under it. `--reason` is kept beside the recorded evidence, and `--release` returns the work to the queue instead, which a pull request closed without merging requires. |
+| `followup list` | List the follow-up work lanes suggested by mail to `@followup` and nobody accepted yet, oldest first, each with its lane, why, paths, expiry and the open issues or claims whose titles it may duplicate; `--json` prints it for scripts. Suggestions expire seven days after they are made. |
+| `followup accept ID` | As `operator`, file one suggestion as a forge issue in the active milestone (the open milestone due soonest, else the oldest; `--milestone TITLE` names another) and offer it to a running lane that holds no claim and has no offer waiting, through the same offer `issue assign` records; `--to LANE` names the lane. With no idle lane the issue is left unclaimed for the next lane that pulls work. A repeat returns the issue already filed. Filing needs the GitHub forge. A Telegram digest carries the same accept as a button. |
 | `issue block NUMBER --on NUMBER` | Record an advisory issue dependency. |
 | `issue unblock NUMBER --on NUMBER` | Remove a recorded dependency. |
 | `plan apply PATH` | Record a TOML work order as advisory dependencies, from the project base checkout only; `plan diff PATH` previews it. |
 | `plan show` | Print the applied plan as a tree with owners; `--json` prints it for scripts. |
+| `plan update STATUS:TEXT ...` | Replace this lane's own task list, run from the lane's checkout, which names the lane. Each step is `pending:`, `in_progress:` or `completed:` and its text, and the whole list is given each time; `--stdin` reads it as JSON, `[{"step": "...", "status": "..."}]`, instead. At most 30 steps of 200 characters and 4 KB are kept. Only the operator sees it in `participant show`, `status`, `top` and the web view; no peer receives it. A Claude lane's `TodoWrite` list is recorded the same way from its hook. |
 | `plan propose --base N --add I:B --remove I:B --reason TEXT` | File a revision of the applied plan's edges against plan version `N`: `--add` records a discovered prerequisite, `--remove` drops an obsolete edge, each repeatable, with up to five `--evidence TEXT`. A lane's revision applies at once only inside the plan's `[revisions]` envelope; otherwise it is kept, changing nothing, with the `plan approve` command that applies it. |
 | `plan proposals` | Print the current plan version, the envelope, the automatic revisions used and every retained proposal with its status. |
 | `plan approve ID` | As `operator`, validate the whole resulting graph and apply one open revision, authorizing any prerequisite it adds; a revision whose base version is no longer current is recorded as stale; an optional `--reason` is kept with it. `plan reject ID --reason TEXT` refuses it. |
@@ -132,6 +139,8 @@ on standard output and export to a file.
 | `credentials show NAME` | Show one profile with every recorded value redacted: the config home, the override names and the variables required from your shell. A profile that sets none of them reads `Account: selects no account`, because it launches on the default account. |
 | `credentials add NAME` | Define a config home and environment requirements. It needs at least one of `--config-home`, `--env` or `--require-env`; a profile with none would select no account, so it exits 2 and writes nothing. |
 | `credentials remove NAME` | Delete a profile definition, preserving native files and logins. |
+| `quota show` | Show remaining headroom per credential profile the project's lanes share, with the lanes parked on it; `--json` prints the rows. Headroom from a vendor rate-limit refusal reads `rate limit reached` until its reset; headroom derived from native token counts against a recorded window is marked `estimated`. |
+| `quota set NAME --hours H --tokens N` | Record one credential's usage window; `--threshold F` (default 1) parks every lane on it but the one holding the most unfinished claims once that fraction of the estimated window is used, and every lane at the limit. `--tokens 0` removes the window. Without a window only a vendor refusal parks lanes. |
 | `branch show` | Show the prefix new lane branches are created under and the recorded integration base. |
 | `branch set PREFIX` | Set that prefix; existing lanes keep their branch. |
 | `branch integration BRANCH` | Record the non-default branch a milestone's pull requests merge into, operator-only; a pull request merged there that closes a claimed issue lands the claim. An empty string removes it. |
@@ -201,7 +210,8 @@ without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 `plan proposals`,
 `approval show`, `verify show`, `init show`, `branch show`, `forge show`,
 `deadlines show`, `budget show`, `resources show`, `pool show`, `state show`,
-`provider list`, `provider show`, `credentials list` and `credentials show`.
+`provider list`, `provider show`, `credentials list`, `credentials show` and
+`projects`.
 The commands that change something print their outcome the same way with
 `--json`: `up`, `down`, `setup`, `run`, `say`, `decide`, `mail send`,
 `mail cancel`, `approve`, `reject`, `report review`, `problems ack`,
@@ -283,7 +293,7 @@ participant or project. Reservations are advisory, not filesystem locks.
 | --- | --- |
 | `send_message` | Send to peers using an idempotency key; optionally join a thread or require acknowledgement. |
 | `fetch_inbox` | Page inbox metadata and optional bodies; filter with `unread` or `unacknowledged`. |
-| `wait_for_message` | Wait up to `timeout_seconds` for the next mail matching the same filters, plus `thread_id`; an expired wait is empty. |
+| `wait_for_message` | Wait up to `timeout_seconds` for the next mail matching the same filters, plus `thread_id`; an expired wait is empty. `hand_off` (`mail`, `handoff`, `check`) hands a long wait to the service instead. |
 | `mark_message_read` | Explicitly mark a received message read; takes an optional `idempotency_key`. |
 | `acknowledge_message` | Explicitly acknowledge a reviewed message; takes an optional `idempotency_key`. |
 | `file_reservation_paths` | Reserve advisory path patterns and report conflicts; takes an optional `idempotency_key`. |
@@ -305,6 +315,13 @@ was never addressed in. Nothing else widens: mail without the flag stays
 readable by its sender and its recipients alone, and a decision obeys the same
 body cap and attachment rules as any other message.
 
+`send_message` with `@followup` as the first `to` entry records follow-up work
+outside this lane's issue for the operator to accept: the `subject` is its
+title, `body_md` the why and any further `to` entries repository paths. It
+reaches no lane, files no issue, offers nothing and starts no lane, so the lane
+keeps its work. The result names the suggestion and lists the open issues and
+claims it may duplicate. An unaccepted suggestion expires after seven days.
+
 `send_message` takes an optional `topic` of at most 80 characters. A newer
 message on the same topic supersedes the recipient's unread older one, and
 `status` counts unread mail per topic. A project note such as `Merged #12` goes
@@ -324,6 +341,19 @@ returns an empty page: no error, no event and no receipt changed. A wait
 occupies no worker slot while it sleeps, so waiting lanes cannot starve the
 service of the sends they are waiting for; a pause, a revoked registration or a
 stopping service ends a wait at once.
+
+A wait longer than the ceiling is handed to the service instead of repeated:
+`wait_for_message` with `hand_off` set to `mail`, `handoff` or `check` reads
+the inbox once with the same filters and returns matching mail at once. With
+nothing there it records what the lane waits for and since when, and returns
+`end_turn: true` with the record under `hand_off`. The lane ends its turn; the
+supervisor's ordinary wake path asks it for one turn when the mail, handoff
+offer or pull request notice arrives, so a 30-minute wait costs one turn to
+start and one to resume. A repeated hand-off of the same wait keeps its first
+time, and the lane's next served call of any other kind ends the record. A lane
+the service cannot wake, because the wake loop is off for it or its provider
+has no resume path, gets `end_turn: false` and the ordinary bounded wait, and
+its record is marked `polling` with the reason.
 
 ## What does not fit in a message
 

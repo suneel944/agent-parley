@@ -47,6 +47,8 @@ sessions from a tool call.
   them with `release_file_reservations`. Reservations are advisory: a peer
   sees the conflict and stops, but no file is locked. Stop editing when a
   reservation conflicts.
+- When your task list changes, run `agent-parley plan update STATUS:TEXT ...`
+  with the whole list (`pending`, `in_progress`, `completed`); peers never see it.
 - To hand off, stop editing and run `agent-parley issue offer NUMBER --to
   PARTICIPANT --summary "what was decided" --remaining "next step"`. The
   offer records the head commit, the reservations held and the remaining

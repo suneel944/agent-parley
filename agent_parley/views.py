@@ -114,6 +114,18 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
         "Tokens the native client counted, never billed spend.",
     ),
     (
+        "agent_parley_lane_side_questions_retained",
+        "gauge",
+        "side_questions",
+        "Side questions answered for the operator by agent-parley ask.",
+    ),
+    (
+        "agent_parley_lane_side_question_tokens_retained",
+        "gauge",
+        "side_question_tokens",
+        "Tokens the lane's side questions counted, part of its budget.",
+    ),
+    (
         "agent_parley_lane_pull_requests_opened_window",
         "gauge",
         "pull_requests_opened",
@@ -890,8 +902,13 @@ def _count(value: object) -> int | None:
 
 def _row(row: dict) -> dict:
     """Reports one live view row with the identifiers its cells abbreviate."""
+    from agent_parley.status import bucket_of
+
     return {
         "participant": row["participant"],
+        "bucket": dict(bucket_of(row)),
+        "recap": row.get("recap"),
+        "task_plan": dict(row["task_plan"]),
         "provider": row["provider_name"],
         "credential": row["credential"],
         "state": row["state"],
@@ -918,6 +935,14 @@ def _row(row: dict) -> dict:
         "queued_by": list(row["queued_by"]),
         "injected_bytes": row["injected_bytes"],
         "injected_bytes_per_hour": row.get("injected_per_hour", 0),
+        "context_percent": row["context_percent"],
+        "context_full": row["context_full"],
+        "diff_files": row["diff_files"],
+        "diff_added": row["diff_added"],
+        "diff_deleted": row["diff_deleted"],
+        "diff_paths": list(row["diff_paths"]),
+        "host": row["host"],
+        "worktree": row["worktree"],
         "hook_events": row["hook_events"],
         "denials": row["denials"],
         "denied_by": [dict(item) for item in row.get("denied_by") or []],

@@ -23,10 +23,64 @@ if TYPE_CHECKING:
     import argparse
 
 ROTATION_OUTCOMES = ("ready", "blocked")
+READY_SHOWN_PATHS = 5
 
 
 class ReportsMixin(BridgeCore):
     """Lane reports, peer review, hook event export, archive and history."""
+
+    def task_plan(
+        self, repo: Path, steps: list[str], document: str = ""
+    ) -> dict:
+        """Replaces the calling lane's own task plan.
+
+        The lane is the roster entry whose worktree holds the checkout, found
+        the way `report` finds it, so a lane never names itself or another
+        lane. The plan goes to the lane's capped plan file beside its state
+        record, which only operator views read and no peer is sent.
+
+        Args:
+            repo: The lane's own checkout.
+            steps: Steps written ``STATUS:TEXT``, where the status is one of
+                `lanes.PLAN_STATUSES`.
+            document: The whole list as JSON, ``[{"step", "status"}]``, in
+                place of `steps`; empty when the steps came as arguments.
+
+        Returns:
+            The recorded plan: ``items``, ``source``, ``updated`` and
+            ``truncated``.
+
+        Raises:
+            BridgeError: If both forms or neither are given, the list is
+                malformed, or the checkout is not a lane.
+        """
+        import json
+
+        from agent_parley import lanes
+        from agent_parley.cli import git, roster
+
+        if bool(steps) == bool(document.strip()):
+            raise BridgeError(
+                "Give the plan as STATUS:TEXT arguments or as JSON with "
+                "--stdin, not both and not neither."
+            )
+        if document.strip():
+            try:
+                entries = json.loads(document)
+            except ValueError as error:
+                raise BridgeError(f"Plan JSON is not valid: {error}.") from None
+        else:
+            entries = []
+            for step in steps:
+                status, _, text = step.partition(":")
+                entries.append({"step": text, "status": status.strip()})
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        return lanes.record_plan(
+            directory, agent, entries, "step", lanes.PLAN_COMMAND
+        )
 
     def report(
         self,
@@ -76,6 +130,12 @@ class ReportsMixin(BridgeCore):
         claim, so it records a rotation point on the activity record: the
         next resume of the lane starts a fresh native session instead of
         continuing this one, as `launch.rotation_task` describes.
+
+        A ready report records the lane's HEAD commit as the code its evidence
+        verified, so it is refused while any tracked file differs from that
+        commit: evidence gathered on uncommitted edits would describe code a
+        reviewer and the integration gate never see. Untracked files are not
+        considered, because lanes keep scratch state and build output there.
 
         Args:
             repo: Assigned agent worktree.
@@ -172,6 +232,18 @@ class ReportsMixin(BridgeCore):
         if key and (recorded := state.get("retries", {}).get(scope)):
             retries.replayed(recorded, "report", key, fingerprint)
             return ""
+        if outcome == "ready" and (
+            changed := git(lane, "diff", "--name-only", "HEAD").splitlines()
+        ):
+            shown = ", ".join(changed[:READY_SHOWN_PATHS])
+            more = len(changed) - READY_SHOWN_PATHS
+            raise BridgeError(
+                f"A ready report records commit {commit[:12]}, but "
+                f"{len(changed)} tracked file(s) differ from it: {shown}"
+                + (f" and {more} more" if more > 0 else "")
+                + ". Commit or revert them first, so the evidence describes "
+                "the recorded commit."
+            )
         ceiling = (data.get("deadlines") or {}).get(
             "wait", supervision.DEFAULT_WAIT_CEILING
         )
@@ -262,6 +334,24 @@ class ReportsMixin(BridgeCore):
                 "attachment": attached or None,
             },
         )
+        if outcome in ROTATION_OUTCOMES:
+            from agent_parley import children
+
+            try:
+                children.deliver(
+                    self.home,
+                    directory,
+                    agent,
+                    {
+                        "state": outcome,
+                        "commit": commit,
+                        "summary": summary,
+                        "remaining": remaining,
+                        "evidence": evidence,
+                    },
+                )
+            except BridgeError as exc:
+                print(f"Child result not relayed: {exc}", file=sys.stderr)
         owned = [str(claim["issue"])] if claim["issue"] is not None else []
         if outcome == "blocked":
             change_attempt(directory, agent, owned)

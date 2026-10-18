@@ -169,18 +169,25 @@ def native_executable(
 
 
 def rotation_task(
-    agent: str, data: dict, directory: Path, state: dict, task: str
+    agent: str,
+    data: dict,
+    directory: Path,
+    state: dict,
+    task: str,
+    home: Path,
 ) -> str:
     """Builds the first prompt of a lane rotated to a fresh native session.
 
     A ready or blocked report records a rotation point on the lane's
-    activity record. The next resume starts a new native session rather
-    than continuing the one that filed the report, so each claim begins
-    from a bounded context instead of a transcript that grows for days.
-    The new session carries only what the lane needs to continue: its
-    identity, the claims it still holds with their next action, and the
-    last report, held to `ROTATION_REPORT_BYTES`, followed by the task the
-    resume was asked to deliver.
+    activity record, and so does `supervision.cache_rotation` when a lane
+    sat idle past its prompt cache. The next resume starts a new native
+    session rather than continuing the old one, so each claim begins from
+    a bounded context instead of a transcript that grows for days or is
+    re-read uncached. The new session carries only what the lane needs to
+    continue: the checkpoint from `lane_context`, the branch its worktree
+    has checked out, the reservations it holds and its unread mail count,
+    followed by the task the resume was asked to deliver. A branch or
+    mailbox that cannot be read is named as unknown.
 
     Args:
         agent: Participant name within the project.
@@ -188,11 +195,63 @@ def rotation_task(
         directory: Private project state directory holding the ledger.
         state: The lane's activity record carrying the last report.
         task: The prompt the resume was asked to deliver.
+        home: Private bridge state root holding the mailbox.
 
     Returns:
         The opening instruction for the fresh session.
     """
-    from agent_parley import issues, lifecycle
+    import subprocess
+
+    from agent_parley import checkpoints, supervision
+
+    rotation = state.get("rotation") or {}
+    if rotation.get("outcome") == supervision.CACHE_ROTATION:
+        reason = "its prompt cache expired while it sat idle"
+    else:
+        reason = "its last resolved claim"
+    participant = data["participants"][agent]
+    try:
+        branch = checkpoints.current_branch(Path(participant["lane"]))
+    except (BridgeError, OSError, subprocess.SubprocessError):
+        branch = "unknown"
+    try:
+        mail = checkpoints.mailbox(home, data["root"], agent)
+        reserved = ", ".join(mail["reserved"]) or "none"
+        unread = f"{mail['unread']} unread"
+    except (BridgeError, OSError, sqlite3.Error):
+        reserved = unread = "unknown"
+    return "\n".join(
+        [
+            "Fresh session: this lane rotated to a new native session after "
+            f"{reason}, so nothing from the previous session carries over. "
+            "Continue from the state below.",
+            *lane_context(agent, data, directory, state),
+            f"Branch: {branch}.",
+            f"Reservations: {reserved}.",
+            f"Mail: {unread}.",
+            "Task:",
+            task,
+        ]
+    )
+
+
+def lane_context(
+    agent: str, data: dict, directory: Path, state: dict
+) -> list[str]:
+    """Describes a lane's checkpoint to a session that lacks its history.
+
+    Args:
+        agent: Participant name within the project.
+        data: Project manifest naming the participant and its worktree.
+        directory: Private project state directory holding the ledger.
+        state: The lane's activity record carrying the last report.
+
+    Returns:
+        One line naming the lane and its worktree, one listing the claims
+        it still holds with their next action, and its last report held to
+        `ROTATION_REPORT_BYTES`.
+    """
+    from agent_parley import issues, lifecycle, supervision
 
     ledger = issues.snapshot(directory)["issues"]
     held = sorted(
@@ -210,9 +269,15 @@ def rotation_task(
         for number in held
     )
     rotation = state.get("rotation") or {}
+    if rotation.get("outcome") == supervision.CACHE_ROTATION:
+        heading = str(state.get("outcome") or "none")
+    else:
+        heading = (
+            f"{rotation.get('outcome') or state.get('outcome') or 'none'} on "
+            f"#{rotation.get('issue') or '?'}"
+        )
     report, _ = _clipped(
-        f"{rotation.get('outcome') or state.get('outcome') or 'none'} on "
-        f"#{rotation.get('issue') or '?'}: {state.get('summary') or ''}"
+        f"{heading}: {state.get('summary') or ''}"
         + (
             f" Remaining: {state['remaining']}"
             if state.get("remaining")
@@ -221,18 +286,84 @@ def rotation_task(
         ROTATION_REPORT_BYTES,
     )
     participant = data["participants"][agent]
-    return "\n".join(
-        [
-            "Fresh session: this lane rotated to a new native session after "
-            "its last resolved claim, so nothing from the previous session "
-            "carries over. Continue from the state below.",
-            f"Lane: {agent} ({participant['provider']}), worktree "
-            f"{participant['lane']}.",
-            f"Open claims: {claims or 'none'}.",
-            f"Last report: {report}",
-            "Task:",
-            task,
+    return [
+        f"Lane: {agent} ({participant['provider']}), worktree "
+        f"{participant['lane']}.",
+        f"Open claims: {claims or 'none'}.",
+        f"Last report: {report}",
+    ]
+
+
+def ask_command(
+    adapter: str, executable: str, prompt: str, lane: str, session: str = ""
+) -> list[str]:
+    """Builds the native command line of a read-only side session.
+
+    Each adapter is held read-only by its own client: Claude Code's ``plan``
+    permission mode, the Codex ``read-only`` sandbox, Copilot CLI's
+    ``--deny-tool`` rules for ``write`` and ``shell``, Gemini CLI's
+    ``default`` approval mode, under which a non-interactive run offers no
+    tool that needs approval, and OpenCode's ``plan`` agent. No permission
+    is widened and no bypass flag is passed. Only Claude Code continues a
+    lane's session, with ``--resume`` and ``--fork-session``, which leaves
+    the original transcript untouched; every other adapter starts fresh.
+
+    Args:
+        adapter: The lane provider's adapter.
+        executable: Resolved native CLI.
+        prompt: The side question with the context it needs.
+        lane: Lane worktree the session may read.
+        session: Lane session to fork, empty to start fresh.
+
+    Returns:
+        The command line to run.
+
+    Raises:
+        BridgeError: If the adapter has no native read-only mode.
+    """
+    if adapter == "claude":
+        forked = ["--resume", session, "--fork-session"] if session else []
+        return [
+            executable,
+            "-p",
+            "--permission-mode",
+            "plan",
+            "--add-dir",
+            lane,
+            *forked,
+            "--",
+            prompt,
         ]
+    if adapter == "codex":
+        return [executable, "exec", "--sandbox", "read-only", prompt]
+    if adapter == "copilot":
+        return [
+            executable,
+            "-p",
+            prompt,
+            "--deny-tool",
+            "write",
+            "--deny-tool",
+            "shell",
+            "--add-dir",
+            lane,
+        ]
+    if adapter == "gemini":
+        return [
+            executable,
+            "--approval-mode",
+            "default",
+            "--include-directories",
+            lane,
+            "-p",
+            prompt,
+        ]
+    if adapter == "opencode":
+        return [executable, "run", "--agent", "plan", prompt]
+    raise BridgeError(
+        f"The {adapter!r} adapter has no native read-only mode, so a side "
+        "question cannot be answered without the session being able to "
+        "write; ask the lane with agent-parley say instead."
     )
 
 
@@ -338,6 +469,8 @@ interface changes, decisions, and blockers; request acknowledgement for changes
 the peer depends on. When finished, send a handoff containing the exact commit
 (if committed), changed files, verification commands/results, and limitations,
 then release your reservations. Avoid repeated empty inbox polling.
+Found work outside your issue? Mail it to @followup and keep going; only the
+operator files it. Never widen your own scope to fix it.
 
 Edit only your worktree. Do not reset, clean, switch, merge, or modify a peer
 worktree or the main checkout. Preserve existing work on your branch. Add any
@@ -416,6 +549,160 @@ reported.
             for event in checkpoints.EVENTS
         }
 
+    def ask(
+        self,
+        agent: str,
+        repo: Path,
+        question: str,
+        *,
+        checkpoint: bool = False,
+    ) -> int:
+        """Answers an operator's side question without touching the lane.
+
+        Mail to a lane wakes it or lands in its next turn, which costs the
+        lane focus and context. A side question is answered instead by a
+        separate native session, held read-only by its own client as
+        `ask_command` describes, and its answer goes to the operator's
+        terminal only. A Claude Code lane with a recorded session is forked
+        with ``--fork-session``, so the answer draws on the lane's history
+        while its transcript is left as it was; every other adapter, a lane
+        with no usable session, and ``checkpoint`` start a fresh session
+        given the lane's checkpoint through `lane_context`.
+
+        The side session runs in `budgets.ask_directory`, a private Git
+        directory outside the target repository, never in the lane
+        worktree: supervision binds a stopped lane to a native client whose
+        working directory is its worktree, and Codex runs only inside a Git
+        directory. It runs under the lane's provider and account, without
+        the lane's coordination token, participant name, MCP server or
+        hooks, so it neither speaks for the lane nor is recorded as it. The
+        tokens its client recorded are written to the lane's ask ledger and
+        count toward the lane's budget, as `budgets.consumption` and the
+        run budget read them.
+
+        Args:
+            agent: Participant name within the project.
+            repo: Target Git repository.
+            question: The operator's question.
+            checkpoint: Answer from the lane's checkpoint even where the
+                provider could fork the lane's session.
+
+        Returns:
+            The native client's exit code.
+
+        Raises:
+            BridgeError: If the participant is unknown or retired, the run
+                budget is exhausted, the native CLI is not on ``PATH``, or
+                the adapter has no native read-only mode.
+        """
+        import subprocess
+
+        from agent_parley import budgets, checkpoints, records, roster
+        from agent_parley.hook import PARTICIPANT_ENV
+
+        directory = self.project(repo, create=False)[1]
+        data = roster.read(directory)
+        participant = data["participants"].get(agent)
+        if participant is None or roster.retired(participant):
+            raise BridgeError(
+                f"No active participant named {agent!r} in this project.",
+                next_command="agent-parley participant list",
+            )
+        if stopped := budgets.halted(directory, data):
+            raise BridgeError(
+                f"The run budget is exhausted ({stopped['cause']}), so no "
+                f"side session is started; {budgets.RESUME}.",
+                next_command="agent-parley budget resume",
+            )
+        entry = roster.provider(self.home, participant["provider"])
+        executable = native_executable(
+            entry["command"],
+            agent,
+            participant["provider"],
+            participant["credential"],
+        )
+        state = checkpoints.activity(directory, agent)
+        session = (
+            ""
+            if checkpoint or entry["adapter"] != "claude"
+            else str(
+                state.get("session_id") or state.get("resumable_session") or ""
+            )
+        )
+        if session.startswith("-") or len(session) > 128:
+            session = ""
+        prompt = "\n".join(
+            [
+                f"Side question from the operator about the lane {agent}. "
+                "You run in a separate read-only session, and nothing you "
+                "do reaches the lane's own session. Do not change any file; "
+                f"read the lane worktree at {participant['lane']} if the "
+                "answer needs it, and answer in plain text.",
+                *(
+                    []
+                    if session
+                    else lane_context(agent, data, directory, state)
+                ),
+                "Question:",
+                question,
+            ]
+        )
+        command = ask_command(
+            entry["adapter"], executable, prompt, participant["lane"], session
+        )
+        scratch = budgets.ask_directory(directory, agent)
+        if not (scratch / ".git").exists():
+            scratch.mkdir(mode=0o700, exist_ok=True)
+            subprocess.run(
+                ["git", "init", "-q", str(scratch)],
+                check=True,
+                capture_output=True,
+            )
+        env = dict(os.environ)
+        for name in (
+            entry.get("home_env") or "",
+            PARTICIPANT_ENV,
+            "AGENT_PARLEY_TOKEN",
+        ):
+            env.pop(name, None)
+        env.update(
+            roster.launch_environment(
+                self.home, entry, participant["credential"]
+            )
+        )
+        print(
+            f"{agent}: answering from a read-only "
+            + (
+                f"fork of session {session}"
+                if session
+                else "fresh session given the lane's checkpoint"
+            )
+            + "; the lane's session is untouched.",
+            file=sys.stderr,
+            flush=True,
+        )
+        began = time.monotonic()
+        status = subprocess.run(
+            command, cwd=scratch, env=env, stdin=subprocess.DEVNULL, check=False
+        ).returncode
+        budgets.record_ask(
+            directory,
+            agent,
+            {
+                "at": time.time(),
+                "mode": "fork" if session else "checkpoint",
+                "status": status,
+                "seconds": round(time.monotonic() - began, 1),
+                "tokens": records.reported_tokens(
+                    self.home,
+                    {**participant, "lane": str(scratch)},
+                    {},
+                    True,
+                ),
+            },
+        )
+        return status
+
     def launch(
         self,
         agent: str,
@@ -477,7 +764,11 @@ reported.
         A resume of a lane whose activity record carries a rotation point,
         left by a ready or blocked report, starts a fresh native session
         with `rotation_task`'s bootstrap instead of resuming the recorded
-        one, unless the supervision setting ``rotate`` is off. Every
+        one, unless the supervision setting ``rotate`` is off. A resume
+        that is not interactive also asks
+        `supervision.cache_rotation` whether the lane sat idle past its
+        prompt cache with a session too large to re-read, and rotates the
+        same way when it did. Every
         adapter starts a fresh session by omitting its resume argument, so
         no provider is skipped. Any launch consumes the point, and the
         session it replaced is kept as ``rotated_from``. The rotation also
@@ -722,8 +1013,17 @@ reported.
                 seen.get("rotation")
                 and supervision.configuration(self.home, data)["rotate"]
             )
+            if resume and not rotating and not sys.stdin.isatty():
+                point = supervision.cache_rotation(
+                    self.home, lane.parent, agent
+                )
+                if point is not None:
+                    seen["rotation"] = point
+                    rotating = True
             if rotating:
-                task = rotation_task(agent, data, lane.parent, seen, task)
+                task = rotation_task(
+                    agent, data, lane.parent, seen, task, self.home
+                )
                 with contextlib.suppress(BridgeError, OSError):
                     supervision.forget_delivered(lane.parent, agent)
             prompt = self.protocol(agent, data)

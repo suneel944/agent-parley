@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_parley import BridgeError, protocol
+from agent_parley.context import lane_diffstats, lane_fields
 from agent_parley.core import BridgeCore
 
 if TYPE_CHECKING:
@@ -45,6 +46,19 @@ HOOK_EXPIRIES = (
 )
 HOOK_SLOWEST = "; slowest stage in the latest: {slowest}"
 STAGE_SPENT = re.compile(r"(\S+) (\d+\.\d+)s(?:\s|$)")
+NEEDS_INPUT = "needs input"
+WORKING = "working"
+IDLE = "idle"
+DONE = "done"
+BUCKETS = (NEEDS_INPUT, WORKING, IDLE, DONE)
+"""Lane buckets in the order every view groups them, needs input first."""
+BLOCKED_WAITS = {
+    "approval": "permission prompt",
+    "prompt": "question",
+    "dialog": "native dialog",
+    "": "blocked",
+}
+"""What a blocked lane waits on, by the cause its state record names."""
 
 
 def reading(
@@ -148,6 +162,309 @@ def lane_state(record: dict) -> str:
     return str(record["availability"]["state"])
 
 
+def lane_bucket(record: dict, now: float | None = None) -> dict:
+    """Sorts one lane into the bucket that says whether it waits on you.
+
+    `status`, `top`, the dashboard frame, the web view and the outbound
+    notifications all call this one function, so a lane reads the same in
+    each. Only recorded facts decide the bucket: the lane state record, an
+    approval, an open decision, the lane's report and its claims. No age
+    threshold takes part, so a lane changes bucket only when one of those
+    facts changes. A lane needs input while it is blocked on a permission
+    prompt, a question such as AskUserQuestion or another native dialog,
+    while its ready report awaits an approval, while a decision for it is
+    open, or while it reports a claim it holds as blocked. Otherwise it is
+    working while starting or working, done once a claim it holds ended or
+    a pull request of it merged in the window or it reported ready, and
+    idle in every other state. A block on exhausted capacity waits on time,
+    not on the operator, so it reads as idle.
+
+    Args:
+        record: One lane record of the status reading or one row of the
+            live view. The keys read are ``condition``, ``provenance``,
+            ``availability``, ``retired_at``, ``paused``,
+            ``awaiting_approval``, ``decisions``, ``outcome``, ``claims``,
+            ``report_age_seconds`` and ``pull_requests_merged``; a missing
+            key is no evidence.
+        now: Unix time ages are measured to, or None for the clock.
+
+    Returns:
+        ``bucket``, one of `BUCKETS`; ``waits``, naming each source of
+        needed input; ``seconds``, the whole seconds of the oldest wait with
+        a known start, or None; and ``inferred``, whether a lane state the
+        dialog watcher or the liveness sample inferred decided the bucket.
+    """
+    moment = time.time() if now is None else now
+    condition = record.get("condition") or {}
+    availability = record.get("availability") or {}
+    state = str(condition.get("state") or availability.get("state") or "")
+    cause = str(condition.get("cause") or "")
+    observed = bool(condition) and bool(
+        (record.get("provenance") or {}).get("inferred")
+    )
+    if state == "waiting" and not condition:
+        state, cause, observed = "blocked", "prompt", True
+    report = record.get("report_age_seconds")
+    reported = None if report is None else moment - float(report)
+    waits: list[tuple[str, float | None]] = []
+    if state == "blocked" and cause != "capacity":
+        since = condition.get("since")
+        waits.append(
+            (
+                BLOCKED_WAITS.get(cause, cause),
+                None if since is None else float(since),
+            )
+        )
+    if record.get("awaiting_approval"):
+        waits.append(("approval", reported))
+    opened = [
+        float(item.get("created") or moment)
+        for item in record.get("decisions") or []
+    ]
+    if opened:
+        named = "decision" if len(opened) == 1 else f"{len(opened)} decisions"
+        waits.append((named, min(opened)))
+    if record.get("outcome") == "blocked" and record.get("claims"):
+        waits.append(("blocked claim", reported))
+    starts = [start for _, start in waits if start is not None]
+    ended = any(claim.get("ended") for claim in record.get("claims") or [])
+    if waits:
+        bucket = NEEDS_INPUT
+        observed = observed and state == "blocked"
+    elif record.get("retired_at") or record.get("paused"):
+        bucket = IDLE
+    elif state in ("starting", "working"):
+        bucket = WORKING
+    elif (
+        ended
+        or record.get("pull_requests_merged")
+        or record.get("outcome") == "ready"
+    ):
+        bucket = DONE
+    else:
+        bucket = IDLE
+    return {
+        "bucket": bucket,
+        "waits": [name for name, _ in waits],
+        "seconds": (
+            int(max(0.0, moment - min(starts))) if waits and starts else None
+        ),
+        "inferred": observed,
+    }
+
+
+def bucket_cell(bucket: dict) -> str:
+    """Words one lane's bucket for a table cell or a message line.
+
+    Args:
+        bucket: A bucket as `lane_bucket` returns it.
+
+    Returns:
+        Text such as ``needs input: approval, decision 3m`` or ``working``,
+        with ``inferred`` added when an inferred lane state decided it.
+    """
+    from agent_parley import tables
+
+    text = str(bucket["bucket"])
+    if bucket["waits"]:
+        text += ": " + ", ".join(bucket["waits"])
+    if bucket["seconds"] is not None:
+        text += f" {tables.age(bucket['seconds'])}"
+    return text + (" (inferred)" if bucket["inferred"] else "")
+
+
+def bucket_of(record: dict) -> dict:
+    """Reads the bucket a reading recorded for one lane, or derives it.
+
+    Args:
+        record: One lane record of the status reading or one live view row.
+
+    Returns:
+        The ``bucket`` the reading stored, else `lane_bucket` of the record.
+    """
+    return record.get("bucket") or lane_bucket(record)
+
+
+def plan_reading(home: Path, directory: Path, lane: str, provider: str) -> dict:
+    """Reads how far one lane is through the task plan it recorded.
+
+    `status`, `top`, the web view and the live view rows all call this one
+    function, so a lane's plan reads the same in each. Only the plan file
+    the lane's hook or `plan update` command wrote is read.
+
+    Args:
+        home: Private bridge state root.
+        directory: Common project state directory.
+        lane: Lane name.
+        provider: Provider name the lane runs.
+
+    Returns:
+        ``source``, the tool the provider's lanes report a plan through, or
+        an empty string when the provider has no path; ``recorded``,
+        whether the lane has a plan; ``done`` and ``total`` step counts;
+        ``current``, the in-progress step, else the first pending one, else
+        an empty string; and ``truncated``, whether a cap clipped the plan.
+    """
+    from agent_parley import lanes, roster
+
+    adapter = str(roster.providers(home).get(provider, {}).get("adapter", ""))
+    plan = lanes.lane_task_plan(directory, lane)
+    items = plan["items"] if plan else []
+    pending = [item for item in items if item["status"] != "completed"]
+    current = next(
+        (item for item in pending if item["status"] == "in_progress"),
+        pending[0] if pending else None,
+    )
+    return {
+        "source": plan["source"] if plan else lanes.plan_source(adapter),
+        "recorded": plan is not None,
+        "done": len(items) - len(pending),
+        "total": len(items),
+        "current": current["text"] if current else "",
+        "truncated": bool(plan and plan["truncated"]),
+    }
+
+
+def plan_cell(plan: dict) -> str:
+    """Words one lane's plan progress for a table cell or a status line.
+
+    Args:
+        plan: A plan as `plan_reading` returns it.
+
+    Returns:
+        Text such as ``2/5 write tests``, ``2/5 done`` for a finished plan,
+        ``-`` for a lane with no plan yet, and ``n/a`` when the provider
+        has no path to report one.
+    """
+    if not plan["recorded"]:
+        return "-" if plan["source"] else "n/a"
+    text = f"{plan['done']}/{plan['total']}"
+    return f"{text} {plan['current'] or 'done'}"
+
+
+def print_plan(record: dict) -> None:
+    """Prints one lane's plan progress under the status table.
+
+    Args:
+        record: One lane record of the status reading. A lane with no plan
+            yet prints nothing; a lane whose provider has no path to report
+            one says so, so the gap is not read as an empty plan.
+    """
+    plan = record["task_plan"]
+    if plan["recorded"]:
+        print(f"Plan {record['participant']}: {plan_cell(plan)}")
+    elif not plan["source"]:
+        print(
+            f"Plan {record['participant']}: n/a, "
+            f"{record['provider']} has no plan path"
+        )
+
+
+def bucket_order(records: list[dict]) -> list[dict]:
+    """Groups lanes by bucket, needs input first, keeping their order.
+
+    The sort is stable, so lanes inside one bucket keep the order the
+    caller read them in, by name, and an unchanged row never moves.
+
+    Args:
+        records: Lanes of the status reading or rows of the live view.
+
+    Returns:
+        The same records ordered by `BUCKETS`.
+    """
+    return sorted(
+        records, key=lambda record: BUCKETS.index(bucket_of(record)["bucket"])
+    )
+
+
+def waiting_recap(directory: Path, record: dict) -> dict | None:
+    """Reads the stored turn recap of a lane that waits on the operator.
+
+    Args:
+        directory: Private project state directory.
+        record: One lane record or live view row with its ``bucket``.
+
+    Returns:
+        The lane's stored recap, or None when the lane is not in the
+        ``needs input`` bucket or holds no recap. Nothing is taken or
+        written, so a view never runs Git or reads a native record.
+    """
+    from agent_parley import recaps
+
+    if bucket_of(record)["bucket"] != NEEDS_INPUT:
+        return None
+    return recaps.lane_recap(directory, record["participant"])
+
+
+def recap_note(record: dict) -> str:
+    """Words a lane's recap as the one line every view shows.
+
+    Args:
+        record: One lane record or live view row with its ``recap``.
+
+    Returns:
+        Text such as ``last turn: Tests pass; 1 failed, 3 files changed``
+        led by the lane's last message, or an empty string when the lane
+        has no recap or it holds nothing to show.
+    """
+    recap = record.get("recap") or {}
+    parts = []
+    if recap.get("message"):
+        parts.append(" ".join(str(recap["message"]).split()))
+    failed = len(recap.get("failed") or []) + int(
+        str(recap.get("failed_omitted", 0) or 0)
+    )
+    changed = len(recap.get("files") or []) + int(
+        str(recap.get("files_omitted", 0) or 0)
+    )
+    counts = [
+        f"{count} {label}"
+        for count, label in ((failed, "failed"), (changed, "files changed"))
+        if count
+    ]
+    if counts:
+        parts.append(", ".join(counts))
+    return f"last turn: {'; '.join(parts)}" if parts else ""
+
+
+def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
+    """Puts one heading above each bucket's rows of a laid-out table.
+
+    Args:
+        lines: The table heading, one line per record in the same order, and
+            any trailing lines such as hidden columns.
+        records: The lanes the rows were built from, in `bucket_order`.
+
+    Returns:
+        The table with a line such as ``Needs input (1): claude approval
+        3m`` before the first row of each bucket, so the operator finds the
+        lanes waiting on them, what each waits on and for how long, without
+        reading every row. A waiting lane's row is followed by its
+        `recap_note` when it has a recap.
+    """
+    if not records:
+        return lines
+    buckets = [bucket_of(record) for record in records]
+    names = [bucket["bucket"] for bucket in buckets]
+    grouped = lines[:1]
+    for index, name in enumerate(names):
+        if index == 0 or names[index - 1] != name:
+            waiting = "; ".join(
+                f"{record['participant']} "
+                + bucket_cell(bucket).removeprefix(f"{NEEDS_INPUT}: ")
+                for record, bucket in zip(records, buckets, strict=True)
+                if bucket["bucket"] == name == NEEDS_INPUT
+            )
+            grouped.append(
+                f"{name.capitalize()} ({names.count(name)}):"
+                + (f" {waiting}" if waiting else "")
+            )
+        grouped.append(lines[index + 1])
+        if note := recap_note(records[index]):
+            grouped.append(f"  {note}")
+    return grouped + lines[len(records) + 1 :]
+
+
 def service_state(server: dict) -> str:
     """Names the coordination service's state in the shared wording.
 
@@ -224,6 +541,32 @@ def fold_line(count: int, after: float, noun: str) -> str:
         f"{count} {noun}{plural} older than {tables.age(after)} hidden; "
         "--all shows them"
     )
+
+
+def handed_note(handed: dict | None) -> str:
+    """Words a lane's handed-off wait for its session text.
+
+    Args:
+        handed: The wait as `waits.pending` reads it, or None.
+
+    Returns:
+        Text such as ``waiting on handoff for 12m, service wakes it`` or
+        ``waiting on mail for 1m, polling: wake is off for this lane``, or
+        an empty string when nothing is handed off.
+    """
+    from agent_parley import tables, waits
+
+    if not handed:
+        return ""
+    named = handed["kind"] + (
+        f" in {handed['thread_id']}" if handed["thread_id"] else ""
+    )
+    how = (
+        "service wakes it"
+        if handed["wake"] == waits.SERVICE
+        else f"polling: {handed['reason']}"
+    )
+    return f"waiting on {named} for {tables.age(handed['age_seconds'])}, {how}"
 
 
 def task_line(record: dict, fallback: str) -> str:
@@ -1031,6 +1374,7 @@ class StatusMixin(BridgeCore):
             "ledger": snapshot(directory),
             "configuration": supervision.configuration(self.home, data),
             "usage": usage,
+            "diffstats": lane_diffstats(data),
             "schedules": schedules,
             "schedules_error": failure,
             "pull_request_record": cached,
@@ -1090,10 +1434,13 @@ class StatusMixin(BridgeCore):
             it last progressed and its cached pull request. `self_wait` names
             an unexpired self-declared wait and its next-check time, which the
             session text also names in place of a bare idle label.
+            `service_wait` is the wait the lane handed to the service, as
+            `waits.pending` reads it with its times in RFC 3339, or None;
+            with no self-declared wait the session text names it instead.
         """
         import sqlite3
 
-        from agent_parley import lifecycle
+        from agent_parley import approvals, lifecycle, waits
         from agent_parley.cli import (
             activity,
             budgets,
@@ -1166,6 +1513,7 @@ class StatusMixin(BridgeCore):
                 condition = lanes.read(db, data["root"], agent)
                 accounts = lanes.read_accounts(db, data["root"])
                 wake = lanes.read_wake(db, data["root"], agent)
+                handed = waits.pending(db, data["root"], name)
                 newer = (
                     store.issue_mail(
                         db, data["root"], name, open_issue, reported_at
@@ -1175,6 +1523,7 @@ class StatusMixin(BridgeCore):
                 )
         except (sqlite3.Error, BridgeError, OSError, ValueError):
             condition, accounts, wake, newer = None, {}, {}, 0
+            handed = None
         provenance = lanes.provenance(
             condition, supervision.hook_gaps(self.home, participant)
         )
@@ -1187,7 +1536,7 @@ class StatusMixin(BridgeCore):
                 f"waiting on {active_wait['reason']}, next check "
                 f"{views.timestamp(active_wait['until'])}"
                 if active_wait
-                else ""
+                else handed_note(handed)
             )
             liveness = (
                 lanes.describe(
@@ -1212,6 +1561,9 @@ class StatusMixin(BridgeCore):
             "participant": agent,
             "identity": name,
             "provider": participant["provider"],
+            "task_plan": plan_reading(
+                self.home, directory, agent, participant["provider"]
+            ),
             "credential": participant["credential"],
             "session": liveness,
             "condition": lanes.view(condition),
@@ -1263,6 +1615,12 @@ class StatusMixin(BridgeCore):
             "injected_bytes": state.get("injected_bytes", 0),
             "injections": state.get("injections", 0),
             "injected_per_hour": checkpoints.hourly_rate(state),
+            **lane_fields(
+                self.home,
+                participant,
+                frame["diffstats"].get(agent),
+                configuration["context_full_percent"],
+            ),
             "claims": [
                 {
                     "issue": int(number),
@@ -1334,6 +1692,15 @@ class StatusMixin(BridgeCore):
                     else None
                 ),
             },
+            "service_wait": (
+                {
+                    **handed,
+                    "since": views.timestamp(handed["since"]),
+                    "woken_at": views.timestamp(handed["woken_at"]),
+                }
+                if handed
+                else None
+            ),
             "operator_edits": list(edited),
             "base_advance_paths": list(advanced),
             "base_advance": supervision.base_advance_marker(
@@ -1366,6 +1733,9 @@ class StatusMixin(BridgeCore):
         )
         record["current_task"] = task_line(record, str(state.get("task") or ""))
         record["lane_state"] = lane_state(record)
+        record["awaiting_approval"] = (record["approval"] or {}).get(
+            "state"
+        ) in (approvals.AWAITING, "unreadable")
         if wake:
             next_at = wake.get("next_at")
             record["wake"] = {
@@ -1453,7 +1823,7 @@ class StatusMixin(BridgeCore):
             gone is left out; one whose root is missing or whose lanes all
             stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
-        from agent_parley import pool
+        from agent_parley import decisions, pool
         from agent_parley.cli import (
             inbound_status,
             issues,
@@ -1497,6 +1867,30 @@ class StatusMixin(BridgeCore):
                         data["participants"], key=tables.natural_key
                     )
                 ]
+                outcomes = metrics.pull_request_outcomes(
+                    context.get("pull_request_record"),
+                    context["ledger"],
+                    time.time() - metrics.OUTCOME_WINDOW,
+                )
+                waiting = decisions.list_open(path.parent)
+                for record in participants:
+                    agent = record["participant"]
+                    record["decisions"] = [
+                        {
+                            "id": item.get("id", ""),
+                            "kind": item.get("kind", ""),
+                            "created": item.get("created"),
+                        }
+                        for item in waiting
+                        if item.get("lane") == agent
+                    ]
+                    record["pull_requests_merged"] = (
+                        outcomes["lanes"]
+                        .get(agent, {})
+                        .get("pull_requests_merged", 0)
+                    )
+                    record["bucket"] = lane_bucket(record)
+                    record["recap"] = waiting_recap(path.parent, record)
                 projects.append(
                     {
                         "root": data["root"],
@@ -1520,13 +1914,7 @@ class StatusMixin(BridgeCore):
                         ),
                         "supervision_poll": supervision.last_poll(path.parent),
                         "fold_after": context["configuration"]["fold_after"],
-                        "pull_request_outcomes": (
-                            metrics.pull_request_outcomes(
-                                context.get("pull_request_record"),
-                                context["ledger"],
-                                time.time() - metrics.OUTCOME_WINDOW,
-                            )
-                        ),
+                        "pull_request_outcomes": outcomes,
                         **self._integration(path.parent, data, context),
                     }
                 )
@@ -1763,7 +2151,8 @@ class StatusMixin(BridgeCore):
             print(note)
         opened = known["issues"] if known["complete"] else None
         work: list[tuple[int, tuple[str, ...]]] = []
-        lanes: list[tuple[str, ...]] = []
+        lanes: dict[str, tuple[str, ...]] = {}
+        roster: list[dict] = []
         notes: list[str] = []
         runs: list[str] = []
         ended: list[int] = []
@@ -1806,18 +2195,23 @@ class StatusMixin(BridgeCore):
                             tables.work_row(shown, owner, record["lane_state"]),
                         )
                     )
-            lanes.append(
-                (
-                    owner,
-                    record["lane_state"],
-                    str(live),
-                    record.get("current_task") or "-",
-                )
+            roster.append(record)
+            lanes[owner] = (
+                owner,
+                record["lane_state"],
+                str(live),
+                record.get("current_task") or "-",
             )
         rows = [row for _, row in sorted(work, key=lambda item: item[0])]
         for text in tables.work_table(rows, width) or ["No open claims."]:
             print(text)
-        for text in tables.lane_table(lanes, width):
+        roster = bucket_order(roster)
+        for text in bucket_lines(
+            tables.lane_table(
+                [lanes[record["participant"]] for record in roster], width
+            ),
+            roster,
+        ):
             print(text)
         if gone:
             print(fold_line(gone, after, "dead lane"))
@@ -1933,16 +2327,19 @@ class StatusMixin(BridgeCore):
             if selection.participant:
                 for record in reported:
                     lane_detail(record, data)
+                    print_plan(record)
                 continue
+            ordered = bucket_order(reported)
             rows = [
                 tables.status_row(
                     record, pending_offers(project, record["participant"])
                 )
-                for record in reported
+                for record in ordered
             ]
-            for row in tables.status_table(rows, width):
+            for row in bucket_lines(tables.status_table(rows, width), ordered):
                 print(row)
             for record in reported:
+                print_plan(record)
                 for claim in record["claims"]:
                     if claim.get("blueprint"):
                         print(f"Blueprint {claim['blueprint']}")
