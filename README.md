@@ -332,6 +332,25 @@ lane setup.
   records the idea with its likely duplicates and the lane keeps working.
   `agent-parley followup accept ID` files the issue in the active milestone
   and offers it to an idle lane; `followup list` shows what waits.
+- **A lane fans out child lanes that return only their result.** Mail to
+  `@child` with the paths the child may reserve and the task as the body. The
+  child gets its own worktree, cut from the parent's branch, under the
+  parent's provider and credential. The parent reads one capped report, never
+  the transcript, and merges the branch with Git. A child cannot spawn
+  children; three per parent and eight per project at most.
+- **Lanes sharing a credential park before its quota runs out.**
+  `agent-parley quota set NAME --hours H --tokens N [--threshold F]` records
+  the plan's window; `quota show` prints the remaining headroom. Near the
+  threshold the lowest-priority lanes park, at the limit all do, and a vendor
+  rate-limit refusal parks them until its reset. Parking defers wakes and
+  offers only; it never moves a lane or stops a running turn.
+- **Lanes are grouped by what they need from you.** `status`, `top`, the
+  `top --serve` web view and the dashboard list needs input first, then
+  working, idle and done. A sort orders rows inside each group only.
+- **You see each lane's plan, recap and footprint.** `participant show NAME`
+  prints the lane's live task plan and, while it needs input, a recap of its
+  last turn. `top` columns give the context window in use, the diff with
+  files changed, and the host and worktree the lane runs in.
 - **Native hooks decide before the tool runs.** They block branch changes
   inside an assigned lane, catch drift after any bypass, and deliver bounded
   updates only when coordination state changes. A prompt you type is never
