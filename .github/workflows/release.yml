@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/secret-scan
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa
       - run: make check
         working-directory: release-source
       - name: Prepare or reuse verified release assets
@@ -74,7 +74,7 @@ jobs:
         run: python3 -m scripts.release_publish stage
       - name: Publish to PyPI
         if: steps.stage.outputs.pending == 'true'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
         with:
           packages-dir: dist/pypi
           print-hash: true
