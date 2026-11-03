@@ -1351,7 +1351,13 @@ class StatusMixin(BridgeCore):
         """
         import sqlite3
 
-        from agent_parley.cli import json, snapshot, store, supervision
+        from agent_parley.cli import (
+            convergence,
+            json,
+            snapshot,
+            store,
+            supervision,
+        )
 
         try:
             cached = json.loads(
@@ -1372,6 +1378,7 @@ class StatusMixin(BridgeCore):
             failure = exc
         return {
             "ledger": snapshot(directory),
+            "convergence": convergence.read(directory),
             "configuration": supervision.configuration(self.home, data),
             "usage": usage,
             "diffstats": lane_diffstats(data),
@@ -1469,7 +1476,6 @@ class StatusMixin(BridgeCore):
             else self._project_context(directory, data)
         )
         ledger = frame["ledger"]
-        accounts = convergence.read(directory)
         configuration = frame["configuration"]
         participant = data["participants"][agent]
         name = participant["display"]
@@ -1661,7 +1667,7 @@ class StatusMixin(BridgeCore):
                     ),
                     **issues.unresolved_completion(record),
                     "convergence": convergence.current(
-                        accounts, number, record.get("claim_id")
+                        frame["convergence"], number, record.get("claim_id")
                     ),
                     **(
                         {"blueprint": blueprints.line(number, runs[number])}
