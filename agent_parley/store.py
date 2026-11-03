@@ -491,7 +491,7 @@ def initialize(home: Path) -> None:
                         "WHERE created_ts IS NULL"
                     )
                 _open_threads(db)
-                _rebuild_search(db, home)
+                rebuild_search(db, home)
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -698,7 +698,7 @@ def _add_message_search(db: sqlite3.Connection, home: Path) -> None:
             db.execute(statement)
             statement = ""
     if triggers != 2:
-        _rebuild_search(db, home)
+        rebuild_search(db, home)
 
 
 def _fts_available(db: sqlite3.Connection) -> bool:
@@ -724,8 +724,11 @@ def _open_threads(db: sqlite3.Connection) -> None:
     )
 
 
-def _rebuild_search(db: sqlite3.Connection, home: Path) -> None:
+def rebuild_search(db: sqlite3.Connection, home: Path) -> None:
     """Indexes every stored message when this store carries an index.
+
+    Rows rewritten without the index seeing it, such as the attachment
+    markers an import renumbers, are indexed again as they now read.
 
     A body that spilled to an attachment keeps only its opening slice in
     ``body_md``, which is all a rebuild reads. Each spilled message is then
