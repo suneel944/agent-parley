@@ -58,6 +58,11 @@ def has_branch(repo: Path, branch: str) -> bool:
     )
 
 
+def _stash_entry(root: Path) -> str:
+    """Returns the object name of the newest stash entry, or empty."""
+    return git(root, "for-each-ref", "--format=%(objectname)", "refs/stash")
+
+
 def preserve_pending(root: Path) -> str | None:
     """Stashes pending base-checkout work so lanes can start from HEAD.
 
@@ -83,6 +88,7 @@ def preserve_pending(root: Path) -> str | None:
     if not git(root, "status", "--porcelain"):
         return None
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    before = _stash_entry(root)
     git(
         root,
         "stash",
@@ -91,13 +97,19 @@ def preserve_pending(root: Path) -> str | None:
         "--message",
         f"{PENDING_MESSAGE} {stamp}",
     )
+    entry = _stash_entry(root)
     if git(root, "status", "--porcelain"):
+        stashed = (
+            f" Part of the work is already in stash entry {entry}."
+            if entry and entry != before
+            else ""
+        )
         raise BridgeError(
             f"The checkout at {root} still holds changes that Git cannot "
-            "stash. Commit or preserve them first; worktrees start at HEAD.",
+            "stash. Commit or preserve them first; worktrees start at HEAD."
+            f"{stashed}",
             next_command=f"git -C {shlex.quote(str(root))} status --short",
         )
-    entry = git(root, "rev-parse", "refs/stash")
     return (
         f"Preserved your pending changes as stash entry {entry}; worktrees "
         f"start at HEAD. Restore them with `git -C "
