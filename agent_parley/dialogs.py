@@ -744,10 +744,11 @@ def bridge_shell(screen: str, text: str, data: bytes) -> bool:
     through its shell tool, so a lane launched before the operator's opt-in
     parks on the first such command. Only a prompt titled as a shell command
     whose command begins with that exact interpreter and module, spelled as
-    `protocol.cli_command` or `protocol.legacy_cli_command`, and whose
-    remainder carries no shell operator that could chain a second command,
-    qualifies. A newline chains commands too, and the flattened screen
-    cannot show one, so the drawn rows must hold the command on one row
+    `protocol.cli_command` with ``-P``, and whose remainder carries no shell
+    operator that could chain a second command, qualifies. A prompt for the
+    interpreter without ``-P`` escalates, because that spelling runs a
+    checkout's own package. A newline chains commands too, and the flattened
+    screen cannot show one, so the drawn rows must hold the command on one row
     followed by at most the description row and the client's approval
     notice. A long command the client wraps onto a second row therefore
     escalates as well. Any other screen escalates as before.
@@ -766,18 +767,8 @@ def bridge_shell(screen: str, text: str, data: bytes) -> bool:
     if title < 0:
         return False
     shown = " ".join(BOX.sub(" ", head[title + len(SHELL_TITLE) :]).split())
-    command = next(
-        (
-            spelled + " "
-            for spelled in (
-                protocol.cli_command(),
-                protocol.legacy_cli_command(),
-            )
-            if shown.startswith(spelled + " ")
-        ),
-        None,
-    )
-    if command is None:
+    command = protocol.cli_command() + " "
+    if not shown.startswith(command):
         return False
     if SHELL_OPERATORS.search(shown[len(command) :]) is not None:
         return False
