@@ -113,6 +113,24 @@ def test_github_reads_whether_the_signed_in_account_holds_an_issue(
     assert forge.assigned(repo, "568") is None
 
 
+def test_beads_reads_the_assignee_before_a_claim_assigns(
+    repo, tmp_path, monkeypatch
+):
+    stub_beads_cli(tmp_path, monkeypatch)
+    (repo / ".beads").mkdir()
+    assert forge.assigned(repo, "42") is False
+    replies = {"show": '{"id": "42", "assignee": "operator"}'}
+    monkeypatch.setattr(forge, "_operator", lambda: "operator")
+    monkeypatch.setattr(forge, "_run", lambda args, timeout: replies["show"])
+    assert forge.assigned(repo, "42") is True
+    replies["show"] = '[{"id": "42", "assignee": "someone"}]'
+    assert forge.assigned(repo, "42") is None
+    replies["show"] = "not json"
+    assert forge.assigned(repo, "42") is None
+    replies["show"] = None
+    assert forge.assigned(repo, "42") is None
+
+
 def test_the_open_issue_catalog_records_the_forge_update_time(
     repo, monkeypatch
 ):
@@ -140,6 +158,8 @@ def test_the_open_issue_catalog_records_the_forge_update_time(
         ("To get started with GitHub CLI, please run:  gh auth login", "auth"),
         ("HTTP 403: API rate limit exceeded for user ID 1.", "rate"),
         ("HTTP 429: Too Many Requests", "rate"),
+        ("API rate limit exceeded for installation ID 1.", "rate"),
+        ("You have exceeded a secondary rate limit.", "rate"),
         ("gh: Not Found (HTTP 404)", "missing"),
         ("HTTP 403: Resource not accessible by integration", "error"),
     ],
@@ -209,7 +229,8 @@ def test_a_claim_under_beads_mirrors_through_bd_not_gh(
     assert record["title"] == "Beads title"
     recorded = calls.read_text().split("\0")[:-1]
     assert recorded[:3] == ["show", "42", "--json"]
-    assert recorded[3:6] == ["update", "42", "--assignee"]
+    assert recorded[3:6] == ["show", "42", "--json"]
+    assert recorded[6:9] == ["update", "42", "--assignee"]
 
 
 def test_participant_pr_refuses_under_a_forge_without_pull_requests(

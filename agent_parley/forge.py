@@ -286,7 +286,7 @@ def issue_completion(repo: Path, number: str) -> dict | None:
         if state != "CLOSED":
             return {"state": state}
         closed_at = _epoch(record["closedAt"])
-        linked = [
+        linked: list[int] | None = [
             int(entry["number"])
             for entry in record.get("closedByPullRequestsReferences") or []
             if entry.get("number")
@@ -303,6 +303,8 @@ def issue_completion(repo: Path, number: str) -> dict | None:
     }
     if not linked:
         linked = _closing_references(project, number, closed_at)
+    if linked is None:
+        return None
     if not linked:
         return reading
     pull = _run(
@@ -333,7 +335,9 @@ def issue_completion(repo: Path, number: str) -> dict | None:
     return reading
 
 
-def _closing_references(project: str, number: str, closed_at: float) -> list:
+def _closing_references(
+    project: str, number: str, closed_at: float
+) -> list[int] | None:
     """Finds merged pull requests that name an issue with a closing keyword.
 
     GitHub links a closing pull request to an issue only when the pull
@@ -356,8 +360,9 @@ def _closing_references(project: str, number: str, closed_at: float) -> list:
     reading stays bounded however long the timeline grows.
 
     Returns:
-        The matching pull request numbers, empty when none match or the
-        timeline cannot be read.
+        The matching pull request numbers, empty when none match, or None
+        when a timeline page cannot be read, so an unknown closer never
+        reads as no closer.
     """
     try:
         events = []
@@ -371,6 +376,8 @@ def _closing_references(project: str, number: str, closed_at: float) -> list:
                 ],
                 5,
             )
+            if output is None:
+                return None
             batch = json.loads(output or "[]")
             events.extend(batch)
             if len(batch) < TIMELINE_PAGE:
@@ -391,7 +398,7 @@ def _closing_references(project: str, number: str, closed_at: float) -> list:
                 found.append(int(source["number"]))
         return found
     except (ValueError, TypeError, AttributeError, KeyError):
-        return []
+        return None
 
 
 def closing_numbers(body: str) -> list[str]:
@@ -632,8 +639,10 @@ def _pull_request_reading(record: dict) -> dict:
 def _checks(rollup: list | None) -> tuple[str, list[str]]:
     """Reduces a pull request's reported checks to one verdict.
 
-    A check run is pending until its status reads completed, and a commit
-    status is pending while its state reads pending or expected. The verdict
+    A check run is pending until its status reads completed with a
+    conclusion other than stale, since a stale run is one the forge set
+    aside to be run again, and a commit status is pending while its state
+    reads pending or expected. The verdict
     is `red` only once every check finished, so a lane is told once about a
     finished run rather than about each job as it fails.
 
@@ -654,6 +663,9 @@ def _checks(rollup: list | None) -> tuple[str, list[str]]:
                 pending = True
                 continue
             outcome = str(entry.get("conclusion") or "").upper()
+            if outcome == "STALE":
+                pending = True
+                continue
         else:
             outcome = str(entry.get("state") or "").upper()
             if outcome in {"", "PENDING", "EXPECTED"}:
@@ -677,16 +689,18 @@ def _pending(rollup: list | None) -> list[dict]:
 
     Returns:
         One entry per check `_checks` counts as pending: its name, its state
-        in lower case (`queued`, `in_progress`, `pending` or `expected`) and
-        its start in Unix seconds, or None when the forge reports no usable
-        start time.
+        in lower case (`queued`, `in_progress`, `stale`, `pending` or
+        `expected`) and its start in Unix seconds, or None when the forge
+        reports no usable start time.
     """
     pending: list[dict] = []
     for entry in rollup or []:
         if "status" in entry:
             state = str(entry.get("status") or "").upper()
             if state == "COMPLETED":
-                continue
+                if str(entry.get("conclusion") or "").upper() != "STALE":
+                    continue
+                state = "STALE"
         else:
             state = str(entry.get("state") or "").upper()
             if state not in {"", "PENDING", "EXPECTED"}:
@@ -907,7 +921,12 @@ def _failure_kind(detail: str) -> str:
         )
     ):
         return "auth"
-    if "http 429" in text or ("http 403" in text and "rate limit" in text):
+    if (
+        "http 429" in text
+        or "rate limit exceeded" in text
+        or "secondary rate limit" in text
+        or ("http 403" in text and "rate limit" in text)
+    ):
         return "rate"
     if "http 404" in text:
         return "missing"
@@ -1446,11 +1465,17 @@ def assigned(repo: Path, number: str) -> bool | None:
 
     Returns:
         True only when the GitHub forge reports the signed-in account among
-        the issue's assignees; False for any other forge or an unreachable
-        project; None when the GitHub forge could not be read, so the caller
-        neither assigns nor marks an issue it knows nothing about.
+        the issue's assignees, or the Beads ledger records the operator as
+        its assignee; False for the null forge, an unreachable project, or a
+        Beads issue with no assignee; None when the forge could not be read
+        or a Beads issue names someone else, whom an assignment would
+        replace, so the caller neither assigns nor marks an issue it knows
+        nothing about and a release never clears an assignee a person set.
     """
-    if _implementation(repo) != "github":
+    chosen = _implementation(repo)
+    if chosen == "beads":
+        return _beads_assigned(number)
+    if chosen != "github":
         return False
     project = _reachable(repo)
     if project is None:
@@ -1528,6 +1553,33 @@ def _operator() -> str:
         return getpass.getuser()
     except OSError:
         return "agent-parley"
+
+
+def _beads_assigned(number: str) -> bool | None:
+    """Reads whether the Beads ledger records the operator on an issue.
+
+    Args:
+        number: Bare repository issue number.
+
+    Returns:
+        True when the operator is the assignee, False when the issue has
+        none, None when the ledger cannot be read or names someone else.
+    """
+    if not _beads_reachable():
+        return None
+    output = _run(["bd", "show", number, "--json"], 15)
+    if output is None:
+        return None
+    try:
+        record = json.loads(output)
+        if isinstance(record, list):
+            record = record[0]
+        assignee = str(record.get("assignee") or "")
+    except (ValueError, TypeError, AttributeError, IndexError):
+        return None
+    if not assignee:
+        return False
+    return True if assignee == _operator() else None
 
 
 def _beads_update(number: str, assignee: str) -> bool:
