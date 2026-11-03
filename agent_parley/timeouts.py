@@ -297,6 +297,9 @@ def record(directory: Path, name: str, applied: dict) -> dict:
 def announce(applied: dict) -> list[dict]:
     """Sends the applied default's one-line notice, best effort.
 
+    The subject is clipped to `notify.MAX_SUBJECT_BYTES` UTF-8 bytes, not
+    characters, without splitting a multibyte character.
+
     Args:
         applied: Decision returned by `settle`.
 
@@ -304,10 +307,12 @@ def announce(applied: dict) -> list[dict]:
         One delivery result per configured transport; empty when
         notification is off.
     """
+    from agent_parley import checkpoints
+
     if not notify.enabled():
         return []
     text = line(applied)
-    subject = text[: notify.MAX_SUBJECT_BYTES]
+    subject = checkpoints.clip(text, notify.MAX_SUBJECT_BYTES)
     return notify.send(notify.settings(), subject, text)
 
 

@@ -2141,8 +2141,9 @@ def test_a_root_publication_without_refused_reads_as_refusing_nothing(
     assert supervision.root_refused(tmp_path) == []
 
 
+@pytest.mark.parametrize("failure", [BridgeError, OSError, ValueError])
 def test_one_refused_reclaim_step_never_skips_the_others(
-    bridge, repo, idle, monkeypatch
+    bridge, repo, idle, monkeypatch, failure
 ):
     ran = []
     reclaimed = cli.Bridge.reclaim
@@ -2150,7 +2151,7 @@ def test_one_refused_reclaim_step_never_skips_the_others(
 
     def refusing(self, root, *, apply=False):
         """Refuses every worktree move."""
-        raise BridgeError("relocation refused")
+        raise failure("relocation refused")
 
     def reclaiming(self, root, *, apply=False):
         """Records that the lane reclaim ran."""

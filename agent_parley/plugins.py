@@ -372,7 +372,10 @@ def environment(name: str, label: str, directory: Path) -> dict[str, str]:
 
     The CLI default is reached by removing the variable rather than setting
     it to the default path, because Claude Code moves other files when the
-    variable is set at all.
+    variable is set at all. Every other label sets the variable to the
+    directory itself, the exported one included, so a credential profile
+    that happens to be named like the `SHELL` label still selects its own
+    home rather than the exported one.
 
     Args:
         name: Supported CLI's executable name.
@@ -385,7 +388,7 @@ def environment(name: str, label: str, directory: Path) -> dict[str, str]:
     env = dict(os.environ)
     if not label:
         env.pop(HOME_ENV[name], None)
-    elif label != SHELL:
+    else:
         env[HOME_ENV[name]] = str(directory)
     return env
 

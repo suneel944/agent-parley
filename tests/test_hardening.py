@@ -123,6 +123,25 @@ def test_a_damaged_activity_record_never_blocks_a_served_tool_call(
     assert checkpoints.serve(bridge.home, request)["status"] == 0
 
 
+@pytest.mark.parametrize("adapter", ["native", "gemini"])
+@pytest.mark.parametrize(
+    "field", [{"tool_name": 5}, {"hook_event_name": ["PreToolUse"]}]
+)
+def test_a_wrongly_typed_hook_field_is_refused_not_raised(
+    bridge, lane, adapter, field
+):
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "adapter": adapter,
+        "payload": {**tool_payload(lane), **field},
+    }
+    served = checkpoints.serve(bridge.home, request)
+    assert served["status"] == 2
+    assert "not text" in served["stderr"]
+    assert checkpoints.deadline_refusal(request) is None
+
+
 @pytest.mark.parametrize("damaged", ["null", "[]", "1", "{trunc"])
 def test_writers_and_fence_reads_survive_a_non_object_record(lane, damaged):
     directory = lane.parent

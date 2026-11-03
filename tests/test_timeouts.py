@@ -190,6 +190,20 @@ def test_an_applied_default_is_recorded_and_announced(
     assert sent == [timeouts.line(applied)]
 
 
+def test_the_announced_subject_is_clipped_to_bytes(monkeypatch):
+    subjects = []
+    monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "telegram")
+    monkeypatch.setattr(notify, "settings", lambda: {"transports": []})
+    monkeypatch.setattr(timeouts, "line", lambda applied: "é" * 150)
+    monkeypatch.setattr(
+        notify,
+        "send",
+        lambda config, subject, body: subjects.append(subject) or [],
+    )
+    timeouts.announce({})
+    assert subjects == ["é" * (notify.MAX_SUBJECT_BYTES // 2)]
+
+
 def open_decision(directory: Path, event: notify.Event) -> dict:
     """Records one notification's decision for lane codex at `ASKED`."""
     options, reversibility = notify.ANSWERS[event]

@@ -7,6 +7,7 @@ it one turn when that arrives. The record lives in the coordination store, so
 `status` reads what a lane waits for and since when.
 """
 
+import math
 import sqlite3
 import threading
 import time
@@ -59,12 +60,16 @@ def bounded(value: object, ceiling: float = MAX_SECONDS) -> float:
         The wait actually held, in seconds, never above the ceiling.
 
     Raises:
-        BridgeError: If the requested wait is not a non-negative number.
+        BridgeError: If the requested wait is not a finite, non-negative
+            number. A NaN compares false against every bound, so it would
+            never expire and would hold its permit for good.
     """
     if value is None:
         requested = DEFAULT_SECONDS
     elif isinstance(value, bool) or not isinstance(value, int | float):
         raise BridgeError("timeout_seconds must be a number of seconds.")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise BridgeError("timeout_seconds must be a finite number.")
     else:
         requested = float(value)
     if requested < 0:

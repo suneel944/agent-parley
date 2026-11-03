@@ -497,8 +497,6 @@ def settle_reboot(home: Path, directory: Path, manifest: dict) -> list[str]:
     Returns:
         Participants whose recorded session was marked stopped.
     """
-    from agent_parley import checkpoints
-
     current = process.boot_id()
     if not current:
         return []
@@ -510,38 +508,72 @@ def settle_reboot(home: Path, directory: Path, manifest: dict) -> list[str]:
     if previous == current or previous.startswith(f"{{ sec = {current},"):
         return []
     marked = []
-    if previous:
-        for name in manifest["participants"]:
-            with lock(directory / f"{name}-checkpoint.lock", timeout=1):
-                state = checkpoints.activity(directory, name)
-                if (
-                    state.get("session_pid") is None
-                    or state.get("session_boot") == current
-                    or rebooted(state)
-                ):
-                    continue
-                with store.connect(home, write=True) as db:
-                    lanes.transition(
-                        db,
-                        manifest["root"],
-                        name,
-                        lanes.STOPPED,
-                        evidence=(
-                            f"{lanes.REBOOTED}: boot {previous} ended session "
-                            f"{state.get('session_pid')}"
-                        ),
-                    )
-                state["activity"] = STOPPED
-                state["rebooted"] = {
-                    "boot_id": previous,
-                    "at": time.time(),
-                    "session_pid": state.get("session_pid"),
-                    "session_ticks": state.get("session_ticks"),
-                }
-                write_json(directory / f"{name}-activity.json", state)
+    busy = False
+    for name in manifest["participants"] if previous else ():
+        try:
+            if _settle_lane(home, directory, manifest, name, previous, current):
                 marked.append(name)
-    write_json(record, {"boot_id": current, "recorded": time.time()})
+        except LockBusy:
+            busy = True
+    if not busy:
+        write_json(record, {"boot_id": current, "recorded": time.time()})
     return marked
+
+
+def _settle_lane(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    name: str,
+    previous: str,
+    current: str,
+) -> bool:
+    """Marks one lane's recorded session stopped by a host restart.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant whose record is settled.
+        previous: Boot identifier the restart ended.
+        current: Boot identifier of the running host.
+
+    Returns:
+        Whether the lane's record was marked stopped.
+
+    Raises:
+        LockBusy: The lane's checkpoint lock stayed busy.
+    """
+    from agent_parley import checkpoints
+
+    with lock(directory / f"{name}-checkpoint.lock", timeout=1):
+        state = checkpoints.activity(directory, name)
+        if (
+            state.get("session_pid") is None
+            or state.get("session_boot") == current
+            or rebooted(state)
+        ):
+            return False
+        with store.connect(home, write=True) as db:
+            lanes.transition(
+                db,
+                manifest["root"],
+                name,
+                lanes.STOPPED,
+                evidence=(
+                    f"{lanes.REBOOTED}: boot {previous} ended session "
+                    f"{state.get('session_pid')}"
+                ),
+            )
+        state["activity"] = STOPPED
+        state["rebooted"] = {
+            "boot_id": previous,
+            "at": time.time(),
+            "session_pid": state.get("session_pid"),
+            "session_ticks": state.get("session_ticks"),
+        }
+        write_json(directory / f"{name}-activity.json", state)
+        return True
 
 
 def rebind_sessions(home: Path, directory: Path, manifest: dict) -> list[str]:
@@ -688,17 +720,7 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         float,
         type(None),
     ):
-        gone = _known_process_gone(known)
-        return {
-            "state": STOPPED if gone else UNKNOWN,
-            "process_alive": False if gone else None,
-            "last_active": None,
-            "age_seconds": None,
-            "activity": STOPPED if gone else UNKNOWN,
-            "evidence": UNREADABLE_STOPPED if gone else UNREADABLE,
-            "stale": False,
-            "ended": False,
-        }
+        return unreadable_presence(_known_process_gone(known))
     _remember_process(known, value)
     derived = lane_state(value, inactive_after)
     current = derived["state"] == IDLE and not derived["stale"]
@@ -712,6 +734,28 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
         "stale": derived["stale"],
         "ended": value.get("event") == "SessionEnd"
         and derived["process_alive"] is None,
+    }
+
+
+def unreadable_presence(gone: bool) -> dict:
+    """Builds the presence reading of a lane whose record cannot be read.
+
+    Args:
+        gone: Whether the lane's last known session process has exited.
+
+    Returns:
+        A `STOPPED` reading when the process is gone, else `UNKNOWN` with
+        no liveness, never stale and never a clean end.
+    """
+    return {
+        "state": STOPPED if gone else UNKNOWN,
+        "process_alive": False if gone else None,
+        "last_active": None,
+        "age_seconds": None,
+        "activity": STOPPED if gone else UNKNOWN,
+        "evidence": UNREADABLE_STOPPED if gone else UNREADABLE,
+        "stale": False,
+        "ended": False,
     }
 
 
@@ -2584,13 +2628,34 @@ def branch_completion(root: Path, branch: str) -> tuple[str, float] | None:
             start = key not in _REFRESHING
             _REFRESHING.add(key)
         if start:
-            threading.Thread(
-                target=_refresh_completion,
-                args=(root, branch, key),
-                name=f"completion {branch}",
-                daemon=True,
-            ).start()
+            _start_refresh(
+                key,
+                threading.Thread(
+                    target=_refresh_completion,
+                    args=(root, branch, key),
+                    name=f"completion {branch}",
+                    daemon=True,
+                ),
+            )
     return cached[1]
+
+
+def _start_refresh(key: tuple[str, str], thread: threading.Thread) -> None:
+    """Starts a background refresh that holds `key` in `_REFRESHING`.
+
+    A thread that cannot start never runs the ``finally`` that releases
+    its key, so the key is released here instead and a later poll tries
+    the refresh again rather than finding it marked running forever.
+
+    Args:
+        key: Refresh mark the thread releases when it ends.
+        thread: Unstarted refresh thread.
+    """
+    try:
+        thread.start()
+    except RuntimeError:
+        with _REFRESHING_LOCK:
+            _REFRESHING.discard(key)
 
 
 def _refresh_completion(root: Path, branch: str, key: tuple[str, str]) -> None:
@@ -6883,7 +6948,9 @@ def forge_upkeep(
             with _REFRESHING_LOCK:
                 _REFRESHING.discard(key)
 
-    threading.Thread(target=upkeep, name="forge upkeep", daemon=True).start()
+    _start_refresh(
+        key, threading.Thread(target=upkeep, name="forge upkeep", daemon=True)
+    )
 
 
 def release_forge_marks(directory: Path, manifest: dict) -> None:
@@ -8257,11 +8324,15 @@ def reclaim_lanes(home: Path, directory: Path, manifest: dict) -> None:
     root = Path(manifest["root"])
 
     def step(label: str, call: Callable[[], list]) -> list:
-        """Runs one sweep step, recording rather than raising its refusal."""
+        """Runs one sweep step, recording rather than raising its failure.
+
+        Any exception is recorded, not only a refusal, so one step that
+        fails on damaged state cannot skip the steps after it.
+        """
         try:
             return call()
-        except BridgeError as exc:
-            errors.append({"step": label, "error": str(exc)})
+        except Exception as exc:
+            errors.append({"step": label, "error": str(exc) or repr(exc)})
             return []
 
     try:
@@ -8825,14 +8896,20 @@ def _poll(home: Path, directory: Path) -> None:
     stages: dict[str, float] = {}
     started = time.time()
 
-    def stage(label: str, call: Callable[..., object], *args: object) -> None:
-        """Runs one poll stage, recording rather than raising its failure."""
+    def stage(label: str, call: Callable[..., object], *args: object) -> object:
+        """Runs one poll stage, recording rather than raising its failure.
+
+        Returns:
+            What the stage returned, or None when it raised.
+        """
         begun = time.time()
+        result = None
         try:
-            call(*args)
+            result = call(*args)
         except Exception as exc:
             failures.append(failure(label, exc))
         stages[label] = round(time.time() - begun, 3)
+        return result
 
     stage("reboot", settle_reboot, home, directory, manifest)
     stage("launches", launches, directory, manifest, config)
@@ -8840,10 +8917,18 @@ def _poll(home: Path, directory: Path) -> None:
     stage("lane evidence", settle_evidence, home, directory, manifest)
     stage("sessions", rebind_sessions, home, directory, manifest)
     read_at = time.time()
-    observations = {
-        name: presence(directory, name, config["inactive_after"])
-        for name in manifest["participants"]
-    }
+    observations: dict[str, dict] = {}
+    for name in manifest["participants"]:
+        reading = stage(
+            f"presence {name}",
+            presence,
+            directory,
+            name,
+            config["inactive_after"],
+        )
+        observations[name] = (
+            reading if isinstance(reading, dict) else unreadable_presence(False)
+        )
     stage(
         "lane states",
         settle_lanes,
@@ -8857,7 +8942,15 @@ def _poll(home: Path, directory: Path) -> None:
     stage("lane accounting", account_lanes, home, directory, manifest)
     stage("run budget", budgets.account, home, directory, manifest)
     stage("quota", quota.account, home, directory, manifest, published_capacity)
-    observations = recorded_observations(home, manifest, observations)
+    recorded = stage(
+        "recorded presence",
+        recorded_observations,
+        home,
+        manifest,
+        observations,
+    )
+    if isinstance(recorded, dict):
+        observations = recorded
     stage("presence", _publish_presence, home, manifest, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
@@ -9921,8 +10014,25 @@ def _wake_due(
     Returns:
         Unix time from which the next attempt may be made.
     """
-    delay = min(window * 2 ** max(attempts - 1, 0), WAKE_BACKOFF_CEILING)
-    return max(at + delay, ready_at)
+    return max(at + _doubled(window, attempts - 1), ready_at)
+
+
+def _doubled(window: float, exponent: int) -> float:
+    """Doubles a window per step, capped at `WAKE_BACKOFF_CEILING`.
+
+    The exponent is clamped to 0 through 64 before the power is taken, so
+    a long attempt count cannot overflow the float a fractional window
+    makes of the product.
+
+    Args:
+        window: Inactivity window the steps are spaced by.
+        exponent: Doublings already spent.
+
+    Returns:
+        Delay in seconds, never above the ceiling.
+    """
+    steps = min(max(exponent, 0), 64)
+    return min(window * 2**steps, WAKE_BACKOFF_CEILING)
 
 
 def _instant(value: object) -> TypeGuard[float]:
@@ -9951,7 +10061,7 @@ def exhaustion_probe_due(observation: dict, window: float) -> float:
     last = observation.get("probed_at")
     if not _instant(last):
         last = observation.get("observed_at") or 0.0
-    return float(last) + min(window * 2**probes, WAKE_BACKOFF_CEILING)
+    return float(last) + _doubled(window, probes)
 
 
 def _wake_block(
@@ -10486,6 +10596,8 @@ def wake(
     until its next launch clears the stop, so a stop is not undone within one
     sweep and the operator's own `run` does not meet a service-held lock.
     """
+    from agent_parley import checkpoints
+
     participant = manifest["participants"][name]
     if (
         not config["wake"]
@@ -10506,8 +10618,7 @@ def wake(
     recorded = condition(home, root, name)
     if lanes.rebooted(recorded):
         return
-    path = directory / f"{name}-activity.json"
-    state = json.loads(path.read_text()) if path.exists() else {}
+    state = checkpoints.activity(directory, name)
     if state.get("operator_stopped"):
         return
     stopped = False

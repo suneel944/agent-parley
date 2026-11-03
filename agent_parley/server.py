@@ -36,6 +36,11 @@ from agent_parley.state import BridgeError, trim_log
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
 MAX_REQUEST_BYTES = 2 * attachments.MAX_ATTACHMENT_BYTES + 16384
 MAX_HOOK_BYTES = 1_048_576
+INVALID_REQUEST = {
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {"code": -32600, "message": "Invalid Request"},
+}
 OVERSIZED = {
     "jsonrpc": "2.0",
     "id": None,
@@ -952,7 +957,7 @@ class Handler(BaseHTTPRequestHandler):
             or not isinstance(message.get("params", {}), dict)
             or ("id" in message and type(message["id"]) not in (int, str))
         ):
-            self._reply(400)
+            self._reply(400, INVALID_REQUEST)
             return
         method = message["method"]
         if "id" not in message:
@@ -977,7 +982,18 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "tools/list":
             response["result"] = {"tools": TOOLS}
         elif method == "tools/call":
-            response["result"] = self._call(actor, params)
+            try:
+                response["result"] = self._call(actor, params)
+            except Exception:
+                log(
+                    self.server.home,
+                    "failed",
+                    "tool call\n" + traceback.format_exc(),
+                )
+                response["error"] = {
+                    "code": -32603,
+                    "message": "Internal error",
+                }
         else:
             response["error"] = {"code": -32601, "message": "Method not found"}
         self._reply(200, response)
@@ -1354,7 +1370,9 @@ class Handler(BaseHTTPRequestHandler):
         does a retirement, which tells the lanes that handed it work. A wait
         that names `hand_off` is handed to the service by `waits.hand_off`,
         and any other call ends the caller's handed-off wait, because the
-        lane is taking a turn again.
+        lane is taking a turn again. Any other failure escapes to the
+        caller, which logs its traceback and answers JSON-RPC ``-32603``
+        on the same connection.
         """
         try:
             declared = self._declared_protocol()

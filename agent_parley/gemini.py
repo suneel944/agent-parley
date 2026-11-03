@@ -108,7 +108,9 @@ def payload(value: dict) -> dict:
 
     A ``Notification`` whose ``notification_type`` is ``ToolPermission``
     becomes ``PermissionRequest``, naming the tool from its ``details``;
-    any other notification is passed on under its native name.
+    any other notification is passed on under its native name. An event
+    or tool name that is not text is passed on unchanged, for the shared
+    checkpoint to refuse rather than for this translation to raise.
 
     Args:
         value: Native Gemini hook input.
@@ -130,9 +132,10 @@ def payload(value: dict) -> dict:
             or ""
         )
         translated["tool_input"] = details.get("tool_input", details)
-    translated["hook_event_name"] = EVENTS.get(native, native)
+    if isinstance(native, str):
+        translated["hook_event_name"] = EVENTS.get(native, native)
     tool = translated.get("tool_name", "")
-    if tool.startswith("mcp_agent_parley_"):
+    if isinstance(tool, str) and tool.startswith("mcp_agent_parley_"):
         translated["tool_name"] = tool.replace(
             "mcp_agent_parley_", "mcp__agent_parley__", 1
         )

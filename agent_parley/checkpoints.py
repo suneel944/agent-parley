@@ -4912,8 +4912,8 @@ def deadline_refusal(request: dict) -> dict | None:
     try:
         adapter = adapter_module(request.get("adapter"))
         if adapter is not None:
-            payload = adapter.payload(payload)
-        if payload.get("hook_event_name") != "PreToolUse":
+            payload = adapter.payload(typed(payload))
+        if typed(payload).get("hook_event_name") != "PreToolUse":
             return None
         refused = lane_refusal(
             Path(str(request.get("directory", ""))),
@@ -5004,7 +5004,8 @@ def serve(
             raise ValueError("Expected a hook object")
         adapter = adapter_module(request.get("adapter"))
         if adapter is not None:
-            payload = adapter.payload(payload)
+            payload = adapter.payload(typed(payload))
+        typed(payload)
         if not protocol.compatible(declared):
             return failed(
                 payload,
@@ -5084,6 +5085,32 @@ def serve(
                 "",
                 str(fallback["cause"]),
             )
+
+
+def typed(payload: dict) -> dict:
+    """Refuses a hook payload whose small text fields are not text.
+
+    A tool name, event name, working directory or session identifier of
+    another type made the decision raise a ``TypeError`` or an
+    ``AttributeError`` that left the hook with exit status 1, which a
+    native client reads as a non-blocking failure, so the guard was
+    skipped. Refusing it as a ``ValueError`` takes the `failed` path,
+    which denies a gated call.
+
+    Args:
+        payload: Native hook payload decoded as a mapping.
+
+    Returns:
+        The payload unchanged.
+
+    Raises:
+        ValueError: A field in `KEPT_FIELDS` is neither text nor null.
+    """
+    for field in KEPT_FIELDS:
+        value = payload.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"hook field {field} is not text")
+    return payload
 
 
 def failed(
