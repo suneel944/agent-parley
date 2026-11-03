@@ -453,13 +453,14 @@ def show(home: Path | None = None, directory: Path | None = None) -> int:
 
     Args:
         home: Private state directory, which need not exist; when None,
-            ``AGENT_PARLEY_HOME`` or the default the parser uses.
+            a non-empty ``AGENT_PARLEY_HOME`` or the default the parser
+            uses.
         directory: Working directory to describe; the current one if None.
 
     Returns:
         Exit status zero.
     """
     if home is None:
-        home = Path(os.environ.get("AGENT_PARLEY_HOME", DEFAULT_HOME))
+        home = Path(os.environ.get("AGENT_PARLEY_HOME") or DEFAULT_HOME)
     print(render(look(home.expanduser(), directory or Path.cwd())))
     return 0

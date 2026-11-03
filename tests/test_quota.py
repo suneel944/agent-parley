@@ -152,6 +152,8 @@ def test_a_window_needs_a_defined_profile_and_usable_values(bridge):
     )
     with pytest.raises(BridgeError):
         quota.set_window(bridge.home, "shared", 5, 1000, threshold=1.5)
+    with pytest.raises(BridgeError, match="finite positive --hours"):
+        quota.set_window(bridge.home, "shared", float("inf"), 1000)
     quota.set_window(bridge.home, "shared", 5, 1000, threshold=0.9)
     assert quota.windows(bridge.home)["shared"]["tokens"] == 1000
     quota.set_window(bridge.home, "shared", 0, 0)

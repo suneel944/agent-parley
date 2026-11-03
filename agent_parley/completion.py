@@ -164,24 +164,44 @@ def _flags(parser: argparse.ArgumentParser) -> list[str]:
     return found
 
 
-def _value_flags(parser: argparse.ArgumentParser) -> dict:
+def _value_flags(path: str, parser: argparse.ArgumentParser) -> dict:
     """Maps this parser's options to the state-backed kind they accept.
 
+    An option declared with the ``PATH`` metavar names a filesystem path,
+    such as ``gc --to``, so it completes files even when its destination
+    shares a name with a state-backed kind.
+
     Args:
+        path: Space-joined command path of the parser; empty for the root.
         parser: Parser to inspect.
 
     Returns:
-        Option string mapped to a name in `KINDS`, for options whose
-        destination names a kind local state can enumerate.
+        ``path option`` keys, as `option_key` builds them, mapped to a name
+        in `KINDS`, for options whose destination names a kind local state
+        can enumerate.
     """
     found: dict = {}
     for action in parser._actions:
         kind = VALUE_KINDS.get(action.dest, "")
-        if not kind or action.nargs == 0:
+        if not kind or action.nargs == 0 or action.metavar == "PATH":
             continue
         for option in action.option_strings:
-            found[option] = kind
+            found[option_key(path, option)] = kind
     return found
+
+
+def option_key(path: str, option: str) -> str:
+    """Names one option of one command path.
+
+    Args:
+        path: Space-joined command path; empty for the root.
+        option: Option string, such as ``--to``.
+
+    Returns:
+        The path and the option joined by a space, or the bare option at the
+        root, so the same option string on two commands stays distinct.
+    """
+    return f"{path} {option}".strip()
 
 
 def tree(
@@ -215,15 +235,17 @@ def value_flags(parser: argparse.ArgumentParser) -> dict:
         parser: Root parser of the program.
 
     Returns:
-        Option string mapped to a name in `KINDS`, merged across the tree so
-        one shell-level rule serves every command that takes the option.
+        `option_key` keys mapped to a name in `KINDS`, so an option string
+        two commands declare differently, such as ``--to``, completes what
+        each command's own option accepts.
     """
     found: dict = {}
-    pending = [parser]
+    pending = [("", parser)]
     while pending:
-        node = pending.pop(0)
-        found.update(_value_flags(node))
-        pending.extend(_subcommands(node).values())
+        path, node = pending.pop(0)
+        found.update(_value_flags(path, node))
+        for name, child in sorted(_subcommands(node).items()):
+            pending.append((f"{path} {name}".strip(), child))
     return found
 
 
@@ -292,17 +314,22 @@ def value_options(parser: argparse.ArgumentParser) -> list[str]:
         parser: Root parser of the program.
 
     Returns:
-        Sorted option strings, across the whole tree, whose action takes a
+        Sorted `option_key` keys, across the whole tree, whose action takes
+        a value, so a switch on one command, such as ``say --ack``, never
+        swallows the next word because another command's ``--ack`` takes a
         value.
     """
     found: set[str] = set()
-    pending = [parser]
+    pending = [("", parser)]
     while pending:
-        node = pending.pop(0)
+        path, node = pending.pop(0)
         for action in node._actions:
             if action.option_strings and action.nargs != 0:
-                found.update(action.option_strings)
-        pending.extend(_subcommands(node).values())
+                found.update(
+                    option_key(path, option) for option in action.option_strings
+                )
+        for name, child in sorted(_subcommands(node).items()):
+            pending.append((f"{path} {name}".strip(), child))
     return sorted(found)
 
 
@@ -317,10 +344,12 @@ def _bash(
     """Emits a Bash completion function for the walked tree.
 
     The function walks the typed words, skipping each option and the value
-    an option in ``takes`` consumes, descends the command tree while the
-    words name subcommands, and counts the positionals after that. The count
-    selects the positional slot to complete; a word starting with ``-``
-    completes the command's flags instead. The command and slot tables are
+    an option in ``takes`` consumes on the command reached so far, descends
+    the command tree while the words name subcommands, and counts the
+    positionals after that. The count selects the positional slot to
+    complete; a word starting with ``-`` completes the command's flags
+    instead, and the word after a value option completes the kind that
+    command's option accepts, or files. The command and slot tables are
     ``case`` lookups rather than associative arrays, because macOS ships
     Bash 3.2, which has none.
 
@@ -346,8 +375,11 @@ def _bash(
         for key, slot in sorted(slots.items())
     )
     cases = "\n".join(
-        f"        {option}) _kind={kind};;"
+        f'    "{program} {option}") _kind={kind};;'
         for option, kind in sorted(values.items())
+    )
+    take_table = "\n".join(
+        f'    "{program} {option}") return 0;;' for option in takes
     )
     return f"""{name}_node() {{
   case "$1" in
@@ -361,19 +393,22 @@ def _bash(
 {slot_table}
   esac
 }}
-{name}() {{
-  local cur prev key probe word node slot _kind i n skip takes
-  takes=" {" ".join(takes)} "
-  cur="${{COMP_WORDS[COMP_CWORD]}}"
-  prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+{name}_takes() {{
+  case "$1" in
+{take_table}
+    *) return 1;;
+  esac
+}}
+{name}_kind() {{
   _kind=""
-  case "$prev" in
+  case "$1" in
 {cases}
   esac
-  if [ -n "$_kind" ]; then
-    COMPREPLY=( $(compgen -W "$({program} {mode} "$_kind")" -- "$cur") )
-    return
-  fi
+}}
+{name}() {{
+  local cur prev key probe word node slot _kind i n skip
+  cur="${{COMP_WORDS[COMP_CWORD]}}"
+  prev="${{COMP_WORDS[COMP_CWORD-1]}}"
   key="{program}"
   n=0
   skip=0
@@ -386,7 +421,7 @@ def _bash(
     case "$word" in
       --*=*) continue;;
       -*)
-        case "$takes" in *" $word "*) skip=1;; esac
+        {name}_takes "$key $word" && skip=1
         continue;;
     esac
     probe="$key $word"
@@ -397,6 +432,11 @@ def _bash(
     fi
   done
   if [ "$skip" = 1 ]; then
+    {name}_kind "$key $prev"
+    if [ -n "$_kind" ]; then
+      COMPREPLY=( $(compgen -W "$({program} {mode} "$_kind")" -- "$cur") )
+      return
+    fi
     COMPREPLY=( $(compgen -f -- "$cur") )
     return
   fi
@@ -453,29 +493,26 @@ def _zsh(
     slot_table = "\n".join(
         f'    ["{key}"]="{slot}"' for key, slot in sorted(slots.items())
     )
-    cases = "\n".join(
-        f"    {option}) _kind={kind};;"
-        for option, kind in sorted(values.items())
+    kind_table = "\n".join(
+        f'    ["{option}"]="{kind}"' for option, kind in sorted(values.items())
     )
+    take_table = "\n".join(f'    ["{option}"]=1' for option in takes)
     return f"""#compdef {program}
 {name}() {{
-  local -A nodes slots
-  local key probe word opts slot takes _kind n skip
+  local -A nodes slots takes kinds
+  local key probe word opts slot _kind n skip
   nodes=(
 {table}
   )
   slots=(
 {slot_table}
   )
-  takes=" {" ".join(takes)} "
-  _kind=""
-  case "${{words[CURRENT-1]}}" in
-{cases}
-  esac
-  if [[ -n "$_kind" ]]; then
-    compadd -- ${{(f)"$({program} {mode} $_kind)"}}
-    return
-  fi
+  takes=(
+{take_table}
+  )
+  kinds=(
+{kind_table}
+  )
   key=""
   n=0
   skip=0
@@ -488,7 +525,8 @@ def _zsh(
       continue
     fi
     if [[ "$word" == -* ]]; then
-      [[ "$takes" == *" $word "* ]] && skip=1
+      probe="${{key:+$key }}$word"
+      [[ -n "${{takes[$probe]+x}}" ]] && skip=1
       continue
     fi
     probe="${{key:+$key }}$word"
@@ -499,6 +537,12 @@ def _zsh(
     fi
   done
   if (( skip )); then
+    probe="${{key:+$key }}${{words[CURRENT-1]}}"
+    _kind="${{kinds[$probe]}}"
+    if [[ -n "$_kind" ]]; then
+      compadd -- ${{(f)"$({program} {mode} $_kind)"}}
+      return
+    fi
     _files
     return
   fi
@@ -549,8 +593,9 @@ def _fish(
 
     Fish matches rules by condition rather than by position, so a command's
     positional values are offered for each of its positional words, and the
-    options a value follows are declared with ``-x`` so Fish completes their
-    value instead of a subcommand.
+    options a value follows are declared with ``-x``, under the condition of
+    the command that declares them, so Fish completes their value instead of
+    a subcommand and never offers one command's kind for another's option.
 
     Args:
         entries: Result of `tree`.
@@ -581,12 +626,13 @@ def _fish(
             f"complete -c {program} -f -n '{_fish_condition(path)}' "
             f"-a '{offered}'"
         )
-    for option, kind in sorted(values.items()):
+    for key, kind in sorted(values.items()):
+        path, _, option = key.rpartition(" ")
         flag = option.lstrip("-")
         switch = "-l" if option.startswith("--") else "-s"
         lines.append(
-            f"complete -c {program} -x {switch} {flag} "
-            f"-a '({program} {mode} {kind})'"
+            f"complete -c {program} -x -n '{_fish_condition(path)}' "
+            f"{switch} {flag} -a '({program} {mode} {kind})'"
         )
     return "\n".join(lines) + "\n"
 

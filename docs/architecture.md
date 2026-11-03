@@ -1016,8 +1016,8 @@ reservations continue to resolve.
 ### State layout
 
 All coordination state lives under one private state root: `--home`, else
-`AGENT_PARLEY_HOME`, else `~/.local/state/agent-parley` (`cli.py` parser,
-`start.DEFAULT_HOME`). `core.BridgeCore` creates it with mode `0700` and refuses a
+a non-empty `AGENT_PARLEY_HOME`, else `~/.local/state/agent-parley`
+(`cli.py` parser, `start.DEFAULT_HOME`). `core.BridgeCore` creates it with mode `0700` and refuses a
 root that grants any group or other permission. Each project gets
 `projects/<key>/`, where `<key>` is the first 16 hexadecimal characters of the
 SHA-256 of the resolved Git common directory (`git rev-parse
