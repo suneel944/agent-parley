@@ -1,37 +1,22 @@
-"""Applies the recommended default to a reversible decision left unanswered.
+"""Declares which decision kinds wait for the operator, and for how long.
 
-Hands-free work stalls whenever the operator is away: a question nobody
-answers holds its lane indefinitely, even when the choice is reversible and
-has an obvious answer. `KINDS` is the one table of decision kinds. Each kind
-declares whether it is ``reversible`` or ``irreversible``, the option the
-service recommends, and the command that undoes that option. Every
-reversible kind is one `sweep` can settle, so `EVENTS` maps a notification
-to it; a kind with no producer is not declared.
-
-A reversible kind waits `TIMEOUT_SECONDS` for an answer. When it expires
-unanswered, `settle` returns the recommended option as ``applied by
-timeout`` with the evidence it used, `record` appends that to the lane's
-report log and `announce` sends one line naming what was done and the
-command that undoes it. A reversible kind whose evidence is already
-conclusive is settled without asking at all and recorded as ``applied on
-evidence``.
-
-Each supervision poll runs `sweep` over the project's open decision records.
-`EVENTS` names the table kind each recorded notification kind settles as; a
-record whose kind it does not name is left open. An orphan decision is one:
-the service cannot carry out any of its options for the operator, so it waits
-until the operator answers or the dead lane's work is returned at the orphan
-ceiling, which retires it. A policy that still names its former
-``orphan_claim`` kind is ignored. A settled record is answered
-with its own recommended option by `ANSWERED_BY` and handed to its lane the
-way any other answer is.
-
-An irreversible kind never times out: a merge to the default branch, a
-release or tag, discarding uncommitted work, deleting a branch, every
-native permission prompt and every tool call a native permission layer
-denied always wait for an answer. A kind this table does
+`KINDS` is the one table of decision kinds. Each kind declares whether it is
+``reversible`` or ``irreversible`` and the option the service recommends.
+Every declared kind is irreversible and never times out: a merge to the
+default branch, a release or tag, discarding uncommitted work, deleting a
+branch, every native permission prompt and every tool call a native
+permission layer denied always wait for an answer. A kind this table does
 not know is treated as irreversible, so a misspelled or newer kind fails
-closed.
+closed. Nothing in the service answers an open decision on the operator's
+behalf.
+
+An orphan decision is not a table kind: the service cannot carry out any of
+its options for the operator, so it waits until the operator answers or the
+dead lane's work is returned at the orphan ceiling, which retires it. A
+policy that still names its former ``orphan_claim`` kind is ignored.
+
+`TIMEOUT_SECONDS` is the decision deadline other modules measure against,
+such as the stop of a session parked on a prompt nobody can answer.
 
 A project can record, with `agent-parley timeout set`, that a kind is
 always asked or that its timeout is longer than the default. The policy is
@@ -42,12 +27,10 @@ gives an irreversible kind a timeout.
 
 from __future__ import annotations
 
-import shlex
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from agent_parley import decisions, metrics, notify, roster
+from agent_parley import roster
 from agent_parley.state import BridgeError
 
 if TYPE_CHECKING:
@@ -60,47 +43,31 @@ MAX_TIMEOUT_SECONDS = 7 * 24 * 3600.0
 POLICY = "timeouts"
 ASK = "ask"
 SECONDS = "seconds"
-APPLIED = "applied by timeout"
-CONCLUDED = "applied on evidence"
-RECORD = "default"
 WAIT = "wait for the operator"
-ANSWERED_BY = "timeout"
 
 
 class Kind(NamedTuple):
-    """One decision kind's class, recommended option and undo command.
+    """One decision kind's class and recommended option.
 
     Attributes:
         reversibility: `REVERSIBLE` or `IRREVERSIBLE`.
-        recommended: Option applied when a reversible decision settles
-            without an answer.
-        undo: Command template that reverses the recommended option, filled
-            from the decision's fields; empty for an irreversible kind.
-        summary: What the decision is about, for the table and the notice.
+        recommended: Option the service recommends for the decision.
+        summary: What the decision is about.
     """
 
     reversibility: str
     recommended: str
-    undo: str
     summary: str
 
 
 KINDS: dict[str, Kind] = {
-    "merge_default": Kind(
-        IRREVERSIBLE, WAIT, "", "merge to the default branch"
-    ),
-    "release_tag": Kind(IRREVERSIBLE, WAIT, "", "publish a release or tag"),
-    "discard_work": Kind(IRREVERSIBLE, WAIT, "", "discard uncommitted work"),
-    "delete_branch": Kind(IRREVERSIBLE, WAIT, "", "delete a branch"),
+    "merge_default": Kind(IRREVERSIBLE, WAIT, "merge to the default branch"),
+    "release_tag": Kind(IRREVERSIBLE, WAIT, "publish a release or tag"),
+    "discard_work": Kind(IRREVERSIBLE, WAIT, "discard uncommitted work"),
+    "delete_branch": Kind(IRREVERSIBLE, WAIT, "delete a branch"),
     "native_permission": Kind(
-        IRREVERSIBLE, WAIT, "", "answer a native permission prompt"
+        IRREVERSIBLE, WAIT, "answer a native permission prompt"
     ),
-}
-
-EVENTS: dict[str, str] = {
-    notify.Event.PERMISSION_PROMPT: "native_permission",
-    notify.Event.PERMISSION_DENIED: "native_permission",
-    notify.Event.NATIVE_DIALOG: "native_permission",
 }
 
 
@@ -114,7 +81,7 @@ def kind_of(name: str) -> Kind:
         The kind's table entry, or an irreversible entry that always waits
         when the table does not know the name.
     """
-    return KINDS.get(name) or Kind(IRREVERSIBLE, WAIT, "", name)
+    return KINDS.get(name) or Kind(IRREVERSIBLE, WAIT, name)
 
 
 def policy(manifest: dict) -> dict[str, dict]:
@@ -176,7 +143,7 @@ def _valid(name: str, entry: object) -> None:
 
 
 def timeout(manifest: dict, name: str) -> float | None:
-    """Returns how long a decision waits before its default is applied.
+    """Returns how long a decision kind waits for an answer under a policy.
 
     Args:
         manifest: Project manifest using the participant roster layout.
@@ -196,200 +163,6 @@ def timeout(manifest: dict, name: str) -> float | None:
     if entry.get(ASK):
         return None
     return float(entry.get(SECONDS, TIMEOUT_SECONDS))
-
-
-def undo(name: str, fields: dict) -> str:
-    """Fills the command that reverses a kind's recommended option.
-
-    Args:
-        name: Decision kind name.
-        fields: Values the undo template names, such as ``issue`` and
-            ``lane``.
-
-    Returns:
-        The command to paste, or an empty string for a kind that has none.
-
-    Raises:
-        BridgeError: If a field the template names is missing, so a default
-            is never applied without a way back.
-    """
-    template = kind_of(name).undo
-    if not template:
-        return ""
-    quoted = {key: shlex.quote(str(value)) for key, value in fields.items()}
-    try:
-        return template.format(**quoted)
-    except KeyError as exc:
-        raise BridgeError(
-            f"A {name} decision needs {exc.args[0]} to name its undo command."
-        ) from exc
-
-
-def settle(manifest: dict, question: dict, now: float) -> dict | None:
-    """Decides whether an open question is settled without an answer.
-
-    Args:
-        manifest: Project manifest using the participant roster layout.
-        question: The open decision: ``kind``, ``asked_at``, the ``fields``
-            its undo command names, the ``evidence`` it rests on, and
-            ``conclusive`` when that evidence already decides it.
-        now: Current time in seconds since the epoch.
-
-    Returns:
-        The applied decision, with its kind, option, outcome, evidence and
-        undo command, or None while the question must keep waiting.
-
-    Raises:
-        BridgeError: If the policy is invalid or a field the undo command
-            needs is missing.
-    """
-    name = str(question.get("kind", ""))
-    waits = timeout(manifest, name)
-    if waits is None:
-        return None
-    if question.get("conclusive"):
-        outcome = CONCLUDED
-    elif now - float(question.get("asked_at", now)) >= waits:
-        outcome = APPLIED
-    else:
-        return None
-    fields = dict(question.get("fields") or {})
-    return {
-        "decision": name,
-        "option": KINDS[name].recommended,
-        "outcome": outcome,
-        "evidence": list(question.get("evidence") or []),
-        "fields": fields,
-        "undo": undo(name, fields),
-    }
-
-
-def line(applied: dict) -> str:
-    """Words the one-line notice for an applied default.
-
-    Args:
-        applied: Decision returned by `settle`.
-
-    Returns:
-        What was done, why, and the command that undoes it.
-    """
-    kind = kind_of(applied["decision"])
-    return (
-        f"{applied['outcome']}: {kind.summary} ({applied['option']}); "
-        f"undo with `{applied['undo']}`"
-    )
-
-
-def record(directory: Path, name: str, applied: dict) -> dict:
-    """Appends an applied default to the lane's durable report log.
-
-    Args:
-        directory: Private state directory for the common repository.
-        name: Participant whose lane the decision concerns.
-        applied: Decision returned by `settle`.
-
-    Returns:
-        The appended record.
-    """
-    return metrics.record_report(directory, name, {"kind": RECORD, **applied})
-
-
-def announce(applied: dict) -> list[dict]:
-    """Sends the applied default's one-line notice, best effort.
-
-    The subject is clipped to `notify.MAX_SUBJECT_BYTES` UTF-8 bytes, not
-    characters, without splitting a multibyte character.
-
-    Args:
-        applied: Decision returned by `settle`.
-
-    Returns:
-        One delivery result per configured transport; empty when
-        notification is off.
-    """
-    from agent_parley import checkpoints
-
-    if not notify.enabled():
-        return []
-    text = line(applied)
-    subject = checkpoints.clip(text, notify.MAX_SUBJECT_BYTES)
-    return notify.send(notify.settings(), subject, text)
-
-
-def sweep(
-    home: Path, directory: Path, manifest: dict, now: float = 0.0
-) -> list[dict]:
-    """Answers every open reversible decision whose timeout has passed.
-
-    Only a record that `EVENTS` maps to a reversible kind, that is itself
-    recorded reversible, and that recommends one of its own options is
-    settled; every other record keeps waiting. A settled record is answered
-    with that option by `ANSWERED_BY`, handed to its lane, appended to the
-    lane's report log and announced. A record answered first by the
-    operator, or missing a field its undo command needs, is left alone.
-
-    Args:
-        home: Private bridge state root.
-        directory: Private project state directory.
-        manifest: Project manifest using the participant roster layout.
-        now: Unix time; the clock when zero.
-
-    Returns:
-        The decisions applied, as `settle` returned them.
-
-    Raises:
-        BridgeError: If the recorded policy is invalid, so no default is
-            applied until it is fixed.
-    """
-    import contextlib
-    import sqlite3
-
-    from agent_parley import inbound
-
-    stamp = now or time.time()
-    policy(manifest)
-    done = []
-    for entry in decisions.list_open(directory, stamp):
-        name = EVENTS.get(str(entry.get("kind", "")), "")
-        option = str(entry.get("recommended", ""))
-        if (
-            not name
-            or entry.get("reversibility") != decisions.REVERSIBLE
-            or option not in decisions.options(entry)
-        ):
-            continue
-        asked = float(entry.get("created", stamp))
-        question = {
-            "kind": name,
-            "asked_at": asked,
-            "fields": {
-                key: str(entry[key])
-                for key in ("issue", "lane")
-                if entry.get(key)
-            },
-            "evidence": [
-                f"decision {entry['id']} ({entry.get('question', '')}) "
-                f"unanswered for {int(stamp - asked)} seconds"
-            ],
-        }
-        try:
-            applied = settle(manifest, question, stamp)
-            if applied is None:
-                continue
-            applied["option"] = option
-            answered = decisions.answer(
-                directory, entry["id"], option, ANSWERED_BY, now=stamp
-            )
-        except BridgeError:
-            continue
-        with contextlib.suppress(
-            OSError, ValueError, BridgeError, sqlite3.Error
-        ):
-            inbound.settle(home, directory, answered)
-        record(directory, str(entry.get("lane", "")), applied)
-        announce(applied)
-        done.append(applied)
-    return done
 
 
 def describe(manifest: dict) -> str:

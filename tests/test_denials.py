@@ -173,13 +173,9 @@ def test_no_decision_is_recorded_without_notifications(
 def test_a_denial_is_never_settled_by_a_timeout(tmp_path):
     found = denials.detect(denied(tmp_path))
     opened = denials.record(tmp_path, "/repo", "codex", found, "42", now=1.0)
-    later = 1.0 + timeouts.TIMEOUT_SECONDS * 10
 
-    assert timeouts.sweep(tmp_path, tmp_path, {}, later) == []
+    assert opened["reversibility"] == decisions.IRREVERSIBLE
     assert decisions.get(tmp_path, opened["id"])["state"] == decisions.OPEN
-    assert timeouts.EVENTS[notify.Event.PERMISSION_DENIED] == (
-        "native_permission"
-    )
     assert (
         timeouts.kind_of("native_permission").reversibility
         == timeouts.IRREVERSIBLE
