@@ -1,5 +1,6 @@
 """Checks the state archive export, inspection and import round trip."""
 
+import contextlib
 import hashlib
 import io
 import json
@@ -539,3 +540,24 @@ def test_imported_providers_are_validated_and_never_replace_a_preset(
     assert "Provider leaky refused" in out
     assert roster.provider(merged, "custom") == custom
     assert roster.provider(merged, "mine")["command"] == "codex"
+
+
+def test_the_export_reads_project_files_while_their_locks_are_held(
+    bridge, repo, tmp_path, monkeypatch
+):
+    directory = registered(bridge, repo)
+    ledger = directory / "issues.json"
+    held = ledger.read_bytes()
+    original = archive._project_locks
+
+    @contextlib.contextmanager
+    def writing_after_release(directories):
+        with original(directories):
+            yield
+        ledger.write_text('{"revision": 2, "issues": {}}\n')
+
+    monkeypatch.setattr(archive, "_project_locks", writing_after_release)
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+    member = f"{archive.PROJECTS}/{directory.name}/issues.json"
+    assert members(output)[member] == held

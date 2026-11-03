@@ -256,7 +256,7 @@ def _scope(
         clause += f" AND {alias}.claim_id=?"
         parameters.append(claim)
     if since:
-        clause += f" AND unixepoch({alias}.created_ts)>=?"
+        clause += f" AND CAST(strftime('%s',{alias}.created_ts) AS INTEGER)>=?"
         parameters.append(since)
     parameters.append(MAX_RECORDS + 1)
     return f"{clause} ORDER BY {alias}.id DESC LIMIT ?", parameters
@@ -303,8 +303,8 @@ def _store_records(
             )
             rows = db.execute(
                 "SELECT a.name AS identity,f.path_pattern,f.claim_id,"
-                "unixepoch(f.created_ts) AS created,"
-                "unixepoch(f.released_ts) AS released "
+                "CAST(strftime('%s',f.created_ts) AS INTEGER) AS created,"
+                "CAST(strftime('%s',f.released_ts) AS INTEGER) AS released "
                 "FROM file_reservations f "
                 "JOIN agents a ON a.id=f.agent_id "
                 "JOIN projects p ON p.id=a.project_id " + clause,
@@ -334,7 +334,8 @@ def _store_records(
             rows = db.execute(
                 "SELECT m.id,a.name AS identity,m.thread_id,m.claim_id,"
                 "substr(m.subject,1,80) AS subject,"
-                "unixepoch(m.created_ts) AS created FROM messages m "
+                "CAST(strftime('%s',m.created_ts) AS INTEGER) AS created "
+                "FROM messages m "
                 "JOIN agents a ON a.id=m.sender_id "
                 "JOIN projects p ON p.id=a.project_id " + clause,
                 parameters,

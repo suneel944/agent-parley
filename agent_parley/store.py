@@ -2289,13 +2289,14 @@ def _expired_leases(
     return db.execute(
         "SELECT f.id,f.agent_id,f.path_pattern,a.name,"
         "a.token_digest IS NOT NULL AS addressable,"
-        "max(0,unixepoch('now')-unixepoch(f.expires_ts)) AS stale_seconds "
+        "max(0,strftime('%s','now')-strftime('%s',f.expires_ts)) "
+        "AS stale_seconds "
         "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "
         "LEFT JOIN participant_presence s ON s.agent_id=f.agent_id "
         "WHERE f.project_id=? AND f.released_ts IS NULL "
         "AND f.expires_ts IS NOT NULL AND f.expires_ts<=CURRENT_TIMESTAMP "
         "AND (s.process_alive=0 OR s.state='idle' "
-        "OR unixepoch('now')-unixepoch(f.expires_ts)>=?) "
+        "OR strftime('%s','now')-strftime('%s',f.expires_ts)>=?) "
         "ORDER BY a.name,f.path_pattern",
         (project_id, RESERVATION_GRACE),
     ).fetchall()
@@ -5330,9 +5331,11 @@ def waiting(home: Path, root: str, name: str) -> dict:
         ).fetchone()
         if not agent:
             return report
-        now = db.execute("SELECT unixepoch('now')").fetchone()[0]
+        now = db.execute(
+            "SELECT CAST(strftime('%s','now') AS INTEGER)"
+        ).fetchone()[0]
         served = db.execute(
-            "SELECT max(0,?-unixepoch(max(created_ts))) AS age "
+            "SELECT max(0,?-strftime('%s',max(created_ts))) AS age "
             "FROM events WHERE agent_id=?",
             (now, agent["id"]),
         ).fetchone()
@@ -5343,7 +5346,7 @@ def waiting(home: Path, root: str, name: str) -> dict:
         ):
             row = db.execute(
                 "SELECT m.id,a.name AS sender,"
-                "max(0,?-unixepoch(m.created_ts)) AS age "
+                "max(0,?-strftime('%s',m.created_ts)) AS age "
                 "FROM message_recipients r "
                 "JOIN messages m ON m.id=r.message_id "
                 "JOIN agents a ON a.id=m.sender_id "
@@ -5592,7 +5595,7 @@ def usage(
             "AND f.expires_ts<=CURRENT_TIMESTAMP),0) AS stale_leases,"
             "cast(strftime('%s','now')-strftime('%s',min(f.created_ts)) "
             "AS INTEGER) AS lease_age,"
-            "coalesce(max(0,unixepoch('now')-unixepoch(min(CASE WHEN "
+            "coalesce(max(0,strftime('%s','now')-strftime('%s',min(CASE WHEN "
             "f.expires_ts<=CURRENT_TIMESTAMP THEN f.expires_ts END))),0) "
             "AS stale_lease_age FROM file_reservations f "
             "JOIN agents a ON a.id=f.agent_id "

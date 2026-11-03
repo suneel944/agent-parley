@@ -2,6 +2,7 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -433,3 +434,12 @@ def test_history_reads_an_empty_store_file_as_absent(
         str(repo),
     )
     assert "file_reservations" not in printed
+
+
+def test_no_query_needs_the_sqlite_3_38_unixepoch_function():
+    package = Path(history.__file__).parent
+    assert [
+        path.name
+        for path in sorted(package.glob("*.py"))
+        if "unixepoch(" in path.read_text()
+    ] == []

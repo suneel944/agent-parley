@@ -3441,8 +3441,9 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         ).fetchone()[0]
         outstanding = db.execute(
             "SELECT m.id,a.name AS sender, "
-            "max(0,unixepoch('now')-unixepoch(m.created_ts)) AS age_seconds, "
-            "max(0,unixepoch('now')-unixepoch(m.ack_deadline_ts)) "
+            "max(0,strftime('%s','now')-strftime('%s',m.created_ts)) "
+            "AS age_seconds, "
+            "max(0,strftime('%s','now')-strftime('%s',m.ack_deadline_ts)) "
             "AS overdue_seconds "
             "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
             "JOIN agents a ON a.id=m.sender_id WHERE r.agent_id=? "
@@ -3453,7 +3454,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         leases = db.execute(
             "SELECT count(*) AS held,coalesce(sum(expires_ts IS NOT NULL "
             "AND expires_ts<=datetime('now')),0) AS stale,"
-            "coalesce(max(0,unixepoch('now')-unixepoch(min(CASE WHEN "
+            "coalesce(max(0,strftime('%s','now')-strftime('%s',min(CASE WHEN "
             "expires_ts<=datetime('now') THEN expires_ts END))),0) AS age "
             "FROM file_reservations WHERE agent_id=? AND released_ts IS NULL",
             (agent["id"],),
