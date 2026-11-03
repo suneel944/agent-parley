@@ -141,16 +141,18 @@ def changed_files(lane: Path, base: str) -> list[str]:
     try:
         try:
             tracked = worktrees.git(
-                lane, "diff", "--name-only", base or "HEAD", "--"
+                lane, "diff", "--name-only", "-z", base or "HEAD", "--"
             )
         except BridgeError:
-            tracked = worktrees.git(lane, "diff", "--name-only", "HEAD", "--")
+            tracked = worktrees.git(
+                lane, "diff", "--name-only", "-z", "HEAD", "--"
+            )
         untracked = worktrees.git(
-            lane, "ls-files", "--others", "--exclude-standard"
+            lane, "ls-files", "-z", "--others", "--exclude-standard"
         )
     except (BridgeError, OSError, subprocess.TimeoutExpired):
         return []
-    return sorted(set((tracked + "\n" + untracked).split()) - {""})
+    return sorted(set((tracked + "\0" + untracked).split("\0")) - {""})
 
 
 def path(directory: Path, name: str) -> Path:
