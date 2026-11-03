@@ -1381,10 +1381,13 @@ def checkout_switches(directory: Path, args: list[str]) -> bool:
 
     Branch-creating and detaching options switch, and a patch restore never
     does. Paths after `--`, or more than one name before it, are a restore.
-    A single name that is `.` or exists in the directory is a path; any
-    other single name switches unless Git tracks it as a path, which costs
-    one `git ls-files` bounded by `RESTORE_CHECK_SECONDS`. A name Git does
-    not track is refused because Git may create a tracking branch from it.
+    A single name followed by a bare `--` is a revision, as Git reads it.
+    Otherwise Git prefers a revision over a path, so a single name that
+    resolves to a commit switches even when a file of that name exists.
+    A name that is `.` or exists in the directory is then a path; any
+    other single name switches unless Git tracks it as a path. Each Git
+    probe is bounded by `RESTORE_CHECK_SECONDS`. A name Git does not
+    track is refused because Git may create a tracking branch from it.
 
     Args:
         directory: Directory the command runs in.
@@ -1406,7 +1409,28 @@ def checkout_switches(directory: Path, args: list[str]) -> bool:
     ]
     if args[split + 1 :] or len(names) != 1:
         return False
+    if "--" in args:
+        return True
     name = names[0]
+    try:
+        commit = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(directory),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{name}^{{commit}}",
+            ],
+            capture_output=True,
+            timeout=RESTORE_CHECK_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if not commit.returncode:
+        return True
     if name == "." or (name != "-" and (directory / name).exists()):
         return False
     try:
@@ -2741,7 +2765,12 @@ def outage(home: Path, cause: str) -> str:
 
 
 def restores_lane_branch(
-    payload: dict, lane: Path, expected: str, *, rename_from: str = ""
+    payload: dict,
+    lane: Path,
+    expected: str,
+    *,
+    rename_from: str = "",
+    create: bool = False,
 ) -> bool:
     """Reports whether a command only restores the assigned bridge branch.
 
@@ -2750,9 +2779,12 @@ def restores_lane_branch(
         lane: Assigned bridge worktree.
         expected: Manifest-owned branch name.
         rename_from: Actual branch when the expected ref is missing.
+        create: Whether HEAD is detached and the expected ref is missing,
+            so only creating it at HEAD can restore it.
 
     Returns:
-        Whether the command exactly switches back or repairs a renamed ref.
+        Whether the command exactly switches back, recreates a deleted
+        ref at a detached HEAD, or repairs a renamed ref.
     """
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
@@ -2770,6 +2802,16 @@ def restores_lane_branch(
         args = args[1:]
     return target.is_relative_to(lane) and (
         (subcommand in {"switch", "checkout"} and args == [expected])
+        or (
+            create
+            and (
+                (
+                    subcommand == "switch"
+                    and args in (["-c", expected], ["--create", expected])
+                )
+                or (subcommand == "checkout" and args == ["-b", expected])
+            )
+        )
         or (
             bool(rename_from)
             and subcommand == "branch"
@@ -2836,7 +2878,8 @@ def branch_head(repo: Path, branch: str) -> str:
 
     Args:
         repo: Checkout the branch is read from.
-        branch: Branch name to resolve.
+        branch: Branch name to resolve under ``refs/heads``, so a tag or
+            other ref of the same name never stands in for it.
 
     Returns:
         The commit the branch points at, or an empty string when Git cannot
@@ -2845,7 +2888,14 @@ def branch_head(repo: Path, branch: str) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--verify", branch],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{branch}",
+            ],
             capture_output=True,
             text=True,
             timeout=3,
@@ -3256,14 +3306,22 @@ def branch_guard(
         return {}, Reason.BRANCH_REBASE
     if actual != expected:
         missing = not branch_exists(lane, expected)
-        rename_from = actual if missing and actual != "<detached HEAD>" else ""
+        detached = actual == "<detached HEAD>"
+        rename_from = actual if missing and not detached else ""
+        create = missing and detached
         if event == "PreToolUse" and restores_lane_branch(
-            payload, lane, expected, rename_from=rename_from
+            payload,
+            lane,
+            expected,
+            rename_from=rename_from,
+            create=create,
         ):
             return None, Reason.BRANCH_RESTORE
         repair = (
             f"git branch -m {shlex.quote(actual)} {shlex.quote(expected)}"
             if rename_from
+            else f"git switch -c {shlex.quote(expected)}"
+            if create
             else f"git switch {shlex.quote(expected)}"
         )
         message = (
