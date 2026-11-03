@@ -42,6 +42,7 @@ MAX_WHY_BYTES = 2000
 MAX_PATHS = 16
 MAX_PATH = 300
 LOCK_SECONDS = 5.0
+FILING_SECONDS = 120.0
 NOTE = (
     "Recorded for the operator. Nothing was filed and no lane was started; "
     "keep working on what you hold."
@@ -423,12 +424,16 @@ def accept(
 ) -> dict:
     """Files one suggestion as a forge issue and offers it to an idle lane.
 
-    The suggestion lock is held across the filing, so two acceptances of
-    one suggestion cannot both file it, and an accepted suggestion answers
-    a repeated acceptance with the issue it already filed. The offer is the
-    operator offer ``issue assign`` records, answered by the lane like any
-    other. With no lane named and none idle, the issue is left unclaimed
-    for the next lane that pulls work.
+    The suggestion is marked ``filing`` under its lock and filed by `_file`
+    outside it, so a slow forge never holds the lock other suggestions
+    wait on, and a second acceptance inside `FILING_SECONDS` of the mark
+    is refused rather than filing it twice. An accepted suggestion answers
+    a repeated acceptance with the issue it already filed, and offers that
+    issue again when no offer was recorded, so an offer that failed after
+    the filing is retried. The offer is the operator offer ``issue
+    assign`` records, answered by the lane like any other. With no lane
+    named and none idle, the issue is left unclaimed for the next lane
+    that pulls work.
 
     Args:
         directory: Private project state directory.
@@ -446,7 +451,7 @@ def accept(
         BridgeError: If the suggestion is unknown or expired, the named lane
             is not a participant, or the forge refused the filing.
     """
-    from agent_parley import forge, issues, roster
+    from agent_parley import issues, roster
 
     if to and to not in manifest.get("participants", {}):
         raise BridgeError(
@@ -462,21 +467,22 @@ def accept(
                 f"No pending suggestion {ident}; it was never recorded or "
                 "expired. Run agent-parley followup list."
             )
-        if entry.get("state") == ACCEPTED:
-            return {**entry, "repeated": True, "offer_id": ""}
-        chosen = milestone or forge.active_milestone(repo) or ""
-        number = forge.file_issue(repo, entry["title"], body(entry), chosen)
-        if number is None:
-            failure = forge.last_failure() or {}
-            raise BridgeError(
-                f"The forge did not file {ident}: "
-                f"{failure.get('detail') or 'no reachable GitHub project'}. "
-                "The suggestion stays pending; fix the forge and retry."
-            )
-        entry.update(
-            state=ACCEPTED, issue=number, milestone=chosen, accepted=time.time()
-        )
-        write_json(directory / RECORD_NAME, record)
+        repeated = entry.get("state") == ACCEPTED
+        if not repeated:
+            started = entry.get("filing")
+            if (
+                isinstance(started, float)
+                and time.time() - started < FILING_SECONDS
+            ):
+                raise BridgeError(
+                    f"Suggestion {ident} is being filed; retry in a minute."
+                )
+            entry["filing"] = time.time()
+            write_json(directory / RECORD_NAME, record)
+    if not repeated:
+        entry = _file(directory, repo, ident, entry, milestone)
+    elif entry.get("offered_to"):
+        return {**entry, "repeated": True, "offer_id": ""}
     recipient = to or idle_lane(directory, manifest)
     offer_id = ""
     if recipient:
@@ -484,7 +490,7 @@ def accept(
             directory,
             roster.OPERATOR,
             "assign",
-            number,
+            str(entry["issue"]),
             participants=set(manifest["participants"]),
             to=recipient,
             summary=f"Accepted follow-up {ident}: {entry['title']}"[:200],
@@ -497,7 +503,60 @@ def accept(
                 record["suggestions"][ident]["offered_to"] = recipient
                 write_json(directory / RECORD_NAME, record)
         entry["offered_to"] = recipient
-    return {**entry, "repeated": False, "offer_id": offer_id}
+    return {**entry, "repeated": repeated, "offer_id": offer_id}
+
+
+def _file(
+    directory: Path, repo: Path, ident: str, entry: dict, milestone: str
+) -> dict:
+    """Files one suggestion marked ``filing`` without holding its lock.
+
+    The forge call can take seconds, and a suggestion recorded meanwhile
+    waits only `LOCK_SECONDS` for the lock, so the call runs between two
+    short holds. The mark is cleared whatever the call did.
+
+    Args:
+        directory: Private project state directory.
+        repo: Checkout that selects the forge project.
+        ident: Suggestion identifier.
+        entry: The suggestion as read under the lock.
+        milestone: Milestone title to file under; the active one when empty.
+
+    Returns:
+        The accepted suggestion as recorded.
+
+    Raises:
+        BridgeError: If the forge refused the filing.
+    """
+    from agent_parley import forge
+
+    number: str | None = None
+    chosen = milestone
+    try:
+        chosen = milestone or forge.active_milestone(repo) or ""
+        number = forge.file_issue(repo, entry["title"], body(entry), chosen)
+    finally:
+        with lock(directory / LOCK_NAME, timeout=LOCK_SECONDS):
+            record = _read(directory)
+            if number is not None:
+                entry = record["suggestions"].setdefault(ident, entry)
+                entry.update(
+                    state=ACCEPTED,
+                    issue=number,
+                    milestone=chosen,
+                    accepted=time.time(),
+                )
+            entry = record["suggestions"].get(ident, entry)
+            entry.pop("filing", None)
+            write_json(directory / RECORD_NAME, record)
+    if number is None:
+        failure = forge.last_failure() or {}
+        raise BridgeError(
+            f"The forge did not file {ident}: "
+            f"{failure.get('detail') or 'no reachable GitHub project'}. "
+            "The suggestion stays pending; fix the forge and retry."
+        )
+    return entry
 
 
 def accept_decision(directory: Path, decision: dict) -> dict:

@@ -229,6 +229,19 @@ def test_a_tool_permission_payload_names_the_shared_tool():
     assert gemini.response({}) == {}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"hook_event_name": "BeforeTool", "tool_name": 5},
+        {"hook_event_name": ["BeforeTool"], "tool_name": "run_shell_command"},
+    ],
+)
+def test_a_wrongly_typed_field_passes_through_untranslated(value):
+    translated = gemini.payload(value)
+    assert translated["tool_name"] == value["tool_name"]
+    assert type(translated["hook_event_name"]) is type(value["hook_event_name"])
+
+
 def test_resume_without_a_recorded_session_is_refused(lane, bridge, repo):
     with pytest.raises(BridgeError, match="No usable native session"):
         bridge.launch("helper", repo, "Continue", "gemini", resume=True)

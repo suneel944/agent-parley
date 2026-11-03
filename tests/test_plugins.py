@@ -408,3 +408,14 @@ def test_lanes_on_an_older_plugin_name_the_oldest_resume(bridge, repo):
     assert "agent-parley run lane-2 --repo" in row["command"]
     assert "lane-1" not in row["command"]
     assert (row["count"], row["seconds"]) == (2, 200)
+
+
+def test_a_profile_named_like_the_shell_label_selects_its_own_home(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "exported"))
+    profile = tmp_path / "profile"
+    env = plugins.environment("codex", plugins.SHELL, profile)
+    assert env["CODEX_HOME"] == str(profile)
+    shell = plugins.environment("codex", plugins.SHELL, tmp_path / "exported")
+    assert shell["CODEX_HOME"] == str(tmp_path / "exported")

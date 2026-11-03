@@ -21,7 +21,7 @@ from agent_parley import (
     store,
     supervision,
 )
-from agent_parley.state import BridgeError, write_json
+from agent_parley.state import BridgeError, lock, write_json
 from agent_parley.status import FORGE_ISSUES
 
 
@@ -238,6 +238,50 @@ def test_accept_to_a_named_lane_and_refusals(bridge, repo, lane, filed):
         bridge.followup_accept(repo, "f99")
     accepted = bridge.followup_accept(repo, created["id"], to="claude")
     assert accepted["offered_to"] == "claude"
+
+
+def test_the_forge_is_called_outside_the_suggestion_lock(
+    bridge, repo, lane, monkeypatch
+):
+    held = []
+
+    def file_issue(repo, title, body, milestone=""):
+        with lock(lane["directory"] / followups.LOCK_NAME, timeout=0):
+            held.append(False)
+        with pytest.raises(BridgeError, match="being filed"):
+            bridge.followup_accept(repo, created["id"])
+        return "901"
+
+    monkeypatch.setattr(forge, "file_issue", file_issue)
+    monkeypatch.setattr(forge, "active_milestone", lambda repo: None)
+    created = followups.suggest(lane["directory"], "codex", "Idea", "Why.")
+    accepted = bridge.followup_accept(repo, created["id"])
+    assert held == [False]
+    assert accepted["issue"] == "901"
+    stored = json.loads(
+        (lane["directory"] / followups.RECORD_NAME).read_text()
+    )["suggestions"][created["id"]]
+    assert "filing" not in stored
+
+
+def test_a_repeated_accept_retries_an_offer_that_failed(
+    bridge, repo, lane, filed, monkeypatch
+):
+    created = followups.suggest(lane["directory"], "codex", "Idea", "Why.")
+    change = issues.change
+
+    def refused(*args, **kwargs):
+        raise BridgeError("issue ledger busy")
+
+    monkeypatch.setattr(issues, "change", refused)
+    with pytest.raises(BridgeError, match="ledger busy"):
+        bridge.followup_accept(repo, created["id"], to="claude")
+    monkeypatch.setattr(issues, "change", change)
+    again = bridge.followup_accept(repo, created["id"], to="claude")
+    assert again["repeated"] is True
+    assert again["offered_to"] == "claude"
+    assert again["offer_id"]
+    assert len(filed) == 1
 
 
 def test_a_forge_refusal_keeps_the_suggestion_pending(
