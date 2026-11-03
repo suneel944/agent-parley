@@ -394,6 +394,46 @@ def test_portable_python_shutdown_keeps_pidfd_identity_check(monkeypatch):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pidfd")
+@pytest.mark.parametrize("vanished", [True, False])
+def test_a_process_exiting_after_its_pin_ends_the_stop(monkeypatch, vanished):
+    with subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"]
+    ) as child:
+        try:
+            ticks = process.start_ticks(child.pid)
+            real = process.linux_start_ticks
+
+            def exited(pid):
+                child.kill()
+                child.wait(timeout=5)
+                return real(pid) if vanished else ticks
+
+            monkeypatch.setattr(process, "linux_start_ticks", exited)
+            process.linux_terminate(child.pid, ticks)
+            assert child.poll() is not None
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+
+def test_macos_names_the_most_recently_started_worktree_client(monkeypatch):
+    started = {101: "Mon Nov  2 10:00:00 2026", 102: "Sat Oct 31 09:00:00 2026"}
+    monkeypatch.setattr(
+        process,
+        "PLATFORM",
+        process.PLATFORM._replace(
+            worktree_clients=lambda lane, command: [101, 102],
+            start_ticks=started.__getitem__,
+        ),
+    )
+    monkeypatch.setattr(process, "alive", lambda pid, ticks: True)
+    assert process.worktree_client(Path("/"), "claude").pid == 101
+    assert process.start_order("1200") > process.start_order("999")
+    assert process.start_order("unreadable") == float("-inf")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pidfd")
 def test_portable_python_pidfd_preserves_native_errors():
     with pytest.raises(ProcessLookupError):
         process.libc_pidfd("pidfd_open", 2**30, 0)

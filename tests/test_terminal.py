@@ -962,6 +962,82 @@ def test_stopping_a_launcher_without_a_terminal_ends_its_client(tmp_path):
         started.wait()
 
 
+STUBBORN_CLIENT = (
+    "import os, signal, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+    "path = sys.argv[1]\n"
+    "with open(path + '.tmp', 'w') as handle:\n"
+    "    handle.write(str(os.getpid()))\n"
+    "os.replace(path + '.tmp', path)\n"
+    "time.sleep(60)\n"
+)
+
+
+def _stubborn_stop(tmp_path: Path, launcher: str) -> None:
+    """Stops a launcher whose client ignores every stop signal."""
+    marker = tmp_path / "client.pid"
+    source = str(Path(terminal.__file__).parents[1])
+    started = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            launcher,
+            STUBBORN_CLIENT,
+            str(marker),
+            str(tmp_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        env=dict(os.environ, PYTHONPATH=source),
+        start_new_session=True,
+    )
+    client_pid = None
+    try:
+        deadline = time.monotonic() + 20
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        client_pid = int(marker.read_text())
+        client_ticks = process.start_ticks(client_pid)
+        started.send_signal(signal.SIGTERM)
+        assert started.wait(timeout=20) == 0
+        assert not process.alive(client_pid, client_ticks)
+    finally:
+        started.kill()
+        started.wait()
+        if client_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(client_pid, signal.SIGKILL)
+
+
+def test_a_launcher_without_a_terminal_kills_a_client_ignoring_stop(
+    tmp_path,
+):
+    _stubborn_stop(
+        tmp_path,
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from agent_parley import terminal\n"
+        "terminal.STOP_GRACE = 0.5\n"
+        "command = [sys.executable, '-c', sys.argv[1], sys.argv[2]]\n"
+        "terminal.call(command, Path(sys.argv[3]), {})\n",
+    )
+
+
+def test_a_detached_launcher_kills_a_client_ignoring_stop(tmp_path):
+    (tmp_path / "lane").mkdir()
+    _stubborn_stop(
+        tmp_path,
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from agent_parley import terminal\n"
+        "terminal.STOP_GRACE = 0.5\n"
+        "command = [sys.executable, '-c', sys.argv[1], sys.argv[2]]\n"
+        "terminal.run(command, Path(sys.argv[3]) / 'lane', dict(os.environ),"
+        " 'lane', attached=False)\n",
+    )
+
+
 def test_the_lane_summary_skips_a_repository_project_json():
     with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
         directory = Path(temporary)
