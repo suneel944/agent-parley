@@ -3971,60 +3971,42 @@ up to 16 minutes. A relaunch stamp dated in the future, as a backward clock
 step leaves, does not hold the next request off. A machine that has never started a service is left alone: the first start
 belongs to the launch or to the operator.
 
-### Decisions that apply their default on timeout
+### Decisions wait for the operator
 
-A question nobody answers should not hold a lane when the choice is
-reversible and has an obvious answer. Every decision kind is declared once, in
-`agent_parley/timeouts.py`, with its class, its recommended option and the
-command that undoes that option:
+The service never answers an open decision on the operator's behalf. Every
+decision kind is declared once, in `agent_parley/timeouts.py`, with its class
+and its recommended option:
 
-| Kind | Class | Default | Timeout | Undo |
-| --- | --- | --- | --- | --- |
-| `merge_default` | irreversible | wait for the operator | never | none |
-| `release_tag` | irreversible | wait for the operator | never | none |
-| `discard_work` | irreversible | wait for the operator | never | none |
-| `delete_branch` | irreversible | wait for the operator | never | none |
-| `native_permission` | irreversible | wait for the operator | never | none |
+| Kind | Class | Default | Timeout |
+| --- | --- | --- | --- |
+| `merge_default` | irreversible | wait for the operator | never |
+| `release_tag` | irreversible | wait for the operator | never |
+| `discard_work` | irreversible | wait for the operator | never |
+| `delete_branch` | irreversible | wait for the operator | never |
+| `native_permission` | irreversible | wait for the operator | never |
 
-A reversible decision left unanswered for its timeout settles to the default.
-The outcome is appended to the lane's report log as a record of kind `default`
-with outcome `applied by timeout`, the evidence it used and the filled undo
-command, and one line naming what was done and that command is sent on the
-configured notification transports. When the evidence is already conclusive,
-nothing is asked and the outcome is `applied on evidence`. An irreversible
-kind, and any kind the table does not know, always waits for an answer. The
-table declares a reversible kind only when a notification produces decisions
-of that kind for the sweep to settle.
+An irreversible kind, and any kind the table does not know, always waits for
+an answer. `permission_prompt`, `permission_denied` and `native_dialog`
+records are `native_permission` decisions and wait like the rest. Every other
+open decision record, the ones notifications deliver, also stays open until
+the operator answers it. An `orphan_decision` record is one of them: the
+service cannot carry out any of its options for the operator, so it stays
+open until the operator answers or the dead lane's work is returned at
+`orphan_retire_after`, which marks it stale. The former `orphan_claim` kind
+is gone; `timeout set orphan_claim` is refused and a policy entry that still
+names it is ignored.
 
-No kind is reversible today, so the table above holds only irreversible kinds
-and `agent-parley timeout show` lists them. `agent-parley timeout set KIND
+`agent-parley timeout show` lists the table. `agent-parley timeout set KIND
 --ask` or `--after DURATION`, run from the base checkout, refuses every
 current kind: an irreversible kind always waits, and any other name is not a
-decision kind. The mechanism stays for a future reversible kind. Its policy is
-stored in `project.json` under `"timeouts"`, as `{"KIND": {"ask": true}}` or
-`{"KIND": {"seconds": 7200}}`, and can only make the kind more cautious: a
-timeout under 30 minutes or over seven days is refused, and a manifest
-holding an invalid entry for a known kind refuses every settlement until it is
-fixed. An entry stored by an earlier release for `orphan_claim`,
+decision kind. A policy is stored in `project.json` under `"timeouts"`, as
+`{"KIND": {"ask": true}}` or `{"KIND": {"seconds": 7200}}`, and can only make
+a kind more cautious: a timeout under 30 minutes or over seven days is
+refused, and a manifest holding an invalid entry for a known kind is refused
+when read. An entry stored by an earlier release for `orphan_claim`,
 `closed_claim`, `idle_key` or `failed_ci` is ignored, and dropped the next
 time `timeout set` writes the policy. `set` refuses lane shells the way
 `unattended set` does.
-
-Every supervision poll sweeps the project's open decision records, the ones
-notifications deliver, before sending the due ones. A record settles only
-when its notification kind maps to a reversible table kind, it was recorded
-reversible, and it recommends one of its own options. Today
-`permission_prompt`, `permission_denied` and `native_dialog` records map to
-`native_permission` and always wait; any other record waits for an answer.
-An `orphan_decision` record is one of them: the service cannot carry out any
-of its options for the operator, so it stays open until the operator answers
-or the dead lane's work is returned at `orphan_retire_after`, which marks it
-stale. The former `orphan_claim` kind is gone; `timeout set orphan_claim` is
-refused and a policy entry that still names it is ignored. A settled record
-is answered with its recommended option by `timeout`, handed to its lane like
-any other answer, with mail saying the service's decision timeout answered
-it, logged and announced as above. A record the operator answered first, or one missing the
-issue or lane its undo command names, is left alone.
 
 ### Keeping the service across reboots
 
