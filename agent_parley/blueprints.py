@@ -750,7 +750,7 @@ def supervise(
             or run.get("lane") not in manifest["participants"]
             or (
                 _held(ledger.get(number) or {}, run)
-                and not _due(directory, run)
+                and not _due(directory, number, run)
             )
         ):
             continue
@@ -765,12 +765,12 @@ def supervise(
     return started
 
 
-def _due(directory: Path, run: dict) -> bool:
+def _due(directory: Path, number: str, run: dict) -> bool:
     """Reports whether a run in progress has anything new to act on."""
     nodes = {node["name"]: node for node in run["nodes"]}
     if run["status"] != WAITING or nodes[run["node"]]["kind"] != "agent":
         return True
-    return _reported(directory, run) is not None
+    return _reported(directory, number, run) is not None
 
 
 def _held(record: dict, run: dict) -> bool:
@@ -1052,7 +1052,7 @@ def _agent(
         and None while the run waits on the lane.
     """
     if run["status"] == WAITING:
-        activity = _reported(directory, run)
+        activity = _reported(directory, number, run)
         if activity is None:
             return None
         run["status"] = RUNNING
@@ -1074,11 +1074,15 @@ def _agent(
     return None
 
 
-def _reported(directory: Path, run: dict) -> dict | None:
+def _reported(directory: Path, number: str, run: dict) -> dict | None:
     """Reads the ready or blocked report a lane filed since its prompt.
+
+    Only a report whose rotation names the run's issue counts, so a lane's
+    report on another issue never moves this run on.
 
     Args:
         directory: Project coordination directory.
+        number: Issue the run belongs to.
         run: The run's recorded state, naming the lane and when the prompt
             was handed over.
 
@@ -1095,6 +1099,8 @@ def _reported(directory: Path, run: dict) -> dict | None:
         isinstance(activity, dict)
         and float(activity.get("reported_at") or 0) > run["since"]
         and activity.get("outcome") in ("ready", "blocked")
+        and isinstance(activity.get("rotation"), dict)
+        and str(activity["rotation"].get("issue")) == number
     ):
         return activity
     return None
