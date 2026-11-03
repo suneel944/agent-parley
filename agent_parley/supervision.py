@@ -1056,7 +1056,7 @@ def dirty_paths(root: str) -> list[str] | None:
     """
     try:
         result = subprocess.run(
-            ["git", "-C", root, "status", "--porcelain", "-uall"],
+            ["git", "-C", root, "status", "--porcelain", "-z", "-uall"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -1067,13 +1067,13 @@ def dirty_paths(root: str) -> list[str] | None:
     if result.returncode:
         return None
     paths = []
-    for line in result.stdout.splitlines():
-        if len(line) < 4:
+    records = iter(result.stdout.split("\0"))
+    for record in records:
+        if len(record) < 4:
             continue
-        entry = line[3:]
-        if line[0] in "RC" and " -> " in entry:
-            entry = entry.split(" -> ", 1)[1]
-        paths.append(entry.rstrip("/"))
+        if record[0] in "RC":
+            next(records, None)
+        paths.append(record[3:].rstrip("/"))
     return paths
 
 
@@ -1118,8 +1118,10 @@ def _changed(root: str, start: str, end: str) -> list[str]:
         rename detection costs half a second on a large diff, and a held
         path that the other side moved away is changed all the same.
     """
-    listing = _read(root, "diff", "--no-renames", "--name-only", start, end)
-    return [path for path in (listing or "").splitlines() if path]
+    listing = _read(
+        root, "diff", "--no-renames", "--name-only", "-z", start, end
+    )
+    return [path for path in (listing or "").split("\0") if path]
 
 
 def operator_edits(home: Path, manifest: dict) -> dict[str, list[str]]:
