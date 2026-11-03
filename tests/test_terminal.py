@@ -1024,18 +1024,20 @@ def test_a_launcher_without_a_terminal_kills_a_client_ignoring_stop(
     )
 
 
-def test_a_detached_launcher_kills_a_client_ignoring_stop(tmp_path):
-    (tmp_path / "lane").mkdir()
-    _stubborn_stop(
-        tmp_path,
-        "import os, sys\n"
-        "from pathlib import Path\n"
-        "from agent_parley import terminal\n"
-        "terminal.STOP_GRACE = 0.5\n"
-        "command = [sys.executable, '-c', sys.argv[1], sys.argv[2]]\n"
-        "terminal.run(command, Path(sys.argv[3]) / 'lane', dict(os.environ),"
-        " 'lane', attached=False)\n",
-    )
+def test_a_detached_launcher_kills_a_client_ignoring_stop():
+    with tempfile.TemporaryDirectory(prefix="wake-") as temporary:
+        directory = Path(temporary)
+        (directory / "lane").mkdir()
+        _stubborn_stop(
+            directory,
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "from agent_parley import terminal\n"
+            "terminal.STOP_GRACE = 0.5\n"
+            "command = [sys.executable, '-c', sys.argv[1], sys.argv[2]]\n"
+            "terminal.run(command, Path(sys.argv[3]) / 'lane',"
+            " dict(os.environ), 'lane', attached=False)\n",
+        )
 
 
 def test_the_lane_summary_skips_a_repository_project_json():
