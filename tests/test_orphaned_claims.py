@@ -733,6 +733,55 @@ def test_takeover_restore_resumes_after_each_durable_phase(
     assert (peer / "worktree.txt").read_text() == "worktree\n"
 
 
+def taken_over(bridge, paired):
+    """Has codex take claude's orphaned issue 42 with unstaged work."""
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    (lane / "worktree.txt").write_text("worktree\n")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    bridge.issue(peer, "claim", "42", take_orphaned=True)
+    record = issues.snapshot(directory)["issues"]["42"]
+    return directory, peer, record["taken"]["checkpoint"]
+
+
+def test_prune_keeps_the_bundle_a_live_take_restores(bridge, repo, paired):
+    directory, _, saved = taken_over(bridge, paired)
+    bundle = directory / "recovery" / saved["artifact"]["reference"]
+
+    removed = recovery.prune(directory, issues.snapshot(directory))
+
+    assert saved["id"] not in removed
+    assert bundle.exists()
+
+
+def test_a_completed_take_reclaims_without_its_bundle(bridge, repo, paired):
+    directory, peer, saved = taken_over(bridge, paired)
+    (directory / "recovery" / saved["artifact"]["reference"]).unlink()
+
+    resumed = bridge.issue(peer, "claim", "42")
+
+    assert resumed["recovery"]["phase"] == "complete"
+
+
+def test_prune_removes_a_restore_receipt_once_its_checkpoint_goes(
+    bridge, repo, paired
+):
+    directory, peer, saved = taken_over(bridge, paired)
+    folder = directory / "recovery"
+    (receipt,) = folder.glob(f"{saved['id']}-to-*.json")
+
+    bridge.issue(peer, "release", "42")
+    removed = recovery.prune(directory, issues.snapshot(directory))
+
+    assert saved["id"] in removed
+    assert not receipt.exists()
+
+
 def test_takeover_revalidates_a_returned_owner_process(bridge, repo, paired):
     registered(bridge, paired)
     lane = Path(paired["lanes"]["claude"])
