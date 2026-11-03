@@ -42,6 +42,11 @@ CAUSE = "permission denied"
 MAX_COMMAND_BYTES = 512
 MAX_REASON_BYTES = 200
 SHELL_TOOLS = frozenset({"Bash"})
+WIDE_PROGRAMS = re.compile(
+    r"(?:[a-z]*sh|python[\d.]*|pypy[\d.]*|node|deno|bun|npx|uvx|perl|ruby"
+    r"|php|lua|osascript|env|sudo|doas|su|exec|eval|xargs|nohup"
+    r"|nice|time|timeout|command|builtin|source|\.)"
+)
 TARGET_FIELDS = (
     "command",
     "file_path",
@@ -83,14 +88,22 @@ class Denial(NamedTuple):
 def _clipped(text: str, budget: int) -> str:
     """Cuts text to a byte budget without splitting a character.
 
+    Every character that is not printable, such as a newline or an escape,
+    is first written as its backslash escape, so text a tool call carried
+    cannot start a line of its own in the decision it is shown in.
+
     Args:
         text: Text to keep.
         budget: Byte cap.
 
     Returns:
-        The text, at most ``budget`` bytes long.
+        The escaped text, at most ``budget`` bytes long.
     """
-    return text.encode()[:budget].decode(errors="ignore")
+    escaped = "".join(
+        char if char.isprintable() else char.encode("unicode_escape").decode()
+        for char in text
+    )
+    return escaped.encode()[:budget].decode(errors="ignore")
 
 
 def _command(tool_input: object) -> str:
@@ -159,9 +172,12 @@ def rule(tool: str, command: str) -> str:
     """Suggests the permission rule that would allow a refused call.
 
     The suggestion is shown to the operator and never written anywhere. A
-    shell command is matched on its program and, when the next word is not
-    an option, its subcommand, in the ``Tool(prefix:*)`` form Claude Code
-    settings take; any other tool is named whole.
+    shell command is matched on its program and its subcommand, in the
+    ``Tool(prefix:*)`` form Claude Code settings take. A command whose
+    prefix would allow arbitrary code is matched exactly instead: one led
+    by an environment assignment or an option, one whose next word is an
+    option, and one whose program `WIDE_PROGRAMS` names, such as a shell
+    or an interpreter. Any other tool is named whole.
 
     Args:
         tool: Native tool name.
@@ -176,10 +192,18 @@ def rule(tool: str, command: str) -> str:
         words = shlex.split(command)
     except ValueError:
         words = command.split()
-    prefix = words[:1]
-    if len(words) > 1 and not words[1].startswith("-"):
-        prefix = words[:2]
-    return f"{tool}({' '.join(prefix)}:*)" if prefix else tool
+    if not words:
+        return tool
+    lead = words[0]
+    wide = (
+        "=" in lead
+        or lead.startswith("-")
+        or WIDE_PROGRAMS.fullmatch(lead.rpartition("/")[2]) is not None
+        or (len(words) > 1 and words[1].startswith("-"))
+    )
+    if wide:
+        return f"{tool}({command})"
+    return f"{tool}({' '.join(words[:2])}:*)"
 
 
 def options(claimed: bool) -> tuple[str, ...]:
