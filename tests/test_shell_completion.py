@@ -84,10 +84,10 @@ def test_the_walk_collects_flags_without_the_help_option():
 
 def test_state_backed_options_map_to_their_candidate_kind():
     values = completion.value_flags(parser())
-    assert values["--to"] == "participants"
-    assert values["--issue"] == "issues"
-    assert values["--repo"] == "projects"
-    assert "--json" not in values
+    assert values["say --to"] == "participants"
+    assert values["issue claim --issue"] == "issues"
+    assert values["issue claim --repo"] == "projects"
+    assert "say --json" not in values
 
 
 def test_every_shell_emits_a_script_naming_the_hidden_callback():
@@ -299,14 +299,24 @@ def test_positionals_name_what_each_command_slot_accepts():
 
 def test_the_credentials_option_completes_profiles():
     values = completion.value_flags(cli.root_parser(None)[0])
-    assert values["--credentials"] == "credentials"
+    assert values["run --credentials"] == "credentials"
 
 
 def test_value_options_include_home_but_not_switches():
     taking = completion.value_options(cli.root_parser(None)[0])
     assert "--home" in taking
-    assert "--credentials" in taking
-    assert "--json" not in taking
+    assert "run --credentials" in taking
+    assert "status --json" not in taking
+
+
+def test_option_values_and_kinds_belong_to_their_own_command():
+    root = cli.root_parser(None)[0]
+    taking = completion.value_options(root)
+    values = completion.value_flags(root)
+    assert "deadlines set --ack" in taking
+    assert "say --ack" not in taking
+    assert values["issue offer --to"] == "participants"
+    assert "gc --to" not in values
 
 
 def offered(shell, script, line, environment):
@@ -359,11 +369,25 @@ def offered(shell, script, line, environment):
         ("completion", {"bash", "zsh", "fish"}),
         ("--home elsewhere participant", {"restart", "list", "show"}),
         ("run claude --credentials", {"work"}),
+        ("say --ack", {"claude-2"}),
     ),
 )
 def test_a_live_shell_completes_positionals_and_values(
     bridge, tmp_path, monkeypatch, shell, line, expected
 ):
+    assert expected <= live(bridge, tmp_path, shell, line)
+
+
+@pytest.mark.parametrize("shell", completion.SHELLS)
+def test_a_live_shell_offers_no_lanes_for_a_path_option(
+    bridge, tmp_path, shell
+):
+    found = live(bridge, tmp_path, shell, "gc --restore claude-2 --to")
+    assert "claude-2" not in found
+
+
+def live(bridge, tmp_path, shell, line):
+    """Runs the real program's completion in one shell for a typed line."""
     if shutil.which(shell) is None:
         pytest.skip(f"{shell} is not installed")
     project(bridge, "/tmp/one", ["claude-2"])
@@ -385,4 +409,4 @@ def test_a_live_shell_completes_positionals_and_values(
         "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
         "AGENT_PARLEY_HOME": str(bridge.home),
     }
-    assert expected <= offered(shell, script, line, environment)
+    return offered(shell, script, line, environment)

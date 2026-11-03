@@ -4583,7 +4583,7 @@ def decide(home: Path, root: str, subject: str, body: str, key: str) -> dict:
             validation.
     """
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         project = db.execute(
             "SELECT id FROM projects WHERE human_key=?", (root,)
@@ -4685,7 +4685,7 @@ def acknowledge(home: Path, root: str, identifier: int) -> dict:
             acknowledgement in this project.
     """
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         rows = db.execute(
             "SELECT a.name AS name FROM message_recipients r "
@@ -4925,7 +4925,7 @@ def speak(
             sender is not registered, or the message fails validation.
     """
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         project = db.execute(
             "SELECT id FROM projects WHERE human_key=?", (root,)
@@ -5075,7 +5075,7 @@ def schedule(home: Path, root: str, item: dict) -> dict:
             f"A repeating message is capped at {MAX_REPEATS} deliveries."
         )
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         project_id = _project_id(db, root)
         cursor = db.execute(
@@ -5160,7 +5160,7 @@ def cancel_schedule(home: Path, root: str, identifier: int) -> dict:
         BridgeError: If the project is not registered.
     """
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         project_id = _project_id(db, root)
         row = _schedule_row(db, project_id, identifier)
@@ -5191,7 +5191,7 @@ def complete_schedule(home: Path, root: str, identifier: int) -> dict:
         BridgeError: If the project is not registered.
     """
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         project_id = _project_id(db, root)
         row = _schedule_row(db, project_id, identifier)
@@ -5229,7 +5229,7 @@ def deliver_schedule(home: Path, root: str, identifier: int, name: str) -> dict:
         BridgeError: If the project is not registered.
     """
     if not (home / DATABASE).exists():
-        raise BridgeError(NO_PROJECT)
+        raise missing()
     with connect(home, write=True) as db:
         project_id = _project_id(db, root)
         row = _schedule_row(db, project_id, identifier)
