@@ -300,6 +300,38 @@ def test_a_native_exit_retains_the_generation_needed_for_recovery(
     assert taken["taken"]["from"] == "claude"
 
 
+def test_a_held_checkpoint_lock_at_exit_still_records_the_lane_stopped(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    holder = lock(directory / "claude-checkpoint.lock")
+
+    def exit_native(*args, **kwargs):
+        holder.__enter__()
+        return 0
+
+    async def identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    monkeypatch.setattr(bridge, "identity", identity)
+    monkeypatch.setattr(cli.shutil, "which", lambda command: sys.executable)
+    monkeypatch.setattr(cli.terminal, "call", exit_native)
+    monkeypatch.setattr(cli, "LAUNCH_LOCK_SECONDS", 0.1)
+    monkeypatch.setattr(
+        cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: False)
+    )
+    try:
+        with pytest.raises(LockBusy):
+            bridge.launch("claude", repo, "Continue recovery work")
+    finally:
+        holder.__exit__(None, None, None)
+    with store.connect(bridge.home) as db:
+        record = lanes.read(db, paired["root"], "claude")
+    assert record["state"] == lanes.STOPPED
+
+
 def test_a_takeover_run_from_a_subdirectory_restores_the_whole_worktree(
     bridge, repo, paired
 ):

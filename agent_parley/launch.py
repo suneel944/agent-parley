@@ -1344,16 +1344,21 @@ reported.
                         )
                     return terminal.call(command, lane, env)
             finally:
-                with lock(lane.parent / f"{agent}-checkpoint.lock", timeout=1):
-                    state = json.loads(activity_path.read_text())
-                    state.update(activity="stopped", updated=time.time())
-                    write_json(activity_path, state)
-                with contextlib.suppress(sqlite3.OperationalError):
-                    with store.connect(self.home, write=True) as db:
-                        lanes.transition(
-                            db,
-                            data["root"],
-                            agent,
-                            lanes.STOPPED,
-                            evidence="launch: session exited",
-                        )
+                try:
+                    with lock(
+                        lane.parent / f"{agent}-checkpoint.lock",
+                        timeout=LAUNCH_LOCK_SECONDS,
+                    ):
+                        state = json.loads(activity_path.read_text())
+                        state.update(activity="stopped", updated=time.time())
+                        write_json(activity_path, state)
+                finally:
+                    with contextlib.suppress(sqlite3.OperationalError):
+                        with store.connect(self.home, write=True) as db:
+                            lanes.transition(
+                                db,
+                                data["root"],
+                                agent,
+                                lanes.STOPPED,
+                                evidence="launch: session exited",
+                            )

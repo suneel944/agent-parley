@@ -15,6 +15,8 @@ The module also takes the one host load and memory reading a launch is
 gated on, through `host_load`.
 """
 
+import calendar
+import contextlib
 import ctypes
 import functools
 import os
@@ -401,7 +403,10 @@ def linux_terminate(pid: int, ticks: str) -> None:
     A process that ignores `SIGTERM`, such as a client wedged in a native
     dialog or left behind by a system hang, is sent `SIGKILL` once the
     shutdown timeout passes, through the same pinned descriptor, so the
-    escalation can never reach a recycled process ID.
+    escalation can never reach a recycled process ID. A process that exits
+    between the pin and the signal is already stopped, so its vanished
+    ``/proc`` entry or refused signal ends the stop instead of failing it;
+    an exited process makes the pinned descriptor readable at once.
 
     Args:
         pid: Process ID recorded for the process.
@@ -420,11 +425,17 @@ def linux_terminate(pid: int, ticks: str) -> None:
     except ProcessLookupError:
         return
     try:
-        if linux_start_ticks(pid) != ticks:
+        try:
+            current = linux_start_ticks(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if current != ticks:
             raise BridgeError("Server PID changed; refusing to signal it.")
-        linux_signal(fd, signal.SIGTERM)
+        with contextlib.suppress(ProcessLookupError):
+            linux_signal(fd, signal.SIGTERM)
         if not select.select([fd], [], [], STOP_TIMEOUT)[0]:
-            linux_signal(fd, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                linux_signal(fd, signal.SIGKILL)
             if not select.select([fd], [], [], KILL_TIMEOUT)[0]:
                 raise BridgeError(
                     f"Process {pid} did not exit after SIGTERM and SIGKILL."
@@ -1430,7 +1441,31 @@ def worktree_client(lane: Path, command: str) -> ServerProcess | None:
             found.append(ServerProcess(pid, ticks))
     if not found:
         return None
-    return max(found, key=lambda client: (len(client.ticks), client.ticks))
+    return max(found, key=lambda client: start_order(client.ticks))
+
+
+def start_order(ticks: str) -> float:
+    """Orders recorded creation identities by when the process started.
+
+    Linux records creation ticks since boot, a decimal count. macOS records
+    ``lstart`` text in UTC under the C locale, such as
+    ``Mon Nov  3 10:00:00 2026``, whose text order follows weekday and
+    month names rather than time, so it is parsed into seconds instead.
+
+    Args:
+        ticks: Creation identity as `start_ticks` returns it.
+
+    Returns:
+        A value that grows with the creation time, or negative infinity
+        when the identity cannot be read as a time.
+    """
+    if ticks.isdigit():
+        return float(ticks)
+    try:
+        started = time.strptime(ticks, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return float("-inf")
+    return float(calendar.timegm(started))
 
 
 def identify(record: dict, home: Path) -> ServerProcess | None:
