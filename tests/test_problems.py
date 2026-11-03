@@ -2142,3 +2142,15 @@ def test_dirtiness_is_read_once_per_reporting_lane_on_worker_threads(
     )
     assert problems.DIRTY in {row["condition"] for row in rows}
     assert calls == []
+
+
+def test_one_unreadable_manifest_is_skipped_by_status_and_problems(
+    bridge, repo, paired, served
+):
+    report = bridge.status_snapshot()
+    broken = bridge.home / "projects" / "broken"
+    broken.mkdir()
+    (broken / "project.json").write_text("{not json")
+    assert len(bridge.status_snapshot()["projects"]) == 1
+    assert isinstance(problems.derive(bridge.home, report), list)
+    assert isinstance(bridge.problems(), list)

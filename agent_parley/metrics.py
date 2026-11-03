@@ -432,11 +432,13 @@ def _mail_waits(
             return []
         rows = db.execute(
             "SELECT m.id,s.name AS sender,m.ack_required,"
-            "unixepoch(m.created_ts) AS created,"
-            "unixepoch(r.read_ts) AS read_at,unixepoch(r.ack_ts) AS ack_at "
+            "CAST(strftime('%s',m.created_ts) AS INTEGER) AS created,"
+            "CAST(strftime('%s',r.read_ts) AS INTEGER) AS read_at,"
+            "CAST(strftime('%s',r.ack_ts) AS INTEGER) AS ack_at "
             "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
             "JOIN agents s ON s.id=m.sender_id "
-            "WHERE r.agent_id=? AND unixepoch(m.created_ts)>=? "
+            "WHERE r.agent_id=? "
+            "AND CAST(strftime('%s',m.created_ts) AS INTEGER)>=? "
             "ORDER BY m.id DESC LIMIT ?",
             (agent["id"], int(since), MAX_WAITS),
         ).fetchall()
@@ -1131,7 +1133,7 @@ def _operator_mail(
         "LEFT JOIN message_recipients r ON r.message_id=m.id "
         "LEFT JOIN agents ra ON ra.id=r.agent_id "
         "WHERE p.human_key=? AND s.name=? "
-        "AND unixepoch(m.created_ts) BETWEEN ? AND ?",
+        "AND CAST(strftime('%s',m.created_ts) AS INTEGER) BETWEEN ? AND ?",
         (root, roster.OPERATOR, int(since), int(now) + 1),
     ).fetchall()
     received: dict[str, int] = {}

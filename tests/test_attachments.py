@@ -10,7 +10,7 @@ import pytest
 
 from agent_parley import attachments, checkpoints, cli, issues, metrics, store
 from agent_parley.checkpoints import MAX_CONTEXT_BYTES, checkpoint
-from agent_parley.state import BridgeError, write_json
+from agent_parley.state import BridgeError, lock, write_json
 
 
 def actors(bridge, data):
@@ -626,3 +626,18 @@ def test_the_allowance_reads_no_released_metadata(tmp_path, monkeypatch):
             [f"message-{n}" for n in range(1, 21)],
         )
     assert reads and set(reads) == {attachments.INDEX}
+
+
+def test_a_busy_index_lock_never_deletes_the_holders_index(
+    tmp_path, monkeypatch
+):
+    attachments.keep(tmp_path, "message", 1, "z" * 5000, "claude", ["codex"])
+    home = attachments.folder(tmp_path)
+    before = (home / attachments.INDEX).read_text()
+    monkeypatch.setattr(attachments, "INDEX_TIMEOUT", 0)
+    with lock(tmp_path / attachments.INDEX_LOCK):
+        attachments.release(tmp_path, "message-1", "claude")
+        (home / attachments.INDEX).write_text(before)
+    assert attachments.used(tmp_path, "claude") == 0
+    assert not (home / attachments.STALE).exists()
+    assert attachments.used(tmp_path, "claude") == 0

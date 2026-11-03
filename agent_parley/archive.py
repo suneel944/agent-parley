@@ -272,18 +272,18 @@ def export(home: Path, output: Path, project: Path | None = None) -> dict:
                 for path in _project_files(directory):
                     relative = path.relative_to(directory).as_posix()
                     member = f"{PROJECTS}/{directory.name}/{relative}"
+                    content = path.read_bytes()
                     if path.name.endswith("-identity.json"):
-                        copied = staged / directory.name / relative
-                        copied.parent.mkdir(parents=True, exist_ok=True)
-                        copied.write_bytes(
-                            _stripped_identity(path.read_bytes())
-                        )
-                        members.append((member, copied))
-                    else:
-                        members.append((member, path))
+                        content = _stripped_identity(content)
+                    copied = staged / directory.name / relative
+                    copied.parent.mkdir(parents=True, exist_ok=True)
+                    copied.write_bytes(content)
+                    members.append((member, copied))
             providers = home / roster.PROVIDERS
             if providers.is_file():
-                members.append((roster.PROVIDERS, providers))
+                copied = staged / roster.PROVIDERS
+                copied.write_bytes(providers.read_bytes())
+                members.append((roster.PROVIDERS, copied))
         manifest = {
             "format": FORMAT,
             "schema": schema,

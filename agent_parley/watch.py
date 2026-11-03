@@ -120,7 +120,8 @@ def _store(home: Path, manifest: dict, name: str) -> list:
     with store.connect(home) as db:
         for row in db.execute(
             "SELECT m.id,m.thread_id,s.name AS sender,"
-            "unixepoch(m.created_ts) AS created FROM message_recipients r "
+            "CAST(strftime('%s',m.created_ts) AS INTEGER) AS created "
+            "FROM message_recipients r "
             "JOIN messages m ON m.id=r.message_id "
             "JOIN agents s ON s.id=m.sender_id "
             "JOIN agents a ON a.id=r.agent_id "
@@ -142,7 +143,8 @@ def _store(home: Path, manifest: dict, name: str) -> list:
                 )
             )
         for row in db.execute(
-            "SELECT e.id,e.tool,e.outcome,unixepoch(e.created_ts) AS created "
+            "SELECT e.id,e.tool,e.outcome,"
+            "CAST(strftime('%s',e.created_ts) AS INTEGER) AS created "
             "FROM events e JOIN agents a ON a.id=e.agent_id "
             "JOIN projects p ON p.id=a.project_id "
             "WHERE p.human_key=? AND a.name=? ORDER BY e.id DESC LIMIT ?",
