@@ -218,6 +218,7 @@ class BridgeCore:
             subprocess,
             write_json,
         )
+        from agent_parley.hook import inherited_environment
 
         with lock(self.home / "server.lock"):
             published = self.home / "server.json"
@@ -270,7 +271,7 @@ class BridgeCore:
                         str(self.home),
                     ],
                     cwd=self.home,
-                    env=os.environ.copy(),
+                    env=inherited_environment(self.home),
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=log,

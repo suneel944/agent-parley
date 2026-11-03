@@ -1028,7 +1028,9 @@ reported.
                     supervision.forget_delivered(lane.parent, agent)
             prompt = self.protocol(agent, data)
             hooks = self.hooks(agent, lane.parent)
-            inherited = dict(os.environ)
+            from agent_parley.hook import inherited_environment
+
+            inherited = inherited_environment(self.home)
             inherited.pop(entry.get("home_env") or "", None)
             env = {
                 **inherited,

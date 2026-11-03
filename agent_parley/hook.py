@@ -57,6 +57,16 @@ RELAUNCH_INTERVAL = 60.0
 HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
 ANSWERED_ENV = "AGENT_PARLEY_SERVICE_ANSWERED"
 PARTICIPANT_ENV = "AGENT_PARLEY_PARTICIPANT"
+LANE_ENV = frozenset(
+    {"AGENT_PARLEY_TOKEN", PARTICIPANT_ENV, HOOK_PID_ENV, ANSWERED_ENV}
+)
+OVERLAY_ENV = frozenset(
+    {
+        "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+        "OPENCODE_CONFIG_DIR",
+        "AMP_SETTINGS_FILE",
+    }
+)
 DECIDING = 202
 
 CLIENT_SCRIPT = r"""#!/usr/bin/env bash
@@ -415,6 +425,39 @@ def framed(received: bytearray) -> int:
     return -1
 
 
+def inherited_environment(home: str | os.PathLike[str]) -> dict[str, str]:
+    """Returns this process's environment without lane-only variables.
+
+    A lane's native client and every hook it runs carry the lane's token,
+    participant name, hook process and service status, and the overlay
+    paths its launch selected. A service start, lane resume or pool fill
+    started from inside a lane must not hand those to its own children: a
+    resumed Gemini lane would otherwise copy its previous overlay, which
+    already defines this bridge's server, as native system policy.
+
+    An overlay variable is dropped only when it names a path inside
+    ``home``, where launches write their overlays, so an operator's own
+    native system policy or configuration directory is still carried.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        A copy of the environment safe to give a detached child.
+    """
+    state = os.path.realpath(home)
+    environment = {}
+    for name, value in os.environ.items():
+        if name in LANE_ENV:
+            continue
+        if name in OVERLAY_ENV and value:
+            path = os.path.realpath(value)
+            if os.path.commonpath([state, path]) == state:
+                continue
+        environment[name] = value
+    return environment
+
+
 def relaunch(home: str) -> None:
     """Asks for a new service when the recorded one is no longer there.
 
@@ -471,6 +514,7 @@ def relaunch(home: str) -> None:
             pass
         subprocess.Popen(
             [sys.executable, "-m", "agent_parley", "--home", home, "up"],
+            env=inherited_environment(home),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

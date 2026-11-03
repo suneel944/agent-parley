@@ -366,11 +366,9 @@ def replenish(home: Path, root: Path, directory: Path) -> None:
         root: Base checkout of the project.
         directory: Private project state directory.
     """
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if name != "AGENT_PARLEY_TOKEN"
-    }
+    from agent_parley.hook import inherited_environment
+
+    environment = inherited_environment(home)
     with (directory / LOG).open("ab") as log:
         subprocess.Popen(
             [

@@ -1,7 +1,6 @@
 """Adapts native Gemini CLI settings and hooks without changing permissions."""
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -48,7 +47,10 @@ def configure(
         name: Validated participant name.
         url: Authenticated loopback MCP endpoint.
         hooks: Common checkpoint hook definitions.
-        source_path: Native system policy selected by the launch environment.
+        source_path: Native system policy the launch environment selects
+            once lane overlays are removed from it; Gemini's default
+            location when unset, whatever this process's environment
+            exports.
         trusted: Whether the operator opted this lane in to pre-approving
             the bridge's own tools, which marks only its server as trusted.
 
@@ -63,10 +65,7 @@ def configure(
         if sys.platform == "darwin"
         else "/etc/gemini-cli/settings.json"
     )
-    source = Path(
-        source_path
-        or os.environ.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH", default)
-    )
+    source = Path(source_path or default)
     settings = json.loads(source.read_text()) if source.exists() else {}
     if not isinstance(settings, dict):
         raise BridgeError("Gemini system settings must be an object.")

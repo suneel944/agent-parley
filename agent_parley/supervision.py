@@ -10818,9 +10818,12 @@ def _resume(
     ]
     if task:
         command += ["--task", task]
+    from agent_parley.hook import inherited_environment
+
     with (directory / f"{name}-wake.log").open("ab") as output:
         child = subprocess.Popen(
             command,
+            env=inherited_environment(home),
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=output,
