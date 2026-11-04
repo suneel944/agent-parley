@@ -5733,8 +5733,8 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     waiting_kind = commands.add_parser(
         "timeout",
         help=(
-            "Show or set how long a reversible decision waits before its "
-            "recommended default is applied."
+            "Show or set the decision timeout policy; every decision kind "
+            "waits for the operator's answer."
         ),
     )
     waiting_kinds = waiting_kind.add_subparsers(dest="action", required=True)
@@ -5745,14 +5745,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     waiting_set = waiting_kinds.add_parser(
-        "set", help="Make a reversible kind always ask, or wait longer."
+        "set", help="Record that a kind always asks, or waits longer."
     )
     waiting_set.add_argument("kind", help="Decision kind the entry governs.")
     waiting_choice = waiting_set.add_mutually_exclusive_group()
     waiting_choice.add_argument(
         "--ask",
         action="store_true",
-        help="Always ask; never apply the default.",
+        help="Always ask for an answer.",
     )
     waiting_choice.add_argument(
         "--after",
@@ -5760,8 +5760,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         default=None,
         metavar="WINDOW",
         help=(
-            "Longer wait than the default, such as 2h. Without --ask or "
-            "--after the kind returns to its default."
+            "Longer wait than 30 minutes, such as 2h; every current kind "
+            "is irreversible and refuses it. Without --ask or --after the "
+            "entry is removed."
         ),
     )
     waiting_set.add_argument(
