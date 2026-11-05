@@ -2,10 +2,52 @@
 
 ## [0.22.0](https://github.com/suneel944/agent-parley/compare/v0.21.0...v0.22.0) (2026-11-05)
 
+0.22.0 fixes the defects found by the audit of 0.21.0. It was planned as 0.21.1; its 18 issues measure a minor release, so it ships as 0.22.0.
 
-### Bug fixes
+### Status and coordination
 
-* deliver the 0.21.1 milestone (#1372) ([#1340](https://github.com/suneel944/agent-parley/issues/1340)) ([#1341](https://github.com/suneel944/agent-parley/issues/1341)) ([#1342](https://github.com/suneel944/agent-parley/issues/1342)) ([#1343](https://github.com/suneel944/agent-parley/issues/1343)) ([#1344](https://github.com/suneel944/agent-parley/issues/1344)) ([#1345](https://github.com/suneel944/agent-parley/issues/1345)) ([#1346](https://github.com/suneel944/agent-parley/issues/1346)) ([#1347](https://github.com/suneel944/agent-parley/issues/1347)) ([#1348](https://github.com/suneel944/agent-parley/issues/1348)) ([#1349](https://github.com/suneel944/agent-parley/issues/1349)) ([#1350](https://github.com/suneel944/agent-parley/issues/1350)) ([#1351](https://github.com/suneel944/agent-parley/issues/1351)) ([#1352](https://github.com/suneel944/agent-parley/issues/1352)) ([#1366](https://github.com/suneel944/agent-parley/issues/1366)) ([#1367](https://github.com/suneel944/agent-parley/issues/1367)) ([#1370](https://github.com/suneel944/agent-parley/issues/1370)) ([#1373](https://github.com/suneel944/agent-parley/issues/1373)) ([#1375](https://github.com/suneel944/agent-parley/issues/1375))
+- Status reports diverging account ledgers again, because lane accounting no longer overwrites the convergence read (#1340).
+- Reservation checks read quoted Git paths, including paths with spaces or non-ASCII names, by their real names (#1341).
+- The lane branch guard follows Git's own resolution for branch-or-path names, deleted expected branches and same-named tags (#1345).
+- A blueprint run matches the issue before it reads a report (#1349).
+
+### Lanes and recovery
+
+- Gemini lanes resume, because lane-only variables stay out of detached children (#1342).
+- Recovery prune keeps bundles a live take needs, and restore checks the receipt before it acts (#1344).
+- Lane stops escalate to SIGKILL after a grace period, and teardown records the stopped lane when the lock is busy (#1348).
+- Lanes no longer carry the older CLI allow rule without `-P` (#1366).
+
+### Reliability
+
+- A failed forge read is unknown, not a closed pull request or an unassigned issue (#1343).
+- Damaged input and stage failures no longer stop the supervision, hook, wait, inbound and server loops (#1347).
+- Store and status paths stay correct under lock contention, old SQLite and a bad manifest (#1351).
+- Single-project exports carry no search index from the source store, and imports rebuild the local index (#1367).
+
+### Approvals and CLI
+
+- Unknown approval decisions fail closed, and denial suggestions no longer widen to whole interpreters (#1346).
+- The CLI refuses empty, zero, negative and infinite values, and reads create no state (#1350).
+- The timeout sweep that could never settle a decision is removed (#1370).
+
+### Documentation
+
+- The command reference covers store repair and metrics throughput (#1352).
+- Timeout help and the command reference no longer say a timeout applies a default (#1373).
+
+### Dependencies
+
+- The development tool group in `uv.lock` is updated, `mypy` moves to 2.4.1, the GitHub Actions group used by the check and release workflows is updated, and `astral-sh/setup-uv` moves to v10.3.3 (#1375).
+
+### Upgrade notes
+
+- No schema migration.
+- Lanes started under 0.19.0 or earlier must restart to drop the old CLI allow rule; until then their CLI shell prompt escalates to the operator instead of being answered.
+- Archives written by this release hold no search index; older archives import as before, and each import runs one index rebuild.
+- Invalid CLI values that were silently accepted now fail with an error.
+
+Closed issues: [milestone 0.22.0](https://github.com/suneel944/agent-parley/issues?q=is%3Aissue%20is%3Aclosed%20milestone%3A0.22.0).
 
 ## [0.21.0](https://github.com/suneel944/agent-parley/compare/v0.20.1...v0.21.0) (2026-10-18)
 
