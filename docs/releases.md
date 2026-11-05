@@ -29,6 +29,16 @@ the references. This check uses read-only CI metadata; repository squash
 settings are only visible with broader repository access. Explicit merge API
 message overrides must also preserve the issue references from the PR body.
 
+A crossing merge is a releasing PR into main that changes the package and
+references more than one issue. PR hygiene also requires its body to group the
+notes under `### ` headings in `## Problem and result`, because a flat body
+publishes one-line notes. When it has a milestone, the milestone title must be
+the version its own references measure: ten or more issues make a minor
+release, a `!` marker a major one, and fewer a patch, skipping retired numbers.
+Units that reached main directly since the approved tag are not added. PR #1372
+crossed 0.21.1 with 18 issues and flat bullets; the release counter cut 0.22.0
+with one-line notes.
+
 PR [#161](https://github.com/suneel944/agent-parley/pull/161) closed seven issues,
 but its squash commit `4edd3fc6ed0f77bf516008b7d2f16f4fef578415` omitted their
 references. Together with the three references retained by PR #139, the release

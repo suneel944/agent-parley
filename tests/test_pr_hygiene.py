@@ -9,6 +9,7 @@ from scripts.check_pr_hygiene import (
     issue_numbers,
     validate,
     validate_commit_references,
+    validate_release_shape,
 )
 
 
@@ -150,6 +151,68 @@ def test_nonreleasing_prs_do_not_require_commit_references(title):
     assert (
         validate_commit_references(pr, commit_messages("No references")) == []
     )
+
+
+SECTIONED = "## Problem and result\n\n### Lanes\n\n- Lanes recover.\n"
+
+
+def crossing(count, *, title="fix: deliver the milestone", body="", **extra):
+    refs = "\n".join(f"Closes #{number}" for number in range(1, count + 1))
+    return {
+        "title": title,
+        "base": {"ref": "main"},
+        "body": (body or "## Problem and result\n") + refs,
+        **extra,
+    }
+
+
+def test_crossing_merge_without_subsections_fails():
+    errors = validate_release_shape(crossing(3), "0.21.0", [], True)
+    assert errors == [
+        "Group the release notes under ### headings in "
+        "## Problem and result; a flat body publishes one-line notes."
+    ]
+
+
+@pytest.mark.parametrize(
+    ("count", "title", "expected", "kind"),
+    [
+        (18, "fix: deliver", "0.22.0", "minor"),
+        (3, "fix: deliver", "0.21.1", "patch"),
+        (2, "feat!: deliver", "1.0.0", "major"),
+    ],
+)
+def test_crossing_milestone_must_be_the_measured_version(
+    count, title, expected, kind
+):
+    pr = crossing(
+        count, title=title, body=SECTIONED, milestone={"title": expected}
+    )
+    assert validate_release_shape(pr, "0.21.0", [], True) == []
+    pr["milestone"] = {"title": "9.9.9"}
+    assert validate_release_shape(pr, "0.21.0", [], True) == [
+        f"Rename milestone 9.9.9 to {expected}: "
+        f"{count} issues measure a {kind} release."
+    ]
+
+
+def test_measured_version_skips_retired_numbers():
+    pr = crossing(2, body=SECTIONED, milestone={"title": "0.21.2"})
+    assert validate_release_shape(pr, "0.21.0", ["0.21.1"], True) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"title": "docs: deliver"},
+        {"base": {"ref": "integration/0.21.1"}},
+        {"body": "## Problem and result\nCloses #1"},
+    ],
+)
+def test_non_crossing_prs_are_not_shaped(change):
+    pr = {**crossing(12, milestone={"title": "0.0.1"}), **change}
+    assert validate_release_shape(pr, "0.21.0", [], True) == []
+    assert validate_release_shape(crossing(12), "0.21.0", [], False) == []
 
 
 @pytest.mark.parametrize("paginate", [False, True])
