@@ -181,7 +181,9 @@ def review(directory: Path, manifest: dict, name: str, head: str) -> dict:
 
     A ready report names the commit it describes. When the branch has moved
     past that commit, the work awaits a new report whatever decision stands,
-    so no approval covers commits that no report described.
+    so no approval covers commits that no report described. A recorded
+    decision other than approved or rejected awaits a new one, so an
+    unknown value refuses rather than permits.
 
     Args:
         directory: Private state directory for the common repository.
@@ -232,8 +234,11 @@ def review(directory: Path, manifest: dict, name: str, head: str) -> dict:
     if recorded != current:
         drift = _drift(recorded, current)
         return {**reviewed, "state": AWAITING, "detail": drift}
-    state = REJECTED if decision.get("decision") == REJECTED else APPROVED
-    return {**reviewed, "state": state}
+    choice = decision.get("decision")
+    if choice in (APPROVED, REJECTED):
+        return {**reviewed, "state": choice}
+    unknown = f"the recorded decision {choice!r} is not known"
+    return {**reviewed, "state": AWAITING, "detail": unknown}
 
 
 def refusal(name: str, step: str, reviewed: dict) -> str:

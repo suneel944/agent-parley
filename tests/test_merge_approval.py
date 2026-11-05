@@ -246,6 +246,36 @@ def test_a_rejection_refuses_integration_and_tells_the_lane_why(
     assert "Needs a test" in chain[0]["detail"]
 
 
+@pytest.mark.parametrize("value", ["approve", "APPROVED", None, 1])
+def test_an_unknown_decision_refuses_rather_than_permits(
+    bridge, repo, paired, awaiting, value
+):
+    directory = awaiting["directory"]
+    data = roster.read(directory)
+    head = branch_head(
+        Path(data["root"]), data["participants"]["codex"]["branch"]
+    )
+    report = reported(directory, "codex")
+    metrics.record_report(
+        directory,
+        "codex",
+        {
+            "kind": "approval",
+            "decision": value,
+            "operator": "someone",
+            "reason": "",
+            "binding": approvals.binding(data, "codex", head, report),
+        },
+    )
+
+    reviewed = approvals.review(directory, data, "codex", head)
+    assert reviewed["state"] == approvals.AWAITING
+    with pytest.raises(BridgeError, match="is not known"):
+        bridge.merge(repo, "codex")
+    with pytest.raises(BridgeError, match="is not known"):
+        bridge.pull_request(repo, "codex")
+
+
 def test_an_unreadable_decision_log_refuses_rather_than_permits(
     bridge, repo, paired, awaiting
 ):

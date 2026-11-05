@@ -148,9 +148,8 @@ def _exportable_tables(db: sqlite3.Connection) -> list[str]:
     The list is read from `sqlite_master` rather than a fixed tuple so a
     table added later is scoped automatically instead of copied whole. A
     virtual table and the shadow tables SQLite keeps for it are left out:
-    the triggers on its content table already remove its rows when that
-    table's rows are deleted, and it carries no ownership column of its
-    own.
+    `_snapshot` drops them before scoping, since they carry no ownership
+    column of their own.
 
     Args:
         db: Open connection on the staged copy of the store.
@@ -175,8 +174,36 @@ def _exportable_tables(db: sqlite3.Connection) -> list[str]:
     ]
 
 
+def _drop_derived(db: sqlite3.Connection) -> None:
+    """Drops every trigger and virtual table from a staged store copy.
+
+    Args:
+        db: Open connection on the staged copy of the store.
+    """
+    rows = db.execute(
+        "SELECT type, name FROM sqlite_master WHERE type='trigger' "
+        "OR (type='table' AND upper(sql) LIKE 'CREATE VIRTUAL TABLE%')"
+    ).fetchall()
+    for kind, name in rows:
+        db.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
+
+
 def _snapshot(home: Path, destination: Path, roots: set[str]) -> None:
-    """Copies the store through the backup interface, scoped to roots."""
+    """Copies the store through the backup interface, scoped to roots.
+
+    Every trigger and virtual table is dropped from the copy before rows are
+    scoped. The full-text index holds the whole body of a message that
+    spilled to an attachment while its content row keeps only the opening
+    slice, so deleting another project's row cannot remove every word it
+    indexed. An import never reads the archived index: the target store's
+    own triggers index each row it inserts, and the merge rebuilds the
+    index afterwards.
+
+    Args:
+        home: Private bridge state root.
+        destination: Path the scoped copy of the store is written to.
+        roots: Canonical roots of the projects the copy keeps.
+    """
     with contextlib.closing(
         sqlite3.connect(home / store.DATABASE, timeout=store.BUSY_TIMEOUT)
     ) as source:
@@ -184,6 +211,7 @@ def _snapshot(home: Path, destination: Path, roots: set[str]) -> None:
             source.backup(copy)
     with contextlib.closing(sqlite3.connect(destination)) as copy:
         copy.execute("PRAGMA journal_mode=DELETE")
+        _drop_derived(copy)
         kept = [
             int(row[0])
             for row in copy.execute("SELECT id,human_key FROM projects")
@@ -272,18 +300,18 @@ def export(home: Path, output: Path, project: Path | None = None) -> dict:
                 for path in _project_files(directory):
                     relative = path.relative_to(directory).as_posix()
                     member = f"{PROJECTS}/{directory.name}/{relative}"
+                    content = path.read_bytes()
                     if path.name.endswith("-identity.json"):
-                        copied = staged / directory.name / relative
-                        copied.parent.mkdir(parents=True, exist_ok=True)
-                        copied.write_bytes(
-                            _stripped_identity(path.read_bytes())
-                        )
-                        members.append((member, copied))
-                    else:
-                        members.append((member, path))
+                        content = _stripped_identity(content)
+                    copied = staged / directory.name / relative
+                    copied.parent.mkdir(parents=True, exist_ok=True)
+                    copied.write_bytes(content)
+                    members.append((member, copied))
             providers = home / roster.PROVIDERS
             if providers.is_file():
-                members.append((roster.PROVIDERS, providers))
+                copied = staged / roster.PROVIDERS
+                copied.write_bytes(providers.read_bytes())
+                members.append((roster.PROVIDERS, copied))
         manifest = {
             "format": FORMAT,
             "schema": schema,
@@ -676,6 +704,10 @@ def _rebind(staged: Path, selected: list[dict]) -> None:
 def _merge_store(home: Path, staged: Path, folders: dict[str, Path]) -> None:
     """Copies the selected projects' store rows into the local store.
 
+    The search index is rebuilt once the rows are in: renumbering an
+    attachment rewrites its message body, and the index has no trigger for
+    an update, so it would otherwise keep the old marker.
+
     Args:
         home: Private bridge state root.
         staged: Directory the archive was extracted into.
@@ -718,6 +750,7 @@ def _merge_store(home: Path, staged: Path, folders: dict[str, Path]) -> None:
                     if "id" in columns:
                         maps[table][row["id"]] = int(cursor.lastrowid or 0)
             _rekey(source, target, maps["messages"], folders)
+            store.rebuild_search(target, home)
 
 
 def _rekey(

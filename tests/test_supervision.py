@@ -234,6 +234,31 @@ def test_presence_reports_no_age_before_the_first_checkpoint(tmp_path):
     assert started["age_seconds"] is None
 
 
+def test_a_failing_presence_reading_is_one_stage_failure(
+    bridge, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    read = supervision.presence
+
+    def presence(directory, name, inactive_after=300):
+        if name == "codex":
+            raise TypeError("damaged reading")
+        return read(directory, name, inactive_after)
+
+    def recorded(home, manifest, observations):
+        raise TypeError("damaged record")
+
+    monkeypatch.setattr(supervision, "presence", presence)
+    monkeypatch.setattr(supervision, "recorded_observations", recorded)
+    supervision.poll(bridge.home, directory)
+    polled = json.loads((directory / supervision.POLL_RECORD).read_text())
+    assert polled["failed"] >= 2
+    assert "presence codex" in polled["stages"]
+    assert "recorded presence" in polled["stages"]
+    assert "presence" in polled["stages"]
+
+
 def test_send_reports_unreachable_and_status_lists_ack_age(
     bridge, paired, capsys
 ):
@@ -2101,6 +2126,39 @@ def test_an_exhaustion_without_a_reset_is_probed_on_a_backoff():
     assert supervision.exhaustion_probe_due(later, 60) == 740
     capped = {"observed_at": 100.0, "probes": 30}
     assert supervision.exhaustion_probe_due(capped, 60) == 3700
+
+
+@pytest.mark.parametrize("damaged", ["{trunc", "[]", "1"])
+def test_a_damaged_activity_file_never_raises_from_wake(
+    bridge, paired, damaged
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    (directory / "codex-activity.json").write_text(damaged)
+    config = {**supervision.DEFAULTS, "inactive_after": 300}
+    observed = supervision.presence(directory, "codex", 300)
+    supervision.wake(bridge.home, directory, paired, "codex", observed, config)
+
+
+def test_a_refresh_thread_that_cannot_start_releases_its_key(monkeypatch):
+    key = ("/repo", "lane/codex")
+    expired = time.monotonic() - supervision.COMPLETION_TTL - 1
+    reading = ("OPEN", 1.0)
+
+    class Unstartable(threading.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setitem(supervision._COMPLETIONS, key, (expired, reading))
+    monkeypatch.setattr(threading, "Thread", Unstartable)
+    assert supervision.branch_completion(Path(key[0]), key[1]) == reading
+    assert key not in supervision._REFRESHING
+
+
+def test_a_long_backoff_with_a_fractional_window_stays_capped():
+    endless = {"observed_at": 100.0, "probes": 5000}
+    assert supervision.exhaustion_probe_due(endless, 0.5) == 3700
+    assert supervision._wake_due(100.0, 5000, 0.0, 0.5) == 3700
 
 
 def test_an_old_exhaustion_without_a_reset_is_woken_and_cleared(

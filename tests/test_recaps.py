@@ -249,6 +249,19 @@ def test_changed_files_cover_commits_edits_and_new_files(paired):
     assert recaps.changed_files(lane, "0" * 40) == ["new.txt", "shared.txt"]
 
 
+def test_changed_files_keep_spaces_and_non_ascii_names(paired):
+    lane = Path(paired["lanes"]["codex"])
+    base = git(lane, "rev-parse", "HEAD")
+    (lane / "my file.txt").write_text("one\n")
+    git(lane, "add", "my file.txt")
+    git(lane, "commit", "-qm", "add")
+    (lane / "naïve name.txt").write_text("new\n")
+    assert recaps.changed_files(lane, base) == [
+        "my file.txt",
+        "naïve name.txt",
+    ]
+
+
 def test_a_recap_is_kept_until_the_lane_moves_again(
     bridge, repo, paired, monkeypatch
 ):

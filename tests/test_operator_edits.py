@@ -159,6 +159,40 @@ def test_a_git_failure_reports_nothing_without_raising(
     assert view["projects"][0]["rows"][0]["operator_edits"] == []
 
 
+def test_paths_git_would_quote_are_read_by_their_real_names(
+    bridge, repo, paired
+):
+    def run(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+
+    (repo / "my file.txt").write_text("one\n")
+    (repo / "naïve.txt").write_text("one\n")
+    (repo / "old name.txt").write_text("one\n")
+    run("add", "old name.txt")
+    run("commit", "-qm", "add")
+    start = supervision._read(paired["root"], "rev-parse", "HEAD")
+    run("mv", "old name.txt", "new näme.txt")
+    assert sorted(supervision.dirty_paths(paired["root"])) == [
+        "my file.txt",
+        "naïve.txt",
+        "new näme.txt",
+    ]
+    run("add", "-A")
+    run("commit", "-qm", "rename")
+    end = supervision._read(paired["root"], "rev-parse", "HEAD")
+    assert sorted(supervision._changed(paired["root"], start, end)) == [
+        "my file.txt",
+        "naïve.txt",
+        "new näme.txt",
+        "old name.txt",
+    ]
+    reserve(bridge, paired["root"], "claude", "naïve.txt")
+    (repo / "naïve.txt").write_text("operator change\n")
+    assert supervision.operator_edits(bridge.home, paired) == {
+        "claude": ["naïve.txt"]
+    }
+
+
 def test_the_hook_reads_the_poll_reading_instead_of_asking_git(
     bridge, repo, paired, monkeypatch
 ):

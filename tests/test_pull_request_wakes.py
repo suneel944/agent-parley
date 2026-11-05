@@ -347,6 +347,16 @@ def test_the_forge_reading_reduces_checks_to_one_verdict(monkeypatch, tmp_path):
     assert one["files"] == ["a.py", "b.py"] and four["files"] == []
 
 
+def test_a_stale_check_run_stays_pending():
+    rollup = [
+        {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"name": "lint", "status": "COMPLETED", "conclusion": "STALE"},
+    ]
+    assert forge._checks(rollup) == ("pending", [])
+    assert [entry["name"] for entry in forge._pending(rollup)] == ["lint"]
+    assert forge._pending(rollup)[0]["state"] == "stale"
+
+
 def test_the_forge_reading_reports_absence_instead_of_raising(
     monkeypatch, tmp_path
 ):

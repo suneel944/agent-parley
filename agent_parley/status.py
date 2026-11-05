@@ -1351,7 +1351,13 @@ class StatusMixin(BridgeCore):
         """
         import sqlite3
 
-        from agent_parley.cli import json, snapshot, store, supervision
+        from agent_parley.cli import (
+            convergence,
+            json,
+            snapshot,
+            store,
+            supervision,
+        )
 
         try:
             cached = json.loads(
@@ -1372,6 +1378,7 @@ class StatusMixin(BridgeCore):
             failure = exc
         return {
             "ledger": snapshot(directory),
+            "convergence": convergence.read(directory),
             "configuration": supervision.configuration(self.home, data),
             "usage": usage,
             "diffstats": lane_diffstats(data),
@@ -1469,7 +1476,6 @@ class StatusMixin(BridgeCore):
             else self._project_context(directory, data)
         )
         ledger = frame["ledger"]
-        accounts = convergence.read(directory)
         configuration = frame["configuration"]
         participant = data["participants"][agent]
         name = participant["display"]
@@ -1661,7 +1667,7 @@ class StatusMixin(BridgeCore):
                     ),
                     **issues.unresolved_completion(record),
                     "convergence": convergence.current(
-                        accounts, number, record.get("claim_id")
+                        frame["convergence"], number, record.get("claim_id")
                     ),
                     **(
                         {"blueprint": blueprints.line(number, runs[number])}
@@ -1820,14 +1826,14 @@ class StatusMixin(BridgeCore):
             per registered project holding its issue ledger and its lanes. A
             service that reports itself stale is not ready, and the state
             names why. A project the supervisor retired because its root is
-            gone is left out; one whose root is missing or whose lanes all
+            gone, or whose manifest cannot be read, is left out, as the
+            dashboard does; one whose root is missing or whose lanes all
             stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
         from agent_parley import decisions, pool
         from agent_parley.cli import (
             inbound_status,
             issues,
-            json,
             metrics,
             notify,
             plan,
@@ -1848,7 +1854,10 @@ class StatusMixin(BridgeCore):
         healthy = usable and bool(self.server_process()) and state == "ready"
         projects = []
         for path in sorted((self.home / "projects").glob("*/project.json")):
-            data = roster.normalize(json.loads(path.read_text()))
+            try:
+                data = roster.read(path.parent)
+            except (BridgeError, OSError, ValueError):
+                continue
             if supervision.root_retired(path.parent):
                 continue
             edits, advances = supervision.readings(self.home, data)

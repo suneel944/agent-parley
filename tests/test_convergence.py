@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import convergence, issues, store, supervision
+from agent_parley import (
+    convergence,
+    issues,
+    problems,
+    store,
+    supervision,
+)
 from agent_parley.state import BridgeError, write_json
 
 FAILURE = "FAILED tests/test_parser.py::test_split - AssertionError: 1 != 2"
@@ -366,6 +372,26 @@ def test_repeated_failure_escalates_once_while_the_lane_keeps_moving(
     assert shown["failures"] == 9 and shown["repeats"] == 9
     stored = (directory / convergence.PUBLICATION).read_text()
     assert "AssertionError" not in stored and "test_split" not in stored
+
+
+def test_status_and_problems_show_an_escalated_account(bridge, paired, claimed):
+    lane, directory = claimed["lane"], claimed["directory"]
+    for index in range(6):
+        failing(bridge, lane, f"change{index}")
+        if index % 3 == 2:
+            run_pass(bridge, directory)
+    assert run_pass(bridge, directory)["stage"] == convergence.ESCALATED
+    [lane_status] = [
+        participant
+        for participant in bridge.status_snapshot()["projects"][0][
+            "participants"
+        ]
+        if participant["participant"] == "claude"
+    ]
+    [claim] = lane_status["claims"]
+    assert claim["convergence"]["stage"] == convergence.ESCALATED
+    conditions = [row["condition"] for row in bridge.problems()]
+    assert problems.DIVERGING in conditions
 
 
 def test_useful_progress_records_a_milestone_and_sends_nothing(

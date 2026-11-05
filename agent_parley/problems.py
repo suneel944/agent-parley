@@ -2352,13 +2352,17 @@ def derive(
                 "agent-parley up",
             )
         )
-    manifests = {
-        data["root"]: (path.parent, data)
-        for path in (home / "projects").glob("*/project.json")
-        for data in [roster.normalize(json.loads(path.read_text()))]
-    }
+    manifests = {}
+    for path in (home / "projects").glob("*/project.json"):
+        try:
+            data = roster.read(path.parent)
+        except (BridgeError, OSError, ValueError):
+            continue
+        manifests[data["root"]] = (path.parent, data)
     aged: list[dict] = []
     for project in report["projects"]:
+        if project["root"] not in manifests:
+            continue
         directory, data = manifests[project["root"]]
         if failing := issues.supervision_error(directory):
             rows.append(

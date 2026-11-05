@@ -722,6 +722,63 @@ def test_a_file_restore_or_plain_text_passes_the_branch_gate(paired, command):
     assert not changes_lane_branch(branch_payload(lane, command), lane)
 
 
+@pytest.mark.parametrize(
+    "command", ["git checkout notes", "git checkout notes --"]
+)
+def test_a_name_that_is_both_a_branch_and_a_path_switches(paired, command):
+    lane = Path(paired["lanes"]["codex"])
+    git(lane, "branch", "notes")
+    (lane / "notes").mkdir()
+    (lane / "notes" / "draft.txt").write_text("x\n")
+    assert changes_lane_branch(branch_payload(lane, command), lane)
+    git(lane, *shlex.split(command)[1:])
+    assert git(lane, "branch", "--show-current") == "notes"
+
+
+def test_a_detached_lane_can_recreate_its_deleted_branch(paired):
+    lane = Path(paired["lanes"]["codex"])
+    expected = paired["branches"]["codex"]
+    head = git(lane, "rev-parse", "HEAD")
+    git(lane, "switch", "--detach")
+    git(lane, "branch", "-D", expected)
+    payload = branch_payload(lane, "git status")
+    denied, reason = branch_guard("PreToolUse", payload, lane, expected)
+    assert reason == "branch_drift"
+    assert f"git switch -c {expected}" in str(denied)
+    for command in (
+        "git switch -c elsewhere",
+        f"git switch -C {expected}",
+    ):
+        payload["tool_input"]["command"] = command
+        assert branch_guard("PreToolUse", payload, lane, expected)[1] == (
+            "branch_drift"
+        )
+    for command in (
+        f"git switch -c {expected}",
+        f"git switch --create {expected}",
+        f"git checkout -b {expected}",
+    ):
+        payload["tool_input"]["command"] = command
+        assert branch_guard("PreToolUse", payload, lane, expected) == (
+            None,
+            "branch_restore",
+        )
+    git(lane, "switch", "-c", expected)
+    assert git(lane, "branch", "--show-current") == expected
+    assert git(lane, "rev-parse", "HEAD") == head
+
+
+def test_branch_head_ignores_a_tag_of_the_same_name(paired):
+    lane = Path(paired["lanes"]["codex"])
+    expected = paired["branches"]["codex"]
+    git(lane, "tag", expected)
+    (lane / "later.txt").write_text("later\n")
+    commit(lane, "Later work")
+    head = git(lane, "rev-parse", f"refs/heads/{expected}")
+    assert git(lane, "rev-parse", f"refs/tags/{expected}") != head
+    assert checkpoints.branch_head(lane, expected) == head
+
+
 def test_a_leading_cd_moves_the_branch_gate_out_of_the_lane(paired, tmp_path):
     lane = Path(paired["lanes"]["codex"])
     elsewhere = f"cd {tmp_path} && git switch x"

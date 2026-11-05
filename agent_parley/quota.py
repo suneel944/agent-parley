@@ -29,6 +29,7 @@ that is one reason the derived figures are always marked estimated.
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -91,10 +92,12 @@ def set_window(
         BridgeError: If the profile is undefined or a value is unusable.
     """
     roster.credential(home, credential)
-    if tokens != 0 and (tokens < 0 or not hours > 0 or not 0 < threshold <= 1):
+    if tokens != 0 and (
+        tokens < 0 or not 0 < hours < math.inf or not 0 < threshold <= 1
+    ):
         raise BridgeError(
-            "A quota window needs positive --hours and --tokens and a "
-            "--threshold above 0 and at most 1."
+            "A quota window needs finite positive --hours, positive --tokens "
+            "and a --threshold above 0 and at most 1."
         )
     with lock(home / "quotas.lock", timeout=LOCK_SECONDS):
         recorded = windows(home)

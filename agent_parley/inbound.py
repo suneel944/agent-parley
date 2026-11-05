@@ -742,19 +742,14 @@ def settle(home: Path, directory: Path, record: Mapping[str, object]) -> None:
         directory: Private project state directory holding the decision.
         record: The answered decision.
     """
-    from agent_parley import roster, store, timeouts
+    from agent_parley import roster, store
 
     manifest = roster.read(directory)
     participant = manifest.get("participants", {}).get(record.get("lane"))
     if not isinstance(participant, dict):
         return
-    answerer = (
-        "The service's decision timeout"
-        if record.get("answered_by") == timeouts.ANSWERED_BY
-        else "The operator"
-    )
     body = (
-        f"{answerer} answered decision {record['id']} "
+        f"The operator answered decision {record['id']} "
         f"({record.get('question', '')}): {record['answer']}, "
         f"by {record.get('answered_by', '')}. Take the step this answer "
         "asks for with the matching agent-parley command; nothing was done "
@@ -972,7 +967,10 @@ def tap(home: Path, config: dict, query: Mapping[str, object]) -> str:
     which option was chosen, by whom and when, keeping the other decisions'
     buttons, and an irreversible option first asks for a confirming tap. A
     tap refused because its decision was replaced, settled or is unknown
-    loses its button row, so the stale button leaves the chat.
+    loses its button row, so the stale button leaves the chat. A tap whose
+    decision fails for any other reason is refused the same way, and a
+    failed edit or acknowledgement is dropped, so a damaged record never
+    ends the reader thread.
 
     Args:
         home: Private bridge state root.
@@ -1015,9 +1013,9 @@ def tap(home: Path, config: dict, query: Mapping[str, object]) -> str:
             confirmed=confirmed,
             nonce=nonce,
         )
-    except BridgeError as refused:
-        verdict, notice = REFUSED, str(refused)
-    with contextlib.suppress(OSError, ValueError, BridgeError):
+    except Exception as refused:
+        verdict, notice = REFUSED, str(refused) or type(refused).__name__
+    with contextlib.suppress(Exception):
         if verdict == REFUSED and not current:
             notify.call(
                 config,
@@ -1047,7 +1045,7 @@ def tap(home: Path, config: dict, query: Mapping[str, object]) -> str:
                     ),
                 },
             )
-    with contextlib.suppress(OSError, ValueError, BridgeError):
+    with contextlib.suppress(Exception):
         notify.call(
             config,
             "answerCallbackQuery",
@@ -1126,7 +1124,9 @@ def run(home: Path, stopped: threading.Event) -> None:
     remedy for one dropped connection. The service log names each failure
     through `failure` when its text differs from the last one logged, so an
     outage writes one line rather than one per retry, and the first poll
-    that succeeds after it logs `RECOVERED`.
+    that succeeds after it logs `RECOVERED`. An update without an integer
+    identifier is skipped, and any failure serving one update is dropped
+    with that update, so one malformed update never ends the reader.
 
     Args:
         home: Private state directory the readings are taken from.
@@ -1161,8 +1161,11 @@ def run(home: Path, stopped: threading.Event) -> None:
             server.log(home, "inbound", RECOVERED)
             failing = ""
         for update in batch:
-            offset = max(offset, int(update.get("update_id", 0)) + 1)
+            identifier = update.get("update_id")
+            if type(identifier) is not int:
+                continue
+            offset = max(offset, identifier + 1)
             if stopped.is_set():
                 return
-            with contextlib.suppress(OSError, ValueError, BridgeError):
+            with contextlib.suppress(Exception):
                 serve(home, config, gate, update)

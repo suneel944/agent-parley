@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, decisions, inbound, notify, store, timeouts
+from agent_parley import cli, decisions, inbound, notify, store
 from agent_parley.state import BridgeError
 
 PASSCODE = "correct-horse-battery"
@@ -427,23 +427,6 @@ def test_a_tap_answers_the_decision_and_hands_it_to_the_lane(
     assert "decline" in mail[0]["subject"]
 
 
-def test_a_timeout_answer_is_not_attributed_to_the_operator(
-    bridge, paired, mail
-):
-    record = waiting(paired)
-    directory = Path(paired["lanes"]["codex"]).parent
-    answered = decisions.answer(
-        directory, record["id"], "accept", timeouts.ANSWERED_BY
-    )
-
-    inbound.settle(bridge.home, directory, answered)
-
-    assert "operator" not in mail[0]["body"]
-    assert mail[0]["body"].startswith(
-        f"The service's decision timeout answered decision {record['id']}"
-    )
-
-
 def test_a_second_tap_is_refused_with_who_answered_first(
     bridge, paired, gate, calls, mail
 ):
@@ -455,6 +438,51 @@ def test_a_second_tap_is_refused_with_who_answered_first(
     assert calls[-1][0] == "answerCallbackQuery"
     assert "already answered accept" in calls[-1][1]["text"]
     assert len(mail) == 1
+
+
+def test_a_tap_on_a_damaged_decision_is_refused_not_raised(
+    bridge, paired, gate, calls, mail, monkeypatch
+):
+    record = waiting(paired)
+
+    def damaged(home, name):
+        raise KeyError("options")
+
+    monkeypatch.setattr(decisions, "find", damaged)
+    verdict = inbound.serve(bridge.home, CONFIG, gate, tapping(record, 0))
+    assert verdict == inbound.REFUSED
+    assert calls[-1][0] == "answerCallbackQuery"
+
+
+def test_a_malformed_update_never_ends_the_reader(bridge, monkeypatch):
+    for variable, value in (
+        ("AGENT_PARLEY_INBOUND", "telegram"),
+        ("AGENT_PARLEY_INBOUND_PASSCODE", PASSCODE),
+        ("AGENT_PARLEY_NOTIFY", "telegram"),
+        ("AGENT_PARLEY_TELEGRAM_TOKEN", "123456:token"),
+        ("AGENT_PARLEY_TELEGRAM_CHAT", "42"),
+    ):
+        monkeypatch.setenv(variable, value)
+    stopped = threading.Event()
+    batches = [[{"update_id": "seven"}, {"update_id": 3}], []]
+    offsets = []
+    served = []
+
+    def updates(config, offset):
+        offsets.append(offset)
+        if len(batches) == 1:
+            stopped.set()
+        return batches.pop(0)
+
+    def serve(home, config, gate, update):
+        served.append(update)
+        raise TypeError("damaged update")
+
+    monkeypatch.setattr(inbound, "updates", updates)
+    monkeypatch.setattr(inbound, "serve", serve)
+    inbound.run(bridge.home, stopped)
+    assert served == [{"update_id": 3}]
+    assert offsets == [0, 4]
 
 
 def test_a_tap_from_another_chat_or_an_unknown_decision_is_dropped(

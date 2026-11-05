@@ -4095,7 +4095,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     watch.add_argument(
         "--interval",
-        type=float,
+        type=duration,
         default=1.0,
         help="Seconds between redraws of the live view.",
     )
@@ -4218,7 +4218,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     measured.add_argument(
         "--every",
-        type=float,
+        type=duration,
         default=0.0,
         metavar="SECONDS",
         help="Rewrite the file on this interval until interrupted.",
@@ -4299,7 +4299,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     follow.add_argument(
         "--interval",
-        type=float,
+        type=duration,
         default=stream.INTERVAL,
         help="Seconds between reads of the store and the event log.",
     )
@@ -5733,8 +5733,8 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     waiting_kind = commands.add_parser(
         "timeout",
         help=(
-            "Show or set how long a reversible decision waits before its "
-            "recommended default is applied."
+            "Show or set the decision timeout policy; every decision kind "
+            "waits for the operator's answer."
         ),
     )
     waiting_kinds = waiting_kind.add_subparsers(dest="action", required=True)
@@ -5745,14 +5745,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     waiting_set = waiting_kinds.add_parser(
-        "set", help="Make a reversible kind always ask, or wait longer."
+        "set", help="Record that a kind always asks, or waits longer."
     )
     waiting_set.add_argument("kind", help="Decision kind the entry governs.")
     waiting_choice = waiting_set.add_mutually_exclusive_group()
     waiting_choice.add_argument(
         "--ask",
         action="store_true",
-        help="Always ask; never apply the default.",
+        help="Always ask for an answer.",
     )
     waiting_choice.add_argument(
         "--after",
@@ -5760,8 +5760,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         default=None,
         metavar="WINDOW",
         help=(
-            "Longer wait than the default, such as 2h. Without --ask or "
-            "--after the kind returns to its default."
+            "Longer wait than 30 minutes, such as 2h; every current kind "
+            "is irreversible and refuses it. Without --ask or --after the "
+            "entry is removed."
         ),
     )
     waiting_set.add_argument(
@@ -6366,7 +6367,7 @@ def root_parser(
         "--home",
         type=Path,
         default=Path(
-            os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
+            os.environ.get("AGENT_PARLEY_HOME") or "~/.local/state/agent-parley"
         ),
         help="Private state directory (or AGENT_PARLEY_HOME).",
     )
@@ -6390,7 +6391,7 @@ def _plain_status() -> int:
     directory belongs to, or every live project outside any project.
     """
     home = Path(
-        os.environ.get("AGENT_PARLEY_HOME", "~/.local/state/agent-parley")
+        os.environ.get("AGENT_PARLEY_HOME") or "~/.local/state/agent-parley"
     )
     try:
         bridge = Bridge(home)
@@ -6553,6 +6554,7 @@ def main() -> int:
         elif args.command == "top":
             from agent_parley import dashboard
 
+            usage = typed_parser(parser, args)
             names = tuple(
                 name.strip().upper()
                 for name in (args.columns or "").replace(",", " ").split()
@@ -6563,21 +6565,19 @@ def main() -> int:
                 if name != "ALL" and name not in dict(dashboard.COLUMNS)
             ]
             if unknown:
-                parser.error(
+                usage.error(
                     f"Unknown column {', '.join(unknown)}. Choose from: "
                     f"{', '.join(name for name, _ in dashboard.COLUMNS)}."
                 )
             if args.sort and args.sort.upper() not in dashboard.SORT_KEYS:
-                parser.error(
+                usage.error(
                     f"Unknown sort column {args.sort}. Choose from: "
                     f"{', '.join(dashboard.SORT_KEYS)}."
                 )
             if args.serve is not None and (args.json or args.once):
-                parser.error(
-                    "--serve cannot be combined with --json or --once."
-                )
+                usage.error("--serve cannot be combined with --json or --once.")
             if args.serve is not None and not 0 <= args.serve <= 65535:
-                parser.error("--serve takes a port from 0 to 65535.")
+                usage.error("--serve takes a port from 0 to 65535.")
 
             def top_view() -> dict:
                 """Reads one frame narrowed and ordered by the top filters."""
@@ -7301,7 +7301,7 @@ def main() -> int:
                 unmeasured_lanes(bridge, repository, args, [args.name])
                 return 0
             if getattr(args, "json", False):
-                _, directory = bridge.project(repository)
+                _, directory = bridge.project(repository, create=False)
                 data = roster.read(directory)
                 print(
                     views.render(
@@ -7313,7 +7313,7 @@ def main() -> int:
                     )
                 )
             elif not preview:
-                _, directory = bridge.project(repository)
+                _, directory = bridge.project(repository, create=False)
                 print(roster.describe(roster.read(directory)))
         elif args.command == "branch":
             repository = args.repo.resolve()
@@ -7638,7 +7638,8 @@ def main() -> int:
             if inspected is None:
                 raise BridgeError(
                     f"Unknown provider {args.name!r}; run "
-                    "agent-parley provider list."
+                    "agent-parley provider list.",
+                    next_command="agent-parley provider list",
                 )
             print(
                 views.render(

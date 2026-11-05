@@ -794,6 +794,9 @@ def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
 
 
 CHECKPOINT_NAME = re.compile(r"issue-([1-9][0-9]{0,17})-([0-9a-f]{16})")
+RECEIPT_NAME = re.compile(
+    r"(issue-[1-9][0-9]{0,17}-[0-9a-f]{16})-to-[0-9a-f]{16}-[0-9a-f]{16}"
+)
 PRESERVED_NAME = re.compile(r"worktree-[0-9a-f]{24}")
 PRESERVED_RETENTION = 30 * 24 * 3600
 TEMPORARY_MAX_AGE = 3600
@@ -806,7 +809,9 @@ def prune(directory: Path, ledger: dict) -> list[str]:
     ever owned; nothing previously removed one. A checkpoint is safe to
     remove once its exact ownership generation is no longer the issue's
     current one: the claim was released, taken again under a new claim
-    identifier, or its issue closed on the forge. A capture also leaves a
+    identifier, or its issue closed on the forge. A checkpoint a live owner
+    took over stays, because `restore` reads it until the take completes; a
+    restore receipt goes once its checkpoint is gone. A capture also leaves a
     same-sized temporary bundle behind when the process is killed between
     `tempfile.mkstemp` and the rename that publishes it; one old enough that
     no capture still in progress could have written it is removed too. A
@@ -822,6 +827,11 @@ def prune(directory: Path, ledger: dict) -> list[str]:
     """
     folder = _folder(directory)
     issue_records = ledger.get("issues", {})
+    taken = {
+        (current_take(record).get("checkpoint") or {}).get("id")
+        for record in issue_records.values()
+        if record.get("owner") and not record.get("ended_on_forge")
+    }
     removed = []
     for record_path in sorted(folder.glob("issue-*.json")):
         match = CHECKPOINT_NAME.fullmatch(record_path.stem)
@@ -834,7 +844,7 @@ def prune(directory: Path, ledger: dict) -> list[str]:
             and current.get("claim_id") == claim_id
             and not current.get("ended_on_forge")
         )
-        if live:
+        if live or record_path.stem in taken:
             continue
         try:
             saved = json.loads(record_path.read_text())
@@ -847,6 +857,10 @@ def prune(directory: Path, ledger: dict) -> list[str]:
         (folder / f"{record_path.stem}-approval.json").unlink(missing_ok=True)
         (folder / f"{record_path.stem}-quiesce.json").unlink(missing_ok=True)
         removed.append(record_path.stem)
+    for receipt in sorted(folder.glob("issue-*-to-*.json")):
+        match = RECEIPT_NAME.fullmatch(receipt.stem)
+        if match and not (folder / f"{match.group(1)}.json").exists():
+            receipt.unlink(missing_ok=True)
     expired = time.time() - PRESERVED_RETENTION
     for saved in preserved(directory):
         if float(saved.get("captured_at") or 0) < expired:
@@ -1730,6 +1744,8 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
     """Restores one taken checkpoint into a clean recipient worktree.
 
     A take that belongs to an earlier ownership generation restores nothing.
+    A take whose receipt is already complete returns without reading the
+    bundle, so a re-claim after the bundle was removed still succeeds.
 
     Args:
         directory: Private project state directory.
@@ -1751,7 +1767,6 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
     recipient_claim = str(record.get("claim_id") or "")
     if not recipient or not re.fullmatch(r"[0-9a-f]{16}", recipient_claim):
         raise BridgeError("Recovery recipient generation is invalid.")
-    _artifact(directory, saved)
     resolved_lane = str(lane.resolve())
     if str(Path(_text(lane, "rev-parse", "--show-toplevel")).resolve()) != (
         resolved_lane
@@ -1796,6 +1811,7 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
         write_json(receipt, restored)
     if restored.get("phase") == "complete":
         return {**record, "recovery": restored}
+    _artifact(directory, saved)
     head_tree = _tree(lane, str(saved["head"]))
     index_tree = _tree(lane, str(saved["index_commit"]))
     worktree_tree = _tree(lane, str(saved["worktree_commit"]))

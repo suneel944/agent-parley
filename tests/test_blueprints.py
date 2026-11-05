@@ -98,6 +98,34 @@ def test_three_nodes_run_in_order_and_the_agent_node_waits_for_a_report(
         blueprints.advance(bridge, repo, "42")
 
 
+def test_a_report_on_another_issue_leaves_the_run_waiting(
+    bridge, repo, claimed, tmp_path
+):
+    path = record(
+        tmp_path,
+        repo,
+        "solo",
+        [{"name": "implement", "kind": "agent", "prompt": "Implement it."}],
+    )
+    blueprints.define(bridge, repo, "solo", path)
+    blueprints.start(bridge, repo, "codex", "solo", "42")
+    _, directory = bridge.project(repo)
+    activity = directory / "codex-activity.json"
+    state = json.loads(activity.read_text()) if activity.exists() else {}
+    state.update(
+        outcome="ready",
+        summary="Other work",
+        reported_at=time.time() + 1,
+        rotation={"at": time.time(), "issue": "43", "outcome": "ready"},
+    )
+    write_json(activity, state)
+
+    assert "waiting at implement" in blueprints.advance(bridge, repo, "42")
+
+    bridge.report(claimed, "ready", "Implemented", "", "make check: passed")
+    assert "done at implement" in blueprints.advance(bridge, repo, "42")
+
+
 def test_a_failing_node_follows_its_failure_edge_until_its_retry_limit(
     bridge, repo, claimed, tmp_path
 ):

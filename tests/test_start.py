@@ -7,7 +7,8 @@ import sys
 
 import pytest
 
-from agent_parley import cli, problems, process, start, store
+from agent_parley import cli, problems, process, start, store, worktrees
+from agent_parley.state import BridgeError
 
 FAKE = "#!/bin/sh\nexit 0\n"
 PLUGIN = "agent-parley@agent-parley"
@@ -135,6 +136,25 @@ def test_registration_stash_is_listed_with_its_restore_command(
     assert f"  Stashed   git stash apply {entry}" in printed
     subprocess.run(["git", "stash", "drop", "-q"], cwd=repo, check=True)
     assert "Stashed" not in screen(capsys, bridge.home, repo)
+
+
+def test_a_partial_stash_failure_names_the_stashed_entry(repo, monkeypatch):
+    original = worktrees.git
+
+    def leaves_work(root, *args):
+        result = original(root, *args)
+        if args[:2] == ("stash", "push"):
+            (root / "late.txt").write_text("late\n")
+        return result
+
+    monkeypatch.setattr(worktrees, "git", leaves_work)
+    (repo / "shared.txt").write_text("changed\n")
+
+    with pytest.raises(BridgeError) as raised:
+        worktrees.preserve_pending(repo)
+
+    entry = original(repo, "rev-parse", "refs/stash")
+    assert f"already in stash entry {entry}." in str(raised.value)
 
 
 def test_a_stash_of_other_work_is_not_listed(path, bridge, repo, capsys):

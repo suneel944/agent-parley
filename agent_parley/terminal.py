@@ -42,6 +42,8 @@ EXEC_FAILED = 127
 SOCKET_GRACE = 60
 DRAIN_READS = 64
 STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+STOP_GRACE = 5.0
+STOP_POLL = 0.05
 TITLE_SAVE = b"\x1b[22;0t"
 TITLE_RESTORE = b"\x1b[23;0t"
 _TITLE_KINDS = (b"0;", b"2;")
@@ -755,7 +757,12 @@ def call(command: list[str], lane: Path, env: dict[str, str]) -> int:
     each `STOP_SIGNALS` signal on to the client, as `run` does, and keeps
     waiting until the client exits, so a stop never leaves the client running
     orphaned in the lane worktree. A signal that arrives before the client
-    has started is held and delivered as soon as the client exists.
+    has started is held and delivered as soon as the client exists. A client
+    still running `STOP_GRACE` seconds after the first stop signal is sent
+    `SIGKILL`, so a client that ignores the signal cannot outlive the
+    launcher. The grace is shorter than the `process.STOP_TIMEOUT` a stop
+    waits before killing the launcher itself, so the launcher ends its
+    client before that kill could orphan it.
 
     Args:
         command: Native CLI command line.
@@ -783,7 +790,15 @@ def call(command: list[str], lane: Path, env: dict[str, str]) -> int:
         child = subprocess.Popen(command, cwd=lane, env=env)
         if stopping:
             child.send_signal(stopping[0])
-        return child.wait()
+        deadline: float | None = None
+        while True:
+            try:
+                return child.wait(timeout=STOP_POLL)
+            except subprocess.TimeoutExpired:
+                if stopping and deadline is None:
+                    deadline = time.monotonic() + STOP_GRACE
+                if deadline is not None and time.monotonic() >= deadline:
+                    child.kill()
     finally:
         for number, handler in previous_stops.items():
             signal.signal(number, handler)
@@ -831,8 +846,10 @@ def run(
     it started still holds the pseudo-terminal. ``SIGTERM`` and ``SIGHUP``
     end it through the same cleanup as a normal exit, restoring the terminal
     and removing the control socket, and the signal is then forwarded to the
-    client. A client that cannot be started exits the forked child with
-    status 127 and never unwinds the launcher's own stack.
+    client. A client still running `STOP_GRACE` seconds after the session
+    ends is sent `SIGKILL`. A client that cannot be started exits the
+    forked child with status 127 and never unwinds the launcher's own
+    stack.
 
     With ``rotate``, a detached launcher whose lane recorded a rotation
     point, a ready or blocked report since the session began, answers an
@@ -932,12 +949,39 @@ def run(
                 if stopping:
                     with contextlib.suppress(ProcessLookupError):
                         os.kill(pid, stopping[0])
-                _, status = os.waitpid(pid, 0)
+                status = _reap(pid)
         finally:
             path.unlink(missing_ok=True)
             for number, handler in previous_stops.items():
                 signal.signal(number, handler)
         return os.waitstatus_to_exitcode(status)
+
+
+def _reap(pid: int) -> int:
+    """Waits for an ended session's client, killing it after a grace.
+
+    The session has already ended: a stop signal was forwarded, or the
+    closed pseudo-terminal hung the client up. A client still running
+    `STOP_GRACE` seconds later is sent `SIGKILL`, so the launcher never
+    waits forever while it holds the lane's session lock. The process ID
+    is the launcher's own unreaped child, so it cannot name another
+    process.
+
+    Args:
+        pid: Native client process.
+
+    Returns:
+        The client's wait status.
+    """
+    deadline = time.monotonic() + STOP_GRACE
+    while time.monotonic() < deadline:
+        reaped, status = os.waitpid(pid, os.WNOHANG)
+        if reaped:
+            return status
+        time.sleep(STOP_POLL)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    return os.waitpid(pid, 0)[1]
 
 
 def _session(

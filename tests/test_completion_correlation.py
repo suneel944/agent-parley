@@ -310,6 +310,24 @@ def test_an_unreadable_closing_pull_request_gives_no_reading(
     assert forge.issue_completion(tmp_path, "1216") is None
 
 
+@pytest.mark.parametrize("timeline", [None, "not json"])
+def test_an_unreadable_timeline_gives_no_reading(
+    monkeypatch, tmp_path, timeline
+):
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    issue = {
+        "state": "CLOSED",
+        "closedAt": "2026-09-20T00:00:00Z",
+        "closedByPullRequestsReferences": [],
+    }
+
+    def run(args, timeout):
+        return json.dumps(issue) if args[1] == "issue" else timeline
+
+    monkeypatch.setattr(forge, "_run", run)
+    assert forge.issue_completion(tmp_path, "1216") is None
+
+
 def test_a_hand_closed_issue_finds_its_pull_request_on_the_timeline(
     monkeypatch, tmp_path
 ):

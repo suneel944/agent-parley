@@ -300,6 +300,38 @@ def test_a_native_exit_retains_the_generation_needed_for_recovery(
     assert taken["taken"]["from"] == "claude"
 
 
+def test_a_held_checkpoint_lock_at_exit_still_records_the_lane_stopped(
+    bridge, repo, paired, monkeypatch
+):
+    registered(bridge, paired)
+    directory = Path(paired["lanes"]["claude"]).parent
+    holder = lock(directory / "claude-checkpoint.lock")
+
+    def exit_native(*args, **kwargs):
+        holder.__enter__()
+        return 0
+
+    async def identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    monkeypatch.setattr(bridge, "identity", identity)
+    monkeypatch.setattr(cli.shutil, "which", lambda command: sys.executable)
+    monkeypatch.setattr(cli.terminal, "call", exit_native)
+    monkeypatch.setattr(cli, "LAUNCH_LOCK_SECONDS", 0.1)
+    monkeypatch.setattr(
+        cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: False)
+    )
+    try:
+        with pytest.raises(LockBusy):
+            bridge.launch("claude", repo, "Continue recovery work")
+    finally:
+        holder.__exit__(None, None, None)
+    with store.connect(bridge.home) as db:
+        record = lanes.read(db, paired["root"], "claude")
+    assert record["state"] == lanes.STOPPED
+
+
 def test_a_takeover_run_from_a_subdirectory_restores_the_whole_worktree(
     bridge, repo, paired
 ):
@@ -731,6 +763,55 @@ def test_takeover_restore_resumes_after_each_durable_phase(
     assert git(peer, "log", "-1", "--format=%s") == "Captured commit"
     assert (peer / "staged.txt").read_text() == "staged\n"
     assert (peer / "worktree.txt").read_text() == "worktree\n"
+
+
+def taken_over(bridge, paired):
+    """Has codex take claude's orphaned issue 42 with unstaged work."""
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    peer = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "42")
+    (lane / "worktree.txt").write_text("worktree\n")
+    killed(directory, "claude", STALLED + 100)
+    running(directory, "codex")
+    supervision.poll(bridge.home, directory)
+    bridge.issue(peer, "claim", "42", take_orphaned=True)
+    record = issues.snapshot(directory)["issues"]["42"]
+    return directory, peer, record["taken"]["checkpoint"]
+
+
+def test_prune_keeps_the_bundle_a_live_take_restores(bridge, repo, paired):
+    directory, _, saved = taken_over(bridge, paired)
+    bundle = directory / "recovery" / saved["artifact"]["reference"]
+
+    removed = recovery.prune(directory, issues.snapshot(directory))
+
+    assert saved["id"] not in removed
+    assert bundle.exists()
+
+
+def test_a_completed_take_reclaims_without_its_bundle(bridge, repo, paired):
+    directory, peer, saved = taken_over(bridge, paired)
+    (directory / "recovery" / saved["artifact"]["reference"]).unlink()
+
+    resumed = bridge.issue(peer, "claim", "42")
+
+    assert resumed["recovery"]["phase"] == "complete"
+
+
+def test_prune_removes_a_restore_receipt_once_its_checkpoint_goes(
+    bridge, repo, paired
+):
+    directory, peer, saved = taken_over(bridge, paired)
+    folder = directory / "recovery"
+    (receipt,) = folder.glob(f"{saved['id']}-to-*.json")
+
+    bridge.issue(peer, "release", "42")
+    removed = recovery.prune(directory, issues.snapshot(directory))
+
+    assert saved["id"] in removed
+    assert not receipt.exists()
 
 
 def test_takeover_revalidates_a_returned_owner_process(bridge, repo, paired):

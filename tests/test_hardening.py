@@ -123,6 +123,25 @@ def test_a_damaged_activity_record_never_blocks_a_served_tool_call(
     assert checkpoints.serve(bridge.home, request)["status"] == 0
 
 
+@pytest.mark.parametrize("adapter", ["native", "gemini"])
+@pytest.mark.parametrize(
+    "field", [{"tool_name": 5}, {"hook_event_name": ["PreToolUse"]}]
+)
+def test_a_wrongly_typed_hook_field_is_refused_not_raised(
+    bridge, lane, adapter, field
+):
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "adapter": adapter,
+        "payload": {**tool_payload(lane), **field},
+    }
+    served = checkpoints.serve(bridge.home, request)
+    assert served["status"] == 2
+    assert "not text" in served["stderr"]
+    assert checkpoints.deadline_refusal(request) is None
+
+
 @pytest.mark.parametrize("damaged", ["null", "[]", "1", "{trunc"])
 def test_writers_and_fence_reads_survive_a_non_object_record(lane, damaged):
     directory = lane.parent
@@ -391,6 +410,46 @@ def test_portable_python_shutdown_keeps_pidfd_identity_check(monkeypatch):
             if child.poll() is None:
                 child.terminate()
                 child.wait(timeout=5)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pidfd")
+@pytest.mark.parametrize("vanished", [True, False])
+def test_a_process_exiting_after_its_pin_ends_the_stop(monkeypatch, vanished):
+    with subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"]
+    ) as child:
+        try:
+            ticks = process.start_ticks(child.pid)
+            real = process.linux_start_ticks
+
+            def exited(pid):
+                child.kill()
+                child.wait(timeout=5)
+                return real(pid) if vanished else ticks
+
+            monkeypatch.setattr(process, "linux_start_ticks", exited)
+            process.linux_terminate(child.pid, ticks)
+            assert child.poll() is not None
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+
+def test_macos_names_the_most_recently_started_worktree_client(monkeypatch):
+    started = {101: "Mon Nov  2 10:00:00 2026", 102: "Sat Oct 31 09:00:00 2026"}
+    monkeypatch.setattr(
+        process,
+        "PLATFORM",
+        process.PLATFORM._replace(
+            worktree_clients=lambda lane, command: [101, 102],
+            start_ticks=started.__getitem__,
+        ),
+    )
+    monkeypatch.setattr(process, "alive", lambda pid, ticks: True)
+    assert process.worktree_client(Path("/"), "claude").pid == 101
+    assert process.start_order("1200") > process.start_order("999")
+    assert process.start_order("unreadable") == float("-inf")
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pidfd")

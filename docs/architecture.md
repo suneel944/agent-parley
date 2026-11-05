@@ -68,7 +68,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `budgets` | A lane's consumption against its advisory budget, from recorded tokens, served calls and session hours; crossing a limit marks and notifies, never stops. Also the opt-in run budget: a durable per-project ledger, `run-budget.json`, of the same readings summed across lanes, restarts and retries. `supervision` admits every wake, work dispatch and capacity retry through it, `launch` refuses to launch or resume a lane while it is exhausted, and a `Stop` hook continuation (`checkpoints.continuation_refused`) is admitted through it like any other dispatch; exhaustion is recorded once and cleared only by the operator's `budget resume` |
 | `quota` | Per-credential quota parking for lanes that share one explicit credential profile on one adapter. A vendor rate-limit refusal that named a reset on any of them parks every lane on that credential until the reset; an optional window the operator records with `quota set` sums the lanes' native token counts and, past its threshold, parks every lane but the one holding the most unfinished claims, and all of them at the limit. Each poll rewrites `quota-ledger.json`; `supervision` defers wakes and fails the capacity fit check of a parked lane, and `checkpoints.continuation_refused` refuses its `Stop` hook continuation. Parking never moves a lane to another provider or credential and never touches its claims or reservations, and a park whose time passed reads as cleared. `headroom` derives remaining headroom per credential from the ledger, marked estimated when it comes from native counts rather than a vendor refusal |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
-| `timeouts` | The table of decision kinds with their reversibility, recommended default and undo command, the project policy that can only make a kind more cautious, and settling an unanswered reversible decision to its default |
+| `timeouts` | The table of decision kinds with their reversibility and recommended default, every one of which waits for the operator, the decision deadline other modules measure against, and the project policy that can only make a kind more cautious |
 | `history` | Read-only ownership history across the ledger, reports and store |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
@@ -1016,8 +1016,8 @@ reservations continue to resolve.
 ### State layout
 
 All coordination state lives under one private state root: `--home`, else
-`AGENT_PARLEY_HOME`, else `~/.local/state/agent-parley` (`cli.py` parser,
-`start.DEFAULT_HOME`). `core.BridgeCore` creates it with mode `0700` and refuses a
+a non-empty `AGENT_PARLEY_HOME`, else `~/.local/state/agent-parley`
+(`cli.py` parser, `start.DEFAULT_HOME`). `core.BridgeCore` creates it with mode `0700` and refuses a
 root that grants any group or other permission. Each project gets
 `projects/<key>/`, where `<key>` is the first 16 hexadecimal characters of the
 SHA-256 of the resolved Git common directory (`git rev-parse

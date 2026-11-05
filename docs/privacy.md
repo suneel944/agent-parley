@@ -85,7 +85,8 @@ their own providers, and it does not read or forward their credentials.
 Coordination state is kept outside your repositories, in a private state
 directory created with mode `0700`. The default location is
 `~/.local/state/agent-parley`, and `AGENT_PARLEY_HOME` or `--home` overrides
-it. The tool refuses to run if that directory is not private.
+it; an empty `AGENT_PARLEY_HOME` counts as unset, never as the current
+directory. The tool refuses to run if that directory is not private.
 
 The directory holds the coordination record you create by using the tool:
 

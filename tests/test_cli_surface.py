@@ -671,7 +671,9 @@ def test_provider_show_reports_one_definition(bridge, monkeypatch, capsys):
         ],
     )
     assert cli.main() == 1
-    assert "Unknown provider" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "Unknown provider" in error
+    assert error.splitlines()[-1] == "next: agent-parley provider list"
 
 
 def test_credentials_show_redacts_every_recorded_value(

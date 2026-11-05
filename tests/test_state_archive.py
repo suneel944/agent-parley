@@ -1,5 +1,6 @@
 """Checks the state archive export, inspection and import round trip."""
 
+import contextlib
 import hashlib
 import io
 import json
@@ -402,6 +403,73 @@ def test_an_imported_attachment_follows_its_renumbered_message(
     assert not (other / "projects" / directory.name).exists()
 
 
+def test_a_project_export_keeps_no_other_projects_search_words(
+    bridge, repo, tmp_path
+):
+    directory = registered(bridge, repo)
+    root = str(bridge.project(repo)[0])
+    token = json.loads((directory / "claude-identity.json").read_text())[
+        "registration_token"
+    ]
+    store.register(bridge.home, root, "codex")
+    (bridge.home / "projects" / "ffff").mkdir()
+    write_json(
+        bridge.home / "projects" / "ffff" / "project.json",
+        {"root": "/elsewhere", "base": "main", "participants": {}},
+    )
+    sender = store.register(bridge.home, "/elsewhere", "codex")
+    store.register(bridge.home, "/elsewhere", "gemini")
+
+    def spill(identity: dict, recipient: str, tail: str) -> dict:
+        return store.call(
+            bridge.home,
+            identity,
+            "send_message",
+            {
+                "to": [recipient],
+                "subject": "Big",
+                "body_md": "padding words\n" * 400 + tail,
+                "idempotency_key": tail,
+            },
+        )
+
+    other = spill(
+        store.authenticate(bridge.home, sender["registration_token"]),
+        "gemini",
+        "zephyrquartz",
+    )
+    kept = spill(store.authenticate(bridge.home, token), "codex", "ochremarble")
+    assert other["attachment"] and kept["attachment"]
+
+    output = tmp_path / "one.tar.gz"
+    archive.export(bridge.home, output, directory)
+    database = members(output)[archive.STORE_MEMBER]
+    assert b"zephyrquartz" not in database
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / store.DATABASE).write_bytes(database)
+    with sqlite3.connect(snapshot / store.DATABASE) as db:
+        assert not db.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'message_search%'"
+            " OR type='trigger'"
+        ).fetchall()
+
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    archive.import_archive(home, output)
+    with store.connect(home) as db:
+        found = db.execute(
+            "SELECT rowid FROM message_search WHERE message_search MATCH ?",
+            ("ochremarble",),
+        ).fetchall()
+        assert [row[0] for row in found] == [
+            row[0]
+            for row in db.execute(
+                "SELECT id FROM messages WHERE body_md LIKE 'padding words%'"
+            )
+        ]
+
+
 def test_an_unscoped_table_fails_the_export_instead_of_leaking(
     bridge, repo, tmp_path
 ):
@@ -539,3 +607,24 @@ def test_imported_providers_are_validated_and_never_replace_a_preset(
     assert "Provider leaky refused" in out
     assert roster.provider(merged, "custom") == custom
     assert roster.provider(merged, "mine")["command"] == "codex"
+
+
+def test_the_export_reads_project_files_while_their_locks_are_held(
+    bridge, repo, tmp_path, monkeypatch
+):
+    directory = registered(bridge, repo)
+    ledger = directory / "issues.json"
+    held = ledger.read_bytes()
+    original = archive._project_locks
+
+    @contextlib.contextmanager
+    def writing_after_release(directories):
+        with original(directories):
+            yield
+        ledger.write_text('{"revision": 2, "issues": {}}\n')
+
+    monkeypatch.setattr(archive, "_project_locks", writing_after_release)
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+    member = f"{archive.PROJECTS}/{directory.name}/issues.json"
+    assert members(output)[member] == held

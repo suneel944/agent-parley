@@ -15,6 +15,7 @@ from agent_parley.state import (
 
 FOLDER = "attachments"
 INDEX = "held.json"
+STALE = "held.stale"
 INDEX_LOCK = "attachments.lock"
 INDEX_TIMEOUT = 5.0
 MAX_ATTACHMENT_BYTES = 65536
@@ -157,12 +158,17 @@ def _scan(home: Path) -> dict[str, dict[str, int]]:
 def _load(home: Path) -> dict[str, dict[str, int]] | None:
     """Reads the allowance index, or None when it is missing or damaged.
 
+    An index is also untrusted while the stale marker `held.stale` exists,
+    because a change that found the lock busy may be missing from it.
+
     Args:
         home: Attachment folder.
 
     Returns:
         The index, keyed by writer and then by reference.
     """
+    if (home / STALE).exists():
+        return None
     try:
         index = json.loads((home / INDEX).read_text())
     except (OSError, ValueError):
@@ -185,9 +191,12 @@ def _change(
     the index existed, is rebuilt from the metadata files first. Callers
     write or mark their metadata before they call, so a rebuild already
     reflects the change and applying it again is harmless. When the lock
-    stays busy the index is deleted instead, so the next reader rebuilds it
-    rather than trusting a count the change never reached; a removal that
-    runs while a transaction rolls back therefore never raises.
+    stays busy the stale marker is written instead, without touching the
+    index the holder may be rewriting, so the next reader rebuilds it rather
+    than trusting a count the change never reached; a removal that runs
+    while a transaction rolls back therefore never raises. The lock holder
+    removes the marker before it rebuilds, so a marker written during the
+    rebuild survives for the next reader.
 
     Args:
         directory: Private state directory for the common repository.
@@ -198,13 +207,18 @@ def _change(
         return
     try:
         with lock(directory / INDEX_LOCK, timeout=INDEX_TIMEOUT):
-            index = _load(home)
+            try:
+                (home / STALE).unlink()
+            except FileNotFoundError:
+                index = _load(home)
+            else:
+                index = None
             if index is None:
                 index = _scan(home)
             change(index)
             write_json(home / INDEX, {k: v for k, v in index.items() if v})
     except LockBusy:
-        (home / INDEX).unlink(missing_ok=True)
+        (home / STALE).touch()
 
 
 def held(directory: Path, writer: str) -> dict[str, int]:

@@ -819,6 +819,7 @@ def test_status_names_the_prompt_and_how_long_it_has_waited(tmp_path):
 
 
 BRIDGE_RULES = [protocol.TOOL_PREFIX, *protocol.cli_rules()]
+UNISOLATED_CLI = protocol.cli_command().replace(" -P ", " ")
 
 
 @pytest.mark.parametrize("scope", ["project", "lane"])
@@ -1127,24 +1128,21 @@ def test_the_prompt_and_the_launch_rule_spell_one_command():
     """Keeps the allow rule on the exact string the prompt orders."""
     assert protocol.cli_rule() == f"Bash({protocol.cli_command()} *)"
     assert protocol.cli_command().endswith(" -P -m agent_parley.cli")
-    assert protocol.cli_rules() == [
-        protocol.cli_rule(),
-        f"Bash({protocol.legacy_cli_command()} *)",
-    ]
-    assert protocol.legacy_cli_command() == protocol.cli_command().replace(
-        " -P ", " "
+    assert protocol.cli_rules() == [protocol.cli_rule()]
+
+
+def test_every_launch_rule_isolates_the_module_path():
+    """Writes no allow rule for the interpreter without ``-P``."""
+    assert all(
+        " -P -m agent_parley.cli *)" in rule for rule in protocol.cli_rules()
     )
+    assert f"Bash({UNISOLATED_CLI} *)" not in protocol.cli_rules()
 
 
-@pytest.mark.parametrize(
-    "command", [protocol.cli_command(), protocol.legacy_cli_command()]
-)
-def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(
-    tmp_path, command
-):
+def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):
     """Unparks a lane on the command the protocol prompt ordered."""
     write_json(tmp_path / "lane-activity.json", {"activity": "working"})
-    screen = _shell_prompt(command + " issue list")
+    screen = _shell_prompt(protocol.cli_command() + " issue list")
     watch = dialogs.Watch(tmp_path, "lane", bridge=True)
     watch.advance(screen.encode(), 0.0)
     assert watch.advance(b"", 0.5) == b"1\r"
@@ -1157,6 +1155,7 @@ def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(
     [
         "gh pr view 12",
         "python3 -m agent_parley.cli issue list",
+        UNISOLATED_CLI + " issue list",
         protocol.cli_command() + " issue list && rm -rf build",
         protocol.cli_command() + " report > /tmp/out",
         "cd x; " + protocol.cli_command() + " issue list",

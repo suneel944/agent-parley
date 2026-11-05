@@ -471,6 +471,35 @@ def test_a_reboot_leaves_a_session_recorded_in_the_new_boot_live(
     assert record["boot_id"] == "new"
 
 
+def test_a_busy_lane_lock_defers_only_that_lane_after_a_reboot(
+    bridge, paired, monkeypatch
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    manifest = roster.read(directory)
+    for name in ("claude", "codex"):
+        write_json(
+            directory / f"{name}-activity.json",
+            {"activity": "working", "updated": 1.0, "session_pid": 1},
+        )
+    write_json(directory / supervision.BOOT_RECORD, {"boot_id": "old"})
+    monkeypatch.setattr(process, "boot_id", lambda: "new")
+
+    def busy(path, timeout=None):
+        if path.name == "claude-checkpoint.lock":
+            raise LockBusy("busy")
+        return lock(path, timeout=timeout)
+
+    monkeypatch.setattr(supervision, "lock", busy)
+    home = bridge.home
+    assert supervision.settle_reboot(home, directory, manifest) == ["codex"]
+    record = json.loads((directory / supervision.BOOT_RECORD).read_text())
+    assert record["boot_id"] == "old"
+    monkeypatch.setattr(supervision, "lock", lock)
+    assert supervision.settle_reboot(home, directory, manifest) == ["claude"]
+    record = json.loads((directory / supervision.BOOT_RECORD).read_text())
+    assert record["boot_id"] == "new"
+
+
 def test_restart_replays_initialization_and_launches_the_same_provider(
     bridge, repo, paired, monkeypatch, tmp_path
 ):

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import dialogs, gemini, roster, store
+from agent_parley import dialogs, gemini, hook, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -229,6 +229,19 @@ def test_a_tool_permission_payload_names_the_shared_tool():
     assert gemini.response({}) == {}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"hook_event_name": "BeforeTool", "tool_name": 5},
+        {"hook_event_name": ["BeforeTool"], "tool_name": "run_shell_command"},
+    ],
+)
+def test_a_wrongly_typed_field_passes_through_untranslated(value):
+    translated = gemini.payload(value)
+    assert translated["tool_name"] == value["tool_name"]
+    assert type(translated["hook_event_name"]) is type(value["hook_event_name"])
+
+
 def test_resume_without_a_recorded_session_is_refused(lane, bridge, repo):
     with pytest.raises(BridgeError, match="No usable native session"):
         bridge.launch("helper", repo, "Continue", "gemini", resume=True)
@@ -256,12 +269,12 @@ def test_system_policy_and_existing_hooks_survive_overlay(
         "hooks": {"BeforeTool": [{"hooks": [{"command": "native-policy"}]}]},
     }
     write_json(native, original)
-    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(native))
     result = gemini.configure(
         tmp_path,
         "lane",
         "http://127.0.0.1:42/mcp/",
         bridge.hooks("lane", tmp_path),
+        str(native),
     )
     overlay = json.loads(result.read_text())
     assert overlay["security"] == original["security"]
@@ -276,14 +289,51 @@ def test_system_policy_and_existing_hooks_survive_overlay(
 def test_disabled_native_hooks_refuse_launch(bridge, tmp_path, monkeypatch):
     native = tmp_path / "system.json"
     write_json(native, {"hooksConfig": {"enabled": False}})
-    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(native))
     with pytest.raises(BridgeError, match="disables hooks"):
         gemini.configure(
             tmp_path,
             "lane",
             "http://127.0.0.1/mcp/",
             bridge.hooks("lane", tmp_path),
+            str(native),
         )
+
+
+def test_relaunch_inside_a_lane_copies_native_policy_not_the_overlay(
+    lane, bridge, repo, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(lane["overlay"]))
+    assert bridge.launch("helper", repo, "Continue", "gemini") == 0
+    capture = json.loads((tmp_path / "capture.json").read_text())
+    settings = json.loads(Path(capture["settings"]).read_text())
+    lane_hooks = [
+        entry
+        for entry in settings["hooks"]["BeforeTool"]
+        if entry["hooks"][0]["command"].endswith("--adapter gemini")
+    ]
+    assert len(lane_hooks) == 1
+
+
+def test_inherited_environment_drops_lane_values_only(
+    bridge, monkeypatch, tmp_path
+):
+    native = tmp_path / "system.json"
+    overlay = bridge.home / "projects" / "key" / "helper-gemini-settings.json"
+    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(native))
+    monkeypatch.setenv("AMP_SETTINGS_FILE", str(overlay))
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "secret")
+    monkeypatch.setenv(hook.PARTICIPANT_ENV, "helper")
+    monkeypatch.setenv(hook.HOOK_PID_ENV, "1")
+    monkeypatch.setenv(hook.ANSWERED_ENV, "409")
+    environment = hook.inherited_environment(bridge.home)
+    assert environment["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] == str(native)
+    assert not {
+        "AMP_SETTINGS_FILE",
+        "AGENT_PARLEY_TOKEN",
+        hook.PARTICIPANT_ENV,
+        hook.HOOK_PID_ENV,
+        hook.ANSWERED_ENV,
+    } & set(environment)
 
 
 def test_native_before_tool_can_receive_denial_and_recover_via_mcp():
