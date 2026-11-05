@@ -221,7 +221,7 @@ def configure(
         bridge: Coordination runtime owning the project state.
         repo: Any checkout of the target repository, outside every lane.
         name: Decision kind name.
-        ask: Always ask, never apply the default.
+        ask: Record that the kind always asks.
         seconds: Longer timeout than `TIMEOUT_SECONDS`.
 
     Returns:
