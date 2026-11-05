@@ -4,10 +4,20 @@ import json
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from scripts.check_policy import has_attribution
-from scripts.release_publish import ISSUE_REFERENCE, RELEASING_SUBJECT
+from scripts.release_publish import (
+    ISSUE_REFERENCE,
+    MANIFEST_PATH,
+    MINOR_THRESHOLD,
+    PACKAGE_PATHS,
+    RELEASING_SUBJECT,
+    advance_version,
+    body_sections,
+    release_history,
+)
 
 
 def issue_numbers(body: str) -> set[int]:
@@ -100,6 +110,62 @@ def validate_commit_references(
     return []
 
 
+def validate_release_shape(
+    pr: dict[str, Any], approved: str, retired: list[str], packaged: bool
+) -> list[str]:
+    """Requires a crossing merge to describe and name the release it cuts.
+
+    A pull request into main with a releasing title, package changes and
+    more than one issue reference is a crossing merge. Its squash commit is
+    what the release measures and what the notes are built from, so a flat
+    body becomes one-line notes and the milestone title must be the version
+    the measurement reaches. The count here is the PR's own references;
+    units that reached main directly since the approved tag are not added,
+    because crossing merges carry the whole milestone.
+
+    Args:
+        pr: Current GitHub REST pull-request metadata.
+        approved: Approved version from the release manifest.
+        retired: Versions that may never be reused.
+        packaged: Whether the PR changes a distributed package path.
+
+    Returns:
+        Actionable failures; empty when the PR is not a crossing merge or
+        its notes and milestone match the release it cuts.
+    """
+    subject = RELEASING_SUBJECT.match(pr.get("title", ""))
+    body = pr.get("body") or ""
+    issues = issue_numbers(body)
+    if (
+        not subject
+        or not packaged
+        or len(issues) < 2
+        or (pr.get("base") or {}).get("ref") != "main"
+    ):
+        return []
+    errors = []
+    if not body_sections(body)[0]:
+        errors.append(
+            "Group the release notes under ### headings in "
+            "## Problem and result; a flat body publishes one-line notes."
+        )
+    milestone = pr.get("milestone")
+    if milestone:
+        if subject[3] == "!":
+            kind = "major"
+        elif len(issues) >= MINOR_THRESHOLD:
+            kind = "minor"
+        else:
+            kind = "patch"
+        version = advance_version(approved, kind, retired)
+        if milestone["title"] != version:
+            errors.append(
+                f"Rename milestone {milestone['title']} to {version}: "
+                f"{len(issues)} issues measure a {kind} release."
+            )
+    return errors
+
+
 def api(path: str, *, paginate: bool = False) -> Any:
     """Reads authenticated GitHub metadata through the native CLI.
 
@@ -134,6 +200,18 @@ def main() -> None:
         f"repos/{repository}/pulls/{number}/commits?per_page=100", paginate=True
     )
     errors += validate_commit_references(pr, commits)
+    files = api(
+        f"repos/{repository}/pulls/{number}/files?per_page=100", paginate=True
+    )
+    packaged = any(
+        file.get("filename", "").startswith(
+            tuple(f"{path}/" for path in PACKAGE_PATHS)
+        )
+        for file in files
+    )
+    _, retired, _ = release_history(Path("."))
+    approved = json.loads(Path(MANIFEST_PATH).read_text())["."]
+    errors += validate_release_shape(pr, approved, retired, packaged)
     if any(has_attribution(commit["commit"]["message"]) for commit in commits):
         errors.append("Remove prohibited attribution from commit messages.")
     for endpoint in (
