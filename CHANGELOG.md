@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/suneel944/agent-parley/compare/v0.21.0...v0.22.0) (2026-11-05)
+
+
+### Bug fixes
+
+* deliver the 0.21.1 milestone (#1372) ([#1340](https://github.com/suneel944/agent-parley/issues/1340)) ([#1341](https://github.com/suneel944/agent-parley/issues/1341)) ([#1342](https://github.com/suneel944/agent-parley/issues/1342)) ([#1343](https://github.com/suneel944/agent-parley/issues/1343)) ([#1344](https://github.com/suneel944/agent-parley/issues/1344)) ([#1345](https://github.com/suneel944/agent-parley/issues/1345)) ([#1346](https://github.com/suneel944/agent-parley/issues/1346)) ([#1347](https://github.com/suneel944/agent-parley/issues/1347)) ([#1348](https://github.com/suneel944/agent-parley/issues/1348)) ([#1349](https://github.com/suneel944/agent-parley/issues/1349)) ([#1350](https://github.com/suneel944/agent-parley/issues/1350)) ([#1351](https://github.com/suneel944/agent-parley/issues/1351)) ([#1352](https://github.com/suneel944/agent-parley/issues/1352)) ([#1366](https://github.com/suneel944/agent-parley/issues/1366)) ([#1367](https://github.com/suneel944/agent-parley/issues/1367)) ([#1370](https://github.com/suneel944/agent-parley/issues/1370)) ([#1373](https://github.com/suneel944/agent-parley/issues/1373)) ([#1375](https://github.com/suneel944/agent-parley/issues/1375))
+
 ## [0.21.0](https://github.com/suneel944/agent-parley/compare/v0.20.1...v0.21.0) (2026-10-18)
 
 
