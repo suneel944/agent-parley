@@ -25,6 +25,7 @@ from typing import Any, TypeGuard, cast
 from agent_parley import (
     budgets,
     children,
+    collisions,
     convergence,
     decisions,
     denials,
@@ -9468,6 +9469,7 @@ def _poll(home: Path, directory: Path) -> None:
         manifest,
         config,
     )
+    stage("converging lanes", collisions.supervise, home, directory, manifest)
     stage(
         "unattended integration",
         unattended.supervise,

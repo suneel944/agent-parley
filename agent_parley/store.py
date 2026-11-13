@@ -6150,12 +6150,15 @@ def renew_reservations(home: Path, root: str, name: str) -> dict:
         return {"renewed": sorted(set(renewed)), "released": released}
 
 
-def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
+def active_reservations(
+    home: Path, root: str, db: sqlite3.Connection | None = None
+) -> dict[str, list[str]]:
     """Reports every unreleased, unexpired reservation key for one project.
 
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
+        db: A status frame's open read transaction, or None to open one.
 
     Returns:
         Mapping of registered identity to the keys it holds, in sorted order.
@@ -6163,10 +6166,10 @@ def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
         and still reported as stale elsewhere, but the paths it names no
         longer read as reserved for the purpose of naming a collision.
     """
-    if not present(home):
+    if db is None and not present(home):
         return {}
     held: dict[str, list[str]] = {}
-    with connect(home) as db:
+    with reading(home, db) as db:
         for row in db.execute(
             "SELECT a.name AS name,f.path_pattern AS pattern "
             "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "

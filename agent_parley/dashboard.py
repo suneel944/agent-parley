@@ -16,6 +16,7 @@ from typing import Any
 from agent_parley import (
     approvals,
     budgets,
+    collisions,
     decisions,
     lanes,
     metrics,
@@ -869,6 +870,15 @@ def collect(
             _row(home, path.parent, data, agent, context)
             for agent in sorted(data["participants"], key=tables.natural_key)
         ]
+        converging = collisions.read(
+            home,
+            path.parent,
+            data,
+            {row["participant"]: row["branch"] for row in rows},
+        )
+        for row in rows:
+            row["converging"] = collisions.peers(converging, row["participant"])
+            row["bucket"] = lane_bucket(row)
         _orphan_remedies(rows, data["root"])
         if providers:
             rows = [row for row in rows if row["provider_name"] in providers]
