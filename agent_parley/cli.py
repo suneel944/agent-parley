@@ -4538,7 +4538,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "participant",
+        nargs="?",
+        default="",
         help="Participant name; a new name creates its own worktree lane.",
+    )
+    run.add_argument(
+        "--lanes",
+        default="",
+        metavar="NAME[,NAME...]",
+        help=(
+            "Open each named lane in its own tmux window, each on a distinct "
+            "issue of --milestone; without tmux, print one run command per "
+            "lane."
+        ),
+    )
+    run.add_argument(
+        "--milestone",
+        default="",
+        metavar="TITLE",
+        help="Milestone whose issues --lanes claims, one per lane.",
     )
     run.add_argument(
         "--provider",
@@ -6803,6 +6821,27 @@ def main() -> int:
             if used:
                 with contextlib.suppress(BridgeError, OSError):
                     projects.touch(bridge.home, used)
+            if args.lanes or args.milestone:
+                from agent_parley import lanes_launch
+
+                if args.participant or not (args.lanes and args.milestone):
+                    parser.error("run --lanes needs --milestone, no NAME.")
+                opened = lanes_launch.open_lanes(
+                    bridge,
+                    args.repo.resolve(),
+                    [name.strip() for name in args.lanes.split(",")],
+                    args.milestone,
+                )
+                for lane in opened["lanes"]:
+                    if lane["reason"]:
+                        print(
+                            f"{lane['participant']}: {lane['reason']}",
+                            file=sys.stderr,
+                        )
+                print("\n".join(lanes_launch.lines(opened)))
+                return 0
+            if not args.participant:
+                parser.error("run needs a participant NAME, or --lanes.")
             status = bridge.launch(
                 args.participant,
                 args.repo.resolve(),

@@ -2183,11 +2183,13 @@ class StatusMixin(BridgeCore):
             every_claim: Also list claims whose work ended on the forge and
                 lanes folded out as long dead.
         """
-        from agent_parley import metrics, stagnation, supervision
+        from agent_parley import lanes_launch, metrics, stagnation, supervision
         from agent_parley.cli import supervision_failure, tables
 
         dormancy = " (dormant)" if project["dormant"] else ""
         print(f"\nProject: {project['root']}{dormancy}")
+        if attach := lanes_launch.attach_line(project["root"]):
+            print(attach)
         if stalled := stagnation.line(project.get("stagnation") or {}):
             print(stalled)
         if failing := project.get("supervision_error"):
