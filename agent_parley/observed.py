@@ -158,6 +158,28 @@ def known(manifest: dict, name: str, cwd: Path) -> dict | None:
     return None
 
 
+def _owned(manifest: dict) -> set[Path]:
+    """Lists the checkouts that already belong to the project or a lane.
+
+    The canonical checkout and every lane are worktrees of the same
+    repository, so a cwd in one of them would otherwise be recorded as a
+    worktree the client made, and a lane working in the main checkout or in
+    a peer's lane would be accepted there.
+
+    Args:
+        manifest: Project manifest.
+
+    Returns:
+        The resolved project root and every participant's lane.
+    """
+    lanes = [entry.get("lane") for entry in manifest["participants"].values()]
+    return {
+        Path(place).resolve()
+        for place in [manifest.get("root"), *lanes]
+        if place
+    }
+
+
 def _reserve(
     home: Path, directory: Path, agent: str, path: Path, lane: Path
 ) -> None:
@@ -240,7 +262,7 @@ def register(
     ):
         return dict(current)
     found = current if current is not None else _inspect(lane, cwd)
-    if found is None:
+    if found is None or Path(found["path"]) in _owned(manifest):
         return None
     fresh = False
     try:

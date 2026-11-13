@@ -140,6 +140,18 @@ def test_a_cwd_in_an_unrelated_repository_is_still_refused(
     assert records(lane) == []
 
 
+@pytest.mark.parametrize("place", ["root", "peer"])
+def test_the_main_checkout_and_a_peer_lane_are_never_registered(
+    bridge, lane, repo, paired, place
+):
+    where = repo if place == "root" else Path(paired["lanes"]["codex"])
+    pre = {"hook_event_name": "PreToolUse", "tool_name": "Read"}
+    served = serve(bridge, lane, {**pre, "tool_input": {}}, where.resolve())
+    assert '"permissionDecision": "deny"' in served["stdout"]
+    assert events(lane)[-1]["reason_class"] == "outside_lane"
+    assert records(lane) == []
+
+
 @pytest.mark.parametrize(
     "event,field",
     [("TaskCompleted", "progressed"), ("TeammateIdle", "teammate_idle")],
