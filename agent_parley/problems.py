@@ -556,7 +556,8 @@ def _integrate_rows(
     anyone integrates it. Nothing merges on its own here; the row names the
     pull request and the integration step its approval policy allows,
     once the wait passes the same ceiling a declared wait uses. A pull
-    request whose cached reading conflicts with its base names the rebase
+    request whose cached reading conflicts with its base, or is behind a
+    base that requires it current, names the rebase
     instead of the merge, and one whose checks are red is left to the
     checks-failed row.
 
@@ -584,12 +585,19 @@ def _integrate_rows(
     if pull.get("url"):
         shown += f" ({pull['url']})"
     approval = record.get("approval")
-    if pull.get("mergeable") == "CONFLICTING":
+    stale = (
+        "conflicts with"
+        if pull.get("mergeable") == "CONFLICTING"
+        else "is behind"
+        if pull.get("merge_state") == "BEHIND"
+        else ""
+    )
+    if stale:
         return [
             _row(
                 INTEGRATE,
                 f"issue #{claim['issue']} reported ready but {shown} "
-                "conflicts with its base",
+                f"{stale} its base",
                 f"rebase the {name} branch onto the base and push, or "
                 f'agent-parley say {name} "<text>" {repo}',
                 seconds,

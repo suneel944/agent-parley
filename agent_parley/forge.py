@@ -28,9 +28,11 @@ MAX_PATHS = 200
 MAX_OPEN_ISSUES = 100
 MAX_PULL_REQUESTS = 30
 PULL_REQUEST_FIELDS = (
-    "number,url,headRefName,headRefOid,mergeable,statusCheckRollup,"
-    "latestReviews,closingIssuesReferences,files"
+    "number,url,headRefName,headRefOid,mergeable,mergeStateStatus,"
+    "statusCheckRollup,latestReviews,comments,closingIssuesReferences,files"
 )
+MAX_COMMENTS = 20
+MAX_CLOSERS = 5
 MAX_LANDINGS = 100
 CLOSING = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b", re.IGNORECASE
@@ -243,8 +245,10 @@ def issue_completion(repo: Path, number: str) -> dict | None:
     A lane may land a claim through a pull request from any branch, so the
     lane branch cannot say whether a claimed issue ended. The issue itself
     can: its state, when it closed, and the pull requests the forge links to
-    it as closing it. The newest linked pull request supplies the head
-    branch and merge commit that identify who landed the work. Only the
+    it as closing it. The newest merged one of the newest `MAX_CLOSERS`
+    linked pull requests, or the newest when none merged, supplies the head
+    branch and merge commit that identify who landed the work, so a later
+    duplicate closer left unmerged never hides the one that landed. Only the
     GitHub forge links pull requests to issues, so every other forge reports
     None and the caller falls back to the lane branch.
 
@@ -307,31 +311,45 @@ def issue_completion(repo: Path, number: str) -> dict | None:
         return None
     if not linked:
         return reading
-    pull = _run(
-        [
-            "gh",
-            "pr",
-            "view",
-            str(max(linked)),
-            "--repo",
-            project,
-            "--json",
-            "state,number,url,headRefName,mergeCommit",
-        ],
-        5,
-    )
-    try:
-        request = json.loads(pull or "null")
-        state = str(request["state"]).upper()
-        reading.update(
-            state="MERGED" if state == "MERGED" else "CLOSED",
-            pull_request=int(request.get("number") or 0),
-            url=str(request.get("url") or ""),
-            branch=str(request.get("headRefName") or ""),
-            commit=str((request.get("mergeCommit") or {}).get("oid") or ""),
+    closers: list[dict] = []
+    for candidate in sorted(set(linked), reverse=True)[:MAX_CLOSERS]:
+        pull = _run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(candidate),
+                "--repo",
+                project,
+                "--json",
+                "state,number,url,headRefName,mergeCommit",
+            ],
+            5,
         )
-    except (ValueError, TypeError, AttributeError, KeyError):
-        return None
+        try:
+            request = json.loads(pull or "null")
+            state = str(request["state"]).upper()
+            closers.append(
+                {
+                    "state": "MERGED" if state == "MERGED" else "CLOSED",
+                    "pull_request": int(request.get("number") or 0),
+                    "url": str(request.get("url") or ""),
+                    "branch": str(request.get("headRefName") or ""),
+                    "commit": str(
+                        (request.get("mergeCommit") or {}).get("oid") or ""
+                    ),
+                }
+            )
+        except (ValueError, TypeError, AttributeError, KeyError):
+            return None
+        if state == "MERGED":
+            break
+    reading.update(
+        next(
+            (item for item in closers if item["state"] == "MERGED"),
+            closers[0],
+        )
+    )
     return reading
 
 
@@ -513,8 +531,11 @@ def open_pull_requests(repo: Path) -> list[dict] | None:
         `none` when nothing reported), the sorted names of failing checks,
         each unfinished check with its state and start time, each failing
         check with the forge's conclusion and whether it never started, the
-        latest reviews as author, state and submission time, the merge state
-        the forge reports, the bare numbers of the issues it closes and the
+        latest reviews as author, state and submission time, the newest
+        `MAX_COMMENTS` conversation comments as author and creation time,
+        whether the forge can merge it as `mergeable`, the forge's merge
+        state status (`BEHIND`, `BLOCKED`, `CLEAN` and the like) as
+        `merge_state`, the bare numbers of the issues it closes and the
         sorted repository paths it changes. None when the forge is
         unavailable or the response cannot be read.
     """
@@ -553,16 +574,18 @@ def pull_request(repo: Path, number: int) -> dict | None:
 
     A truncated `open_pull_requests` reading omits the oldest open pull
     requests, so the caller re-reads one it already tracks here instead of
-    treating its absence as closed.
+    treating its absence as closed, and reads how one that left the open
+    list ended.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
         number: Pull request number.
 
     Returns:
-        The reading `open_pull_requests` would give while it is open, an
-        empty mapping once the forge reports it merged or closed, and None
-        when the forge is unavailable or the response cannot be read.
+        The reading `open_pull_requests` would give while it is open; once
+        the forge reports it ended, a mapping holding only its `state`,
+        `MERGED` or `CLOSED`, and no `number`; and None when the forge is
+        unavailable or the response cannot be read.
     """
     if _implementation(repo) != "github":
         return None
@@ -586,8 +609,9 @@ def pull_request(repo: Path, number: int) -> dict | None:
         record = json.loads(output or "null")
         if not isinstance(record, dict):
             return None
-        if record.get("state") != "OPEN":
-            return {} if record.get("state") else None
+        state = str(record.get("state") or "").upper()
+        if state != "OPEN":
+            return {"state": state} if state in {"MERGED", "CLOSED"} else None
         return _pull_request_reading(record)
     except (ValueError, TypeError, AttributeError, KeyError):
         return None
@@ -620,7 +644,15 @@ def _pull_request_reading(record: dict) -> dict:
             }
             for review in record.get("latestReviews") or []
         ],
+        "comments": [
+            {
+                "author": str((comment.get("author") or {}).get("login") or ""),
+                "at": str(comment.get("createdAt") or ""),
+            }
+            for comment in (record.get("comments") or [])[-MAX_COMMENTS:]
+        ],
         "mergeable": str(record.get("mergeable") or "UNKNOWN"),
+        "merge_state": str(record.get("mergeStateStatus") or "UNKNOWN"),
         "issues": [
             str(entry["number"])
             for entry in record.get("closingIssuesReferences") or []

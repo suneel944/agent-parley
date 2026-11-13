@@ -503,6 +503,24 @@ def test_wait_ci_blocks_once_the_pull_request_used_its_ci_rounds(
     assert "used 3 CI rounds" in blocked
 
 
+def test_wait_ci_blocks_on_a_head_supervision_found_without_checks(
+    bridge, repo, paired, claimed, tmp_path
+):
+    ci_blueprint(bridge, repo, tmp_path)
+    _, directory = bridge.project(repo)
+    branch = paired["branches"]["codex"]
+    head = git(repo, "rev-parse", branch)
+    blueprints.start(bridge, repo, "codex", "ci", "42")
+    checks(directory, branch, head, "none")
+    assert "waiting at ci" in blueprints.advance(bridge, repo, "42")
+
+    checks(directory, branch, head, "none", none_told=head)
+    blocked = blueprints.advance(bridge, repo, "42")
+
+    assert "blocked at ci; passed none" in blocked
+    assert "reports no checks" in blocked
+
+
 def test_wait_ci_waits_out_supervisions_automatic_rerun_of_a_red_head(
     bridge, repo, paired, claimed, tmp_path
 ):
