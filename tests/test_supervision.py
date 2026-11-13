@@ -501,6 +501,55 @@ def test_live_idle_wakes_back_off_without_acknowledging(
     )
 
 
+def test_new_mail_keeps_the_wake_attempt_count_and_backoff(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    write_json(
+        lane.parent / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, lane.parent, "codex")
+    for _ in range(3):
+        send(bridge, actors["claude"], "codex")
+        supervision.wake(
+            bridge.home, lane.parent, paired, "codex", observed, config
+        )
+        record = rewake(bridge, paired, lane.parent, "codex", at=0)
+    assert record["attempts"] == 3
+
+
+def test_only_a_running_turn_holds_an_overdue_claim_wake(bridge, paired):
+    directory = Path(paired["lanes"]["codex"]).parent
+    asked = time.time()
+    key = "overdue:7"
+
+    def answered(result, backlog=(key,), at=asked + 1):
+        supervision.store_wake(
+            bridge.home,
+            directory,
+            paired["root"],
+            "codex",
+            {"result": result, "backlog": list(backlog), "at": at},
+        )
+        return supervision.turn_in_flight(
+            bridge.home, directory, paired["root"], "codex", key, asked
+        )
+
+    assert answered(supervision.TURN_BUSY)
+    assert not answered("busy:input")
+    assert not answered(supervision.TURN_BUSY, backlog=("mail",))
+    assert not answered(supervision.TURN_BUSY, at=asked - 60)
+
+
 def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
     bridge, paired, monkeypatch
 ):
@@ -1325,6 +1374,58 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
     assert "--resume" in launched[0][0]
     record = json.loads((directory / "codex-wake.json").read_text())
     assert record["result"] == "resume requested (launcher 4321)"
+
+
+def test_a_resume_launcher_that_exits_with_a_failure_is_recorded(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    native = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    native_ticks = process.start_ticks(native.pid)
+    native.kill()
+    native.wait(timeout=5)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "session_id": "manual-session",
+            "session_pid": native.pid,
+            "session_ticks": native_ticks,
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+
+    class Child:
+        pid = 4322
+        returncode = 2
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        supervision.subprocess, "Popen", lambda command, **kwargs: Child()
+    )
+    observed = sampled(
+        bridge, paired, directory, "codex", 300, session="manual-session"
+    )
+    paired.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        observed,
+        supervision.DEFAULTS,
+    )
+    supervision.reap_launchers()
+    record = json.loads((directory / "codex-wake.json").read_text())
+    assert record["result"] == (
+        "resume failed (launcher 4322 exited with status 2)"
+    )
+    assert "exited with status 2" in supervision.undelivered_wake(record)
 
 
 @pytest.mark.parametrize(

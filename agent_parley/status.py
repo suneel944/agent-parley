@@ -1602,6 +1602,9 @@ class StatusMixin(BridgeCore):
             "wake_log": (
                 str(directory / f"{agent}-wake.log")
                 if state.get("attached") is False
+                or str(wake.get("result") or "").startswith(
+                    supervision.RESUME_FAILED
+                )
                 else ""
             ),
             "retired_at": views.timestamp(participant.get("retired")),

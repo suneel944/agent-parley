@@ -653,9 +653,11 @@ def _fold(
     a replaced lane's sources stay counted after it is gone. Every
     transcript of a lane is advanced from the byte offset the ledger
     recorded for it, so a transcript that stopped growing between polls is
-    read to its end. A new transcript is a new source even when it replays
-    messages an earlier one recorded, so a resumed session can be counted
-    twice. The records of a lane's side questions, kept under
+    read to its end. A new transcript that replays messages an earlier one
+    recorded, as a resumed session's does, skips the message identifiers
+    the lane's known transcripts already counted, as
+    `records.lane_sources` describes, so a resumed session is counted
+    once. The records of a lane's side questions, kept under
     `ask_directory`, are folded into that lane the same way. The fold also
     records the unmetered lanes and releases the calls
     reserved by admissions, whose use it has now read.
