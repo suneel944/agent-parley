@@ -16,10 +16,13 @@ from the start to its ready report. The token count is the client's own
 reading, never billed spend. Review findings are read from the ``reviews``
 record and are unknown when no round returned on that lane.
 
-The trial ends only when the operator keeps one lane's branch. That lane
-becomes the issue's ordinary owner, carrying its trial claim generation and
-any ready commit it reported; every other lane is released with the recorded
-outcome. Nothing here deletes a branch or a worktree. The ended trial is
+The trial ends only when the operator keeps one lane's branch or cancels it.
+A kept lane becomes the issue's ordinary owner, carrying its trial claim
+generation and any ready commit it reported; every other lane is released
+with the recorded outcome, and a cancel releases them all. A trial records
+the project's claim deadline, and the supervisor notifies its lanes once
+when it runs past it; nothing is ended for them. Nothing here deletes a
+branch or a worktree. The ended trial is
 appended to `RECORD_NAME`, which `metrics trials` reads per provider.
 """
 
@@ -38,6 +41,7 @@ MIN_LANES = 2
 RUNNING = "running"
 KEPT = "kept"
 RELEASED = "released"
+CANCELLED = "cancelled"
 TOKEN_LABEL = "client-reported tokens, not billed spend"
 _PASSED = re.compile(r"\b(\d+)\s+passed\b", re.IGNORECASE)
 _FAILED = re.compile(r"\b(\d+)\s+(?:failed|errors?)\b", re.IGNORECASE)
@@ -72,7 +76,9 @@ def member(record: dict | None, name: str) -> bool:
 def tests(evidence: str) -> dict:
     """Reads the test counts a ready report's evidence states.
 
-    Only explicit counts are read, such as pytest's ``12 passed, 1 failed``.
+    Only explicit counts are read, such as pytest's ``12 passed, 1 failed``,
+    and only from the last line stating one, so a failing run followed by a
+    rerun counts the rerun alone.
 
     Args:
         evidence: Evidence text the lane reported.
@@ -80,10 +86,15 @@ def tests(evidence: str) -> dict:
     Returns:
         ``run`` and ``passed``, each None when the evidence states no count.
     """
-    passed = sum(int(value) for value in _PASSED.findall(evidence))
-    failed = sum(int(value) for value in _FAILED.findall(evidence))
-    if not _PASSED.search(evidence) and not _FAILED.search(evidence):
+    stated = [
+        line
+        for line in evidence.splitlines()
+        if _PASSED.search(line) or _FAILED.search(line)
+    ]
+    if not stated:
         return {"run": None, "passed": None}
+    passed = sum(int(value) for value in _PASSED.findall(stated[-1]))
+    failed = sum(int(value) for value in _FAILED.findall(stated[-1]))
     return {"run": passed + failed, "passed": passed}
 
 
@@ -96,6 +107,7 @@ def start(
     base: str,
     readings: dict[str, dict | None],
     cap: int | None,
+    expected: float | None = None,
     now: float = 0.0,
 ) -> dict:
     """Records a trial of one issue across several lanes.
@@ -108,6 +120,8 @@ def start(
         base: Base commit every lane starts from.
         readings: Each lane's consumption reading at the start.
         cap: The project's `max_claims_per_lane`, or None for no cap.
+        expected: Seconds the trial is expected to take, recorded as its
+            deadline, or None for no deadline.
         now: Unix time; the clock when zero.
 
     Returns:
@@ -164,6 +178,7 @@ def start(
             "state": RUNNING,
             "base": base,
             "started": now,
+            "deadline": now + expected if expected else None,
             "ended": None,
             "kept": "",
             "lanes": {
@@ -359,13 +374,77 @@ def keep(
                 ),
             },
         )
-        archive = _read(directory)
-        if not any(item.get("id") == trial["id"] for item in archive):
-            archive.append(trial)
-        write_json(directory / RECORD_NAME, {"trials": archive[-MAX_ENDED:]})
-        ledger["revision"] += 1
-        write_json(directory / "issues.json", ledger)
+        _archive(directory, ledger, trial)
     return trial
+
+
+def cancel(directory: Path, issue: str, *, now: float = 0.0) -> dict:
+    """Ends a trial without keeping any lane's branch.
+
+    Every lane is released with the recorded outcome, the issue returns to
+    the queue with no owner, and no branch or worktree is touched.
+
+    Args:
+        directory: Private project state directory.
+        issue: Bare issue number the trial runs on.
+        now: Unix time; the clock when zero.
+
+    Returns:
+        The ended trial.
+
+    Raises:
+        BridgeError: If no trial runs on the issue.
+    """
+    from agent_parley import issues
+
+    now = now or time.time()
+    with lock(directory / "issues.lock", timeout=1):
+        ledger = issues.snapshot(directory)
+        record = ledger["issues"].get(issue)
+        trial = running(record)
+        if not trial:
+            raise BridgeError(f"Issue #{issue} runs no trial.")
+        assert record is not None
+        for entry in trial["lanes"].values():
+            entry.update(outcome=RELEASED, reason="operator cancelled")
+        trial.update(state=CANCELLED, ended=now)
+        record.pop("trial", None)
+        lifecycle.append_history(
+            record,
+            {
+                "action": "trial-cancel",
+                "actor": issues.OPERATOR,
+                "at": now,
+                "owner": None,
+                "offer": None,
+                "request": None,
+                "offer_id": None,
+                "claim_id": None,
+                "trial": trial["id"],
+                "released": sorted(trial["lanes"]),
+            },
+        )
+        _archive(directory, ledger, trial)
+    return trial
+
+
+def _archive(directory: Path, ledger: dict, trial: dict) -> None:
+    """Appends an ended trial to its record and writes the ledger.
+
+    Called under the ledger lock with the trial already removed from its
+    issue record.
+
+    Args:
+        directory: Private project state directory.
+        ledger: Issue ledger the trial was removed from.
+        trial: The ended trial.
+    """
+    archive = _read(directory)
+    if not any(item.get("id") == trial["id"] for item in archive):
+        archive.append(trial)
+    write_json(directory / RECORD_NAME, {"trials": archive[-MAX_ENDED:]})
+    ledger["revision"] += 1
+    write_json(directory / "issues.json", ledger)
 
 
 def ended(directory: Path) -> list[dict]:

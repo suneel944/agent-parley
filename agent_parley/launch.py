@@ -248,24 +248,30 @@ def lane_context(
 
     Returns:
         One line naming the lane and its worktree, one listing the claims
-        it still holds with their next action, and its last report held to
-        `ROTATION_REPORT_BYTES`.
+        it still holds with their next action, each trial it works marked
+        as one, and its last report held to `ROTATION_REPORT_BYTES`.
     """
-    from agent_parley import issues, lifecycle, supervision
+    from agent_parley import issues, lifecycle, supervision, trials
 
     ledger = issues.snapshot(directory)["issues"]
     held = sorted(
         (
             number
             for number, record in ledger.items()
-            if record.get("owner") == agent
+            if (record.get("owner") == agent or trials.member(record, agent))
             and lifecycle.state(record)["state"] != lifecycle.COMPLETE
         ),
         key=lambda number: (len(number), number),
     )
     claims = "; ".join(
-        f"#{number} ({lifecycle.state(ledger[number])['state']}: "
-        f"{lifecycle.describe_action(ledger[number])})"
+        (
+            f"#{number} (trial from base "
+            f"{trials.running(ledger[number])['base'][:12]}: work it on "
+            "your own branch and report ready; the operator keeps one lane)"
+            if trials.member(ledger[number], agent)
+            else f"#{number} ({lifecycle.state(ledger[number])['state']}: "
+            f"{lifecycle.describe_action(ledger[number])})"
+        )
         for number in held
     )
     rotation = state.get("rotation") or {}

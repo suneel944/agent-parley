@@ -5007,19 +5007,20 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "trial",
         help=(
             "Run one issue side by side across provider lanes, compare them "
-            "with trial show ISSUE, and keep one with trial keep ISSUE."
+            "with trial show ISSUE, keep one with trial keep ISSUE, or end "
+            "it keeping none with trial cancel ISSUE."
         ),
     )
     trying.add_argument(
         "target",
-        metavar="ISSUE|show|keep",
-        help="Issue number to start a trial of, or show or keep.",
+        metavar="ISSUE|show|keep|cancel",
+        help="Issue number to start a trial of, or show, keep or cancel.",
     )
     trying.add_argument(
         "issue",
         nargs="?",
         default="",
-        help="Issue number the show or keep reading names.",
+        help="Issue number the show, keep or cancel reading names.",
     )
     trying.add_argument(
         "--lanes",
@@ -6979,7 +6980,7 @@ def main() -> int:
             from agent_parley import trials
 
             repo = args.repo.resolve()
-            if args.target in ("show", "keep") and not args.issue:
+            if args.target in ("show", "keep", "cancel") and not args.issue:
                 parser.error(f"trial {args.target} needs an ISSUE.")
             if args.target == "show":
                 compared = bridge.trial_show(repo, args.issue)
@@ -7003,6 +7004,15 @@ def main() -> int:
                             name for name in ended["lanes"] if name != args.lane
                         )
                     )
+                    + "; no branch was deleted."
+                )
+            elif args.target == "cancel":
+                ended = bridge.trial_cancel(repo, args.issue)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Cancelled the trial of #{ended['issue']}; released "
+                    + ", ".join(sorted(ended["lanes"]))
                     + "; no branch was deleted."
                 )
             else:

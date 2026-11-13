@@ -257,6 +257,7 @@ class ReportsMixin(BridgeCore):
             state.get("session_pid"),
         )
         identifier = uuid.uuid4().hex[:16]
+        stated = evidence
         evidence, attached = attachments.spill(
             directory,
             "report",
@@ -282,7 +283,7 @@ class ReportsMixin(BridgeCore):
                     str(claim["issue"]),
                     outcome=outcome,
                     commit=commit,
-                    evidence=evidence,
+                    evidence=stated,
                     usage=budgets.claim_reading(
                         self.home, directory, data, agent
                     ),

@@ -160,7 +160,8 @@ def idle_lanes(directory: Path, manifest: dict) -> list[str]:
     """Lists running lanes that hold no claim and have no offer waiting.
 
     This is the reading ``followups.idle_lane`` takes its first entry from,
-    kept whole so a round can rank every idle lane by provider.
+    kept whole so a round can rank every idle lane by provider. A lane in a
+    running trial holds that trial's claim, so it never reviews a rival.
 
     Args:
         directory: Private project state directory.
@@ -169,13 +170,18 @@ def idle_lanes(directory: Path, manifest: dict) -> list[str]:
     Returns:
         Display names of such lanes, in participant name order.
     """
-    from agent_parley import checkpoints, issues, supervision
+    from agent_parley import checkpoints, issues, supervision, trials
 
     ledger = issues.snapshot(directory)
     busy = set(issues.holders(ledger))
     busy |= {
         str((record.get("offer") or {}).get("to") or "")
         for record in ledger.get("issues", {}).values()
+    }
+    busy |= {
+        lane
+        for record in ledger.get("issues", {}).values()
+        for lane in trials.running(record).get("lanes", {})
     }
     idle = []
     for name, entry in sorted(manifest.get("participants", {}).items()):

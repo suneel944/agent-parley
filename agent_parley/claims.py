@@ -168,7 +168,9 @@ class ClaimsMixin(ReportsMixin):
             The running trial.
 
         Raises:
-            BridgeError: If run from a lane, or `trials.start` refuses.
+            BridgeError: If run from a lane, a named lane's head is not the
+                base commit or its worktree has uncommitted tracked changes,
+                or `trials.start` refuses.
         """
         from agent_parley import budgets, supervision, trials
         from agent_parley.cli import git, parse_issue
@@ -176,20 +178,37 @@ class ClaimsMixin(ReportsMixin):
         directory, data = self._trial_operator(repo, "start")
         issue = parse_issue(number)
         names = lanes.split(",")
+        chosen = {item.strip() for item in names}
+        base = git(Path(data["root"]), "rev-parse", data["base"])
+        for name, participant in sorted(data["participants"].items()):
+            if name not in chosen:
+                continue
+            worktree = Path(participant["lane"])
+            if git(worktree, "rev-parse", "HEAD") != base:
+                raise BridgeError(
+                    f"{name}'s head is not the trial base {base[:12]}; "
+                    f"reset its worktree to {data['base']} first."
+                )
+            if git(worktree, "status", "--porcelain", "--untracked-files=no"):
+                raise BridgeError(
+                    f"{name}'s worktree has uncommitted changes; commit, "
+                    "stash or revert them before the trial starts."
+                )
         trial = trials.start(
             directory,
             data,
             issue,
             names,
-            base=git(Path(data["root"]), "rev-parse", data["base"]),
+            base=base,
             readings={
                 name: budgets.claim_reading(self.home, directory, data, name)
                 for name in data["participants"]
-                if name in {item.strip() for item in names}
+                if name in chosen
             },
             cap=supervision.configuration(self.home, data)[
                 "max_claims_per_lane"
             ],
+            expected=(data.get("deadlines") or {}).get("claim"),
         )
         for name, entry in trial["lanes"].items():
             self._trial_mail(
@@ -238,13 +257,20 @@ class ClaimsMixin(ReportsMixin):
             BridgeError: If run from a lane, or `trials.keep` refuses.
         """
         from agent_parley import trials
-        from agent_parley.cli import parse_issue
+        from agent_parley.cli import forge, issues, parse_issue
 
         directory, data = self._trial_operator(repo, "end")
         issue = parse_issue(number)
         trial = trials.keep(
             directory, issue, lane, defaults=data.get("deadlines") or {}
         )
+        forge.select(repo, data)
+        if (
+            not issues.forge_assignees(directory, issue)
+            and forge.assigned(repo, issue) is False
+            and forge.assign(repo, issue)
+        ):
+            forge_mark(directory, issue, added=True)
         for name, entry in trial["lanes"].items():
             self._trial_mail(
                 data,
@@ -254,17 +280,72 @@ class ClaimsMixin(ReportsMixin):
                 + (
                     f"You now own #{issue}."
                     if name == lane
-                    else f"You are released from #{issue}; your branch "
-                    f"{entry['branch']} is left as it is."
+                    else self._trial_release_text(data, issue, name, entry)
                 ),
             )
         return trial
+
+    def trial_cancel(self, repo: Path, number: str) -> dict:
+        """Ends a trial without keeping any lane's branch.
+
+        Every lane is released with the recorded outcome and the issue
+        returns to the queue unclaimed. No branch or worktree is deleted.
+
+        Args:
+            repo: Project base checkout.
+            number: Repository issue number.
+
+        Returns:
+            The ended trial.
+
+        Raises:
+            BridgeError: If run from a lane, or `trials.cancel` refuses.
+        """
+        from agent_parley import trials
+        from agent_parley.cli import parse_issue
+
+        directory, data = self._trial_operator(repo, "cancel")
+        issue = parse_issue(number)
+        trial = trials.cancel(directory, issue)
+        for name, entry in trial["lanes"].items():
+            self._trial_mail(
+                data,
+                name,
+                f"Trial of issue #{issue} was cancelled by the operator; "
+                "no branch was kept. "
+                + self._trial_release_text(data, issue, name, entry),
+            )
+        return trial
+
+    @staticmethod
+    def _trial_release_text(
+        data: dict, issue: str, name: str, entry: dict
+    ) -> str:
+        """Tells a released trial lane how to start its next work cleanly.
+
+        Args:
+            data: Project manifest.
+            issue: Bare issue number the trial ran on.
+            name: Released participant.
+            entry: The lane's trial entry.
+
+        Returns:
+            The release text with the commands that keep the trial work on
+            its own branch and reset the worktree to the project base.
+        """
+        return (
+            f"You are released from #{issue}; your branch {entry['branch']} "
+            "is left as it is. Before new work, keep the trial commits with "
+            f"git branch trial-{issue}-{name}, then reset your worktree with "
+            f"git reset --hard {data['base']}."
+        )
 
     def _trial_mail(self, data: dict, name: str, body: str) -> None:
         """Writes one operator message about a trial to a lane's inbox.
 
         Delivery is best effort: the trial is already recorded, so a lane
-        whose inbox cannot be written still reads it in status and show.
+        whose inbox cannot be written still reads it in status and show, and
+        a lane no longer on the roster is skipped.
 
         Args:
             data: Project manifest.
@@ -273,6 +354,8 @@ class ClaimsMixin(ReportsMixin):
         """
         from agent_parley.cli import operator_key, store
 
+        if name not in data["participants"]:
+            return
         identity = data["participants"][name].get("display", name)
         subject = "trial"
         with contextlib.suppress(BridgeError):

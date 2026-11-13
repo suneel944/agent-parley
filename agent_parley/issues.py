@@ -306,7 +306,8 @@ def deadline_notice(record: dict) -> dict:
     older ledgers kept after ownership ended. A no-progress notice is also
     silenced once the claim records progress after it was written, rather
     than at the supervisor's next poll, because its frozen idle age would
-    otherwise contradict the progress the holder just reported.
+    otherwise contradict the progress the holder just reported. An overdue
+    trial's notice names no holder and stands while that trial runs.
 
     Args:
         record: Published ledger record for one issue, or an empty mapping.
@@ -315,6 +316,9 @@ def deadline_notice(record: dict) -> dict:
         The recorded notice, or an empty mapping when it no longer applies.
     """
     notice = record.get("deadline_notice") or {}
+    if str(notice.get("id", "")).startswith("trial:"):
+        current = f"trial:{trials.running(record).get('id')}:"
+        return notice if notice["id"].startswith(current) else {}
     if (
         notice.get("holder")
         and notice["holder"] == record.get("owner")
