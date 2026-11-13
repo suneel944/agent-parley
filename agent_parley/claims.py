@@ -280,7 +280,9 @@ class ClaimsMixin(ReportsMixin):
                 + (
                     f"You now own #{issue}."
                     if name == lane
-                    else self._trial_release_text(data, issue, name, entry)
+                    else self._trial_release_text(
+                        data, issue, name, entry, trial["id"]
+                    )
                 ),
             )
         return trial
@@ -313,31 +315,39 @@ class ClaimsMixin(ReportsMixin):
                 name,
                 f"Trial of issue #{issue} was cancelled by the operator; "
                 "no branch was kept. "
-                + self._trial_release_text(data, issue, name, entry),
+                + self._trial_release_text(
+                    data, issue, name, entry, trial["id"]
+                ),
             )
         return trial
 
     @staticmethod
     def _trial_release_text(
-        data: dict, issue: str, name: str, entry: dict
+        data: dict, issue: str, name: str, entry: dict, trial: str
     ) -> str:
         """Tells a released trial lane how to start its next work cleanly.
+
+        The keeping branch carries the trial id, so a second trial of the
+        same issue on the same lane gets its own name, and the reset runs
+        only after that branch exists.
 
         Args:
             data: Project manifest.
             issue: Bare issue number the trial ran on.
             name: Released participant.
             entry: The lane's trial entry.
+            trial: Id of the trial that ended.
 
         Returns:
-            The release text with the commands that keep the trial work on
-            its own branch and reset the worktree to the project base.
+            The release text with the one command that keeps the trial work
+            on its own branch and then resets the worktree to the base.
         """
+        kept = f"trial-{issue}-{trial}-{name}"
         return (
-            f"You are released from #{issue}; your branch {entry['branch']} "
-            "is left as it is. Before new work, keep the trial commits with "
-            f"git branch trial-{issue}-{name}, then reset your worktree with "
-            f"git reset --hard {data['base']}."
+            f"You are released from #{issue}. Before new work, run "
+            f"git branch {kept} && git reset --hard {data['base']}. The "
+            f"reset moves your branch {entry['branch']} to the base; the "
+            f"trial commits stay on {kept}."
         )
 
     def _trial_mail(self, data: dict, name: str, body: str) -> None:

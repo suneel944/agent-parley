@@ -334,10 +334,18 @@ def test_cancel_releases_every_lane_and_requeues_the_issue(
     assert git(repo, "branch", "--list", ended["lanes"]["claude"]["branch"])
     with pytest.raises(BridgeError, match="runs no trial"):
         bridge.trial_cancel(repo, "7")
+    data = roster.read(directory)
+    entry = ended["lanes"]["claude"]
     released = bridge._trial_release_text(
-        roster.read(directory), "7", "claude", ended["lanes"]["claude"]
+        data, "7", "claude", entry, ended["id"]
     )
-    assert "git reset --hard" in released
+    kept = f"trial-7-{ended['id']}-claude"
+    assert f"git branch {kept} && git reset --hard {data['base']}" in released
+    assert f"trial commits stay on {kept}" in released
+    assert "left as it is" not in released
+    second = bridge._trial_release_text(data, "7", "claude", entry, "other")
+    assert "trial-7-other-claude" in second
+    assert kept not in second
 
 
 def test_trial_start_refuses_a_dirty_or_moved_lane(
