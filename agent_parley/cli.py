@@ -1598,12 +1598,17 @@ def selection_plan(
     return "\n".join(lines)
 
 
-def confirmed(proposal: str, assume_yes: bool) -> bool:
+def confirmed(
+    proposal: str,
+    assume_yes: bool,
+    question: str = "Proceed with these lanes?",
+) -> bool:
     """Prints one plan and asks once for the whole selected set.
 
     Args:
         proposal: The plan the operator reads before answering.
         assume_yes: Whether `--yes` already confirmed the whole set.
+        question: What the prompt asks, naming everything the plan changes.
 
     Returns:
         Whether the operator confirmed. A closed or empty answer declines.
@@ -1612,7 +1617,7 @@ def confirmed(proposal: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     try:
-        answer = input("Proceed with these lanes? [y/N]: ")
+        answer = input(f"{question} [y/N]: ")
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")
@@ -1759,12 +1764,42 @@ def applied_remedy(bridge: Bridge, row: dict) -> str:
     return " ".join(supervision.forgotten_lines(removed))
 
 
+def session_returned(bridge: Bridge, row: dict) -> bool:
+    """Tells whether a retirement's lane may have a session again.
+
+    The listing read the session process before the prompt, and the
+    operator may answer much later. A native session started in the
+    worktree since then holds no session lock, so the process is read once
+    more right before the retirement, which runs only while it is known to
+    be gone.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        True when the row retires a lane whose session process is now alive
+        or unreadable; False for a gone process or a collection.
+
+    Raises:
+        BridgeError: If the row's project is no longer registered.
+    """
+    if row["action"]["kind"] != problems.RETIRE_ACTION:
+        return False
+    directory = bridge.project(Path(row["project"]), create=False)[1]
+    reading = supervision.presence(directory, row["participant"])
+    return reading["process_alive"] is not False
+
+
 def applied_remedies(bridge: Bridge, rows: list[dict], assume_yes: bool) -> int:
     """Runs every remedy `problems` classes safe, after one confirmation.
 
     The plan names each safe remedy and each skipped one with its reason,
-    and one question covers the whole safe set. A remedy that refuses or
-    fails is reported beside its label while the rest are still run.
+    and one question covers the whole safe set, naming the lanes it retires
+    and the projects whose state it collects. A remedy that refuses or
+    fails is reported beside its label while the rest are still run. A
+    retirement whose session process `session_returned` finds again is
+    reported skipped, not failed.
 
     Args:
         bridge: Launcher holding the private coordination state.
@@ -1790,13 +1825,32 @@ def applied_remedies(bridge: Bridge, rows: list[dict], assume_yes: bool) -> int:
         plan.append("No safe remedy to run, so nothing was done.")
         print("\n".join(plan))
         return 0
-    if not confirmed("\n".join(plan), assume_yes):
+    retiring = sum(
+        row["action"]["kind"] == problems.RETIRE_ACTION for row in safe
+    )
+    changes = []
+    if retiring:
+        changes.append(f"retiring {retiring} lane(s)")
+    if len(safe) > retiring:
+        changes.append(
+            f"collecting the state of {len(safe) - retiring} project(s)"
+        )
+    question = f"Proceed with {' and '.join(changes)}?"
+    if not confirmed("\n".join(plan), assume_yes, question):
         print("Declined: nothing was done.")
         return 1
     failed = []
+    late = []
     for row in safe:
         label = remedy_label(row)
         try:
+            if session_returned(bridge, row):
+                print(
+                    f"- {label}: skipped. Its session process may be "
+                    "running again, so the lane is kept."
+                )
+                late.append(label)
+                continue
             print(f"- {label}: {applied_remedy(bridge, row)}")
         except (
             BridgeError,
@@ -1806,7 +1860,10 @@ def applied_remedies(bridge: Bridge, rows: list[dict], assume_yes: bool) -> int:
         ) as failure:
             print(f"- {label}: failed. {failure}")
             failed.append(label)
-    tally = f"Ran {len(safe) - len(failed)} of {len(safe)} safe remedy(s)"
+    ran = len(safe) - len(failed) - len(late)
+    tally = f"Ran {ran} of {len(safe)} safe remedy(s)"
+    if late:
+        tally += f". Skipped: {'; '.join(late)}"
     if failed:
         tally += f". Failed: {'; '.join(failed)}"
     print(f"{tally}.")

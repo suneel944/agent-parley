@@ -1844,14 +1844,18 @@ def _collect_rows(home: Path) -> list[dict]:
     `status` and `derive` skip such a project, because nothing in it can
     act, so its rows exist only for `remedies`: the state directory stays
     until `supervision.forget` collects it, and collecting it keeps the
-    recovery checkpoints, so it drops no work.
+    recovery checkpoints, so it drops no work. `supervision.forget` refuses
+    a project with a lane that may still run or whose retirement was
+    refused, so such a project's action names that reason, as `_root_rows`
+    does, rather than failing every apply.
 
     Args:
         home: Private bridge state root.
 
     Returns:
-        One `ROOT` row per collectable project, carrying a safe
-        `COLLECT_ACTION`.
+        One `ROOT` row per project whose retired root is gone, carrying a
+        `COLLECT_ACTION` that is safe unless `supervision.forget` would
+        refuse it.
     """
     found = []
     for path in sorted((home / "projects").glob("*/project.json")):
@@ -1862,13 +1866,21 @@ def _collect_rows(home: Path) -> list[dict]:
         root = str(data["root"])
         if Path(root).exists() or not supervision.root_retired(path.parent):
             continue
+        live = supervision.running_lanes(path.parent, data["participants"])
+        reason = (
+            f"live lanes may still be running: {', '.join(live)}"
+            if live
+            else "lanes hold work their retirement refused to release"
+            if supervision.root_refused(path.parent)
+            else ""
+        )
         row = _row(
             ROOT,
             ROOT_COLLECTABLE,
             protocol.FORGET_ROOT.format(root=shlex.quote(root)),
             project=root,
         )
-        row["action"] = _action(COLLECT_ACTION)
+        row["action"] = _action(COLLECT_ACTION, reason)
         found.append(row)
     return found
 

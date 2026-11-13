@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeGuard, cast
@@ -9136,6 +9136,28 @@ def root_returned(directory: Path, manifest: dict) -> None:
         kept.unlink(missing_ok=True)
 
 
+def running_lanes(directory: Path, names: Iterable[str]) -> list[str]:
+    """Names the lanes whose session process may still be running.
+
+    Args:
+        directory: Private project state directory.
+        names: Participant names to read.
+
+    Returns:
+        Each name whose session process is alive or whose identity cannot be
+        read, in the order given; `forget` keeps a project while any remain.
+    """
+    live = []
+    for name in names:
+        reading = presence(directory, name)
+        if (
+            reading["process_alive"] is True
+            or reading["evidence"] in STILL_RUNNING
+        ):
+            live.append(name)
+    return live
+
+
 def forget(
     home: Path, root: str, *, apply: bool = False, discard: bool = False
 ) -> dict:
@@ -9190,14 +9212,7 @@ def forget(
             f"{named} still exists, so its project state is kept; retire "
             "its lanes with `agent-parley participant retire` instead."
         )
-    live = []
-    for name in data["participants"]:
-        reading = presence(directory, name)
-        if (
-            reading["process_alive"] is True
-            or reading["evidence"] in STILL_RUNNING
-        ):
-            live.append(name)
+    live = running_lanes(directory, data["participants"])
     if live:
         raise BridgeError(
             f"Lanes of {named} may still be running: {', '.join(live)}; "
