@@ -2108,16 +2108,28 @@ every project series `project`. The lane families are
 `agent_parley_lane_pull_requests_merged_window`,
 `agent_parley_lane_pull_requests_closed_window`,
 `agent_parley_lane_first_pass_ratio`, `agent_parley_lane_ci_rounds_unknown`,
-`agent_parley_lane_ci_rounds_median` and
-`agent_parley_lane_claim_to_merge_seconds_median`. The project families are
+`agent_parley_lane_ci_rounds_median`,
+`agent_parley_lane_claim_to_merge_seconds_median`,
+`agent_parley_lane_merge_fraction_ratio`,
+`agent_parley_lane_pull_requests_abandoned_window`,
+`agent_parley_lane_pull_requests_end_unknown_window` and
+`agent_parley_lane_shared_file_degree_ratio`. The project families are
 `agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
 `agent_parley_project_context_bytes_window`,
 `agent_parley_project_hook_events_window`,
-`agent_parley_project_hook_denials_window` and
-`agent_parley_project_pull_requests_excluded`; the summed families add up the
+`agent_parley_project_hook_denials_window`,
+`agent_parley_project_pull_requests_excluded`,
+`agent_parley_project_merge_fraction_ratio`,
+`agent_parley_project_pull_requests_abandoned_window`,
+`agent_parley_project_pull_requests_end_unknown_window` and
+`agent_parley_project_shared_file_degree_ratio`; the summed families add up the
 rows that project reports, so a total never counts a lane the export does not
-show. The pull request families are explained in
-[Monitoring](monitoring.md).
+show. The provider families, labelled `project` and `provider`, are
+`agent_parley_provider_merge_fraction_ratio`,
+`agent_parley_provider_pull_requests_abandoned_window`,
+`agent_parley_provider_pull_requests_end_unknown_window` and
+`agent_parley_provider_shared_file_degree_ratio`. The pull request and merge
+health families are explained in [Monitoring](monitoring.md).
 `agent_parley_lane_hook_denials_by_cause_window` splits a lane's denials by
 `reason` and `tool`, so a refusal over a reserved path or an expiring offer
 reads apart from a policy refusal.

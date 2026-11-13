@@ -20,6 +20,7 @@ retention kept is reported as incomplete rather than quietly counted as zero.
 
 from __future__ import annotations
 
+import collections
 import datetime
 import json
 import sqlite3
@@ -672,6 +673,14 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
     when it left the open list without one. One whose reading names no lane
     and no claim names either is excluded and counted as such.
 
+    A closed unmerged pull request is abandoned only when the forge read
+    supervision made as it left the open list, stored as ``ended``, said
+    ``CLOSED``. One with no such answer, such as a reading archived before
+    the answer was stored, is counted as unknown, never as abandoned; a
+    failed read keeps the pull request in the open list. The merge
+    fraction is the share of pull requests opened in the window that a
+    resolution or that forge read records as merged.
+
     Args:
         record: Parsed pull request record, or anything else when it could
             not be read, which reports nothing.
@@ -680,11 +689,12 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
 
     Returns:
         ``lanes`` mapping each participant with an outcome to its counts,
-        first-pass rate over merged pull requests with a known CI round
-        count, the count without one, the median CI rounds and the median
-        claim-to-merge seconds, with None for a rate or a median over
-        nothing, so a lane without the data reports no value; and
-        ``excluded``, the pull requests no lane owns.
+        merge fraction, abandoned and unknown-end counts, first-pass rate
+        over merged pull requests with a known CI round count, the count
+        without one, the median CI rounds and the median claim-to-merge
+        seconds, with None for a fraction, a rate or a median over nothing,
+        so a lane without the data reports no value; and ``excluded``, the
+        pull requests no lane owns.
     """
     stored = record if isinstance(record, dict) else {}
     opened = stored.get("pull_requests")
@@ -718,6 +728,9 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
                 "rounds": [],
                 "unknown": 0,
                 "seconds": [],
+                "landed": 0,
+                "abandoned": 0,
+                "unread": 0,
             },
         )
 
@@ -732,7 +745,11 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
         counted.add(number)
         owner = item.get("lane") or every.get(number, {}).get("lane")
         if owner:
-            tally(str(owner))["opened"] += 1
+            counts = tally(str(owner))
+            counts["opened"] += 1
+            counts["landed"] += int(
+                number in every or item.get("ended") == "MERGED"
+            )
         else:
             excluded.add(number)
     for number, item in readings.items():
@@ -743,7 +760,11 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
         ):
             continue
         if item.get("lane"):
-            tally(str(item["lane"]))["closed"] += 1
+            counts = tally(str(item["lane"]))
+            counts["closed"] += 1
+            ended = item.get("ended")
+            counts["abandoned"] += int(ended == "CLOSED")
+            counts["unread"] += int(ended not in {"CLOSED", "MERGED"})
         else:
             excluded.add(number)
     for number, merge in merged.items():
@@ -764,6 +785,14 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
                 "pull_requests_opened": counts["opened"],
                 "pull_requests_merged": counts["merged"],
                 "pull_requests_closed": counts["closed"],
+                "pull_requests_opened_merged": counts["landed"],
+                "pull_requests_abandoned": counts["abandoned"],
+                "pull_requests_end_unknown": counts["unread"],
+                "merge_fraction": (
+                    counts["landed"] / counts["opened"]
+                    if counts["opened"]
+                    else None
+                ),
                 "first_pass": counts["first"],
                 "first_pass_known": len(counts["rounds"]),
                 "first_pass_rate": (
@@ -828,6 +857,65 @@ def outcome_line(outcomes: dict, window: str) -> str:
         + (f" ({unknown} without CI rounds)" if unknown else "")
         + (f", {excluded} unowned excluded" if excluded else "")
     )
+
+
+def share_files(rows: list[dict]) -> None:
+    """Marks on each lane row the files another lane of its project touches.
+
+    The footprint is the diff `top` already reads, each row's
+    ``diff_paths``; a row whose diff could not be read touches nothing.
+
+    Args:
+        rows: Every participant row of one project, before any filter,
+            each gaining ``shared_paths`` and ``shared_file_degree``, the
+            share of its own files another lane touches, or None for a lane
+            that touches no file.
+    """
+    touched = collections.Counter(
+        path for row in rows for path in set(row.get("diff_paths") or [])
+    )
+    for row in rows:
+        own = set(row.get("diff_paths") or [])
+        shared = sorted(path for path in own if touched[path] > 1)
+        row["shared_paths"] = shared
+        row["shared_file_degree"] = len(shared) / len(own) if own else None
+
+
+def merge_health(rows: list[dict]) -> dict:
+    """Sums merge fraction, abandonment and file sharing over lane rows.
+
+    Args:
+        rows: Lane rows carrying the counts of `pull_request_outcomes` and
+            the marks of `share_files`, such as one project's or one
+            provider's reported rows.
+
+    Returns:
+        The opened, opened-and-merged, abandoned and unknown-end counts,
+        ``merge_fraction`` and ``shared_file_degree``, the share of the
+        files the rows touch that more than one lane touches. Each share is
+        None over nothing, so no pull request reports no fraction, not 0.
+    """
+    counts = {
+        key: sum(int(row.get(key) or 0) for row in rows)
+        for key in (
+            "pull_requests_opened",
+            "pull_requests_opened_merged",
+            "pull_requests_abandoned",
+            "pull_requests_end_unknown",
+        )
+    }
+    files = {path for row in rows for path in row.get("diff_paths") or []}
+    shared = {path for row in rows for path in row.get("shared_paths") or []}
+    return {
+        **counts,
+        "merge_fraction": (
+            counts["pull_requests_opened_merged"]
+            / counts["pull_requests_opened"]
+            if counts["pull_requests_opened"]
+            else None
+        ),
+        "shared_file_degree": len(shared) / len(files) if files else None,
+    }
 
 
 def _bucket(state: str, cause: str) -> str:
