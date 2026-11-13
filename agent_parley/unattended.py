@@ -381,6 +381,35 @@ def _replayed(directory: Path, name: str, key: tuple) -> dict | None:
     return None
 
 
+def _repeated(directory: Path, name: str, key: tuple, reason: str) -> bool:
+    """Reports whether a service refusal would repeat the lane's newest one.
+
+    The service evaluates a refused claim again on every poll, so a cause
+    that has not cleared would otherwise append and mail the same refusal
+    each time. Only the newest decision counts: once anything else was
+    recorded, the refusal is news again.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant whose lane is evaluated.
+        key: Issue, claim generation and source commit this attempt read.
+        reason: The unmet condition this attempt found.
+
+    Returns:
+        True when the newest decision is a refusal of the same claim for
+        the same reason.
+    """
+    newest = latest(directory, name)
+    if newest is None or newest.get("outcome") != REFUSED:
+        return False
+    evidence = newest.get("evidence") or {}
+    return (
+        evidence.get("issue"),
+        evidence.get("claim_id"),
+        evidence.get("source_commit"),
+    ) == key and newest.get("reason") == reason[:MAX_REASON]
+
+
 def _evaluate(
     bridge: Bridge,
     root: Path,
@@ -513,9 +542,17 @@ def _conditions(
     target_commit = git(root, "rev-parse", "HEAD")
     evidence["target_commit"] = target_commit
     standing = merges.integration_record(directory)
-    if standing and merges.integration_holds(root, standing):
+    if (
+        standing
+        and merges.integration_holds(root, standing)
+        and not (
+            merges.integration_owner(directory, standing) == name
+            and standing.get("issue") == issue
+        )
+    ):
         return (
-            "Unattended integration never repairs an unverified base. "
+            "Unattended integration never repairs an unverified base for "
+            "a lane that does not own it. "
             + merges.integration_hold(root, directory, standing)
         )
     waits = merges.dependency_refusal(ledger, issue)
@@ -697,6 +734,11 @@ def integrate(
                 "and recorded complete; nothing was merged again."
             )
         if unmet:
+            if actor and _repeated(directory, name, key, unmet):
+                raise BridgeError(
+                    f"Unattended integration of {name} is still refused; "
+                    f"nothing was merged. {unmet}"
+                )
             raise refuse(directory, name, evidence, unmet)
         try:
             tree = _candidate(root, directory, data, evidence)
@@ -777,7 +819,11 @@ def _decided(
     source commit settles it, unless that decision read a target commit
     the base has since moved from, or it failed only because the lane's
     session was running, which ends without changing anything the key
-    names.
+    names. A refusal never settles: its cause, such as the base checkout
+    off the target branch, a peer reservation or another lane's unverified
+    integration, can clear without changing the key or the target, so the
+    claim is evaluated again on every poll. `integrate` records and mails
+    a repeated refusal only when its reason changed.
 
     Args:
         directory: Private state directory for the common repository.
@@ -801,6 +847,8 @@ def _decided(
         )
         if bound != key:
             continue
+        if record.get("outcome") == REFUSED:
+            return False
         read = evidence.get("target_commit")
         return not (read and read != target_commit) and record.get(
             "reason"

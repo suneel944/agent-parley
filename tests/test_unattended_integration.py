@@ -457,6 +457,32 @@ def test_an_unverified_base_is_refused_and_never_repaired(bridge, repo, ready):
     assert "claude's integration" in refusal["reason"]
 
 
+def test_the_owner_completes_its_own_unverified_integration(
+    bridge, repo, ready, monkeypatch
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    complete = lifecycle.complete
+
+    def busy(*arguments):
+        raise BridgeError("issues.lock is held")
+
+    monkeypatch.setattr(lifecycle, "complete", busy)
+    with pytest.raises(BridgeError, match="could not be recorded complete"):
+        unattended.integrate(bridge, repo, "codex")
+    integrated = git(repo, "rev-parse", "HEAD")
+    assert merges.integration_record(directory)["lane"] == "codex"
+    assert execution(directory)["state"] == lifecycle.READY
+    monkeypatch.setattr(lifecycle, "complete", complete)
+
+    unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD") == integrated
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert merges.integration_record(directory) is None
+    assert decisions(directory)[-1]["outcome"] == unattended.INTEGRATED
+
+
 def test_an_unconfigured_gate_is_refused(bridge, repo, ready):
     authorize(bridge, repo, ready)
     bridge.verification(repo, "")
@@ -689,6 +715,28 @@ def test_auto_records_an_unchanged_refusal_once(bridge, repo, ready):
     assert refusal["outcome"] == unattended.REFUSED
     assert "not the policy target" in refusal["reason"]
     assert subjects(bridge, repo) == ["Unattended integration refused"]
+
+
+def test_auto_retries_a_refusal_once_its_cause_clears(bridge, repo, ready):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+    git(repo, "switch", "-c", "elsewhere")
+    tick(bridge, directory)
+
+    git(repo, "switch", ready["target"])
+    tick(bridge, directory)
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert [record["outcome"] for record in decisions(directory)] == [
+        unattended.REFUSED,
+        unattended.INTEGRATED,
+    ]
+    assert subjects(bridge, repo) == [
+        "Unattended integration refused",
+        "Unattended integration integrated",
+    ]
 
 
 def test_auto_records_a_failure_once_and_raises_a_problem(
