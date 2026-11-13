@@ -615,12 +615,15 @@ def ci_rounds(reading: dict | None) -> int | None:
     return value
 
 
-def _merges(ledger: dict, since: float) -> dict[str, dict]:
+def _merges(
+    ledger: dict, since: float, until: float | None = None
+) -> dict[str, dict]:
     """Lists the pull requests a claim's resolution recorded as merged.
 
     Args:
         ledger: Published issue ledger.
         since: Unix time the window starts.
+        until: Unix time the window ends, or None for no upper bound.
 
     Returns:
         One entry per pull request number merged inside the window: the
@@ -645,7 +648,7 @@ def _merges(ledger: dict, since: float) -> dict[str, dict]:
             ):
                 continue
             at = float(evidence.get("closed_at") or entry.get("at") or 0)
-            if at < since:
+            if at < since or (until is not None and at > until):
                 continue
             merged[str(int(evidence["pull_request"]))] = {
                 "lane": str(entry["holder"]),
@@ -1593,7 +1596,8 @@ def _lane_cost_row(
     """Joins one lane's priced tokens with what it shipped."""
     provider = str(participant.get("provider", ""))
     model = str(participant.get("model", ""))
-    rates = table.get(provider, {}).get(model)
+    rows = table.get(provider, {})
+    rates = rows.get(model or "default")
     spent = lane_cost(tokens, rates)
     if tokens is None:
         reason = "the provider reports no token count"
@@ -1659,17 +1663,19 @@ def _project_cost(
         ledger = issues.snapshot(directory)
     except (OSError, ValueError):
         ledger = {"issues": {}}
-    merges = _merges(ledger, since)
+    merges = _merges(ledger, since, now)
     found: dict[str, int] = {}
     for entry in reviews.rounds(directory):
-        if (
-            entry.get("state") == reviews.RETURNED
-            and since <= float(entry.get("returned") or 0) <= now
-        ):
+        if entry.get("state") != reviews.RETURNED:
+            continue
+        try:
+            returned = float(entry.get("returned") or 0)
+            count = int(entry.get("findings") or 0)
+        except (TypeError, ValueError):
+            continue
+        if since <= returned <= now:
             reviewer = str(entry.get("reviewer", ""))
-            found[reviewer] = found.get(reviewer, 0) + int(
-                entry.get("findings") or 0
-            )
+            found[reviewer] = found.get(reviewer, 0) + count
     measured = {}
     for name in sorted(manifest["participants"]):
         participant = manifest["participants"][name]
@@ -1702,7 +1708,9 @@ def cost(home: Path, since: float, now: float = 0.0) -> dict:
     are the clients' own and the rates the operator's, so every figure is an
     estimate and never billed spend. A lane whose provider reports no token
     count, or whose model has no price row, is unknown and adds nothing to a
-    provider's total. A divisor of zero leaves its figure unknown.
+    provider's total. A divisor of zero leaves its figure unknown. A lane
+    with no recorded model is priced with the row its provider names
+    ``default``, and a lane with a recorded model never is.
 
     Args:
         home: Private bridge state root.
@@ -1711,9 +1719,11 @@ def cost(home: Path, since: float, now: float = 0.0) -> dict:
 
     Returns:
         ``estimate``, ``price_table_version`` and, once a table is
-        recorded, ``since``, ``until`` and one entry per project with its
-        ``lanes`` and ``providers``; otherwise a ``message`` that no price
-        table is recorded and no project figures.
+        recorded, ``since``, ``until``, one entry per project with its
+        ``lanes`` and ``providers``, and ``providers`` totalled across every
+        project, so the cheapest provider per shipped unit can be read;
+        otherwise a ``message`` that no price table is recorded and no
+        project figures.
     """
     table = roster.price_table(home)
     if not table:
@@ -1723,15 +1733,23 @@ def cost(home: Path, since: float, now: float = 0.0) -> dict:
             "message": NO_PRICE_TABLE,
         }
     ends = now or time.time()
+    projects = [
+        _project_cost(home, directory, manifest, (since, ends), table)
+        for directory, manifest in _manifests(home)
+    ]
     return {
         "estimate": ESTIMATE,
         "price_table_version": roster.price_version(table),
         "since": since,
         "until": ends,
-        "projects": [
-            _project_cost(home, directory, manifest, (since, ends), table)
-            for directory, manifest in _manifests(home)
-        ],
+        "projects": projects,
+        "providers": _provider_cost_rows(
+            {
+                f"{project['root']}:{name}": row
+                for project in projects
+                for name, row in project["lanes"].items()
+            }
+        ),
     }
 
 
@@ -1777,6 +1795,10 @@ def describe_cost(reading: dict) -> str:
             f"{_money(counts['cost_per_finding']):>12}"
         )
 
+    lines += ["", "All projects", header("PROVIDER")]
+    lines += [
+        row(name, counts, "") for name, counts in reading["providers"].items()
+    ]
     for project in reading["projects"]:
         lines += ["", f"Project {project['root']}", header("LANE")]
         lines += [

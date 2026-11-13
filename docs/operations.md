@@ -2264,12 +2264,19 @@ change to a rate gives a new version.
 
 `metrics cost --since` takes an instant or a window like `metrics throughput`
 and joins each lane's native client token counts in the window with what the
-lane shipped in it. A lane's model comes from its participant record. Its
+lane shipped in it. A lane's model comes from its participant record; a lane
+with no recorded model is priced with the row named `default`
+(`provider price NAME --model default ...`), and a lane whose recorded model
+has no row is `unknown` and never falls back to `default`. Its
 input is split into cache-read tokens, priced at the cache-read rate, and the
-rest, priced at the input rate. Per project it prints a lane table and a
-provider table with the estimated cost and the cost per merged issue, per
-merged pull request and per review finding the lane returned as a reviewer.
-`--json` prints one document that carries `price_table_version`.
+rest, priced at the input rate. It prints a provider table totalled across
+every project, so the provider with the lowest cost per shipped unit can be
+read, then per project a lane table and a provider table, each with the
+estimated cost and the cost per merged issue, per merged pull request and per
+review finding the lane returned as a reviewer. Merges, tokens and findings
+all stop at the window end. `--json` prints one document that carries
+`price_table_version`, the per-project figures and the cross-project
+`providers`.
 
 The output is an estimate from the clients' own token counts and the
 operator's recorded prices. It is not billed spend, and the command makes no

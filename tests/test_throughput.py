@@ -552,3 +552,169 @@ def test_a_model_price_is_validated(bridge):
     ):
         with pytest.raises(BridgeError, match="model price"):
             roster.price({"models": {"opus": rates}})
+
+
+def test_a_malformed_review_round_is_skipped_not_fatal(bridge, repo, priced):
+    directory = bridge.project(repo)[1]
+    good = json.loads((directory / "reviews.json").read_text())
+    rounds = good["rounds"]
+    rounds["r2"] = {**rounds["r1"], "id": "r2", "returned": "x"}
+    rounds["r3"] = {**rounds["r1"], "id": "r3", "findings": "2a"}
+    write_json(directory / "reviews.json", {**good, "next": 4})
+    reading = metrics.cost(bridge.home, priced["since"])
+    assert reading["projects"][0]["lanes"]["claude"]["findings"] == 2
+
+
+def test_a_lane_with_no_recorded_model_uses_the_default_row(
+    bridge, repo, window, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    monkeypatch.chdir(repo)
+    bridge.price(repo, "claude", None, "default", RATES)
+    reading = metrics.cost(bridge.home, window["since"])
+    claude = reading["projects"][0]["lanes"]["claude"]
+    assert claude["model"] == ""
+    assert claude["estimated_cost"] == 0.4502
+    manifest = json.loads((directory / "project.json").read_text())
+    manifest["participants"]["claude"]["model"] = "sonnet"
+    write_json(directory / "project.json", manifest)
+    reading = metrics.cost(bridge.home, window["since"])
+    named = reading["projects"][0]["lanes"]["claude"]
+    assert named["estimated_cost"] is None
+    assert "no price row for claude model sonnet" in named["unknown_reason"]
+
+
+def test_merges_after_the_window_end_are_not_counted(bridge, priced):
+    ledger = {"issues": {"43": resolved("codex", 43, priced["now"] - 600)}}
+    assert len(metrics._merges(ledger, 0.0)) == 1
+    assert len(metrics._merges(ledger, 0.0, priced["now"])) == 1
+    assert metrics._merges(ledger, 0.0, priced["now"] - 900) == {}
+    early = metrics.cost(bridge.home, priced["since"], priced["now"] - 900)
+    lanes = early["projects"][0]["lanes"]
+    assert lanes["codex"]["pull_requests"] == 0
+    assert lanes["claude"]["pull_requests"] == 1
+    later = metrics.cost(bridge.home, priced["since"], priced["now"])
+    assert later["projects"][0]["lanes"]["codex"]["pull_requests"] == 1
+
+
+def test_providers_are_totalled_across_projects(bridge, priced):
+    reading = metrics.cost(bridge.home, priced["since"])
+    root = reading["projects"][0]["root"]
+    assert reading["providers"]["claude"]["estimated_cost"] == 0.4502
+    assert reading["providers"]["claude"]["cost_per_pull_request"] == 0.4502
+    assert reading["providers"]["codex"]["unknown_lanes"] == [f"{root}:codex"]
+    printed = metrics.describe_cost(reading)
+    assert printed.index("All projects") < printed.index("Project ")
+    assert "claude" in printed.split("Project ")[0]
+
+
+def test_a_cached_codex_total_is_counted_as_a_window_delta(tmp_path):
+    rollout = lines(
+        tmp_path / "rollout.jsonl",
+        [
+            {
+                "timestamp": iso(50),
+                "payload": {
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 10,
+                        }
+                    }
+                },
+            },
+            {
+                "timestamp": iso(150),
+                "payload": {
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 400,
+                            "cached_input_tokens": 120,
+                            "output_tokens": 40,
+                        }
+                    }
+                },
+            },
+        ],
+    )
+    assert metrics._file_tokens(rollout, "codex", 100.0, 200.0) == (
+        300,
+        30,
+        100,
+    )
+
+
+def test_a_recorded_run_is_priced_through_the_command(
+    bridge, repo, paired, priced, monkeypatch, capsys
+):
+    directory = bridge.project(repo)[1]
+    manifest = json.loads((directory / "project.json").read_text())
+    manifest["participants"]["codex"]["model"] = "gpt"
+    write_json(directory / "project.json", manifest)
+    bridge.price(repo, "codex", None, "gpt", RATES)
+    day = datetime.date.today()
+    lines(
+        Path(records.DEFAULT_HOMES["codex"])
+        / "sessions"
+        / f"{day:%Y}"
+        / f"{day:%m}"
+        / f"{day:%d}"
+        / "rollout-recorded.jsonl",
+        [
+            {
+                "type": "session_meta",
+                "payload": {"cwd": str(paired["lanes"]["codex"])},
+            },
+            {
+                "timestamp": iso(priced["now"] - 8000),
+                "payload": {
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 200,
+                            "output_tokens": 100,
+                        }
+                    }
+                },
+            },
+            {
+                "timestamp": iso(priced["now"] - 500),
+                "payload": {
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 3000,
+                            "cached_input_tokens": 1200,
+                            "output_tokens": 300,
+                        }
+                    }
+                },
+            },
+        ],
+    )
+    document = json.loads(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "metrics",
+            "cost",
+            "--since",
+            "2h",
+            "--json",
+        )
+    )
+    assert "not billed spend" in document["estimate"]
+    assert document["price_table_version"] == roster.price_version(
+        roster.price_table(bridge.home)
+    )
+    found = document["projects"][0]["lanes"]
+    assert found["claude"]["estimated_cost"] == 0.4502
+    assert found["claude"]["cost_per_finding"] == 0.2251
+    assert found["codex"]["estimated_cost"] == 2.1
+    assert found["codex"]["cost_per_pull_request"] == 2.1
+    assert found["codex"]["cost_per_issue"] == 2.1
+    assert found["codex"]["cost_per_finding"] is None
+    assert document["providers"]["codex"]["estimated_cost"] == 2.1
+    assert document["providers"]["claude"]["estimated_cost"] == 0.4502
