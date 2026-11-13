@@ -41,7 +41,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -820,12 +820,140 @@ def decide(
         return CONFIRMING, record
     if record.get("kind") == followups.KIND:
         followups.accept_decision(directory, record)
+    carry = _carrying(home, directory, record, option, answered_by, note)
     answered = decisions.answer(directory, name, option, answered_by, note=note)
+    if carry is not None:
+        if decisions.applied(directory, name):
+            carry()
+        return ANSWERED, answered
     if answered.get("kind") == notify.Event.NATIVE_DIALOG.value:
         return ANSWERED, answered
     with contextlib.suppress(OSError, ValueError, BridgeError, sqlite3.Error):
         settle(home, directory, answered)
     return ANSWERED, answered
+
+
+def _permission(
+    directory: Path,
+    record: Mapping[str, object],
+    option: str,
+    answered_by: str,
+    note: str,
+) -> None:
+    """Carries a permission prompt answer to the dialog its lane shows.
+
+    The lane is held by the prompt and reads no mail, so the answer is
+    recorded on the lane's open native dialog decision, which its launcher
+    presses once it reads the same dialog on screen again. Deny picks the
+    dialog's first refusing option; allow picks its first option that
+    neither refuses nor widens a permission, so a chat answer never grants
+    more than one call.
+
+    Args:
+        directory: Private project state directory.
+        record: The open permission prompt decision.
+        option: `notify.PERMISSION_DENY` or `notify.PERMISSION_ALLOW`.
+        answered_by: Who answered.
+        note: Free text attached to the answer.
+
+    Raises:
+        BridgeError: If the lane shows no relayed dialog this answer can be
+            pressed on.
+    """
+    from agent_parley import dialogs
+
+    lane = record.get("lane")
+    shown = [
+        item
+        for item in decisions.list_open(directory)
+        if item.get("lane") == lane
+        and item.get("kind") == dialogs.DECISION_KIND
+    ]
+    for dialog in reversed(shown):
+        widening = dialog.get("confirm") or []
+        chosen = [
+            item
+            for item in decisions.options(dialog)
+            if bool(dialogs.REFUSING.match(item))
+            == (option == notify.PERMISSION_DENY)
+            and item not in widening
+        ]
+        if chosen:
+            decisions.answer(
+                directory, str(dialog["id"]), chosen[0], answered_by, note=note
+            )
+            return
+    raise BridgeError(
+        f"{lane} shows no relayed permission dialog to press {option} on; "
+        "answer it in the lane's terminal."
+    )
+
+
+def _carrying(
+    home: Path,
+    directory: Path,
+    record: Mapping[str, object],
+    option: str,
+    answered_by: str,
+    note: str,
+) -> Callable[[], object] | None:
+    """Prepares the step the service takes for an answer instead of mail.
+
+    A permission prompt answer reaches the lane's dialog, a run budget
+    answer resumes the run, and an orphan answer gives the dead lane's
+    claims to a live peer or returns them now. Each step that can be
+    refused is taken or checked here, before the answer is recorded, so a
+    refusal leaves the decision open for another answer.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory holding the decision.
+        record: The open decision.
+        option: The chosen option.
+        answered_by: Who answered.
+        note: Free text attached to the answer.
+
+    Returns:
+        The step to take once the answer is recorded and claimed, or None
+        when the answer is handed to the lane by mail.
+
+    Raises:
+        BridgeError: If the step is refused.
+    """
+    from agent_parley import budgets, roster, store, supervision
+
+    kind = record.get("kind")
+    if kind == notify.Event.PERMISSION_PROMPT.value:
+        _permission(directory, record, option, answered_by, note)
+        return lambda: None
+    if kind == notify.Event.RUN_BUDGET_EXHAUSTED.value:
+        if option == notify.BUDGET_RAISE:
+            budgets.resume(home, directory, roster.read(directory))
+        return lambda: None
+    if kind != notify.Event.ORPHAN_DECISION.value:
+        return None
+    dead = str(record.get("lane", ""))
+    if option == notify.ORPHAN_RETURN:
+        return lambda: supervision.return_orphaned(home, directory, dead)
+    if option != notify.ORPHAN_GIVE:
+        return lambda: None
+    peer = supervision.orphan_peer(home, directory, dead)
+    if not peer:
+        raise BridgeError(
+            f"No live peer fits {dead}'s claims; answer "
+            f"{notify.ORPHAN_RETURN} or {notify.ORPHAN_WAIT}."
+        )
+    manifest = roster.read(directory)
+    listed = record.get("issue", "")
+    return lambda: store.speak(
+        home,
+        manifest["root"],
+        manifest["participants"][peer]["display"],
+        f"Take {dead}'s orphaned claims {listed}",
+        f"The operator gave you {dead}'s orphaned claims {listed}. Take "
+        "each with agent-parley issue claim NUMBER --take-orphaned.",
+        f"decision:{record['id']}",
+    )
 
 
 def _confirm(

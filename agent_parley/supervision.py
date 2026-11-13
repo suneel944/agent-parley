@@ -5873,10 +5873,12 @@ def orphan_decision(
                 "issue": listed,
                 "detail": (
                     f"{name} stayed dead after {WORK_WAKE_ATTEMPTS} wakes; "
-                    f"{choice}; or retry agent-parley run {name} --resume "
-                    f"--repo {root}. Unless you act, the service returns "
-                    "its claims and reservations once it has been dead for "
-                    "the orphan ceiling."
+                    f"{choice}. {notify.ORPHAN_GIVE} mails the live peer "
+                    f"to take them, {notify.ORPHAN_RETURN} returns its "
+                    f"claims and reservations now, {notify.ORPHAN_WAIT} "
+                    "leaves them until the orphan ceiling returns them. To "
+                    f"retry the lane, run agent-parley run {name} --resume "
+                    f"--repo {root} yourself."
                 ),
             },
         )
@@ -6465,6 +6467,51 @@ def dead_lanes(
             reason,
             f"{name} is dead; its work returned",
         )
+
+
+def orphan_peer(home: Path, directory: Path, name: str) -> str | None:
+    """Names the live peer a dead lane's orphaned claims would go to.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        name: Dead participant holding the orphaned claims.
+
+    Returns:
+        The peer `_overdue_peer` chooses, or None when no peer fits.
+    """
+    manifest = roster.read(directory)
+    return _overdue_peer(
+        home, directory, manifest, configuration(home, manifest), {}, name
+    )
+
+
+def return_orphaned(home: Path, directory: Path, name: str) -> None:
+    """Returns a dead lane's work now, on the operator's answer.
+
+    The same return the orphan ceiling makes, taken early because the
+    operator chose it rather than waiting for the ceiling.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        name: Dead participant whose work is returned.
+    """
+    manifest = roster.read(directory)
+    root = manifest["root"]
+    records = {
+        lane: condition(home, root, lane) for lane in manifest["participants"]
+    }
+    _return_work(
+        home,
+        directory,
+        manifest,
+        configuration(home, manifest),
+        _audience(manifest, records, {name}),
+        name,
+        "the operator chose to return its work",
+        f"{name} is dead; its work returned",
+    )
 
 
 def _return_work(
@@ -7313,6 +7360,7 @@ CHECKS_STALLED_SECONDS = 3600.0
 CHECKS_STALLED_FACTOR = 2
 RERUN_CONCLUSIONS = frozenset({"cancelled", "timed_out"})
 CI_ROUNDS_KIND = "ci_rounds_exhausted"
+NOT_STARTED_KIND = "checks_not_started"
 CI_ROUND_GRANT = "grant one more round"
 CI_ROUND_TAKEOVER = "take over"
 PULL_REQUEST_FEEDBACK_BYTES = 3000
@@ -7910,7 +7958,9 @@ def _not_started_decisions(
     same cause commonly blocks several open pull requests at once; grouping
     them by the check name and the forge's own conclusion keeps the operator
     from being asked the same cause once per lane. Each cause keeps one open
-    decision, refreshed rather than reopened while it recurs.
+    decision, refreshed rather than reopened while it recurs; an answered
+    one stays answered while the cause lasts, and a cause no longer seen is
+    closed, so it is asked again only when it recurs.
 
     Args:
         directory: Private project state directory.
@@ -7919,6 +7969,7 @@ def _not_started_decisions(
             number.
         now: Unix time of this poll.
     """
+    kept = set()
     for (name, conclusion), members in _not_started_groups(readings).items():
         numbers = sorted(int(item["number"]) for item in members)
         listed = ", ".join(f"#{number}" for number in numbers)
@@ -7927,18 +7978,28 @@ def _not_started_decisions(
             f"not started, forge reports {conclusion}. Affected: {listed}"
         )
         with contextlib.suppress(BridgeError, OSError, ValueError):
-            decisions.open_or_refresh(
+            record = decisions.open_or_refresh(
                 directory,
                 project=project,
                 lane="",
-                kind="checks_not_started",
+                kind=NOT_STARTED_KIND,
                 key=f"{name}\x00{conclusion}",
                 question=question,
                 options=("acknowledge", "resolved"),
                 recommended="acknowledge",
                 reversibility=decisions.REVERSIBLE,
                 now=now,
+                keep_answered=True,
             )
+            kept.add(record["id"])
+    with contextlib.suppress(BridgeError, OSError, ValueError):
+        for record in decisions.list_open(directory, now, answered=True):
+            if (
+                record.get("kind") == NOT_STARTED_KIND
+                and record.get("project") == project
+                and record["id"] not in kept
+            ):
+                decisions.close(directory, record["id"], now)
 
 
 def _pull_request_changes(before: dict, after: dict) -> list[str]:

@@ -14,7 +14,7 @@ FAKE = "test_claim"
 
 @pytest.fixture
 def reversible(monkeypatch) -> str:
-    """Declares one reversible kind, since no shipped kind is reversible."""
+    """Declares one reversible kind with a known recommended option."""
     monkeypatch.setitem(
         timeouts.KINDS,
         FAKE,
@@ -64,6 +64,17 @@ def test_a_project_policy_override_is_honoured(reversible):
     assert timeouts.timeout(asking, reversible) is None
     longer = {timeouts.POLICY: {reversible: {timeouts.SECONDS: 7200}}}
     assert timeouts.timeout(longer, reversible) == 7200.0
+
+
+@pytest.mark.parametrize("name", ["lane_idle", "idle_blocker"])
+def test_an_idle_decision_takes_a_policy_as_notify_records_it(name):
+    from agent_parley import notify
+
+    _, reversibility = notify.ANSWERS[notify.Event(name)]
+    assert timeouts.kind_of(name).reversibility == reversibility
+    asking = {timeouts.POLICY: {name: {timeouts.ASK: True}}}
+    assert timeouts.policy(asking) == {name: {timeouts.ASK: True}}
+    assert timeouts.timeout(asking, name) is None
 
 
 @pytest.mark.parametrize(

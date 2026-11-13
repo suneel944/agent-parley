@@ -2360,9 +2360,12 @@ def test_a_spent_budget_asks_the_operator_about_orphaned_claims(
     assert fields["issue"] == "#1"
     assert fields["since"] == int(record["exhausted_at"])
     assert "--take-orphaned" in fields["detail"]
+    for option in supervision.notify.ANSWERS[
+        supervision.notify.Event.ORPHAN_DECISION
+    ][0]:
+        assert option in fields["detail"]
     assert fields["detail"].endswith(
-        "returns its claims and reservations once it has been dead for "
-        "the orphan ceiling."
+        f"run codex --resume --repo {paired['root']} yourself."
     )
     assert issues.snapshot(directory)["issues"]["1"]["owner"] == "codex"
 
