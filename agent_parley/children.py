@@ -31,9 +31,11 @@ it is never woken, offered work or counted again. Its result report retires
 it as the report is relayed. A child that files none is given
 `DEADLINE_SECONDS` from its spawn, recorded on its entry as ``deadline``;
 past that time `expire`, run on every supervision poll, tells the parent
-and records the outcome ``expired``. Retiring a child here only records the
-time: its worktree and branch stay for the parent to merge, and a session
-still running is left to end by itself.
+and the child and records the outcome ``expired``. Retiring a child here
+only records the time: its worktree and branch stay for the parent to
+merge, and a session still running is told to stop and is not killed, so
+work it has not committed is never lost. Its report after that still
+reaches the parent and replaces the expired outcome.
 """
 
 from __future__ import annotations
@@ -649,6 +651,12 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
     recorded, and its next report tries again; `expire` ends a child whose
     result never arrives.
 
+    A child that was still working at its deadline may report after
+    `expire` ended it. That late report is relayed too, under the result
+    key the expiry message never used, and replaces the recorded `EXPIRED`
+    outcome, so the parent receives the real result once and is woken by
+    it. The child stays retired.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -657,7 +665,7 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
 
     Returns:
         True when the result was relayed now, False for a lane that is not
-        a child or already returned its result.
+        a child or already returned a result of its own.
 
     Raises:
         BridgeError: If the store refuses the message.
@@ -668,7 +676,8 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
         manifest = roster.read(directory)
         entry = manifest["participants"].get(name) or {}
         parent = manifest["participants"].get(entry.get("parent") or "")
-        if parent is None or entry.get("result"):
+        prior = entry.get("result") or {}
+        if parent is None or (prior and prior.get("outcome") != EXPIRED):
             return False
         sent = store.speak(
             home,
@@ -696,7 +705,9 @@ def expire(home: Path, directory: Path, now: float | None = None) -> list[str]:
 
     Each such child is recorded with the outcome `EXPIRED` and retired, and
     its parent is sent one operator message, keyed per child, naming the
-    branch the child left. A parent the store cannot be reached for still
+    branch the child left. The child is sent one operator message as well,
+    telling it to stop starting work and file its report, which `deliver`
+    still relays. A parent the store cannot be reached for still
     has its child ended, with no message recorded, so a failed send never
     keeps the slot held. The manifest is first read without the setup lock,
     and the lock is taken only when that reading holds an overdue child, so
@@ -745,6 +756,20 @@ def expire(home: Path, directory: Path, now: float | None = None) -> list[str]:
                 )
             except BridgeError as exc:
                 print(f"Child expiry not relayed: {exc}", file=sys.stderr)
+            try:
+                store.speak(
+                    home,
+                    manifest["root"],
+                    entry["display"],
+                    f"Deadline passed for child {name}",
+                    "Your deadline passed with no result report, so you "
+                    "were retired and your parent was told. Stop starting "
+                    "new work. Commit what is finished and file one ready "
+                    "or blocked report; it is still relayed to your parent.",
+                    f"child-expired-notice-{name}",
+                )
+            except BridgeError as exc:
+                print(f"Child not told of expiry: {exc}", file=sys.stderr)
             entry["result"] = {
                 "outcome": EXPIRED,
                 "commit": None,

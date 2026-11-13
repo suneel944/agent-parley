@@ -428,6 +428,43 @@ def test_an_overdue_child_is_ended_when_its_parent_cannot_be_told(
     assert entry["result"]["message"] is None
 
 
+def test_a_report_after_expiry_replaces_the_expired_result(
+    bridge, parent, launched, monkeypatch
+):
+    actor = {"project": parent["root"], "name": "claude"}
+    directory = parent["directory"]
+    child = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})
+    name = child["child"]
+    store.register(bridge.home, parent["root"], name)
+    lane = Path(child["worktree"])
+    commit(lane, "a/x.txt", "x")
+    told = []
+    speak = store.speak
+
+    def spy(home, root, recipient, *args, **kwargs):
+        told.append(recipient)
+        return speak(home, root, recipient, *args, **kwargs)
+
+    monkeypatch.setattr(store, "speak", spy)
+    late = time.time() + children.DEADLINE_SECONDS + 1
+    assert children.expire(bridge.home, directory, late) == [name]
+    entries = roster.read(directory)["participants"]
+    assert told == [entries["claude"]["display"], entries[name]["display"]]
+    expired = entries[name]["result"]["message"]
+    report = {"state": "ready", "commit": "abc", "summary": "Wrote a"}
+    assert children.deliver(bridge.home, directory, name, report)
+    assert not children.deliver(bridge.home, directory, name, report)
+    manifest = roster.read(directory)
+    entry = manifest["participants"][name]
+    assert roster.retired(entry)
+    assert entry["result"]["outcome"] == "ready"
+    assert entry["result"]["message"] not in (None, expired)
+    assert children.live(manifest) == []
+    assert supervision.held_issue_mail(
+        bridge.home, directory, manifest, "claude"
+    ) == [str(entry["result"]["message"])]
+
+
 def test_a_delivered_child_is_retired_and_lifts_its_parents_wait(
     bridge, parent, launched
 ):
