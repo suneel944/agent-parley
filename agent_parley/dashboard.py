@@ -218,7 +218,8 @@ LEGEND = (
     "and never asks the forge.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, +queued requests waiting on those "
-    "keys, with the age of the oldest; DENIALS "
+    "keys, with the age of the oldest, then each reserved Python symbol "
+    "such as src/store.py::Store.claim; DENIALS "
     "denied or blocked of retained hook events; CALLS served MCP calls, "
     "!rejected; TOKENS what that lane's own native client recorded for "
     "its session, not billed spend and not comparable between vendors, "
@@ -643,6 +644,7 @@ def _row(
         "pending_ack": mail.get("pending_ack", "?"),
         "usage_read": context.get("usage_read", True),
         "leases": stats.get("leases", 0),
+        "reserved_symbols": list(mail.get("reserved_symbols", [])),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
         "stale_lease_age": stats.get("stale_lease_age", 0),
@@ -1039,7 +1041,8 @@ def row_cells(row: dict) -> tuple[str, ...]:
         f"{row['leases']}"
         + (f"!{row['stale_leases']}" if row["stale_leases"] else "")
         + (f"+{row['queued']}" if row["queued"] else "")
-        + (f" {tables.age(row['lease_age'])}" if row["leases"] else ""),
+        + (f" {tables.age(row['lease_age'])}" if row["leases"] else "")
+        + "".join(f" {key}" for key in row.get("reserved_symbols", [])),
         tables.size(row["injected_bytes"]),
         window_cell(row),
         diff_cell(row),

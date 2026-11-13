@@ -145,6 +145,16 @@ that habitually change together with a reserved path and that a peer holds
 now, each with `path`, `peer` and `count`. It is advisory; message the peer to
 sequence the work rather than editing the forecast path.
 
+A key may also name one Python function or class as `PATH::NAME`, such as
+`src/store.py::Store.claim`. A path reservation covers every symbol in its
+file, a class covers its methods, and two different symbols in one file do
+not conflict. The edit hook parses a Python file before and after an `Edit`,
+`MultiEdit` or `Write` with the standard library `ast` module and compares the
+definitions the change touches; a change at module level touches the whole
+file. A file that does not parse is compared by path, the hook says so, and a
+parse failure never refuses the edit. Other languages use path reservations.
+Symbol reservations are advisory, like path reservations.
+
 `request_reservation` takes the same keys and is the call to use when you mean
 to take a contested one next. Free keys are granted exactly as
 `file_reservation_paths` grants them; a key a peer holds is queued instead of

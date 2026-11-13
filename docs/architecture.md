@@ -52,6 +52,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `symbols` | The Python definitions an `Edit`, `MultiEdit` or `Write` changes, read with the standard library `ast` before and after the call, so the lane hook compares `path::Name` reservations by symbol; text that does not parse names nothing and the hook falls back to the path. Reservations stay advisory |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |

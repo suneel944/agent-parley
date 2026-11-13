@@ -1800,6 +1800,7 @@ class StatusMixin(BridgeCore):
             "stale_reservations": mail.get("stale_reservations", 0),
             "stale_reservation_age": mail.get("stale_reservation_age", 0),
             "named_resources": list(mail.get("named_resources", [])),
+            "reserved_symbols": list(mail.get("reserved_symbols", [])),
             "queued_requests": frame["usage"].get(name, {}).get("queued", 0),
             "queued_by": list(
                 frame["usage"].get(name, {}).get("queued_by", [])
