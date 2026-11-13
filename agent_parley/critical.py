@@ -135,7 +135,9 @@ def graph(blockers: dict[str, list[str]], open_issues: set[str]) -> dict:
         directly on it, ascending, and ``cycles``, every set of issues that
         wait on each other, members ascending, ordered by first member. The
         edges among a cycle's members, and a self-reference, are absent from
-        ``unblocks``.
+        ``unblocks``. ``blocked`` maps each issue to the open issues it
+        still waits on once those cycle edges are dropped, ascending; an
+        issue with no such blocker is absent.
     """
     edges: dict[str, list[str]] = {number: [] for number in open_issues}
     for waiter, waiting_on in blockers.items():
@@ -155,6 +157,7 @@ def graph(blockers: dict[str, list[str]], open_issues: set[str]) -> dict:
         for member in members:
             member_of[member] = position
     unblocks: dict[str, list[str]] = {}
+    waiting: dict[str, list[str]] = {}
     for blocker, waiters in edges.items():
         kept = sorted(
             {
@@ -169,7 +172,13 @@ def graph(blockers: dict[str, list[str]], open_issues: set[str]) -> dict:
         )
         if kept:
             unblocks[blocker] = kept
-    return {"unblocks": unblocks, "cycles": cycles}
+        for waiter in kept:
+            waiting.setdefault(waiter, []).append(blocker)
+    blocked = {
+        waiter: sorted(blockers, key=int)
+        for waiter, blockers in waiting.items()
+    }
+    return {"unblocks": unblocks, "cycles": cycles, "blocked": blocked}
 
 
 def _depths(unblocks: dict[str, list[str]], roots: list[str]) -> dict[str, int]:
@@ -257,7 +266,9 @@ def milestone_edges(
     Edges come from the cached forge catalog's ``blocked_by`` and from the
     ledger's, joined. An edge counts only when both ends carry the same
     milestone, an issue the catalog does not name one for belonging to the
-    unnamed milestone. An issue the ledger records complete is not open.
+    unnamed milestone. An issue the ledger records complete, closed on the
+    forge or ended there is not open, and with a non-empty catalog an issue
+    the catalog does not list is not open either.
 
     Args:
         catalog: The forge cache's issue mapping, possibly empty.
@@ -269,13 +280,13 @@ def milestone_edges(
         Issue number to the numbers it waits on, and the open issues
         considered.
     """
-    from agent_parley import lifecycle
+    from agent_parley import issues
 
     recorded = ledger.get("issues", {})
     done = {
         number
         for number, record in recorded.items()
-        if lifecycle.state(record)["state"] == lifecycle.COMPLETE
+        if issues.closed(record) or record.get("ended_on_forge")
     }
 
     def entry(number: str) -> dict:
@@ -292,6 +303,7 @@ def milestone_edges(
         for number in {*catalog, *recorded}
         if str(number).isdigit()
         and number not in done
+        and (not catalog or number in catalog)
         and (milestone is None or titled(number) == milestone)
     }
     blockers: dict[str, list[str]] = {}

@@ -70,7 +70,8 @@ from the forge's issue relationships where the forge reports them, and from
 the ledger's `issue block` records. An issue that transitively unblocks more
 open issues, then one that starts a longer chain, ranks ahead of one that does
 not, and its reason says `critical path: unblocks N open issues, longest chain
-M`. An issue with no edge ranks as it always did. Issues that wait on each
+M`. An issue that still waits on an open issue of the milestone is not offered,
+as one the ledger blocks is not. An issue with no edge ranks as it always did. Issues that wait on each
 other can never start: the cycle is named with its members, its edges are
 ignored in the ranking, and `issue next` prints a `Dependency cycle` line.
 `agent-parley milestone path` prints the longest chain of the active milestone

@@ -39,7 +39,7 @@ def offline(monkeypatch):
     """
     fake = {"calls": [], "answer": None, "since": [], "delta": None}
 
-    def catalog(repo, limit, timeout, since=None):
+    def catalog(repo, limit, timeout, since=None, edges=False):
         if since is not None:
             fake["since"].append(since)
             return fake["delta"]
@@ -580,7 +580,7 @@ def test_a_failed_delta_keeps_the_reading_and_records_the_cause(
     }
     write_json(cache, reading)
 
-    def refused(repo, limit, timeout, since=None):
+    def refused(repo, limit, timeout, since=None, edges=False):
         forge._record_failure("auth", "HTTP 401: Bad credentials")
         return None
 

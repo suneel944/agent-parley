@@ -627,8 +627,10 @@ class ClaimsMixin(ReportsMixin):
                 forge names none.
 
         Returns:
-            The milestone, the chain blocker first with each issue's title,
-            lifecycle state and holder, and the dependency cycles found.
+            The milestone, whether a fresh cached forge reading backed the
+            graph as ``forge_reading``, the chain blocker first with each
+            issue's title, lifecycle state and holder, and the dependency
+            cycles found.
 
         Raises:
             BridgeError: If the repository has no recorded project.
@@ -662,6 +664,7 @@ class ClaimsMixin(ReportsMixin):
 
         return {
             "milestone": title,
+            "forge_reading": bool(catalog),
             "path": [step(number) for number in critical.path(found)],
             "cycles": found["cycles"],
         }

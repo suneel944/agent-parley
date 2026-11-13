@@ -2012,9 +2012,13 @@ issues, blocker first, as `#N TITLE: STATE, HOLDER` per issue, where `STATE` is
 the ledger's lifecycle state or `unclaimed`, and `HOLDER` is the owning lane or
 `nobody`. `--milestone TITLE` selects the milestone, which is the forge's
 active one when omitted and every cached open issue when the forge names none.
-`--json` reports `milestone`, `path` with `issue`, `title`, `state` and
-`holder` per step, and `cycles`. It reads the ledger and the cached forge
-reading, claims nothing and writes nothing.
+`--json` reports `milestone`, `forge_reading`, `path` with `issue`, `title`,
+`state` and `holder` per step, and `cycles`. `forge_reading` is false when the
+cached forge reading is missing or older than the freshness window, or the
+project has no GitHub forge; the text then says `No fresh forge reading` rather
+than that no edge is recorded, because only ledger dependencies are known. It
+reads the ledger and the cached forge reading, claims nothing and writes
+nothing.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory`, `inbound` as

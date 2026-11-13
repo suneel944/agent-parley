@@ -322,7 +322,10 @@ def rank(
     much authorized, unfinished work, planned or owned, waits on the issue,
     then by how many owned issues wait on it, then by the issue number. An
     issue with no dependency edge has no such term and ranks as it did
-    without one.
+    without one. An issue that still waits on an open issue of the graph,
+    from a forge relationship or a ``Blocked by`` line, cannot start and is
+    left out, as `issues.unclaimed` leaves out one the ledger blocks; an
+    issue that only waits inside a dependency cycle stays a candidate.
 
     Args:
         state: Published issue ledger.
@@ -361,12 +364,14 @@ def rank(
     owned = issues.waiters(state)
     placed = _grouped(groups)
     started = _underway(groups, state)
-    found = found or {"unblocks": {}, "cycles": []}
+    found = found or {"unblocks": {}, "cycles": [], "blocked": {}}
     cycle_of = {
         member: members for members in found["cycles"] for member in members
     }
     ranked = []
     for number in issues.unclaimed(state):
+        if found.get("blocked", {}).get(number):
+            continue
         risk = risks.get(number) or {}
         group = placed.get(number, "")
         unblocks = waiting.get(number, [])
@@ -713,7 +718,7 @@ def render_path(result: dict) -> str:
     Returns:
         A header, one line per issue on the path with its state and holder,
         and one line per dependency cycle; or the statement that no edge is
-        recorded.
+        recorded, or that no fresh forge reading backs the graph.
     """
     label = result["milestone"] or "every open issue"
     chain = result["path"]
@@ -726,7 +731,12 @@ def render_path(result: dict) -> str:
             for step in chain
         ]
         if chain
-        else [f"No dependency edge is recorded for {label}."]
+        else [
+            f"No dependency edge is recorded for {label}."
+            if result.get("forge_reading", True)
+            else f"No fresh forge reading for {label}; only ledger "
+            "dependencies are known, and none is recorded."
+        ]
     )
     return "\n".join([*lines, *cycle_lines(result["cycles"])])
 

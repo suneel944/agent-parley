@@ -181,13 +181,42 @@ def test_milestone_edges_join_the_forge_and_ledger_and_keep_one_milestone():
     assert blockers == {"2": ["1"], "3": ["2"]}
 
 
+def test_closed_and_unlisted_ledger_records_are_not_open_nodes():
+    catalog = {"1": {}, "2": {}, "3": {}}
+    state = ledger("1", "2", "3", "4", "6")
+    state["issues"]["2"]["ended_on_forge"] = True
+    state["issues"]["3"]["blocked_by"] = ["1"]
+    state["issues"]["6"]["blocked_by"] = ["4"]
+    blockers, opened = critical.milestone_edges(catalog, state, None)
+    assert opened == {"1", "3"}
+    assert blockers == {"3": ["1"]}
+    blockers, opened = critical.milestone_edges({}, state, None)
+    assert opened == {"1", "3", "4", "6"}
+
+
+def test_a_waiting_issue_is_blocked_unless_it_only_waits_in_a_cycle():
+    graph = found({"2": ["1"], "3": ["2"], "5": ["4"], "4": ["5"], "6": ["4"]})
+    assert graph["blocked"] == {"2": ["1"], "3": ["2"], "6": ["4"]}
+    assert "4" not in graph["blocked"] and "5" not in graph["blocked"]
+    assert critical.graph({}, {"1"})["blocked"] == {}
+
+
+def test_rank_drops_candidates_that_wait_on_an_open_issue():
+    state = ledger("1", "2", "3", "4", "5")
+    graph = found(
+        {"2": ["1"], "4": ["5"], "5": ["4"]}, {"1", "2", "3", "4", "5"}
+    )
+    ranked = recommend.rank(state, {}, {}, {}, "claude", found=graph)
+    assert [r["issue"] for r in ranked] == ["1", "3", "4", "5"]
+
+
 def test_an_issue_with_an_edge_outranks_one_without_at_equal_terms():
     state = ledger("1", "2", "3")
     plain = recommend.rank(state, {}, {}, {}, "claude")
     assert [r["issue"] for r in plain] == ["1", "2", "3"]
     graph = found({"2": ["3"]})
     ranked = recommend.rank(state, {}, {}, {}, "claude", found=graph)
-    assert [r["issue"] for r in ranked] == ["3", "1", "2"]
+    assert [r["issue"] for r in ranked] == ["3", "1"]
     first = ranked[0]
     assert (first["reach"], first["chain"], first["cycle"]) == (1, 1, [])
     assert first["reasons"][1] == (
@@ -236,63 +265,77 @@ def test_render_adds_a_line_per_cycle():
     )
 
 
-def test_the_catalog_reads_edges_from_bodies_and_forge_relationships(
-    tmp_path, monkeypatch
-):
-    calls = []
-    issue_list = json.dumps(
+def titles(*rows):
+    """Builds the JSON the issue list call prints for numbered rows."""
+    return json.dumps(
         [
-            {
-                "number": 1,
-                "title": "Root",
-                "labels": [],
-                "assignees": [],
-                "body": "Notes\nBlocked by #9\n```\nDepends on #8\n```",
-                "milestone": {"title": "M1"},
-            },
-            {
-                "number": 2,
-                "title": "Leaf",
-                "labels": [],
-                "assignees": [],
-                "body": None,
-                "milestone": None,
-            },
+            {"number": n, "title": f"T{n}", "labels": [], "assignees": [], **x}
+            for n, x in rows
         ]
     )
-    relations = json.dumps(
+
+
+def page(nodes, cursor=""):
+    """Builds one GraphQL page of issue nodes, with a next page if cursor."""
+    return json.dumps(
         {
             "data": {
                 "repository": {
                     "issues": {
-                        "nodes": [
-                            {
-                                "number": 2,
-                                "blockedBy": {"nodes": [{"number": 1}]},
-                            },
-                            {"number": 1, "blockedBy": {"nodes": []}},
-                            {
-                                "number": 77,
-                                "blockedBy": {"nodes": [{"number": 1}]},
-                            },
-                        ]
+                        "pageInfo": {
+                            "hasNextPage": bool(cursor),
+                            "endCursor": cursor or None,
+                        },
+                        "nodes": nodes,
                     }
                 }
             }
         }
     )
 
+
+def node(number, body=None, milestone=None, blockers=()):
+    """Builds one GraphQL issue node."""
+    return {
+        "number": number,
+        "body": body,
+        "milestone": {"title": milestone} if milestone else None,
+        "blockedBy": {"nodes": [{"number": n} for n in blockers]},
+    }
+
+
+@pytest.fixture
+def github(monkeypatch):
+    """Points the forge module at a fake GitHub project and clean failures."""
+    monkeypatch.setattr(forge, "_failure", {})
+    monkeypatch.setattr(forge, "_recorded", {})
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+
+
+def test_the_catalog_reads_edges_from_bodies_and_forge_relationships(
+    tmp_path, monkeypatch, github
+):
+    calls = []
+    issue_list = titles((1, {}), (2, {}))
+    relations = page(
+        [
+            node(1, "Notes\nBlocked by #9\n```\nDepends on #8\n```", "M1"),
+            node(2, None, None, [1]),
+            node(77, None, None, [1]),
+        ]
+    )
+
     def reply(args, timeout):
         calls.append(args)
         return relations if args[1] == "api" else issue_list
 
-    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
-    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
     monkeypatch.setattr(forge, "_run", reply)
-    catalog = forge.open_issue_catalog(tmp_path)
+    catalog = forge.open_issue_catalog(tmp_path, edges=True)
     assert len(calls) == 2
-    assert "body" in calls[0][calls[0].index("--json") + 1]
-    assert "-F" in calls[1] and "count=1000" not in calls[1]
+    fields = calls[0][calls[0].index("--json") + 1]
+    assert fields == "number,title,labels,assignees,updatedAt"
+    assert "orderBy" in calls[1][calls[1].index("-f") + 1]
     assert catalog["1"]["blocked_by"] == ["9"]
     assert catalog["1"]["milestone"] == "M1"
     assert catalog["2"]["blocked_by"] == ["1"]
@@ -301,40 +344,158 @@ def test_the_catalog_reads_edges_from_bodies_and_forge_relationships(
     assert "77" not in catalog
 
 
-def test_a_failed_relationship_read_is_not_a_forge_failure(
-    tmp_path, monkeypatch
+def test_a_catalog_read_without_edges_makes_one_forge_call(
+    tmp_path, monkeypatch, github
 ):
-    monkeypatch.setattr(forge, "_failure", {})
-    monkeypatch.setattr(forge, "_recorded", {})
-    issue_list = (
-        '[{"number": 1, "title": "Root", "labels": [], "assignees": [],'
-        ' "body": "Depends on #4", "milestone": null}]'
-    )
+    calls = []
 
     def reply(args, timeout):
-        if args[1] == "api":
-            forge._record_failure("error", "no such field")
-            return None
-        return issue_list
+        calls.append(args)
+        return titles((1, {}))
 
-    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
-    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
     monkeypatch.setattr(forge, "_run", reply)
     catalog = forge.open_issue_catalog(tmp_path)
-    assert catalog["1"]["blocked_by"] == ["4"]
+    assert len(calls) == 1
+    assert catalog["1"] == {"title": "T1", "labels": [], "assignees": []}
+
+
+def test_a_failed_edge_read_keeps_the_title_catalog_and_no_failure(
+    tmp_path, monkeypatch, github
+):
+    def reply(args, timeout):
+        if args[1] == "api":
+            forge._record_failure("timeout", "gh gave no answer")
+            return None
+        return titles((1, {}))
+
+    monkeypatch.setattr(forge, "_run", reply)
+    catalog = forge.open_issue_catalog(tmp_path, edges=True)
+    assert catalog == {"1": {"title": "T1", "labels": [], "assignees": []}}
     assert forge.last_failure() is None
     assert forge.last_failure(own=True) is None
 
 
-def test_an_empty_catalog_skips_the_relationship_call(tmp_path, monkeypatch):
+def test_a_quiet_failure_leaves_another_threads_failure_alone(
+    monkeypatch, github
+):
+    def other_thread_failed(args, timeout):
+        forge._record_failure("error", "mine")
+        forge._failure.clear()
+        forge._failure.update({"at": 1.0, "kind": "auth", "detail": "other"})
+
+    monkeypatch.setattr(forge, "_run", other_thread_failed)
+    assert forge._run_quiet(["gh"], 5) is None
+    assert forge.last_failure()["kind"] == "auth"
+
+
+def test_a_quiet_failure_does_not_revive_a_cleared_failure(monkeypatch, github):
+    forge._record_failure("rate", "HTTP 429")
+
+    def success_cleared_it(args, timeout):
+        forge._record_failure("error", "mine")
+        forge._failure.clear()
+
+    monkeypatch.setattr(forge, "_run", success_cleared_it)
+    assert forge._run_quiet(["gh"], 5) is None
+    assert forge.last_failure() is None
+
+
+def test_edges_page_by_cursor_newest_first_up_to_the_page_cap(
+    tmp_path, monkeypatch, github
+):
     calls = []
-    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
-    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+
+    def reply(args, timeout):
+        calls.append(args)
+        step = len(calls)
+        return page([node(step, f"Depends on #{step + 1}")], f"c{step}")
+
+    monkeypatch.setattr(forge, "EDGE_PAGES", 3)
+    monkeypatch.setattr(forge, "_run", reply)
+    found = forge.issue_edges(tmp_path, None, 1000, 20)
+    assert sorted(found, key=int) == ["1", "2", "3"]
+    assert len(calls) == 3
+    assert "after=c1" in calls[1] and "after=c2" in calls[2]
+    assert not any(a.startswith("after=") for a in calls[0])
+
+
+def test_a_delta_reads_edges_only_until_its_open_issues_are_seen(
+    tmp_path, monkeypatch, github
+):
+    calls = []
+    issue_list = titles(
+        (1, {"state": "OPEN"}), (2, {"state": "CLOSED"}), (3, {"state": "OPEN"})
+    )
+
+    def reply(args, timeout):
+        calls.append(args)
+        if args[1] != "api":
+            return issue_list
+        return page([node(3, None, "M"), node(1, "Blocked by #4", "M")], "more")
+
+    monkeypatch.setattr(forge, "_run", reply)
+    catalog = forge.open_issue_catalog(tmp_path, since=100.0, edges=True)
+    assert len(calls) == 2
+    assert catalog["1"]["blocked_by"] == ["4"]
+    assert "blocked_by" not in catalog["2"]
+
+
+def test_an_empty_catalog_skips_the_relationship_call(
+    tmp_path, monkeypatch, github
+):
+    calls = []
     monkeypatch.setattr(
         forge, "_run", lambda args, timeout: calls.append(args) or "[]"
     )
-    assert forge.open_issue_catalog(tmp_path) == {}
+    assert forge.open_issue_catalog(tmp_path, edges=True) == {}
     assert len(calls) == 1
+
+
+def test_the_refresh_keeps_cached_edges_a_failed_enrichment_lacks(
+    tmp_path, monkeypatch
+):
+    from agent_parley import supervision
+
+    now = time.time()
+    write_json(
+        tmp_path / FORGE_ISSUES,
+        {
+            "read_at": now - 1000,
+            "complete_at": now - 1000,
+            "issues": {
+                "7": {"title": "Old", "milestone": "M", "blocked_by": ["5"]},
+                "8": {"title": "Eight", "milestone": "M", "blocked_by": ["5"]},
+            },
+        },
+    )
+    seen = []
+
+    def delta(root, limit, timeout, since=None, edges=False):
+        seen.append(edges)
+        return {
+            "7": {"title": "New", "state": "OPEN"},
+            "8": {
+                "title": "Eight",
+                "state": "OPEN",
+                "milestone": "N",
+                "blocked_by": [],
+            },
+        }
+
+    monkeypatch.setattr(supervision.forge, "select", lambda *a: "github")
+    monkeypatch.setattr(supervision.forge, "open_issue_catalog", delta)
+    supervision.refresh_forge_issues(tmp_path, {"root": str(tmp_path)})
+    cached = json.loads((tmp_path / FORGE_ISSUES).read_text())["issues"]
+    assert seen == [True]
+    assert cached["7"] == {
+        "title": "New",
+        "labels": [],
+        "assignees": [],
+        "milestone": "M",
+        "blocked_by": ["5"],
+    }
+    assert cached["8"]["milestone"] == "N"
+    assert cached["8"]["blocked_by"] == []
 
 
 def recorded(directory, age=0.0):
@@ -395,7 +556,7 @@ def test_a_recorded_milestone_ranks_by_what_each_issue_unblocks(
     directory = lane.parent
     recorded(directory)
     ranked = bridge.issue_next(lane, 20)
-    assert order(ranked) == ["5", "3", "7", "9", "1", "2", "4", "8", "10"]
+    assert order(ranked) == ["5", "1", "2", "4", "8"]
     assert ranked["cycles"] == [["1", "2"]]
     by_number = {record["issue"]: record for record in ranked["candidates"]}
     assert (by_number["5"]["reach"], by_number["5"]["chain"]) == (4, 3)
@@ -417,6 +578,25 @@ def test_a_stale_cache_leaves_the_ledger_edges_alone(bridge, repo, paired):
     recorded(lane.parent, age=10**6)
     ranked = bridge.issue_next(lane, 20)
     assert ranked["candidates"] == []
+    assert ranked["cycles"] == []
+    write_json(
+        lane.parent / "issues.json",
+        {
+            "revision": 1,
+            "issues": {
+                "5": {**ledger("5")["issues"]["5"]},
+                "6": {**ledger("6")["issues"]["6"], "blocked_by": ["5"]},
+                "7": {**ledger("7")["issues"]["7"]},
+                "8": {**ledger("8")["issues"]["8"], "blocked_by": ["7"]},
+                "9": {**ledger("9")["issues"]["9"], "blocked_by": ["5"]},
+            },
+        },
+    )
+    ranked = bridge.issue_next(lane, 20)
+    assert order(ranked) == ["5", "7"]
+    by_number = {record["issue"]: record for record in ranked["candidates"]}
+    assert (by_number["5"]["reach"], by_number["5"]["chain"]) == (2, 1)
+    assert (by_number["7"]["reach"], by_number["7"]["chain"]) == (1, 1)
     assert ranked["cycles"] == []
 
 
@@ -484,9 +664,15 @@ def test_milestone_path_json_and_the_empty_milestone(
     recorded(lane.parent)
     reading = bridge.milestone_path(lane, "M2")
     assert reading["path"] == []
+    assert reading["forge_reading"] is True
     assert recommend.render_path(reading) == (
         "No dependency edge is recorded for M2."
     )
+    recorded(lane.parent, age=10**6)
+    stale = bridge.milestone_path(lane, "M2")
+    assert stale["forge_reading"] is False
+    assert recommend.render_path(stale).startswith("No fresh forge reading")
+    recorded(lane.parent)
     monkeypatch.setattr(forge, "active_milestone", lambda repo: None)
     reading = bridge.milestone_path(lane)
     assert reading["milestone"] is None
