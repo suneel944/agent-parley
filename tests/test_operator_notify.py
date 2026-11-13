@@ -146,6 +146,53 @@ def test_an_orphaned_claim_already_asked_is_not_asked_again(
     assert lanes == {"codex"}
 
 
+def test_a_dead_lane_woken_then_told_to_wait_is_asked_once(
+    bridge, repo, paired, transport, monkeypatch
+):
+    directory = bridge.project(repo)[1]
+    root = paired["root"]
+    start = time.time()
+    dead = [row("orphaned claims", root, participant="claude")]
+    marker = {"owner": "claude", "reason": "dead", "created": start}
+    ledger = {"revision": 1, "issues": {"7": {"owner": "claude"}}}
+    ledger["issues"]["7"]["orphan"] = marker
+    write_json(directory / "issues.json", ledger)
+
+    def asked(found, now):
+        """Polls once and returns the lane's orphaned claims decisions."""
+        feed(monkeypatch, found, now)
+        notify.problem_decisions(bridge.home, directory, root, now)
+        return [
+            record
+            for record in decisions.list_open(directory, now, answered=True)
+            if record["kind"] == "orphaned claims"
+        ]
+
+    [first] = asked(dead, start)
+    for step, found in enumerate(([], dead, [], dead), 1):
+        [again] = asked(found, start + 60 * step)
+        assert again["created"] == first["created"]
+    orphan = decisions.open_or_refresh(
+        directory,
+        project=root,
+        lane="claude",
+        kind=notify.Event.ORPHAN_DECISION.value,
+        key="orphan",
+        question="Decide",
+        options=(notify.ORPHAN_WAIT,),
+        now=start + 300,
+    )
+    decisions.answer(
+        directory, orphan["id"], notify.ORPHAN_WAIT, "operator", start + 310
+    )
+    assert decisions.applied(directory, orphan["id"], start + 320)
+    [after] = asked(dead, start + 360)
+    assert after["created"] == first["created"]
+    del ledger["issues"]["7"]["orphan"]
+    write_json(directory / "issues.json", ledger)
+    assert asked([], start + 420) == []
+
+
 def test_a_service_row_never_opens_a_decision(
     bridge, repo, paired, transport, monkeypatch
 ):

@@ -1127,8 +1127,14 @@ def problem_decisions(
     a handoff offer its recipient is about to answer is not sent as a
     problem. An estate row, which names no project, is carried by the first
     project directory alone, so a failing store prune is asked once rather
-    than once per project. Orphaned claims the supervisor already raised as
-    an `ORPHAN_DECISION` for the lane are not asked a second time.
+    than once per project. Orphaned claims the supervisor raised as an
+    `ORPHAN_DECISION` for the lane within the last day are not asked a
+    second time, whether that decision is open, answered or carried out, so
+    an operator who answered wait is not asked again. The orphaned claims
+    row disappears while a wake keeps the lane's process alive and returns
+    when the wake fails, so its decision stays as it is while the ledger
+    still marks a claim of that lane orphaned, instead of closing and being
+    sent again on every wake.
 
     Args:
         home: Private bridge state root.
@@ -1142,7 +1148,7 @@ def problem_decisions(
     """
     if not enabled(home):
         return []
-    from agent_parley import problems
+    from agent_parley import issues, problems
     from agent_parley.cli import Bridge
 
     stamp = now or time.time()
@@ -1161,8 +1167,14 @@ def problem_decisions(
     owners = {root} if directory.name != first else {root, ""}
     asked = {
         record.get("lane")
-        for record in decisions.list_open(directory, stamp)
+        for record in decisions._peek(directory).values()
         if record.get("kind") == Event.ORPHAN_DECISION.value
+        and stamp - record.get("created", 0.0) < problems.STALE_AFTER
+    }
+    marked = {
+        record.get("owner")
+        for record in issues.snapshot(directory)["issues"].values()
+        if record.get("orphan")
     }
     kept = []
     for row in rows:
@@ -1198,6 +1210,10 @@ def problem_decisions(
             record.get("kind") in PROBLEM_CONDITIONS
             and record.get("project") == root
             and record["id"] not in kept
+            and not (
+                record.get("kind") == problems.ORPHANED
+                and record.get("lane") in marked
+            )
         ):
             decisions.close(directory, record["id"], stamp)
     return kept

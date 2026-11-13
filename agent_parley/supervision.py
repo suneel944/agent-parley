@@ -11634,7 +11634,7 @@ def run(home: Path, stopped: threading.Event) -> None:
     pruned: float | None = None
     repaired: float | None = None
     failing: dict[str, str] = {}
-    noted = ""
+    noted: str | None = None
 
     def upkeep(label: str, call: Callable[[], object]) -> None:
         """Runs one service upkeep step and keeps or clears its failure."""
