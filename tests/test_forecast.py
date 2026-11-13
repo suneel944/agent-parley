@@ -1,8 +1,10 @@
 """Checks the co-change forecast and the merge forecast between lanes."""
 
+import contextlib
 import json
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 from agent_parley import cli, dashboard, forecast, forge, store
@@ -250,7 +252,8 @@ def test_a_clean_pair_is_merged_and_predicts_nothing(bridge, repo, paired):
     edit(paired["lanes"]["claude"], 1)
     edit(paired["lanes"]["codex"], 9)
     before = untouched(paired)
-    taken = forecast.reading(paired["root"], paired, {})
+    directory = Path(paired["lanes"]["claude"]).parent
+    taken = forecast.reading(paired["root"], paired, {}, directory)
     assert taken["pairs"] == []
     assert list(taken["merges"].values()) == [[]]
     assert taken["lanes"]["claude"]["paths"] == ["big.txt"]
@@ -325,11 +328,22 @@ def test_the_plan_lands_the_order_that_avoids_a_second_conflict(
         "gemini": edit(lanes["gemini"], 9),
     }
     root = manifest["root"]
-    assert not forecast.merge(root, heads["claude"], heads["codex"])["clean"]
-    assert not forecast.merge(root, heads["claude"], heads["gemini"])["clean"]
-    assert forecast.merge(root, heads["codex"], heads["gemini"])["clean"]
+    directory = Path(lanes["claude"]).parent
+    with contextlib.ExitStack() as stack:
+        env = forecast.scratch(root, directory, stack)
+        clean = {
+            (ours, theirs): forecast.merge(
+                root, heads[ours], heads[theirs], env
+            )["clean"]
+            for ours, theirs in (
+                ("claude", "codex"),
+                ("claude", "gemini"),
+                ("codex", "gemini"),
+            )
+        }
+    assert list(clean.values()) == [False, False, True]
     before = untouched(manifest)
-    planned = forecast.plan(root, manifest, set(), [])
+    planned = forecast.plan(root, manifest, set(), [], directory)
     assert [entry["lane"] for entry in planned["order"]] == [
         "codex",
         "gemini",
@@ -381,8 +395,253 @@ def test_eight_lanes_cost_two_git_calls_once_nothing_moved(
     forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
     first = forecast.read(directory)
     assert len(first["merges"]) == 28
-    assert len(calls) <= 2 + 2 * 8 + 2 * 28
+    assert len(first["pairs"]) == 7
+    assert Counter(command[3] for command in calls) == {
+        "rev-parse": 2,
+        "for-each-ref": 1,
+        "merge-base": 8,
+        "diff": 8,
+        "merge-tree": 28,
+        "cat-file": 7,
+    }
+    assert len(calls) == 54
     calls.clear()
     forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
-    assert len(calls) == 2
+    assert [command[3] for command in calls] == ["rev-parse", "for-each-ref"]
     assert forecast.read(directory)["merges"] == first["merges"]
+
+
+def objects_in(repo):
+    """Lists every file in the target repository's object store."""
+    return sorted(
+        path
+        for path in (repo / ".git" / "objects").rglob("*")
+        if path.is_file()
+    )
+
+
+def conflicting(bridge, repo, manifest, *names):
+    """Adds the named lanes and commits one line 2 edit in every lane."""
+    for name in names:
+        manifest = bridge.add_participant(repo, name, name)
+    spread(repo, manifest)
+    for checkout in manifest["lanes"].values():
+        edit(checkout, 2)
+    return manifest, Path(manifest["lanes"]["claude"]).parent
+
+
+def test_an_untested_pair_keeps_its_prediction_and_is_not_mailed_again(
+    bridge, repo, paired, monkeypatch
+):
+    manifest, directory = conflicting(bridge, repo, paired, "gemini")
+    holders = {
+        name: lane(bridge, paired["root"], name)
+        for name in ("claude", "codex", "gemini")
+    }
+    forecast.supervise(bridge.home, directory, manifest, {})
+    first = forecast.read(directory)
+    assert len(first["pairs"]) == 3
+    monkeypatch.setattr(forecast, "MAX_MERGES", 1 + forecast.MAX_FILES)
+    edit(manifest["lanes"]["codex"], 2, 3)
+    edit(manifest["lanes"]["gemini"], 2, 4)
+    forecast.supervise(bridge.home, directory, manifest, {})
+    second = forecast.read(directory)
+    assert [pair["lanes"] for pair in second["pairs"]] == [
+        ["claude", "codex"],
+        ["claude", "gemini"],
+        ["codex", "gemini"],
+    ]
+    assert len(second["merges"]) == 1
+    assert second["pairs"][0]["heads"] != first["pairs"][0]["heads"]
+    assert second["pairs"][0]["since"] == first["pairs"][0]["since"]
+    assert second["pairs"][1:] == first["pairs"][1:]
+    for name, holder in holders.items():
+        for peer in holders:
+            subject = f"Merge conflict predicted with {peer}"
+            assert inbox(bridge, holder, subject) == (peer != name)
+
+
+def test_a_merge_git_cannot_answer_ends_the_pass_and_is_not_retried(
+    bridge, repo, paired, monkeypatch
+):
+    manifest, directory = conflicting(bridge, repo, paired, "gemini")
+    attempts = []
+    monkeypatch.setattr(
+        forecast,
+        "merge",
+        lambda root, ours, theirs, env: attempts.append(ours),
+    )
+    forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
+    assert len(attempts) == 1
+    published = forecast.read(directory)
+    assert published["pairs"] == [] and published["merges"] == {}
+    assert len(published["failed"]) == 3
+    forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
+    assert len(attempts) == 1
+    commit(repo, "base moves", "other.txt")
+    forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
+    assert len(attempts) == 2
+
+
+def test_a_moved_base_rereads_every_lane_and_keeps_merges(
+    bridge, repo, paired, monkeypatch
+):
+    spread(repo, paired)
+    edit(paired["lanes"]["claude"], 2)
+    edit(paired["lanes"]["codex"], 9)
+    directory = Path(paired["lanes"]["claude"]).parent
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    first = forecast.read(directory)
+    commit(repo, "base moves", "other.txt")
+    calls = []
+    real_run = forecast.subprocess.run
+
+    def record(command, **kwargs):
+        calls.append(command[3])
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(forecast.subprocess, "run", record)
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    second = forecast.read(directory)
+    assert second["base"] != first["base"]
+    assert {entry["base"] for entry in second["lanes"].values()} == {
+        second["base"]
+    }
+    assert Counter(calls) == {
+        "rev-parse": 1,
+        "for-each-ref": 1,
+        "merge-base": 2,
+        "diff": 2,
+    }
+    assert list(first["merges"].values()) == [[]]
+    assert second["merges"] == first["merges"]
+
+
+def test_a_retired_lane_is_never_read(bridge, repo, paired):
+    spread(repo, paired)
+    edit(paired["lanes"]["claude"], 2)
+    edit(paired["lanes"]["codex"], 2)
+    participants = paired["participants"]
+    retired = {
+        **paired,
+        "participants": {
+            **participants,
+            "codex": {**participants["codex"], "retired": 1.0},
+        },
+    }
+    directory = Path(paired["lanes"]["claude"]).parent
+    taken = forecast.reading(paired["root"], retired, {}, directory)
+    assert list(taken["lanes"]) == ["claude"]
+    assert taken["merges"] == {} and taken["pairs"] == []
+    assert len(forecast.reading(paired["root"], paired, {}, directory)["pairs"])
+
+
+def test_a_branch_only_on_origin_is_read_from_there(bridge, repo, paired):
+    base = spread(repo, paired)
+    claude = edit(paired["lanes"]["claude"], 2)
+    codex = edit(paired["lanes"]["codex"], 2)
+    branch = paired["participants"]["claude"]["branch"]
+    git(repo, "update-ref", "refs/remotes/origin/remote-only", codex)
+    git(repo, "update-ref", f"refs/remotes/origin/{branch}", base)
+    git(repo, "update-ref", "refs/tags/remote-only", base)
+    participants = paired["participants"]
+    moved = {
+        **paired,
+        "participants": {
+            **participants,
+            "codex": {**participants["codex"], "branch": "remote-only"},
+        },
+    }
+    directory = Path(paired["lanes"]["claude"]).parent
+    taken = forecast.reading(paired["root"], moved, {}, directory)
+    assert taken["lanes"]["codex"]["head"] == codex
+    assert taken["lanes"]["codex"]["branch"] == "remote-only"
+    assert taken["lanes"]["claude"]["head"] == claude
+    [pair] = taken["pairs"]
+    assert pair["branches"] == [branch, "remote-only"]
+
+
+def test_a_failed_merge_base_is_not_cached(bridge, repo, paired, monkeypatch):
+    spread(repo, paired)
+    edit(paired["lanes"]["claude"], 2)
+    old = edit(paired["lanes"]["codex"], 2)
+    directory = Path(paired["lanes"]["claude"]).parent
+    real_git = forecast._git
+
+    def failing(root, *args):
+        return None if args[0] == "merge-base" else real_git(root, *args)
+
+    monkeypatch.setattr(forecast, "_git", failing)
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    assert forecast.read(directory)["lanes"] == {}
+    monkeypatch.setattr(forecast, "_git", real_git)
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    published = forecast.read(directory)
+    assert sorted(published["lanes"]) == ["claude", "codex"]
+    assert len(published["pairs"]) == 1
+    edit(paired["lanes"]["codex"], 2, 3)
+    monkeypatch.setattr(forecast, "_git", failing)
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    kept = forecast.read(directory)
+    assert kept["lanes"]["codex"]["head"] == old
+    assert kept["pairs"] == published["pairs"]
+    monkeypatch.setattr(forecast, "_git", real_git)
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    assert forecast.read(directory)["lanes"]["codex"]["head"] != old
+
+
+def test_the_plan_takes_pull_requests_and_reuses_the_forecast(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    base = spread(repo, paired)
+    edit(paired["lanes"]["claude"], 2)
+    edit(paired["lanes"]["codex"], 9)
+    feature = tmp_path / "feature"
+    git(repo, "worktree", "add", "-b", "pr-feature", str(feature), base)
+    edit(feature, 2)
+    directory = Path(paired["lanes"]["claude"]).parent
+    forecast.supervise(bridge.home, directory, paired, {"prompts": False})
+    pulls = [
+        {"number": 5, "branch": paired["participants"]["claude"]["branch"]},
+        {"number": 7, "branch": "pr-feature"},
+        {"number": 9, "branch": "gone"},
+    ]
+    calls = []
+    real_run = forecast.subprocess.run
+
+    def record(command, **kwargs):
+        calls.append(command[3])
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(forecast.subprocess, "run", record)
+    before = objects_in(repo)
+    planned = forecast.plan(paired["root"], paired, {"codex"}, pulls, directory)
+    assert [
+        (entry["lane"], entry["pull_request"], entry["clean"])
+        for entry in planned["order"]
+    ] == [("codex", None, True), (None, 7, True), ("claude", 5, False)]
+    assert planned["order"][2]["conflicts_with"] == ["#7"]
+    assert planned["skipped"] == [
+        {
+            "pull_request": 9,
+            "branch": "gone",
+            "reason": "head branch not available locally",
+        }
+    ]
+    assert calls.count("merge-base") == 1
+    assert calls.count("merge-tree") == 2 + 3
+    assert calls.count("commit-tree") == 2
+    assert objects_in(repo) == before
+    monkeypatch.setattr(forecast, "MAX_MERGES", 0)
+    capped = forecast.plan(paired["root"], paired, {"codex"}, pulls, directory)
+    assert capped["order"][2]["conflicts_with"] == []
+
+
+def test_no_object_is_written_into_the_target_repository(bridge, repo, paired):
+    manifest, directory = conflicting(bridge, repo, paired)
+    before = objects_in(repo)
+    forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
+    assert len(forecast.read(directory)["pairs"]) == 1
+    forecast.plan(manifest["root"], manifest, set(), [], directory)
+    assert objects_in(repo) == before
+    assert list((directory / forecast.OBJECTS).iterdir()) == []

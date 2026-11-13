@@ -9,9 +9,11 @@ inside its timeout is no forecast rather than a failed call.
 
 Once lanes have committed, the merge forecast tests what their branches would
 actually do when merged. Each pair of lanes whose changes touch a common path
-is merged with ``git merge-tree --write-tree``, which needs no checkout: it
-writes unreachable tree and blob objects into the object store and moves no
-reference, index or worktree. A predicted conflict names the pair, the files
+is merged with ``git merge-tree --write-tree``, which needs no checkout and
+moves no reference, index or worktree. The tree and blob objects it writes go
+to a private object store under the project state directory, removed at the
+end of the pass, so nothing is written into the target repository. A
+predicted conflict names the pair, the files
 and the conflicting hunks' line ranges, and each lane is told once per newly
 predicted pair. ``plan`` orders the open pull requests and lanes with work
 for landing so that the fewest of them conflict with the default branch as it
@@ -19,11 +21,13 @@ would stand. The coordinator never merges: it forecasts and recommends.
 """
 
 import contextlib
+import functools
 import itertools
 import json
 import os
 import sqlite3
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -38,6 +42,7 @@ TIMEOUT = 10
 CACHE = "cochanges.json"
 MAX_FORECAST = 16
 MERGE_RECORD = "merge-forecast.json"
+OBJECTS = "merge-forecast-objects"
 MAX_MERGES = 64
 MAX_FILES = 8
 MAX_RANGES = 8
@@ -185,15 +190,16 @@ def collisions(
 
 
 def _run(
-    root: str, *args: str, scratch: bool = False
+    root: str, *args: str, env: dict[str, str] | None = None
 ) -> tuple[int, str] | None:
     """Runs one bounded Git command and reports its status and output.
 
     Args:
         root: Checkout the command runs in.
         *args: Git arguments following the checkout selection.
-        scratch: Whether the fixed forecast identity is supplied, which
-            ``commit-tree`` needs to write an unreachable scratch commit.
+        env: Variables added to the inherited environment, such as the
+            private object store ``scratch`` names or the fixed identity
+            ``commit-tree`` needs.
 
     Returns:
         The exit status and standard output, undecodable bytes replaced, or
@@ -207,7 +213,7 @@ def _run(
             errors="replace",
             timeout=TIMEOUT,
             check=False,
-            env={**os.environ, **SCRATCH_IDENTITY} if scratch else None,
+            env={**os.environ, **env} if env else None,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -227,20 +233,64 @@ def _ranges(text: str) -> list[list[int]]:
     return ranges[:MAX_RANGES]
 
 
-def merge(root: str, ours: str, theirs: str) -> dict | None:
+def scratch(
+    root: str, directory: Path, stack: contextlib.ExitStack
+) -> dict[str, str] | None:
+    """Opens a private object store for the objects a pass writes.
+
+    The store is a temporary directory under ``OBJECTS`` in the project
+    state directory, removed when ``stack`` closes. Git reads the target
+    repository's objects through it as an alternate and writes every new
+    object into it, so a merge test or scratch commit leaves the target
+    repository's object store untouched.
+
+    Args:
+        root: Base checkout whose object store holds the commits.
+        directory: Private project state directory.
+        stack: Owner of the temporary directory's lifetime.
+
+    Returns:
+        The environment that points Git at the private store, or None when
+        Git cannot name the repository's object store or the directory
+        cannot be made.
+    """
+    common = _git(root, "rev-parse", "--git-common-dir")
+    if common is None:
+        return None
+    parent = directory / OBJECTS
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        private = stack.enter_context(
+            tempfile.TemporaryDirectory(dir=parent, ignore_cleanup_errors=True)
+        )
+    except OSError:
+        return None
+    return {
+        "GIT_OBJECT_DIRECTORY": private,
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(
+            Path(root, common.rstrip("\n")).resolve() / "objects"
+        ),
+    }
+
+
+def merge(
+    root: str, ours: str, theirs: str, env: dict[str, str]
+) -> dict | None:
     """Tests one merge without a checkout and names what would conflict.
 
     ``git merge-tree --write-tree`` finds the merge base itself and writes
-    the result as unreachable objects; no reference, index or worktree
-    changes. Each conflicted file's line ranges are read from the conflict
-    markers in the written result, so they number the lines of the merged
-    file a person resolving the conflict would see. A conflict without
-    markers, such as a binary file or a modify/delete, has no ranges.
+    the result as unreachable objects into the private store ``env`` names;
+    no reference, index, worktree or repository object changes. Each
+    conflicted file's line ranges are read from the conflict markers in the
+    written result, so they number the lines of the merged file a person
+    resolving the conflict would see. A conflict without markers, such as a
+    binary file or a modify/delete, has no ranges.
 
     Args:
         root: Checkout whose object store holds both commits.
         ours: Commit or branch merged into.
         theirs: Commit or branch merged in.
+        env: Private object store environment, as ``scratch`` returns it.
 
     Returns:
         ``clean``, whether the merge succeeds without conflict; ``tree``,
@@ -258,6 +308,7 @@ def merge(root: str, ours: str, theirs: str) -> dict | None:
         "--no-messages",
         ours,
         theirs,
+        env=env,
     )
     if result is None or result[0] not in (0, 1):
         return None
@@ -270,16 +321,20 @@ def merge(root: str, ours: str, theirs: str) -> dict | None:
             paths.append(path)
     files = []
     for path in paths[:MAX_FILES]:
-        shown = _run(root, "cat-file", "blob", f"{tree}:{path}")
+        shown = _run(root, "cat-file", "blob", f"{tree}:{path}", env=env)
         ranges = _ranges(shown[1]) if shown and not shown[0] else []
         files.append({"path": path, "ranges": ranges})
     return {"clean": result[0] == 0, "tree": tree.strip(), "files": files}
 
 
 def _branch_heads(root: str) -> dict[str, str] | None:
-    """Reads every local branch head in one Git call, or reports None."""
+    """Reads local and ``origin`` branch heads in one Git call, or None."""
     result = _run(
-        root, "for-each-ref", "--format=%(refname)%00%(objectname)", "refs/"
+        root,
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)",
+        "refs/heads/",
+        "refs/remotes/origin/",
     )
     if result is None or result[0]:
         return None
@@ -293,7 +348,7 @@ def _branch_heads(root: str) -> dict[str, str] | None:
     return heads
 
 
-def _change(root: str, base: str, head: str, cached: dict) -> dict:
+def _change(root: str, base: str, head: str, cached: dict) -> dict | None:
     """Reads where a branch forked from the base and the paths it changed.
 
     Args:
@@ -306,50 +361,138 @@ def _change(root: str, base: str, head: str, cached: dict) -> dict:
     Returns:
         ``head``, ``base``, ``fork`` and the sorted ``paths`` the branch
         changed since it forked; no paths when it holds nothing beyond the
-        base or Git could not answer.
+        base. None when Git could not answer, so a failed read is never
+        cached as a branch without changes.
     """
     if cached.get("head") == head and cached.get("base") == base:
         return cached
-    fork = (_git(root, "merge-base", base, head) or "").strip()
+    fork = _git(root, "merge-base", base, head)
+    if fork is None:
+        return None
+    fork = fork.strip()
     listing = (
         _git(root, "diff", "--no-renames", "--name-only", "-z", fork, head)
-        if fork and fork != head
+        if fork != head
         else ""
     )
+    if listing is None:
+        return None
     return {
         "head": head,
         "base": base,
         "fork": fork,
-        "paths": sorted(path for path in (listing or "").split("\0") if path),
+        "paths": sorted(path for path in listing.split("\0") if path),
     }
 
 
-def reading(root: str, manifest: dict, previous: dict) -> dict | None:
+def _test(
+    root: str,
+    entries: dict[str, dict],
+    cache: dict,
+    failed: list[str],
+    objects: Callable[[], dict[str, str] | None],
+) -> tuple[dict[str, list[dict]], list[str], set[tuple[str, str]]]:
+    """Merges each pair of entries whose changed paths share a path.
+
+    A pair is keyed by its two heads in label order. Its result is reused
+    from ``cache`` while neither head moved, and a pair Git could not merge
+    is not retried while neither head moved. New merges spend at most
+    ``MAX_MERGES`` Git calls per pass, counting each ``merge-tree`` and each
+    conflicted file's ``cat-file``; a merge runs only while its worst case
+    of one plus ``MAX_FILES`` calls fits. The first merge Git cannot answer
+    ends the pass's merging, since a Git older than 2.38 fails every one,
+    and every pair it leaves untested is recorded as failed with it.
+
+    Args:
+        root: Base checkout.
+        entries: Changes by label, each with ``head`` and ``paths``.
+        cache: Conflicted files per head pair from an earlier pass.
+        failed: Head pairs an earlier pass could not merge.
+        objects: Supplies the private object store environment on first
+            use, or None when there is none.
+
+    Returns:
+        The conflicted files per head pair tested or reused, empty for a
+        clean merge; the head pairs that could not be merged; and the label
+        pairs left untested, by the bound or by a failure.
+    """
+    merges: dict[str, list[dict]] = {}
+    failures: list[str] = []
+    untested: set[tuple[str, str]] = set()
+    spent = 0
+    stopped = False
+    labels = [label for label in sorted(entries) if entries[label]["paths"]]
+    for first, second in itertools.combinations(labels, 2):
+        one, two = entries[first], entries[second]
+        if not set(one["paths"]) & set(two["paths"]):
+            continue
+        key = f"{one['head']}..{two['head']}"
+        files = cache.get(key)
+        if files is None and key not in failed and not stopped:
+            env = None if spent + 1 + MAX_FILES > MAX_MERGES else objects()
+            if env is None:
+                untested.add((first, second))
+                continue
+            tested = merge(root, one["head"], two["head"], env)
+            spent += 1 + (len(tested["files"]) if tested else 0)
+            stopped = tested is None
+            if tested is not None:
+                files = [] if tested["clean"] else tested["files"]
+        if files is None:
+            failures.append(key)
+            untested.add((first, second))
+            continue
+        merges[key] = files
+    return merges, failures, untested
+
+
+def reading(
+    root: str, manifest: dict, previous: dict, directory: Path
+) -> dict | None:
     """Reads every working lane's branch change and tests overlapping pairs.
 
     The base is the head of the base checkout, which is the branch every
     lane merges back into. A retired lane is never read. A lane's fork point
     and changed paths are reused from ``previous`` while neither its head
     nor the base moved, and a pair's merge result is reused while neither
-    head moved, so a cycle in which nothing moved costs two Git calls. Only
+    head moved, so a cycle in which nothing moved costs two Git calls. A
+    lane whose change Git cannot read keeps its previous reading for this
+    pass, or is left out when it has none; the failure is not cached. Only
     a pair whose committed changes share a path is merged, since two lanes
-    that touch disjoint paths cannot conflict line by line, and at most
-    ``MAX_MERGES`` new merges run per reading; a pair over that bound is
-    tested by a later reading. Uncommitted worktree changes are not part of
-    a branch and are not forecast.
+    that touch disjoint paths cannot conflict line by line, within the
+    ``MAX_MERGES`` call bound ``_test`` applies. A pair left untested keeps
+    its previous predicted conflict, so its lanes are not told again. A
+    pair Git could not merge is retried once either head or the base moves.
+    Uncommitted worktree changes are not part of a branch and are not
+    forecast.
 
     Args:
         root: Canonical project key, which is the base checkout's path.
         manifest: Project manifest naming the roster and each lane's branch.
         previous: The last published reading, or an empty mapping.
+        directory: Private project state directory that holds the private
+            object store for this pass.
 
     Returns:
         ``base``, the base head; ``lanes``, each lane's branch change by
-        name; ``merges``, the conflicted files per tested head pair; and
-        ``pairs``, one record per predicted conflict carrying ``lanes``,
-        ``branches``, ``heads`` and ``files``, in lane-name order. None when
-        Git cannot read the base or the branches.
+        name; ``merges``, the conflicted files per tested head pair;
+        ``failed``, the head pairs Git could not merge; and ``pairs``, one
+        record per predicted conflict carrying ``lanes``, ``branches``,
+        ``heads`` and ``files``, in lane-name order. None when Git cannot
+        read the base or the branches.
     """
+    with contextlib.ExitStack() as stack:
+        objects = functools.cache(lambda: scratch(root, directory, stack))
+        return _reading(root, manifest, previous, objects)
+
+
+def _reading(
+    root: str,
+    manifest: dict,
+    previous: dict,
+    objects: Callable[[], dict[str, str] | None],
+) -> dict | None:
+    """Takes the reading ``reading`` describes with a given object store."""
     base = (_git(root, "rev-parse", "--verify", "HEAD") or "").strip()
     heads = _branch_heads(root) if base else None
     if heads is None:
@@ -361,32 +504,30 @@ def reading(root: str, manifest: dict, previous: dict) -> dict | None:
         head = heads.get(branch)
         if roster.retired(participant) or not head:
             continue
-        cached = known.get(name)
-        found[name] = {
-            **_change(root, base, head, cached or {}),
-            "branch": branch,
-        }
-    cache = previous.get("merges") or {}
-    merges: dict[str, list[dict]] = {}
+        cached = known.get(name) or {}
+        change = _change(root, base, head, cached)
+        if change is None and cached.get("branch") == branch:
+            change = cached
+        if change is not None:
+            found[name] = {**change, "branch": branch}
+    merges, failed, untested = _test(
+        root,
+        found,
+        previous.get("merges") or {},
+        previous.get("failed") or [] if previous.get("base") == base else [],
+        objects,
+    )
+    earlier = {
+        tuple(pair.get("lanes") or ()): pair
+        for pair in previous.get("pairs") or []
+    }
     pairs = []
-    spent = 0
-    working = [name for name, lane in found.items() if lane["paths"]]
-    for first, second in itertools.combinations(working, 2):
+    for first, second in itertools.combinations(found, 2):
         one, two = found[first], found[second]
-        if not set(one["paths"]) & set(two["paths"]):
-            continue
-        key = f"{one['head']}..{two['head']}"
-        files = cache.get(key)
-        if files is None:
-            if spent >= MAX_MERGES:
-                continue
-            spent += 1
-            tested = merge(root, one["head"], two["head"])
-            if tested is None:
-                continue
-            files = [] if tested["clean"] else tested["files"]
-        merges[key] = files
-        if files:
+        files = merges.get(f"{one['head']}..{two['head']}")
+        if (first, second) in untested and (first, second) in earlier:
+            pairs.append(earlier[(first, second)])
+        elif files and (first, second) not in untested:
             pairs.append(
                 {
                     "lanes": [first, second],
@@ -395,7 +536,13 @@ def reading(root: str, manifest: dict, previous: dict) -> dict | None:
                     "files": files,
                 }
             )
-    return {"base": base, "lanes": found, "merges": merges, "pairs": pairs}
+    return {
+        "base": base,
+        "lanes": found,
+        "merges": merges,
+        "failed": failed,
+        "pairs": pairs,
+    }
 
 
 def read(directory: Path) -> dict:
@@ -511,7 +658,7 @@ def supervise(
 
     started = time.monotonic()
     previous = read(directory)
-    taken = reading(manifest["root"], manifest, previous)
+    taken = reading(manifest["root"], manifest, previous, directory)
     if taken is None:
         return
     since = {
@@ -551,13 +698,15 @@ def supervise(
                 )
 
 
-def _land(root: str, landed: str, head: str, tree: str) -> str:
+def _land(
+    root: str, landed: str, head: str, tree: str, env: dict[str, str]
+) -> str:
     """Writes the unreachable scratch commit a simulated landing leaves.
 
     The commit has both the landed base and the candidate as parents, so
     the next candidate's merge base is found from real ancestry. It is
-    written with a fixed identity and date and is reachable from no
-    reference.
+    written with a fixed identity and date into the private object store
+    ``env`` names and is reachable from no reference.
 
     Returns:
         The scratch commit, or an empty string when Git refused.
@@ -573,7 +722,7 @@ def _land(root: str, landed: str, head: str, tree: str) -> str:
         "-m",
         "merge forecast",
         tree,
-        scratch=True,
+        env={**env, **SCRATCH_IDENTITY},
     )
     return result[1].strip() if result and not result[0] else ""
 
@@ -610,14 +759,16 @@ def _candidates(
             by_branch[branch]["pull_request"] = number
             continue
         head = heads.get(branch)
-        change = _change(root, taken["base"], head, {}) if head else {}
-        if not change.get("paths"):
+        change = _change(root, taken["base"], head, {}) if head else None
+        if not change or not change["paths"]:
             skipped.append(
                 {
                     "pull_request": number,
                     "branch": branch,
                     "reason": "head branch not available locally"
                     if not head
+                    else "Git could not read its change"
+                    if change is None
                     else "nothing beyond the default branch",
                 }
             )
@@ -633,12 +784,21 @@ def _candidates(
     return candidates, skipped
 
 
-def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
+def plan(
+    root: str,
+    manifest: dict,
+    ready: set[str],
+    pulls: list[dict],
+    directory: Path,
+) -> dict:
     """Recommends a landing order that minimises predicted conflicts.
 
     Every lane with committed work beyond the default branch and every open
     pull request whose head is available locally is a candidate. Pairwise
-    conflicts are tested first. Landing is then simulated against the
+    conflicts are tested first, reusing the published merge forecast's
+    lane readings and merge results and spending at most ``MAX_MERGES`` Git
+    calls on new pairwise merges; a pair over that bound counts as not
+    conflicting. Landing is then simulated against the
     default branch as it stands: at each position the candidates still
     waiting are tried in order of how many other waiting candidates they
     conflict with, fewest first, an open pull request before a lane without
@@ -651,8 +811,9 @@ def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
     keeps the count of predicted conflicts low: landing it first would
     make every one of them conflict.
 
-    The plan claims nothing, merges nothing and moves no reference, index or
-    worktree.
+    The plan claims nothing, merges nothing, moves no reference, index or
+    worktree, and writes its objects only into a private object store that
+    is removed when it returns.
 
     Args:
         root: Canonical project key, which is the base checkout's path.
@@ -660,6 +821,8 @@ def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
         ready: Participants whose latest report is ready.
         pulls: Open pull requests as supervision last cached them, each
             with ``number`` and head ``branch``.
+        directory: Private project state directory holding the published
+            merge forecast and the private object store.
 
     Returns:
         ``branch`` and ``base``, the default branch and its head; ``order``,
@@ -671,9 +834,23 @@ def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
 
     Raises:
         BridgeError: If Git cannot read the base checkout or its branches,
-            or cannot test a merge.
+            cannot open the private object store, or cannot test a merge.
     """
-    taken = reading(root, manifest, {})
+    with contextlib.ExitStack() as stack:
+        objects = functools.cache(lambda: scratch(root, directory, stack))
+        return _plan(root, manifest, ready, pulls, read(directory), objects)
+
+
+def _plan(
+    root: str,
+    manifest: dict,
+    ready: set[str],
+    pulls: list[dict],
+    published: dict,
+    objects: Callable[[], dict[str, str] | None],
+) -> dict:
+    """Makes the plan ``plan`` describes with a given object store."""
+    taken = _reading(root, manifest, published, objects)
     if taken is None:
         raise BridgeError(
             f"Git could not read the branches of {root}; no plan was made."
@@ -682,13 +859,13 @@ def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
         _git(root, "symbolic-ref", "--short", "-q", "HEAD") or "HEAD"
     ).strip()
     candidates, skipped = _candidates(root, taken, ready, pulls)
+    merges, _, _ = _test(
+        root, candidates, taken["merges"], taken["failed"], objects
+    )
     collides: dict[str, set[str]] = {label: set() for label in candidates}
     for first, second in itertools.combinations(sorted(candidates), 2):
         one, two = candidates[first], candidates[second]
-        if not set(one["paths"]) & set(two["paths"]):
-            continue
-        tested = merge(root, one["head"], two["head"])
-        if tested and not tested["clean"]:
+        if merges.get(f"{one['head']}..{two['head']}"):
             collides[first].add(second)
             collides[second].add(first)
     waiting = sorted(candidates)
@@ -708,7 +885,15 @@ def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
         failed: dict[str, list[dict]] = {}
         chosen = ""
         for label in waiting:
-            tested = merge(root, landed, candidates[label]["head"])
+            env = objects()
+            if env is None:
+                raise BridgeError(
+                    "Git could not name the object store of "
+                    f"{root}, or the private object store could not be "
+                    "made; no plan was made."
+                )
+            head = candidates[label]["head"]
+            tested = merge(root, landed, head, env)
             if tested is None:
                 raise BridgeError(
                     f"Git could not test merging {candidates[label]['branch']}"
@@ -716,15 +901,13 @@ def plan(root: str, manifest: dict, ready: set[str], pulls: list[dict]) -> dict:
                     "or later; no plan was made."
                 )
             if tested["clean"]:
-                scratch = _land(
-                    root, landed, candidates[label]["head"], tested["tree"]
-                )
-                if not scratch:
+                written = _land(root, landed, head, tested["tree"], env)
+                if not written:
                     raise BridgeError(
                         "Git could not write the scratch commit that "
                         "simulates landing; no plan was made."
                     )
-                landed, chosen = scratch, label
+                landed, chosen = written, label
                 break
             failed[label] = tested["files"]
         if not chosen:
@@ -837,7 +1020,7 @@ def project_plan(directory: Path, ready: set[str], record: Path) -> dict:
         for pull in (pulls.values() if isinstance(pulls, dict) else [])
         if isinstance(pull, dict)
     ]
-    return plan(manifest["root"], manifest, ready, readings)
+    return plan(manifest["root"], manifest, ready, readings, directory)
 
 
 def render_plan(planned: dict) -> str:
