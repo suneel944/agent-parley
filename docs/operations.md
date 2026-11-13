@@ -645,6 +645,7 @@ condition, that count, its age and what clears it:
 | `checks failed` | An open pull request's checks are red with at least one check the forge ran and failed, or its head is pending on the one automatic re-run supervision requested. The row names the attempt and the failed checks. | `gh pr checks URL`, then fix and push or re-run; while the automatic re-run is pending, wait for its conclusion; after it, run the re-run command the row names yourself, or fix and push. |
 | `ci rounds exhausted` | An open pull request's head is red after it used its CI rounds: the `ci_rounds` supervision setting (2) plus any round the operator granted. A round is a head commit whose checks finished; a re-run on the same head is not a new round. The lane was told once to stop pushing and report blocked, and one decision offers `grant one more round` or `take over`. The row replaces `checks failed` for that pull request and clears on a green head. | Answer the decision: a grant lets the lane push once more; a takeover stops further decisions for that pull request. The limit is advisory and never refuses a push. |
 | `checks refused` | A required check the forge never started blocks one or more open pull requests. One row per check name and forge conclusion names every pull request it blocks. | Resolve it at the forge (billing, spending limit or manual approval), then re-run once. |
+| `reservation contention` | Two lanes were refused by each other, alternating, four times on one path inside 30 minutes of the first; one lane retrying against an idle holder does not count, and a refusal blocked by several leases of one holder counts once. Each lane was told once to finish or stash its edit on that path and wait. One row per pair and path names both claims, and the lanes sit in the needs-input group of `status` and `top`; `issue show` prints it for both issues. Reservations stay advisory and nothing locks the path. The pair is not flagged again for that path until the operator acts. | `agent-parley issue offer N --to LANE` then the other lane accepts, or `agent-parley issue release N`; an accept ends only the record between the two lanes, and a release ends the releasing lane's records only when it holds no other issue. Counting then restarts. A record naming a retired lane is no longer reported, and old records are pruned. |
 | `session outliving its claim` | The lane holds no claim, yet a native session in a worktree the lane made showed activity in the last 60 seconds. | `agent-parley status NAME`; Agent Parley never stops such a session. |
 | `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
 | `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
@@ -2001,8 +2002,24 @@ command where one applies; `--json` is the stable machine form.
 `collisions` its likely paths run into, `named_to`, the other lane whose
 published work names it as next work or empty, `same_files`, the claims
 this lane holds whose paths its forecast paths run into, `held_back`, the
-other lanes' live claims doing so as `issue` and `owner` records, and the
-ordered `reasons` for its place.
+other lanes' live claims doing so as `issue` and `owner` records, `reach`
+and `chain`, the open issues it transitively unblocks and the longest chain it
+starts, `cycle`, the issues it waits on in a dependency cycle or empty, and
+the ordered `reasons` for its place. The top level also carries `cycles`, every
+dependency cycle found, as lists of issue numbers.
+
+`milestone path` prints the longest dependency chain among a milestone's open
+issues, blocker first, as `#N TITLE: STATE, HOLDER` per issue, where `STATE` is
+the ledger's lifecycle state or `unclaimed`, and `HOLDER` is the owning lane or
+`nobody`. `--milestone TITLE` selects the milestone, which is the forge's
+active one when omitted and every cached open issue when the forge names none.
+`--json` reports `milestone`, `forge_reading`, `path` with `issue`, `title`,
+`state` and `holder` per step, and `cycles`. `forge_reading` is false when the
+cached forge reading is missing or older than the freshness window, or the
+project has no GitHub forge; the text then says `No fresh forge reading` rather
+than that no edge is recorded, because only ledger dependencies are known. It
+reads the ledger and the cached forge reading, claims nothing and writes
+nothing.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory`, `inbound` as

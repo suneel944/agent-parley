@@ -81,8 +81,16 @@ PRUNES = (
         "scheduled_deliveries WHERE coalesce(delivered_ts,cancelled_ts)<:epoch "
         "AND id<(SELECT max(id) FROM scheduled_deliveries) LIMIT :limit)",
     ),
+    (
+        "reservation_contention",
+        "DELETE FROM reservation_contention WHERE rowid IN (SELECT rowid "
+        "FROM reservation_contention WHERE "
+        "coalesce(flagged_ts,last_ts)<:epoch LIMIT :limit)",
+    ),
 )
 REFUSAL_SECONDS = 86400.0
+CONTENTION_WINDOW = 1800.0
+CONTENTION_ATTEMPTS = 4
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
@@ -214,6 +222,12 @@ CREATE TABLE IF NOT EXISTS reservation_refusals (
  agent_id INTEGER NOT NULL REFERENCES agents(id), holder TEXT NOT NULL,
  path_pattern TEXT NOT NULL, refused_ts REAL NOT NULL,
  PRIMARY KEY(project_id,agent_id,holder,path_pattern));
+CREATE TABLE IF NOT EXISTS reservation_contention (
+ project_id INTEGER NOT NULL REFERENCES projects(id),
+ low TEXT NOT NULL, high TEXT NOT NULL, path_pattern TEXT NOT NULL,
+ count INTEGER NOT NULL, first_ts REAL NOT NULL, last_ts REAL NOT NULL,
+ flagged_ts REAL, last_lane TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(project_id,low,high,path_pattern));
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), tool TEXT NOT NULL,
@@ -3555,6 +3569,7 @@ def _dispatch(
         )
         if tool in RESERVING and result.get("conflicts"):
             _record_refusals(db, actor, result["conflicts"])
+            _contend(db, actor, result["conflicts"], time.time())
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -5584,6 +5599,206 @@ def _record_refusals(
     )
 
 
+def _contend(
+    db: sqlite3.Connection, actor: dict, conflicts: list[dict], now: float
+) -> None:
+    """Counts alternating refusals between two lanes on one key and flags it.
+
+    Refusals in either direction between the same two lanes on the same key
+    share one row. The count rises only when the refused lane differs from
+    the lane refused in the previous counted refusal, so one lane retrying
+    against an idle holder counts once, and `CONTENTION_ATTEMPTS` means that
+    many alternating refusals. A refusal blocked by several leases of one
+    owner counts once per owner and key. A refusal arriving more than
+    `CONTENTION_WINDOW` after the first refusal of the count restarts the
+    count at that refusal. The row that reaches `CONTENTION_ATTEMPTS` is
+    flagged once and each lane receives one bounded update. A flagged row is
+    never changed or sent again until `clear_contention` removes it or the
+    prune retires it. Reservations stay advisory: nothing here locks a path.
+
+    Args:
+        db: Open transaction that also carries the refused call.
+        actor: Authenticated project and the lane that was refused.
+        conflicts: Conflicts the refused batch reported.
+        now: Unix time of this refusal.
+    """
+    project = actor["project_id"]
+    db.execute(
+        "DELETE FROM reservation_contention WHERE project_id=? "
+        "AND flagged_ts IS NULL AND last_ts<?",
+        (project, now - REFUSAL_SECONDS),
+    )
+    lane = str(actor["name"])
+    refused = dict.fromkeys(
+        (str(conflict["owner"]), conflict["path"]) for conflict in conflicts
+    )
+    for owner, path in refused:
+        low, high = sorted((lane, owner))
+        if low == high:
+            continue
+        key = (project, low, high, path)
+        row = db.execute(
+            "SELECT count,first_ts,flagged_ts,last_lane FROM "
+            "reservation_contention WHERE project_id=? AND low=? AND high=? "
+            "AND path_pattern=?",
+            key,
+        ).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT INTO reservation_contention(project_id,low,high,"
+                "path_pattern,count,first_ts,last_ts,last_lane) "
+                "VALUES (?,?,?,?,1,?,?,?)",
+                (*key, now, now, lane),
+            )
+            continue
+        if row["flagged_ts"] is not None:
+            continue
+        if now - row["first_ts"] > CONTENTION_WINDOW:
+            count, first = 1, now
+        else:
+            count = row["count"] + (row["last_lane"] != lane)
+            first = row["first_ts"]
+        flagged = now if count >= CONTENTION_ATTEMPTS else None
+        db.execute(
+            "UPDATE reservation_contention SET count=?,first_ts=?,last_ts=?,"
+            "flagged_ts=?,last_lane=? WHERE project_id=? AND low=? "
+            "AND high=? AND path_pattern=?",
+            (count, first, now, flagged, lane, *key),
+        )
+        if flagged is not None:
+            _warn_contention(db, project, (low, high), path, now)
+
+
+def _warn_contention(
+    db: sqlite3.Connection,
+    project: int,
+    lanes: tuple[str, str],
+    path: str,
+    now: float,
+) -> None:
+    """Sends each of two contending lanes one update from the operator.
+
+    A lane that cannot receive mail, such as a retired one, is skipped, so a
+    refusal is never turned into an error by the update that follows it.
+
+    Args:
+        db: Open transaction that also carries the refused call.
+        project: Identifier of the project both lanes belong to.
+        lanes: The two lane identities, sorted.
+        path: Key the lanes keep refusing each other.
+        now: Unix time the pair was flagged, which keys the update.
+    """
+    db.execute(
+        "INSERT INTO agents(project_id,name) VALUES (?,?) "
+        "ON CONFLICT(project_id,name) DO NOTHING",
+        (project, OPERATOR),
+    )
+    sender = dict(
+        db.execute(
+            "SELECT id,project_id,name FROM agents WHERE project_id=? "
+            "AND name=?",
+            (project, OPERATOR),
+        ).fetchone()
+    )
+    for lane, peer in (lanes, lanes[::-1]):
+        digest = hashlib.sha256(
+            f"{lane}\0{peer}\0{path}\0{now}".encode()
+        ).hexdigest()
+        with contextlib.suppress(BridgeError):
+            _send(
+                db,
+                sender,
+                {
+                    "to": [lane],
+                    "subject": f"Reservation contention on {path[:100]}",
+                    "body_md": (
+                        f"You and {peer} keep refusing each other's "
+                        f"reservation on {path}. Finish or stash your edit "
+                        "on that path and wait. The operator will hand the "
+                        "work off or release it. Reservations are advisory "
+                        "declarations; nothing locks the path."
+                    ),
+                    "idempotency_key": f"contention-{digest[:40]}",
+                },
+            )
+
+
+def _contended(db: sqlite3.Connection, root: str) -> list[dict]:
+    """Reads the flagged records of one project whose lanes both remain.
+
+    A record naming a retired lane, one without an active credential, is
+    left out, so the surviving lane is not reported as contended with a
+    lane that can no longer act. Records come oldest first.
+    """
+    return [
+        {
+            "lanes": [row["low"], row["high"]],
+            "path": row["path_pattern"],
+            "count": row["count"],
+            "since": row["flagged_ts"],
+        }
+        for row in db.execute(
+            "SELECT c.low,c.high,c.path_pattern,c.count,c.flagged_ts "
+            "FROM reservation_contention c "
+            "JOIN projects p ON p.id=c.project_id WHERE p.human_key=? "
+            "AND c.flagged_ts IS NOT NULL AND (SELECT count(*) FROM agents a "
+            "WHERE a.project_id=c.project_id AND a.name IN (c.low,c.high) "
+            "AND a.token_digest IS NOT NULL)=2 "
+            "ORDER BY c.flagged_ts,c.low,c.high",
+            (root,),
+        )
+    ]
+
+
+def contentions(home: Path, root: str) -> list[dict]:
+    """Lists the lane pairs flagged for repeated reservation contention.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        One record per flagged pair and key, oldest first, naming the two
+        ``lanes``, the ``path``, the refusal ``count`` and ``since`` as the
+        Unix time of the flag. Empty when no store exists.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with reading(home) as db:
+        return _contended(db, root)
+
+
+def clear_contention(
+    home: Path, root: str, name: str, peer: str | None = None
+) -> int:
+    """Removes the contention records that name one lane.
+
+    The operator's handoff or release of that lane's work is the action that
+    ends a flag, so the pair is flagged again only if refusals resume. A
+    lane releasing or renewing its own reservations does not call this.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose records are removed.
+        peer: When given, only the records between `name` and this lane are
+            removed and records against any other lane stay.
+
+    Returns:
+        How many records were removed.
+    """
+    if not (home / DATABASE).exists():
+        return 0
+    low, high = sorted((name, peer)) if peer is not None else (name, name)
+    clause = "low=? AND high=?" if peer is not None else "(low=? OR high=?)"
+    with connect(home, write=True) as db:
+        return db.execute(
+            "DELETE FROM reservation_contention WHERE project_id=("
+            f"SELECT id FROM projects WHERE human_key=?) AND {clause}",
+            (root, low, high),
+        ).rowcount
+
+
 def record_refusal(
     home: Path, root: str, name: str, holder: str, path: str
 ) -> None:
@@ -5686,7 +5901,8 @@ def usage(
         declared time to live, the age of its oldest held lease, how long
         the oldest expired one has been expired, and the queued reservation
         requests waiting on the keys it holds with the lanes that asked,
-        and the lanes it refused a key it still holds as ``refused``. An
+        and the lanes it refused a key it still holds as ``refused``, and the
+        flagged contention records naming it as ``contention`` when any. An
         expired lease is counted apart from the live ones and keeps blocking
         until it is renewed, released or reclaimed; a queued request holds
         nothing of its own. Counts cover retained events only; older events
@@ -5721,6 +5937,19 @@ def usage(
             )
         for holder, refused in _refused_by(db, root).items():
             report.setdefault(holder, {}).update(refused=refused)
+        for flagged in _contended(db, root):
+            for lane, peer in (
+                flagged["lanes"],
+                flagged["lanes"][::-1],
+            ):
+                report.setdefault(lane, {}).setdefault("contention", []).append(
+                    {
+                        "peer": peer,
+                        "path": flagged["path"],
+                        "count": flagged["count"],
+                        "since": flagged["since"],
+                    }
+                )
         for row in db.execute(
             "SELECT a.name AS name,count(*) AS leases,"
             "coalesce(sum(f.expires_ts IS NOT NULL "

@@ -3291,6 +3291,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "milestone",
             "followup",
             "mail",
             "say",
@@ -3822,6 +3823,16 @@ def issue_lines(reading: dict) -> str:
         "Reservations held: "
         + (", ".join(reading["reservations"]) or "none recorded")
     )
+    for flagged in reading.get("contention") or []:
+        lines.append(
+            f"Contention with {flagged['peer']} on {flagged['path']}: "
+            f"{flagged['count']} refusals; {flagged['peer']} holds "
+            + (
+                ", ".join(f"#{held}" for held in flagged["issues"])
+                or "no issue"
+            )
+            + "; the operator hands off or releases one"
+        )
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
     reported = reading["history"]
@@ -6046,6 +6057,31 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     naming_base.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
+    milestoning = commands.add_parser(
+        "milestone",
+        help="Read how a milestone's open issues depend on one another.",
+    )
+    milestone_actions = milestoning.add_subparsers(dest="action", required=True)
+    milestone_path = milestone_actions.add_parser(
+        "path",
+        help=(
+            "Print the critical path of a milestone with each issue's state "
+            "and holder; it claims nothing."
+        ),
+    )
+    milestone_path.add_argument(
+        "--milestone",
+        default=None,
+        metavar="TITLE",
+        help=(
+            "Milestone to read; the forge's active milestone when omitted, "
+            "every cached open issue when the forge names none."
+        ),
+    )
+    milestone_path.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    milestone_path.add_argument("--json", action="store_true", help=JSON_HELP)
     tracker = commands.add_parser(
         "forge",
         help="Show or set the issue tracker this project coordinates over.",
@@ -7440,6 +7476,13 @@ def main() -> int:
                         repository, getattr(args, "prefix", None)
                     )
                 )
+        elif args.command == "milestone":
+            reading = bridge.milestone_path(args.repo.resolve(), args.milestone)
+            print(
+                views.render("milestone_path", reading)
+                if args.json
+                else recommend.render_path(reading)
+            )
         elif args.command == "forge":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
