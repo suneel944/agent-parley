@@ -186,8 +186,10 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
             live view. The keys read are ``condition``, ``provenance``,
             ``availability``, ``retired_at``, ``paused``,
             ``awaiting_approval``, ``decisions``, ``outcome``, ``claims``,
-            ``converging``, ``report_age_seconds`` and
-            ``pull_requests_merged``; a missing
+            ``converging``, ``report_age_seconds``,
+            ``pull_requests_merged`` and ``contention``, the flagged
+            reservation contention records naming the lane, each carrying
+            ``since``; a missing
             key is no evidence.
         now: Unix time ages are measured to, or None for the clock.
 
@@ -231,6 +233,10 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
         waits.append(("blocked claim", reported))
     for peer in record.get("converging") or []:
         waits.append((f"converging with {peer}", None))
+    if flagged := record.get("contention"):
+        waits.append(
+            ("contention", min(float(item["since"]) for item in flagged))
+        )
     starts = [start for _, start in waits if start is not None]
     ended = any(claim.get("ended") for claim in record.get("claims") or [])
     if waits:
@@ -256,6 +262,83 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
         ),
         "inferred": observed,
     }
+
+
+def held_issues(held: dict, data: dict, lane: str) -> list[int]:
+    """Lists the issues one lane owns in the ledger.
+
+    Args:
+        held: The ``issues`` mapping of the published ledger.
+        data: Project manifest.
+        lane: Registered identity, the display name, of the lane.
+
+    Returns:
+        The issue numbers whose owner has that identity, ascending.
+    """
+    names = {key: item["display"] for key, item in data["participants"].items()}
+    return sorted(
+        int(number)
+        for number, entry in held.items()
+        if names.get(entry.get("owner")) == lane
+    )
+
+
+def contention_reading(
+    flagged: list[dict], data: dict, held: dict, lane: str
+) -> list[dict]:
+    """Adds both lanes' claims to a lane's flagged contention records.
+
+    Args:
+        flagged: The ``contention`` records the store reported for the lane.
+        data: Project manifest.
+        held: The ``issues`` mapping of the published ledger.
+        lane: Registered identity, the display name, of the lane.
+
+    Returns:
+        The records, each carrying ``lane``, the issues it ``own``s and the
+        issues its ``peer`` holds as ``theirs``.
+    """
+    return [
+        {
+            **item,
+            "lane": lane,
+            "own": held_issues(held, data, lane),
+            "theirs": held_issues(held, data, item["peer"]),
+        }
+        for item in flagged
+    ]
+
+
+def contention_lines(records: list[dict]) -> list[str]:
+    """Words each flagged pair of lanes once, with both claims and the key.
+
+    Args:
+        records: Lanes of the status reading or rows of the live view.
+
+    Returns:
+        One line per pair and key, such as ``contention: claude (#1) and
+        codex (#2) on src/a.py``, however many of the lanes carry the record.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    lines = []
+    for record in records:
+        for item in record.get("contention") or []:
+            first, second = sorted((item["lane"], item["peer"]))
+            if (first, second, item["path"]) in seen:
+                continue
+            seen.add((first, second, item["path"]))
+            claims = {item["lane"]: item["own"], item["peer"]: item["theirs"]}
+            lines.append(
+                "contention: "
+                + " and ".join(
+                    f"{lane} ("
+                    + (", ".join(f"#{n}" for n in claims[lane]) or "no issue")
+                    + ")"
+                    for lane in (first, second)
+                )
+                + f" on {item['path']}"
+            )
+    return lines
 
 
 def bucket_cell(bucket: dict) -> str:
@@ -464,6 +547,10 @@ def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
                 f"{name.capitalize()} ({names.count(name)}):"
                 + (f" {waiting}" if waiting else "")
             )
+            if name == NEEDS_INPUT:
+                grouped.extend(
+                    f"  {line}" for line in contention_lines(records)
+                )
         grouped.append(lines[index + 1])
         if note := recap_note(records[index]):
             grouped.append(f"  {note}")
@@ -1760,6 +1847,12 @@ class StatusMixin(BridgeCore):
         record["awaiting_approval"] = (record["approval"] or {}).get(
             "state"
         ) in (approvals.AWAITING, "unreadable")
+        record["contention"] = contention_reading(
+            frame["usage"].get(name, {}).get("contention", []),
+            data,
+            ledger["issues"],
+            name,
+        )
         if wake:
             next_at = wake.get("next_at")
             record["wake"] = {

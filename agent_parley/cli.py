@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         checkpoints,
         completion,
         convergence,
+        criteria,
         evidence,
         followups,
         forge,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
         metrics,
         notify,
         plan,
+        polling,
         problems,
         process,
         protocol,
@@ -144,6 +146,7 @@ DEFERRED_MODULES = (
     "completion",
     "convergence",
     "copilot",
+    "criteria",
     "delivery",
     "dialogs",
     "evidence",
@@ -161,6 +164,7 @@ DEFERRED_MODULES = (
     "notify",
     "opencode",
     "plan",
+    "polling",
     "problems",
     "process",
     "protocol",
@@ -1034,7 +1038,7 @@ def lane_detail(record: dict, data: dict) -> None:
         )
     if timing := launch_line(data["participants"][agent].get("launch")):
         print(f"    {timing}")
-    if record["idle"]["stalled"]:
+    if record["idle"]["marker"]:
         print(f"    {record['idle']['marker']}")
     if record["budget"]["marker"]:
         print(f"    {record['budget']['marker']}")
@@ -3292,6 +3296,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "milestone",
             "followup",
             "mail",
             "say",
@@ -3781,7 +3786,7 @@ def lane_reading(bridge: Bridge, repo: Path, name: str) -> tuple[dict, dict]:
 
 
 def issue_lines(reading: dict) -> str:
-    """Renders one issue's ownership, blockers, reservations and history.
+    """Renders an issue's ownership, blockers, criteria and history.
 
     Args:
         reading: Reading produced by the issue show command.
@@ -3823,8 +3828,19 @@ def issue_lines(reading: dict) -> str:
         "Reservations held: "
         + (", ".join(reading["reservations"]) or "none recorded")
     )
+    for flagged in reading.get("contention") or []:
+        lines.append(
+            f"Contention with {flagged['peer']} on {flagged['path']}: "
+            f"{flagged['count']} refusals; {flagged['peer']} holds "
+            + (
+                ", ".join(f"#{held}" for held in flagged["issues"])
+                or "no issue"
+            )
+            + "; the operator hands off or releases one"
+        )
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
+    lines.extend(criteria.lines(record))
     reported = reading["history"]
     lines.append(
         history.describe(
@@ -4686,8 +4702,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     report.add_argument(
         "--evidence",
-        default="",
-        help="What was checked; longer evidence is attached to the report.",
+        action="append",
+        default=[],
+        help=(
+            "What was checked; repeatable, one line each. A ready report on "
+            "an issue with acceptance criteria needs one line per criterion, "
+            "written `N: <evidence>`. Longer evidence is attached to the "
+            "report."
+        ),
     )
     report.add_argument(
         "--issue",
@@ -4923,6 +4945,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Return the work to the queue instead of recording it complete. "
             "It is required when the pull request was closed without merging, "
             "because nothing was integrated."
+        ),
+    )
+    resolving.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="N: TEXT",
+        help=(
+            "Evidence for one acceptance criterion of the claim; repeatable, "
+            "one per criterion. Without it the holder's ready report evidence "
+            "stands, or the forge outcome is recorded for every criterion."
         ),
     )
     resolving.add_argument("--json", action="store_true", help=JSON_HELP)
@@ -6045,6 +6078,31 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     naming_base.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
+    milestoning = commands.add_parser(
+        "milestone",
+        help="Read how a milestone's open issues depend on one another.",
+    )
+    milestone_actions = milestoning.add_subparsers(dest="action", required=True)
+    milestone_path = milestone_actions.add_parser(
+        "path",
+        help=(
+            "Print the critical path of a milestone with each issue's state "
+            "and holder; it claims nothing."
+        ),
+    )
+    milestone_path.add_argument(
+        "--milestone",
+        default=None,
+        metavar="TITLE",
+        help=(
+            "Milestone to read; the forge's active milestone when omitted, "
+            "every cached open issue when the forge names none."
+        ),
+    )
+    milestone_path.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    milestone_path.add_argument("--json", action="store_true", help=JSON_HELP)
     tracker = commands.add_parser(
         "forge",
         help="Show or set the issue tracker this project coordinates over.",
@@ -6457,6 +6515,7 @@ def _plain_status() -> int:
     )
     try:
         bridge = Bridge(home)
+        polling.record(bridge.home, "cli:status")
         bridge.board(
             Selection(project=bridge.project_at(Path.cwd())), terminal_width()
         )
@@ -6932,7 +6991,7 @@ def main() -> int:
                 args.state,
                 args.summary,
                 args.remaining,
-                args.evidence,
+                "\n".join(args.evidence),
                 key=args.idempotency_key,
                 issue=args.issue,
                 resume_on=args.resume_on,
@@ -6986,6 +7045,7 @@ def main() -> int:
         ):
             return assigned_selection(bridge, args.repo.resolve(), args)
         elif args.command == "issue" and args.action == "next":
+            polling.record(bridge.home, "cli:issue-next")
             ranked = bridge.issue_next(args.repo.resolve(), args.limit)
             print(
                 views.render("issue_next", ranked)
@@ -7042,6 +7102,7 @@ def main() -> int:
                 args.number,
                 reason=args.reason,
                 release=args.release,
+                proof="\n".join(args.evidence),
             )
             print(
                 views.render("issue_resolve", views.resolution(ended))
@@ -7285,6 +7346,7 @@ def main() -> int:
                     else plan.render_diff(applied)
                 )
         elif args.command == "mail":
+            polling.record(bridge.home, "cli:mail")
             page = bridge.mail(
                 args.repo.resolve(),
                 args.action,
@@ -7455,6 +7517,13 @@ def main() -> int:
                         repository, getattr(args, "prefix", None)
                     )
                 )
+        elif args.command == "milestone":
+            reading = bridge.milestone_path(args.repo.resolve(), args.milestone)
+            print(
+                views.render("milestone_path", reading)
+                if args.json
+                else recommend.render_path(reading)
+            )
         elif args.command == "forge":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -7887,6 +7956,7 @@ def main() -> int:
                 else json.dumps(registered, indent=2)
             )
         else:
+            polling.record(bridge.home, "cli:status")
             selection = selected_status(args)
             workspace = getattr(args, "workspace", "")
             if workspace:

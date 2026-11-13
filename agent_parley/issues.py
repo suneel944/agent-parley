@@ -849,6 +849,7 @@ def change(
     takeover: dict | None = None,
     cap: int | None = None,
     usage: dict | None = None,
+    criteria: list[str] | None = None,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -898,6 +899,9 @@ def change(
             or an acceptance as the start its resolution is measured from.
             It is a reading, not intent, so it is excluded from the
             arguments a key is compared against.
+        criteria: Acceptance criteria read from the issue body on a claim.
+            Like a title it is forge context, excluded from the arguments a
+            key is compared against.
 
     Returns:
         The persisted issue record, including its capped transition history.
@@ -929,6 +933,7 @@ def change(
             takeover=takeover,
             cap=cap,
             usage=usage,
+            criteria=criteria,
             **transition,
         )
     key = retries.validate(key)
@@ -952,6 +957,7 @@ def change(
             takeover=takeover,
             cap=cap,
             usage=usage,
+            criteria=criteria,
             **transition,
         )
     except Transient:
@@ -1454,6 +1460,7 @@ def _change(
     takeover: dict | None = None,
     cap: int | None = None,
     usage: dict | None = None,
+    criteria: list[str] | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -1498,6 +1505,9 @@ def _change(
             past the cap one offer at a time.
         usage: The acting lane's consumption reading, kept on a claim or an
             acceptance it makes as the start of the new generation.
+        criteria: Acceptance criteria read from the issue body on a claim,
+            kept on the record as ``criteria``. None, a forge that could not
+            be read, leaves any previously recorded list in place.
 
     A transition that ends an ownership generation, by releasing it, by
     handing it to another lane, by taking it from an orphaned owner or by the
@@ -1619,6 +1629,9 @@ def _change(
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
+            stated = previous.get("criteria") if criteria is None else criteria
+            if stated is not None:
+                record["criteria"] = stated
             if taken or reclaimed:
                 if inherited := previous.get("handoff"):
                     record["handoff"] = inherited

@@ -347,18 +347,23 @@ def account(
     directory: Path,
     manifest: dict,
     observe: Callable[[Path, str], dict],
+    extra: Mapping[str, dict] | None = None,
 ) -> dict:
     """Recomputes every credential's window and the parked lanes once.
 
     The supervision poll calls this once per tick. Token counts are read
     only for a credential with a recorded window, so a project that records
-    none parses no transcript here.
+    none parses no transcript here. Parks another cause decided in the same
+    poll, such as `polling.observe`, join the same ``parked`` map, so every
+    path that defers a parked lane defers them too; a credential park of the
+    same lane is kept in their place.
 
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
         manifest: Project manifest.
         observe: Reads one lane's durable capacity observation.
+        extra: Parked records decided elsewhere this poll, per lane.
 
     Returns:
         The ledger written: per credential its window entry, the vendor
@@ -398,6 +403,7 @@ def account(
                 "entry": rolled,
                 "reported": list(reported) if reported is not None else None,
             }
+        parked = {**(extra or {}), **parked}
         ledger = {"at": now, "credentials": credentials, "parked": parked}
         write_json(directory / LEDGER, ledger)
     return ledger
