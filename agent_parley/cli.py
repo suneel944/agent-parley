@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         recaps,
         reclaim,
         recommend,
+        reviews,
         roster,
         state,
         store,
@@ -167,6 +168,7 @@ DEFERRED_MODULES = (
     "reclaim",
     "recommend",
     "retries",
+    "reviews",
     "roster",
     "state",
     "store",
@@ -6874,6 +6876,12 @@ def main() -> int:
                 if args.json
                 else issue_lines(detail)
             )
+            if not args.json:
+                _, directory = bridge.project(args.repo.resolve(), create=False)
+                for line in reviews.lines(
+                    reviews.rounds(directory, issue=str(args.number))
+                ):
+                    print(line)
         elif (
             args.command == "issue"
             and args.action == "assign"
@@ -7221,6 +7229,16 @@ def main() -> int:
                 _, directory = bridge.project(repository, create=False)
                 lane_detail(record, roster.read(directory))
                 for line in recap_lines(directory, args.name):
+                    print(line)
+                display = str(
+                    roster.read(directory)["participants"]
+                    .get(args.name, {})
+                    .get("display")
+                    or args.name
+                )
+                for line in reviews.lines(
+                    reviews.rounds(directory, lane=display)
+                ):
                     print(line)
                 for line in plan_lines(
                     lanes.lane_task_plan(directory, args.name)
