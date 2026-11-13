@@ -13,6 +13,7 @@ import pytest
 from agent_parley import (
     children,
     cli,
+    dashboard,
     followups,
     process,
     roster,
@@ -335,7 +336,7 @@ def test_message_is_capped_and_names_the_merge():
 
 
 def test_a_child_spawned_on_a_model_and_effort_records_and_shows_them(
-    bridge, parent, service, launched
+    bridge, parent, service, launched, capsys
 ):
     body = "model: claude-sonnet-5-5\nEffort: high\nWrite the parser."
     spawned = decoded(
@@ -362,6 +363,23 @@ def test_a_child_spawned_on_a_model_and_effort_records_and_shows_them(
         "claude-c1", "b-c1", {"state": "ready"}, children.tier_label(entry)
     )
     assert "Ran on: model claude-sonnet-5-5, effort high" in body
+    rows = {
+        row["participant"]: row
+        for row in dashboard.select(dashboard.collect(bridge.home, False, {}))[
+            "projects"
+        ][0]["rows"]
+    }
+    column = [name for name, _ in dashboard.COLUMNS].index("PROVIDER")
+    assert dashboard.row_cells(rows["claude-c1"])[column].endswith(
+        " claude-sonnet-5-5 high"
+    )
+    assert "sonnet" not in dashboard.row_cells(rows["claude"])[column]
+    record = {
+        item["participant"]: item
+        for item in bridge.status_snapshot()["projects"][0]["participants"]
+    }["claude-c1"]
+    cli.lane_detail(record, roster.read(parent["directory"]))
+    assert "Model: claude-sonnet-5-5; effort: high" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -370,6 +388,8 @@ def test_a_child_spawned_on_a_model_and_effort_records_and_shows_them(
         ("effort: turbo\nDo it", "takes effort low, medium, high"),
         ("model: x;rm\nDo it", "is not a model or effort name"),
         ("model: a\nmodel: b\nDo it", "names model: more than once"),
+        ("model:\nDo it", "names model: with no value"),
+        ("Effort:  \nDo it", "names effort: with no value"),
     ],
 )
 def test_a_tier_the_cli_cannot_honour_is_refused_with_the_reason(

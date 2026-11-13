@@ -192,7 +192,8 @@ def headers(body: object) -> tuple[dict[str, str], object]:
         for `_task` to refuse.
 
     Raises:
-        BridgeError: If a header repeats.
+        BridgeError: If a header repeats or names no value, so an empty
+            header never starts the child silently on the default.
     """
     if not isinstance(body, str):
         return {}, body
@@ -202,6 +203,11 @@ def headers(body: object) -> tuple[dict[str, str], object]:
         field = match.group(1).lower()
         if field in found:
             raise BridgeError(f"spawn_child names {field}: more than once.")
+        if not match.group(2):
+            raise BridgeError(
+                f"spawn_child names {field}: with no value; name one or "
+                "leave the line out for the provider default."
+            )
         found[field] = match.group(2)
         lines.pop(0)
     return found, "\n".join(lines)

@@ -339,7 +339,14 @@ lane setup.
   the transcript, and merges the branch with Git. A child cannot spawn
   children; three per parent and eight per project at most. A child is
   retired once it reports, or after four hours without a report, and either
-  outcome wakes a parent that is waiting on it.
+  outcome wakes a parent that is waiting on it. To run a child
+  on another tier, open the body with `model: NAME` and `effort: LEVEL`
+  lines. Claude, Codex, Gemini, Copilot and OpenCode take `model:`; only
+  Claude (`low` to `max`) and Codex (`none` to `xhigh`) take `effort:`. A
+  setting the CLI cannot honour, an empty value or a repeated line refuses
+  the spawn with the reason. Without them the child runs on the provider
+  default. `top`, `participant show` and the child report name the tier,
+  and `quota show` splits a Claude credential's window use by model.
 - **Lanes sharing a credential park before its quota runs out.**
   `agent-parley quota set NAME --hours H --tokens N [--threshold F]` records
   the plan's window; `quota show` prints the remaining headroom. Near the
