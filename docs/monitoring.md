@@ -376,6 +376,16 @@ also shows a `last turn:` line from its stored turn recap: its last message,
 the failed commands and the changed files, each capped in bytes. `status
 --json` and the live view carry the recap as `recap`, and a lane without one
 shows nothing.
+Two live lanes that share a branch name, a new file named in both task plans,
+or at least three reserved paths that are also half of the smaller lane's set
+are converging on duplicate work. Both lanes read `needs input: converging
+with PEER on ITEM`, `status` prints one `Converging:` line per pair naming both
+lanes and the shared item, and the supervision poll mails each lane once while
+the overlap is unchanged. A plan names a new file only as a path with a
+directory and a letters-only extension that the base checkout lacks. A child
+lane is never paired with its parent, and a stopped, dead, reclaimed or
+retired lane is not compared. The flag clears when the overlap does; nothing
+is refused, renamed or released.
 `--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED,
 FIT and PLAN. The web view shows every column. PLAN is the lane's own task
 list: steps done of all and the step in progress, `-` before the lane records
