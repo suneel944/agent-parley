@@ -674,6 +674,24 @@ window, or the last 7 days when no window is given:
 | `agent_parley_lane_ci_rounds_median` | gauge | Median CI rounds over merged pull requests with a known count |
 | `agent_parley_lane_claim_to_merge_seconds_median` | gauge | Median seconds from the claim to the merge of its pull request |
 | `agent_parley_project_pull_requests_excluded` | gauge | Pull requests in the window that no lane owns, left out of every lane figure |
+| `agent_parley_lane_merge_fraction_ratio` | gauge | Share of pull requests opened in the window that merged, by a claim resolution or by the forge's answer when it left the open list |
+| `agent_parley_lane_pull_requests_abandoned_window` | gauge | Pull requests that left the open list in the window and that the forge reported `CLOSED` |
+| `agent_parley_lane_pull_requests_end_unknown_window` | gauge | Pull requests that left the open list in the window with no recorded merge and no forge answer, never counted as abandoned |
+| `agent_parley_lane_shared_file_degree_ratio` | gauge | Share of the files in the lane's diff that another lane's diff also touches |
+
+The four merge health families are also exported as
+`agent_parley_provider_*`, labelled by project and provider, and
+`agent_parley_project_*`, labelled by project, summed over the reported lanes:
+the fraction is merged over opened summed across them, and the shared-file
+degree is the share of every file those lanes touch that more than one lane of
+the project touches. With no `--provider` filter, the project sums also count
+the outcomes of lanes no longer in the project, so a removed lane's pull
+requests stay in the project's fraction. When supervision re-reads a pull
+request that left the open list, it stores the forge's answer on the archived reading as `ended`. A
+failed read keeps the pull request in the open list, and an archived reading
+with no answer, such as one archived before `ended` was stored, counts as
+unknown rather than abandoned. The file footprint is the diff `top` already reads, so it describes
+the lanes now rather than the window.
 
 Nothing here reads the forge. Supervision's pull request poll already keeps
 each open pull request in `pull-requests.json` with the lane it belongs to and

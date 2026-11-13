@@ -85,6 +85,7 @@ COLUMNS = (
     ("IDLE", 8),
     ("UNUSED", 7),
     ("FIT", 8),
+    ("MERGED", 6),
     ("PLAN", 14),
     ("TASK", 4),
 )
@@ -106,6 +107,7 @@ DEFAULT_COLUMNS = (
 FLEX = ("STATE", "TASK")
 ONCE_HINT = "Live view: top without --once; ? explains each column."
 DROP_ORDER = (
+    "MERGED",
     "PROVIDER",
     "EVENT",
     "BRANCH",
@@ -150,6 +152,9 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
         -(row.get("accounting") or {}).get("idle_per_lane_hour", -1.0)
     ),
     "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
+    "MERGED": lambda row: (
+        -(-1.0 if row.get("merge_fraction") is None else row["merge_fraction"])
+    ),
     "PLAN": lambda row: -row["task_plan"]["done"],
     "TASK": lambda row: row["prompt"],
 }
@@ -196,8 +201,12 @@ LEGEND = (
     "budget counts what the client recorded, not spend.",
     "TASK is the lane's last prompt or recorded task, clipped to the "
     "terminal; enter shows it whole. The default columns leave out "
-    "PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED and FIT; c or "
-    "--columns all shows them.",
+    "PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED, FIT and "
+    "MERGED; c or --columns all shows them.",
+    "MERGED is the share of the lane's pull requests opened in the outcome "
+    "window, the --since window or the last 7 days, that merged; - when the "
+    "lane opened none. It reads the pull request record supervision keeps "
+    "and never asks the forge.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, +queued requests waiting on those "
     "keys, with the age of the oldest; DENIALS "
@@ -880,14 +889,28 @@ def collect(
             row["converging"] = collisions.peers(converging, row["participant"])
             row["bucket"] = lane_bucket(row)
         _orphan_remedies(rows, data["root"])
+        metrics.share_files(rows)
+        retired = [
+            counts
+            for name, counts in outcomes["lanes"].items()
+            if name not in data["participants"]
+        ]
         if providers:
             rows = [row for row in rows if row["provider_name"] in providers]
+            retired = []
         projects.append(
             {
                 "root": data["root"],
                 "present": present,
                 "rows": rows,
                 "pull_requests_excluded": outcomes["excluded"],
+                "merge_health": metrics.merge_health([*rows, *retired]),
+                "provider_health": {
+                    name: metrics.merge_health(
+                        [row for row in rows if row["provider_name"] == name]
+                    )
+                    for name in {row["provider_name"] for row in rows}
+                },
                 "ready_groups": plan.ready_groups(
                     plan.groups(path.parent),
                     context["issues"],
@@ -972,6 +995,11 @@ def row_cells(row: dict) -> tuple[str, ...]:
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _unused(row.get("accounting")),
         _fitness(row),
+        (
+            "-"
+            if row.get("merge_fraction") is None
+            else f"{row['merge_fraction']:.0%}"
+        ),
         plan_cell(row["task_plan"]),
         row["prompt"] or "-",
     )

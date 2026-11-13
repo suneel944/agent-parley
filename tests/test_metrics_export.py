@@ -203,7 +203,9 @@ def test_a_label_value_escapes_quotes_backslashes_and_newlines():
         if name.startswith("agent_parley_project_")
     ]
     lane_aliases = len(views.DEPRECATED_ALIASES) - len(project_aliases)
-    lane_families = len(views.LANE_METRICS) + 1 + lane_aliases
+    lane_families = (
+        len(views.LANE_METRICS) + 1 + lane_aliases + 3 * len(views.MERGE_HEALTH)
+    )
     project_families = len(views.PROJECT_METRICS) + len(project_aliases)
     assert len(text.splitlines()) == lane_families * 2 + project_families * 3
 

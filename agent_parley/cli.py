@@ -4176,8 +4176,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help=(
             "Show only these columns, comma separated, such as "
             "PARTICIPANT,STATE,IDLE, or all for every column. The default "
-            "leaves out PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and "
-            "FIT."
+            "leaves out PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED, FIT "
+            "and MERGED, the merge fraction over the --since window or the "
+            "last 7 days."
         ),
     )
     watch.add_argument(

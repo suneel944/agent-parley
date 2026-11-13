@@ -100,6 +100,10 @@ def test_a_replayed_window_gives_exact_counts_and_medians():
         "pull_requests_opened": 3,
         "pull_requests_merged": 3,
         "pull_requests_closed": 0,
+        "pull_requests_opened_merged": 3,
+        "pull_requests_abandoned": 0,
+        "pull_requests_end_unknown": 0,
+        "merge_fraction": 1.0,
         "first_pass": 1,
         "first_pass_known": 2,
         "first_pass_rate": 0.5,
@@ -119,6 +123,78 @@ def test_a_replayed_window_gives_exact_counts_and_medians():
         "Pull requests (last 7d): 5 opened, 3 merged, 1 closed unmerged, "
         "first pass 1/2 (1 without CI rounds), 2 unowned excluded"
     )
+
+
+def test_only_a_forge_close_is_abandoned_and_an_unread_end_is_unknown():
+    record = {
+        "pull_requests": {
+            "43": {"number": 43, "lane": "a", "opened_at": NOW - 10},
+        },
+        "history": [
+            {
+                "number": 40,
+                "lane": "a",
+                "opened_at": NOW - 100,
+                "gone_at": NOW - 50,
+                "ended": "CLOSED",
+            },
+            {"number": 41, "lane": "a", "opened_at": NOW - 90, "gone_at": NOW},
+            {
+                "number": 42,
+                "lane": "a",
+                "opened_at": NOW - 80,
+                "gone_at": NOW - 5,
+                "ended": "MERGED",
+            },
+        ],
+    }
+    lane = metrics.pull_request_outcomes(record, {"issues": {}}, SINCE)
+    counts = lane["lanes"]["a"]
+    assert counts["pull_requests_opened"] == 4
+    assert counts["pull_requests_closed"] == 2
+    assert counts["pull_requests_abandoned"] == 1
+    assert counts["pull_requests_end_unknown"] == 1
+    assert counts["pull_requests_opened_merged"] == 1
+    assert counts["merge_fraction"] == 0.25
+
+
+def test_merge_health_sums_lanes_and_shares_files():
+    rows = [
+        {
+            "participant": "a",
+            "provider_name": "claude",
+            "diff_paths": ["x", "y"],
+            "pull_requests_opened": 2,
+            "pull_requests_opened_merged": 1,
+            "pull_requests_abandoned": 1,
+        },
+        {
+            "participant": "b",
+            "provider_name": "codex",
+            "diff_paths": ["y", "z"],
+            "pull_requests_opened": 2,
+            "pull_requests_opened_merged": 2,
+        },
+        {"participant": "c", "provider_name": "claude", "diff_paths": []},
+    ]
+    metrics.share_files(rows)
+    assert rows[0]["shared_paths"] == ["y"]
+    assert rows[0]["shared_file_degree"] == 0.5
+    assert rows[2]["shared_file_degree"] is None
+    health = metrics.merge_health(rows)
+    assert health["merge_fraction"] == 0.75
+    assert health["pull_requests_abandoned"] == 1
+    assert health["shared_file_degree"] == pytest.approx(1 / 3)
+    claude = metrics.merge_health([rows[0], rows[2]])
+    assert claude["shared_file_degree"] == 0.5
+    assert metrics.merge_health([rows[2]]) == {
+        "pull_requests_opened": 0,
+        "pull_requests_opened_merged": 0,
+        "pull_requests_abandoned": 0,
+        "pull_requests_end_unknown": 0,
+        "merge_fraction": None,
+        "shared_file_degree": None,
+    }
 
 
 def test_an_empty_window_reports_nothing_rather_than_failing():
@@ -199,6 +275,33 @@ def test_a_pull_request_leaving_the_open_list_is_archived_and_pruned(
     assert after["history"][0]["gone_at"] >= seen
 
 
+def test_an_archived_reading_keeps_the_forge_end_state(
+    bridge, project, monkeypatch
+):
+    first = observe(bridge, project, monkeypatch, opened(7))
+    first["pull_requests"]["7"]["lane"] = "claude"
+    (project / supervision.PULL_REQUEST_RECORD).write_text(
+        json.dumps({**first, "read_at": 0})
+    )
+    monkeypatch.setattr(
+        supervision.forge, "pull_request", lambda root, number: None
+    )
+    unread = observe(bridge, project, monkeypatch)
+    assert sorted(unread["pull_requests"]) == ["7"]
+    assert unread["history"] == []
+    (project / supervision.PULL_REQUEST_RECORD).write_text(
+        json.dumps({**unread, "read_at": 0})
+    )
+    monkeypatch.setattr(
+        supervision.forge,
+        "pull_request",
+        lambda root, number: {"state": "CLOSED"},
+    )
+    after = observe(bridge, project, monkeypatch)
+    assert after["pull_requests"] == {}
+    assert after["history"][0]["ended"] == "CLOSED"
+
+
 def test_a_full_reading_archives_nothing(bridge, project, monkeypatch):
     monkeypatch.setattr(forge, "MAX_PULL_REQUESTS", 1)
     observe(bridge, project, monkeypatch, opened(7))
@@ -227,6 +330,9 @@ def test_metrics_status_and_top_report_recorded_outcomes(
         empty
     )
     assert f"agent_parley_lane_first_pass_ratio{{{labels}}}" not in empty
+    assert "agent_parley_lane_merge_fraction_ratio{" not in empty
+    assert "agent_parley_provider_merge_fraction_ratio{" not in empty
+    assert "agent_parley_project_merge_fraction_ratio{" not in empty
     assert (
         f'agent_parley_project_pull_requests_excluded{{project="'
         f'{paired["root"]}"}} 0' in empty
@@ -251,6 +357,30 @@ def test_metrics_status_and_top_report_recorded_outcomes(
         f'agent_parley_project_pull_requests_excluded{{project="'
         f'{paired["root"]}"}} 1' in text
     )
+    assert f"agent_parley_lane_merge_fraction_ratio{{{labels}}} 0" in text
+    assert (
+        f'agent_parley_provider_merge_fraction_ratio{{project="'
+        f'{paired["root"]}",provider="claude"}} 0' in text
+    )
+    assert (
+        f'agent_parley_project_merge_fraction_ratio{{project="'
+        f'{paired["root"]}"}} 0' in text
+    )
+    merged = run(
+        monkeypatch,
+        capsys,
+        *home,
+        "top",
+        "--once",
+        "--columns",
+        "PARTICIPANT,MERGED",
+    )
+    cells = {
+        line.split()[0]: line.split()[1:]
+        for line in merged.splitlines()
+        if line.split()[:1] in (["claude"], ["codex"])
+    }
+    assert cells == {"claude": ["0%"], "codex": ["-"]}
     document = json.loads(run(monkeypatch, capsys, *home, "top", "--json"))
     row = next(
         participant
@@ -263,3 +393,45 @@ def test_metrics_status_and_top_report_recorded_outcomes(
     summary = "1 opened, 0 merged, 0 closed unmerged"
     assert summary in run(monkeypatch, capsys, *home, "top", "--once")
     assert summary in run(monkeypatch, capsys, *home, "status")
+
+
+def test_a_retired_lane_still_counts_in_the_project_merge_fraction(
+    bridge, paired, monkeypatch, capsys
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    home = ["--home", str(bridge.home)]
+    project = f'project="{paired["root"]}"'
+    now = time.time()
+    (directory / supervision.PULL_REQUEST_RECORD).write_text(
+        json.dumps(
+            {
+                "read_at": now,
+                "pull_requests": {
+                    "4": {"number": 4, "lane": "claude", "opened_at": now}
+                },
+                "history": [
+                    {
+                        "number": 6,
+                        "lane": "retired",
+                        "opened_at": now,
+                        "gone_at": now,
+                        "ended": "MERGED",
+                    }
+                ],
+            }
+        )
+    )
+    text = run(monkeypatch, capsys, *home, "metrics")
+    assert f"agent_parley_project_merge_fraction_ratio{{{project}}} 0.5" in (
+        text
+    )
+    assert (
+        f"agent_parley_provider_merge_fraction_ratio{{{project},"
+        f'provider="claude"}} 0' in text
+    )
+    filtered = run(
+        monkeypatch, capsys, *home, "metrics", "--provider", "claude"
+    )
+    assert f"agent_parley_project_merge_fraction_ratio{{{project}}} 0" in (
+        filtered
+    )
