@@ -14,10 +14,14 @@ import ast
 import difflib
 
 DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+BLOCKS = (ast.stmt, ast.excepthandler, ast.match_case)
 
 
 def owners(source: str) -> list[str]:
     """Maps each line of a module to the innermost definition holding it.
+
+    Only statements are searched, since a definition is always one, so the
+    expressions of a long module are never walked.
 
     Args:
         source: Module text.
@@ -43,7 +47,7 @@ def owners(source: str) -> list[str]:
                 end = child.end_lineno or child.lineno
                 spans.append((start, -end, name))
                 pending.append((child, name + "."))
-            else:
+            elif isinstance(child, BLOCKS):
                 pending.append((child, prefix))
     found = [""] * (source.count("\n") + 2)
     for start, negative, name in sorted(spans):
@@ -59,6 +63,15 @@ def touched(before: str, after: str) -> list[str] | None:
     one added. Each line is charged to the innermost function or class
     holding it, so editing one method touches that method, not its class.
 
+    A class span covers the blank lines between its methods, so a blank or
+    comment-only changed line is not charged while any other line changed;
+    adding a method beside a reserved one then touches only the new
+    method. An edit that changes nothing but such lines is charged by them.
+
+    The lines both texts share at the start and the end are trimmed before
+    the texts are compared, so a small edit of a long module compares only
+    the span it changes.
+
     Args:
         before: Module text before the edit, empty for a new file.
         after: Module text the edit would leave.
@@ -72,12 +85,44 @@ def touched(before: str, after: str) -> list[str] | None:
         new = owners(after)
     except (SyntaxError, ValueError):
         return None
+    first = before.split("\n")
+    second = after.split("\n")
+    shorter = min(len(first), len(second))
+    head = 0
+    while head < shorter and first[head] == second[head]:
+        head += 1
+    tail = 0
+    while tail < shorter - head and first[-1 - tail] == second[-1 - tail]:
+        tail += 1
     matcher = difflib.SequenceMatcher(
-        None, before.split("\n"), after.split("\n"), autojunk=False
+        None,
+        first[head : len(first) - tail],
+        second[head : len(second) - tail],
+        autojunk=False,
     )
-    found: set[str] = set()
-    for tag, first, last, start, end in matcher.get_opcodes():
+    changed: list[tuple[str, str]] = []
+    for tag, start, end, begin, finish in matcher.get_opcodes():
         if tag != "equal":
-            found.update(old[first + 1 : last + 1])
-            found.update(new[start + 1 : end + 1])
-    return sorted(found)
+            changed.extend(
+                (first[line], old[line + 1])
+                for line in range(head + start, head + end)
+            )
+            changed.extend(
+                (second[line], new[line + 1])
+                for line in range(head + begin, head + finish)
+            )
+    code = {name for text, name in changed if not ignorable(text)}
+    return sorted(code or {name for _, name in changed})
+
+
+def ignorable(line: str) -> bool:
+    """Reports whether a line is blank or holds only a comment.
+
+    Args:
+        line: One line of module text.
+
+    Returns:
+        Whether the line carries no code.
+    """
+    text = line.strip()
+    return not text or text.startswith("#")

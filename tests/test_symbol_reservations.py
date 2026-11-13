@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agent_parley import checkpoints, store, symbols
+from agent_parley import checkpoints, cli, dashboard, store, symbols
 
 MODULE = (
     "import os\n"
@@ -170,6 +170,61 @@ def test_a_file_that_does_not_parse_falls_back_and_says_so(bridge, lanes):
     assert "claude reserves src/store.py::Store.claim" in context
 
 
+def test_adding_a_method_beside_a_reserved_one_is_allowed(bridge, lanes):
+    granted(reserve(lanes, "claude", "src/store.py::Store.claim"))
+
+    decision = edit(
+        bridge,
+        lanes,
+        "return 1\n",
+        "return 1\n\n    def take(self):\n        return 5\n",
+    )
+
+    assert decision.get("permissionDecision") != "deny"
+    assert "Store.claim" not in decision.get("additionalContext", "")
+
+
+def test_an_edit_that_breaks_the_parse_falls_back_and_says_so(bridge, lanes):
+    granted(reserve(lanes, "claude", "src/store.py::Store.claim"))
+
+    decision = edit(bridge, lanes, "return 2", "return (")
+
+    assert decision.get("permissionDecision") != "deny"
+    context = decision["additionalContext"]
+    assert "does not parse" in context
+    assert "compared by path" in context
+
+
+def test_status_prints_the_reserved_symbol(bridge, lanes, capsys):
+    granted(reserve(lanes, "claude", "src/store.py::Store.claim"))
+
+    bridge.status(cli.Selection(participant="claude"))
+
+    output = capsys.readouterr().out
+    assert "Symbols reserved: src/store.py::Store.claim" in output
+    assert "Named resources held" not in output
+
+
+def test_top_prints_the_reserved_symbol(bridge, lanes):
+    granted(reserve(lanes, "claude", "src/store.py::Store.claim"))
+
+    view = dashboard.select(dashboard.collect(bridge.home, False, {}))
+    lines = dashboard.layout(view)["lines"]
+
+    claude = [line for line in lines if line.startswith("claude")]
+    assert claude
+    assert "src/store.py::Store.claim" in claude[0]
+
+
+def test_a_resource_with_a_double_colon_is_not_a_symbol(bridge, lanes):
+    granted(reserve(lanes, "claude", "host:db::5432", "a.py::f"))
+
+    mail = checkpoints.mailbox(bridge.home, lanes["root"], "claude")
+
+    assert mail["named_resources"] == ["host:db::5432"]
+    assert mail["reserved_symbols"] == ["a.py::f"]
+
+
 def test_status_lists_the_reserved_symbol(bridge, lanes):
     granted(reserve(lanes, "claude", "src/store.py::Store.claim", "a.py::f"))
 
@@ -210,3 +265,19 @@ def test_changed_definitions_are_named_innermost_first():
         "Store.release"
     ]
     assert symbols.touched(MODULE, MODULE + "def broken(:\n") is None
+
+
+def test_blank_and_comment_lines_are_not_charged_beside_code():
+    added = MODULE.replace(
+        "        return 1\n",
+        "        return 1\n\n    # new\n    def take(self):\n"
+        "        return 5\n",
+    )
+    assert symbols.touched(MODULE, added) == ["Store.take"]
+    spaced = MODULE.replace("        return 1\n", "        return 1\n\n")
+    assert symbols.touched(MODULE, spaced) == ["Store"]
+
+
+def test_a_named_resource_with_a_double_colon_stays_a_resource():
+    assert store.named_resource("host:db::5432")
+    assert not store.named_resource("src/store.py::Store.claim")

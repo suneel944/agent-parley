@@ -3645,12 +3645,12 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         named = db.execute(
             "SELECT path_pattern FROM file_reservations WHERE agent_id=? "
             "AND released_ts IS NULL AND instr(path_pattern,':')>0 "
-            "AND instr(path_pattern,'::')=0 "
-            "AND (instr(path_pattern,'/')=0 "
-            "OR instr(path_pattern,':')<instr(path_pattern,'/')) "
-            "ORDER BY path_pattern LIMIT 16",
+            "ORDER BY path_pattern",
             (agent["id"],),
         ).fetchall()
+        named = [
+            row for row in named if store.named_resource(row["path_pattern"])
+        ][:16]
         topics = db.execute(
             "SELECT coalesce(nullif(m.topic,''),?) AS topic,count(*) AS n "
             "FROM message_recipients r JOIN messages m ON m.id=r.message_id "
@@ -3683,7 +3683,9 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "reserved_symbols": [
                 row["path_pattern"]
                 for row in held
-                if row["own"] and store.SYMBOL_SEPARATOR in row["path_pattern"]
+                if row["own"]
+                and store.SYMBOL_SEPARATOR in row["path_pattern"]
+                and not store.named_resource(row["path_pattern"])
             ],
             "peer_reservations": [
                 {"holder": row["holder"], "pattern": row["path_pattern"]}
