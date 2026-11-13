@@ -1,10 +1,11 @@
 """Checks the suspected-flaky flag over real Git trees and report logs."""
 
 import json
+from pathlib import Path
 
 import pytest
 
-from agent_parley import flaky, followups, metrics, store
+from agent_parley import flaky, followups, metrics, store, supervision
 from agent_parley.worktrees import git
 
 TEST = "tests/test_core.py::test_value"
@@ -131,18 +132,49 @@ def test_relative_and_from_imports_resolve_to_dotted_modules():
     assert not flaky.touches(["pkg/conftest.py"], TEST, found)
 
 
+def test_source_the_parser_cannot_hold_imports_nothing():
+    for source in ("-" * 200000 + "1", "(" * 150 + ")" * 150, "[" * 100000):
+        assert flaky.imports(source, "tests/test_deep.py") == set()
+
+
 def test_a_damaged_test_record_is_dropped_on_read(tmp_path):
+    event = {
+        "lane": "one",
+        "outcome": flaky.FAIL,
+        "tree": "t" * 40,
+        "source": flaky.REPORT,
+        "at": 1.0,
+        "touches": False,
+    }
     (tmp_path / flaky.PUBLICATION).write_text(
         json.dumps(
             {
                 "tests": {
                     TEST: {"events": [{"lane": "one"}], "suspected": None},
-                    "tests/a.py::ok": {"events": [], "suspected": None},
+                    "tests/a.py::no_commit": {
+                        "events": [event],
+                        "suspected": None,
+                    },
+                    "tests/a.py::ok": {
+                        "events": [{**event, "commit": "c" * 40}],
+                        "suspected": None,
+                    },
                 }
             }
         )
     )
     assert list(flaky.read(tmp_path)["tests"]) == ["tests/a.py::ok"]
+
+
+def test_a_test_id_is_quoted_as_code_with_its_backticks_replaced():
+    held = {
+        "reason": flaky.SAME_TREE,
+        "evidence": [],
+        "followup": "",
+    }
+    subject, body = flaky.message("tests/a.py::t[`x`]", held)
+    assert subject == "Suspected flaky test `tests/a.py::t['x']`"
+    assert "Test `tests/a.py::t['x']` is suspected" in body
 
 
 def test_a_same_tree_flip_tells_every_lane_once_and_suggests_one_issue(
@@ -160,7 +192,8 @@ def test_a_same_tree_flip_tells_every_lane_once_and_suggests_one_issue(
     assert sorted(name for name, *_ in sent) == ["one", "three", "two"]
     assert len({key.split(":")[1] for *_, key in sent}) == 1
     subject, body = sent[0][1], sent[0][2]
-    assert subject == f"Suspected flaky test {TEST}"
+    assert subject == f"Suspected flaky test `{TEST}`"
+    assert f"Test `{TEST}` is suspected" in body
     assert flaky.SAME_TREE in body
     assert "no test was skipped or disabled" in body
     assert held(project)["reason"] == flaky.SAME_TREE
@@ -275,3 +308,146 @@ def test_a_green_forge_run_on_a_failed_tree_is_a_flip(project):
     supervise(project)
     assert held(project)["reason"] == flaky.SAME_TREE
     assert len(project["sent"]) == 3
+
+
+def test_lanes_forked_either_side_of_a_merged_change_are_not_two_lanes(
+    project,
+):
+    first = change(project, "one", "notes.txt", "more notes\n")
+    root = project["root"]
+    (root / "pkg" / "other.py").write_text("OTHER = 5\n")
+    git(root, "commit", "-q", "-am", "merged change")
+    second = change(project, "two", "notes.txt", "other notes\n")
+    report(project, "one", first, FAILED)
+    report(project, "two", second, FAILED)
+    supervise(project)
+
+    assert held(project) is None
+    assert project["sent"] == []
+
+
+def test_a_refused_suggestion_still_tells_the_lanes(project, monkeypatch):
+    def refuse(*args):
+        raise ValueError("bad record")
+
+    monkeypatch.setattr(followups, "suggest", refuse)
+    commit = change(project, "one", "notes.txt", "more notes\n")
+    report(project, "one", commit, FAILED)
+    report(project, "one", commit, PASSED, "ready")
+    supervise(project)
+
+    assert held(project)["followup"] == ""
+    assert len(project["sent"]) == 3
+
+
+def pull_request(bridge, paired, monkeypatch, log):
+    """Wakes the Claude lane on a red pull request with a quoting review."""
+    store.initialize(bridge.home)
+    for name in ("claude", "codex"):
+        store.register(bridge.home, paired["root"], name)
+    monkeypatch.setattr(supervision, "PULL_REQUEST_SECONDS", 0.0)
+    directory = Path(paired["lanes"]["claude"]).parent
+    manifest = supervision.roster.read(directory)
+    review = {"author": "alice", "state": "CHANGES_REQUESTED", "at": "t1"}
+    reading = {
+        "number": 7,
+        "url": "https://example.test/pull/7",
+        "branch": manifest["participants"]["claude"]["branch"],
+        "sha": git(Path(paired["root"]), "rev-parse", "HEAD"),
+        "checks": "red",
+        "failing": ["test"],
+        "failed": [
+            {"name": "test", "run": "1", "job": "2", "conclusion": "failure"}
+        ]
+        if log
+        else [],
+        "reviews": [review],
+        "mergeable": "MERGEABLE",
+        "issues": [],
+    }
+    details = [
+        {
+            "author": "alice",
+            "at": "t1",
+            "body": "FAILED tests/x.py::t and tests/x.py::u PASSED",
+            "comments": [
+                {"path": "a.py", "line": 3, "body": "tests/y.py::v FAILED"}
+            ],
+        }
+    ]
+    monkeypatch.setattr(
+        supervision.forge, "open_pull_requests", lambda root: [reading]
+    )
+    monkeypatch.setattr(
+        supervision.forge,
+        "review_feedback",
+        lambda root, number: ("gh pr view 7", details),
+    )
+    monkeypatch.setattr(
+        supervision.forge,
+        "failed_log",
+        lambda root, run, job: ("gh run view 1", log),
+    )
+    supervision.pull_request_wakes(bridge.home, directory, manifest)
+    with store.connect(bridge.home) as db:
+        bodies = [
+            row[0]
+            for row in db.execute(
+                "SELECT body_md FROM messages WHERE subject LIKE 'Pull%'"
+            )
+        ]
+    return directory, bodies
+
+
+def test_review_text_on_a_pull_request_records_nothing(
+    bridge, paired, monkeypatch
+):
+    directory, bodies = pull_request(bridge, paired, monkeypatch, "")
+    assert "FAILED tests/x.py::t" in bodies[0]
+    assert flaky.read(directory)["tests"] == {}
+
+
+def test_only_the_failed_step_log_of_a_pull_request_is_recorded(
+    bridge, paired, monkeypatch
+):
+    directory, bodies = pull_request(
+        bridge, paired, monkeypatch, "FAILED tests/z.py::w - boom"
+    )
+    assert "FAILED tests/x.py::t" in bodies[0]
+    assert list(flaky.read(directory)["tests"]) == ["tests/z.py::w"]
+
+
+def test_the_supervision_poll_tells_every_lane_of_a_flip(bridge, paired):
+    store.initialize(bridge.home)
+    for name in ("claude", "codex"):
+        store.register(bridge.home, paired["root"], name)
+    directory = Path(paired["lanes"]["claude"]).parent
+    commit = git(Path(paired["root"]), "rev-parse", "HEAD")
+    for state, evidence in (("partial", FAILED), ("ready", PASSED)):
+        metrics.record_report(
+            directory,
+            "claude",
+            {
+                "kind": "report",
+                "state": state,
+                "commit": commit,
+                "clean": True,
+                "evidence": evidence,
+            },
+        )
+    supervision.poll(bridge.home, directory)
+    with store.connect(bridge.home) as db:
+        told = sorted(
+            row[0]
+            for row in db.execute(
+                "SELECT a.name FROM messages m "
+                "JOIN message_recipients r ON r.message_id=m.id "
+                "JOIN agents a ON a.id=r.agent_id "
+                "WHERE m.subject = ?",
+                (f"Suspected flaky test `{TEST}`",),
+            )
+        )
+    assert told == ["claude", "codex"]
+    assert flaky.read(directory)["tests"][TEST]["suspected"]["reason"] == (
+        flaky.SAME_TREE
+    )

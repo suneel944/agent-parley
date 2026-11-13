@@ -718,26 +718,34 @@ The supervision poll keeps the test failures and passes lanes record, and
 names a test suspected flaky only from those recorded occurrences. Two
 sources feed it:
 
-- report evidence (`agent-parley report --state ready --evidence ...`, or
-  any other report whose worktree matched its commit), read from the lane's
-  report log;
+- report evidence (`agent-parley report --evidence ...`) recorded `clean`:
+  the worktree had no tracked change and no untracked file outside the
+  ignore rules, so the run tested exactly the reported commit; read from
+  the lane's report log;
 - a lane's pull request on the forge: the failed-step logs the poll already
-  quotes to the lane when checks fail, and checks that finish green.
+  quotes to the lane when checks fail, and checks that finish green, both
+  for the head commit the same reading names. Review bodies and inline
+  comments quoted beside the logs are never read.
 
 Test identifiers are pytest node ids (`tests/test_core.py::test_value`) read
 from `FAILED <id>`, `<id> FAILED`, the same forms with `ERROR`, and
-`PASSED <id>` or `<id> PASSED`. Evidence the convergence account reads as a
-pass, such as `12 passed`, and a green forge run pass every test already
-tracked on that commit's tree.
+`PASSED <id>` or `<id> PASSED`. Report evidence passes only the tests it
+names as passed, since a report cannot show whether it ran the whole suite;
+a green forge run passes every test already tracked on that commit's tree.
 
 A test is suspected flaky when it:
 
 - failed and passed on the same Git tree, or
-- failed in two lanes whose diffs, each against its fork from the base
-  checkout's head, change neither the test file nor a module it imports.
+- failed in two lanes forked from the same base commit whose diffs, each
+  against that fork from the base checkout's head, change neither the test
+  file nor a module it imports.
 
 A failure in a lane whose diff changes the test or one of its imports never
 counts towards two lanes, so a regression the change caused is not marked.
+Requiring one fork point means the two lanes ran the same base code: a
+regression merged into the base between their forks gives them different
+fork points and is not counted. A test the shared base itself breaks is
+still marked, which only labels it.
 Each lane that is not retired gets one update per suspicion, naming the test
 and up to six occurrences, and one `test:` issue is suggested to the
 operator, who sees it in `agent-parley followup list` and accepts it with

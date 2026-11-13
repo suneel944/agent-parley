@@ -7578,6 +7578,11 @@ def pull_request_wakes(
     or a second conflict at the same head, wakes the lane again, while a
     poll retried before its record was written does not.
 
+    A green or red notice also records its test outcomes through
+    `flaky.record`, from the failed-step logs alone and never from review
+    text, against the head commit of the same reading, which the forge's
+    check rollup describes.
+
     Each reading keeps when its current head was first seen pending, and a
     new head or a finished run restarts that clock. A head still pending
     past `checks_ceiling` is announced once, naming each unfinished check
@@ -7710,7 +7715,7 @@ def pull_request_wakes(
             "yourself: merge it, fix it or answer the review. Nothing was "
             "merged, changed or answered for you."
         )
-        feedback = _pull_request_feedback(
+        feedback, logs = _pull_request_feedback(
             Path(manifest["root"]),
             previous,
             reading,
@@ -7729,7 +7734,7 @@ def pull_request_wakes(
                     Path(manifest["root"]),
                     name,
                     str(reading["sha"]),
-                    feedback,
+                    logs,
                     flaky.FORGE,
                     green=record["checks"] == "green",
                 )
@@ -8390,7 +8395,7 @@ def _closed_pull_requests(
 
 def _pull_request_feedback(
     root: Path, before: dict, after: dict, changes: list[str], budget: int
-) -> str:
+) -> tuple[str, str]:
     """Quotes the new reviews and failed-step logs behind a wake, bounded.
 
     Each review `_pull_request_changes` reported as new contributes its body
@@ -8410,9 +8415,12 @@ def _pull_request_feedback(
 
     Returns:
         The quoted block, or an empty string when the wake reports no new
-        review and no failed check with a log.
+        review and no failed check with a log, and the failed-step log
+        sections alone, unbounded by `budget` and without review text, for
+        `flaky.record`.
     """
     sections: list[tuple[str, str, bool, bool]] = []
+    logs: list[str] = []
     known = before.get("reviews") or []
     added = [review for review in after["reviews"] if review not in known]
     if added:
@@ -8441,7 +8449,8 @@ def _pull_request_feedback(
             )
             text = f"{check['name']} failed-step log:\n{log or ''}".rstrip()
             sections.append((text, command, True, log is not None))
-    return _quoted_feedback(sections, budget)
+            logs.append(text)
+    return _quoted_feedback(sections, budget), "\n".join(logs)
 
 
 def _review_text(review: dict, detail: dict | None) -> tuple[str, bool]:

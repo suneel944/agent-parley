@@ -327,7 +327,9 @@ class ReportsMixin(BridgeCore):
                 "issue": claim["issue"],
                 "claim_id": claim["claim_id"],
                 "commit": commit,
-                "clean": not changed,
+                "clean": not git(
+                    lane, "status", "--porcelain", "--untracked-files=normal"
+                ),
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,

@@ -10,26 +10,34 @@ An occurrence is one test failing or passing on one Git tree in one lane,
 from one of two sources. A lane's report evidence is read from its durable
 report log (`report`), and a lane's pull request is read from the forge
 (`forge`): the failed-step logs the poll already quotes to the lane on red
-checks, and green checks. Test identifiers are pytest node ids,
+checks, and green checks. Review bodies and inline comments quoted beside
+those logs are never read. The forge's check rollup describes a pull
+request's head commit only, so a forge occurrence is recorded against the
+head commit read in the same reading. Test identifiers are pytest node ids,
 `path.py::name`, read from `FAILED <id>`, `<id> FAILED`, the same two forms
 with `ERROR`, and `PASSED <id>` or `<id> PASSED` for a pass; terminal colour
 codes are removed first and nothing else is parsed. Checks that finished
 green pass every test already tracked on that tree. Report evidence passes
 only the tests it names as passed, because a report cannot show whether it
-ran the whole suite or one focused file. A report counts only when its
-worktree matched its commit: a ready report always does, since `report`
-refuses one that differs, and any other report counts when it recorded
-`clean`. Evidence spilled to an attachment is read from its retained
-preview only.
+ran the whole suite or one focused file. A report counts only when it
+recorded `clean`: its worktree had no tracked change and no untracked file
+outside the ignore rules, so the run tested exactly its commit. Evidence
+spilled to an attachment is read from its retained preview only.
 
 A test is suspected flaky when it failed and passed on the same tree, in
-either order, or when it failed in two lanes whose diffs change neither the
-test file nor a module it imports. A lane's diff is its commit against the
-point it forked from the base checkout's head; a Python module matches an
-import when its dotted path equals the imported name or ends with it, and a
-diff Git cannot read counts as changing the test. A failure whose diff
-changes the test or its imports never counts towards two lanes, so a real
-regression is not marked.
+either order, or when it failed in two lanes forked from the same base
+commit whose diffs change neither the test file nor a module it imports. A
+lane's diff is its commit against the point it forked from the base
+checkout's head; a Python module matches an import when its dotted path
+equals the imported name or ends with it, and a diff Git cannot read counts
+as changing the test. A failure whose diff changes the test or its imports
+never counts towards two lanes, so a lane's own regression is not marked.
+Two lanes on one fork point run the same base code, so their diffs are the
+only difference between them; a regression merged into the base between
+two forks gives the lanes different fork points and is not counted, and a
+commit already merged into the base forks at itself. A test the shared
+base itself breaks still fails in both lanes and is marked, which only
+labels it: nothing is skipped.
 
 On a new suspicion every lane that is not retired is told once, by keyed
 mail naming the test and up to `MAX_SHOWN` occurrences, and one `test:`
@@ -63,7 +71,10 @@ PASS = "pass"
 REPORT = "report"
 FORGE = "forge"
 SAME_TREE = "failed and passed on the same tree"
-TWO_LANES = "failed in two lanes whose diffs change neither it nor its imports"
+TWO_LANES = (
+    "failed in two lanes forked from one base commit whose diffs change "
+    "neither it nor its imports"
+)
 MAX_TESTS = 256
 MAX_EVENTS = 32
 MAX_IDS = 256
@@ -116,13 +127,18 @@ def _git(root: Path, *args: str) -> str | None:
         return None
 
 
-def _changed(root: Path, commit: str) -> list[str] | None:
-    """Lists the paths a commit changed since its fork from the base head."""
+def _changed(root: Path, commit: str) -> tuple[str, list[str] | None]:
+    """Names a commit's fork from the base head and the paths it changed.
+
+    Returns:
+        The fork point, empty when Git cannot name it, and the changed
+        paths, or None when the diff cannot be read.
+    """
     fork = _git(root, "merge-base", "HEAD", commit)
-    if fork is None:
-        return None
+    if not fork:
+        return "", None
     found = _git(root, "diff", "--name-only", "--no-renames", fork, commit)
-    return None if found is None else found.splitlines()
+    return fork, None if found is None else found.splitlines()
 
 
 def imports(source: str, path: str) -> set[str]:
@@ -138,7 +154,7 @@ def imports(source: str, path: str) -> set[str]:
     """
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
         return set()
     package = path.split("/")[:-1]
     names: set[str] = set()
@@ -233,11 +249,12 @@ def _sound(entry: object) -> bool:
     """
     if not isinstance(entry, dict) or not isinstance(entry.get("events"), list):
         return False
-    fields = ("lane", "outcome", "tree", "source")
+    fields = ("lane", "outcome", "tree", "commit", "source")
     if not all(
         isinstance(item, dict)
         and isinstance(item.get("at"), int | float)
         and isinstance(item.get("touches"), bool)
+        and isinstance(item.get("fork", ""), str)
         and all(isinstance(item.get(field), str) for field in fields)
         for item in entry["events"]
     ):
@@ -302,7 +319,7 @@ def record(
     tree = _git(root, "rev-parse", f"{commit}^{{tree}}")
     if not tree:
         return 0
-    changed = _changed(root, commit) if failed else []
+    fork, changed = _changed(root, commit) if failed else ("", [])
     sources: dict[str, set[str]] = {}
     events: list[tuple[str, dict]] = []
     for name in failed:
@@ -318,6 +335,7 @@ def record(
                     "outcome": FAIL,
                     "tree": tree,
                     "commit": commit,
+                    "fork": fork,
                     "source": source,
                     "at": stamp,
                     "touches": changed is None
@@ -384,10 +402,19 @@ def suspicion(events: list[dict]) -> tuple[str, list[dict]]:
     )
     if flipped:
         return SAME_TREE, [item for item in events if item["tree"] == flipped]
-    untouched = [item for item in failures if not item["touches"]]
-    if len({item["lane"] for item in untouched}) >= 2:
-        return TWO_LANES, untouched
-    return "", []
+    forks: dict[str, list[dict]] = {}
+    for item in failures:
+        if not item["touches"] and item.get("fork"):
+            forks.setdefault(item["fork"], []).append(item)
+    shared = next(
+        (
+            found
+            for found in forks.values()
+            if len({item["lane"] for item in found}) >= 2
+        ),
+        [],
+    )
+    return (TWO_LANES, shared) if shared else ("", [])
 
 
 def assess(entry: dict, now: float) -> dict:
@@ -437,6 +464,11 @@ def assess(entry: dict, now: float) -> dict:
     return current
 
 
+def _quoted(test: str) -> str:
+    """Quotes a lane-written test id as code, its backticks made quotes."""
+    return f"`{test.replace('`', "'")}`"
+
+
 def _occurrence(item: dict) -> str:
     """Renders one occurrence as one evidence line."""
     verb = "failed" if item["outcome"] == FAIL else "passed"
@@ -458,6 +490,7 @@ def message(test: str, held: dict) -> tuple[str, str]:
         `MAX_SHOWN` occurrences and the suggested follow-up.
     """
     lines = "\n".join(_occurrence(item) for item in held["evidence"])
+    named = _quoted(test)
     pending = (
         f"Suggestion {held['followup']} for a `test:` issue waits for the "
         "operator in `agent-parley followup list`; do not file it yourself."
@@ -466,8 +499,8 @@ def message(test: str, held: dict) -> tuple[str, str]:
         "your report instead of filing an issue."
     )
     return (
-        f"Suspected flaky test {test[:MAX_TITLE_TEST]}",
-        f"Test {test} is suspected flaky: it {held['reason']}.\n"
+        f"Suspected flaky test {_quoted(test[:MAX_TITLE_TEST])}",
+        f"Test {named} is suspected flaky: it {held['reason']}.\n"
         f"Evidence:\n{lines}\n"
         "This is a label with evidence: no test was skipped or disabled. "
         f"{pending} A later "
@@ -486,11 +519,13 @@ def _suggest(directory: Path, test: str, held: dict) -> str:
         made = followups.suggest(
             directory,
             str(held["evidence"][0]["lane"]),
-            f"test: investigate suspected flaky {test[:MAX_TITLE_TEST]}",
-            f"Suspected flaky: it {held['reason']}. Occurrences:\n{lines}",
+            "test: investigate suspected flaky "
+            f"{_quoted(test[:MAX_TITLE_TEST])}",
+            f"Suspected flaky {_quoted(test)}: it {held['reason']}. "
+            f"Occurrences:\n{lines}",
             [path],
         )
-    except BridgeError:
+    except (BridgeError, OSError, ValueError):
         return ""
     return str(made.get("id") or "")
 
@@ -517,7 +552,7 @@ def _reports(directory: Path, root: Path, lanes: list[str]) -> None:
             if (
                 item.get("kind") != "report"
                 or not commit
-                or not (item.get("state") == "ready" or item.get("clean"))
+                or item.get("clean") is not True
             ):
                 continue
             record(
