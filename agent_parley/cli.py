@@ -6440,7 +6440,7 @@ def _plain_status() -> int:
     )
     try:
         bridge = Bridge(home)
-        polling.record(home, "cli:status")
+        polling.record(bridge.home, "cli:status")
         bridge.board(
             Selection(project=bridge.project_at(Path.cwd())), terminal_width()
         )

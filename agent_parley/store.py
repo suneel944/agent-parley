@@ -3027,7 +3027,9 @@ def _event(
         db: Open transaction that also carries the tool's own effect.
         actor: Authenticated project and lane.
         tool: Coordination tool that was called.
-        outcome: ``ok`` for a served call, ``error`` for a rejected one.
+        outcome: ``ok`` for a served call, ``error`` for a rejected one,
+            ``conflict`` for a reservation that met a holder and ``empty``
+            for an inbox page that carried no message.
         started: Monotonic reading taken before the call was dispatched.
         result_bytes: Encoded size of the served result, zero on rejection.
     """
@@ -3100,7 +3102,9 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
             home,
             actor,
             tool,
-            "ok",
+            "empty"
+            if tool == "fetch_inbox" and not result.get("messages")
+            else "ok",
             started,
             len(json.dumps(result, ensure_ascii=False).encode()),
         )

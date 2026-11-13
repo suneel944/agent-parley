@@ -1,10 +1,11 @@
 """Checks that a lane polling coordination state is flagged, told, parked."""
 
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-from agent_parley import polling, quota, store, supervision
+from agent_parley import cli, polling, quota, store, supervision
 
 
 def lane_of(bridge, repo, paired):
@@ -125,6 +126,75 @@ def test_an_operator_message_clears_the_park(bridge, repo, paired, monkeypatch):
     assert settle(bridge, directory, paired) == {}
     assert quota.held(directory, "claude") is None
     assert polling.marker(directory, "claude") == ""
+
+
+def test_draining_a_backlog_is_never_polling(bridge, repo, paired):
+    directory, token = lane_of(bridge, repo, paired)
+    store.register(bridge.home, paired["root"], "codex")
+    for number in range(150):
+        store.speak(
+            bridge.home,
+            paired["root"],
+            "claude",
+            f"Backlog {number}",
+            "Read me",
+            f"backlog-{number}",
+            sender="codex",
+        )
+    actor = store.authenticate(bridge.home, token)
+    after = 0
+    pages = 0
+    while True:
+        page = store.call(
+            bridge.home, actor, "fetch_inbox", {"after_id": after, "limit": 5}
+        )
+        pages += 1
+        if not page["messages"]:
+            break
+        after = page["next_after_id"]
+    assert pages > polling.THRESHOLD
+    assert settle(bridge, directory, paired) == {}
+    assert polling.marker(directory, "claude") == ""
+    assert notices(bridge, paired) == 0
+    for _ in range(polling.THRESHOLD):
+        store.call(bridge.home, actor, "fetch_inbox", {"after_id": after})
+    assert settle(bridge, directory, paired) == {}
+    assert "lane told" in polling.marker(directory, "claude")
+
+
+def test_a_told_lane_that_goes_quiet_is_no_longer_polling(
+    bridge, repo, paired, monkeypatch
+):
+    directory, token = lane_of(bridge, repo, paired)
+    settle(bridge, directory, paired)
+    poll_status(bridge, monkeypatch, token, 40)
+    assert settle(bridge, directory, paired) == {}
+    assert "lane told" in polling.marker(directory, "claude")
+    later = time.time() + polling.WINDOW + 5
+    assert polling.observe(bridge.home, directory, paired, later) == {}
+    assert polling.marker(directory, "claude") == ""
+    poll_status(bridge, monkeypatch, token, 40)
+    assert settle(bridge, directory, paired) == {}
+    assert "lane told" in polling.marker(directory, "claude")
+    assert quota.held(directory, "claude") is None
+    assert notices(bridge, paired) == 2
+
+
+def test_a_lane_status_command_records_a_read(
+    bridge, repo, paired, monkeypatch
+):
+    _, token = lane_of(bridge, repo, paired)
+    monkeypatch.setenv("HOME", str(bridge.home.parent))
+    monkeypatch.setenv("AGENT_PARLEY_HOME", f"~/{bridge.home.name}")
+    monkeypatch.setenv(polling.TOKEN_ENV, token)
+    monkeypatch.setattr(sys, "argv", ["agent-parley", "status"])
+    monkeypatch.chdir(repo)
+    cli.main()
+    with store.connect(bridge.home) as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM events WHERE tool='cli:status'"
+        ).fetchone()[0]
+    assert count == 1
 
 
 def test_an_operator_command_records_no_read(bridge, repo, paired, monkeypatch):

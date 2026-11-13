@@ -209,13 +209,17 @@ a lane that cannot continue: it ends the lane's work on the claim and the next
 resume starts a fresh session.
 
 Waiting is not polling. A lane that makes 30 or more coordination reads
-(`status`, `issue next`, `mail`, its inbox or the board) in five minutes with
-no claim, reservation, commit, report or handoff is marked polling in `status`
-and `top` and receives one message naming the pattern. If it makes as many
-reads again, the supervisor parks it the way it parks a lane on an exhausted
-quota: wakes, continuations and work offers wait, and a running turn is never
-stopped. The next progress or your next message to the lane ends the park. A
-lane blocked in `wait_for_message` is never counted.
+(`status`, `issue next`, `mail`, the board, or an inbox read that found no
+message) in five minutes with no claim, reservation, commit, report or
+handoff is marked polling in `status` and `top` and receives one message
+naming the pattern. Inbox pages that carry mail, threads, attachments and
+searches never count, so a lane draining a backlog is not polling. If it
+makes as many reads again, the supervisor parks it the way it parks a lane
+on an exhausted quota: wakes, continuations and work offers wait, and a
+running turn is never stopped. The next progress or your next message to the
+lane ends the park. A lane that heeds the message and falls under 30 reads
+in the window stops being marked polling. A lane blocked in
+`wait_for_message` is never counted.
 
 ## Asking for a review round
 

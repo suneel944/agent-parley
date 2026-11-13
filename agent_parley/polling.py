@@ -1,13 +1,13 @@
 """Flags a lane that keeps reading coordination state without progress.
 
-A lane that calls ``status``, ``issue next``, ``mail`` or a read-only
-coordination tool in a loop looks busy in every column while it moves no
-work, and every one of those reads spends the turn that could have moved
-it. The reads are counted from the store's ``events`` table, never from a
-transcript: a served read-only tool is recorded there already, and the
-command line records its own reads through `record`. A lane blocked in
-``wait_for_message`` is waiting for mail rather than polling for it, so
-that call never counts.
+A lane that calls ``status``, ``issue next``, ``mail``, ``next_issues``
+or ``fetch_inbox`` on an empty inbox in a loop looks busy in every column
+while it moves no work, and every one of those reads spends the turn that
+could have moved it. The reads are counted from the store's ``events``
+table, never from a transcript: a served read-only tool is recorded there
+already, and the command line records its own reads through `record`. A
+lane blocked in ``wait_for_message`` is waiting for mail rather than
+polling for it, so that call never counts.
 
 Each supervision poll compares a lane's reads over the last `WINDOW`
 seconds with its progress over the same window: a claim it took or
@@ -21,7 +21,10 @@ window after that message is parked through the quota parking path: its
 wakes, Stop-hook continuations and work offers are deferred exactly like
 a quota park, and a running turn is never stopped. The episode, and with
 it the flag and the park, ends at the first progress after it began or at
-the first message the operator sends the lane after the notice. Reads
+the first message the operator sends the lane after the notice. A flag
+that never became a park also ends once the lane's reads in the window
+fall under `THRESHOLD`, so a lane that heeded the notice and went quiet is
+neither shown as polling nor parked later without a fresh notice. Reads
 made before an episode ended never start the next one.
 """
 
@@ -61,12 +64,15 @@ and it is the same count again after the notice that turns the flag into a
 park, so a lane that heeds the notice and reads a few times to find its
 work is never parked.
 """
-READS = (
-    *(tool for tool in store.READ_ONLY if tool != "wait_for_message"),
-    "cli:status",
-    "cli:issue-next",
-    "cli:mail",
-)
+READS = ("next_issues", "cli:status", "cli:issue-next", "cli:mail")
+"""Reads counted whatever they returned: the board and the status lines.
+
+An inbox read counts only when its page carried no message, which the
+store records with the outcome ``empty``. A lane draining a backlog five
+messages a page, or reading a thread, an attachment or a search result it
+was pointed at, is working through mail rather than polling for it.
+"""
+INBOX = "fetch_inbox"
 PROGRESS = (
     "send_message",
     "file_reservation_paths",
@@ -181,13 +187,15 @@ def _reading(
     marks = ",".join("?" * len(READS))
     reads = db.execute(
         "SELECT COUNT(*) AS reads, COALESCE(SUM(id>?),0) AS later "
-        f"FROM events WHERE agent_id=? AND id>? AND tool IN ({marks}) "
+        "FROM events WHERE agent_id=? AND id>? "
+        f"AND (tool IN ({marks}) OR (tool=? AND outcome='empty')) "
         "AND created_ts>=datetime(?,'unixepoch')",
         (
             int(episode.get("after", 0) or 0),
             agent["id"],
             int(lane.get("floor", 0) or 0),
             *READS,
+            INBOX,
             int(start),
         ),
     ).fetchone()
@@ -313,6 +321,10 @@ def observe(
                     progressed > float(episode["since"])
                     or reading["progress"] > int(episode["top"])
                     or reading["mail"] > int(episode["mail"])
+                    or (
+                        not episode.get("parked")
+                        and reading["reads"] < THRESHOLD
+                    )
                 ):
                     lane.pop("episode")
                     lane["floor"] = reading["top"]
