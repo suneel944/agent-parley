@@ -138,6 +138,32 @@ def test_gemini_counts_each_message_once_from_its_first_token_copy(
     assert sources[0]["last"] == "g2"
 
 
+def test_a_resumed_session_counts_replayed_messages_once(bridge, tmp_path):
+    lane = tmp_path / "lane"
+    participant = lane_entry("gemini", lane)
+    first = gemini_log(
+        lane, [gemini_message("g1", 40), gemini_message("g2", 10)]
+    )
+    known = {
+        source["key"]: source
+        for source in records.lane_sources(bridge.home, participant, {}, 0.0)
+    }
+    resumed = lines(
+        first.parent / "session-2.jsonl",
+        [
+            {"sessionId": "session-2"},
+            gemini_message("g1", 40),
+            gemini_message("g2", 10),
+            gemini_message("g3", 7),
+        ],
+    )
+    later = time.time() + 5
+    os.utime(resumed, (later, later))
+    sources = records.lane_sources(bridge.home, participant, known, 0.0)
+    counted = {source["key"]: source["tokens"] for source in sources}
+    assert counted[next(key for key in counted if key not in known)] == 7
+
+
 def test_gemini_reads_subagent_logs_and_skips_unregistered_lanes(
     bridge, tmp_path
 ):

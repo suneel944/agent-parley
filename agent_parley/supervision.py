@@ -4,6 +4,7 @@ import ast
 import contextlib
 import contextvars
 import copy
+import functools
 import hashlib
 import json
 import os
@@ -171,7 +172,10 @@ WAKE_BACKOFF_CEILING = 3600.0
 TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 WAKE_ATTENTION = "manual attention required"
 SESSION_HELD = "busy:session"
+TURN_BUSY = "busy:turn"
 WAKE_UNAVAILABLE = "unavailable"
+RESUME_REQUESTED = "resume requested"
+RESUME_FAILED = "resume failed"
 UNDELIVERED_WAKES = {
     WAKE_UNAVAILABLE: (
         "no launcher answered the lane's wake socket, so a client started "
@@ -212,6 +216,7 @@ AVAILABILITY = {
 }
 
 _LAUNCHERS: list[subprocess.Popen[bytes]] = []
+_EXITS: dict[subprocess.Popen[bytes], Callable[[int], None]] = {}
 _LAUNCHERS_LOCK = threading.Lock()
 _READINGS: dict[str, tuple[float, dict, dict, float]] = {}
 _READINGS_FLIGHTS: dict[str, "_ReadingsFlight"] = {}
@@ -237,18 +242,44 @@ def track_launcher(child: subprocess.Popen[bytes]) -> None:
         _LAUNCHERS.append(child)
 
 
+def on_launcher_exit(
+    child: subprocess.Popen[bytes], exited: Callable[[int], None]
+) -> None:
+    """Asks for a tracked launcher's exit status once a sweep collects it.
+
+    Args:
+        child: A launcher passed to `track_launcher`.
+        exited: Called with the launcher's exit status.
+    """
+    with _LAUNCHERS_LOCK:
+        _EXITS[child] = exited
+
+
 def reap_launchers() -> int:
     """Collects the launchers that exited since the previous sweep.
 
     The sweep never blocks: each launcher is polled once and a running
-    launcher is kept for the next sweep.
+    launcher is kept for the next sweep. A collected launcher's exit status
+    goes to the callback `on_launcher_exit` registered for it, outside the
+    tracking lock, so a resume that failed at once is reported rather than
+    left reading as a pending resume. A callback that fails is skipped so
+    the others still run.
 
     Returns:
         The number of tracked launchers still running.
     """
     with _LAUNCHERS_LOCK:
-        _LAUNCHERS[:] = [child for child in _LAUNCHERS if child.poll() is None]
-        return len(_LAUNCHERS)
+        done = [child for child in _LAUNCHERS if child.poll() is not None]
+        _LAUNCHERS[:] = [child for child in _LAUNCHERS if child not in done]
+        running = len(_LAUNCHERS)
+        exits = [(child, _EXITS.pop(child, None)) for child in done]
+    for child, exited in exits:
+        if exited is not None:
+            with contextlib.suppress(
+                BridgeError, OSError, sqlite3.Error, ValueError
+            ):
+                exited(int(child.returncode))
+    return running
 
 
 def settings(value: dict) -> dict:
@@ -4762,10 +4793,42 @@ def wake_attempt(
         or result.startswith("busy")
     ):
         return 0.0, False
-    return at, result not in (
+    return at, not result.startswith(RESUME_FAILED) and result not in (
         WAKE_UNAVAILABLE,
         WAKE_ATTENTION,
         OPT_IN_MISSING,
+    )
+
+
+def turn_in_flight(
+    home: Path, directory: Path, root: str, name: str, key: str, since: float
+) -> bool:
+    """Reports whether a wake carrying one backlog key found a turn running.
+
+    `wake_attempt` does not count a busy result, so a holder whose launcher
+    answered every wake with `busy:turn` read as one no attempt reached and
+    lost its claim after one window, although that answer comes from the
+    launcher seeing the lane's own terminal output within the inactivity
+    window. Only that answer is evidence of work; the other busy reasons
+    name a lane waiting on something else.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant the wake is for.
+        key: Backlog key the wake must carry.
+        since: Unix time the wake was asked for.
+
+    Returns:
+        True when the latest wake at or after ``since`` carried the key and
+        the launcher answered that a turn is in progress.
+    """
+    record = wake_record(home, root, name, directory)
+    return (
+        record.get("result") == TURN_BUSY
+        and key in (record.get("backlog") or [])
+        and float(record.get("at", 0) or 0) >= since
     )
 
 
@@ -5075,7 +5138,10 @@ def overdue_claims(
     attempt rather than from the step. A holder no attempt reached within
     one window of the step, because the wake was refused or found nothing
     to send, advances then as one that could not be woken, so the claim
-    never stays parked on a wake that will not come.
+    never stays parked on a wake that will not come. A holder whose
+    launcher answered that wake with a turn in progress keeps the claim at
+    its wake step, because the answer is the launcher's own sight of the
+    lane producing output; see `turn_in_flight`.
 
     Args:
         home: Private bridge state root.
@@ -5146,6 +5212,15 @@ def overdue_claims(
         cause = f"has recorded no progress for {idle}s while {holder} holds it"
         if silent and ours and current.get("step") == "wake":
             asked = float(current.get("at", 0) or 0)
+            if turn_in_flight(
+                home,
+                directory,
+                root,
+                holder,
+                f"overdue:{identifier}",
+                asked,
+            ):
+                continue
             attempted, delivered = wake_attempt(
                 home,
                 directory,
@@ -9416,9 +9491,13 @@ def undelivered_wake(record: dict) -> str:
     Returns:
         One sentence naming when the wake was attempted and why it was not
         delivered, or an empty string when the last wake was delivered,
-        refused for a reason reported elsewhere, or never attempted.
+        refused for a reason reported elsewhere, or never attempted. A
+        resume whose launcher failed is named with its exit status.
     """
-    reason = UNDELIVERED_WAKES.get(str(record.get("result") or ""))
+    result = str(record.get("result") or "")
+    reason = UNDELIVERED_WAKES.get(result)
+    if result.startswith(RESUME_FAILED):
+        reason = f"the {result.removeprefix(RESUME_FAILED).strip(' ()')}"
     at = record.get("at")
     if reason is None or not isinstance(at, (int, float)) or not at:
         return ""
@@ -9868,7 +9947,7 @@ def _write_work_dispatch(
             last_result=result,
             updated_at=time.time(),
         )
-        if result == "accepted" or result.startswith("resume requested"):
+        if result == "accepted" or result.startswith(RESUME_REQUESTED):
             dispatch["delivered"] = True
             delivered = [
                 item
@@ -10482,7 +10561,10 @@ def wake(
     unrelated trigger. An offer that was cancelled, declined or accepted is no
     longer recorded on its issue and so leaves the backlog, and a replacement
     offer carries a new identifier, which resets the bounded attempt count
-    rather than extending the old one. A request the launcher refuses with a
+    rather than extending the old one. Any other backlog change keeps the
+    count and its backoff: on a busy project new mail arrives on almost
+    every poll, and resetting on it meant the bound, its orphan decision and
+    its escalation never fired. A request the launcher refuses with a
     `busy` reason is spaced like any other but does not count against the
     bound, because the lane never received a turn to decline; it is asked
     again once it is idle.
@@ -10699,11 +10781,12 @@ def wake(
         and not record["handoff_prompt"].get("responded_at")
         and not issues.unresolved_completion(record)["unresolved"]
     )
-    backlog.extend(
+    offered = [
         record["offer"]["id"]
         for record in ledger
         if (record.get("offer") or {}).get("to") == name
-    )
+    ]
+    backlog.extend(offered)
     backlog.extend(
         f"overdue:{recovery['id']}"
         for record in ledger
@@ -10748,10 +10831,11 @@ def wake(
             work_offer = None
             if not backlog:
                 return
-        attempts = (
-            record.get("attempts", 0) if same_backlog and not worked else 0
+        renewed = worked or any(
+            offer not in (record.get("backlog") or []) for offer in offered
         )
-        throttle_at = record.get("at", 0) if same_backlog else 0
+        attempts = 0 if renewed else record.get("attempts", 0)
+        throttle_at = record.get("at", 0) if same_backlog or not renewed else 0
         if work_offer:
             dispatch = published_work(directory, name).get("dispatch") or {}
             if not worked:
@@ -10839,7 +10923,7 @@ def wake(
                     result = "busy:stale"
                 else:
                     child = _resume(home, directory, manifest, name, prompt)
-                    result = f"resume requested (launcher {child.pid})"
+                    result = f"{RESUME_REQUESTED} (launcher {child.pid})"
         probe_exhaustion(directory, name, result)
         gap = result == OPT_IN_MISSING
         repeated = gap and record.get("result") == OPT_IN_MISSING
@@ -10868,7 +10952,7 @@ def wake(
                 ),
             },
         )
-        if result == "accepted" or result.startswith("resume requested"):
+        if result == "accepted" or result.startswith(RESUME_REQUESTED):
             waits.woke(home, root, participant["display"], now)
         if work_offer and not spent_before:
             _write_work_dispatch(
@@ -10904,7 +10988,8 @@ def _resume(
 
     The launcher is this package's own ``run --resume``, so the lane keeps
     its native authentication and permissions, and its output goes to the
-    lane's wake log.
+    lane's wake log. Its exit status is read when the service reaps it, and
+    `_resume_exited` records a failed one.
 
     Args:
         home: Private bridge state root.
@@ -10941,8 +11026,47 @@ def _resume(
             stderr=output,
             start_new_session=True,
         )
+    on_launcher_exit(
+        child,
+        functools.partial(
+            _resume_exited, home, directory, manifest["root"], name, child.pid
+        ),
+    )
     track_launcher(child)
     return child
+
+
+def _resume_exited(
+    home: Path, directory: Path, root: str, name: str, pid: int, status: int
+) -> None:
+    """Records a service resume whose launcher exited with a failure.
+
+    The wake record kept `resume requested` after the launcher died, so a
+    resume that failed at once read as one still pending and its output sat
+    in a wake log nothing pointed to. A nonzero exit replaces that result
+    with `RESUME_FAILED`, the launcher and its exit status, which `status`,
+    `problems` and the lane's next hook context report. A later wake that
+    already replaced the result is left alone, and a launcher that exited
+    cleanly ended a session that ran.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        root: Canonical project key.
+        name: Participant whose lane was resumed.
+        pid: Process identifier of the launcher.
+        status: Exit status the sweep collected.
+    """
+    if status == 0:
+        return
+    with lock(directory / f"{name}-wake.lock"):
+        record = wake_record(home, root, name)
+        if record.get("result") != f"{RESUME_REQUESTED} (launcher {pid})":
+            return
+        record["result"] = (
+            f"{RESUME_FAILED} (launcher {pid} exited with status {status})"
+        )
+        store_wake(home, directory, root, name, record)
 
 
 def _idle(home: Path, root: str, name: str, state: dict) -> bool:

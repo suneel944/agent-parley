@@ -1115,7 +1115,20 @@ def _lane_rows(
     quiet = availability["state"] != supervision.ACTIVE
     waking = bool(config["wake"] and participant.get("wake", True))
     wake = record.get("wake") or {}
-    if wake.get("result", "") in WAKE_DETAILS:
+    if str(wake.get("result", "")).startswith(supervision.RESUME_FAILED):
+        rows.append(
+            _row(
+                WAKE,
+                f"wake {wake['result']}; its output is in "
+                f"{record.get('wake_log') or 'the lane wake log'}",
+                f"agent-parley run {name} --resume {repo}",
+                wake.get("age_seconds"),
+                name,
+                root,
+                BY_OPERATOR,
+            )
+        )
+    elif wake.get("result", "") in WAKE_DETAILS:
         command, actor = _remedy(name, repo, record, waking)
         detail = WAKE_DETAILS[wake["result"]]
         if wake["result"] in supervision.UNDELIVERED_WAKES and wake.get("at"):
