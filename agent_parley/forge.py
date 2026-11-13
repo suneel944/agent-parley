@@ -19,6 +19,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -897,6 +898,9 @@ def _epoch(value: str) -> float:
 
 
 _failure: dict[str, object] = {}
+_recorded: dict[str, float] = {}
+_FAILURE_LOCK = threading.Lock()
+_own = threading.local()
 
 
 def _failure_kind(detail: str) -> str:
@@ -933,33 +937,55 @@ def _failure_kind(detail: str) -> str:
     return "error"
 
 
-def last_failure() -> dict | None:
+def last_failure(own: bool = False) -> dict | None:
     """Reports the newest forge call failure since the last success.
 
     `_run` records each failed call and clears the record on the next call
     that succeeds, so callers can wait out a refused or throttled forge
     instead of repeating every call on every poll.
 
+    The service calls the forge from several threads and the record is one
+    per process. A success only clears a failure recorded before that
+    successful call started: a call already in flight when another was
+    refused says nothing about the forge after the refusal, and used to
+    erase it and the wait it asks for. A caller asking why the call it just
+    made failed passes ``own``, because another thread's later success may
+    by then have cleared the shared record.
+
+    Args:
+        own: Whether to report the calling thread's own newest call rather
+            than the newest call of any thread.
+
     Returns:
         ``at`` in Unix seconds, ``kind`` as `_failure_kind` names it or
         ``timeout``, and up to 200 characters of ``detail``; None when the
         newest call succeeded or none failed.
     """
-    return dict(_failure) or None
+    if own:
+        return getattr(_own, "failure", None)
+    with _FAILURE_LOCK:
+        return dict(_failure) or None
 
 
 def _record_failure(kind: str, detail: str) -> None:
     """Records one failed forge call for `last_failure`."""
-    _failure.clear()
-    _failure.update({"at": time.time(), "kind": kind, "detail": detail[:200]})
+    record = {"at": time.time(), "kind": kind, "detail": detail[:200]}
+    _own.failure = dict(record)
+    with _FAILURE_LOCK:
+        _failure.clear()
+        _failure.update(record)
+        _recorded["at"] = time.monotonic()
 
 
 def _run(args: list[str], timeout: int) -> str | None:
     """Runs a forge client, reporting absence instead of raising.
 
     A failure is recorded for `last_failure` with its class and the
-    client's own explanation, which is otherwise discarded.
+    client's own explanation, which is otherwise discarded. A success
+    clears the shared record only when it started after that record was
+    written.
     """
+    started = time.monotonic()
     try:
         result = subprocess.run(
             args,
@@ -978,7 +1004,10 @@ def _run(args: list[str], timeout: int) -> str | None:
         detail = (result.stderr or result.stdout or "").strip()
         _record_failure(_failure_kind(detail), detail)
         return None
-    _failure.clear()
+    _own.failure = None
+    with _FAILURE_LOCK:
+        if _recorded.get("at", 0.0) <= started:
+            _failure.clear()
     return result.stdout
 
 

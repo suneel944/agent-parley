@@ -1030,6 +1030,8 @@ class StatusMixin(BridgeCore):
             remedy = protocol.START
         elif stale:
             remedy = protocol.RELAUNCH
+        elif serving == protocol.DEGRADED:
+            remedy = protocol.RECOVERING
         elif behind:
             state, remedy = protocol.STALE, protocol.RESTART
         components.append(
@@ -1039,7 +1041,10 @@ class StatusMixin(BridgeCore):
                 "protocol": protocol.PROTOCOL,
                 "state": state,
                 "remedy": remedy,
-                "compatible": not stale and not stopped and not behind,
+                "compatible": not stale
+                and not stopped
+                and not behind
+                and serving != protocol.DEGRADED,
             }
         )
         gone = sorted(
@@ -1994,6 +1999,8 @@ class StatusMixin(BridgeCore):
             print(protocol.START)
         if report["server"].get("state") == protocol.STALE:
             print(f"Code: {protocol.STALE}; {protocol.RELAUNCH}")
+        if report["server"].get("state") == protocol.DEGRADED:
+            print(f"Background: {protocol.DEGRADED}; {protocol.RECOVERING}")
         schema = store.schema_state(store.schema_version(self.home))
         if repair := store.remedy(schema):
             if schema == store.SCHEMA_DAMAGED:

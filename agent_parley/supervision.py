@@ -7070,7 +7070,7 @@ def refresh_forge_issues(
         catalog = forge.open_issue_catalog(root, FORGE_LIMIT, FORGE_TIMEOUT)
         complete_at = now
     if catalog is None:
-        failure = forge.last_failure() or {}
+        failure = forge.last_failure(own=True) or {}
         if float(failure.get("at") or 0) < now:
             failure = {}
         write_json(
@@ -11102,7 +11102,12 @@ def run(home: Path, stopped: threading.Event) -> None:
     Every exception a poll raises is caught, not only the expected kinds.
     This thread is started once and serves every project, so an unexpected
     `KeyError` from one malformed record used to end supervision for the
-    whole service with no trace until it was restarted.
+    whole service with no trace until it was restarted. Listing the projects
+    and reading back or recording a project's failure are caught the same
+    way, each for its own project, so a state directory that cannot be
+    listed or an error record that cannot be written costs one log line and
+    the other projects are still polled. `server.Background` restarts this
+    loop if anything still escapes it.
 
     Once at start and then every `PRUNE_INTERVAL` seconds the store drops
     settled rows past its retention window through `store.prune`.
@@ -11133,23 +11138,37 @@ def run(home: Path, stopped: threading.Event) -> None:
             except Exception as exc:
                 server.log(home, "supervision", failure("repair plugins", exc))
             repaired = time.monotonic() + DEFAULTS["interval"]
-        for path in (home / "projects").glob("*/project.json"):
+        try:
+            paths = sorted((home / "projects").glob("*/project.json"))
+        except Exception as exc:
+            server.log(home, "supervision", failure("list projects", exc))
+            paths = []
+        for path in paths:
             if stopped.is_set():
                 return
             if time.monotonic() < deadlines.get(path, 0):
                 continue
             interval = DEFAULTS["interval"]
             try:
-                manifest = roster.read(path.parent)
-                interval = configuration(home, manifest)["interval"]
-                poll(home, path.parent)
+                try:
+                    manifest = roster.read(path.parent)
+                    interval = configuration(home, manifest)["interval"]
+                    poll(home, path.parent)
+                except Exception as exc:
+                    issues.note_supervision_error(
+                        path.parent, failure("poll", exc)
+                    )
+                if error := issues.supervision_error(path.parent):
+                    server.log(
+                        home,
+                        "supervision",
+                        f"{path.parent.name}: {error['detail']}",
+                    )
             except Exception as exc:
-                issues.note_supervision_error(path.parent, failure("poll", exc))
-            if error := issues.supervision_error(path.parent):
                 server.log(
                     home,
                     "supervision",
-                    f"{path.parent.name}: {error['detail']}",
+                    failure(f"{path.parent.name}: record poll failure", exc),
                 )
             deadlines[path] = time.monotonic() + interval
         try:

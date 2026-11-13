@@ -550,7 +550,7 @@ def _file(
             entry.pop("filing", None)
             write_json(directory / RECORD_NAME, record)
     if number is None:
-        failure = forge.last_failure() or {}
+        failure = forge.last_failure(own=True) or {}
         raise BridgeError(
             f"The forge did not file {ident}: "
             f"{failure.get('detail') or 'no reachable GitHub project'}. "

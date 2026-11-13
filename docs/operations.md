@@ -4091,6 +4091,28 @@ never runs. The distribution also stops when its last terminal closes, which
 stops the service with it. In that case nothing restarts the service at boot;
 it starts again with the next `agent-parley run`, or with `agent-parley up`.
 
+Neither recipe supervises the service after it starts: `up` returns and the
+unit or the agent has nothing left to watch. A service that dies later is
+restarted from the lanes instead. Every running lane launcher asks for a
+service once a minute, and every native hook asks when its client makes a tool
+call, so an idle estate recovers too. Both start nothing while the recorded
+service is alive, and nothing after `agent-parley down`, which removes the
+record they read. A start that keeps failing is retried at a doubling interval
+up to sixteen minutes. With no lane running and no unit, nothing restarts the
+service until the next `agent-parley run` or `agent-parley up`.
+
+Inside the service, the supervision loop and the inbound loop each run on a
+thread of their own. A loop that raises is logged with its traceback under
+`background` in the service log and started again five seconds later. While
+one waits for that restart, `/health/readiness` answers `degraded` with the
+loop and its failure in `detail`, `agent-parley status` prints a `Background:`
+line, and `agent-parley doctor` reports the service as `DEGRADED`. A service
+that stays degraded keeps failing the same way: read the log, then restart it
+with `agent-parley down` and `agent-parley up`. A service that cannot
+re-execute itself after its sources moved retries five times, one second
+apart, then exits with status 1, so the launchers and hooks above start a new
+one rather than leaving a process that serves the old code.
+
 Worktrees start at a captured commit and persist. Ignored environment files,
 dependencies and untracked configuration are not copied. Set up each worktree
 as needed. Review each lane's branch, integrate it with `participant merge` or
