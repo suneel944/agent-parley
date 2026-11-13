@@ -1017,6 +1017,11 @@ def lane_detail(record: dict, data: dict) -> None:
         f"  {agent} ({record['identity']}): {record['session']}\n"
         f"    Provider: {record['provider']}; {account}"
     )
+    if record.get("model") or record.get("effort"):
+        print(
+            f"    Model: {record.get('model') or 'provider default'}; "
+            f"effort: {record.get('effort') or 'provider default'}"
+        )
     print(
         f"    Availability: {record['availability']['state']}; "
         "session process alive: "

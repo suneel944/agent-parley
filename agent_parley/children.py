@@ -36,11 +36,19 @@ only records the time: its worktree and branch stay for the parent to
 merge, and a session still running is told to stop and is not killed, so
 work it has not committed is never lost. Its report after that still
 reaches the parent and replaces the expired outcome.
+
+The body may open with ``model:`` and ``effort:`` header lines. The child
+keeps the parent's provider and credential, so sign-in and permissions are
+unchanged, and only the model and the reasoning effort its native CLI starts
+with differ. A request the provider's CLI cannot honour refuses the spawn
+with the reason rather than starting the child on a different tier. Without
+the headers the child starts on the parent's own model and effort.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import re
 import subprocess
 import sys
 import time
@@ -74,6 +82,20 @@ UNREGISTERED = (
     "This repository has no coordination project yet; launch a participant "
     "once with agent-parley run so the project registers."
 )
+TIER_FIELDS = ("model", "effort")
+TIER_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,79}")
+HEADER = re.compile(r"(model|effort):[ \t]*(\S*)[ \t]*", re.IGNORECASE)
+MODEL_FLAGS = {
+    "claude": "--model",
+    "codex": "--model",
+    "gemini": "--model",
+    "copilot": "--model",
+    "opencode": "--model",
+}
+EFFORTS = {
+    "claude": ("low", "medium", "high", "xhigh", "max"),
+    "codex": ("none", "minimal", "low", "medium", "high", "xhigh"),
+}
 
 
 def _clip(text: str, limit: int) -> str:
@@ -153,6 +175,104 @@ def _paths(value: object) -> list[str]:
         if path not in accepted:
             accepted.append(path)
     return accepted
+
+
+def headers(body: object) -> tuple[dict[str, str], object]:
+    """Splits the ``model:`` and ``effort:`` header lines off a spawn body.
+
+    Only the lines that open the body count, each at most once, so a task
+    that mentions a model further down is left as it was written.
+
+    Args:
+        body: ``body_md`` of the ``@child`` message.
+
+    Returns:
+        The requested fields, lower-cased by name, and the remaining task.
+        A body that is not a string is returned unchanged with no fields,
+        for `_task` to refuse.
+
+    Raises:
+        BridgeError: If a header repeats.
+    """
+    if not isinstance(body, str):
+        return {}, body
+    found: dict[str, str] = {}
+    lines = body.split("\n")
+    while lines and (match := HEADER.fullmatch(lines[0].strip())):
+        field = match.group(1).lower()
+        if field in found:
+            raise BridgeError(f"spawn_child names {field}: more than once.")
+        found[field] = match.group(2)
+        lines.pop(0)
+    return found, "\n".join(lines)
+
+
+def tier(adapter: str, model: str = "", effort: str = "") -> list[str]:
+    """Builds the native arguments that start a child on a requested tier.
+
+    Args:
+        adapter: Adapter of the child's provider, as the roster defines it.
+        model: Requested model name, or empty for the provider default.
+        effort: Requested reasoning effort, or empty for the default.
+
+    Returns:
+        The arguments to place right after the native executable, empty
+        when neither field was requested.
+
+    Raises:
+        BridgeError: If a value is malformed, or the provider's CLI takes no
+            model or no effort setting, or not that effort level. The child
+            is never started on a different tier instead.
+    """
+    arguments: list[str] = []
+    for field, value in (("model", model), ("effort", effort)):
+        if value and not TIER_VALUE.fullmatch(value):
+            raise BridgeError(
+                f"spawn_child {field} {value[:40]!r} is not a model or effort "
+                "name: letters, digits and . _ : / @ - only, starting with a "
+                "letter or digit, at most 80 characters."
+            )
+    if model:
+        flag = MODEL_FLAGS.get(adapter)
+        if flag is None:
+            raise BridgeError(
+                f"spawn_child refused: the {adapter} CLI takes no model "
+                "setting, so the child would run on the parent's model."
+            )
+        arguments += [flag, model]
+    if effort:
+        levels = EFFORTS.get(adapter)
+        if levels is None:
+            raise BridgeError(
+                f"spawn_child refused: the {adapter} CLI takes no effort "
+                "setting, so the child would run at the parent's effort."
+            )
+        if effort not in levels:
+            raise BridgeError(
+                f"spawn_child refused: the {adapter} CLI takes effort "
+                f"{', '.join(levels)}, not {effort!r}."
+            )
+        arguments += (
+            ["--effort", effort]
+            if adapter == "claude"
+            else ["-c", f'model_reasoning_effort="{effort}"']
+        )
+    return arguments
+
+
+def tier_label(entry: dict) -> str:
+    """Names the model and effort a roster entry asked to start on.
+
+    Args:
+        entry: Roster entry of a participant.
+
+    Returns:
+        ``model M, effort E`` with only the fields recorded, or an empty
+        string for a lane on its provider's default.
+    """
+    return ", ".join(
+        f"{field} {entry[field]}" for field in TIER_FIELDS if entry.get(field)
+    )
 
 
 def _lane_of(manifest: dict, display: str) -> str:
@@ -245,7 +365,8 @@ def of(manifest: dict, name: str) -> list[dict]:
 
     Returns:
         One mapping per child in name order, with its ``name``, ``branch``,
-        ``lane``, reservable ``paths``, ``spawned`` time and ``state``:
+        ``lane``, reservable ``paths``, ``spawned`` time, requested
+        ``model`` and ``effort`` (empty for the default) and ``state``:
         ``running`` until it reports, ``retired`` once it retires without
         a report, otherwise the outcome of its relayed report, which is
         also kept whole under ``result``.
@@ -268,6 +389,8 @@ def of(manifest: dict, name: str) -> list[dict]:
                 "lane": entry.get("lane", ""),
                 "paths": list(entry.get("paths") or []),
                 "spawned": entry.get("spawned"),
+                "model": entry.get("model", ""),
+                "effort": entry.get("effort", ""),
                 "state": state,
                 "result": dict(result),
             }
@@ -512,15 +635,20 @@ def requested(tool: str, args: dict) -> dict | None:
         args: Arguments of that call.
 
     Returns:
-        The ``task`` and ``paths`` to spawn with, or None when the call does
-        not address a child.
+        The ``task`` and ``paths`` to spawn with, and the ``model`` and
+        ``effort`` header lines when the body opened with them, or None when
+        the call does not address a child.
+
+    Raises:
+        BridgeError: If a header line repeats.
     """
     to = args.get("to")
     if tool != "send_message" or not isinstance(to, list) or not to:
         return None
     if to[0] != ADDRESS:
         return None
-    return {"task": args.get("body_md"), "paths": to[1:]}
+    fields, task = headers(args.get("body_md"))
+    return {"task": task, "paths": to[1:], **fields}
 
 
 def spawn(home: Path, actor: dict, args: dict) -> dict:
@@ -534,19 +662,26 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
     Args:
         home: Private bridge state root.
         actor: Authenticated project and lane.
-        args: ``task`` and ``paths`` from the tool call.
+        args: ``task`` and ``paths`` from the tool call, and optionally the
+            ``model`` and ``effort`` the child runs on. Either one left out
+            keeps the provider's own default, as the parent runs.
 
     Returns:
         The child's name, branch, worktree, reservable paths, provider,
-        credential profile and the log its launcher writes.
+        credential profile, any requested model and effort, and the log its
+        launcher writes.
 
     Raises:
         BridgeError: If an argument is invalid, a limit or budget refuses
-            the spawn, the project or caller is unknown, Git cannot create
-            the worktree, or ``init`` fails in it.
+            the spawn, the parent's CLI cannot honour the requested model or
+            effort, the project or caller is unknown, Git cannot create the
+            worktree, or ``init`` fails in it.
     """
     task = _task(args.get("task"))
     paths = _paths(args.get("paths"))
+    requested_tier = {
+        field: str(args.get(field) or "") for field in TIER_FIELDS
+    }
     root = str(actor.get("project", ""))
     directory = roster.locate(home, root) if root else None
     if directory is None:
@@ -556,6 +691,11 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
         participants = manifest["participants"]
         parent = _lane_of(manifest, str(actor.get("name", "")))
         _admit(home, directory, manifest, parent)
+        source = participants[parent]
+        tier(
+            roster.provider(home, source["provider"])["adapter"],
+            **requested_tier,
+        )
         base = Path(manifest["root"])
         refs = set(
             worktrees.git(
@@ -563,7 +703,6 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
             ).splitlines()
         )
         number = _slot(manifest, parent, refs, directory)
-        source = participants[parent]
         name = f"{parent[:STEM_CHARACTERS]}-c{number}"
         branch = f"{source['branch']}-c{number}"
         lane = directory / name
@@ -586,6 +725,7 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
                 created - started, time.monotonic() - created
             ),
             **{key: source[key] for key in INHERITED if key in source},
+            **{key: value for key, value in requested_tier.items() if value},
             "parent": parent,
             "paths": paths,
             "spawned": spawned,
@@ -606,11 +746,12 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
         "paths": paths,
         "provider": source["provider"],
         "credential": source["credential"],
+        **{key: value for key, value in requested_tier.items() if value},
         "log": str(directory / f"{name}-wake.log"),
     }
 
 
-def message(name: str, branch: str, report: dict) -> str:
+def message(name: str, branch: str, report: dict, ran_on: str = "") -> str:
     """Writes the capped result message a parent receives.
 
     Args:
@@ -618,6 +759,8 @@ def message(name: str, branch: str, report: dict) -> str:
         branch: Child branch.
         report: The child's recorded report: ``state``, ``commit``,
             ``summary``, ``evidence`` and ``remaining``.
+        ran_on: The child's requested model and effort, as `tier_label`
+            writes them; empty for a child on its provider's default.
 
     Returns:
         The message body, at most `REPORT_BYTES`, carrying only the report's
@@ -628,6 +771,8 @@ def message(name: str, branch: str, report: dict) -> str:
         f"Branch: {branch} at {str(report.get('commit') or '')[:12]}",
         "Summary: " + _clip(str(report.get("summary") or ""), FIELD_BYTES),
     ]
+    if ran_on:
+        lines.insert(2, f"Ran on: {ran_on}")
     if report.get("evidence"):
         lines.append("Checks: " + _clip(str(report["evidence"]), FIELD_BYTES))
     if report.get("remaining"):
@@ -684,7 +829,7 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
             manifest["root"],
             parent["display"],
             f"Child {name} result: {report.get('state')}",
-            message(name, entry["branch"], report),
+            message(name, entry["branch"], report, tier_label(entry)),
             f"child-result-{name}",
             sender=entry["display"],
         )
