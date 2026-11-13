@@ -780,6 +780,11 @@ output labels the total as an estimate from recorded prices, not a bill. A lane
 cannot set or change a price: the command refuses a lane worktree and any
 process holding a lane's `AGENT_PARLEY_TOKEN`.
 
+Per-model rates for input, output and cache-read tokens are set with
+`provider price NAME --model MODEL --input A --output B --cache-read C` and
+feed `metrics cost` ([Operations](operations.md#estimated-cost-per-shipped-unit)).
+Removing the blended price leaves those rows in place.
+
 ## `watch`
 
 One lane can be followed as a stream. `agent-parley watch NAME` prints one line

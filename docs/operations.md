@@ -2243,6 +2243,51 @@ The project total counts a merged issue and an operator message once. A lane
 whose retained transitions start inside the window is named, because its
 hours understate the window; each project keeps its latest 2000 lane events.
 
+### Estimated cost per shipped unit
+
+```bash
+agent-parley provider price claude --model opus --input 15 --output 75 --cache-read 1.5
+agent-parley provider price claude
+agent-parley metrics cost --since 7d
+agent-parley metrics cost --since 7d --json
+```
+
+`provider price NAME --model MODEL --input A --output B --cache-read C` records
+a price row: what one million tokens of that model cost, in whatever currency
+the operator uses. All three rates are required, each from 0 up. The rows live
+in the provider registry beside the blended `--per-mtok` figure, which keeps
+working for `report usage`; setting one does not remove the other. Setting a
+row for the same provider and model again overwrites it. `provider price NAME`
+with no flag prints the rows. Like every provider setting, the command is
+operator only. The table's version is a short digest of its content, so any
+change to a rate gives a new version.
+
+`metrics cost --since` takes an instant or a window like `metrics throughput`
+and joins each lane's native client token counts in the window with what the
+lane shipped in it. A lane's model comes from its participant record. Its
+input is split into cache-read tokens, priced at the cache-read rate, and the
+rest, priced at the input rate. Per project it prints a lane table and a
+provider table with the estimated cost and the cost per merged issue, per
+merged pull request and per review finding the lane returned as a reviewer.
+`--json` prints one document that carries `price_table_version`.
+
+The output is an estimate from the clients' own token counts and the
+operator's recorded prices. It is not billed spend, and the command makes no
+claim about tokens saved.
+
+- With no price table recorded the command prints one line saying so and how
+  to record a row. It uses no default price.
+- A lane whose provider reports no token count, such as amp, or whose model
+  has no price row, is `unknown` with the reason. It is never zero and adds
+  nothing to the provider total, which lists it under `unknown_lanes`.
+- The cost per unit is the lane's windowed cost divided by its units in the
+  window, not a measure of the cost of one claim: no client record names the
+  claim it was working on. A unit count of zero leaves that figure unknown.
+- Only Claude and Codex report a cache-read count. For the other providers
+  all input is priced at the input rate.
+- Review rounds are retained for seven days, so findings older than that are
+  not counted.
+
 ## Participants, providers and accounts
 
 ### Availability, reminders and waking

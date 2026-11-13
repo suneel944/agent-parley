@@ -7,8 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, decisions, lanes, metrics, records, store
-from agent_parley.state import write_json
+from agent_parley import (
+    cli,
+    decisions,
+    lanes,
+    metrics,
+    records,
+    roster,
+    store,
+)
+from agent_parley.state import BridgeError, write_json
 
 HOUR = 3600.0
 
@@ -271,7 +279,7 @@ def test_running_totals_count_only_the_window(tmp_path):
             },
         ],
     )
-    assert metrics._file_tokens(codex, "codex", 100.0, 200.0) == (300, 30)
+    assert metrics._file_tokens(codex, "codex", 100.0, 200.0) == (300, 30, 0)
     copilot = lines(
         tmp_path / "events.jsonl",
         [
@@ -287,7 +295,7 @@ def test_running_totals_count_only_the_window(tmp_path):
             }
         ],
     )
-    assert metrics._file_tokens(copilot, "copilot", 100.0, 200.0) == (8, 4)
+    assert metrics._file_tokens(copilot, "copilot", 100.0, 200.0) == (8, 4, 0)
     gemini = lines(
         tmp_path / "chat.jsonl",
         [
@@ -311,7 +319,7 @@ def test_running_totals_count_only_the_window(tmp_path):
             },
         ],
     )
-    assert metrics._file_tokens(gemini, "gemini", 100.0, 200.0) == (5, 2)
+    assert metrics._file_tokens(gemini, "gemini", 100.0, 200.0) == (5, 2, 0)
 
 
 def test_a_provider_without_a_split_reader_reports_no_tokens(bridge):
@@ -358,3 +366,189 @@ def test_a_window_start_is_an_instant_or_a_window():
     assert cli.instant("1h") == pytest.approx(metrics.time.time() - HOUR, 5)
     with pytest.raises(ValueError):
         cli.instant("yesterday")
+
+
+RATES = {"input": 1000, "output": 5000, "cache_read": 100}
+
+
+@pytest.fixture
+def priced(bridge, repo, window, monkeypatch):
+    """Names the claude lane's model, prices it and records one finding."""
+    directory = bridge.project(repo)[1]
+    manifest = json.loads((directory / "project.json").read_text())
+    manifest["participants"]["claude"]["model"] = "opus"
+    write_json(directory / "project.json", manifest)
+    write_json(
+        directory / "reviews.json",
+        {
+            "next": 2,
+            "rounds": {
+                "r1": {
+                    "id": "r1",
+                    "state": "returned",
+                    "builder": "codex",
+                    "reviewer": "claude",
+                    "returned": window["now"] - 100,
+                    "findings": 2,
+                }
+            },
+        },
+    )
+    monkeypatch.chdir(repo)
+    bridge.price(repo, "claude", None, "opus", RATES)
+    return window
+
+
+def test_no_price_table_means_no_cost_output(
+    bridge, window, monkeypatch, capsys
+):
+    reading = metrics.cost(bridge.home, window["since"])
+    assert reading["price_table_version"] is None
+    assert "projects" not in reading
+    assert "No price table is recorded" in reading["message"]
+    assert "provider price" in reading["message"]
+    home = ["--home", str(bridge.home)]
+    printed = run(
+        monkeypatch, capsys, *home, "metrics", "cost", "--since", "2h"
+    )
+    assert printed == reading["message"] + "\n"
+    document = json.loads(
+        run(
+            monkeypatch,
+            capsys,
+            *home,
+            "metrics",
+            "cost",
+            "--since",
+            "2h",
+            "--json",
+        )
+    )
+    assert document["price_table_version"] is None
+    assert "not billed spend" in document["estimate"]
+    assert "projects" not in document
+
+
+def test_cost_joins_priced_tokens_with_shipped_units(bridge, priced):
+    reading = metrics.cost(bridge.home, priced["since"])
+    lanes = reading["projects"][0]["lanes"]
+    claude = lanes["claude"]
+    assert claude["estimated_cost"] == 0.4502
+    assert (claude["issues"], claude["pull_requests"]) == (1, 1)
+    assert claude["findings"] == 2
+    assert claude["cost_per_issue"] == 0.4502
+    assert claude["cost_per_pull_request"] == 0.4502
+    assert claude["cost_per_finding"] == 0.2251
+    group = reading["projects"][0]["providers"]["claude"]
+    assert group["estimated_cost"] == 0.4502
+    assert group["cost_per_issue"] == 0.4502
+    assert group["unknown_lanes"] == []
+
+
+def test_a_lane_without_a_price_row_is_unknown_not_zero(bridge, priced):
+    reading = metrics.cost(bridge.home, priced["since"])
+    project = reading["projects"][0]
+    codex = project["lanes"]["codex"]
+    assert codex["estimated_cost"] is None
+    assert codex["cost_per_issue"] is None
+    assert "no price row for codex" in codex["unknown_reason"]
+    assert project["providers"]["codex"]["estimated_cost"] is None
+    assert project["providers"]["codex"]["unknown_lanes"] == ["codex"]
+    printed = metrics.describe_cost(reading)
+    assert "codex: cost unknown, no price row for codex" in printed
+    assert "unknown" in printed
+
+
+def test_a_provider_without_token_counts_is_unknown_not_zero():
+    unpriced = {"amp": {"default": RATES}}
+    row = metrics._lane_cost_row(
+        {"provider": "amp", "model": "default"},
+        None,
+        unpriced,
+        {"issues": 1, "pull_requests": 1, "findings": 1},
+    )
+    assert row["estimated_cost"] is None
+    assert row["input_tokens"] is None
+    assert row["cost_per_issue"] is None
+    assert "no token count" in row["unknown_reason"]
+    assert metrics.lane_cost(None, RATES) is None
+    tokens = {"input": 10, "output": 1, "cache_read": 4}
+    assert metrics.lane_cost(tokens, None) is None
+    assert metrics.lane_cost(tokens, RATES) == pytest.approx(0.0114)
+
+
+def test_the_command_labels_every_format_and_names_the_version(
+    bridge, repo, priced, monkeypatch, capsys
+):
+    home = ["--home", str(bridge.home)]
+    arguments = [*home, "metrics", "cost", "--since", "2h"]
+    document = json.loads(run(monkeypatch, capsys, *arguments, "--json"))
+    version = document["price_table_version"]
+    assert len(version) == 12
+    assert "not billed spend" in document["estimate"]
+    assert "operator's recorded prices" in document["estimate"]
+    printed = run(monkeypatch, capsys, *arguments)
+    assert document["estimate"] in printed
+    assert f"Price table version {version}." in printed
+    assert "PER_ISSUE" in printed
+    bridge.price(repo, "claude", None, "opus", {**RATES, "output": 1})
+    changed = json.loads(run(monkeypatch, capsys, *arguments, "--json"))
+    assert changed["price_table_version"] != version
+
+
+def test_model_rates_are_set_from_the_command_line(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    monkeypatch.chdir(repo)
+    home = ["--home", str(bridge.home)]
+    printed = run(
+        monkeypatch,
+        capsys,
+        *home,
+        "provider",
+        "price",
+        "claude",
+        "--model",
+        "opus",
+        "--input",
+        "3",
+        "--output",
+        "15",
+        "--cache-read",
+        "0.3",
+    )
+    assert "model opus per million tokens: input 3, output 15" in printed
+    assert roster.price_table(bridge.home)["claude"]["opus"] == {
+        "input": 3,
+        "output": 15,
+        "cache_read": 0.3,
+    }
+    shown = run(monkeypatch, capsys, *home, "provider", "price", "claude")
+    assert "cache-read 0.3" in shown
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            *home,
+            "provider",
+            "price",
+            "claude",
+            "--model",
+            "opus",
+            "--input",
+            "1",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+def test_a_model_price_is_validated(bridge):
+    for rates in (
+        {"input": 1, "output": 2},
+        {"input": -1, "output": 2, "cache_read": 0},
+        {"input": "1", "output": 2, "cache_read": 0},
+    ):
+        with pytest.raises(BridgeError, match="model price"):
+            roster.price({"models": {"opus": rates}})

@@ -4305,6 +4305,26 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     delivered.add_argument("--json", action="store_true", help=JSON_HELP)
+    spent = readings.add_parser(
+        "cost",
+        help=(
+            "Estimate the cost per merged issue, merged pull request and "
+            "review finding by lane and provider, from client token counts "
+            "and the operator's recorded prices."
+        ),
+    )
+    spent.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        required=True,
+        metavar="TIME",
+        help=(
+            "Start of the window, such as 2026-10-15T09:01:00Z, or a window "
+            "counted back from now, such as 7d."
+        ),
+    )
+    spent.add_argument("--json", action="store_true", help=JSON_HELP)
     follow = commands.add_parser(
         "watch",
         help=(
@@ -6263,6 +6283,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "fetched, and refused from a lane."
         ),
     )
+    pricing.add_argument(
+        "--model",
+        metavar="NAME",
+        help=(
+            "Record this model's rates for `metrics cost`; needs --input, "
+            "--output and --cache-read."
+        ),
+    )
+    for rate in ("input", "output", "cache-read"):
+        pricing.add_argument(
+            f"--{rate}",
+            type=float,
+            metavar="AMOUNT",
+            help=f"Price per million {rate} tokens of --model.",
+        )
     accounts = commands.add_parser(
         "credentials", help="Inspect or define per-account profiles."
     )
@@ -6668,6 +6703,12 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_throughput(reading), end="")
+        elif args.command == "metrics" and args.reading == "cost":
+            reading = metrics.cost(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_cost(reading), end="")
         elif args.command == "metrics":
             from agent_parley import dashboard
 
@@ -7778,7 +7819,28 @@ def main() -> int:
                     )
                 return 0
             elif args.action == "price":
-                print(bridge.price(Path.cwd(), args.name, args.per_mtok))
+                rates = {
+                    "input": args.input,
+                    "output": args.output,
+                    "cache_read": args.cache_read,
+                }
+                if args.model and None in rates.values():
+                    parser.error(
+                        "--model needs --input, --output and --cache-read."
+                    )
+                if not args.model and set(rates.values()) != {None}:
+                    parser.error(
+                        "--input, --output and --cache-read need --model."
+                    )
+                print(
+                    bridge.price(
+                        Path.cwd(),
+                        args.name,
+                        args.per_mtok,
+                        args.model or "",
+                        rates,
+                    )
+                )
                 return 0
             defined = roster.inspect(bridge.home)
             print(
