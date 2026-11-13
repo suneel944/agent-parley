@@ -323,17 +323,22 @@ merge lock is then taken only to check the target has not moved and merge;
 a moved target is gated again, so an unverified result never lands. The merge
 is the `participant merge` step with the same locks and approvals, and every
 attempt records a decision in the lane's report log. It never pushes and
-never repairs an unverified integration. A lane holding several claims
+never repairs another lane's unverified integration; the lane that owns the
+record, for the issue it records, retries it as `participant merge` would,
+such as a verified merge whose completion could not be recorded. A lane
+holding several claims
 integrates its only ready one; when several are ready, name one with
 `--issue N`, which `participant merge NAME` accepts too.
 
 With `--auto` recorded, each supervision poll makes that same attempt for
 every listed issue whose claim is ready, on its own thread so a slow gate
 never holds the poll. A lane whose session is still running waits until the
-session ends, because every merge refuses a running session. The service
-attempts one claim once per issue, claim generation, ready commit and target
-commit, so an unchanged refusal is recorded once, not on every poll; after
-fixing what it names, run `unattended run NAME` or let a new commit move it.
+session ends, because every merge refuses a running session. A failure is
+attempted once per issue, claim generation, ready commit and target commit.
+A refusal is evaluated again on every poll, because its cause, such as the
+base off the target branch or a peer reservation, can clear on its own; an
+unchanged refusal is recorded and mailed once, and the claim integrates on
+the first poll after the cause clears.
 Each new decision is mailed to the lane, and a failed attempt raises an
 `unattended integration failed` row in `problems`. Without `--auto` the
 service never attempts it. The full policy is in
