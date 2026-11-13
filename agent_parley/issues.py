@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_parley import attachments, lifecycle, retries
+from agent_parley import attachments, lifecycle, retries, trials
 from agent_parley.state import BridgeError, Transient, lock, write_json
 
 MAX_BLOCKERS = 10
@@ -745,6 +745,7 @@ def unclaimed(state: dict) -> list[str]:
             for number, record in issues.items()
             if not record.get("owner")
             and not record.get("offer")
+            and not trials.running(record)
             and not record.get("blocked_by")
             and not record.get("ended_on_forge")
             and lifecycle.state(record)["authorized"]
@@ -798,7 +799,7 @@ def counted_claims(ledger: dict, agent: str) -> list[str]:
         (
             number
             for number, item in ledger.items()
-            if item.get("owner") == agent
+            if (item.get("owner") == agent or trials.member(item, agent))
             and not delivered(item)
             and not closed(item)
         ),
@@ -1538,6 +1539,14 @@ def _change(
                 recorded, action, scope.rsplit("\x00", 1)[1], fingerprint
             )
         record = state["issues"].get(issue)
+        if action in ("claim", "assign", "request") and trials.running(record):
+            raise BridgeError(
+                f"Issue #{issue} is in a trial across "
+                + ", ".join(sorted(trials.running(record)["lanes"]))
+                + "; the operator ends it with trial keep "
+                + f"{issue} --lane NAME.",
+                next_command=f"agent-parley trial show {issue}",
+            )
         if action == "claim":
             orphan = (record or {}).get("orphan") or {}
             taken: dict = {}
@@ -2118,7 +2127,7 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
     owned = {
         number: record
         for number, record in ledger.items()
-        if record["owner"] == name
+        if record["owner"] == name or trials.member(record, name)
     }
     held = ", ".join(f"#{number}" for number in sorted(owned, key=int))
     if issue:
@@ -2144,6 +2153,13 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
         return {"issue": None, "claim_id": None}
     else:
         number = next(iter(owned))
+    trial = trials.running(owned[number])
+    if name in trial.get("lanes", {}):
+        return {
+            "issue": int(number),
+            "claim_id": trial["lanes"][name]["claim_id"],
+            "trial": True,
+        }
     return {"issue": int(number), "claim_id": owned[number].get("claim_id")}
 
 

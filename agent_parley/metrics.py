@@ -1243,6 +1243,59 @@ def _manifests(home: Path) -> list[tuple[Path, dict]]:
     return found
 
 
+def trials(home: Path, since: float = 0.0) -> dict:
+    """Aggregates ended trial outcomes per provider across every project.
+
+    Args:
+        home: Agent Parley state home.
+        since: Count only trials that ended at or after this Unix time.
+
+    Returns:
+        The window start, the token label and, per provider, the lanes it
+        entered, kept, released and reported ready, the mean wall seconds to
+        ready and the summed client-reported tokens.
+    """
+    from agent_parley import trials as trial_record
+
+    ended = [
+        trial
+        for directory, _ in _manifests(home)
+        for trial in trial_record.ended(directory)
+    ]
+    return {
+        "since": since,
+        "token_label": trial_record.TOKEN_LABEL,
+        "providers": trial_record.outcomes(ended, since),
+    }
+
+
+def describe_trials(reading: dict) -> str:
+    """Formats per-provider trial outcomes for a terminal.
+
+    Args:
+        reading: Result of `trials`.
+
+    Returns:
+        One line per provider, or a line saying no trial ended.
+    """
+    if not reading["providers"]:
+        return "No trial ended in this window.\n"
+    lines = []
+    for provider, counts in reading["providers"].items():
+        waited = counts["mean_ready_seconds"]
+        lines.append(
+            f"{provider or '?'}: {counts['entered']} trial lane(s), "
+            f"{counts['kept']} kept, {counts['released']} released, "
+            f"{counts['ready']} ready, mean "
+            + ("n/a" if waited is None else f"{waited}s")
+            + " to ready, "
+            + _tokens(counts["client_tokens"])
+            + " client tokens"
+        )
+    lines.append(f"Client tokens: {reading['token_label']}.")
+    return "\n".join(lines) + "\n"
+
+
 def _project_throughput(
     home: Path,
     directory: Path,

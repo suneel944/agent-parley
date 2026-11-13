@@ -27,6 +27,7 @@ from agent_parley import (
     store,
     supervision,
     tables,
+    trials,
     views,
 )
 from agent_parley.checkpoints import (
@@ -452,6 +453,14 @@ def _row(
         ),
         key=int,
     )
+    trialled = sorted(
+        (
+            number
+            for number, record in issues.items()
+            if trials.member(record, agent)
+        ),
+        key=int,
+    )
     overdue = [
         number
         for number in owned
@@ -573,11 +582,15 @@ def _row(
         "orphaned": orphaned,
         "orphan_keys": orphan_keys,
         "orphan": supervision.orphan_marker(orphaned, orphan_keys),
+        "trials": trialled,
         "issues": ",".join(
-            f"#{number}"
-            + ("!" if number in overdue else "")
-            + ("*" if number in orphaned else "")
-            for number in owned
+            [
+                f"#{number}"
+                + ("!" if number in overdue else "")
+                + ("*" if number in orphaned else "")
+                for number in owned
+            ]
+            + [f"#{number}(trial)" for number in trialled]
         )
         or "-",
         "offers": offers,

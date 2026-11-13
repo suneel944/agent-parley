@@ -1454,7 +1454,7 @@ class StatusMixin(BridgeCore):
         """
         import sqlite3
 
-        from agent_parley import approvals, lifecycle, waits
+        from agent_parley import approvals, lifecycle, trials, waits
         from agent_parley.cli import (
             activity,
             budgets,
@@ -1690,6 +1690,11 @@ class StatusMixin(BridgeCore):
                 )
                 if record.get("owner") == agent
             ],
+            "trials": sorted(
+                int(number)
+                for number, record in ledger["issues"].items()
+                if trials.member(record, agent)
+            ),
             "idle": {
                 "stalled": stalled["stalled"],
                 "kind": stalled["kind"],

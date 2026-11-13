@@ -444,6 +444,7 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
             eligible = (
                 not record.get("owner")
                 and not record.get("offer")
+                and not record.get("trial")
                 and not record.get("ended_on_forge")
                 and execution["state"] == QUEUED
             )

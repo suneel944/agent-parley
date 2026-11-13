@@ -272,7 +272,22 @@ class ReportsMixin(BridgeCore):
                 if key and (recorded := state.get("retries", {}).get(scope)):
                     retries.replayed(recorded, "report", key, fingerprint)
                     return ""
-            if outcome != "waiting":
+            if claim.get("trial"):
+                from agent_parley import budgets, trials
+
+                trials.reported(
+                    directory,
+                    data["participants"][agent],
+                    agent,
+                    str(claim["issue"]),
+                    outcome=outcome,
+                    commit=commit,
+                    evidence=evidence,
+                    usage=budgets.claim_reading(
+                        self.home, directory, data, agent
+                    ),
+                )
+            elif outcome != "waiting":
                 lifecycle.record_report(
                     directory,
                     agent,

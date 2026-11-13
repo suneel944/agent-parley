@@ -50,6 +50,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
+| `trials` | Side-by-side trials of one issue across provider lanes: the running trial on the issue's ledger record, the one recorded exception to one owner per issue, its per-lane ready figures (diff since the recorded base, tests stated in the evidence, client-reported tokens, wall time), the comparison `trial show` prints, `trial keep` turning one lane into the ordinary owner and releasing the rest without touching a branch, and the ended-trial record `metrics trials` aggregates per provider |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
@@ -1051,6 +1052,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `followups` | `followups.json` under `followups.lock` |
 | `reviews` | `reviews.json` under `reviews.lock` |
+| `trials` | the running trial on its issue's `issues.json` record; ended trials in `trials.json`, both under `issues.lock` |
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
 | `quota` | `quota-ledger.json` under `quota.lock` |

@@ -127,6 +127,164 @@ class ClaimsMixin(ReportsMixin):
 
         return recovery.authorize(directory, data, parse_issue(number), reason)
 
+    def _trial_operator(self, repo: Path, verb: str) -> tuple[Path, dict]:
+        """Resolves a trial command run from the project base checkout.
+
+        Args:
+            repo: Checkout the command runs from.
+            verb: What the command does, for the refusal.
+
+        Returns:
+            The project state directory and manifest.
+
+        Raises:
+            BridgeError: If run from a lane rather than the base checkout.
+        """
+        from agent_parley.cli import roster
+
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        if repo.resolve() != Path(data["root"]).resolve() or roster.from_lane(
+            data
+        ):
+            raise BridgeError(
+                f"Only the operator can {verb} a trial, from the project "
+                "base checkout."
+            )
+        return directory, data
+
+    def trial_start(self, repo: Path, number: str, lanes: str) -> dict:
+        """Assigns one issue to several lanes as a side-by-side trial.
+
+        Each lane keeps its own provider, credential and worktree; the base
+        commit they all start from is recorded and sent to each lane.
+
+        Args:
+            repo: Project base checkout.
+            number: Repository issue number.
+            lanes: Comma-separated participant names, at least two.
+
+        Returns:
+            The running trial.
+
+        Raises:
+            BridgeError: If run from a lane, or `trials.start` refuses.
+        """
+        from agent_parley import budgets, supervision, trials
+        from agent_parley.cli import git, parse_issue
+
+        directory, data = self._trial_operator(repo, "start")
+        issue = parse_issue(number)
+        names = lanes.split(",")
+        trial = trials.start(
+            directory,
+            data,
+            issue,
+            names,
+            base=git(Path(data["root"]), "rev-parse", data["base"]),
+            readings={
+                name: budgets.claim_reading(self.home, directory, data, name)
+                for name in data["participants"]
+                if name in {item.strip() for item in names}
+            },
+            cap=supervision.configuration(self.home, data)[
+                "max_claims_per_lane"
+            ],
+        )
+        for name, entry in trial["lanes"].items():
+            self._trial_mail(
+                data,
+                name,
+                f"Trial of issue #{issue}: work it on your own branch "
+                f"{entry['branch']} from base {trial['base']}; other "
+                f"lanes work it too. Report ready with --issue {issue} "
+                "when done; the operator keeps one branch.",
+            )
+        return trial
+
+    def trial_show(self, repo: Path, number: str) -> dict:
+        """Compares the lanes of an issue's trial side by side.
+
+        Args:
+            repo: Any checkout of the project.
+            number: Repository issue number.
+
+        Returns:
+            The comparison `trials.comparison` builds.
+        """
+        from agent_parley import trials
+        from agent_parley.cli import parse_issue, roster
+
+        _, directory = self.project(repo)
+        return trials.comparison(
+            directory, roster.read(directory), parse_issue(number)
+        )
+
+    def trial_keep(self, repo: Path, number: str, lane: str) -> dict:
+        """Ends a trial by keeping one lane's branch and releasing the rest.
+
+        No branch or worktree is deleted; a released lane's branch stays
+        until the operator removes it.
+
+        Args:
+            repo: Project base checkout.
+            number: Repository issue number.
+            lane: Participant whose branch is kept.
+
+        Returns:
+            The ended trial.
+
+        Raises:
+            BridgeError: If run from a lane, or `trials.keep` refuses.
+        """
+        from agent_parley import trials
+        from agent_parley.cli import parse_issue
+
+        directory, data = self._trial_operator(repo, "end")
+        issue = parse_issue(number)
+        trial = trials.keep(
+            directory, issue, lane, defaults=data.get("deadlines") or {}
+        )
+        for name, entry in trial["lanes"].items():
+            self._trial_mail(
+                data,
+                name,
+                f"Trial of issue #{issue} ended: the operator kept "
+                f"{lane}'s branch. "
+                + (
+                    f"You now own #{issue}."
+                    if name == lane
+                    else f"You are released from #{issue}; your branch "
+                    f"{entry['branch']} is left as it is."
+                ),
+            )
+        return trial
+
+    def _trial_mail(self, data: dict, name: str, body: str) -> None:
+        """Writes one operator message about a trial to a lane's inbox.
+
+        Delivery is best effort: the trial is already recorded, so a lane
+        whose inbox cannot be written still reads it in status and show.
+
+        Args:
+            data: Project manifest.
+            name: Participant the message goes to.
+            body: Message text.
+        """
+        from agent_parley.cli import operator_key, store
+
+        identity = data["participants"][name].get("display", name)
+        subject = "trial"
+        with contextlib.suppress(BridgeError):
+            store.speak(
+                self.home,
+                data["root"],
+                identity,
+                subject,
+                body,
+                operator_key(identity, subject, body),
+            )
+
     def issue(
         self,
         repo: Path,
