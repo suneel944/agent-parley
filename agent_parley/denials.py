@@ -275,15 +275,31 @@ def record(
 def waiting(directory: Path, lane: str, now: float = 0.0) -> dict:
     """Finds the open refusal decision that holds a lane's wakes.
 
+    A refusal holds the lane only while the refused step is still what it
+    is doing. The lane's hook records `progressed` each time a tool call
+    completes, so a call that completed after the refusal was last seen
+    proves the lane moved past it, and that refusal no longer holds the
+    lane even though its decision stays open for the operator to answer.
+    A repeat of the same refusal refreshes the decision and holds again.
+
     Args:
         directory: Private project state directory.
         lane: Lane to look up.
         now: Unix time; the clock when zero.
 
     Returns:
-        The oldest open refusal decision of the lane, or an empty mapping.
+        The oldest open refusal decision of the lane that the lane has not
+        progressed past, or an empty mapping.
     """
+    from agent_parley import checkpoints
+
+    found = checkpoints.activity(directory, lane).get("progressed")
+    progressed = float(found) if isinstance(found, (int, float)) else 0.0
     for entry in decisions.list_open(directory, now):
-        if entry.get("kind") == KIND and entry.get("lane") == lane:
+        if (
+            entry.get("kind") == KIND
+            and entry.get("lane") == lane
+            and float(entry.get("refreshed") or 0.0) >= progressed
+        ):
             return entry
     return {}

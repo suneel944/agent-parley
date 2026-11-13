@@ -4249,6 +4249,8 @@ def checkpoint(
         if stale:
             state.pop("dialog", None)
             state.update(prior, updated=applied)
+        elif event == "PostToolUse":
+            state["progressed"] = time.time()
         if event == "UserPromptSubmit":
             state["turn"] = {
                 "started": time.time(),
