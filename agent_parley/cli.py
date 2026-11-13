@@ -3822,6 +3822,16 @@ def issue_lines(reading: dict) -> str:
         "Reservations held: "
         + (", ".join(reading["reservations"]) or "none recorded")
     )
+    for flagged in reading.get("contention") or []:
+        lines.append(
+            f"Contention with {flagged['peer']} on {flagged['path']}: "
+            f"{flagged['count']} refusals; {flagged['peer']} holds "
+            + (
+                ", ".join(f"#{held}" for held in flagged["issues"])
+                or "no issue"
+            )
+            + "; the operator hands off or releases one"
+        )
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
     reported = reading["history"]

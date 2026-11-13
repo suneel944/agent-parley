@@ -158,6 +158,15 @@ causes deny a tool call:
 Every other hazard is a notice. Otherwise a call that only reads, and Agent
 Parley's own commands, are never refused for coordination.
 
+Two lanes that refuse each other's reservation of one path four times inside
+30 minutes are escalated once. Each lane receives one message asking it to
+finish or stash its edit on that path and wait. The pair appears under needs
+input in `status` and `top` with both claims and the path, and the record is
+kept in the store and printed by `issue show` for both issues. It is not
+raised again for that path until the operator hands the work to one lane with
+`issue offer` or frees it with `issue release`. Reservations stay advisory:
+this adds a notice and a decision, never a lock.
+
 Overlap is shown before the work, not found as a merge conflict after it.
 A write to a file a peer reserves, even shared, or that a peer's open pull
 request changes, carries a notice naming that reservation or pull request and
