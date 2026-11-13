@@ -232,9 +232,8 @@ class ReportsMixin(BridgeCore):
         if key and (recorded := state.get("retries", {}).get(scope)):
             retries.replayed(recorded, "report", key, fingerprint)
             return ""
-        if outcome == "ready" and (
-            changed := git(lane, "diff", "--name-only", "HEAD").splitlines()
-        ):
+        changed = git(lane, "diff", "--name-only", "HEAD").splitlines()
+        if outcome == "ready" and changed:
             shown = ", ".join(changed[:READY_SHOWN_PATHS])
             more = len(changed) - READY_SHOWN_PATHS
             raise BridgeError(
@@ -328,6 +327,7 @@ class ReportsMixin(BridgeCore):
                 "issue": claim["issue"],
                 "claim_id": claim["claim_id"],
                 "commit": commit,
+                "clean": not changed,
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,

@@ -712,6 +712,42 @@ one `Pull requests` summary to its issues line and `status` one line per
 project over the last 7 days, each only when the window holds any, and `top --json` carries each lane's figures
 under `pull_requests`.
 
+## Suspected flaky tests
+
+The supervision poll keeps the test failures and passes lanes record, and
+names a test suspected flaky only from those recorded occurrences. Two
+sources feed it:
+
+- report evidence (`agent-parley report --state ready --evidence ...`, or
+  any other report whose worktree matched its commit), read from the lane's
+  report log;
+- a lane's pull request on the forge: the failed-step logs the poll already
+  quotes to the lane when checks fail, and checks that finish green.
+
+Test identifiers are pytest node ids (`tests/test_core.py::test_value`) read
+from `FAILED <id>`, `<id> FAILED`, the same forms with `ERROR`, and
+`PASSED <id>` or `<id> PASSED`. Evidence the convergence account reads as a
+pass, such as `12 passed`, and a green forge run pass every test already
+tracked on that commit's tree.
+
+A test is suspected flaky when it:
+
+- failed and passed on the same Git tree, or
+- failed in two lanes whose diffs, each against its fork from the base
+  checkout's head, change neither the test file nor a module it imports.
+
+A failure in a lane whose diff changes the test or one of its imports never
+counts towards two lanes, so a regression the change caused is not marked.
+Each lane that is not retired gets one update per suspicion, naming the test
+and up to six occurrences, and one `test:` issue is suggested to the
+operator, who sees it in `agent-parley followup list` and accepts it with
+`agent-parley followup accept`. The lanes file nothing, and no test is
+skipped or disabled: the flag is a label with evidence. More occurrences of
+a suspected test send nothing more. A later failure on a tree whose diff
+changes the test or its imports clears the suspicion; the test is suspected
+again only on new evidence, and then each lane is told again. The record is
+`flaky.json` in the project's state directory.
+
 ## Usage per issue
 
 A claim records what its lane had consumed when it began and again when it

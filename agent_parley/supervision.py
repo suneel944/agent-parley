@@ -30,6 +30,7 @@ from agent_parley import (
     decisions,
     denials,
     dialogs,
+    flaky,
     forge,
     issues,
     lanes,
@@ -7721,6 +7722,17 @@ def pull_request_wakes(
         )
         if feedback:
             body = f"{body}\n\n{feedback}"
+        if record["checks"] in {"green", "red"} and reading["sha"]:
+            with contextlib.suppress(BridgeError, OSError):
+                flaky.record(
+                    directory,
+                    Path(manifest["root"]),
+                    name,
+                    str(reading["sha"]),
+                    feedback,
+                    flaky.FORGE,
+                    green=record["checks"] == "green",
+                )
         digest = hashlib.sha256(
             f"{reading['number']}\x00{name}\x00{body}\x00"
             f"{seen.get('read_at') or 0}".encode()
@@ -9474,6 +9486,7 @@ def _poll(home: Path, directory: Path) -> None:
         config,
     )
     stage("converging lanes", collisions.supervise, home, directory, manifest)
+    stage("flaky tests", flaky.supervise, home, directory, manifest)
     stage(
         "unattended integration",
         unattended.supervise,
