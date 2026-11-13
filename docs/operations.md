@@ -3904,6 +3904,12 @@ agent-parley unattended run claude-1
 agent-parley unattended set          # remove it; operator-only again
 ```
 
+`show` is the default action. `unattended`, `verify`, `init`, `pool`,
+`approval` and `timeout` typed with no action print what `show` prints and
+exit 0, and accept the options `show` accepts, such as `--repo` and `--json`.
+Every command that changes state still requires its own action, and
+`--help` and shell completion still list every action.
+
 The policy is stored in `project.json` as
 `"integration": {"unattended": {"target": "main", "issues": ["42", "43"]}}`.
 Without it, which is every existing project, integration stays operator-only

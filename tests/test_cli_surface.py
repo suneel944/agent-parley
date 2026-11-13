@@ -1692,3 +1692,51 @@ def test_issue_recover_says_what_it_approved_and_json_carries_the_envelope(
     )
     assert document["claim_id"] == "c1"
     assert document["authorized_at"] == "2025-10-09T08:53:20Z"
+
+
+POLICY_COMMANDS = (
+    "unattended",
+    "verify",
+    "init",
+    "pool",
+    "approval",
+    "timeout",
+)
+
+
+@pytest.mark.parametrize("command", POLICY_COMMANDS)
+def test_policy_command_without_action_prints_what_show_prints(
+    bridge, repo, paired, monkeypatch, capsys, command
+):
+    monkeypatch.delenv("AGENT_PARLEY_TOKEN", raising=False)
+    home = ["--home", str(bridge.home)]
+    where = ["--repo", str(repo)]
+    shown = text(monkeypatch, capsys, *home, command, "show", *where)
+    assert text(monkeypatch, capsys, *home, command, *where) == shown
+    assert shown
+
+
+@pytest.mark.parametrize("command", POLICY_COMMANDS)
+def test_policy_command_help_still_lists_every_action(
+    monkeypatch, capsys, command
+):
+    monkeypatch.setattr(sys, "argv", ["agent-parley", command, "--help"])
+    with pytest.raises(SystemExit) as exit_status:
+        cli.main()
+    assert exit_status.value.code == 0
+    assert "show" in capsys.readouterr().out
+
+
+def test_default_action_leaves_state_changing_commands_alone():
+    assert cli.with_default_action(["verify", "set", "x"]) == [
+        "verify",
+        "set",
+        "x",
+    ]
+    assert cli.with_default_action(["--home", "h", "pool"]) == [
+        "--home",
+        "h",
+        "pool",
+        "show",
+    ]
+    assert cli.with_default_action(["issue"]) == ["issue"]
